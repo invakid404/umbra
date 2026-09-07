@@ -1,20 +1,16 @@
 //! Provider executable; constructs only this package's backend after the handshake.
 #![forbid(unsafe_code)]
 #[cfg(unix)]
-fn no_options(options: &[u8]) -> umbra_core::Result<()> {
-    if !options.is_empty() {
-        return Err(umbra_core::provider::protocol_error(
-            "provider accepts no configuration options",
-        ));
-    }
-    Ok(())
-}
-#[cfg(unix)]
 fn run() -> umbra_core::Result<()> {
     umbra_platform::provider::serve_provider("macos", |options| {
-        no_options(options)?;
+        let options = if options.is_empty() {
+            umbra_platform_macos::Options::default()
+        } else {
+            serde_json::from_slice(options)
+                .map_err(|e| umbra_core::provider::protocol_error(e.to_string()))?
+        };
         Ok(umbra_platform::PlatformSession {
-            control: Box::new(umbra_platform_macos::MacosTraceBackend),
+            control: Box::new(umbra_platform_macos::MacosTraceBackend::new(options)),
             abi: Box::new(umbra_platform_macos::DarwinArm64Abi),
         })
     })

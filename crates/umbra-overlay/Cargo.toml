@@ -13,3 +13,8 @@ umbra-journal = { path = "../umbra-journal" }
 
 [dependencies.serde]
 workspace = true
+
+[dev-dependencies]
+umbra-storage-local = { path = "../umbra-storage-local" }
+tempfile.workspace = true
+uuid.workspace = true

@@ -7,6 +7,24 @@ use umbra_core::provider::{self as wire, protocol_error, Client, ProviderDescrip
 /// Owned requests for protocol version 1.
 #[derive(Serialize, Deserialize)]
 pub enum Request {
+    /// Read logical bytes without a native syscall buffer layout.
+    ReadAt {
+        /// Logical path beneath the tracee root anchor.
+        path: StoragePath,
+        /// Absolute byte offset.
+        offset: u64,
+        /// Bounded output size.
+        len: u32,
+    },
+    /// Enumerate a merged directory snapshot.
+    List {
+        /// Logical directory beneath the tracee root anchor.
+        path: StoragePath,
+        /// Session-bound continuation.
+        cursor: Option<umbra_core::ListCursor>,
+        /// Maximum number of entries.
+        limit: u32,
+    },
     /// Resolve.
     Resolve {
         /// Context associated with this value or operation.
@@ -49,6 +67,10 @@ pub enum Request {
 /// Method-tagged successful responses; errors travel in the transport envelope.
 #[derive(Serialize, Deserialize)]
 pub enum Response {
+    /// Read bytes.
+    ReadAt(Vec<u8>),
+    /// Merged directory page.
+    List(umbra_core::DirectoryPage),
     /// Resolve.
     Resolve(ResolvedAction),
     /// Prepare.
@@ -94,6 +116,37 @@ impl NamespaceResolver for Proxy {
     }
 }
 impl NamespaceSession for Proxy {
+    fn read_at(&mut self, path: &StoragePath, offset: u64, out: &mut [u8]) -> Result<usize> {
+        if out.len() > umbra_core::MAX_IO_BYTES || offset.checked_add(out.len() as u64).is_none() {
+            return Err(protocol_error("namespace read exceeds bounds"));
+        }
+        match self.call(&Request::ReadAt {
+            path: path.clone(),
+            offset,
+            len: out.len() as u32,
+        })? {
+            Response::ReadAt(bytes) if bytes.len() <= out.len() => {
+                out[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+            _ => Err(protocol_error("namespace.read_at response mismatch")),
+        }
+    }
+    fn list(
+        &mut self,
+        path: &StoragePath,
+        cursor: Option<&umbra_core::ListCursor>,
+        limit: u32,
+    ) -> Result<umbra_core::DirectoryPage> {
+        match self.call(&Request::List {
+            path: path.clone(),
+            cursor: cursor.cloned(),
+            limit,
+        })? {
+            Response::List(page) if page.entries.len() <= limit as usize => Ok(page),
+            _ => Err(protocol_error("namespace.list response mismatch")),
+        }
+    }
     fn prepare(
         &mut self,
         operation: OperationId,
@@ -151,6 +204,25 @@ pub fn serve_provider<B: NamespaceSession>(
         Ok((backend, capabilities))
     })?;
     wire::serve(connection, |request| match request {
+        Request::ReadAt { path, offset, len } => {
+            if len as usize > umbra_core::MAX_IO_BYTES || offset.checked_add(len as u64).is_none() {
+                return Err(protocol_error("namespace read exceeds bounds"));
+            }
+            let mut bytes = vec![0; len as usize];
+            let count = backend.read_at(&path, offset, &mut bytes)?;
+            if count > bytes.len() {
+                return Err(protocol_error("namespace read returned excessive bytes"));
+            }
+            bytes.truncate(count);
+            Ok(Response::ReadAt(bytes))
+        }
+        Request::List {
+            path,
+            cursor,
+            limit,
+        } => backend
+            .list(&path, cursor.as_ref(), limit)
+            .map(Response::List),
         Request::Resolve { context, operation } => {
             backend.resolve(&context, &operation).map(Response::Resolve)
         }

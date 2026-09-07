@@ -1,14 +1,11 @@
 //! Provider executable; constructs only this package's backend after the handshake.
 #![forbid(unsafe_code)]
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
 fn run() -> umbra_core::Result<()> {
     umbra_storage::provider::serve_provider("nfs", |options| {
-        let root: umbra_core::BytePath = umbra_core::provider::decode(options)?;
-        Ok(umbra_storage_nfs::NfsStorage::new(
-            umbra_storage_nfs::NfsStorageConfig::new(std::ffi::OsStr::from_bytes(root.as_bytes())),
-        ))
+        umbra_storage_nfs::NfsStorage::connect(umbra_storage_nfs::NfsStorageConfig::from_options(
+            options,
+        )?)
     })
 }
 #[cfg(not(unix))]

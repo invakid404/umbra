@@ -10,5 +10,9 @@ publish = false
 umbra-core = { path = "../umbra-core" }
 umbra-platform = { path = "../umbra-platform" }
 
+serde.workspace = true
+serde_json.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2.workspace = true
+libc = "0.2"

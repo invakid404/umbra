@@ -1,9 +1,8 @@
-//! Storage-independent overlay policy and fail-closed M0 namespace scaffolding.
+//! Storage-independent MVP overlay with explicit runtime and immutable-base injection.
 //!
 //! Reads prefer the shadow, respect whiteouts, then consult the immutable base.
 //! Writes require journaled materialisation into the selected shadow. Classification
-//! alone never authorizes a syscall: every execution path currently returns an
-//! not-implemented error until anchored resolution and transactions exist.
+//! alone never authorizes a syscall: mutation requires journaled preparation.
 //! No backend selection, host filesystem I/O, or physical mount identity lives here.
 
 #![forbid(unsafe_code)]
@@ -13,7 +12,7 @@ pub use umbra_core::{
     AbortReason, Checkpoint, CheckpointRequest, CommitReceipt, OperationId, OperationOutcome,
     PreparedAction,
 };
-use umbra_core::{BytePath, FsOp, MapFlags, ProcessContext, ResolvedAction, Result, UmbraError};
+use umbra_core::{BytePath, FsOp, MapFlags, ProcessContext, ResolvedAction, Result};
 pub use umbra_journal::Journal;
 pub use umbra_storage::{
     ApprovedBaseObject, RequestContext, Storage, StorageCapabilities, StoragePath,
@@ -30,6 +29,44 @@ pub trait NamespaceResolver {
 
 /// Transaction lifecycle; errors require retaining a stopped or recovery-required run.
 pub trait NamespaceSession: NamespaceResolver {
+    /// Inject native directory encoding and the current syscall's output-buffer binding.
+    /// The encoder owns ABI knowledge; the overlay owns merged names and continuation.
+    fn set_directory_encoder(&mut self, _encoder: Box<dyn DirectoryEncoder>) -> Result<()> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.directory_encoder",
+            "provider does not support directory encoding",
+        ))
+    }
+    /// Bind already-open, same-run storage/journal sessions and an approved immutable base.
+    fn bind(&mut self, _config: SessionConfig, _base: Box<dyn Base>) -> Result<()> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.bind",
+            "provider does not support runtime binding",
+        ))
+    }
+    /// Read logical bytes through the overlay without native ABI memory encoding.
+    fn read_at(&mut self, _path: &StoragePath, _offset: u64, _out: &mut [u8]) -> Result<usize> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.read_at",
+            "provider does not expose typed reads",
+        ))
+    }
+    /// Return a merged snapshot page; cursors are session-bound and repeatable.
+    fn list(
+        &mut self,
+        _path: &StoragePath,
+        _cursor: Option<&umbra_core::ListCursor>,
+        _limit: u32,
+    ) -> Result<umbra_core::DirectoryPage> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.list",
+            "provider does not expose typed directory pages",
+        ))
+    }
     /// Prepare journaled execution for the resolved operation.
     fn prepare(
         &mut self,
@@ -145,95 +182,8 @@ pub fn components(path: &BytePath) -> impl Iterator<Item = Component<'_>> {
         })
 }
 
-/// Standard engine, owning injected contracts rather than concrete backends.
-///
-/// M0 has no active namespace session. Construction performs no I/O, and all
-/// operational methods fail closed. Storage and Journal must eventually refer to
-/// the same run, with one fenced writer and ordered prepare/result/commit handling.
-pub struct Overlay {
-    storage: Box<dyn Storage>,
-    journal: Box<dyn Journal>,
-}
-
-impl Overlay {
-    /// Construct this value from the supplied configuration or fields.
-    pub fn new(storage: Box<dyn Storage>, journal: Box<dyn Journal>) -> Self {
-        Self { storage, journal }
-    }
-
-    /// Backend capabilities are information, not qualification of this overlay.
-    pub fn storage_capabilities(&self) -> StorageCapabilities {
-        self.storage.capabilities()
-    }
-
-    /// Return ownership without closing, flushing, or asserting a clean handoff.
-    pub fn into_backends(self) -> (Box<dyn Storage>, Box<dyn Journal>) {
-        (self.storage, self.journal)
-    }
-
-    /// Plan shadow/whiteout/base lookup without triggering materialisation.
-    /// Descriptor reads additionally require validated tracked object identity.
-    fn read_through(
-        &mut self,
-        _context: &ProcessContext,
-        _operation: &FsOp,
-    ) -> Result<ResolvedAction> {
-        Err(not_implemented("overlay.read_through"))
-    }
-
-    /// Plan copy-up/create/link/rename or validate a pathless shadow mutation.
-    /// Writable descriptors and shared writable mappings must already reference
-    /// shadow objects; copy-up alone cannot retarget an existing kernel handle.
-    fn materialise(
-        &mut self,
-        _context: &ProcessContext,
-        _operation: &FsOp,
-    ) -> Result<ResolvedAction> {
-        Err(not_implemented("overlay.materialise"))
-    }
-}
-
-impl NamespaceResolver for Overlay {
-    fn resolve(&mut self, context: &ProcessContext, operation: &FsOp) -> Result<ResolvedAction> {
-        match dispatch(operation) {
-            Dispatch::ReadThrough => self.read_through(context, operation),
-            Dispatch::Materialise => self.materialise(context, operation),
-            Dispatch::Whiteout => Err(not_implemented("overlay.whiteout")),
-            Dispatch::MergeDirectory => Err(not_implemented("overlay.merge_directory")),
-            Dispatch::ProcessState => Err(not_implemented("overlay.process_state")),
-        }
-    }
-}
-
-impl NamespaceSession for Overlay {
-    fn prepare(
-        &mut self,
-        _operation: OperationId,
-        _action: &ResolvedAction,
-    ) -> Result<PreparedAction> {
-        Err(not_implemented("overlay.prepare"))
-    }
-    fn observe_result(
-        &mut self,
-        _operation: OperationId,
-        _result: &OperationOutcome,
-    ) -> Result<()> {
-        Err(not_implemented("overlay.observe_result"))
-    }
-    fn commit(&mut self, _operation: OperationId) -> Result<CommitReceipt> {
-        Err(not_implemented("overlay.commit"))
-    }
-    fn abort(&mut self, _operation: OperationId, _reason: &AbortReason) -> Result<()> {
-        Err(not_implemented("overlay.abort"))
-    }
-    fn checkpoint(&mut self, _request: &CheckpointRequest) -> Result<Checkpoint> {
-        Err(not_implemented("overlay.checkpoint"))
-    }
-}
-
-fn not_implemented(operation: &'static str) -> UmbraError {
-    UmbraError::not_implemented(operation)
-}
+mod engine;
+pub use engine::{Base, DirectoryEncoder, EncodedDirectory, Overlay, SessionConfig, StorageBase};
 
 #[cfg(test)]
 mod tests {
