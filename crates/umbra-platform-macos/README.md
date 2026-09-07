@@ -2,8 +2,9 @@
 
 Darwin arm64 tracing backend. Direct Umbra dependencies are `umbra-core` and
 `umbra-platform`; `mach2` and `libc` are gated to `cfg(target_os = "macos")`.
-Non-macOS builds still compile (through `src/unsupported.rs`), but every
-runtime call structurally reports `UnsupportedCapability`.
+Non-arm64-macOS builds still compile (through `src/unsupported.rs`) — this
+covers non-macOS targets and macOS on x86_64 — but every runtime call
+structurally reports `UnsupportedCapability`.
 
 The crate implements the v2 experimental tracer described in
 `experiments/tracer/umbra_tracer.py` and `experiments/tracer/REPORT-v2.md`
@@ -70,8 +71,9 @@ decodes JSON `Options` from opaque provider options (empty falls back to
 
 `tests/fixtures.rs` drives Track D's C fixtures through the Rust tracer.
 It reads `UMBRA_TEST_FIXTURE_PATH` (path to `umbra-test-child`) and
-`UMBRA_TEST_REDIRECT_ROOT` (shadow root); the whole test binary is skipped
-when either env var is unset. Fixture cases:
+`UMBRA_TEST_REDIRECT_ROOT` (shadow root); when either env var is unset,
+each test body skips via `eprintln` — the binary still reports the two
+non-`#[ignore]`d cases as passed. Fixture cases:
 
 | Case | State |
 |---|---|

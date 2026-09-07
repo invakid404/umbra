@@ -40,10 +40,10 @@ the first run I/O.
   - `rename` — `renameat` with anchor descriptors; `RenameMode::NoReplace`
     routed to the underlying flag.
   - `unlink` / `RemoveDirectory` — `unlinkat` with `AT_REMOVEDIR` selection.
-  - `stat` — `fstatatx_np(AT_SYMLINK_NOFOLLOW)` on Darwin; does not follow
-    the final symlink.
+  - `stat` — `fstatat(AT_SYMLINK_NOFOLLOW)`; does not follow the final
+    symlink.
   - `list` — bounded pages through opaque cursor tokens keyed by run,
-    invalidated on `(nlink, mtime, ctime)` directory-stamp change.
+    invalidated on `(ino, mtime+nsec, ctime+nsec)` directory-stamp change.
   - `atomic_swap` — `renameatx_np(RENAME_SWAP)` is implemented, but
     `capabilities().atomic_swap` is currently `false` and
     `umbra_storage::validate_request` rejects `StorageOperation::AtomicSwap`
@@ -52,9 +52,9 @@ the first run I/O.
     for an unqualified export.* Native code is retained for future
     qualification.
 - **Writer authority**: `acquire_writer` / `renew_writer` / `release_writer`
-  use a 60-second lease with epoch fencing under
-  `.provider/lease/`. Duplicate `operation_id`s recover their prior result
-  from an on-disk retry journal (`.provider/retries`). `flush` returns
+  use a 60-second lease with epoch fencing via `.provider/writer.lock`
+  and `.provider/epoch`. Duplicate `operation_id`s recover their prior
+  result from an on-disk retry journal (`.provider/retries`). `flush` returns
   `Durability::Local`; the evidence string names the persistence boundary
   and explicitly declines to claim qualified remote NFS durability.
 - **Runtime config**: mount root, `run_parent`, `root_anchor`,
@@ -73,7 +73,7 @@ misconfigured export fails fast. Register it via `umbra providers
 
 ## Test coverage
 
-`tests/mounted.rs` (207 lines) exercises the full contract against a live
+`tests/mounted.rs` (396 lines) exercises the full contract against a live
 mount when `UMBRA_TEST_NFS_MOUNT` is set (skipped when unset). Cases:
 
 - `absent_mount_rejected_without_creating_it`
