@@ -12,11 +12,11 @@ Running list of setup steps, snags, and per-user configuration umbra needs on ma
 sudo /usr/sbin/DevToolsSecurity -enable
 ```
 
-**Why:** Umbra's supervisor calls `task_for_pid()` on child processes to obtain debug-level task control. On macOS, `task_for_pid` is gated by `system.privilege.taskport`, whose policy requires the caller to be in the `_developer` group; otherwise the call triggers a Security Server authentication prompt. That prompt is fine in a graphical session, but in a headless subshell (CI, agent-orchestrated sessions, non-tty invocations) it never renders and `task_for_pid` blocks forever.
+**Why:** adds the current user to `_developer`. On macOS 26.5.1 this is **sufficient** — kernel `taskgated` then grants `task_for_pid` to LLDB / `debugserver` (which carries Apple's `com.apple.private.cs.debugger` entitlement) non-interactively for callers in `_developer`. No prompt, no auth db modification, no signed umbra binary needed for the tracer to attach.
 
-**Effect:** adds the current user to `_developer`. Same setting Xcode's first-launch dance applies. One-time; persistent across reboots.
+**Common misdiagnosis:** the user-space `security authorize -e system.privilege.taskport` CLI still returns `NO (-60007)` after `DevToolsSecurity -enable`. That's a *separate* code path (`AuthorizationServices`) that debuggers do not use. Do not use this CLI as a health check for umbra's tracer — it will always fail and it doesn't matter.
 
-**Discovered during:** M0 Gate 2 (Track A tracer). Full analysis in `docs/m0/gate-2.md`.
+**Discovered during:** M0 Gate 2 verification. Full analysis in [`docs/m0/gate-2.md`](m0/gate-2.md).
 
 ### 2. Command Line Tools
 
