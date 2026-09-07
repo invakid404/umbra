@@ -1,0 +1,15 @@
+COMMAND: /usr/bin/lldb --no-lldbinit --batch -o 'settings set target.disable-aslr false' -o 'b main' -o run -o 'process status' -o 'script import sys; sys.path.insert(0, '"'"'/Users/inva/umbra-scratch/seatbelt'"'"'); import lldb_composition; lldb_composition.verify_stop(lldb.debugger, 4294969696)' -o 'process kill' -- /usr/bin/sandbox-exec -f /Users/inva/umbra-scratch/seatbelt/umbra.sb /tmp/umbra-m0/twins/ls-c-test -d /Users/inva/umbra-scratch/seatbelt
+(lldb) target create "/usr/bin/sandbox-exec"
+Current executable set to '/usr/bin/sandbox-exec' (arm64e).
+(lldb) settings set -- target.run-args  "-f" "/Users/inva/umbra-scratch/seatbelt/umbra.sb" "/tmp/umbra-m0/twins/ls-c-test" "-d" "/Users/inva/umbra-scratch/seatbelt"
+(lldb) settings set target.disable-aslr false
+(lldb) b main
+Breakpoint 1: no locations (pending).
+WARNING:  Unable to resolve breakpoint to any actual locations.
+(lldb) run
+error: process exited with status -1 (attach failed (Not allowed to attach to process.  Look in the console messages (Console.app), near the debugserver entries, when the attach failed.  The subsystem that denied the attach permission will likely have logged an informative message about why it was denied.))
+
+HARNESS exit=1 timeout=False
+HARNESS process=89134 executable=/usr/bin/lldb
+HARNESS process=89144 executable=/usr/bin/sandbox-exec
+HARNESS process=89145 executable=/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Resources/debugserver

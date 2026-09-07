@@ -1,0 +1,9 @@
+(lldb) target create "/tmp/umbra-m0/twins/ls-c-test"
+Current executable set to '/tmp/umbra-m0/twins/ls-c-test' (arm64e).
+(lldb) settings set target.disable-aslr false
+(lldb) b main
+Breakpoint 1: no locations (pending).
+WARNING:  Unable to resolve breakpoint to any actual locations.
+(lldb) run
+
+TIMEOUT

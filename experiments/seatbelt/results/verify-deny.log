@@ -1,0 +1,3 @@
+PASS sandbox starts and reads /bin/ls
+PASS /tmp write denied: touch: /tmp/umbra-should-be-denied: Operation not permitted
+SKIP NFS write allowed: skipped, mount not up (/mnt/umbra-nfs absent)

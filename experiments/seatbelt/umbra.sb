@@ -1,0 +1,37 @@
+;; M0 only: read the host, mutate only the physical shadow namespace.
+(version 1)
+(deny default)
+
+;; No read exclusions. Includes executable mappings and metadata reads.
+(allow file-read*)
+(allow file-write* (subpath "/mnt/umbra-nfs"))
+;; Required by LLDB's target.disable-stdio launch path (measured EPERM without
+;; it). This character-device sink persists no filesystem data. No create,
+;; unlink, metadata mutation, or other device writes are permitted here.
+(allow file-write-data (literal "/dev/null"))
+
+(allow process-fork)
+(allow process-exec)
+(allow signal (target self) (target children))
+(allow sysctl-read)
+;; LLDB launches debugserver and the twin as siblings. The measured denial is
+;; "mach-priv-task-port same-sandbox"; children-only would miss this relation.
+;; This allows debugger task-port requests within this sandbox, not host tasks.
+;; AMFI/get-task-allow checks still apply independently.
+(allow mach-priv-task-port (target same-sandbox))
+
+;; M0 agents need network access (APIs, package downloads, debugger loopback).
+;; This is a filesystem guard, not a network/exfiltration boundary.
+(allow network*)
+;; Basic system services; add measured debugger dependencies separately.
+(allow mach-lookup
+    (global-name "com.apple.system.logger")
+    (global-name "com.apple.system.notification_center")
+    (global-name "com.apple.bsd.dirhelper")
+    (global-name "com.apple.lsd.mapdb")
+    (global-name "com.apple.SecurityServer")
+    (global-name "com.apple.trustd.agent")
+    (global-name "com.apple.mDNSResponder"))
+
+;; No /tmp, /private/var/folders, or other persistent write carve-outs.
+;; The trusted supervisor must arrange inherited stdio and NFS runtime dirs.

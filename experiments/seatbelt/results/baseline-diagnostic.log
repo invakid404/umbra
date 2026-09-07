@@ -1,0 +1,13 @@
+COMMAND: /usr/bin/lldb -o 'log enable -f /Users/inva/umbra-scratch/seatbelt/results/gdb-packets.log gdb-remote packets' --no-lldbinit --batch -o 'settings set target.disable-aslr false' -o 'settings set target.disable-stdio true' -o 'settings set target.process.stop-on-exec false' -o 'breakpoint set -s ls-c-test -a 0x100000960' -o 'process launch -X false' -o 'process status' -o 'script import sys; sys.path.insert(0, '"'"'/Users/inva/umbra-scratch/seatbelt'"'"'); import lldb_composition; lldb_composition.verify_stop(lldb.debugger, 4294969696)' -o 'process kill' -- /tmp/umbra-m0/twins/ls-c-test -d /Users/inva/umbra-scratch/seatbelt
+(lldb) target create "/tmp/umbra-m0/twins/ls-c-test"
+Current executable set to '/tmp/umbra-m0/twins/ls-c-test' (arm64e).
+(lldb) settings set -- target.run-args  "-d" "/Users/inva/umbra-scratch/seatbelt"
+(lldb) log enable -f /Users/inva/umbra-scratch/seatbelt/results/gdb-packets.log gdb-remote packets
+(lldb) settings set target.disable-aslr false
+(lldb) settings set target.disable-stdio true
+(lldb) settings set target.process.stop-on-exec false
+(lldb) breakpoint set -s ls-c-test -a 0x100000960
+Breakpoint 1: where = ls-c-test`___lldb_unnamed_symbol_100000960, address = 0x0000000100000960
+(lldb) process launch -X false
+
+HARNESS exit=-9 timeout=True

@@ -1,0 +1,23 @@
+ <   1> send packet: +
+ history[1] tid=0x0103 <   1> send packet: +
+ <  19> send packet: $QStartNoAckMode#b0
+ <   1> read packet: +
+ <   6> read packet: $OK#9a
+ <   1> send packet: +
+ < 104> send packet: $qSupported:xmlRegisters=i386,arm,mips,arc;multiprocess+;fork-events+;vfork-events+;swbreak+;hwbreak+#cd
+ < 129> read packet: $qXfer:features:read+;PacketSize=20000;qEcho+;native-signals+;SupportedWatchpointTypes=aarch64-mask,aarch64-bas;MultiMemRead+;#00
+ <  26> send packet: $QThreadSuffixSupported#e4
+ <   6> read packet: $OK#00
+ <  27> send packet: $QListThreadsInStopReply#21
+ <   6> read packet: $OK#00
+ <  13> send packet: $qHostInfo#9b
+ < 204> read packet: $cputype:16777228;cpusubtype:2;addressing_bits:47;ostype:macosx;watchpoint_exceptions_received:before;vendor:apple;os_version:26.5.1;maccatalyst_version:26.5;endian:little;ptrsize:8;vm-page-size:16384;#00
+ <  10> send packet: $vCont?#49
+ <  17> read packet: $vCont;c;C;s;S#00
+ <  27> send packet: $qVAttachOrWaitSupported#38
+ <   6> read packet: $OK#00
+ <  23> send packet: $QEnableErrorStrings#8c
+ <   6> read packet: $OK#00
+ <  23> send packet: $QSetDetachOnError:1#f8
+ <   6> read packet: $OK#00
+<lldb.process.gdb-remote.async>  <  17> send packet: $vAttach;145f9#3f

@@ -1,0 +1,22 @@
+Timestamp               Ty Process[PID:TID]
+2026-09-07 15:19:37.904 E  kernel[0:2177ac8] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) file-write-data /dev/dtracehelper
+2026-09-07 15:19:37.906 E  kernel[0:217778c] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-09-07 15:19:37.907 E  kernel[0:217778c] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) mach-lookup com.apple.logd
+2026-09-07 15:19:37.907 E  kernel[0:2177ac8] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) ipc-posix-shm-read-data apple.shm.notification_center
+2026-09-07 15:19:37.920 E  kernel[0:2177ac9] [com.apple.sandbox.reporting:violation] 1 duplicate report for Sandbox: lldb(84813) deny(1) ipc-posix-shm-read-data apple.shm.notification_center
+2026-09-07 15:19:37.920 E  kernel[0:2177ac9] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) file-write-data /dev/dtracehelper
+2026-09-07 15:19:37.925 E  kernel[0:217778c] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) mach-lookup com.apple.logd
+2026-09-07 15:19:37.925 E  kernel[0:2177ac9] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) ipc-posix-shm-read-data apple.shm.notification_center
+2026-09-07 15:19:37.925 E  kernel[0:217778c] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) mach-lookup com.apple.analyticsd
+2026-09-07 15:19:37.928 E  kernel[0:2177ac9] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) ipc-posix-shm-read-data apple.shm.notification_center
+2026-09-07 15:19:37.952 E  kernel[0:21773cb] [com.apple.sandbox.reporting:violation] 1 duplicate report for Sandbox: lldb(84813) deny(1) ipc-posix-shm-read-data apple.shm.notification_center
+2026-09-07 15:19:37.952 E  kernel[0:21773cb] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-09-07 15:19:37.957 E  kernel[0:2177ac9] [com.apple.sandbox.reporting:violation] 5 duplicate reports for Sandbox: lldb(84813) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-09-07 15:19:37.957 E  kernel[0:2177ac9] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) ipc-posix-shm-read-data apple.shm.notification_center
+2026-09-07 15:19:37.957 E  kernel[0:21773cb] [com.apple.sandbox.reporting:violation] 3 duplicate reports for Sandbox: lldb(84813) deny(1) ipc-posix-shm-read-data apple.shm.notification_center
+2026-09-07 15:19:37.957 E  kernel[0:21773cb] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) mach-lookup com.apple.system.opendirectoryd.libinfo
+2026-09-07 15:19:37.959 E  kernel[0:21773cb] [com.apple.sandbox.reporting:violation] 2 duplicate reports for Sandbox: lldb(84813) deny(1) mach-lookup com.apple.system.opendirectoryd.libinfo
+2026-09-07 15:19:37.959 E  kernel[0:21773cb] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) mach-lookup com.apple.distributed_notifications@Uv3
+2026-09-07 15:19:37.959 E  kernel[0:217778c] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) mach-lookup com.apple.metadata.mds
+2026-09-07 15:19:37.960 E  kernel[0:2177ace] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) ipc-posix-shm-read-data apple.shm.notification_center
+2026-09-07 15:19:38.027 E  kernel[0:2177ac9] [com.apple.sandbox.reporting:violation] Sandbox: lldb(84813) deny(1) file-write-data /dev/null

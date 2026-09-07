@@ -1,0 +1,13 @@
+COMMAND: /usr/bin/sandbox-exec -f /Users/inva/umbra-scratch/seatbelt/umbra.sb /usr/bin/lldb --no-lldbinit --batch -o 'settings set target.disable-aslr false' -o 'b main' -o run -o 'process status' -o 'script import sys; sys.path.insert(0, '"'"'/Users/inva/umbra-scratch/seatbelt'"'"'); import lldb_composition; lldb_composition.verify_stop(lldb.debugger, 4294969696)' -o 'process kill' -- /tmp/umbra-m0/twins/ls-c-test -d /Users/inva/umbra-scratch/seatbelt
+(lldb) target create "/tmp/umbra-m0/twins/ls-c-test"
+Current executable set to '/tmp/umbra-m0/twins/ls-c-test' (arm64e).
+(lldb) settings set -- target.run-args  "-d" "/Users/inva/umbra-scratch/seatbelt"
+(lldb) settings set target.disable-aslr false
+(lldb) b main
+Breakpoint 1: no locations (pending).
+WARNING:  Unable to resolve breakpoint to any actual locations.
+(lldb) run
+error: shell expansion failed (reason: Operation not permitted). consider launching with 'process launch'.
+
+HARNESS exit=1 timeout=False
+HARNESS process=89307 executable=/usr/bin/sandbox-exec

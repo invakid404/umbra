@@ -1,0 +1,5 @@
+FAIL baseline-entry
+FAIL lldb-outside-literal
+FAIL sandbox-outside-literal
+FAIL lldb-outside-resigned-launcher
+FAIL sandbox-outside-entry

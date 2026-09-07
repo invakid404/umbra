@@ -1,0 +1,16 @@
+COMMAND: /usr/bin/lldb --no-lldbinit --batch -o 'settings set target.disable-aslr false' -o 'settings set target.disable-stdio true' -o 'settings set target.process.stop-on-exec false' -o 'breakpoint set -s ls-c-test -a 0x100000960' -o 'process launch -X false' -o 'process status' -o 'script import sys; sys.path.insert(0, '"'"'/Users/inva/umbra-scratch/seatbelt'"'"'); import lldb_composition; lldb_composition.verify_stop(lldb.debugger, 4294969696)' -o 'process kill' -- /tmp/umbra-m0/twins/sandbox-exec-c-test -f /Users/inva/umbra-scratch/seatbelt/umbra.sb /tmp/umbra-m0/twins/ls-c-test -d /Users/inva/umbra-scratch/seatbelt
+(lldb) target create "/tmp/umbra-m0/twins/sandbox-exec-c-test"
+Current executable set to '/tmp/umbra-m0/twins/sandbox-exec-c-test' (arm64e).
+(lldb) settings set -- target.run-args  "-f" "/Users/inva/umbra-scratch/seatbelt/umbra.sb" "/tmp/umbra-m0/twins/ls-c-test" "-d" "/Users/inva/umbra-scratch/seatbelt"
+(lldb) settings set target.disable-aslr false
+(lldb) settings set target.disable-stdio true
+(lldb) settings set target.process.stop-on-exec false
+(lldb) breakpoint set -s ls-c-test -a 0x100000960
+Breakpoint 1: no locations (pending).
+WARNING:  Unable to resolve breakpoint to any actual locations.
+(lldb) process launch -X false
+
+HARNESS exit=-9 timeout=True
+HARNESS process=89317 executable=/usr/bin/lldb
+HARNESS process=89322 executable=/tmp/umbra-m0/twins/sandbox-exec-c-test
+HARNESS process=89323 executable=/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Resources/debugserver

@@ -1,0 +1,45 @@
+ProductName:		macOS
+ProductVersion:		26.5.1
+BuildVersion:		25F80
+arm64
+System Integrity Protection status: enabled.
+lldb-2100.0.17.108
+Apple Swift version 6.3.2 (swiftlang-6.3.2.1.108 clang-2100.1.1.101)
+/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)
+devfs on /dev (devfs, local, nobrowse)
+/dev/disk3s6 on /System/Volumes/VM (apfs, local, noexec, journaled, noatime, nobrowse)
+/dev/disk3s2 on /System/Volumes/Preboot (apfs, local, journaled, nobrowse)
+/dev/disk3s4 on /System/Volumes/Update (apfs, local, journaled, nobrowse)
+/dev/disk1s2 on /System/Volumes/xarts (apfs, local, noexec, journaled, noatime, nobrowse)
+/dev/disk1s1 on /System/Volumes/iSCPreboot (apfs, local, journaled, nobrowse)
+/dev/disk1s3 on /System/Volumes/Hardware (apfs, local, journaled, nobrowse)
+/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse, protect, root data)
+map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
+/dev/disk2s1 on /System/Volumes/Update/SFR/mnt1 (apfs, local, journaled, nobrowse)
+/dev/disk3s1 on /System/Volumes/Update/mnt1 (apfs, sealed, local, journaled, nobrowse)
+OrbStack:/OrbStack on /Users/inva/OrbStack (nfs, nodev, nosuid, noatime, mounted by inva)
+127.0.0.1:/umbra on /Users/inva/umbra-scratch/nfs/mnt/umbra-nfs (nfs, nodev, nosuid, noatime, nobrowse, mounted by inva)
+/tmp/umbra-m0/twins/ls-c-test: replacing existing signature
+Executable=/private/tmp/umbra-m0/twins/ls-c-test
+Identifier=com.apple.ls
+Format=Mach-O universal (x86_64 arm64e)
+CodeDirectory v=20400 size=485 flags=0x2(adhoc) hashes=5+7 location=embedded
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+warning: Specifying ':' in the path is deprecated and will not work in a future release
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/><key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/><key>com.apple.security.get-task-allow</key><true/></dict></plist>
+/tmp/umbra-m0/twins/sandbox-exec-c-test: replacing existing signature
+Executable=/private/tmp/umbra-m0/twins/sandbox-exec-c-test
+Identifier=com.apple.sandbox-exec
+Format=Mach-O universal (x86_64 arm64e)
+CodeDirectory v=20400 size=431 flags=0x2(adhoc) hashes=3+7 location=embedded
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+warning: Specifying ':' in the path is deprecated and will not work in a future release
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/><key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/><key>com.apple.security.get-task-allow</key><true/></dict></plist>

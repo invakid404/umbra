@@ -1,0 +1,126 @@
+debugserver-@(#)PROGRAM:LLDB  PROJECT:lldb-2100.0.17.108
+ for arm64.
+
+1 +0.000000 sec [145fa/0103]:      548 RNBRemote::StartReadRemoteDataThread called
+2 +0.000016 sec [145fa/0d0f]: RNBRemote::ThreadFunctionReadRemoteData (0x101415d78): thread starting...
+Got a connection, waiting for process information for launching or attaching.
+
+4 +0.000005 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) ...
+3 +0.000025 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 20 err = 0x00000000
+5 +0.000013 sec [145fa/0d0f]: read: +$QStartNoAckMode#b0
+6 +0.000005 sec [145fa/0d0f]: getpkt: $QStartNoAckMode#b0
+7 +0.000009 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) => 0x00000020
+8 +0.000009 sec [145fa/0103]: ::write ( socket = 8, buffer = 0x100b56a6c, length = 1) => 1 err = 0x00000000
+9 +0.000004 sec [145fa/0103]: putpkt: +
+10 +0.000003 sec [145fa/0103]: sent: +
+11 +0.000004 sec [145fa/0103]: HandleReceivedPacket ("QStartNoAckMode");
+12 +0.000008 sec [145fa/0103]:      103 RNBRemote::SendPacket (OK) called
+13 +0.000005 sec [145fa/0103]: ::write ( socket = 8, buffer = 0x16f331760, length = 6) => 6 err = 0x00000000
+14 +0.000004 sec [145fa/0103]: putpkt: $OK#9a
+15 +0.000003 sec [145fa/0103]: sent: $OK#9a
+16 +0.000014 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 1 err = 0x00000000
+17 +0.000007 sec [145fa/0d0f]: read: +
+18 +0.000003 sec [145fa/0d0f]: getpkt: +
+19 +0.000004 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 104 err = 0x00000000
+20 +0.000004 sec [145fa/0d0f]: read: $qSupported:xmlRegisters=i386,arm,mips,arc;multiprocess+;fork-events+;vfork-events+;swbreak+;hwbreak+#cd
+22 +0.000003 sec [145fa/0d0f]: getpkt: $qSupported:xmlRegisters=i386,arm,mips,arc;multiprocess+;fork-events+;vfork-events+;swbreak+;hwbreak+#cd
+21 +0.000001 sec [145fa/0103]:       44 RNBRemote::SendPacket ($OK#9a) got reply: '+'
+23 +0.000009 sec [145fa/0103]: #### RNBRunLoopGetStartModeFromRemote
+24 +0.000003 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) ...
+25 +0.000003 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) => 0x00000020
+26 +0.000004 sec [145fa/0103]: HandleReceivedPacket ("qSupported:xmlRegisters=i386,arm,mips,arc;multiprocess+;fork-events+;vfork-events+;swbreak+;hwbreak+");
+27 +0.000020 sec [145fa/0103]:       42 RNBRemote::SendPacket (qXfer:features:read+;PacketSize=20000;qEcho+;native-signals+;SupportedWatchpointTypes=aarch64-mask,aarch64-bas;MultiMemRead+;) called
+28 +0.000006 sec [145fa/0103]: ::write ( socket = 8, buffer = 0x1014190d0, length = 129) => 129 err = 0x00000000
+29 +0.000002 sec [145fa/0103]: putpkt: $qXfer:features:read+;PacketSize=20000;qEcho+;native-signals+;SupportedWatchpointTypes=aarch64-mask,aarch64-bas;MultiMemRead+;#00
+30 +0.000003 sec [145fa/0103]: sent: $qXfer:features:read+;PacketSize=20000;qEcho+;native-signals+;SupportedWatchpointTypes=aarch64-mask,aarch64-bas;MultiMemRead+;#00
+31 +0.000004 sec [145fa/0103]: #### RNBRunLoopGetStartModeFromRemote
+32 +0.000004 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) ...
+33 +0.000013 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 26 err = 0x00000000
+34 +0.000005 sec [145fa/0d0f]: read: $QThreadSuffixSupported#e4
+35 +0.000003 sec [145fa/0d0f]: getpkt: $QThreadSuffixSupported#e4
+36 +0.000005 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) => 0x00000020
+37 +0.000004 sec [145fa/0103]: HandleReceivedPacket ("QThreadSuffixSupported");
+38 +0.000003 sec [145fa/0103]:       53 RNBRemote::SendPacket (OK) called
+39 +0.000005 sec [145fa/0103]: ::write ( socket = 8, buffer = 0x16f331760, length = 6) => 6 err = 0x00000000
+40 +0.000003 sec [145fa/0103]: putpkt: $OK#00
+41 +0.000003 sec [145fa/0103]: sent: $OK#00
+42 +0.000003 sec [145fa/0103]: #### RNBRunLoopGetStartModeFromRemote
+43 +0.000004 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) ...
+44 +0.000005 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 27 err = 0x00000000
+45 +0.000014 sec [145fa/0d0f]: read: $QListThreadsInStopReply#21
+46 +0.000003 sec [145fa/0d0f]: getpkt: $QListThreadsInStopReply#21
+47 +0.000005 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) => 0x00000020
+48 +0.000003 sec [145fa/0103]: HandleReceivedPacket ("QListThreadsInStopReply");
+49 +0.000003 sec [145fa/0103]:       51 RNBRemote::SendPacket (OK) called
+50 +0.000003 sec [145fa/0103]: ::write ( socket = 8, buffer = 0x16f331760, length = 6) => 6 err = 0x00000000
+51 +0.000002 sec [145fa/0103]: putpkt: $OK#00
+52 +0.000002 sec [145fa/0103]: sent: $OK#00
+53 +0.000002 sec [145fa/0103]: #### RNBRunLoopGetStartModeFromRemote
+54 +0.000002 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) ...
+55 +0.000012 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 13 err = 0x00000000
+56 +0.000003 sec [145fa/0d0f]: read: $qHostInfo#9b
+57 +0.000002 sec [145fa/0d0f]: getpkt: $qHostInfo#9b
+58 +0.000004 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) => 0x00000020
+59 +0.000003 sec [145fa/0103]: HandleReceivedPacket ("qHostInfo");
+60 +0.001927 sec [145fa/0103]:     1961 RNBRemote::SendPacket (cputype:16777228;cpusubtype:2;addressing_bits:47;ostype:macosx;watchpoint_exceptions_received:before;vendor:apple;os_version:26.5.1;maccatalyst_version:26.5;endian:little;ptrsize:8;vm-page-size:16384;) called
+61 +0.000011 sec [145fa/0103]: ::write ( socket = 8, buffer = 0x10141e2f0, length = 204) => 204 err = 0x00000000
+62 +0.000004 sec [145fa/0103]: putpkt: $cputype:16777228;cpusubtype:2;addressing_bits:47;ostype:macosx;watchpoint_exceptions_received:before;vendor:apple;os_version:26.5.1;maccatalyst_version:26.5;endian:little;ptrsize:8;vm-page-size:16384;#00
+63 +0.000003 sec [145fa/0103]: sent: $cputype:16777228;cpusubtype:2;addressing_bits:47;ostype:macosx;watchpoint_exceptions_received:before;vendor:apple;os_version:26.5.1;maccatalyst_version:26.5;endian:little;ptrsize:8;vm-page-size:16384;#00
+64 +0.000003 sec [145fa/0103]: #### RNBRunLoopGetStartModeFromRemote
+65 +0.000002 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) ...
+66 +0.000009 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 10 err = 0x00000000
+67 +0.000004 sec [145fa/0d0f]: read: $vCont?#49
+68 +0.000003 sec [145fa/0d0f]: getpkt: $vCont?#49
+69 +0.000006 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) => 0x00000020
+70 +0.000004 sec [145fa/0103]: HandleReceivedPacket ("vCont?");
+71 +0.000003 sec [145fa/0103]:       53 RNBRemote::SendPacket (vCont;c;C;s;S) called
+72 +0.000005 sec [145fa/0103]: ::write ( socket = 8, buffer = 0x16f3311b0, length = 17) => 17 err = 0x00000000
+73 +0.000002 sec [145fa/0103]: putpkt: $vCont;c;C;s;S#00
+74 +0.000003 sec [145fa/0103]: sent: $vCont;c;C;s;S#00
+75 +0.000002 sec [145fa/0103]: #### RNBRunLoopGetStartModeFromRemote
+76 +0.000003 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) ...
+77 +0.000009 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 27 err = 0x00000000
+78 +0.000003 sec [145fa/0d0f]: read: $qVAttachOrWaitSupported#38
+79 +0.000003 sec [145fa/0d0f]: getpkt: $qVAttachOrWaitSupported#38
+80 +0.000003 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) => 0x00000020
+81 +0.000005 sec [145fa/0103]: HandleReceivedPacket ("qVAttachOrWaitSupported");
+82 +0.000003 sec [145fa/0103]:       41 RNBRemote::SendPacket (OK) called
+83 +0.000004 sec [145fa/0103]: ::write ( socket = 8, buffer = 0x16f331760, length = 6) => 6 err = 0x00000000
+84 +0.000002 sec [145fa/0103]: putpkt: $OK#00
+85 +0.000001 sec [145fa/0103]: sent: $OK#00
+86 +0.000002 sec [145fa/0103]: #### RNBRunLoopGetStartModeFromRemote
+87 +0.000002 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) ...
+88 +0.000004 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 23 err = 0x00000000
+89 +0.000009 sec [145fa/0d0f]: read: $QEnableErrorStrings#8c
+90 +0.000002 sec [145fa/0d0f]: getpkt: $QEnableErrorStrings#8c
+91 +0.000005 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) => 0x00000020
+92 +0.000003 sec [145fa/0103]: HandleReceivedPacket ("QEnableErrorStrings");
+93 +0.000002 sec [145fa/0103]:       36 RNBRemote::SendPacket (OK) called
+94 +0.000004 sec [145fa/0103]: ::write ( socket = 8, buffer = 0x16f331760, length = 6) => 6 err = 0x00000000
+95 +0.000002 sec [145fa/0103]: putpkt: $OK#00
+96 +0.000002 sec [145fa/0103]: sent: $OK#00
+97 +0.000003 sec [145fa/0103]: #### RNBRunLoopGetStartModeFromRemote
+98 +0.000002 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) ...
+99 +0.000018 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 23 err = 0x00000000
+100 +0.000003 sec [145fa/0d0f]: read: $QSetDetachOnError:1#f8
+101 +0.000002 sec [145fa/0d0f]: getpkt: $QSetDetachOnError:1#f8
+102 +0.000004 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) => 0x00000020
+103 +0.000003 sec [145fa/0103]: HandleReceivedPacket ("QSetDetachOnError:1");
+104 +0.000002 sec [145fa/0103]:       45 RNBRemote::SendPacket (OK) called
+105 +0.000003 sec [145fa/0103]: ::write ( socket = 8, buffer = 0x16f331760, length = 6) => 6 err = 0x00000000
+106 +0.000002 sec [145fa/0103]: putpkt: $OK#00
+107 +0.000002 sec [145fa/0103]: sent: $OK#00
+108 +0.000002 sec [145fa/0103]: #### RNBRunLoopGetStartModeFromRemote
+109 +0.000002 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) ...
+110 +0.000017 sec [145fa/0d0f]: ::read ( 8, 0x16f3bab10, 1024 ) => 17 err = 0x00000000
+111 +0.000006 sec [145fa/0d0f]: read: $vAttach;145f9#3f
+112 +0.000003 sec [145fa/0d0f]: getpkt: $vAttach;145f9#3f
+113 +0.000006 sec [145fa/0103]: RNBRunLoopGetStartModeFromRemote ctx.Events().WaitForSetEvents( 0x000000a0 ) => 0x00000020
+114 +0.000003 sec [145fa/0103]: HandleReceivedPacket ("vAttach;145f9");
+[LaunchAttach] START 83450 vAttach to pid 83449
+115 +0.000134 sec [145fa/0103]: MachProcess::MachProcess()
+116 +0.000003 sec [145fa/0103]: (DebugNub) attaching to pid 83449...
+117 +0.000003 sec [145fa/0103]: MachProcess::SetState(Unloaded) ignoring redundant state change...
+118 +0.000002 sec [145fa/0103]: MachProcess::SetState(Attaching) upating state (previous state was Unloaded), event_mask = 0x00000001
+119 +0.000002 sec [145fa/0103]: MachTask::StartExceptionThread ( )
+[LaunchAttach] (83450) about to task_for_pid(83449)
