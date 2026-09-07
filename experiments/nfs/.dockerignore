@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!ganesha.conf
+!container-entrypoint.sh
+!rpc-check.py

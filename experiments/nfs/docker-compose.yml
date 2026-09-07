@@ -1,0 +1,27 @@
+name: umbra-nfs
+services:
+  nfs:
+    build: .
+    image: umbra-nfs-ganesha:local
+    hostname: umbra-nfs
+    restart: unless-stopped
+    cap_add:
+      - DAC_READ_SEARCH
+    ports:
+      - "127.0.0.1:2049:2049/tcp"
+    environment:
+      UMBRA_UID: "${UMBRA_UID:-501}"
+      UMBRA_GID: "${UMBRA_GID:-20}"
+    volumes:
+      - export-data:/export/umbra
+      - recovery-data:/var/lib/nfs/ganesha
+    healthcheck:
+      test: ["CMD", "python3", "/usr/local/bin/rpc-check.py", "127.0.0.1"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+      start_period: 5s
+    stop_grace_period: 30s
+volumes:
+  export-data:
+  recovery-data:
