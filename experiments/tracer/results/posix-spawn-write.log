@@ -1,0 +1,16 @@
+COMMAND: ['/Library/Developer/CommandLineTools/usr/bin/python3', '/Users/inva/umbra-scratch/tracer/umbra_tracer.py', '--timeout', '10.0', '--redirect-root', '/tmp/umbra-nfs-stub', '/Users/inva/umbra-scratch/fixtures/umbra-test-child', 'posix-spawn-write', '/tmp/umbra-gate2-ffpeb0kb/posix-spawn-write']
+BASELINE: PASS
+TWIN[hit]: /Users/inva/umbra-scratch/fixtures/umbra-test-child -> /Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1/umbra-test-child
+BREAKPOINT: __open svc file-address=0x1804ae690 path=x0
+BREAKPOINT: __open_nocancel svc file-address=0x1804ae944 path=x0
+BREAKPOINT: __openat svc file-address=0x1804af5ac path=x1
+BREAKPOINT: __openat_nocancel svc file-address=0x1804b3950 path=x1
+BREAKPOINT: __execve svc file-address=0x1804badcc path=x0
+BREAKPOINT: __posix_spawn svc file-address=0x1804b50d8 path=x1
+BREAKPOINT: __fork svc file-address=0x1804b58fc path=None
+RAW-SCAN: main executable svc sites=1
+LAUNCH: /Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1/umbra-test-child
+TIMEOUT: 10.0s: /Library/Developer/CommandLineTools/usr/bin/python3
+CLEANUP: killed owned pid=93656
+CLEANUP: killed owned pid=93655
+CLEANUP: killed owned pid=93650

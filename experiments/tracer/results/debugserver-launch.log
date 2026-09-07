@@ -1,0 +1,22 @@
+debugserver-@(#)PROGRAM:LLDB  PROJECT:lldb-2100.0.17.108
+ for arm64.
+
+1 +0.000000 sec [13dca/0103]: RNBRunLoopLaunchInferior Launching '/Users/inva/Library/Caches/umbra/twins/3a25b72820c7e4e65f92f4e632a49d3519240dce612ea2c24d220fe870ec5a6f/hello_writer'...
+2 +0.000040 sec [13dca/0103]: DNBProcessLaunch ( path='/Users/inva/Library/Caches/umbra/twins/3a25b72820c7e4e65f92f4e632a49d3519240dce612ea2c24d220fe870ec5a6f/hello_writer', argv = 0x71d003420, envp = 0x10594d0d0, working_dir=(null), stdin=(null), stdout=(null), stderr=(null), no-stdio=0, launch_flavor = 1, disable_aslr = 0, err = 0x16aef9208, err_len = 1024) called...
+3 +0.000104 sec [13dca/0103]: MachProcess::MachProcess()
+4 +0.000012 sec [13dca/0103]: MachProcess::SetState(Unloaded) ignoring redundant state change...
+5 +0.000005 sec [13dca/0103]: LaunchForDebug( path = '/Users/inva/Library/Caches/umbra/twins/3a25b72820c7e4e65f92f4e632a49d3519240dce612ea2c24d220fe870ec5a6f/hello_writer', argv = 0x71d003420, envp = 0x10594d0d0, launch_flavor = 1, disable_aslr = 0 )
+6 +0.000003 sec [13dca/0103]: MachProcess::SetState(Launching) upating state (previous state was Unloaded), event_mask = 0x00000001
+7 +0.000003 sec [13dca/0103]: PosixSpawnChildForPTraceDebugging ( path='/Users/inva/Library/Caches/umbra/twins/3a25b72820c7e4e65f92f4e632a49d3519240dce612ea2c24d220fe870ec5a6f/hello_writer', argv=0x71d003420, envp=0x10594d0d0, working_dir=(null), stdin=(null), stdout=(null) stderr=(null), no-stdio=0)
+8 +0.000003 sec [13dca/0103]: ::posix_spawnattr_init ( &attr ) err = 0x00000000
+9 +0.000002 sec [13dca/0103]: ::posix_spawnattr_setflags ( &attr, POSIX_SPAWN_START_SUSPENDED ) err = 0x00000000
+10 +0.000003 sec [13dca/0103]: ::posix_spawn_file_actions_init ( &file_actions ) err = 0x00000000
+11 +0.000961 sec [13dca/0103]: ::posix_spawn_file_actions_addopen (&file_actions, filedes=STDIN_FILENO, path='/dev/ttys088') err = 0x00000000
+12 +0.000005 sec [13dca/0103]: ::posix_spawn_file_actions_addopen (&file_actions, filedes=STDOUT_FILENO, path='/dev/ttys088') err = 0x00000000
+13 +0.000002 sec [13dca/0103]: ::posix_spawn_file_actions_addopen (&file_actions, filedes=STDERR_FILENO, path='/dev/ttys088') err = 0x00000000
+14 +0.000544 sec [13dca/0103]: ::posix_spawnp ( pid => 81356, path = '/Users/inva/Library/Caches/umbra/twins/3a25b72820c7e4e65f92f4e632a49d3519240dce612ea2c24d220fe870ec5a6f/hello_writer', file_actions = 0x16aef8980, attr = 0x16aef8998, argv = 0x71d003420, envp = 0x10594d0d0 ) err = 0x00000000
+15 +0.000009 sec [13dca/0103]: MachProcess::PosixSpawnChildForPTraceDebugging ( ) pid=81356, cpu_type=0x0100000c
+16 +0.000004 sec [13dca/0103]: DNBArchProtocol::SetDefaultArchitecture (cpu_type=0x0100000c, cpu_subtype=0x00000000) => 1
+17 +0.000002 sec [13dca/0103]: ::posix_spawn_file_actions_destroy ( &file_actions ) err = 0x00000000
+18 +0.000003 sec [13dca/0103]: MachTask::StartExceptionThread ( )
+[LaunchAttach] (81354) about to task_for_pid(81356)

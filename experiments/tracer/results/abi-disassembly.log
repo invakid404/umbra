@@ -1,0 +1,396 @@
+(lldb) target create "/Users/inva/umbra-scratch/fixtures/umbra-test-child"
+Current executable set to '/Users/inva/umbra-scratch/fixtures/umbra-test-child' (arm64).
+(lldb) disassemble -n __open
+dyld`__open:
+dyld[0x180119f48] <+0>:  mov    x16, #0x5                 ; =5 
+dyld[0x180119f4c] <+4>:  svc    #0x80
+dyld[0x180119f50] <+8>:  b.lo   0x180119f70               ; <+40>
+dyld[0x180119f54] <+12>: pacibsp 
+dyld[0x180119f58] <+16>: stp    x29, x30, [sp, #-0x10]!
+dyld[0x180119f5c] <+20>: mov    x29, sp
+dyld[0x180119f60] <+24>: bl     0x1801191b4               ; cerror
+dyld[0x180119f64] <+28>: mov    sp, x29
+dyld[0x180119f68] <+32>: ldp    x29, x30, [sp], #0x10
+dyld[0x180119f6c] <+36>: retab  
+dyld[0x180119f70] <+40>: ret    
+
+libsystem_kernel.dylib`__open:
+libsystem_kernel.dylib[0x1804ae68c] <+0>:  mov    x16, #0x5                 ; =5 
+libsystem_kernel.dylib[0x1804ae690] <+4>:  svc    #0x80
+libsystem_kernel.dylib[0x1804ae694] <+8>:  b.lo   0x1804ae6b4               ; <+40>
+libsystem_kernel.dylib[0x1804ae698] <+12>: pacibsp 
+libsystem_kernel.dylib[0x1804ae69c] <+16>: stp    x29, x30, [sp, #-0x10]!
+libsystem_kernel.dylib[0x1804ae6a0] <+20>: mov    x29, sp
+libsystem_kernel.dylib[0x1804ae6a4] <+24>: bl     0x1804af5d4               ; cerror
+libsystem_kernel.dylib[0x1804ae6a8] <+28>: mov    sp, x29
+libsystem_kernel.dylib[0x1804ae6ac] <+32>: ldp    x29, x30, [sp], #0x10
+libsystem_kernel.dylib[0x1804ae6b0] <+36>: retab  
+libsystem_kernel.dylib[0x1804ae6b4] <+40>: ret    
+
+(lldb) disassemble -n __openat
+dyld`__openat:
+dyld[0x180119f74] <+0>:  mov    x16, #0x1cf               ; =463 
+dyld[0x180119f78] <+4>:  svc    #0x80
+dyld[0x180119f7c] <+8>:  b.lo   0x180119f9c               ; <+40>
+dyld[0x180119f80] <+12>: pacibsp 
+dyld[0x180119f84] <+16>: stp    x29, x30, [sp, #-0x10]!
+dyld[0x180119f88] <+20>: mov    x29, sp
+dyld[0x180119f8c] <+24>: bl     0x1801191b4               ; cerror
+dyld[0x180119f90] <+28>: mov    sp, x29
+dyld[0x180119f94] <+32>: ldp    x29, x30, [sp], #0x10
+dyld[0x180119f98] <+36>: retab  
+dyld[0x180119f9c] <+40>: ret    
+
+libsystem_kernel.dylib`__openat:
+libsystem_kernel.dylib[0x1804af5a8] <+0>:  mov    x16, #0x1cf               ; =463 
+libsystem_kernel.dylib[0x1804af5ac] <+4>:  svc    #0x80
+libsystem_kernel.dylib[0x1804af5b0] <+8>:  b.lo   0x1804af5d0               ; <+40>
+libsystem_kernel.dylib[0x1804af5b4] <+12>: pacibsp 
+libsystem_kernel.dylib[0x1804af5b8] <+16>: stp    x29, x30, [sp, #-0x10]!
+libsystem_kernel.dylib[0x1804af5bc] <+20>: mov    x29, sp
+libsystem_kernel.dylib[0x1804af5c0] <+24>: bl     0x1804af5d4               ; cerror
+libsystem_kernel.dylib[0x1804af5c4] <+28>: mov    sp, x29
+libsystem_kernel.dylib[0x1804af5c8] <+32>: ldp    x29, x30, [sp], #0x10
+libsystem_kernel.dylib[0x1804af5cc] <+36>: retab  
+libsystem_kernel.dylib[0x1804af5d0] <+40>: ret    
+
+(lldb) disassemble -n __open_nocancel
+libsystem_kernel.dylib`__open_nocancel:
+libsystem_kernel.dylib[0x1804ae940] <+0>:  mov    x16, #0x18e               ; =398 
+libsystem_kernel.dylib[0x1804ae944] <+4>:  svc    #0x80
+libsystem_kernel.dylib[0x1804ae948] <+8>:  b.lo   0x1804ae968               ; <+40>
+libsystem_kernel.dylib[0x1804ae94c] <+12>: pacibsp 
+libsystem_kernel.dylib[0x1804ae950] <+16>: stp    x29, x30, [sp, #-0x10]!
+libsystem_kernel.dylib[0x1804ae954] <+20>: mov    x29, sp
+libsystem_kernel.dylib[0x1804ae958] <+24>: bl     0x1804ae5f4               ; cerror_nocancel
+libsystem_kernel.dylib[0x1804ae95c] <+28>: mov    sp, x29
+libsystem_kernel.dylib[0x1804ae960] <+32>: ldp    x29, x30, [sp], #0x10
+libsystem_kernel.dylib[0x1804ae964] <+36>: retab  
+libsystem_kernel.dylib[0x1804ae968] <+40>: ret    
+(lldb) disassemble -n __openat_nocancel
+libsystem_kernel.dylib`__openat_nocancel:
+libsystem_kernel.dylib[0x1804b394c] <+0>:  mov    x16, #0x1d0               ; =464 
+libsystem_kernel.dylib[0x1804b3950] <+4>:  svc    #0x80
+libsystem_kernel.dylib[0x1804b3954] <+8>:  b.lo   0x1804b3974               ; <+40>
+libsystem_kernel.dylib[0x1804b3958] <+12>: pacibsp 
+libsystem_kernel.dylib[0x1804b395c] <+16>: stp    x29, x30, [sp, #-0x10]!
+libsystem_kernel.dylib[0x1804b3960] <+20>: mov    x29, sp
+libsystem_kernel.dylib[0x1804b3964] <+24>: bl     0x1804ae5f4               ; cerror_nocancel
+libsystem_kernel.dylib[0x1804b3968] <+28>: mov    sp, x29
+libsystem_kernel.dylib[0x1804b396c] <+32>: ldp    x29, x30, [sp], #0x10
+libsystem_kernel.dylib[0x1804b3970] <+36>: retab  
+libsystem_kernel.dylib[0x1804b3974] <+40>: ret    
+(lldb) disassemble -n __execve
+dyld`__execve:
+dyld[0x180119cdc] <+0>:  mov    x16, #0x3b                ; =59 
+dyld[0x180119ce0] <+4>:  svc    #0x80
+dyld[0x180119ce4] <+8>:  b.lo   0x180119d04               ; <+40>
+dyld[0x180119ce8] <+12>: pacibsp 
+dyld[0x180119cec] <+16>: stp    x29, x30, [sp, #-0x10]!
+dyld[0x180119cf0] <+20>: mov    x29, sp
+dyld[0x180119cf4] <+24>: bl     0x180116da8               ; cerror_nocancel
+dyld[0x180119cf8] <+28>: mov    sp, x29
+dyld[0x180119cfc] <+32>: ldp    x29, x30, [sp], #0x10
+dyld[0x180119d00] <+36>: retab  
+dyld[0x180119d04] <+40>: ret    
+
+libsystem_kernel.dylib`__execve:
+libsystem_kernel.dylib[0x1804badc8] <+0>:  mov    x16, #0x3b                ; =59 
+libsystem_kernel.dylib[0x1804badcc] <+4>:  svc    #0x80
+libsystem_kernel.dylib[0x1804badd0] <+8>:  b.lo   0x1804badf0               ; <+40>
+libsystem_kernel.dylib[0x1804badd4] <+12>: pacibsp 
+libsystem_kernel.dylib[0x1804badd8] <+16>: stp    x29, x30, [sp, #-0x10]!
+libsystem_kernel.dylib[0x1804baddc] <+20>: mov    x29, sp
+libsystem_kernel.dylib[0x1804bade0] <+24>: bl     0x1804ae5f4               ; cerror_nocancel
+libsystem_kernel.dylib[0x1804bade4] <+28>: mov    sp, x29
+libsystem_kernel.dylib[0x1804bade8] <+32>: ldp    x29, x30, [sp], #0x10
+libsystem_kernel.dylib[0x1804badec] <+36>: retab  
+libsystem_kernel.dylib[0x1804badf0] <+40>: ret    
+
+(lldb) disassemble -n __posix_spawn
+dyld`__posix_spawn:
+dyld[0x180119fd8] <+0>:  mov    x16, #0xf4                ; =244 
+dyld[0x180119fdc] <+4>:  svc    #0x80
+dyld[0x180119fe0] <+8>:  b.lo   0x18011a000               ; <+40>
+dyld[0x180119fe4] <+12>: pacibsp 
+dyld[0x180119fe8] <+16>: stp    x29, x30, [sp, #-0x10]!
+dyld[0x180119fec] <+20>: mov    x29, sp
+dyld[0x180119ff0] <+24>: bl     0x1801191b4               ; cerror
+dyld[0x180119ff4] <+28>: mov    sp, x29
+dyld[0x180119ff8] <+32>: ldp    x29, x30, [sp], #0x10
+dyld[0x180119ffc] <+36>: retab  
+dyld[0x18011a000] <+40>: ret    
+
+libsystem_kernel.dylib`__posix_spawn:
+libsystem_kernel.dylib[0x1804b50d4] <+0>:  mov    x16, #0xf4                ; =244 
+libsystem_kernel.dylib[0x1804b50d8] <+4>:  svc    #0x80
+libsystem_kernel.dylib[0x1804b50dc] <+8>:  b.lo   0x1804b50fc               ; <+40>
+libsystem_kernel.dylib[0x1804b50e0] <+12>: pacibsp 
+libsystem_kernel.dylib[0x1804b50e4] <+16>: stp    x29, x30, [sp, #-0x10]!
+libsystem_kernel.dylib[0x1804b50e8] <+20>: mov    x29, sp
+libsystem_kernel.dylib[0x1804b50ec] <+24>: bl     0x1804af5d4               ; cerror
+libsystem_kernel.dylib[0x1804b50f0] <+28>: mov    sp, x29
+libsystem_kernel.dylib[0x1804b50f4] <+32>: ldp    x29, x30, [sp], #0x10
+libsystem_kernel.dylib[0x1804b50f8] <+36>: retab  
+libsystem_kernel.dylib[0x1804b50fc] <+40>: ret    
+
+(lldb) disassemble -n posix_spawn
+libsystem_kernel.dylib`posix_spawn:
+libsystem_kernel.dylib[0x1804b4e90] <+0>:   pacibsp 
+libsystem_kernel.dylib[0x1804b4e94] <+4>:   sub    sp, sp, #0xf0
+libsystem_kernel.dylib[0x1804b4e98] <+8>:   stp    x26, x25, [sp, #0xa0]
+libsystem_kernel.dylib[0x1804b4e9c] <+12>:  stp    x24, x23, [sp, #0xb0]
+libsystem_kernel.dylib[0x1804b4ea0] <+16>:  stp    x22, x21, [sp, #0xc0]
+libsystem_kernel.dylib[0x1804b4ea4] <+20>:  stp    x20, x19, [sp, #0xd0]
+libsystem_kernel.dylib[0x1804b4ea8] <+24>:  stp    x29, x30, [sp, #0xe0]
+libsystem_kernel.dylib[0x1804b4eac] <+28>:  add    x29, sp, #0xe0
+libsystem_kernel.dylib[0x1804b4eb0] <+32>:  mov    x19, x5
+libsystem_kernel.dylib[0x1804b4eb4] <+36>:  mov    x20, x4
+libsystem_kernel.dylib[0x1804b4eb8] <+40>:  mov    x21, x1
+libsystem_kernel.dylib[0x1804b4ebc] <+44>:  mov    x22, x0
+libsystem_kernel.dylib[0x1804b4ec0] <+48>:  mrs    x26, TPIDRRO_EL0
+libsystem_kernel.dylib[0x1804b4ec4] <+52>:  ldr    x8, [x26, #0x8]
+libsystem_kernel.dylib[0x1804b4ec8] <+56>:  adrp   x24, 442826
+libsystem_kernel.dylib[0x1804b4ecc] <+60>:  add    x24, x24, #0x520          ; errno
+libsystem_kernel.dylib[0x1804b4ed0] <+64>:  cmp    x8, #0x0
+libsystem_kernel.dylib[0x1804b4ed4] <+68>:  csel   x10, x24, x8, eq
+libsystem_kernel.dylib[0x1804b4ed8] <+72>:  ldr    w25, [x10]
+libsystem_kernel.dylib[0x1804b4edc] <+76>:  stur   wzr, [x29, #-0x44]
+libsystem_kernel.dylib[0x1804b4ee0] <+80>:  movi.2d v0, #0000000000000000
+libsystem_kernel.dylib[0x1804b4ee4] <+84>:  stp    q0, q0, [sp, #0x70]
+libsystem_kernel.dylib[0x1804b4ee8] <+88>:  stp    q0, q0, [sp, #0x50]
+libsystem_kernel.dylib[0x1804b4eec] <+92>:  stp    q0, q0, [sp, #0x30]
+libsystem_kernel.dylib[0x1804b4ef0] <+96>:  stp    q0, q0, [sp, #0x10]
+libsystem_kernel.dylib[0x1804b4ef4] <+100>: str    q0, [sp]
+libsystem_kernel.dylib[0x1804b4ef8] <+104>: cbz    x2, 0x1804b4f1c           ; <+140>
+libsystem_kernel.dylib[0x1804b4efc] <+108>: ldr    x9, [x2]
+libsystem_kernel.dylib[0x1804b4f00] <+112>: cbz    x9, 0x1804b4f1c           ; <+140>
+libsystem_kernel.dylib[0x1804b4f04] <+116>: ldr    w11, [x9, #0x4]
+libsystem_kernel.dylib[0x1804b4f08] <+120>: cbnz   x3, 0x1804b4f14           ; <+132>
+libsystem_kernel.dylib[0x1804b4f0c] <+124>: cmp    w11, #0x0
+libsystem_kernel.dylib[0x1804b4f10] <+128>: b.le   0x1804b5030               ; <+416>
+libsystem_kernel.dylib[0x1804b4f14] <+132>: cbnz   x3, 0x1804b4f20           ; <+144>
+libsystem_kernel.dylib[0x1804b4f18] <+136>: b      0x1804b5010               ; <+384>
+libsystem_kernel.dylib[0x1804b4f1c] <+140>: cbz    x3, 0x1804b5030           ; <+416>
+libsystem_kernel.dylib[0x1804b4f20] <+144>: ldr    x9, [x3]
+libsystem_kernel.dylib[0x1804b4f24] <+148>: cbz    x9, 0x1804b5000           ; <+368>
+libsystem_kernel.dylib[0x1804b4f28] <+152>: mov    w11, #0xf8                ; =248 
+libsystem_kernel.dylib[0x1804b4f2c] <+156>: stp    x11, x9, [sp]
+libsystem_kernel.dylib[0x1804b4f30] <+160>: ldr    x11, [x9, #0xc0]
+libsystem_kernel.dylib[0x1804b4f34] <+164>: cbz    x11, 0x1804b4f74          ; <+228>
+libsystem_kernel.dylib[0x1804b4f38] <+168>: ldrsw  x13, [x11, #0x4]
+libsystem_kernel.dylib[0x1804b4f3c] <+172>: mov    w12, #0x18                ; =24 
+libsystem_kernel.dylib[0x1804b4f40] <+176>: umulh  x12, x13, x12
+libsystem_kernel.dylib[0x1804b4f44] <+180>: cmp    xzr, x12
+libsystem_kernel.dylib[0x1804b4f48] <+184>: cset   w12, ne
+libsystem_kernel.dylib[0x1804b4f4c] <+188>: add    x14, x13, x13, lsl #1
+libsystem_kernel.dylib[0x1804b4f50] <+192>: lsl    x14, x14, #3
+libsystem_kernel.dylib[0x1804b4f54] <+196>: adds   x14, x14, #0x8
+libsystem_kernel.dylib[0x1804b4f58] <+200>: csinc  w12, w12, wzr, lo
+libsystem_kernel.dylib[0x1804b4f5c] <+204>: cmp    w12, #0x0
+libsystem_kernel.dylib[0x1804b4f60] <+208>: csel   x12, xzr, x14, ne
+libsystem_kernel.dylib[0x1804b4f64] <+212>: cmp    x12, #0x0
+libsystem_kernel.dylib[0x1804b4f68] <+216>: ccmp   w13, #0x0, #0x4, eq
+libsystem_kernel.dylib[0x1804b4f6c] <+220>: b.ne   0x1804b5090               ; <+512>
+libsystem_kernel.dylib[0x1804b4f70] <+224>: stp    x12, x11, [sp, #0x20]
+libsystem_kernel.dylib[0x1804b4f74] <+228>: ldr    x11, [x9, #0xc8]
+libsystem_kernel.dylib[0x1804b4f78] <+232>: cbz    x11, 0x1804b4fb0          ; <+288>
+libsystem_kernel.dylib[0x1804b4f7c] <+236>: ldrsw  x12, [x11, #0x4]
+libsystem_kernel.dylib[0x1804b4f80] <+240>: mov    w13, #0x90                ; =144 
+libsystem_kernel.dylib[0x1804b4f84] <+244>: umulh  x13, x12, x13
+libsystem_kernel.dylib[0x1804b4f88] <+248>: cmp    xzr, x13
+libsystem_kernel.dylib[0x1804b4f8c] <+252>: cset   w13, ne
+libsystem_kernel.dylib[0x1804b4f90] <+256>: ccmp   w12, #0x0, #0x4, ne
+libsystem_kernel.dylib[0x1804b4f94] <+260>: b.ne   0x1804b5090               ; <+512>
+libsystem_kernel.dylib[0x1804b4f98] <+264>: add    x8, x12, x12, lsl #3
+libsystem_kernel.dylib[0x1804b4f9c] <+268>: lsl    x8, x8, #4
+libsystem_kernel.dylib[0x1804b4fa0] <+272>: orr    x8, x8, #0x8
+libsystem_kernel.dylib[0x1804b4fa4] <+276>: cmp    w13, #0x0
+libsystem_kernel.dylib[0x1804b4fa8] <+280>: csel   x8, xzr, x8, ne
+libsystem_kernel.dylib[0x1804b4fac] <+284>: stp    x8, x11, [sp, #0x30]
+libsystem_kernel.dylib[0x1804b4fb0] <+288>: ldr    x8, [x9, #0xd0]
+libsystem_kernel.dylib[0x1804b4fb4] <+292>: cbz    x8, 0x1804b4fc0           ; <+304>
+libsystem_kernel.dylib[0x1804b4fb8] <+296>: mov    w10, #0x30                ; =48 
+libsystem_kernel.dylib[0x1804b4fbc] <+300>: stp    x10, x8, [sp, #0x40]
+libsystem_kernel.dylib[0x1804b4fc0] <+304>: ldr    x8, [x9, #0xd8]
+libsystem_kernel.dylib[0x1804b4fc4] <+308>: cbz    x8, 0x1804b4fd0           ; <+320>
+libsystem_kernel.dylib[0x1804b4fc8] <+312>: mov    w10, #0x58                ; =88 
+libsystem_kernel.dylib[0x1804b4fcc] <+316>: stp    x10, x8, [sp, #0x50]
+libsystem_kernel.dylib[0x1804b4fd0] <+320>: ldr    x8, [x9, #0xe0]
+libsystem_kernel.dylib[0x1804b4fd4] <+324>: cbz    x8, 0x1804b4fe0           ; <+336>
+libsystem_kernel.dylib[0x1804b4fd8] <+328>: mov    w10, #0x154               ; =340 
+libsystem_kernel.dylib[0x1804b4fdc] <+332>: stp    x10, x8, [sp, #0x60]
+libsystem_kernel.dylib[0x1804b4fe0] <+336>: ldr    x8, [x9, #0xe8]
+libsystem_kernel.dylib[0x1804b4fe4] <+340>: cbz    x8, 0x1804b4ff0           ; <+352>
+libsystem_kernel.dylib[0x1804b4fe8] <+344>: mov    w10, #0x400               ; =1024 
+libsystem_kernel.dylib[0x1804b4fec] <+348>: stp    x10, x8, [sp, #0x70]
+libsystem_kernel.dylib[0x1804b4ff0] <+352>: ldr    x8, [x9, #0xf0]
+libsystem_kernel.dylib[0x1804b4ff4] <+356>: cbz    x8, 0x1804b5000           ; <+368>
+libsystem_kernel.dylib[0x1804b4ff8] <+360>: mov    w9, #0x80                 ; =128 
+libsystem_kernel.dylib[0x1804b4ffc] <+364>: stp    x9, x8, [sp, #0x80]
+libsystem_kernel.dylib[0x1804b5000] <+368>: cbz    x2, 0x1804b5028           ; <+408>
+libsystem_kernel.dylib[0x1804b5004] <+372>: ldr    x9, [x2]
+libsystem_kernel.dylib[0x1804b5008] <+376>: cbz    x9, 0x1804b5028           ; <+408>
+libsystem_kernel.dylib[0x1804b500c] <+380>: ldr    w11, [x9, #0x4]
+libsystem_kernel.dylib[0x1804b5010] <+384>: cmp    w11, #0x1
+libsystem_kernel.dylib[0x1804b5014] <+388>: b.lt   0x1804b5028               ; <+408>
+libsystem_kernel.dylib[0x1804b5018] <+392>: mov    w8, #0x410                ; =1040 
+libsystem_kernel.dylib[0x1804b501c] <+396>: umull  x8, w11, w8
+libsystem_kernel.dylib[0x1804b5020] <+400>: orr    x8, x8, #0x8
+libsystem_kernel.dylib[0x1804b5024] <+404>: stp    x8, x9, [sp, #0x10]
+libsystem_kernel.dylib[0x1804b5028] <+408>: mov    x23, sp
+libsystem_kernel.dylib[0x1804b502c] <+412>: b      0x1804b5034               ; <+420>
+libsystem_kernel.dylib[0x1804b5030] <+416>: mov    x23, #0x0                 ; =0 
+libsystem_kernel.dylib[0x1804b5034] <+420>: adrp   x8, 431881
+libsystem_kernel.dylib[0x1804b5038] <+424>: ldr    x8, [x8, #0x9c8]
+libsystem_kernel.dylib[0x1804b503c] <+428>: cbz    x8, 0x1804b5068           ; <+472>
+libsystem_kernel.dylib[0x1804b5040] <+432>: sub    x5, x29, #0x44
+libsystem_kernel.dylib[0x1804b5044] <+436>: mov    x0, x22
+libsystem_kernel.dylib[0x1804b5048] <+440>: mov    x1, x21
+libsystem_kernel.dylib[0x1804b504c] <+444>: mov    x2, x20
+libsystem_kernel.dylib[0x1804b5050] <+448>: mov    x3, x19
+libsystem_kernel.dylib[0x1804b5054] <+452>: mov    x4, x23
+libsystem_kernel.dylib[0x1804b5058] <+456>: bl     0x1804bde14               ; _posix_spawn_with_filter
+libsystem_kernel.dylib[0x1804b505c] <+460>: tbz    w0, #0x0, 0x1804b5068     ; <+472>
+libsystem_kernel.dylib[0x1804b5060] <+464>: ldur   w0, [x29, #-0x44]
+libsystem_kernel.dylib[0x1804b5064] <+468>: b      0x1804b5084               ; <+500>
+libsystem_kernel.dylib[0x1804b5068] <+472>: mov    x0, x22
+libsystem_kernel.dylib[0x1804b506c] <+476>: mov    x1, x21
+libsystem_kernel.dylib[0x1804b5070] <+480>: mov    x2, x23
+libsystem_kernel.dylib[0x1804b5074] <+484>: mov    x3, x20
+libsystem_kernel.dylib[0x1804b5078] <+488>: mov    x4, x19
+libsystem_kernel.dylib[0x1804b507c] <+492>: bl     0x1804b50d4               ; __posix_spawn
+libsystem_kernel.dylib[0x1804b5080] <+496>: stur   w0, [x29, #-0x44]
+libsystem_kernel.dylib[0x1804b5084] <+500>: ldr    x8, [x26, #0x8]
+libsystem_kernel.dylib[0x1804b5088] <+504>: tbnz   w0, #0x1f, 0x1804b5098    ; <+520>
+libsystem_kernel.dylib[0x1804b508c] <+508>: b      0x1804b50a8               ; <+536>
+libsystem_kernel.dylib[0x1804b5090] <+512>: mov    w9, #0x16                 ; =22 
+libsystem_kernel.dylib[0x1804b5094] <+516>: str    w9, [x10]
+libsystem_kernel.dylib[0x1804b5098] <+520>: cmp    x8, #0x0
+libsystem_kernel.dylib[0x1804b509c] <+524>: csel   x9, x24, x8, eq
+libsystem_kernel.dylib[0x1804b50a0] <+528>: ldr    w9, [x9]
+libsystem_kernel.dylib[0x1804b50a4] <+532>: stur   w9, [x29, #-0x44]
+libsystem_kernel.dylib[0x1804b50a8] <+536>: cmp    x8, #0x0
+libsystem_kernel.dylib[0x1804b50ac] <+540>: csel   x8, x24, x8, eq
+libsystem_kernel.dylib[0x1804b50b0] <+544>: str    w25, [x8]
+libsystem_kernel.dylib[0x1804b50b4] <+548>: ldur   w0, [x29, #-0x44]
+libsystem_kernel.dylib[0x1804b50b8] <+552>: ldp    x29, x30, [sp, #0xe0]
+libsystem_kernel.dylib[0x1804b50bc] <+556>: ldp    x20, x19, [sp, #0xd0]
+libsystem_kernel.dylib[0x1804b50c0] <+560>: ldp    x22, x21, [sp, #0xc0]
+libsystem_kernel.dylib[0x1804b50c4] <+564>: ldp    x24, x23, [sp, #0xb0]
+libsystem_kernel.dylib[0x1804b50c8] <+568>: ldp    x26, x25, [sp, #0xa0]
+libsystem_kernel.dylib[0x1804b50cc] <+572>: add    sp, sp, #0xf0
+libsystem_kernel.dylib[0x1804b50d0] <+576>: retab  
+(lldb) disassemble -n __fork
+libsystem_kernel.dylib`__fork:
+libsystem_kernel.dylib[0x1804b58ec] <+0>:  pacibsp 
+libsystem_kernel.dylib[0x1804b58f0] <+4>:  stp    x29, x30, [sp, #-0x10]!
+libsystem_kernel.dylib[0x1804b58f4] <+8>:  mov    x29, sp
+libsystem_kernel.dylib[0x1804b58f8] <+12>: mov    x16, #0x2                 ; =2 
+libsystem_kernel.dylib[0x1804b58fc] <+16>: svc    #0x80
+libsystem_kernel.dylib[0x1804b5900] <+20>: b.hs   0x1804b5924               ; <+56>
+libsystem_kernel.dylib[0x1804b5904] <+24>: cbz    x1, 0x1804b592c           ; <+64>
+libsystem_kernel.dylib[0x1804b5908] <+28>: adrp   x9, 442824
+libsystem_kernel.dylib[0x1804b590c] <+32>: add    x9, x9, #0xe58            ; _current_pid
+libsystem_kernel.dylib[0x1804b5910] <+36>: mov    w0, #0x0                  ; =0 
+libsystem_kernel.dylib[0x1804b5914] <+40>: str    w0, [x9]
+libsystem_kernel.dylib[0x1804b5918] <+44>: mov    sp, x29
+libsystem_kernel.dylib[0x1804b591c] <+48>: ldp    x29, x30, [sp], #0x10
+libsystem_kernel.dylib[0x1804b5920] <+52>: retab  
+libsystem_kernel.dylib[0x1804b5924] <+56>: bl     0x1804af5d4               ; cerror
+libsystem_kernel.dylib[0x1804b5928] <+60>: mov    w0, #-0x1                 ; =-1 
+libsystem_kernel.dylib[0x1804b592c] <+64>: mov    sp, x29
+libsystem_kernel.dylib[0x1804b5930] <+68>: ldp    x29, x30, [sp], #0x10
+libsystem_kernel.dylib[0x1804b5934] <+72>: retab  
+(lldb) disassemble -n vfork
+libsystem_c.dylib`vfork:
+libsystem_c.dylib[0x1803c1648] <+0>:   pacibsp 
+libsystem_c.dylib[0x1803c164c] <+4>:   stp    x20, x19, [sp, #-0x20]!
+libsystem_c.dylib[0x1803c1650] <+8>:   stp    x29, x30, [sp, #0x10]
+libsystem_c.dylib[0x1803c1654] <+12>:  add    x29, sp, #0x10
+libsystem_c.dylib[0x1803c1658] <+16>:  adrp   x8, 443067
+libsystem_c.dylib[0x1803c165c] <+20>:  ldr    x8, [x8, #0x128]
+libsystem_c.dylib[0x1803c1660] <+24>:  cbz    x8, 0x1803c1670           ; <+40>
+libsystem_c.dylib[0x1803c1664] <+28>:  mov    w0, #0x1                  ; =1 
+libsystem_c.dylib[0x1803c1668] <+32>:  blraaz x8
+libsystem_c.dylib[0x1803c166c] <+36>:  b      0x1803c167c               ; <+52>
+libsystem_c.dylib[0x1803c1670] <+40>:  adrp   x8, 443067
+libsystem_c.dylib[0x1803c1674] <+44>:  ldr    x8, [x8, #0x140]
+libsystem_c.dylib[0x1803c1678] <+48>:  blraaz x8
+libsystem_c.dylib[0x1803c167c] <+52>:  bl     0x1803f8fdc               ; symbol stub for: __fork
+libsystem_c.dylib[0x1803c1680] <+56>:  mov    x19, x0
+libsystem_c.dylib[0x1803c1684] <+60>:  cbz    w0, 0x1803c16a4           ; <+92>
+libsystem_c.dylib[0x1803c1688] <+64>:  adrp   x8, 443067
+libsystem_c.dylib[0x1803c168c] <+68>:  cmn    w19, #0x1
+libsystem_c.dylib[0x1803c1690] <+72>:  ldr    x8, [x8, #0xe8]
+libsystem_c.dylib[0x1803c1694] <+76>:  cbnz   x8, 0x1803c16b0           ; <+104>
+libsystem_c.dylib[0x1803c1698] <+80>:  adrp   x8, 443067
+libsystem_c.dylib[0x1803c169c] <+84>:  ldr    x8, [x8, #0x148]
+libsystem_c.dylib[0x1803c16a0] <+88>:  b      0x1803c16c4               ; <+124>
+libsystem_c.dylib[0x1803c16a4] <+92>:  adrp   x8, 443067
+libsystem_c.dylib[0x1803c16a8] <+96>:  ldr    x8, [x8, #0xf0]
+libsystem_c.dylib[0x1803c16ac] <+100>: cbz    x8, 0x1803c16bc           ; <+116>
+libsystem_c.dylib[0x1803c16b0] <+104>: mov    w0, #0x1                  ; =1 
+libsystem_c.dylib[0x1803c16b4] <+108>: blraaz x8
+libsystem_c.dylib[0x1803c16b8] <+112>: b      0x1803c16c8               ; <+128>
+libsystem_c.dylib[0x1803c16bc] <+116>: adrp   x8, 443067
+libsystem_c.dylib[0x1803c16c0] <+120>: ldr    x8, [x8, #0x150]
+libsystem_c.dylib[0x1803c16c4] <+124>: blraaz x8
+libsystem_c.dylib[0x1803c16c8] <+128>: mov    x0, x19
+libsystem_c.dylib[0x1803c16cc] <+132>: ldp    x29, x30, [sp, #0x10]
+libsystem_c.dylib[0x1803c16d0] <+136>: ldp    x20, x19, [sp], #0x20
+libsystem_c.dylib[0x1803c16d4] <+140>: retab  
+(lldb) disassemble -n raw_open
+umbra-test-child`raw_open:
+umbra-test-child[0x100000c48] <+0>:   sub    sp, sp, #0x60
+umbra-test-child[0x100000c4c] <+4>:   stp    x29, x30, [sp, #0x50]
+umbra-test-child[0x100000c50] <+8>:   add    x29, sp, #0x50
+umbra-test-child[0x100000c54] <+12>:  stur   x0, [x29, #-0x10]
+umbra-test-child[0x100000c58] <+16>:  ldur   x8, [x29, #-0x10]
+umbra-test-child[0x100000c5c] <+20>:  stur   x8, [x29, #-0x18]
+umbra-test-child[0x100000c60] <+24>:  mov    x8, #0x601                ; =1537 
+umbra-test-child[0x100000c64] <+28>:  stur   x8, [x29, #-0x20]
+umbra-test-child[0x100000c68] <+32>:  mov    x8, #0x1a4                ; =420 
+umbra-test-child[0x100000c6c] <+36>:  str    x8, [sp, #0x28]
+umbra-test-child[0x100000c70] <+40>:  str    xzr, [sp, #0x20]
+umbra-test-child[0x100000c74] <+44>:  str    xzr, [sp, #0x18]
+umbra-test-child[0x100000c78] <+48>:  str    xzr, [sp, #0x10]
+umbra-test-child[0x100000c7c] <+52>:  mov    x8, #0x5                  ; =5 
+umbra-test-child[0x100000c80] <+56>:  str    x8, [sp, #0x8]
+umbra-test-child[0x100000c84] <+60>:  ldur   x0, [x29, #-0x18]
+umbra-test-child[0x100000c88] <+64>:  ldur   x1, [x29, #-0x20]
+umbra-test-child[0x100000c8c] <+68>:  ldr    x2, [sp, #0x28]
+umbra-test-child[0x100000c90] <+72>:  ldr    x3, [sp, #0x20]
+umbra-test-child[0x100000c94] <+76>:  ldr    x4, [sp, #0x18]
+umbra-test-child[0x100000c98] <+80>:  ldr    x5, [sp, #0x10]
+umbra-test-child[0x100000c9c] <+84>:  ldr    x16, [sp, #0x8]
+umbra-test-child[0x100000ca0] <+88>:  svc    #0x80
+umbra-test-child[0x100000ca4] <+92>:  cneg   x0, x0, hs
+umbra-test-child[0x100000ca8] <+96>:  stur   x0, [x29, #-0x18]
+umbra-test-child[0x100000cac] <+100>: stur   x1, [x29, #-0x20]
+umbra-test-child[0x100000cb0] <+104>: str    x2, [sp, #0x28]
+umbra-test-child[0x100000cb4] <+108>: str    x3, [sp, #0x20]
+umbra-test-child[0x100000cb8] <+112>: str    x4, [sp, #0x18]
+umbra-test-child[0x100000cbc] <+116>: str    x5, [sp, #0x10]
+umbra-test-child[0x100000cc0] <+120>: str    x16, [sp, #0x8]
+umbra-test-child[0x100000cc4] <+124>: ldur   x8, [x29, #-0x18]
+umbra-test-child[0x100000cc8] <+128>: tbz    x8, #0x3f, 0x100000cf8    ; <+176> at umbra-test-child.c:72:17
+umbra-test-child[0x100000ccc] <+132>: b      0x100000cd0               ; <+136> at umbra-test-child.c:69:23
+umbra-test-child[0x100000cd0] <+136>: ldur   x9, [x29, #-0x18]
+umbra-test-child[0x100000cd4] <+140>: mov    x8, #0x0                  ; =0 
+umbra-test-child[0x100000cd8] <+144>: subs   x8, x8, x9
+umbra-test-child[0x100000cdc] <+148>: str    x8, [sp]
+umbra-test-child[0x100000ce0] <+152>: bl     0x1000010d4               ; symbol stub for: __error
+umbra-test-child[0x100000ce4] <+156>: ldr    x8, [sp]
+umbra-test-child[0x100000ce8] <+160>: str    w8, [x0]
+umbra-test-child[0x100000cec] <+164>: mov    w8, #-0x1                 ; =-1 
+umbra-test-child[0x100000cf0] <+168>: stur   w8, [x29, #-0x4]
+umbra-test-child[0x100000cf4] <+172>: b      0x100000d04               ; <+188> at umbra-test-child.c:73:1
+umbra-test-child[0x100000cf8] <+176>: ldur   x8, [x29, #-0x18]
+umbra-test-child[0x100000cfc] <+180>: stur   w8, [x29, #-0x4]
+umbra-test-child[0x100000d00] <+184>: b      0x100000d04               ; <+188> at umbra-test-child.c:73:1
+umbra-test-child[0x100000d04] <+188>: ldur   w0, [x29, #-0x4]
+umbra-test-child[0x100000d08] <+192>: ldp    x29, x30, [sp, #0x50]
+umbra-test-child[0x100000d0c] <+196>: add    sp, sp, #0x60
+umbra-test-child[0x100000d10] <+200>: ret    
+(lldb) quit

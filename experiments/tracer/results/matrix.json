@@ -1,0 +1,68 @@
+[
+  {
+    "case": "open-libc",
+    "label": "libc open interception + rewrite",
+    "baseline_pass": true,
+    "exit_code": 124,
+    "host_exists": false,
+    "shadow_exists": false,
+    "shadow_content_matches": false,
+    "status": "PARTIAL",
+    "reason": "fixture available; LLDB launch timed out before task control; interception not exercised"
+  },
+  {
+    "case": "open-svc",
+    "label": "raw-svc open interception",
+    "baseline_pass": true,
+    "exit_code": 124,
+    "host_exists": false,
+    "shadow_exists": false,
+    "shadow_content_matches": false,
+    "status": "PARTIAL",
+    "reason": "fixture available; LLDB launch timed out before task control; interception not exercised"
+  },
+  {
+    "case": "fork-write",
+    "label": "fork + immediate child write",
+    "baseline_pass": true,
+    "exit_code": 124,
+    "host_exists": false,
+    "shadow_exists": false,
+    "shadow_content_matches": false,
+    "status": "PARTIAL",
+    "reason": "fixture available; LLDB launch timed out before task control; interception not exercised"
+  },
+  {
+    "case": "posix-spawn-write",
+    "label": "posix_spawn + child write",
+    "baseline_pass": true,
+    "exit_code": 124,
+    "host_exists": false,
+    "shadow_exists": false,
+    "shadow_content_matches": false,
+    "status": "PARTIAL",
+    "reason": "fixture available; LLDB launch timed out before task control; interception not exercised"
+  },
+  {
+    "case": "exec-write",
+    "label": "exec + child write",
+    "baseline_pass": true,
+    "exit_code": 124,
+    "host_exists": false,
+    "shadow_exists": false,
+    "shadow_content_matches": false,
+    "status": "PARTIAL",
+    "reason": "fixture available; LLDB launch timed out before task control; interception not exercised"
+  },
+  {
+    "case": "grandchild-write",
+    "label": "grandchild write",
+    "baseline_pass": true,
+    "exit_code": 124,
+    "host_exists": false,
+    "shadow_exists": false,
+    "shadow_content_matches": false,
+    "status": "PARTIAL",
+    "reason": "fixture available; LLDB launch timed out before task control; interception not exercised"
+  }
+]

@@ -1,0 +1,17 @@
+TWIN[resigned]: /tmp/umbra-cache-check-wrhtgyzn/cache_probe -> /Users/inva/Library/Caches/umbra/twins/24bfcbd9b22917225a53cf2ac67f588c981686d52aa5cf058f5285f51f4cd28e/cache_probe
+TWIN[hit]: /tmp/umbra-cache-check-wrhtgyzn/cache_probe -> /Users/inva/Library/Caches/umbra/twins/24bfcbd9b22917225a53cf2ac67f588c981686d52aa5cf058f5285f51f4cd28e/cache_probe
+CACHE HIT: PASS (same twin, unchanged mtime)
+TWIN[resigned]: /tmp/umbra-cache-check-wrhtgyzn/cache_probe -> /Users/inva/Library/Caches/umbra/twins/24bfcbd9b22917225a53cf2ac67f588c981686d52aa5cf058f5285f51f4cd28e/cache_probe
+CACHE CORRUPTION: PASS (hash mismatch rebuilt and signature verified)
+TWIN[resigned]: /tmp/umbra-cache-check-wrhtgyzn/cache_probe -> /Users/inva/Library/Caches/umbra/twins/f2e7172741dfcadfc0fb4531877d0f5ad3beb2a6ed3f401818381e98ffb09f92/cache_probe
+SOURCE UPDATE: PASS (different source hash selects different cache directory)
+BREAKPOINT: __open svc file-address=0x1804ae690 path=x0
+BREAKPOINT: __open_nocancel svc file-address=0x1804ae944 path=x0
+BREAKPOINT: __openat svc file-address=0x1804af5ac path=x1
+BREAKPOINT: __openat_nocancel svc file-address=0x1804b3950 path=x1
+BREAKPOINT: __execve svc file-address=0x1804badcc path=x0
+BREAKPOINT: __posix_spawn svc file-address=0x1804b50d8 path=x1
+BREAKPOINT: __fork svc file-address=0x1804b58fc path=None
+RAW-SCAN: main executable svc sites=1
+BREAKPOINT INVENTORY: PASS (7 libsystem svc sites + 1 executable svc site)
+Runtime interception remains unverified; these are offline/signing checks.

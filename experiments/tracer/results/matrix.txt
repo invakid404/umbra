@@ -1,0 +1,6 @@
+libc open interception + rewrite: PARTIAL — fixture available; LLDB launch timed out before task control; interception not exercised
+raw-svc open interception: PARTIAL — fixture available; LLDB launch timed out before task control; interception not exercised
+fork + immediate child write: PARTIAL — fixture available; LLDB launch timed out before task control; interception not exercised
+posix_spawn + child write: PARTIAL — fixture available; LLDB launch timed out before task control; interception not exercised
+exec + child write: PARTIAL — fixture available; LLDB launch timed out before task control; interception not exercised
+grandchild write: PARTIAL — fixture available; LLDB launch timed out before task control; interception not exercised
