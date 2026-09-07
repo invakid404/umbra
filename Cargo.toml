@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/umbra-core",
+    "crates/umbra-platform",
+    "crates/umbra-platform-macos",
+    "crates/umbra-platform-linux",
+    "crates/umbra-storage",
+    "crates/umbra-storage-nfs",
+    "crates/umbra-storage-local",
+    "crates/umbra-overlay",
+    "crates/umbra-journal",
+    "crates/umbra-journal-file",
+    "crates/umbra-agent",
+    "crates/umbra-agent-codex",
+    "crates/umbra-agent-claude",
+    "crates/umbra-supervisor",
+    "crates/umbra-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Umbra contributors"]
+license = "Unlicense"
+edition = "2021"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+mach2 = "0.4"
+tempfile = "3"
+serde_json = "1"

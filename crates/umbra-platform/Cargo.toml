@@ -1,0 +1,11 @@
+[package]
+name = "umbra-platform"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+umbra-core = { path = "../umbra-core" }
+serde.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "umbra-platform-macos"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+umbra-core = { path = "../umbra-core" }
+umbra-platform = { path = "../umbra-platform" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2.workspace = true

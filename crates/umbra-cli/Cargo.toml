@@ -1,0 +1,22 @@
+[package]
+name = "umbra-cli"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "umbra"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+uuid.workspace = true
+umbra-core = { path = "../umbra-core" }
+umbra-supervisor = { path = "../umbra-supervisor" }
+umbra-agent = { path = "../umbra-agent" }
+umbra-platform = { path = "../umbra-platform" }
+umbra-storage = { path = "../umbra-storage" }
+umbra-journal = { path = "../umbra-journal" }
+umbra-overlay = { path = "../umbra-overlay" }

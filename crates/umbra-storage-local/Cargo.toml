@@ -1,0 +1,15 @@
+[package]
+name = "umbra-storage-local"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+umbra-core = { path = "../umbra-core" }
+umbra-storage = { path = "../umbra-storage" }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

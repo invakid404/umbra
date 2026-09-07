@@ -1,0 +1,15 @@
+[package]
+name = "umbra-overlay"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+umbra-core = { path = "../umbra-core" }
+umbra-storage = { path = "../umbra-storage" }
+umbra-journal = { path = "../umbra-journal" }
+
+[dependencies.serde]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "umbra-supervisor"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+umbra-core = { path = "../umbra-core" }
+umbra-platform = { path = "../umbra-platform" }
+umbra-storage = { path = "../umbra-storage" }
+umbra-overlay = { path = "../umbra-overlay" }
+umbra-journal = { path = "../umbra-journal" }
+umbra-agent = { path = "../umbra-agent" }
