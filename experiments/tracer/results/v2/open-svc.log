@@ -1,0 +1,29 @@
+COMMAND: ['/usr/bin/python3', '/Users/inva/umbra-scratch/tracer/umbra_tracer.py', '--timeout', '25', '/Users/inva/umbra-scratch/fixtures/umbra-test-child', 'open-svc', '/tmp/umbra-gate2-v2-open-svc']
+TWIN[hit]: /Users/inva/umbra-scratch/fixtures/umbra-test-child -> /Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1/umbra-test-child
+BREAKPOINT: __open svc file-address=0x1804ae690 path=x0
+BREAKPOINT: __open_nocancel svc file-address=0x1804ae944 path=x0
+BREAKPOINT: __openat svc file-address=0x1804af5ac path=x1
+BREAKPOINT: __openat_nocancel svc file-address=0x1804b3950 path=x1
+BREAKPOINT: __execve svc file-address=0x1804badcc path=x0
+BREAKPOINT: __posix_spawn svc file-address=0x1804b50d8 path=x1
+BREAKPOINT: __fork svc file-address=0x1804b58fc path=None
+BREAKPOINT: __wait4 svc file-address=0x1804b5474 path=None
+BREAKPOINT: __wait4_nocancel svc file-address=0x1804ba2a4 path=None
+RAW-SCAN: main executable svc sites=1
+LAUNCH: /Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1/umbra-test-child
+LAUNCHED: pid=76291
+SIGNAL[suppressed]: pid=76291 signal=17
+INTERCEPT: pid=76291 tid=35643168 __open
+ABI[__open]: svc #0x80; b.lo 0x18c9d26b4; pacibsp ; stp x29, x30, [sp, #-0x10]!; mov x29, sp; bl 0x18c9d35d4; mov sp, x29; ldp x29, x30, [sp], #0x10
+OPEN[old]: /Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1
+OPEN[new]: /tmp/umbra-nfs-stub/Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1
+INTERCEPT: pid=76291 tid=35643168 __open
+OPEN[old]: /Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1
+OPEN[new]: /tmp/umbra-nfs-stub/Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1
+INTERCEPT: pid=76291 tid=35643168 main-executable svc
+ABI[main-executable svc]: svc #0x80; cneg x0, x0, hs; stur x0, [x29, #-0x18]; stur x1, [x29, #-0x20]; str x2, [sp, #0x28]; str x3, [sp, #0x20]; str x4, [sp, #0x18]; str x5, [sp, #0x10]
+RAW[svc]: pid=76291 syscall=5
+OPEN[old]: /tmp/umbra-gate2-v2-open-svc
+OPEN[new]: /tmp/umbra-nfs-stub/tmp/umbra-gate2-v2-open-svc
+EXIT: pid=76291 status=0 
+SUMMARY: opens=3 exec_rewrites=0 fork_entries=0 spawn_entries=0

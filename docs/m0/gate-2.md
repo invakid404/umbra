@@ -1,90 +1,84 @@
 # M0 Gate 2 — descendant capture and syscall interception
 
-**Status:** mixed. Syscall interception (libc `open`, `openat` stubs, and raw arm64 `svc`) works end-to-end with path rewrite into a shadow root. Descendant capture (fork / `posix_spawn` / exec / grandchild) is not achieved by the current disposable prototype — exactly the "principal macOS risk" flagged in handoff §6.4.
+**Status:** ✅ PASS on all six fixture cases in the disposable Python prototype. Syscall interception (libc + raw arm64 svc) and descendant capture (fork / posix_spawn / exec / grandchild) both proven end-to-end. This closes M0 exit criterion 2, which was the last outstanding item — all four §12 criteria are now met.
 
 **Environment:** macOS 26.5.1 (25F80), arm64, SIP enabled, LLDB 2100.0.17.108.
 
-## Prerequisite: enable macOS developer authorization
+## Descendant capture result — v2 tracer (2026-09-07)
 
-The tracer requires `sudo /usr/sbin/DevToolsSecurity -enable` to have been run once on the machine (adds the user to `_developer`). That was previously conflated with a separate auth-db issue — the correct picture is:
-
-- `sudo DevToolsSecurity -enable` **is sufficient** on macOS 26.5.1. Once the user is in `_developer`, `taskgated` grants `task_for_pid` to LLDB / `debugserver` at the kernel level — no interactive prompt fires, no auth db policy change needed.
-- The `security authorize -e system.privilege.taskport` CLI returns `NO (-60007)` even after DevToolsSecurity is enabled — that's a *different* code path (user-space `AuthorizationServices`) that debuggers do not go through. Do not use this CLI as a health check for the tracer.
-- `debugserver`'s built-in `com.apple.private.cs.debugger` entitlement (Apple's private, not `com.apple.security.cs.debugger` from a Developer ID) is what earns it the taskgated bypass. Third-party debuggers embedding their own `debugserver`-equivalent will want the public `com.apple.security.cs.debugger` on the eventual signed umbra binary; not required for M0 verification because we invoke Apple's `debugserver`.
-
-An earlier draft of this doc claimed DevToolsSecurity was insufficient and recommended modifying the auth db. That was wrong; the recommendation is retracted. See `docs/macos-setup.md` for the corrected setup requirements.
-
-## Test matrix and results (2026-09-07, after DevToolsSecurity was enabled)
-
-### Syscall interception + path rewrite: ✅
-
-| Fixture | Case | Result |
+| Fixture | Result | How |
 |---|---|---|
-| `demo.sh` inline hello-writer | libc `open` → `/tmp/umbra-should-not-exist` | ✅ CAPTURED; file appears at `/tmp/umbra-nfs-stub/tmp/umbra-should-not-exist`, absent from host |
-| Track D `open-libc` | libc `open` (verifies path rewrite for arbitrary target) | ✅ CAPTURED |
-| Track D `open-svc` | raw arm64 `svc #0x80` open in main executable | ✅ CAPTURED; main-executable svc scan hit the site, syscall dispatched by `x16=5`, path rewritten to shadow |
+| `open-libc` | ✅ CAPTURED | libc `open` intercepted at `__open` svc stub, path rewritten to shadow root |
+| `open-svc` | ✅ CAPTURED | raw arm64 `svc #0x80` open in main executable; dispatched by `x16=5`; path rewritten |
+| `fork-write` | ✅ CAPTURED | see "race elimination" below; child attached before its first open |
+| `posix-spawn-write` | ✅ CAPTURED | suspended child (`POSIX_SPAWN_START_SUSPENDED`) attached, SIGHUP suppressed, resumed under supervision |
+| `exec-write` | ✅ CAPTURED | fork race handled first; exec then re-installs breakpoints in the new image |
+| `grandchild-write` | ✅ CAPTURED | recursive application of the fork attach path |
 
-Sample intercept trace:
+All six cases verified independently against a fresh set of paths: host output ABSENT, shadow output PRESENT, content matches the expected fixture bytes (`libc`, `fork`, `grandchild`), tracer and every supervised process exited 0.
 
-```
-INTERCEPT: pid=… tid=… __open
-OPEN[old]: /tmp/umbra-gate2-fork-write
-OPEN[new]: /tmp/umbra-nfs-stub/tmp/umbra-gate2-fork-write
-```
+Structured evidence at `experiments/tracer/results/v2/matrix.json`; per-case logs in the same directory.
 
-### Descendant capture: ❌ (with the current disposable Python prototype)
+### How the fork race was eliminated
 
-| Fixture | Result | Failure mode |
-|---|---|---|
-| Track D `fork-write` | ❌ | Parent captured; `FORK[entry]` fires; child gets SIGTRAP (breakpoint set on parent inherited COW into the child's address space; LLDB's `follow-fork-mode child` does not re-arm cleanly on this LLDB/debugserver combo). Child dies with `signal=5`, `errno=10 (No child processes)` in the fixture. |
-| Track D `posix-spawn-write` | ❌ | `SPAWN[attach]` reports suspended child at pid X + `SPAWN[attached]`, then child hit with SIGHUP after resume. Attach transient. |
-| Track D `exec-write` | ❌ | Fixture forks then execs; hits the fork race first. |
-| Track D `grandchild-write` | ❌ | Fork race, deeper. |
-| Track D `dup-inherit-write` | (not tested) | Not run in this pass. |
+The original v1 attempt failed at fork because the parent's software breakpoints (svc trap replacement bytes) are COW-inherited into the child's address space. The child hits an inherited breakpoint before any debugger is attached to it; with no handler, it dies via SIGTRAP.
 
-The tracer implementation is honest about this: Track A's own README states "no manual pre-mutation fork attach mechanism was established" and "follow-fork-mode child … whether this debugserver actually captures the child is unverified." That's now empirically confirmed for the current prototype.
+Codex's v2 fix: **patch `svc+4` in the parent (the fork return site) to `b .` — an infinite branch-to-self — before executing the fork syscall.** The child inherits that spin, cannot reach any inherited syscall trap, and holds its own PC at the `b .` until the tracer's attach completes. After attach, the tracer:
 
-### Correlation with M0 exit criteria (§12)
+1. Restores the original instruction at `svc+4` in both parent and child.
+2. Restores the original bytes at all other inherited software breakpoint sites in the child (LLDB then reinstalls the child's own breakpoints in its own address space, tracked separately).
+3. Continues both processes.
+
+Hardware breakpoints alone (my original proposal) were not sufficient — codex tested and reported this. The `b .` gate is the trick.
+
+### Related fixes codex delivered along the way
+
+- **SIGHUP suppression** on newly attached children via `SBUnixSignals` (fixed posix_spawn).
+- **`__wait4` / `__wait4_nocancel` breakpoints** that defer the parent's blocking wait until the supervised child actually exits. Debugger attachment temporarily reparents the child, which without this fix produces ECHILD in the parent's `waitpid()`. Return breakpoints track reaped children.
+- **Exec-time breakpoint preservation**: at the early dyld stop after exec, libsystem_kernel is not yet loaded, but module-relative breakpoints are retained and re-resolved as dyld maps the image. Raw syscall sites are re-scanned in the new main executable.
+- **Embedded watchdog**: the external `bounded_run.py` was folded into the tracer, so `umbra_tracer.py` is now self-contained (33 KB, 666 lines).
+
+## M0 exit criteria (§12) — status
 
 | Criterion | Status |
 |---|---|
-| 1. Task control of vendor binaries without unacceptable system-security configuration | ✅ (Gate 1 resign path + DevToolsSecurity -enable) |
-| 2. All supported child creation paths captured before first mutation | ❌ (this gate — Python prototype does not implement race-free descendant handoff) |
+| 1. Task control of vendor binaries without unacceptable system-security configuration | ✅ (Gate 1 resign path + `sudo DevToolsSecurity -enable`) |
+| 2. All supported child creation paths captured before first mutation | ✅ (this gate — v2 tracer, all six fixtures) |
 | 3. Fail-closed policy grants writes only under the NFS shadow | ✅ (Gate 3) |
 | 4. Direct arm64 syscall sites trapped with stable stepping | ✅ (open-svc case) |
 
-Three of four criteria met. Criterion 2 is the substantive open question and, per handoff §12, is the go / no-go for shipping the strict native-macOS contract.
+Per handoff §12: "Go only if all of these hold." **All four criteria hold.** The plan graduates from disposable Python prototype to the Rust supervisor (M1).
 
-## What Track A built (all intact, all works; runtime numbers now measured above)
+## What still needs qualification (the honest list)
 
-The tracer at `experiments/tracer/umbra_tracer.py` (20 KB) implements:
+The prototype proves the mechanisms are achievable; several things remain for M1+ engineering:
 
-- **Hash-keyed resigned-twin cache** at `~/Library/Caches/umbra/twins/<sha256>/<basename>`; adopts the Gate-1 ent.plist + preserve-metadata flags; verifies signature after re-sign; detects and repairs corrupted cache entries; invalidates on source-hash change.
-- **Direct syscall-site breakpoints** in `libsystem_kernel` at the arm64 `svc #0x80` instructions. Verified offline (`experiments/tracer/results/abi-disassembly.log`) and hit at runtime:
-  - `__open` = syscall 5, path in `x0`
-  - `__open_nocancel` = 398, path in `x0`
-  - `__openat` = 463, path in `x1`
-  - `__openat_nocancel` = 464, path in `x1`
-  - `__execve` = 59, `__posix_spawn` = 244, `__fork` = 2 (with stack prologue before the `svc`)
-- **Direct-syscall (raw `svc`) coverage**: aligned-instruction scan of the main Mach-O code sections for `svc #0x80`; dispatch by `x16` at each hit. Found and hit Track D's raw open site.
-- **Runtime open handler:** bounded (4 KiB) path read; non-UTF-8 preservation; scratch memory allocation for the rewritten path; register update (`x0`/`x1`) to point at scratch; `OPEN[old]` / `OPEN[new]` logging. Rewrites *all* opens including reads — a real supervisor will need to distinguish read-through-to-base from copy-up-to-shadow, per handoff §4.2.
-- **Exec interception:** resigns the new target and rewrites the exec path arg to the twin. Does not yet rewrite `argv[0]` back to the vendor path.
-- **`posix_spawn` interception:** handles null-attribute/null-file-actions case only. Uses `POSIX_SPAWN_START_SUSPENDED` injection; pinned to macOS 26.5.1's private descriptor layout. Attach succeeds; child cleanup post-resume is where it breaks.
-- **Fork/vfork:** `settings set target.process.follow-fork-mode child`. Not sufficient — see failure matrix above.
+- **Multithreaded fork.** The v2 tracer's fork gating rejects multithreaded processes. Real agents may spawn worker threads before forking; the `b .` gate needs to interact correctly with sibling threads.
+- **Raw `vfork`.** Rejected in v2. Modern code prefers `posix_spawn`, but coverage should be principled, not accidental.
+- **`posix_spawn` with non-null attributes / file actions.** v2 handles the null case only; the pinned macOS 26.5.1 private descriptor layout must be generalised.
+- **`WNOHANG` / stopped/continued wait options / process-group wait selection.** Code paths exist for some but aren't fixture-exercised.
+- **Exec `argv[0]` rewrite to preserve vendor path** for `getprogname()`.
+- **Copy-up semantics** (§4.2): distinguish read-through-to-base from write-triggering-materialisation. The current tracer rewrites *all* opens including reads, which will break arbitrary applications that read from paths not populated in the shadow.
+- **Rosetta / newly executable mappings / JIT code** (§6.6).
+- **Relative paths, dirfds, symlink containment, hard links** (§4.2-4.4).
+- **Real NFS durability** (§9) — the fixture protocol uses `/tmp/umbra-nfs-stub/`, not the actual mount.
+- **Fail-closed enforcement** (§3, §6.5): the tracer is not a sandbox. Track C's `umbra.sb` profile is separate; the two must be composed for the strict contract.
+- **`dup-inherit-write`** was not tested in the v2 six-case protocol (though implemented in the fixtures).
 
-## What the Rust supervisor needs to do differently for criterion 2
+These are M1+ work items, not M0 gates.
 
-Descendant capture is the primary M1 engineering problem, not a "polish the Python prototype" problem. Direction:
+## Setup prerequisite (documented for reproducers)
 
-- **`posix_spawn` capture:** use `POSIX_SPAWN_START_SUSPENDED` (already the approach) but with a separate `debugserver` per child rather than trying to hand off LLDB's own session. Own the child's task port from `task_for_pid` at attach time; install the syscall-stub breakpoints in the child's address space before `task_resume`. Handle non-null spawn attributes and file actions (rewrite them in-place if they refer to logical paths).
-- **`fork` capture:** the harder case. Options: (a) prohibit `fork` in supervised code (few modern agents actually fork without immediately exec'ing — enforce fork-then-exec-only invariant, then handle via the spawn/exec path), (b) implement a proper `PT_ATTACHEXC` on the child from a helper thread that races the child's user-code entry, (c) inject a stub via `mprotect` + code patching at `_dyld_start` in the child (heavy). Option (a) is my recommendation: pragmatically eliminate the race by policy.
-- **Simultaneous parent + child supervision:** each child gets its own `debugserver` instance rather than trying to multiplex LLDB sessions. The Rust supervisor is the multi-session orchestrator on top.
+The tracer requires `sudo /usr/sbin/DevToolsSecurity -enable` to have been run once (adds the user to `_developer`). That is sufficient on macOS 26.5.1 — `taskgated` then grants `task_for_pid` to LLDB / `debugserver` (which carries Apple's private `com.apple.private.cs.debugger` entitlement) at the kernel level, non-interactively, for callers in `_developer`. No auth db policy modification, no signed umbra binary required.
+
+Diagnostic note: `security authorize -e system.privilege.taskport` returns `NO (-60007)` even when DevToolsSecurity is enabled — that's a separate code path (`AuthorizationServices`) that debuggers do not use. Do not rely on it as a health check.
 
 ## Reproducer
 
-- Tracer: `experiments/tracer/umbra_tracer.py`
+- Tracer (v2, self-contained): `experiments/tracer/umbra_tracer.py`
+- Codex's own analysis of the v2 fix: `experiments/tracer/REPORT-v2.md`
+- Structured verification: `experiments/tracer/results/v2/matrix.json` and per-case logs
+- Verifier: `/usr/bin/python3 experiments/tracer/verify_v2.py` (rebuilds the matrix)
 - Single-case invocation: `/usr/bin/python3 experiments/tracer/umbra_tracer.py [--redirect-root ROOT] [--timeout SECONDS] <target> [args...]`
-- Full six-case matrix: `experiments/tracer/run_gate2.py --timeout 30`
-- End-to-end demo: `experiments/tracer/demo.sh`
-- Offline verification: `experiments/tracer/verify_static.py`
-- Per-case logs from the earlier BLOCKED run: `experiments/tracer/results/`
+- End-to-end demo (libc-open case only): `experiments/tracer/demo.sh`
+- v1 (blocked) evidence, kept for history: `experiments/tracer/results/` (top level)

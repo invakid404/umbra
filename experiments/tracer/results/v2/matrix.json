@@ -1,0 +1,65 @@
+{
+  "tracer_sha256": "f80647f31f808ce384192b66090803524cf3f6a4128aed6dcc059107d7e2bca0",
+  "cases": [
+    {
+      "case": "open-libc",
+      "exit_code": 0,
+      "host": "/tmp/umbra-gate2-v2-open-libc",
+      "shadow": "/tmp/umbra-nfs-stub/tmp/umbra-gate2-v2-open-libc",
+      "host_present": false,
+      "shadow_present": true,
+      "content_matches": true,
+      "status": "CAPTURED"
+    },
+    {
+      "case": "open-svc",
+      "exit_code": 0,
+      "host": "/tmp/umbra-gate2-v2-open-svc",
+      "shadow": "/tmp/umbra-nfs-stub/tmp/umbra-gate2-v2-open-svc",
+      "host_present": false,
+      "shadow_present": true,
+      "content_matches": true,
+      "status": "CAPTURED"
+    },
+    {
+      "case": "fork-write",
+      "exit_code": 0,
+      "host": "/tmp/umbra-gate2-v2-fork-write",
+      "shadow": "/tmp/umbra-nfs-stub/tmp/umbra-gate2-v2-fork-write",
+      "host_present": false,
+      "shadow_present": true,
+      "content_matches": true,
+      "status": "CAPTURED"
+    },
+    {
+      "case": "posix-spawn-write",
+      "exit_code": 0,
+      "host": "/tmp/umbra-gate2-v2-posix-spawn-write",
+      "shadow": "/tmp/umbra-nfs-stub/tmp/umbra-gate2-v2-posix-spawn-write",
+      "host_present": false,
+      "shadow_present": true,
+      "content_matches": true,
+      "status": "CAPTURED"
+    },
+    {
+      "case": "exec-write",
+      "exit_code": 0,
+      "host": "/tmp/umbra-gate2-v2-exec-write",
+      "shadow": "/tmp/umbra-nfs-stub/tmp/umbra-gate2-v2-exec-write",
+      "host_present": false,
+      "shadow_present": true,
+      "content_matches": true,
+      "status": "CAPTURED"
+    },
+    {
+      "case": "grandchild-write",
+      "exit_code": 0,
+      "host": "/tmp/umbra-gate2-v2-grandchild-write",
+      "shadow": "/tmp/umbra-nfs-stub/tmp/umbra-gate2-v2-grandchild-write",
+      "host_present": false,
+      "shadow_present": true,
+      "content_matches": true,
+      "status": "CAPTURED"
+    }
+  ]
+}

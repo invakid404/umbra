@@ -1,0 +1,80 @@
+TWIN[hit]: /Users/inva/umbra-scratch/fixtures/umbra-test-child -> /Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1/umbra-test-child
+BREAKPOINT: __open svc file-address=0x1804ae690 path=x0
+BREAKPOINT: __open_nocancel svc file-address=0x1804ae944 path=x0
+BREAKPOINT: __openat svc file-address=0x1804af5ac path=x1
+BREAKPOINT: __openat_nocancel svc file-address=0x1804b3950 path=x1
+BREAKPOINT: __execve svc file-address=0x1804badcc path=x0
+BREAKPOINT: __posix_spawn svc file-address=0x1804b50d8 path=x1
+BREAKPOINT: __fork svc file-address=0x1804b58fc path=None
+BREAKPOINT: __wait4 svc file-address=0x1804b5474 path=None
+BREAKPOINT: __wait4_nocancel svc file-address=0x1804ba2a4 path=None
+RAW-SCAN: main executable svc sites=1
+LAUNCH: /Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1/umbra-test-child
+LAUNCHED: pid=79828
+SIGNAL[suppressed]: pid=79828 signal=17
+INTERCEPT: pid=79828 tid=35653556 __open
+ABI[__open]: svc #0x80; b.lo 0x18c9d26b4; pacibsp ; stp x29, x30, [sp, #-0x10]!; mov x29, sp; bl 0x18c9d35d4; mov sp, x29; ldp x29, x30, [sp], #0x10
+OPEN[old]: /Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1
+OPEN[new]: /tmp/umbra-nfs-stub/Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1
+INTERCEPT: pid=79828 tid=35653556 __open
+OPEN[old]: /Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1
+OPEN[new]: /tmp/umbra-nfs-stub/Users/inva/Library/Caches/umbra/twins/a3a95a71817b5bd3c2c3b06cc06888a9bc679af875cc626914404012d68fdda1
+INTERCEPT: pid=79828 tid=35653556 __fork
+ABI[__fork]: svc #0x80; b.hs 0x18c9d9924; cbz x1, 0x18c9d992c; adrp x9, 442824; add x9, x9, #0xe58; mov w0, #0x0; str w0, [x9]; mov sp, x29
+FORK[entry]: pid=79828; hardware return=0x18c9d9900
+INTERCEPT: pid=79828 tid=35653556 11
+ABI[11]: b 0x18c9d9900; cbz x1, 0x18c9d992c; adrp x9, 442824; add x9, x9, #0xe58; mov w0, #0x0; str w0, [x9]; mov sp, x29; ldp x29, x30, [sp], #0x10
+FORK[attach]: pid=79840
+FORK[restored]: pid=79840; inherited sites=11
+BREAKPOINT: __open svc file-address=0x1804ae690 path=x0
+BREAKPOINT: __open_nocancel svc file-address=0x1804ae944 path=x0
+BREAKPOINT: __openat svc file-address=0x1804af5ac path=x1
+BREAKPOINT: __openat_nocancel svc file-address=0x1804b3950 path=x1
+BREAKPOINT: __execve svc file-address=0x1804badcc path=x0
+BREAKPOINT: __posix_spawn svc file-address=0x1804b50d8 path=x1
+BREAKPOINT: __fork svc file-address=0x1804b58fc path=None
+BREAKPOINT: __wait4 svc file-address=0x1804b5474 path=None
+BREAKPOINT: __wait4_nocancel svc file-address=0x1804ba2a4 path=None
+RAW-SCAN: main executable svc sites=1
+FORK[attached]: pid=79840; pending initial debugger stop
+SIGNAL[suppressed]: pid=79840 signal=17
+INTERCEPT: pid=79828 tid=35653556 __wait4
+ABI[__wait4]: svc #0x80; b.lo 0x18c9d9498; pacibsp ; stp x29, x30, [sp, #-0x10]!; mov x29, sp; bl 0x18c9d35d4; mov sp, x29; ldp x29, x30, [sp], #0x10
+WAIT[deferred]: pid=79828 child=79840
+INTERCEPT: pid=79840 tid=35653601 __fork
+ABI[__fork]: svc #0x80; b.hs 0x18c9d9924; cbz x1, 0x18c9d992c; adrp x9, 442824; add x9, x9, #0xe58; mov w0, #0x0; str w0, [x9]; mov sp, x29
+FORK[entry]: pid=79840; hardware return=0x18c9d9900
+INTERCEPT: pid=79840 tid=35653601 11
+ABI[11]: b 0x18c9d9900; cbz x1, 0x18c9d992c; adrp x9, 442824; add x9, x9, #0xe58; mov w0, #0x0; str w0, [x9]; mov sp, x29; ldp x29, x30, [sp], #0x10
+FORK[attach]: pid=79851
+FORK[restored]: pid=79851; inherited sites=11
+BREAKPOINT: __open svc file-address=0x1804ae690 path=x0
+BREAKPOINT: __open_nocancel svc file-address=0x1804ae944 path=x0
+BREAKPOINT: __openat svc file-address=0x1804af5ac path=x1
+BREAKPOINT: __openat_nocancel svc file-address=0x1804b3950 path=x1
+BREAKPOINT: __execve svc file-address=0x1804badcc path=x0
+BREAKPOINT: __posix_spawn svc file-address=0x1804b50d8 path=x1
+BREAKPOINT: __fork svc file-address=0x1804b58fc path=None
+BREAKPOINT: __wait4 svc file-address=0x1804b5474 path=None
+BREAKPOINT: __wait4_nocancel svc file-address=0x1804ba2a4 path=None
+RAW-SCAN: main executable svc sites=1
+FORK[attached]: pid=79851; pending initial debugger stop
+SIGNAL[suppressed]: pid=79851 signal=17
+INTERCEPT: pid=79840 tid=35653601 __wait4
+ABI[__wait4]: svc #0x80; b.lo 0x18c9d9498; pacibsp ; stp x29, x30, [sp, #-0x10]!; mov x29, sp; bl 0x18c9d35d4; mov sp, x29; ldp x29, x30, [sp], #0x10
+WAIT[deferred]: pid=79840 child=79851
+INTERCEPT: pid=79851 tid=35653632 __open
+ABI[__open]: svc #0x80; b.lo 0x18c9d26b4; pacibsp ; stp x29, x30, [sp, #-0x10]!; mov x29, sp; bl 0x18c9d35d4; mov sp, x29; ldp x29, x30, [sp], #0x10
+OPEN[old]: /tmp/umbra-gate2-v2-standalone
+OPEN[new]: /tmp/umbra-nfs-stub/tmp/umbra-gate2-v2-standalone
+EXIT: pid=79851 status=0 
+WAIT[ready]: pid=79840
+INTERCEPT: pid=79840 tid=35653601 12
+ABI[12]: b.lo 0x18c9d9498; pacibsp ; stp x29, x30, [sp, #-0x10]!; mov x29, sp; bl 0x18c9d35d4; mov sp, x29; ldp x29, x30, [sp], #0x10; retab 
+EXIT: pid=79840 status=0 
+WAIT[ready]: pid=79828
+INTERCEPT: pid=79828 tid=35653556 12
+ABI[12]: b.lo 0x18c9d9498; pacibsp ; stp x29, x30, [sp, #-0x10]!; mov x29, sp; bl 0x18c9d35d4; mov sp, x29; ldp x29, x30, [sp], #0x10; retab 
+grandchild-write: child exit=0
+EXIT: pid=79828 status=0 
+SUMMARY: opens=3 exec_rewrites=0 fork_entries=2 spawn_entries=0

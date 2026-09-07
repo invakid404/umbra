@@ -9,6 +9,7 @@ from pathlib import Path
 import plistlib
 import platform
 import shutil
+import signal
 import subprocess
 import struct
 import sys
@@ -83,6 +84,59 @@ def resign(source):
     return str(twin)
 
 
+def process_snapshot():
+    """Record identities so the watchdog never kills a reused PID."""
+    output = subprocess.check_output(
+        ["/bin/ps", "-axo", "pid=,ppid=,lstart=,command="], text=True)
+    rows = {}
+    for line in output.splitlines():
+        parts = line.split(None, 7)
+        if len(parts) == 8:
+            rows[int(parts[0])] = (int(parts[1]), " ".join(parts[2:7]), parts[7])
+    return rows
+
+
+def run_bounded(argv, timeout):
+    """Bound even blocking LLDB attach calls; embedded for single-file use."""
+    process_snapshot()  # Fail before launch if inspection is unavailable.
+    child = subprocess.Popen(argv, start_new_session=True)
+    known = {}
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            rows = process_snapshot()
+            roots = {child.pid} | {pid for pid in known
+                                  if pid in rows and rows[pid][1:] == known[pid]}
+            changed = True
+            while changed:
+                changed = False
+                for pid, row in rows.items():
+                    if pid == child.pid or row[0] in roots:
+                        if pid not in roots:
+                            roots.add(pid)
+                            changed = True
+                        known[pid] = row[1:]
+            status = child.poll()
+            if status is not None:
+                return status
+            if time.monotonic() >= deadline:
+                log(f"TIMEOUT: {timeout}s: {argv[0]}")
+                return 124
+            time.sleep(0.1)
+    finally:
+        rows = process_snapshot()
+        for pid in reversed(list(known)):
+            if pid in rows and rows[pid][1:] == known[pid]:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    log(f"CLEANUP: killed owned pid={pid}")
+                except ProcessLookupError:
+                    pass
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
 class Tracer:
     def __init__(self, root, timeout):
         self.root = os.path.abspath(root)
@@ -96,7 +150,7 @@ class Tracer:
         self.forks = 0
         self.spawn_count = 0
         self.cli("settings set target.process.stop-on-exec true")
-        self.cli("settings set target.process.follow-fork-mode child")
+        self.cli("settings set target.process.follow-fork-mode parent")
         self.cli("settings set target.skip-prologue false")
 
     def cli(self, text):
@@ -105,6 +159,18 @@ class Tracer:
         if not result.Succeeded():
             log(f"SETTING[unsupported]: {text}: {result.GetError().strip()}")
         return result
+
+    @staticmethod
+    def suppress_signal(process, signo):
+        signals = process.GetUnixSignals()
+        if not (signals.SetShouldSuppress(signo, True) and
+                signals.SetShouldStop(signo, False) and
+                signals.SetShouldNotify(signo, False)):
+            raise RuntimeError(f"cannot suppress signal {signo} for pid={process.GetProcessID()}")
+
+    def child_signals(self, process):
+        for signo in (signal.SIGHUP, signal.SIGTRAP, signal.SIGSTOP):
+            self.suppress_signal(process, signo)
 
     def install(self, target):
         kinds = {}
@@ -117,6 +183,10 @@ class Tracer:
             ("__posix_spawn", "spawn", "x1"),
             # On this build both libc fork() and vfork() call __fork.
             ("__fork", "fork", None),
+            # Debugserver temporarily reparents attached children. Defer an
+            # actual wait until their exit makes them waitable again.
+            ("__wait4", "wait", None),
+            ("__wait4_nocancel", "wait", None),
         ]:
             contexts = target.FindFunctions(name)
             found = False
@@ -133,6 +203,12 @@ class Tracer:
                         break
             if not found:
                 raise RuntimeError(f"cannot find {name} syscall stub in local libsystem_kernel")
+        self.install_raw(target, kinds)
+        return {"target": target, "process": None, "kinds": kinds, "stop": -1,
+                "scratch": [], "abi": set(), "done": False, "pending_spawn": {},
+                "pending_fork": {}, "waiting": [], "parent": None, "reaped": False}
+
+    def install_raw(self, target, kinds):
         # Scan native executable code, not a fixture-specific symbol. This is
         # deliberately limited to the main Mach-O; dyld/JIT coverage is future work.
         def sections(section):
@@ -161,8 +237,6 @@ class Tracer:
                         kinds[bp.GetID()] = ("raw", None, "main-executable svc")
                         raw_sites += 1
         log(f"RAW-SCAN: main executable svc sites={raw_sites}")
-        return {"target": target, "process": None, "kinds": kinds, "stop": -1,
-                "scratch": [], "abi": set(), "done": False, "pending_spawn": {}}
 
     @staticmethod
     def reg(frame, name):
@@ -230,19 +304,35 @@ class Tracer:
         if kind == "spawn-return":
             self.spawn_return(session, thread, name)
             return
+        if kind == "fork-return":
+            self.fork_return(session, thread, name)
+            return
+        if kind == "wait-return":
+            session["target"].BreakpointDelete(int(name))
+            session["kinds"].pop(int(name))
+            if not self.reg(frame, "cpsr") & (1 << 29):
+                pid = self.reg(frame, "x0")
+                for child in self.sessions:
+                    if child["parent"] == process.GetProcessID() and child["process"].GetProcessID() == pid:
+                        child["reaped"] = True
+            return
         if kind == "raw":
             number = self.reg(frame, "x16")
             mapping = {5: ("open", "x0"), 398: ("open", "x0"),
                        463: ("open", "x1"), 464: ("open", "x1"),
                        59: ("exec", "x0"), 244: ("spawn", "x1"),
-                       2: ("fork", None), 66: ("fork", None)}
+                       2: ("fork", None), 66: ("fork", None),
+                       7: ("wait", None), 400: ("wait", None)}
             if number not in mapping:
                 raise RuntimeError(f"unsupported raw syscall {number}")
             kind, register = mapping[number]
             log(f"RAW[svc]: pid={process.GetProcessID()} syscall={number}")
         if kind == "fork":
             self.forks += 1
-            log(f"FORK[entry]: pid={process.GetProcessID()} {name}; follow-fork-mode=child (capture unproven)")
+            self.prepare_fork(session, thread)
+            return
+        if kind == "wait":
+            self.prepare_wait(session, thread)
             return
         old = self.path(process, self.reg(frame, register))
         if kind == "open":
@@ -265,8 +355,121 @@ class Tracer:
                 self.spawn_count += 1
                 self.prepare_spawn(session, thread, new)
 
+    def prepare_fork(self, session, thread):
+        frame = thread.GetFrameAtIndex(0)
+        target = session["target"]
+        pc = frame.GetPC()
+        # A return breakpoint in the parent alone cannot win an attach race.
+        # Both tasks inherit this branch-to-self, so the child waits in user
+        # space before reaching any inherited syscall software breakpoint.
+        process = session["process"]
+        if self.reg(frame, "x16") != 2:
+            raise RuntimeError("only fork syscall 2 supports the child gate; raw vfork is unsupported")
+        if process.GetNumThreads() != 1:
+            raise RuntimeError("fork gate requires a single-threaded process in this prototype")
+        restore = {pc + 4: self.read(process, pc + 4, 4)}
+        for bid in session["kinds"]:
+            entry = target.FindBreakpointByID(bid)
+            if entry.IsEnabled() and not entry.IsHardware():
+                for loc in entry:
+                    addr = loc.GetAddress().GetLoadAddress(target)
+                    if addr != lldb.LLDB_INVALID_ADDRESS:
+                        restore[addr] = self.read(process, addr, 4)
+        self.write(process, pc + 4, b"\x00\x00\x00\x14")  # b .
+        bp = target.BreakpointCreateByAddress(pc + 4)
+        error = bp.SetIsHardware(True)
+        if error.Fail() or not bp.IsHardware():
+            raise RuntimeError(f"fork return hardware breakpoint: {error}")
+        bp.SetThreadID(thread.GetThreadID())
+        disabled = []
+        for bid in session["kinds"]:
+            entry = target.FindBreakpointByID(bid)
+            if any(loc.GetAddress().GetLoadAddress(target) == pc for loc in entry):
+                entry.SetEnabled(False)
+                disabled.append(bid)
+        key = str(bp.GetID())
+        session["pending_fork"][key] = (disabled, restore, pc + 4)
+        session["kinds"][bp.GetID()] = ("fork-return", None, key)
+        log(f"FORK[entry]: pid={session['process'].GetProcessID()}; hardware return={pc + 4:#x}")
+
+    def fork_return(self, session, thread, key):
+        frame = thread.GetFrameAtIndex(0)
+        disabled, restore, gate = session["pending_fork"].pop(key)
+        session["target"].BreakpointDelete(int(key))
+        session["kinds"].pop(int(key))
+        for bid in disabled:
+            session["target"].FindBreakpointByID(bid).SetEnabled(True)
+        self.write(session["process"], gate, restore[gate])
+        if self.reg(frame, "cpsr") & (1 << 29):
+            log(f"FORK[failed]: errno={self.reg(frame, 'x0')}")
+            return
+        pid = self.reg(frame, "x0")
+        if pid <= 0:
+            raise RuntimeError(f"invalid fork child PID: {pid}")
+        twin = str(session["target"].GetExecutable())
+        self.attach_child(session, pid, twin, "FORK", restore)
+
+    @staticmethod
+    def write(process, address, data):
+        error = lldb.SBError()
+        count = process.WriteMemory(address, data, error)
+        if error.Fail() or count != len(data):
+            raise RuntimeError(f"write {address:#x}/{len(data)}: {error}")
+
+    def attach_child(self, parent, pid, twin, kind, restore=None):
+        log(f"{kind}[attach]: pid={pid}")
+        target = self.debugger.CreateTarget(twin)
+        # A freshly spawned image is still at dyld entry, before shared-cache
+        # modules are loaded. Resolve its file breakpoints before attachment.
+        child = {"target": target, "process": None} if restore else self.install(target)
+        self.sessions.append(child)
+        error = lldb.SBError()
+        child["process"] = target.AttachToProcessWithID(self.listener, pid, error)
+        if error.Fail():
+            raise RuntimeError(f"attach child {pid}: {error}")
+        self.child_signals(child["process"])
+        if restore:
+            for address, data in restore.items():
+                self.write(child["process"], address, data)
+            log(f"FORK[restored]: pid={pid}; inherited sites={len(restore)}")
+        process = child["process"]
+        if restore:
+            child.update(self.install(target))
+        child["process"] = process
+        child["parent"] = parent["process"].GetProcessID()
+        log(f"{kind}[attached]: pid={pid}; pending initial debugger stop")
+
+    def prepare_wait(self, session, thread):
+        frame = thread.GetFrameAtIndex(0)
+        wanted = ctypes.c_int32(self.reg(frame, "x0") & 0xffffffff).value
+        children = [s for s in self.sessions
+                    if s["parent"] == session["process"].GetProcessID() and not s["reaped"]]
+        if wanted > 0:
+            children = [s for s in children if s["process"].GetProcessID() == wanted]
+        elif wanted != -1 and children:
+            raise RuntimeError("wait4 process-group selection is not implemented for supervised children")
+        if not children:
+            return
+        options = self.reg(frame, "x2")
+        if options & ~1:
+            raise RuntimeError("only exit waits and WNOHANG are implemented for supervised children")
+        ready = any(s["done"] for s in children)
+        if options & 1 and not ready:  # WNOHANG: live traced children, none ready
+            self.setreg(frame, "x0", 0)
+            self.setreg(frame, "cpsr", self.reg(frame, "cpsr") & ~(1 << 29))
+            self.setreg(frame, "pc", frame.GetPC() + 4)
+            return
+        if session["process"].GetNumThreads() != 1:
+            raise RuntimeError("deferred wait4 requires a single-threaded process in this prototype")
+        bp = session["target"].BreakpointCreateByAddress(frame.GetPC() + 4)
+        bp.SetThreadID(thread.GetThreadID())
+        session["kinds"][bp.GetID()] = ("wait-return", None, str(bp.GetID()))
+        if not ready:
+            session["waiting"] = children
+            log(f"WAIT[deferred]: pid={session['process'].GetProcessID()} child={wanted}")
+
     def prepare_spawn(self, session, thread, twin):
-        """Pinned, null-attributes/file-actions spawn probe; runtime unverified.
+        """Pinned, null-attributes/file-actions suspended-spawn probe.
 
         The local 25F80 posix_spawn disassembly passes a 144-byte descriptor
         with (size, pointer) pairs, and sizeof(*attr) == 248. Use the host's
@@ -316,14 +519,7 @@ class Tracer:
         if pid <= 0:
             raise RuntimeError(f"invalid spawn child PID: {pid}")
         log(f"SPAWN[attach]: suspended pid={pid}")
-        target = self.debugger.CreateTarget(twin)
-        child = self.install(target)
-        self.sessions.append(child)
-        error = lldb.SBError()
-        child["process"] = target.AttachToProcessWithID(self.listener, pid, error)
-        if error.Fail():
-            raise RuntimeError(f"attach suspended child {pid}: {error}")
-        log(f"SPAWN[attached]: pid={pid}; pending initial debugger stop")
+        self.attach_child(session, pid, twin, "SPAWN")
 
     def drain(self, process):
         for getter, stream in [(process.GetSTDOUT, sys.stdout), (process.GetSTDERR, sys.stderr)]:
@@ -362,6 +558,14 @@ class Tracer:
                 p = current["process"]
                 self.drain(p)
                 state = p.GetState()
+                if current["waiting"]:
+                    if any(child["done"] for child in current["waiting"]):
+                        current["waiting"] = []
+                        log(f"WAIT[ready]: pid={p.GetProcessID()}")
+                        err = p.Continue()
+                        if err.Fail():
+                            raise RuntimeError(f"continue wait: {err}")
+                    continue
                 if state == lldb.eStateExited:
                     current["done"] = True
                     current["exit"] = p.GetExitStatus()
@@ -374,11 +578,18 @@ class Tracer:
                         reason = thread.GetStopReason()
                         if reason == lldb.eStopReasonExec:
                             current["scratch"].clear()
-                            for bid in list(current["kinds"]):
-                                current["target"].BreakpointDelete(bid)
-                            replacement = self.install(current["target"])
-                            current["kinds"] = replacement["kinds"]
+                            current["abi"].clear()
+                            # Exec stops at dyld entry, before libsystem is
+                            # loaded. Keep its module-relative breakpoints:
+                            # LLDB resolves them as the shared cache loads.
+                            # Only executable svc sites belong to the old image.
+                            for bid, item in list(current["kinds"].items()):
+                                if item[0] in ("raw", "spawn-return", "fork-return", "wait-return"):
+                                    current["target"].BreakpointDelete(bid)
+                                    current["kinds"].pop(bid)
+                            self.install_raw(current["target"], current["kinds"])
                             current["pending_spawn"].clear()
+                            current["pending_fork"].clear()
                             log(f"EXEC[stop]: pid={p.GetProcessID()}")
                         elif reason == lldb.eStopReasonBreakpoint:
                             seen = set()
@@ -389,13 +600,24 @@ class Tracer:
                                     if item[:2] not in seen:
                                         self.hit(current, thread, *item)
                                         seen.add(item[:2])
-                        elif reason in (lldb.eStopReasonSignal, lldb.eStopReasonException):
-                            if not (current["stop"] <= 1 and reason == lldb.eStopReasonSignal and
-                                    thread.GetStopReasonDataAtIndex(0) in (5, 17)):
+                        elif reason == lldb.eStopReasonSignal:
+                            signo = thread.GetStopReasonDataAtIndex(0)
+                            # Attach transients and non-fatal notifications must
+                            # not be re-delivered by Continue(). Preserve fatal
+                            # faults as errors rather than looping over them.
+                            allowed = (signal.SIGHUP, signal.SIGTRAP, signal.SIGSTOP,
+                                       signal.SIGCHLD, signal.SIGCONT, signal.SIGWINCH,
+                                       signal.SIGURG, signal.SIGIO)
+                            if signo not in allowed:
                                 raise RuntimeError(f"pid={p.GetProcessID()} stopped: {thread.GetStopDescription(1024)}")
-                    err = p.Continue()
-                    if err.Fail():
-                        raise RuntimeError(f"continue: {err}")
+                            self.suppress_signal(p, signo)
+                            log(f"SIGNAL[suppressed]: pid={p.GetProcessID()} signal={signo}")
+                        elif reason == lldb.eStopReasonException:
+                            raise RuntimeError(f"pid={p.GetProcessID()} stopped: {thread.GetStopDescription(1024)}")
+                    if not current["waiting"]:
+                        err = p.Continue()
+                        if err.Fail():
+                            raise RuntimeError(f"continue: {err}")
             if not active:
                 log(f"SUMMARY: opens={self.opens} exec_rewrites={self.execs} fork_entries={self.forks} spawn_entries={self.spawn_count}")
                 return max(s.get("exit", 1) for s in self.sessions)
@@ -425,9 +647,8 @@ def main():
     if options.timeout <= 0:
         parser.error("--timeout must be positive")
     if not options.worker:
-        from bounded_run import run
         try:
-            return run([sys.executable, str(Path(__file__).resolve()), "--worker"] + sys.argv[1:], options.timeout)
+            return run_bounded([sys.executable, str(Path(__file__).resolve()), "--worker"] + sys.argv[1:], options.timeout)
         except (OSError, subprocess.SubprocessError) as error:
             log(f"ERROR: watchdog needs permission to inspect its subprocess tree: {error}")
             return 1
