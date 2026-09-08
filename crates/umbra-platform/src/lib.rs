@@ -27,9 +27,9 @@
 #![deny(missing_docs)]
 
 pub use umbra_core::{
-    EmulatedResult, FsOp, LaunchSpec, PlatformCapabilities, PreparedRewrite, ProcessHandle,
-    QuiescedTree, RegisterSet, Result, ResumeCommand, TaskId, TerminationPolicy, ThreadId,
-    TraceEvent,
+    BytePath, EmulatedResult, FsOp, LaunchSpec, PlatformCapabilities, PreparedRewrite,
+    ProcessHandle, QuiescedTree, RegisterSet, Result, ResumeCommand, TaskId, TerminationPolicy,
+    ThreadId, TraceEvent,
 };
 
 /// Owns the tracing transport and process-tree interception boundary.
@@ -110,6 +110,32 @@ pub trait TraceControl: TraceBackend {
     /// Terminate the supervised tree according to policy while retaining enforcement.
     /// Controller loss must keep tracees stopped or terminate them safely.
     fn terminate(&mut self, process: ProcessHandle, policy: TerminationPolicy) -> Result<()>;
+
+    /// Prepare an executable path rewrite for a stopped thread's current syscall.
+    ///
+    /// The namespace has already journaled preparation and, where required, has
+    /// created or copied up the target; `operation` is therefore the *prepared*
+    /// operation, whose flags may differ from the ones the tracee issued. The
+    /// backend allocates bounded scratch memory in the tracee, validates the path
+    /// operand slots for this ABI, and returns the argument and memory writes that
+    /// would redirect the call. It performs none of those writes and resumes
+    /// nothing: this is a plan, not an applied rewrite.
+    ///
+    /// Reject multi-path operations and operand slots the backend cannot address.
+    /// The default refuses, so a backend without a qualified scratch mechanism
+    /// cannot be mistaken for one that has it.
+    fn prepare_rewrite(
+        &mut self,
+        _thread: ThreadId,
+        _path: &BytePath,
+        _operation: FsOp,
+    ) -> Result<PreparedRewrite> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "platform.prepare_rewrite",
+            "backend cannot prepare syscall path rewrites",
+        ))
+    }
 }
 
 /// Paired objects returned by a platform factory after session/ABI negotiation.

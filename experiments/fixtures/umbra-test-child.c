@@ -77,7 +77,7 @@ static int open_write(const char *path, int direct)
     int fd = direct ? raw_open(path) : open(path, open_flags, 0644);
     if (fd < 0)
         return error_line(direct ? "svc open" : "open", errno);
-    int result = write_all(fd, "libc\n", 5);
+    int result = write_all(fd, "libc\n", sizeof("libc\n") - 1);
     if (close(fd) < 0)
         result = error_line("close", errno);
     return result;
@@ -115,7 +115,7 @@ static int fork_write(const char *path)
         int fd = open(path, open_flags, 0644);
         if (fd < 0)
             _exit(error_line("child open", errno));
-        int result = write_all(fd, "fork\n", 5);
+        int result = write_all(fd, "fork\n", sizeof("fork\n") - 1);
         _exit(result); /* Kernel closes the descriptor. */
     }
     if (pid < 0)
@@ -166,7 +166,7 @@ static int grandchild_write(const char *path)
             int fd = open(path, open_flags, 0644);
             if (fd < 0)
                 _exit(error_line("grandchild open", errno));
-            _exit(write_all(fd, "grandchild\n", 11));
+            _exit(write_all(fd, "grandchild\n", sizeof("grandchild\n") - 1));
         }
         if (grandchild < 0)
             _exit(error_line("grandchild fork", errno));
@@ -185,7 +185,7 @@ static int dup_inherit_write(const char *path)
         return error_line("parent open", errno);
     pid_t pid = fork();
     if (pid == 0)
-        _exit(write_all(fd, "dup\n", 4));
+        _exit(write_all(fd, "dup\n", sizeof("dup\n") - 1));
     if (pid < 0) {
         int error = errno;
         close(fd);

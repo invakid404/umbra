@@ -21,7 +21,7 @@ use crate::StorageArgs;
 pub enum Command {
     /// Validate explicitly configured provider connections without starting a run.
     Providers(providers::ProviderArgs),
-    /// Start a supervised agent run (not implemented).
+    /// Start a supervised run over an explicit provider registry.
     Run(run::RunArgs),
     /// Stop a supervised run (not implemented).
     Stop(RunIdArgs),
@@ -55,11 +55,12 @@ impl Command {
     }
 }
 
+/// Report an unimplemented command without echoing its arguments: argv and
+/// environment can carry paths and secrets that have no business in a log line.
 fn not_implemented(
     command: &'static str,
-    args: &impl std::fmt::Debug,
-    storage: &StorageArgs,
+    _args: &impl std::fmt::Debug,
+    _storage: &StorageArgs,
 ) -> Result<()> {
-    println!("{command}: {args:?}, {storage:?}");
     Err(UmbraError::not_implemented(command))
 }

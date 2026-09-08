@@ -10,7 +10,10 @@ is no NFS dependency and no host filesystem I/O in the library.
 Construction does no I/O. The owner must call `NamespaceSession::bind` with:
 
 - `SessionConfig`: the opened shadow run's `RunBinding`, fenced `RequestContext`
-  (with a unique session idempotency prefix), and the journal's `RecoveryState`.
+  (with a unique session idempotency prefix), the journal's `RecoveryState`, and
+  the `WriterLease` those sessions mutate under. The lease lives here so that one
+  owner renews, releases and mutates through the same storage session, rather than
+  a second mutable session being opened just to hold authority.
 - An approved, immutable `Box<dyn Base>`. `StorageBase` adapts another opened
   `Storage` run to this read-only contract. The owner freezes that base for the
   session and validates its fingerprint; the overlay never opens arbitrary host
@@ -182,3 +185,34 @@ loop bounds, symlink escape and unchecked physical-link rejection, rename identi
 base symlink copy-up, journal failures, transaction ordering and checkpoints.
 APFS configurations that reject non-UTF-8 filenames still run byte resolver and
 marker checks; actual raw-name filesystem I/O is conditional on native support.
+
+## Run lifecycle
+
+`NamespaceSession` adds three lifecycle methods, each defaulting to a refusal so a
+provider that does not implement them cannot be handed a run:
+
+- `renew_writer` renews the injected lease through this session's own storage. A
+  refused or epoch-advanced renewal is `LeaseLost`: authority is gone or unproven,
+  and the caller must stop resuming tracees rather than retry into a mutation.
+  Renewal is permitted while a transaction is pending, so an in-flight syscall
+  cannot starve the lease it mutates under.
+- `finish_run` durably completes a fresh command run: flush run data, append and
+  flush a `RunCompleted` record, close the journal, release the writer, close
+  storage. A receipt is returned only when every step succeeded. This is not a
+  resumable checkpoint and authorizes no takeover.
+- `fail_run` leaves the run explicitly failed. It writes no completion record and
+  publishes no checkpoint, and it releases the writer lease only when the request
+  carries evidence that the supervised tree is gone. Without that evidence the
+  writer marker is retained and the session is poisoned, so a later writer cannot
+  take over a run whose effects are uncertain.
+
+Each storage request derives its own `OperationId` from the pending transaction's
+identity (or the session's) plus a serial. One logical transaction issues several
+storage requests — a copy-up, its parent directories, the create itself — and a
+backend may bind an operation ID to the single idempotency key it was first used
+with, refusing a second, different request under it. Derivation is deterministic,
+so requests stay attributable to the operation the journal recorded.
+
+`umbra_supervisor` is the in-process owner that supplies all of the above; the
+namespace provider protocol carries no lifecycle calls, so an alternative
+namespace provider cannot yet own a run.

@@ -36,8 +36,28 @@ pub trait TraceControl: TraceBackend {
     fn capabilities(&self) -> PlatformCapabilities;
     fn quiesce(&mut self, process: ProcessHandle) -> Result<QuiescedTree>;
     fn terminate(&mut self, process: ProcessHandle, policy: TerminationPolicy) -> Result<()>;
+    fn prepare_rewrite(
+        &mut self,
+        thread: ThreadId,
+        path: &BytePath,
+        operation: FsOp,
+    ) -> Result<PreparedRewrite>;
 }
 ```
+
+`prepare_rewrite` plans a path redirection for a stopped thread's current syscall:
+the backend allocates bounded scratch memory in the tracee, validates the operand
+slots for its ABI, and returns the argument and memory writes that would perform
+the rewrite. It writes nothing and resumes nothing. `operation` is the *prepared*
+operation, whose flags may differ from the ones the tracee issued, because the
+namespace may already have created the target. It is the one method with a default
+implementation, and that default refuses, so a backend without a qualified scratch
+mechanism cannot be mistaken for one that has it.
+
+Every `LaunchSpec` carries a `SandboxRequirement`. A backend that accepts
+`Required(profile)` must apply that profile and return only once the target is
+stopped before its first instruction; if it cannot prove that boundary it must
+fail the launch, and it must not advertise `sandboxed-stopped-launch-v1`.
 
 Every `Result` is `umbra_core::Result`; errors retain category, operation/context,
 and optional platform errno. `decode_entry` returns `None` only for a positively

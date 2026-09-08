@@ -73,14 +73,36 @@ decodes JSON `Options` from opaque provider options (empty falls back to
 `Options::default()`). Register it via `umbra providers --registry <path>
 --role platform`.
 
-**Provider IPC.** `TraceBackend::launch` and the compatibility method
-`launch_experimental` share `native.rs::MacosTraceBackend::launch_traced`:
-both launch suspended, sanitize inherited descriptors, and install the same
-syscall interception loop before returning. Launch requires explicit
-`LocalDevelopment`, stdio descriptors only, absolute executable/cwd, and
-non-empty argv. A backend accepts one run, including after termination.
-The caller must rewrite write-intent opens before resuming; this remains the
-M1 feasibility tracer, without independent production sandbox qualification.
+**Launch and enforcement.** `TraceBackend::launch` and `launch_experimental`
+share `native.rs::MacosTraceBackend::launch_traced`: both launch suspended,
+sanitize inherited descriptors, and install the same syscall interception loop
+before returning. Launch requires explicit `LocalDevelopment` or
+`NfsClientFsync` persistence, stdio descriptors only, absolute executable/cwd,
+and non-empty argv. A backend accepts one run, including after termination.
+The caller must rewrite write-intent opens before resuming.
+
+The `SandboxRequirement` on the spec decides enforcement, and there is no
+default. `Required(profile)` launches an explicitly addressed
+`/usr/bin/sandbox-exec` — resigned as a twin, never reached through a shell —
+with the rendered profile as bounded argv and the target's own twin as the
+command. The backend then drives that trusted bootstrap internally, consuming
+its startup events rather than exposing them as workspace syscalls, and returns
+only at the target's exec stop, verified with `proc_pidpath` to be the intended
+image. That exec stop is the handoff boundary: the policy is in force and the
+target has not run an instruction. An installer that exits, forks, execs
+something else, or does not reach the exec within its event budget fails the
+launch, and the tree is killed rather than returned without a handle.
+`UnsandboxedExperiment` is the only way to run unenforced, it is a named
+selection rather than an omission, and `launch_experimental` accepts nothing
+else.
+
+The backend advertises `sandboxed-stopped-launch-v1` and
+`experimental-syscall-rewrite-v1`. `tests/sandbox_launch.rs` qualifies the first
+in both directions on this host: with interception rewriting the open, the
+payload lands in the shadow and the host destination stays absent; with the
+identical fixture and destination but no rewrite, the open fails `EPERM` and
+neither file appears, which is the only way to show the policy is real rather
+than that a launch merely failed.
 
 Invoke the shipped binary through a platform `ProviderDescriptor` and
 `umbra_core::provider::Client::connect`, then send `Request::Capabilities`,
@@ -112,6 +134,9 @@ It reads `UMBRA_TEST_FIXTURE_PATH` (path to `umbra-test-child`) and
 `UMBRA_TEST_REDIRECT_ROOT` (shadow root); when either env var is unset,
 each test body skips via `eprintln` — the binary still reports the cases as
 passed, so qualification requires the `CAPTURED <case>` stderr verdict.
+These are direct tracer tests: they exercise interception without enforcement,
+and are lower-level than the integrated `umbra run` matrix, which drives the
+same seven cases through storage, journal, namespace and an installed sandbox.
 All seven cases are enabled. Fixture cases:
 
 | Case | State |

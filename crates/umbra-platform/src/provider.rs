@@ -73,6 +73,15 @@ pub enum Request {
         /// Result.
         result: EmulatedResult,
     },
+    /// Prepare rewrite.
+    PrepareRewrite {
+        /// Thread.
+        thread: ThreadId,
+        /// Path interpreted according to the enclosing operation and path type.
+        path: BytePath,
+        /// Operation.
+        operation: FsOp,
+    },
 }
 /// Owned method results, including buffers copied only after response validation.
 #[derive(Serialize, Deserialize)]
@@ -93,6 +102,8 @@ pub enum Response {
     Quiesced(QuiescedTree),
     /// Decoded.
     Decoded(Option<FsOp>),
+    /// Prepared.
+    Prepared(PreparedRewrite),
 }
 /// Callback bound to the stopped task by the caller's TraceMemory adapter.
 #[derive(Serialize, Deserialize)]
@@ -218,6 +229,24 @@ impl TraceControl for Control {
     fn terminate(&mut self, process: ProcessHandle, policy: TerminationPolicy) -> Result<()> {
         unit(call(&self.client, &Request::Terminate { process, policy })?)
     }
+    fn prepare_rewrite(
+        &mut self,
+        thread: ThreadId,
+        path: &BytePath,
+        operation: FsOp,
+    ) -> Result<PreparedRewrite> {
+        match call(
+            &self.client,
+            &Request::PrepareRewrite {
+                thread,
+                path: path.clone(),
+                operation,
+            },
+        )? {
+            Response::Prepared(v) => Ok(v),
+            _ => Err(protocol_error("platform.prepare_rewrite response")),
+        }
+    }
 }
 impl SyscallAbi for Abi {
     fn decode_entry(
@@ -328,6 +357,13 @@ fn control_request(control: &mut dyn TraceControl, request: Request) -> Result<R
         Request::Terminate { process, policy } => {
             control.terminate(process, policy).map(|()| Response::Unit)
         }
+        Request::PrepareRewrite {
+            thread,
+            path,
+            operation,
+        } => control
+            .prepare_rewrite(thread, &path, operation)
+            .map(Response::Prepared),
         _ => Err(protocol_error("ABI request in control lane")),
     }
 }

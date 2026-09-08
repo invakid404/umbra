@@ -671,20 +671,65 @@ impl MacosTraceBackend {
         }
         Ok(())
     }
-    /// Compatibility entry point for the same LocalDevelopment tracer as trait launch.
+    /// Direct, deliberately unenforced tracer entry point for lower-level tests.
+    ///
+    /// It accepts only [`SandboxRequirement::UnsandboxedExperiment`], so a caller
+    /// holding a rendered profile cannot reach an unenforced launch through it.
     pub fn launch_experimental(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
+        if !matches!(spec.sandbox, SandboxRequirement::UnsandboxedExperiment) {
+            return Err(unsupported(
+                "launch_experimental installs no policy; use the supervised launch",
+            ));
+        }
         self.launch_traced(spec)
     }
+    /// Validate the *shape* of an enforcement requirement before anything spawns.
+    ///
+    /// Whether the policy is actually installed is decided by the launch path
+    /// below, which returns only after the target is stopped with the profile in
+    /// force. This check exists so a malformed profile fails before a process
+    /// is created rather than after.
+    fn check_sandbox_shape(spec: &LaunchSpec) -> Result<()> {
+        let profile = match &spec.sandbox {
+            SandboxRequirement::UnsandboxedExperiment => return Ok(()),
+            SandboxRequirement::Required(profile) => profile,
+        };
+        if profile.format() != SEATBELT_PROFILE_FORMAT {
+            return Err(unsupported(format!(
+                "unsupported sandbox profile format: {}",
+                profile.format()
+            )));
+        }
+        if profile.source().is_empty() || profile.source().len() > MAX_SANDBOX_PROFILE_BYTES {
+            return Err(error("launch", "sandbox profile exceeds its size bounds"));
+        }
+        if profile.source().contains(&0) {
+            return Err(error("launch", "sandbox profile contains a NUL byte"));
+        }
+        if !profile.write_root().is_absolute() || profile.write_root().as_bytes() == b"/" {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidPath,
+                "launch",
+                "sandbox write root must be an absolute path below the filesystem root",
+            ));
+        }
+        Ok(())
+    }
     fn launch_traced(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
+        Self::check_sandbox_shape(&spec)?;
         if self.deadline.is_some() {
             return Err(error("launch", "one run per backend"));
         }
         if self.options.timeout_ms == 0 || self.options.timeout_ms > 3_600_000 {
             return Err(error("launch", "timeout must be 1..3600000 ms"));
         }
-        if spec.policy.persistence != PersistencePolicy::LocalDevelopment {
+        if !matches!(
+            spec.policy.persistence,
+            PersistencePolicy::LocalDevelopment | PersistencePolicy::NfsClientFsync
+        ) {
             return Err(unsupported(
-                "prototype only supports explicit LocalDevelopment",
+                "this backend supports explicit LocalDevelopment or NfsClientFsync; \
+                 strict remote persistence is not qualified",
             ));
         }
         if spec
@@ -728,7 +773,31 @@ impl MacosTraceBackend {
             &self.options,
             deadline,
         )?;
-        let path = cstr(twin.as_os_str().as_bytes())?;
+        // Enforcement is installed by a trusted bootstrap that applies the
+        // profile and then execs the target, so the image actually spawned is
+        // the bootstrap and the target becomes its exec. The bootstrap is
+        // addressed explicitly and never reached through a shell or PATH.
+        let (image, args) = match &spec.sandbox {
+            SandboxRequirement::UnsandboxedExperiment => (twin.clone(), args),
+            SandboxRequirement::Required(profile) => {
+                let bootstrap =
+                    cache::resign(Path::new(SANDBOX_BOOTSTRAP), &self.options, deadline)?;
+                // The target runs as its resigned twin, exactly as on the
+                // unenforced path, so image identity and `_NSGetExecutablePath`
+                // agree across both. The bootstrap sets the target's argv[0] to
+                // the path it was handed, so argv[0] is the twin path here.
+                let mut bytes = vec![
+                    b"sandbox-exec".to_vec(),
+                    b"-p".to_vec(),
+                    profile.source().to_vec(),
+                    twin.as_os_str().as_bytes().to_vec(),
+                ];
+                bytes.extend(spec.argv.iter().skip(1).cloned());
+                let args = bytes.iter().map(|a| cstr(a)).collect::<Result<Vec<_>>>()?;
+                (bootstrap, args)
+            }
+        };
+        let path = cstr(image.as_os_str().as_bytes())?;
         let mut argv = args
             .iter()
             .map(|v| v.as_ptr() as *mut libc::c_char)
@@ -791,7 +860,7 @@ impl MacosTraceBackend {
         let session = Session::attach(
             pid,
             self.generation,
-            twin,
+            image,
             None,
             &self.options,
             deadline,
@@ -814,8 +883,110 @@ impl MacosTraceBackend {
             task: handle.0,
             thread: self.sessions[0].thread,
         });
+        if matches!(spec.sandbox, SandboxRequirement::Required(_)) {
+            if let Err(e) = self.complete_sandboxed_handoff(handle, &twin) {
+                // Never return a live tree from a launch that could not prove the
+                // boundary: the caller would have no handle to terminate it with.
+                for session in &self.sessions {
+                    session.task.kill();
+                }
+                self.sessions.clear();
+                self.events.clear();
+                return Err(e);
+            }
+        }
         Ok(handle)
     }
+
+    /// Drive the trusted bootstrap to the target's exec and stop there.
+    ///
+    /// Everything the installer does before that exec is fixed trusted launch
+    /// code: its events are consumed here rather than exposed as workspace
+    /// syscalls to rewrite. The handoff boundary is the exec stop itself, at
+    /// which the profile is already in force and the target has not run an
+    /// instruction. Anything else — the installer exiting, forking, or execing
+    /// something other than the target — fails the launch.
+    fn complete_sandboxed_handoff(&mut self, handle: ProcessHandle, target: &Path) -> Result<()> {
+        // Bounded independently of the watchdog so a bootstrap that loops without
+        // blocking still fails rather than spinning to the deadline.
+        const MAX_BOOTSTRAP_EVENTS: usize = 8192;
+        for _ in 0..MAX_BOOTSTRAP_EVENTS {
+            let resume = match self.next_event()? {
+                TraceEvent::Exec { task, thread, .. } if task == handle.0 => {
+                    let image = image_path(task.0.native_id as i32)?;
+                    if image != target {
+                        return Err(error(
+                            "sandbox.launch",
+                            format!(
+                                "installer exec'd {} instead of the target {}",
+                                image.display(),
+                                target.display()
+                            ),
+                        ));
+                    }
+                    // Report the stopped target the way an ordinary launch does.
+                    self.events
+                        .push_back(TraceEvent::ThreadStarted { task, thread });
+                    return Ok(());
+                }
+                TraceEvent::Exit { status, .. } => {
+                    return Err(error(
+                        "sandbox.launch",
+                        format!(
+                            "sandbox installer exited with {status:?} before applying the \
+                             policy and starting the target"
+                        ),
+                    ))
+                }
+                TraceEvent::Child { .. } => {
+                    return Err(error(
+                        "sandbox.launch",
+                        "sandbox installer created a child before installing the policy",
+                    ))
+                }
+                TraceEvent::ThreadExited { .. } => continue,
+                TraceEvent::ThreadStarted { thread, .. }
+                | TraceEvent::SyscallEntry { thread, .. }
+                | TraceEvent::SyscallExit { thread, .. }
+                | TraceEvent::Exec { thread, .. }
+                | TraceEvent::Signal { thread, .. } => thread,
+            };
+            self.resume(ResumeCommand {
+                thread: resume,
+                mode: ResumeMode::Syscall,
+                signal: None,
+            })?;
+        }
+        Err(error(
+            "sandbox.launch",
+            "sandbox installer did not reach the target exec within its event budget",
+        ))
+    }
+}
+
+/// The explicitly addressed system installer. Never resolved through PATH.
+const SANDBOX_BOOTSTRAP: &str = "/usr/bin/sandbox-exec";
+
+/// The running image of a process, used as evidence that the installer handed off
+/// to the intended target rather than to something else.
+fn image_path(pid: i32) -> Result<PathBuf> {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: owned buffer with its true length; the call writes at most that many bytes.
+    let written = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            buffer.len() as u32,
+        )
+    };
+    if written <= 0 {
+        return Err(error(
+            "sandbox.launch",
+            "cannot read the target's image path",
+        ));
+    }
+    buffer.truncate(written as usize);
+    Ok(PathBuf::from(OsStr::from_bytes(&buffer).to_owned()))
 }
 fn errno(code: i32, operation: &str) -> Result<()> {
     if code == 0 {
@@ -1329,8 +1500,26 @@ impl TraceControl for MacosTraceBackend {
     fn capabilities(&self) -> PlatformCapabilities {
         PlatformCapabilities {
             architectures: vec![Architecture::Aarch64],
-            capabilities: ["darwin-arm64-abi-v1".to_owned()].into_iter().collect(),
+            // Both are implemented and measured on this host: scratch-backed
+            // open/openat rewriting by the direct fixture tests, and the traced
+            // installer handoff by tests/sandbox_launch.rs, which also proves an
+            // unrewritten write outside the run root is denied by the kernel.
+            capabilities: [
+                "darwin-arm64-abi-v1".to_owned(),
+                umbra_core::capabilities::PLATFORM_SANDBOXED_LAUNCH_V1.to_owned(),
+                umbra_core::capabilities::PLATFORM_SYSCALL_REWRITE_V1.to_owned(),
+            ]
+            .into_iter()
+            .collect(),
         }
+    }
+    fn prepare_rewrite(
+        &mut self,
+        thread: ThreadId,
+        path: &BytePath,
+        operation: FsOp,
+    ) -> Result<PreparedRewrite> {
+        MacosTraceBackend::prepare_rewrite(self, thread, path, operation)
     }
     fn quiesce(&mut self, process: ProcessHandle) -> Result<QuiescedTree> {
         if self.sessions.first().is_none_or(|s| s.id != process.0) {

@@ -509,6 +509,7 @@ version = "0.1.0"
 dependencies = [
  "umbra-core",
  "umbra-journal",
+ "uuid",
 ]
 
 [[package]]
@@ -604,6 +605,7 @@ dependencies = [
  "umbra-overlay",
  "umbra-platform",
  "umbra-storage",
+ "uuid",
 ]
 
 [[package]]

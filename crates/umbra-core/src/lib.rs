@@ -5,7 +5,11 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod capabilities;
 pub mod storage;
+
+mod sandbox;
+pub use sandbox::*;
 
 macro_rules! string_id {
     ($($name:ident),+ $(,)?) => {$(
@@ -76,6 +80,10 @@ pub enum ErrorKind {
     StaleHandle,
     /// Io.
     Io,
+    /// A supervised process exited nonzero or was terminated by a signal. The
+    /// run's own preparation and teardown may still have succeeded; this reports
+    /// the tracee's outcome, not an Umbra malfunction.
+    ProcessFailed,
 }
 
 /// A machine-readable failure with the operation and diagnostic context preserved.
@@ -185,6 +193,28 @@ id_type!(TracedFd, i32);
 id_type!(ObjectId, Uuid);
 id_type!(RunId, Uuid);
 id_type!(OperationId, Uuid);
+
+impl OperationId {
+    /// Derive a distinct operation identity from this one.
+    ///
+    /// A storage backend may record which idempotency key an operation ID was
+    /// used with, so that a retry can be recognized and a *different* request
+    /// under the same ID can be refused. A caller performing several storage
+    /// operations on behalf of one logical transaction therefore needs a
+    /// distinct identity per request rather than one identity reused with
+    /// different keys. Derivation is deterministic, so the same (salt, index)
+    /// reproduces the same ID and a genuine retry stays a retry.
+    pub fn derive(self, salt: u64, index: u64) -> Self {
+        let mut bytes = *self.0.as_bytes();
+        for (slot, byte) in bytes[..8].iter_mut().zip(salt.to_be_bytes()) {
+            *slot ^= byte;
+        }
+        for (slot, byte) in bytes[8..].iter_mut().zip(index.to_be_bytes()) {
+            *slot ^= byte;
+        }
+        Self(Uuid::from_bytes(bytes))
+    }
+}
 id_type!(Sequence, u64);
 id_type!(LeaseEpoch, u64);
 
@@ -766,6 +796,11 @@ pub enum PersistencePolicy {
     StrictRemote,
     /// Local development.
     LocalDevelopment,
+    /// Runs on a validated NFSv4 mount whose durability boundary is the client
+    /// fsync only. This is distinct from `LocalDevelopment` so a backend need not
+    /// mislabel a mounted run, and distinct from `StrictRemote` because remote
+    /// commit is not qualified. It promises no server-side durability.
+    NfsClientFsync,
 }
 
 /// Every launch requires enforcement and stopped descendant capture before running.
@@ -801,6 +836,9 @@ pub struct LaunchSpec {
     pub cwd: BytePath,
     /// Policy.
     pub policy: LaunchPolicy,
+    /// Enforcement to install before the target's first instruction. There is no
+    /// default: a launch cannot become unsandboxed by omitting this field.
+    pub sandbox: SandboxRequirement,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
