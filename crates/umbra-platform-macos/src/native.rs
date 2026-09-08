@@ -442,8 +442,10 @@ impl Session {
             std::mem::forget(me);
             result?;
             let offset = code
-                .chunks_exact(4)
-                .position(|b| b == [1, 16, 0, 212])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .position(|b| *b == [1, 16, 0, 212])
                 .ok_or_else(|| error("symbol", format!("no svc in {name}")))?
                 * 4;
             self.breakpoint(start + offset as u64, false)?;
@@ -581,8 +583,8 @@ impl Session {
             for (i, chunk) in code.chunks_mut(MAX_IO_BYTES).enumerate() {
                 self.task.read(address + (i * MAX_IO_BYTES) as u64, chunk)?;
             }
-            for (i, insn) in code.chunks_exact(4).enumerate() {
-                if insn == [1, 16, 0, 212] {
+            for (i, insn) in code.as_chunks::<4>().0.iter().enumerate() {
+                if *insn == [1, 16, 0, 212] {
                     self.breakpoint(address + (i * 4) as u64, true)?;
                 }
             }

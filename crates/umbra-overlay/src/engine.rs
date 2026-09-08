@@ -1671,7 +1671,7 @@ impl Overlay {
                                 let target = components.last_mut().ok_or_else(|| {
                                     error(ErrorKind::CorruptJournal, "missing whiteout component")
                                 })?;
-                                for pair in chunk.chunks_exact(2) {
+                                for pair in chunk.as_chunks::<2>().0.iter() {
                                     let text = std::str::from_utf8(pair).map_err(|_| {
                                         error(
                                             ErrorKind::CorruptJournal,
