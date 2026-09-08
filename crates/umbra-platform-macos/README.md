@@ -29,7 +29,11 @@ RLE decode, and a per-request deadline.
 - `Options { debugserver, twin_cache, timeout_ms }` — runtime configuration.
   `debugserver` overrides the `xcode-select -p` discovery; `twin_cache`
   overrides the `$HOME/Library/Caches/umbra/twins` default. No user-specific
-  paths are baked into the code.
+  paths are baked into the code. When `debugserver` is unset, the
+  `UMBRA_DEBUGSERVER` environment variable overrides discovery before
+  `xcode-select -p` is consulted; it exists so the test suites can run on
+  hosts whose selected Xcode keeps debugserver under `SharedFrameworks`
+  rather than the `Library/PrivateFrameworks` path probed below.
 
 ## Shipped mechanisms
 
@@ -115,8 +119,8 @@ All seven cases are enabled. Fixture cases:
 | `open-libc`         | **CAPTURED** — the M1 minimum acceptance bar |
 | `open-svc`          | **CAPTURED** |
 | `fork-write`        | **CAPTURED** |
-| `posix-spawn-write` | **CAPTURED** |
-| `exec-write`        | Enabled; fails inside a post-exec debugger interaction loop (see M2 gap below) |
+| `posix-spawn-write` | **CAPTURED** on macOS 26.5.1; refuses elsewhere (version pin, below) |
+| `exec-write`        | **CAPTURED** — see the closed M2 gap below |
 | `grandchild-write`  | **CAPTURED** |
 | `dup-inherit-write` | **CAPTURED** |
 
@@ -126,68 +130,58 @@ removals remove entries. Fork children receive only inherited instruction
 repairs before installing their own breakpoints. Temporary return and dyld
 breakpoints use the same registry; the parent's fork gate uses `Z1`/`z1`.
 
-The `exec-write` case is enabled without `#[ignore]` so its running repro
-travels with the tree. Its assertions remain intact.
+Debugserver's own registrations are reference counted and **survive
+`execve` on that connection**, so this crate's registry must be released
+rather than discarded across an exec — see the closed M2 gap below. A
+duplicate `Z0` at one address makes the matching `z0` decrement without
+restoring the instruction, and debugserver answers `OK` either way.
 
-## M2 gap: `exec-write` post-exec breakpoint loop
+`posix-spawn-write` additionally requires the qualified host: the spawn
+file-actions descriptor layout is pinned to macOS 26.5.1 in
+`src/native.rs`, and the case returns `UnsupportedCapability` on any other
+release rather than guessing at the layout. On macOS 27.0 the remaining
+six cases are CAPTURED and this one refuses by design.
 
-M1.5 closed the fork-gate teardown E08 affecting fork descendants
-in the passing multi-process fixtures and reacquired the child's Mach task
-port on `reason:exec`
-(fixing the pre-M1.5 `mach_vm_read` status `268435459` /
-`MACH_SEND_INVALID_DEST` failure). `exec-write` now advances past the
-`reason:exec` boundary and emits an `Exec` event. The recorded diagnosis
-observed its first post-exec `SyscallEntry` at PC `0x18c9d2690` — an
-`__openat`-family stub in that run's shared cache — followed by a bounded
-live-lock. Addresses and iteration counts are run-specific:
 
-- The tracer sends `z0,18c9d2690,4` (`OK`) + `Z0,18c9d2694,4` (`OK`) +
-  `c` — remove the entry BP, install the return-gate BP at `pc+4`,
-  continue.
-- The very next stop reports PC = `0x18c9d2690` again — the ENTRY
-  address, NOT the gate `0x18c9d2694`.
-- This repeats ~3024 times with successful register reads between
-  continuations until the 25 s session watchdog fires with `session
-  timed out`.
+## Closed M2 gap: `exec-write` post-exec breakpoint loop
 
-Both `z0` and `Z0` are ACK'd; the tracee behaves as if `z0` did not
-clear the trap. Two live hypotheses, neither yet distinguished:
+`exec-write` used to live-lock after `execve`: the first post-exec
+`SyscallEntry` landed on an `__openat`-family stub, the tracer sent
+`z0,<entry>,4` (`OK`) + `Z0,<entry+4>,4` (`OK`) + `c`, and the very next
+stop reported the ENTRY address again rather than the gate. It repeated
+thousands of times until the 25 s session watchdog fired. Both packets
+were ACK'd, so the tracee behaved as if `z0` had not cleared the trap.
 
-- **(H-A) Debugserver Z0 shadow-state desync with the post-exec address
-  space.** Debugserver tracks per-address original instruction bytes to
-  restore on `z0`. If the post-exec shared-cache mapping presents a
-  different physical page, its recorded shadow may no longer match the
-  live memory and its `z0` restore may write bytes that don't clear the
-  BRK trap.
-- **(H-B) Post-exec BRK-exception PC-advance / i-cache coherency
-  issue.** If the CPU re-executes the previous instruction bytes at PC
-  on re-continuation (e.g. because the `M` write we made to clear the
-  BRK on this cycle is not coherent with the instruction fetch
-  pipeline), the CPU loops on the same BRK site.
+**Cause.** Debugserver's breakpoint registrations survive `execve` on the
+same connection, and its `Z0` handler is reference counted. The exec reset
+dropped this crate's own `breaks` registry without releasing those
+registrations, then called `install()`, which re-registered the same
+shared-cache addresses. Debugserver's count for each reached two, so the
+single `z0` that retires an entry site decremented to one and left the
+`BRK` in place — while still answering `OK`, because the request itself
+succeeded.
 
-Reproduce with the fixture environment variables set as below and
-`UMBRA_RSP_LOG=1 cargo test -p umbra-platform-macos --test fixtures exec_write -- --nocapture`.
-Look for repeated `T…thread:<id>;` stops at the same post-exec entry PC,
-with successful register reads and `c` continuations; the PC and count
-need not match the recorded run. Distinguishing the hypotheses requires
-interactive debug: `qMemoryRegionInfo` around the entry PC, `m` reads of
-the four instruction bytes immediately after the `z0` ACK (`M` writes
-memory; see the [GDB packet reference](https://www.sourceware.org/gdb/download/onlinedocs/gdb.html/Packets.html)),
-and single-stepping (`vCont;s`) the first post-exec continuation
-instead of `c`.
+The mismatch was invisible to the obvious probe: debugserver masks its own
+breakpoints in `m` reads, so `m<entry>,4` returned the original
+`svc #0x80` bytes both before and after the `z0`. A `mach_vm_read` of the
+same address returned `BRK` in both cases, and `vCont;s` did not advance
+the PC. That pairing is what identified the leak.
 
-Run with verdicts visible:
-
-```
-UMBRA_TEST_FIXTURE_PATH=<abs> UMBRA_TEST_REDIRECT_ROOT=<abs> \
-  cargo test -p umbra-platform-macos --test fixtures -- --nocapture
-```
+**Fix.** The `reason:exec` handler now sends `z0` for every address the
+session still owns before clearing `breaks` and re-resolving the new
+image. A refused release is not fatal — the new image need not map an
+address the old one did, and a refusal means the registration is already
+gone. See the `reason:exec` branch in `src/native.rs`.
 
 `src/rsp.rs::tests::debugserver_reverse_connect_no_ack_handshake` spawns a
 real debugserver and asserts the negotiated `qHostInfo.ostype` is
 `macosx`, guarding the reverse-connect nonblocking-inheritance fix from
-regressing. It resolves `xcode-select -p` and checks the actual debugserver
-binary path before connecting; missing tools print `SKIP` and return.
+regressing. It resolves the binary through the same `discover_debugserver`
+helper `connect` uses — `UMBRA_DEBUGSERVER` first, then the path below
+`xcode-select -p` — and checks that the resolved path is a file before
+connecting; missing tools print `SKIP` and return. Sharing that helper is
+what stops the test from skipping on a host where only the environment
+override names a usable binary.
 That guard is implemented. A present debugger still requires socket and
 debugging permissions.
 

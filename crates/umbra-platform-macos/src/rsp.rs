@@ -32,11 +32,34 @@ pub fn fields(s: &str) -> BTreeMap<&str, &str> {
     s.split(';').filter_map(|f| f.split_once(':')).collect()
 }
 pub struct Rsp {
+    /// Debug aid: distinguishes concurrent connections in UMBRA_RSP_LOG output.
+    pub id: u32,
     stream: TcpStream,
     child: Child,
     buffer: Vec<u8>,
     no_ack: bool,
     deadline: Instant,
+}
+/// Debugserver discovery for callers that did not name one in `Options`:
+/// `UMBRA_DEBUGSERVER` first, then the path below `xcode-select -p`. The
+/// environment override exists because some Xcode layouts keep debugserver
+/// under `SharedFrameworks`, where the probed path does not resolve.
+///
+/// `connect` and its handshake test share this so the test cannot silently skip
+/// on a host where only the override names a usable binary.
+pub fn discover_debugserver() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("UMBRA_DEBUGSERVER") {
+        return Some(std::path::PathBuf::from(path));
+    }
+    Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+                .join("Library/PrivateFrameworks/LLDB.framework/Resources/debugserver")
+        })
 }
 impl Rsp {
     pub fn deadline(&self) -> Instant {
@@ -45,17 +68,8 @@ impl Rsp {
     pub fn connect(options: &Options, deadline: Instant) -> Result<Self> {
         let executable = match &options.debugserver {
             Some(p) => p.clone(),
-            None => {
-                let out = Command::new("/usr/bin/xcode-select")
-                    .arg("-p")
-                    .output()
-                    .map_err(|e| error("xcode-select", e))?;
-                if !out.status.success() {
-                    return Err(error("xcode-select", "developer tools unavailable"));
-                }
-                std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
-                    .join("Library/PrivateFrameworks/LLDB.framework/Resources/debugserver")
-            }
+            None => discover_debugserver()
+                .ok_or_else(|| error("xcode-select", "developer tools unavailable"))?,
         };
         let listener =
             TcpListener::bind("127.0.0.1:0").map_err(|e| error("debugserver listen", e))?;
@@ -105,7 +119,9 @@ impl Rsp {
         stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .map_err(|e| error("rsp", e))?;
+        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let mut r = Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             stream,
             child,
             buffer: Vec::new(),
@@ -125,7 +141,7 @@ impl Rsp {
     }
     pub fn send(&mut self, body: &str) -> Result<()> {
         if std::env::var_os("UMBRA_RSP_LOG").is_some() {
-            eprintln!("RSP > {body}");
+            eprintln!("RSP[{}] > {body}", self.id);
         }
         if Instant::now() >= self.deadline {
             return Err(error("watchdog", "session deadline expired"));
@@ -229,7 +245,11 @@ impl Rsp {
                 Ok(0) => return Err(error("rsp", "debugserver disconnected")),
                 Ok(n) => {
                     if std::env::var_os("UMBRA_RSP_LOG").is_some() {
-                        eprintln!("RSP < {}", String::from_utf8_lossy(&bytes[..n]));
+                        eprintln!(
+                            "RSP[{}] < {}",
+                            self.id,
+                            String::from_utf8_lossy(&bytes[..n])
+                        );
                     }
                     self.buffer.extend_from_slice(&bytes[..n]);
                 }
@@ -286,21 +306,16 @@ mod tests {
         // path, but the LLDB.framework debugserver binary is not present in
         // that layout. Probe the actual binary path — not just the SDK — so
         // the test skips cleanly rather than panicking during connect().
-        let debugserver_path = std::process::Command::new("/usr/bin/xcode-select")
-            .arg("-p")
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| {
-                std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
-                    .join("Library/PrivateFrameworks/LLDB.framework/Resources/debugserver")
-            });
+        // Resolve it exactly as connect() does, so a host that only names a
+        // usable binary through UMBRA_DEBUGSERVER still exercises the
+        // handshake instead of skipping.
+        let debugserver_path = discover_debugserver();
         let debugserver_present = debugserver_path.as_ref().is_some_and(|p| p.is_file());
         if !debugserver_present {
             let where_ = debugserver_path
                 .as_ref()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<xcode-select unavailable>".into());
+                .unwrap_or_else(|| "<no UMBRA_DEBUGSERVER and xcode-select unavailable>".into());
             eprintln!(
                 "SKIP debugserver_reverse_connect_no_ack_handshake: debugserver missing at {where_}"
             );
