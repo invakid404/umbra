@@ -1429,6 +1429,7 @@ impl TraceControl for MacosTraceBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
 
     /// Drift detector for the private `posix_spawn` structures.
     ///
@@ -1464,15 +1465,16 @@ mod tests {
             std::env::temp_dir().join(format!("umbra-spawn-probe-{}", unsafe { libc::getpid() }));
         std::fs::create_dir_all(&directory).expect("probe directory");
         let marker = directory.join("ran");
-        let script = std::ffi::CString::new(format!("touch {}", marker.display())).unwrap();
-        let shell = c"/bin/sh";
-        let dash_c = c"-c";
-        let argv = [
-            shell.as_ptr(),
-            dash_c.as_ptr(),
-            script.as_ptr(),
-            std::ptr::null(),
-        ];
+        // Exec the marker command directly. Going through a shell would put
+        // the path into shell source, where a temporary directory containing
+        // whitespace splits into separate words: the child then fails to
+        // create the marker and this test passes without detecting anything.
+        // A direct exec also needs no PATH, which the empty environment below
+        // does not provide.
+        let touch = c"/usr/bin/touch";
+        let marker_arg = std::ffi::CString::new(marker.as_os_str().as_bytes())
+            .expect("temporary paths contain no NUL");
+        let argv = [touch.as_ptr(), marker_arg.as_ptr(), std::ptr::null()];
         let envp: [*const libc::c_char; 1] = [std::ptr::null()];
 
         let mut pid: libc::pid_t = 0;
@@ -1481,7 +1483,7 @@ mod tests {
             libc::syscall(
                 244,
                 &mut pid as *mut libc::pid_t,
-                shell.as_ptr(),
+                touch.as_ptr(),
                 descriptor.as_ptr(),
                 argv.as_ptr(),
                 envp.as_ptr(),
