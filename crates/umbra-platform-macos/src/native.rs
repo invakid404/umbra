@@ -350,7 +350,12 @@ impl Session {
         self.install_breakpoint(address, Breakpoint { original, raw })
     }
     fn install_breakpoint(&mut self, address: u64, breakpoint: Breakpoint) -> Result<()> {
-        debug_assert!(!self.breaks.contains_key(&address));
+        if self.breaks.contains_key(&address) {
+            return Err(error(
+                "breakpoint",
+                format!("session already owns breakpoint at {address:x}"),
+            ));
+        }
         self.rsp.ok(&format!("Z0,{address:x},4"))?;
         self.breaks.insert(address, breakpoint);
         Ok(())

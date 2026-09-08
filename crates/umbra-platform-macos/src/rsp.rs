@@ -280,6 +280,17 @@ mod tests {
 
     #[test]
     fn debugserver_reverse_connect_no_ack_handshake() {
+        let developer_tools_present = std::process::Command::new("/usr/bin/xcode-select")
+            .arg("-p")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !developer_tools_present {
+            eprintln!(
+                "SKIP debugserver_reverse_connect_no_ack_handshake: xcode-select -p unavailable"
+            );
+            return;
+        }
         let mut rsp = Rsp::connect(
             &Options::default(),
             Instant::now() + Duration::from_secs(10),
