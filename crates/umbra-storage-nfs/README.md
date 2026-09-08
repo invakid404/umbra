@@ -8,8 +8,8 @@ Live NFSv4 storage backend for Umbra. Direct Umbra dependencies are
 and supported mutations through `umbra_storage::Storage` against an
 externally managed NFSv4 mount. Hard links, logical symlinks, xattrs,
 kernel-shadow qualification and strict remote persistence are unsupported.
-Construction does not mount anything; it validates that the configured mount
-root is an existing NFSv4 export before the first run I/O.
+Construction does not mount anything. `NfsStorage::new` retains the config and
+defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
 
 ## Public API
 
