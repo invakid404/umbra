@@ -134,7 +134,10 @@ Control metadata lives outside tracee listings:
   deleted link. Immutable target records remain for future journal reconciliation.
 
 The iterative resolver expands at most **40 symlinks per lookup**, including cwd
-or dirfd anchor expansion, and returns structured `InvalidPath` on overflow.
+or dirfd anchor expansion, and returns structured `SymlinkLoop` on overflow —
+a distinct `ErrorKind`, so a platform answers a link loop with its own native
+errno without reading an error message, and containment failures stay
+`InvalidPath`.
 Absolute targets restart at `ProcessContext::root`; relative targets start at the
 link's containing logical directory. Expansion precedes `..` processing, and a
 parent above the logical root returns the existing containment error before any

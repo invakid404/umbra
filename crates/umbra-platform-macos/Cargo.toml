@@ -13,6 +13,16 @@ umbra-platform = { path = "../umbra-platform" }
 serde.workspace = true
 serde_json.workspace = true
 
+# Integration-test only: the dirfd fixture drives the real overlay transaction
+# flow. The crate itself stays free of any namespace or storage backend.
+[dev-dependencies]
+umbra-overlay = { path = "../umbra-overlay" }
+umbra-storage = { path = "../umbra-storage" }
+umbra-storage-local = { path = "../umbra-storage-local" }
+umbra-journal = { path = "../umbra-journal" }
+tempfile.workspace = true
+uuid.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2.workspace = true
 libc = "=0.2.189"

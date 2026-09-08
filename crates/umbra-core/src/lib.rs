@@ -64,6 +64,10 @@ pub enum ErrorKind {
     CorruptJournal,
     /// Path bytes fail the contract validation rules.
     InvalidPath,
+    /// Logical symlink expansion exhausted its bound while resolving a path.
+    /// Distinct from `InvalidPath` so a caller can answer a link loop with its
+    /// own native errno instead of inspecting an error message.
+    SymlinkLoop,
     /// The request fails an input constraint.
     InvalidInput,
     /// The operation is invalid in the current lifecycle state.

@@ -145,11 +145,53 @@ struct Breakpoint {
 }
 #[derive(Clone)]
 enum ReturnKind {
-    Open,
+    /// A filesystem syscall whose result the caller observes as a SyscallExit.
+    Syscall,
     Wait,
-    Fork { restore: BTreeMap<u64, [u8; 4]> },
-    Spawn { pid_pointer: u64, twin: PathBuf },
+    Fork {
+        restore: BTreeMap<u64, [u8; 4]>,
+    },
+    Spawn {
+        pid_pointer: u64,
+        twin: PathBuf,
+    },
     Exec,
+}
+/// SDK `sys/wait.h` spells `WNOHANG` as mask value 1 — the least significant
+/// bit, bit index 0 — not `1 << 1`.
+const WNOHANG: u32 = libc::WNOHANG as u32;
+/// What an intercepted `wait4`/`wait4_nocancel` should do, decided from the
+/// tracee's arguments and the tracer's view of the caller's children alone.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitPlan {
+    /// WNOHANG over live but unfinished children: report "nothing reaped"
+    /// without running the syscall, parking, or touching status/rusage.
+    Poll,
+    /// A blocking wait over live but unfinished children: park the thread.
+    Park,
+    /// Nothing tracked matches, or a match has finished: let the kernel
+    /// answer, so ECHILD and the real status/rusage writes are preserved.
+    Native,
+    /// Selections the tracer refuses to virtualize rather than mis-emulate.
+    Unsupported,
+}
+/// `wanted` is the pid selector the callee receives; `x2` is the raw option
+/// register, truncated here because arm64 leaves the upper 32 bits of a
+/// register holding an `int` argument unspecified and the kernel's argument
+/// munger drops them — reading all 64 bits rejects legal WNOHANG callers.
+fn wait_plan(wanted: i32, x2: u64, children: bool, ready: bool) -> WaitPlan {
+    let options = x2 as u32;
+    if !children {
+        return WaitPlan::Native;
+    }
+    if wanted <= 0 && wanted != -1 || options & !WNOHANG != 0 {
+        return WaitPlan::Unsupported;
+    }
+    match (ready, options & WNOHANG != 0) {
+        (true, _) => WaitPlan::Native,
+        (false, true) => WaitPlan::Poll,
+        (false, false) => WaitPlan::Park,
+    }
 }
 struct Pending {
     entry: u64,
@@ -428,6 +470,29 @@ impl Session {
             "__fork",
             "__wait4",
             "__wait4_nocancel",
+            // Dirfd-relative filesystem calls. Names are the stubs that
+            // actually carry the `svc`, verified per host below; several have
+            // no `__`-prefixed form, and `unlinkat`'s public wrapper carries
+            // its own `svc` rather than tail-calling `__unlinkat`, so both are
+            // installed. `fstatat`/`fstatat64` is one symbol reaching 470,
+            // while `__fstatat` is a separate stub reaching 469.
+            // symlink and readlink have no `__`-prefixed form; the public
+            // symbols are the stubs carrying the `svc`.
+            "symlink",
+            "readlink",
+            "__renameat",
+            "__renameatx_np",
+            "__unlinkat",
+            "unlinkat",
+            "linkat",
+            "symlinkat",
+            "mkdirat",
+            "fchmodat",
+            "fchownat",
+            "__fstatat",
+            "fstatat",
+            "readlinkat",
+            "faccessat",
         ] {
             let name_c = cstr(name.as_bytes())?;
             let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name_c.as_ptr()) };
@@ -701,11 +766,18 @@ impl MacosTraceBackend {
                 "absolute executable/cwd and argv[0] required",
             ));
         }
-        let args = spec
+        // The tracee runs from a signed twin, but must see its own vendor
+        // identity: argv[0] is always the absolute executable the caller asked
+        // for, whatever argv[0] they supplied. argv[1..] and the launched image
+        // (the twin) are passed through byte for byte. The caller's argv[0] is
+        // still validated before it is dropped, so a malformed one is an error
+        // rather than a silent substitution.
+        let mut args = spec
             .argv
             .iter()
             .map(|a| cstr(a))
             .collect::<Result<Vec<_>>>()?;
+        args[0] = cstr(spec.executable.as_bytes())?;
         let env = spec
             .environment
             .iter()
@@ -833,19 +905,43 @@ extern "C" {
 
 impl MacosTraceBackend {
     /// Allocate a task-owned, non-reused scratch path and prepare the ABI rewrite.
+    /// Allocate one scratch buffer per resolved path operand and build the
+    /// rewrite. Each operand gets its own bounded, NUL-terminated allocation,
+    /// so a two-path syscall cannot alias its source and destination buffers.
+    pub fn prepare_physical(
+        &mut self,
+        thread: ThreadId,
+        physical: PhysicalOperation,
+    ) -> Result<PreparedRewrite> {
+        let i = self.thread_index(thread)?;
+        let regs = self.sessions[i].regs()?;
+        let mut addresses = Vec::new();
+        for rewrite in &physical.paths {
+            let len = rewrite.path.0.as_bytes().len();
+            if len >= abi::MAX_PATH {
+                return Err(error("rewrite", "path exceeds 4 KiB"));
+            }
+            addresses.push(self.sessions[i].allocate(&vec![0; len + 1])?);
+        }
+        abi::prepare_paths(&regs, physical, &addresses)
+    }
+    /// Single-path compatibility wrapper over [`Self::prepare_physical`].
     pub fn prepare_rewrite(
         &mut self,
         thread: ThreadId,
         path: &BytePath,
         operation: FsOp,
     ) -> Result<PreparedRewrite> {
-        let i = self.thread_index(thread)?;
-        let regs = self.sessions[i].regs()?;
-        if path.as_bytes().len() >= abi::MAX_PATH {
-            return Err(error("rewrite", "path exceeds 4 KiB"));
-        }
-        let address = self.sessions[i].allocate(&vec![0; path.as_bytes().len() + 1])?;
-        abi::prepare_path(&regs, address, path, operation)
+        self.prepare_physical(
+            thread,
+            PhysicalOperation {
+                operation,
+                paths: vec![PathRewrite {
+                    operand: PathOperand::Path,
+                    path: PhysicalPath(path.clone()),
+                }],
+            },
+        )
     }
     fn attach_child(
         &mut self,
@@ -903,7 +999,7 @@ impl MacosTraceBackend {
         }
         s.install_breakpoint(pending.entry, pending.entry_breakpoint)?;
         match pending.kind {
-            ReturnKind::Open => {
+            ReturnKind::Syscall => {
                 self.events.push_back(TraceEvent::SyscallExit {
                     task: s.id,
                     thread: s.thread,
@@ -957,7 +1053,8 @@ impl MacosTraceBackend {
         let number = get(&regs, 16)?;
         let pc = get(&regs, PC)?;
         match number {
-            5 | 398 | 463 | 464 => {
+            // Filesystem calls the caller decodes, rewrites and observes.
+            5 | 57 | 58 | 398 | 463..=475 | 488 => {
                 let s = &mut self.sessions[index];
                 s.entry = Some(pc);
                 self.events.push_back(TraceEvent::SyscallEntry {
@@ -981,7 +1078,6 @@ impl MacosTraceBackend {
             }
             7 | 400 => {
                 let wanted = get(&regs, 0)? as i32;
-                let options = get(&regs, 2)?;
                 let children = self
                     .sessions
                     .iter()
@@ -993,25 +1089,31 @@ impl MacosTraceBackend {
                     })
                     .map(|(i, _)| i)
                     .collect::<Vec<_>>();
-                if !children.is_empty() && (wanted <= 0 && wanted != -1 || options & !1 != 0) {
-                    return Err(unsupported(
-                        "wait process-group/stopped/continued selection",
-                    ));
-                }
                 let ready = children.iter().any(|i| self.sessions[*i].done);
+                let plan = wait_plan(wanted, get(&regs, 2)?, !children.is_empty(), ready);
                 let s = &mut self.sessions[index];
-                if !children.is_empty() && !ready && options & 1 != 0 {
-                    set(&mut regs, 0, 0)?;
-                    let flags = get(&regs, CPSR)?;
-                    set(&mut regs, CPSR, flags & !(1 << 29))?;
-                    set(&mut regs, PC, pc + 4)?;
-                    s.set_regs(&regs)?;
-                    s.continue_run()?;
-                } else if !children.is_empty() && !ready {
-                    s.single_thread()?;
-                    s.waiting = children;
-                } else {
-                    s.return_stop(ReturnKind::Wait)?;
+                match plan {
+                    WaitPlan::Unsupported => {
+                        return Err(unsupported(
+                            "wait process-group/stopped/continued selection",
+                        ))
+                    }
+                    // Success zero with the carry flag cleared, past the svc,
+                    // leaving status/rusage and every child's reaped state
+                    // exactly as the tracee left them.
+                    WaitPlan::Poll => {
+                        set(&mut regs, 0, 0)?;
+                        let flags = get(&regs, CPSR)?;
+                        set(&mut regs, CPSR, flags & !(1 << 29))?;
+                        set(&mut regs, PC, pc + 4)?;
+                        s.set_regs(&regs)?;
+                        s.continue_run()?;
+                    }
+                    WaitPlan::Park => {
+                        s.single_thread()?;
+                        s.waiting = children;
+                    }
+                    WaitPlan::Native => s.return_stop(ReturnKind::Wait)?,
                 }
             }
             59 | 244 => {
@@ -1310,7 +1412,7 @@ impl TraceBackend for MacosTraceBackend {
         if let Some(pc) = s.entry.take() {
             let regs = s.regs()?;
             if get(&regs, PC)? == pc {
-                s.return_stop(ReturnKind::Open)
+                s.return_stop(ReturnKind::Syscall)
             } else {
                 self.events.push_back(TraceEvent::SyscallExit {
                     task: s.id,
@@ -1430,6 +1532,52 @@ impl TraceControl for MacosTraceBackend {
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
+
+    /// Truth table for the `wait4`/`wait4_nocancel` decision. Needs no
+    /// debugger, fixture or environment variable; the live behaviour it
+    /// describes is qualified by the `wnohang-wait` fixture case.
+    #[test]
+    fn wait_plan_decides_from_the_callee_visible_arguments() {
+        // The SDK spells WNOHANG as mask 1 — bit index 0, not `1 << 1`.
+        assert_eq!(WNOHANG, 1);
+        // Live children, none finished: WNOHANG polls, a blocking wait parks.
+        assert_eq!(wait_plan(-1, WNOHANG as u64, true, false), WaitPlan::Poll);
+        assert_eq!(wait_plan(-1, 0, true, false), WaitPlan::Park);
+        assert_eq!(wait_plan(4321, WNOHANG as u64, true, false), WaitPlan::Poll);
+        // A finished child, or nothing tracked, is the kernel's to answer: it
+        // owns the real status/rusage writes and ECHILD.
+        assert_eq!(wait_plan(-1, WNOHANG as u64, true, true), WaitPlan::Native);
+        assert_eq!(
+            wait_plan(-1, WNOHANG as u64, false, false),
+            WaitPlan::Native
+        );
+        assert_eq!(wait_plan(0, WNOHANG as u64, false, false), WaitPlan::Native);
+        assert_eq!(wait_plan(-1, u64::MAX, false, false), WaitPlan::Native);
+        // Selections the tracer refuses rather than mis-emulating.
+        for (wanted, options) in [
+            (0, WNOHANG as u64),                              // caller's group
+            (-7, WNOHANG as u64),                             // group 7
+            (-1, libc::WUNTRACED as u64),                     // stopped
+            (-1, (WNOHANG | libc::WCONTINUED as u32) as u64), // continued
+        ] {
+            assert_eq!(
+                wait_plan(wanted, options, true, false),
+                WaitPlan::Unsupported,
+                "wanted {wanted} options {options:#x}"
+            );
+        }
+        // Arm64 leaves the upper half of a register holding an `int` argument
+        // unspecified and the kernel's munger drops it, so those bits must not
+        // read as reserved options. Truncation must not lose real ones either.
+        assert_eq!(
+            wait_plan(-1, 0xdead_beef_0000_0001, true, false),
+            WaitPlan::Poll
+        );
+        assert_eq!(
+            wait_plan(-1, 0x0000_0000_0000_0002, true, false),
+            WaitPlan::Unsupported
+        );
+    }
 
     /// Drift detector for the private `posix_spawn` structures.
     ///
