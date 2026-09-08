@@ -289,13 +289,22 @@ impl TarStorage {
                     return Err(error(ErrorKind::InvalidPath, "list requires directory"));
                 }
                 let (entries, start) = if let Some(cursor) = cursor {
-                    let (scope, entries, start) = run.pages.get(&cursor.0).ok_or_else(|| {
-                        error(ErrorKind::StaleHandle, "unknown or invalidated cursor")
-                    })?;
-                    if scope != path {
-                        return Err(error(ErrorKind::StaleHandle, "cursor directory mismatch"));
+                    let run = self.run.as_mut().unwrap();
+                    match run.pages.get(&cursor.0) {
+                        None => {
+                            return Err(error(
+                                ErrorKind::StaleHandle,
+                                "unknown or invalidated cursor",
+                            ));
+                        }
+                        Some((scope, _, _)) if scope != path => {
+                            return Err(error(ErrorKind::StaleHandle, "cursor directory mismatch"));
+                        }
+                        Some(_) => (),
                     }
-                    (entries.clone(), *start)
+                    // Consume only a correctly scoped cursor; move its snapshot forward.
+                    let (_, entries, start) = run.pages.remove(&cursor.0).unwrap();
+                    (entries, start)
                 } else {
                     let mut entries = Vec::new();
                     for (p, n) in &run.state.nodes {
@@ -330,10 +339,6 @@ impl TarStorage {
                 } else {
                     None
                 };
-                // Consumed cursors are single-use; even empty/end pages remain bounded.
-                if let Some(cursor) = cursor {
-                    self.run.as_mut().unwrap().pages.remove(&cursor.0);
-                }
                 Ok(StorageResponse::List(DirectoryPage {
                     entries: page,
                     next,

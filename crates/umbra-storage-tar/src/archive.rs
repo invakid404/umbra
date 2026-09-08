@@ -216,10 +216,11 @@ pub(crate) fn encode_manifest(state: &State) -> Result<Vec<u8>> {
     let manifest = serde_json::to_vec(&(&state.request, &state.layout, records, &state.retries))
         .map_err(json_error)?;
     if manifest.len() as u64 > MANIFEST_LIMIT {
-        return Err(error(
-            ErrorKind::StorageUnavailable,
-            "archive metadata/retry budget exhausted (16 MiB)",
-        ));
+        let message = format!(
+            "archive metadata/retry budget exhausted ({} MiB)",
+            MANIFEST_LIMIT / (1024 * 1024)
+        );
+        return Err(error(ErrorKind::StorageUnavailable, &message));
     }
     Ok(manifest)
 }

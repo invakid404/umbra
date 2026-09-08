@@ -102,6 +102,30 @@ fn writer_exclusivity_stale_tokens_epochs_and_abandoned_lock() {
 }
 
 #[test]
+fn missing_writer_lock_is_reported_as_lease_lost() {
+    let (temp, mut s, _, lease) = setup();
+    fs::remove_file(temp.path().join("run.tar.provider/writer.lock")).unwrap();
+    assert_eq!(
+        s.renew_writer(&lease).unwrap_err().kind,
+        ErrorKind::LeaseLost
+    );
+    assert_eq!(
+        s.create(&ctx(&lease), &path(b"denied"), &file())
+            .unwrap_err()
+            .kind,
+        ErrorKind::LeaseLost
+    );
+    assert_eq!(
+        s.stat(&ctx(&lease), &path(b"denied")).unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+    assert_eq!(
+        s.release_writer(&lease).unwrap_err().kind,
+        ErrorKind::LeaseLost
+    );
+}
+
+#[test]
 fn exclusive_create_and_all_mutations_require_current_authority() {
     let (_temp, mut s, _, lease) = setup();
     let p = path(b"new");
@@ -749,7 +773,10 @@ fn corrupt_archive_and_physical_symlink_are_rejected_without_side_effects() {
     let mut s = TarStorage::new(TarStorageConfig::new(&archive));
     let mut req = request();
     req.intent = OpenRunIntent::OpenExisting;
-    assert!(s.open_run(&req).is_err());
+    assert_eq!(
+        s.open_run(&req).unwrap_err().kind,
+        ErrorKind::CorruptJournal
+    );
     assert!(!temp.path().join("bad.tar.provider").exists());
     assert_eq!(s.close_run().unwrap_err().kind, ErrorKind::InvalidState);
     let link = temp.path().join("link.tar");
@@ -868,7 +895,10 @@ fn malformed_tar_entries_and_truncation_cannot_escape_or_bind() {
         builder.finish().unwrap();
         drop(builder);
         let mut bad = TarStorage::new(TarStorageConfig::new(&p));
-        assert!(bad.open_run(&req).is_err());
+        assert_eq!(
+            bad.open_run(&req).unwrap_err().kind,
+            ErrorKind::CorruptJournal
+        );
         assert_eq!(bad.close_run().unwrap_err().kind, ErrorKind::InvalidState);
         assert!(!temp
             .path()
@@ -878,7 +908,10 @@ fn malformed_tar_entries_and_truncation_cannot_escape_or_bind() {
     let p = temp.path().join("truncated.tar");
     fs::write(&p, &original[..original.len() - 512]).unwrap();
     let mut bad = TarStorage::new(TarStorageConfig::new(p));
-    assert!(bad.open_run(&req).is_err());
+    assert_eq!(
+        bad.open_run(&req).unwrap_err().kind,
+        ErrorKind::CorruptJournal
+    );
     assert!(!temp.path().join("outside").exists());
 }
 

@@ -202,7 +202,13 @@ impl TarStorage {
         }
         let mut token = Vec::new();
         use std::io::Read;
-        regular(&run.private.join("writer.lock"))?
+        regular(&run.private.join("writer.lock"))
+            .map_err(|e| match e.kind {
+                ErrorKind::NotFound | ErrorKind::InvalidPath => {
+                    error(ErrorKind::LeaseLost, "writer lock missing or replaced")
+                }
+                _ => e,
+            })?
             .take(17)
             .read_to_end(&mut token)
             .map_err(io)?;
