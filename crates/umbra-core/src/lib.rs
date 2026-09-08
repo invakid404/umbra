@@ -202,8 +202,13 @@ impl OperationId {
     /// under the same ID can be refused. A caller performing several storage
     /// operations on behalf of one logical transaction therefore needs a
     /// distinct identity per request rather than one identity reused with
-    /// different keys. Derivation is deterministic, so the same (salt, index)
-    /// reproduces the same ID and a genuine retry stays a retry.
+    /// different keys. For a fixed seed, distinct (salt, index) pairs yield
+    /// distinct identities, and a given pair reproduces the same identity.
+    /// Transport retries reuse the already-built request context; they do not
+    /// re-enter derivation with a new index.
+    ///
+    /// The result is an opaque 128-bit identity, not a well-formed UUIDv4.
+    /// Consumers must not rely on UUID version or variant bits.
     pub fn derive(self, salt: u64, index: u64) -> Self {
         let mut bytes = *self.0.as_bytes();
         for (slot, byte) in bytes[..8].iter_mut().zip(salt.to_be_bytes()) {

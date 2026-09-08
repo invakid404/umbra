@@ -25,11 +25,12 @@ The staged order is fixed, and each stage's failure decides what may be released
 3. Connect storage, `open_run(CreateNew)`, then `acquire_writer` with
    `TakeoverPolicy::Refuse`. There is no stale-writer takeover.
 4. Open the journal against the run's `control/` binding with the same run,
-   writer identity and epoch.
+   writer identity and epoch, rejecting a non-fresh recovery state for CreateNew.
 5. Bind the namespace over those already-open sessions, handing it the lease so
    one owner renews, releases and mutates.
 6. Render enforcement from the run's own root, re-verify the workspace inventory,
-   then connect the platform and launch stopped.
+   then connect the platform, require exactly one ABI capability matching
+   `<platform>-<arch>-abi-v<decimal version>`, and launch stopped.
 7. Drive events, then tear down in order: flush run data, append and flush a
    completion record, close the journal, release the writer, close storage.
 
@@ -38,6 +39,11 @@ signalled child after a clean teardown is `ErrorKind::ProcessFailed`. A failure
 after the lease is taken releases writer authority only when the supervised tree
 is provably gone; otherwise the run is left recovery-required with the writer
 marker retained, and the primary error is preserved with cleanup damage appended.
+
+A provider bookkeeping error after all process exits preserves the run's success
+semantics and is reported through `RunObserver::teardown_warning` (or tracing
+when no observer is installed). A `finish_run` error enters the namespace failure
+path, preserving the original error and appending cleanup failures.
 
 ## Event loop
 

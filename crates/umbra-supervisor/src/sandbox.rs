@@ -45,12 +45,13 @@ pub fn render(spec: &SandboxSpec) -> Result<SandboxProfile> {
             "sandbox template must contain exactly one {RUN_ROOT_TOKEN}, found {occurrences}"
         )));
     }
-    let source = TEMPLATE.replace(RUN_ROOT_TOKEN, &literal);
-    if source.contains("{{") || source.contains("}}") {
+    let remaining = TEMPLATE.replace(RUN_ROOT_TOKEN, "");
+    if remaining.contains("{{") || remaining.contains("}}") {
         return Err(invalid(
-            "sandbox template still contains an unresolved token after rendering",
+            "sandbox template contains an unknown unresolved token",
         ));
     }
+    let source = TEMPLATE.replace(RUN_ROOT_TOKEN, &literal);
     if source.len() > MAX_SANDBOX_PROFILE_BYTES {
         return Err(invalid("rendered sandbox profile exceeds its size bound"));
     }
@@ -139,13 +140,10 @@ mod tests {
             .lines()
             .filter(|line| line.trim_start().starts_with("(allow file-write"))
             .collect();
-        // One subpath rule for the run root, plus the measured /dev/null sink.
+        // Only the per-run root grants writes.
         assert_eq!(
             writes,
-            vec![
-                r#"(allow file-write* (subpath "/runs/a/root"))"#,
-                r#"(allow file-write-data (literal "/dev/null"))"#
-            ]
+            vec![r#"(allow file-write* (subpath "/runs/a/root"))"#]
         );
     }
 
@@ -159,6 +157,14 @@ mod tests {
         )
         .unwrap();
         assert!(source.contains(r#"(subpath "/runs/a b\"c\\d/ünïcode/root")"#));
+    }
+
+    #[test]
+    fn braces_in_a_root_are_literal_path_bytes() {
+        let source = render(&spec(b"/runs/{{literal}}/root")).unwrap();
+        assert!(std::str::from_utf8(source.source())
+            .unwrap()
+            .contains("/runs/{{literal}}/root"));
     }
 
     #[test]

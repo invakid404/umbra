@@ -310,7 +310,11 @@ impl Journal for FileJournal {
                 .map_err(|e| io_error("journal_file.open", &log, e))?
                 .len();
             if length > MAX_LOG_BYTES {
-                return Err(corrupt("journal log exceeds the replay bound"));
+                return Err(error(
+                    ErrorKind::UnsupportedCapability,
+                    "journal_file.open",
+                    "journal log exceeds the supported replay size",
+                ));
             }
             let mut magic = [0u8; 8];
             file.read_exact(&mut magic)
@@ -394,6 +398,7 @@ impl Journal for FileJournal {
             closed: false,
         }));
 
+        let clean = recovery_is_clean(&pending, &tail);
         Ok(RecoveryState {
             run_id: request.control.run_id,
             checkpoint,
@@ -405,7 +410,7 @@ impl Journal for FileJournal {
             tail,
             // Anything left prepared-but-uncommitted needs reconciliation by the
             // namespace owner before this run can be called clean.
-            clean: pending_is_empty(&last_sequence),
+            clean,
         })
     }
 
@@ -429,6 +434,13 @@ impl Journal for FileJournal {
             payload: record.payload.clone(),
         };
         let frame = encode_frame(&stored)?;
+        if frame.len() as u64 > MAX_LOG_BYTES.saturating_sub(state.valid_bytes) {
+            return Err(error(
+                ErrorKind::UnsupportedCapability,
+                "journal_file.append",
+                "journal log reached the supported replay size",
+            ));
+        }
         let mut file = OpenOptions::new()
             .write(true)
             .open(&state.log)
@@ -533,7 +545,10 @@ impl Journal for FileJournal {
         // Contents are durable before anything points at them, so recovery can
         // never select a half-written snapshot.
         let reference = state.directory.join("checkpoint");
-        write_durably(&reference, checkpoint.id.0.to_string().as_bytes())?;
+        let temporary = state.directory.join("checkpoint.tmp");
+        write_durably(&temporary, checkpoint.id.0.to_string().as_bytes())?;
+        std::fs::rename(&temporary, &reference)
+            .map_err(|e| io_error("journal_file.checkpoint", &reference, e))?;
         fsync_directory(&state.directory)?;
         Ok(checkpoint.id)
     }
@@ -625,6 +640,11 @@ fn read_checkpoint(directory: &Path) -> Result<Option<Checkpoint>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(io_error("journal_file.open", &reference, e)),
     };
+    // Older writers could truncate the reference before publishing it. The
+    // complete log remains authoritative; recover by replaying without a snapshot.
+    if id.trim().is_empty() {
+        return Ok(None);
+    }
     let snapshot = directory
         .join("checkpoints")
         .join(format!("{}.json", id.trim()));
@@ -663,10 +683,12 @@ fn apply_recovery(
     }
 }
 
-/// A fresh log with no frames is clean; anything else needs the namespace owner
-/// to reconcile before this run may be treated as clean.
-fn pending_is_empty(last: &Sequence) -> bool {
-    last.0 == 0
+/// Unfinished operations and a damaged tail each require reconciliation.
+fn recovery_is_clean(
+    pending: &BTreeMap<umbra_core::OperationId, JournalPendingOperation>,
+    tail: &JournalTailRecovery,
+) -> bool {
+    pending.is_empty() && matches!(tail, JournalTailRecovery::Intact)
 }
 
 #[cfg(test)]
@@ -772,6 +794,10 @@ mod tests {
             .collect();
         assert_eq!(tail, vec![Sequence(2)]);
         journal.close().unwrap();
+        let mut reopened = FileJournal::new();
+        let recovered = reopened.open(&request(&dir, run_id, 8)).unwrap();
+        assert!(recovered.pending.is_empty());
+        assert!(recovered.clean, "a fully committed intact journal is clean");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -924,6 +950,46 @@ mod tests {
         let mut reopened = FileJournal::new();
         let state = reopened.open(&request(&dir, run_id, 6)).unwrap();
         assert_eq!(state.checkpoint.unwrap().id, checkpoint.id);
+        assert!(!dir.join("journal/checkpoint.tmp").exists());
+        // Simulate the empty reference left by an older truncate-based writer.
+        std::fs::write(dir.join("journal/checkpoint"), b"").unwrap();
+        let mut recovered = FileJournal::new();
+        let state = recovered.open(&request(&dir, run_id, 7)).unwrap();
+        assert!(state.checkpoint.is_none());
+        assert_eq!(state.last_valid_sequence, Sequence(1));
+        assert_eq!(recovered.replay(Sequence(0)).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn append_refuses_to_make_the_log_unreplayable() {
+        let dir = scratch("append-bound");
+        let run_id = RunId(uuid_v4());
+        let mut journal = FileJournal::new();
+        journal.open(&request(&dir, run_id, 1)).unwrap();
+        // Place the append cursor at the bound without allocating a huge log.
+        journal.session.as_mut().unwrap().valid_bytes = MAX_LOG_BYTES;
+        let e = journal
+            .append(&record(1, OperationId(uuid_v4()), JournalPayload::Commit))
+            .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::UnsupportedCapability);
+        assert_eq!(
+            std::fs::metadata(dir.join("journal/log")).unwrap().len(),
+            MAGIC.len() as u64
+        );
+        assert_eq!(journal.session.as_ref().unwrap().last_sequence, Sequence(0));
+        // A sparse oversized legacy log reports a capacity limit, not corruption.
+        OpenOptions::new()
+            .write(true)
+            .open(dir.join("journal/log"))
+            .unwrap()
+            .set_len(MAX_LOG_BYTES + 1)
+            .unwrap();
+        let mut reopened = FileJournal::new();
+        assert_eq!(
+            reopened.open(&request(&dir, run_id, 2)).unwrap_err().kind,
+            ErrorKind::UnsupportedCapability
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

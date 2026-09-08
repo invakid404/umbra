@@ -211,7 +211,7 @@ fn storage_root_is_rejected_for_run_instead_of_silently_ignored() {
         "/bin/true",
     ]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("--registry"), "{stderr}");
+    assert!(stderr.contains("--storage-root"), "{stderr}");
     std::fs::remove_dir_all(dir).unwrap();
 }
 

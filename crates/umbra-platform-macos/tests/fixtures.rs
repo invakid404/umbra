@@ -21,6 +21,10 @@ fn fixture(case: &str, expected: &[u8]) {
         std::env::var_os("UMBRA_TEST_FIXTURE_PATH"),
         std::env::var_os("UMBRA_TEST_REDIRECT_ROOT"),
     ) else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT"
+        );
         eprintln!("SKIP {case}: set UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT");
         return;
     };

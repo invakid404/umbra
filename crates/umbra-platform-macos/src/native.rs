@@ -873,6 +873,8 @@ impl MacosTraceBackend {
                     libc::kill(pid, libc::SIGKILL);
                     libc::waitpid(pid, std::ptr::null_mut(), 0);
                 }
+                self.deadline = None;
+                self.watchdog = None;
                 return Err(e);
             }
         };
@@ -890,8 +892,20 @@ impl MacosTraceBackend {
                 for session in &self.sessions {
                     session.task.kill();
                 }
+                for session in &self.sessions {
+                    unsafe {
+                        while libc::waitpid(session.id.0.native_id as i32, std::ptr::null_mut(), 0)
+                            == -1
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                        {
+                        }
+                    }
+                }
                 self.sessions.clear();
                 self.events.clear();
+                self.quiesced_stops.clear();
+                self.deadline = None;
+                self.watchdog = None;
                 return Err(e);
             }
         }
@@ -1395,6 +1409,11 @@ fn spawn_attributes() -> Result<SpawnAttributes> {
 }
 impl TraceBackend for MacosTraceBackend {
     fn launch(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
+        if matches!(spec.sandbox, SandboxRequirement::UnsandboxedExperiment) {
+            return Err(unsupported(
+                "supervised launch requires an installed sandbox",
+            ));
+        }
         self.launch_traced(spec)
     }
     fn next_event(&mut self) -> Result<TraceEvent> {

@@ -37,3 +37,8 @@ five trait crates. Runtime executable paths/options never belong in checkpoint i
 handshake as `accept` for injected private connections such as test socketpairs.
 
 Check with `cargo check -p umbra-core`.
+
+Derived operation IDs are reproducible for a fixed seed and `(salt, index)` pair
+and distinct across pairs for that seed. They are opaque 128-bit values; consumers
+must not rely on UUID version or variant bits. Transport retries reuse the
+already-built request context.

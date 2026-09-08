@@ -51,6 +51,10 @@ fn open_libc_provider_ipc() {
         std::env::var_os("UMBRA_TEST_FIXTURE_PATH"),
         std::env::var_os("UMBRA_TEST_REDIRECT_ROOT"),
     ) else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT"
+        );
         eprintln!(
             "SKIP open-libc provider IPC: set UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT"
         );
@@ -119,10 +123,26 @@ fn open_libc_provider_ipc() {
             persistence: PersistencePolicy::LocalDevelopment,
             inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
         },
-        // Protocol coverage for the unenforced experiment path. A required
-        // profile is rejected below, because installation is not implemented.
-        sandbox: SandboxRequirement::UnsandboxedExperiment,
+        // The contract path always installs enforcement. The overbroad profile
+        // below is refused because it grants the filesystem root.
+        sandbox: SandboxRequirement::Required(
+            SandboxProfile::new(
+                SEATBELT_PROFILE_FORMAT,
+                include_str!("../../../experiments/seatbelt/umbra.sb")
+                    .replace("{{UMBRA_RUN_ROOT}}", &format!("\"{}\"", root.display()))
+                    .into_bytes(),
+                byte_path(&root),
+            )
+            .unwrap(),
+        ),
     };
+    let mut unsandboxed = spec.clone();
+    unsandboxed.sandbox = SandboxRequirement::UnsandboxedExperiment;
+    let refused: Result<Response> = client.call(&Request::Launch(unsandboxed));
+    assert_eq!(
+        refused.err().unwrap().kind,
+        ErrorKind::UnsupportedCapability
+    );
     for invalid in 0..5 {
         let mut rejected = spec.clone();
         match invalid {

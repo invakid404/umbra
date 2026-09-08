@@ -23,7 +23,7 @@ def quote(root: str) -> str:
         raise SystemExit("write root must not be the filesystem root")
     if root.endswith("/"):
         raise SystemExit(f"write root must not have a trailing separator: {root}")
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in root):
+    if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in root):
         raise SystemExit("write root contains control characters")
     escaped = root.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
@@ -35,9 +35,10 @@ def main(argv: list[str]) -> int:
     source = TEMPLATE.read_text()
     if source.count(TOKEN) != 1:
         raise SystemExit(f"{TEMPLATE} must contain exactly one {TOKEN}")
+    remaining = source.replace(TOKEN, "")
+    if "{{" in remaining or "}}" in remaining:
+        raise SystemExit("template contains an unknown unresolved token")
     rendered = source.replace(TOKEN, quote(argv[1]))
-    if "{{" in rendered or "}}" in rendered:
-        raise SystemExit("rendered profile still contains an unresolved token")
     Path(argv[2]).write_text(rendered)
     print(f"rendered {TEMPLATE} for {argv[1]} into {argv[2]}")
     return 0

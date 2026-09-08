@@ -43,8 +43,12 @@ rejects a connection whose backend does not actually advertise the name.
 `--strict-remote` is a deterministic `UnsupportedCapability` error: no storage
 provider qualifies strict remote durability.
 
-Omitting `--agent` runs the trailing `--` arguments as a command; `argv[0]` is the
-executable and must be absolute, because PATH is never searched. Supplying
+Omitting `--agent` runs the trailing `--` arguments as a command; the executable
+argument must be absolute, because PATH is never searched. Under the required
+sandbox profile, the target observes `argv[0]` as its resigned twin cache path:
+`sandbox-exec` provides no way to preserve the requested `argv[0]`. `argv[1..]`
+and `_NSGetExecutablePath` are unaffected by enforcement (the latter already
+returns the twin path on both launch paths). Supplying
 `--agent ID` requires the registry's agent provider to have that exact ID and then
 reports `NotImplemented`, since adapters are not implemented.
 
@@ -87,3 +91,10 @@ connections and starts trusted provider processes but no tracees. See
 cargo check -p umbra-cli
 cargo test -p umbra-cli
 ```
+
+The committed `tests/run_fixtures.rs` runs seven cases each against local storage
+and an existing NFSv4 mount. Build providers with `cargo build --workspace --bins`
+and compile `experiments/fixtures/umbra-test-child.c` first. Set
+`UMBRA_TEST_FIXTURE_PATH` and `UMBRA_TEST_NFS_ROOT`, then run
+`UMBRA_INTEGRATION_REQUIRED=1 cargo test -p umbra-cli --test run_fixtures -- --nocapture`.
+Required mode fails on missing inputs; ordinary developer tests may skip.

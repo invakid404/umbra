@@ -146,3 +146,7 @@ injection points that cross worker boundaries.
 
 Check this contract crate with `cargo check -p umbra-platform`, and compile its
 trait-object smoke example with `cargo test -p umbra-platform --doc`.
+
+The provider dispatcher rejects `UnsandboxedExperiment` before calling a backend:
+IPC launch is exclusively the supervised contract path. ABI capability identities
+use `<platform>-<arch>-abi-v<decimal version>`; run composition requires exactly one.

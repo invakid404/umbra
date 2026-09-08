@@ -94,7 +94,12 @@ something else, or does not reach the exec within its event budget fails the
 launch, and the tree is killed rather than returned without a handle.
 `UnsandboxedExperiment` is the only way to run unenforced, it is a named
 selection rather than an omission, and `launch_experimental` accepts nothing
-else.
+else. `TraceBackend::launch` and the provider IPC dispatcher reject that selection.
+
+Under a required profile the target observes `argv[0]` as its resigned twin cache
+path: `sandbox-exec` provides no way to preserve the requested value. `argv[1..]`
+and `_NSGetExecutablePath` are unaffected by enforcement; the latter already
+returns the twin path on both launch paths.
 
 The backend advertises `sandboxed-stopped-launch-v1` and
 `experimental-syscall-rewrite-v1`. `tests/sandbox_launch.rs` qualifies the first
@@ -247,3 +252,9 @@ UMBRA_TEST_FIXTURE_PATH=<abs> UMBRA_TEST_REDIRECT_ROOT=<abs> \
 
 Successful compilation does not qualify tracing on any target — the M1
 minimum bar is what `open-libc` CAPTURED demonstrates.
+
+Set `UMBRA_INTEGRATION_REQUIRED=1` to make missing fixture inputs fail the sandbox,
+IPC and direct tracer suites. CI's `native-qualification` job runs these and the
+CLI's fourteen-case matrix on a runner labelled `umbra-integration`; that runner
+requires debugger permission and an existing NFSv4 mount configured through the
+`UMBRA_TEST_NFS_ROOT` repository variable. No test provisions a mount or prompts.

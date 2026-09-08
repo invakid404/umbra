@@ -22,9 +22,8 @@ Construction does no I/O. The owner must call `NamespaceSession::bind` with:
 The owner opens the injected Journal against `binding.control` with the same run
 and writer epoch. Binding validates matching identities and accepts only an empty,
 intact journal with no checkpoint or pending transactions. Nonempty recovery is
-explicitly unsupported until reconciliation is implemented. The existing
-supervisor constructor does not yet supply this extra initialization; deployment
-wiring is outside this track. Unbound engines return `InvalidState`.
+explicitly unsupported until reconciliation is implemented. The supervisor's
+`run` composition supplies this initialization. Unbound engines return `InvalidState`.
 
 ## MVP behavior
 
@@ -92,14 +91,11 @@ failure. Crash-atomic recovery requires replay/reconciliation of the intent and
 both markers. This MVP refuses reopening nonempty journals rather than exposing
 partially reconciled state.
 
-**Persistence assumption / TODO:** `umbra-journal-file` still returns
-`NotImplemented` for all operations. The actual Journal interface has
-`append(&JournalRecord)` and `flush`, not a `journal.commit` method. The
-record's payload carries `JournalPayload::Commit`. This engine calls those real
-methods and propagates failures; it does not replace them
-with a successful stub. Tests inject an in-memory Journal that models record
-ordering and failure boundaries, with no production durability claim. A usable
-persistent session awaits file-journal persistence and recovery reconciliation.
+The injected Journal owns persistence. The shipped `umbra-journal-file` backend
+implements append and fsync-backed flush; the record payload carries
+`JournalPayload::Commit`. This engine calls those methods and propagates failures.
+Unit tests inject an in-memory Journal to model ordering and failure boundaries;
+restart recovery still requires reconciliation that this engine does not implement.
 
 Abort never claims that copy-up, creation, unlink, or a kernel mutation was undone.
 An aborted mutation requires recovery and leaves the session stopped. Checkpoint

@@ -48,7 +48,10 @@ The workspace uses Rust edition 2021 and the toolchain pinned in
 [rust-toolchain.toml](rust-toolchain.toml).
 [CI](.github/workflows/ci.yml) runs formatting, Clippy with warnings denied,
 workspace checks, tests, and doctests on macOS and Linux for pushes to `master`
-and pull requests.
+and pull requests. The additional native qualification job runs the committed
+fourteen-case CLI matrix and sandbox/IPC suites with required inputs on an
+`umbra-integration` macOS ARM64 runner. It requires debugger permission and an
+existing NFSv4 mount configured as `UMBRA_TEST_NFS_ROOT`; missing inputs fail.
 
 If you're contributing, [the Memoria guide](docs/memoria.md) explains how we keep
 READMEs connected to the code they describe. It covers the review flow and the

@@ -70,6 +70,10 @@ impl RunArgs {
 struct StderrStatus;
 
 impl RunObserver for StderrStatus {
+    fn teardown_warning(&mut self, error: &UmbraError) {
+        eprintln!("provider teardown warning: {error}");
+    }
+
     fn prepared(&mut self, run_id: RunId) {
         eprintln!("umbra: run {} prepared", run_id.0);
     }

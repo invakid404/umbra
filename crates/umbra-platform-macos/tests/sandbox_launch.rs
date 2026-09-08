@@ -31,20 +31,16 @@ impl TraceMemory for Memory<'_> {
 /// The same policy shape the supervisor renders: read the host, write only under
 /// one run root. Built here because a backend may not depend on the supervisor.
 fn profile(write_root: &Path) -> SandboxProfile {
-    let source = format!(
-        "(version 1)\n(deny default)\n(allow file-read*)\n\
-         (allow file-write* (subpath \"{}\"))\n\
-         (allow file-write-data (literal \"/dev/null\"))\n\
-         (allow process-fork)\n(allow process-exec)\n\
-         (allow signal (target self) (target children))\n(allow sysctl-read)\n\
-         (allow mach-priv-task-port (target same-sandbox))\n(allow network*)\n\
-         (allow mach-lookup (global-name \"com.apple.system.logger\") \
-         (global-name \"com.apple.system.notification_center\") \
-         (global-name \"com.apple.bsd.dirhelper\") (global-name \"com.apple.lsd.mapdb\") \
-         (global-name \"com.apple.SecurityServer\") (global-name \"com.apple.trustd.agent\") \
-         (global-name \"com.apple.mDNSResponder\"))\n",
-        write_root.display()
+    let literal = format!(
+        "\"{}\"",
+        write_root
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
     );
+    let source = include_str!("../../../experiments/seatbelt/umbra.sb")
+        .replace("{{UMBRA_RUN_ROOT}}", &literal);
     SandboxProfile::new(
         SEATBELT_PROFILE_FORMAT,
         source.into_bytes(),
@@ -56,6 +52,7 @@ fn profile(write_root: &Path) -> SandboxProfile {
 struct Outcome {
     first_event_after_launch: TraceEvent,
     rewrites: usize,
+    open_outcome: Option<OperationOutcome>,
     root_status: Option<ExitStatus>,
     host_exists: bool,
     shadow: Option<Vec<u8>>,
@@ -97,6 +94,8 @@ fn drive(case: &str, fixture: &Path, root: &Path, rewrite: bool) -> Outcome {
 
     let mut live = 1;
     let mut rewrites = 0;
+    let mut pending_open = None;
+    let mut open_outcome = None;
     let mut root_status = None;
     let mut first = None;
     while live > 0 {
@@ -125,6 +124,9 @@ fn drive(case: &str, fixture: &Path, root: &Path, rewrite: bool) -> Outcome {
                 {
                     let write_intent =
                         flags.write || flags.append || flags.create || flags.truncate;
+                    if path == &byte_path(&host) && write_intent {
+                        pending_open = Some(thread);
+                    }
                     if write_intent && rewrite {
                         let physical = root.join(
                             Path::new(std::ffi::OsStr::from_bytes(path.as_bytes()))
@@ -153,7 +155,15 @@ fn drive(case: &str, fixture: &Path, root: &Path, rewrite: bool) -> Outcome {
                 }
                 Some(thread)
             }
-            TraceEvent::SyscallExit { thread, .. } => Some(thread),
+            TraceEvent::SyscallExit {
+                thread, outcome, ..
+            } => {
+                if pending_open == Some(thread) {
+                    open_outcome = Some(outcome);
+                    pending_open = None;
+                }
+                Some(thread)
+            }
             TraceEvent::Exit { task, status } => {
                 if task == process.0 {
                     root_status = Some(status);
@@ -178,6 +188,7 @@ fn drive(case: &str, fixture: &Path, root: &Path, rewrite: bool) -> Outcome {
     let outcome = Outcome {
         first_event_after_launch: first.expect("at least one event"),
         rewrites,
+        open_outcome,
         root_status,
         host_exists: host.exists(),
         shadow: std::fs::read(&shadow).ok(),
@@ -192,6 +203,10 @@ fn inputs() -> Option<(PathBuf, PathBuf)> {
         std::env::var_os("UMBRA_TEST_FIXTURE_PATH"),
         std::env::var_os("UMBRA_TEST_REDIRECT_ROOT"),
     ) else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT"
+        );
         eprintln!("SKIP: set UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT");
         return None;
     };
@@ -232,6 +247,10 @@ fn an_unrewritten_write_outside_the_run_root_is_denied_by_the_installed_policy()
     // nothing. Only the installed policy can stop this write.
     let outcome = drive("open-libc", &fixture, &root, false);
     assert_eq!(outcome.rewrites, 0);
+    assert_eq!(
+        outcome.open_outcome,
+        Some(OperationOutcome::Failure(Errno(libc::EPERM)))
+    );
     assert_eq!(
         outcome.root_status,
         Some(ExitStatus::Code(1)),

@@ -18,8 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use umbra_core::{
     capabilities as caps, provider::ProviderDescriptor, provider::ProviderRegistry,
     AgentLaunchRequest, BytePath, EnvironmentVariable, ErrorKind, ExitStatus, IdempotencyKey,
-    LaunchPolicy, LaunchSpec, OperationId, PersistencePolicy, Result, RunId, SandboxRequirement,
-    TerminationPolicy, TracedFd, UmbraError, WriterId,
+    JournalTailRecovery, LaunchPolicy, LaunchSpec, OperationId, PersistencePolicy, Result, RunId,
+    SandboxRequirement, Sequence, TerminationPolicy, TracedFd, UmbraError, WriterId,
 };
 
 use crate::sandbox::{self, SandboxSpec};
@@ -73,6 +73,8 @@ pub trait RunObserver {
     fn prepared(&mut self, run_id: RunId);
     /// Called once when the supervised tree has finished, before teardown result.
     fn finished(&mut self, outcome: &RunOutcome);
+    /// Provider bookkeeping failed after all processes reported exit.
+    fn teardown_warning(&mut self, error: &UmbraError);
 }
 
 /// Everything one run needs. Ownership containers, not persisted records.
@@ -458,6 +460,24 @@ mod unix {
             }
         };
 
+        // CreateNew must produce a fresh journal. Anything else is a storage /
+        // journal disagreement, not recovery this new-run path can reconcile.
+        if !recovery.clean
+            || !recovery.pending.is_empty()
+            || !matches!(recovery.tail, JournalTailRecovery::Intact)
+            || recovery.last_valid_sequence != Sequence(0)
+            || recovery.checkpoint.is_some()
+        {
+            let e = error(
+                ErrorKind::InvalidState,
+                "run.journal",
+                "CreateNew returned a non-fresh journal",
+            );
+            let e = with_cleanup(e, journal.close());
+            let e = with_cleanup(e, storage.release_writer(&lease));
+            return Err(with_cleanup(e, storage.close_run()));
+        }
+
         // From here the namespace owns storage and journal; failures go through
         // its own fail path so one owner decides what is released.
         let mut namespace = standard_namespace(storage, journal);
@@ -537,18 +557,29 @@ mod unix {
                 ))
             }
         };
+        // ABI identities use the documented `<platform>-<arch>-abi-v<version>`
+        // capability suffix. Exactly one identity must be negotiated.
+        let mut abi_names = capabilities.capabilities.iter().filter(|name| {
+            name.rsplit_once("-abi-v").is_some_and(|(prefix, version)| {
+                !prefix.is_empty()
+                    && !version.is_empty()
+                    && version.bytes().all(|b| b.is_ascii_digit())
+            })
+        });
+        let abi = match (abi_names.next(), abi_names.next()) {
+            (Some(abi), None) => abi.clone(),
+            _ => return Err(fail(namespace, run_id, error(
+                ErrorKind::UnsupportedCapability, "run.platform",
+                "platform must advertise exactly one ABI identity (<platform>-<arch>-abi-v<version>)",
+            ), true)),
+        };
         let budget = RunBudget {
             // Renew at half the interval so one blocking event read cannot
             // consume the whole budget before the next renewal check.
             renew_after: Duration::from_millis(lease.renew_after_millis / 2),
             cwd: command.cwd.clone(),
             architecture,
-            abi: capabilities
-                .capabilities
-                .iter()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| "provider-negotiated".to_owned()),
+            abi,
         };
 
         if let Some(observer) = observer.as_mut() {
@@ -592,14 +623,23 @@ mod unix {
             return Err(fail(namespace, run_id, primary, terminated));
         }
 
+        if let Err(e) = reaped {
+            if let Some(observer) = observer.as_mut() {
+                observer.teardown_warning(&e);
+            } else {
+                tracing::warn!(error = %e, "provider teardown bookkeeping failed");
+            }
+        }
         if let Some(observer) = observer.as_mut() {
             observer.finished(&outcome);
         }
-        namespace.finish_run(&FinishRunRequest {
+        if let Err(e) = namespace.finish_run(&FinishRunRequest {
             run_id,
             root_status: outcome.root_status,
             processes_exited: outcome.processes_exited,
-        })?;
+        }) {
+            return Err(fail(namespace, run_id, e, true));
+        }
 
         match outcome.root_status {
             Some(ExitStatus::Code(0)) => Ok(()),

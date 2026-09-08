@@ -1517,10 +1517,7 @@ impl NamespaceSession for Overlay {
         // must not be able to starve the lease it is mutating under.
         let lease = self.config()?.lease.clone();
         let renewed = self.storage.renew_writer(&lease)?;
-        if renewed.run_id != lease.run_id
-            || renewed.writer_id != lease.writer_id
-            || renewed.epoch.0 < lease.epoch.0
-        {
+        if renewed.run_id != lease.run_id || renewed.writer_id != lease.writer_id {
             return Err(error(ErrorKind::LeaseLost, "invalid lease renewal"));
         }
         if renewed.epoch != lease.epoch {

@@ -18,19 +18,24 @@ Boundaries the implementation keeps:
 - `open` validates format version, run identity, access intent and injected writer
   authority before opening anything for mutation, then replays to establish the
   last valid sequence and the prepared-but-uncommitted operations for the
-  namespace owner to reconcile. Readable frames are never treated as evidence of a
+  namespace owner to reconcile. Recovery is clean only with no pending operations
+  and an intact tail. Readable frames are never treated as evidence of a
   previous flush receipt.
-- A demonstrably incomplete final frame is the only recoverable damage, reported as
+- A demonstrably incomplete final frame is the only recoverable log damage, reported as
   `IncompleteFinalFrame`; truncating it requires writer authority, so a read-only
   open reports it without repairing. A complete frame with a bad checksum, or any
   interior corruption or sequence gap, is `CorruptJournal`.
 - `append` assigns and persists the sequence itself; a caller's sequence is not
   authority to place a frame. A record whose epoch does not match the session's
-  writer authority is `LeaseLost`. Acceptance is not durability.
+  writer authority is `LeaseLost`. Appends refuse to exceed the 512 MiB replay
+  limit; an oversized existing log is `UnsupportedCapability`, not corruption.
+  Acceptance is not durability.
 - `flush` fsyncs and returns a receipt; a sequence beyond the log is rejected.
 - `write_checkpoint` requires the checkpoint's last committed sequence to have been
   flushed, and writes snapshot contents durably before the reference that names
-  them, so recovery cannot select a half-written snapshot.
+  them. The reference is written to `checkpoint.tmp`, fsynced, renamed over
+  `checkpoint`, then the journal directory is fsynced. An empty reference left
+  by an older writer falls back to full log replay without selecting a snapshot.
 - `close` surfaces the error from its final flush rather than reporting a clean
   shutdown over a failed write.
 
