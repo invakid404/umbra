@@ -9,3 +9,6 @@ publish = false
 [dependencies]
 umbra-core = { path = "../umbra-core" }
 umbra-journal = { path = "../umbra-journal" }
+
+[dev-dependencies]
+uuid.workspace = true

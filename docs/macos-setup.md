@@ -56,7 +56,7 @@ The tested mount is `~/umbra-scratch/nfs/mnt/umbra-nfs`. Configure its absolute 
 
 ### Sandbox profile — parameterised mount path
 
-The historical Seatbelt profile (`experiments/seatbelt/umbra.sb`) uses the literal `/mnt/umbra-nfs`. Runtime rendering, mount-path parameterisation and installation by the Rust tracer are not implemented. The experiment includes two carve-outs beyond the deny-default + read + write-under-mount rules:
+`experiments/seatbelt/umbra.sb` is now a template with a single `{{UMBRA_RUN_ROOT}}` token; the pinned `/mnt/umbra-nfs` literal is gone. The supervisor embeds that template and renders it per run against the opened run's own root (`umbra_supervisor::sandbox`), resolving the root first because Seatbelt matches resolved paths. Installation by the tracer is **not** implemented: the macOS backend validates a required profile and then refuses to launch, and it does not advertise `sandboxed-stopped-launch-v1`, so `umbra run` fails during preparation rather than launching unenforced. The experiment includes two carve-outs beyond the deny-default + read + write-under-mount rules:
 
 - `(allow mach-priv-task-port (target same-sandbox))` — LLDB launches `debugserver` and the tracee as siblings, so a children-only rule is insufficient.
 - `(allow file-write-data (literal "/dev/null"))` — required by LLDB's `target.disable-stdio` launch path.

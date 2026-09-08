@@ -13,7 +13,27 @@ RESULTS = ROOT / "results"
 TWIN = Path("/tmp/umbra-m0/twins/ls-c-test")
 WRAPPER = TWIN.with_name("sandbox-exec-c-test")
 ENT = Path("/Users/inva/Coding/umbra/experiments/gate-1/ent.plist")
-PROFILE = ROOT / "umbra.sb"
+
+
+def rendered_profile():
+    """The rendered profile to compose against; there is no built-in default.
+
+    `umbra.sb` is a template carrying one unresolved token, so passing it to
+    sandbox-exec would test policy text that never runs. Render it first with
+    ./render-profile.py and point UMBRA_PROFILE at the result.
+    """
+    path = os.environ.get("UMBRA_PROFILE")
+    if not path:
+        raise SystemExit(
+            "set UMBRA_PROFILE to a rendered profile "
+            "(./render-profile.py <absolute-run-root> <output>)")
+    profile = Path(path)
+    if not profile.is_file():
+        raise SystemExit(f"rendered profile does not exist: {profile}")
+    if "{{" in profile.read_text():
+        raise SystemExit(f"{profile} still contains an unrendered template token")
+    return profile
+
 
 
 def entry_address():
@@ -151,6 +171,7 @@ def main():
                            stdout=log, stderr=subprocess.STDOUT, check=True)
             subprocess.run(["/usr/bin/codesign", "-dvv", "--entitlements", ":-", str(destination)],
                            stdout=log, stderr=subprocess.STDOUT, check=True)
+    PROFILE = rendered_profile()
     address = entry_address()
     print("ls LC_MAIN file address: {:#x} (stripped main symbol fallback)".format(address), flush=True)
     arguments = ["-f", PROFILE, TWIN, "-d", ROOT]

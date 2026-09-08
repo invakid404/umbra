@@ -4,7 +4,13 @@
 
 ;; No read exclusions. Includes executable mappings and metadata reads.
 (allow file-read*)
-(allow file-write* (subpath "/mnt/umbra-nfs"))
+;; The UMBRA_RUN_ROOT token below is a template placeholder, not policy syntax.
+;; The supervisor replaces it with one complete, quoted Seatbelt literal naming the
+;; opened run's own root binding (`<store>/<run-id>/root`), so this is the only
+;; persistent write allowance and it never covers the whole backing store, a
+;; sibling run, control/, or the base snapshot. Rendering fails if the token is
+;; absent, appears more than once, or if any token survives substitution.
+(allow file-write* (subpath {{UMBRA_RUN_ROOT}}))
 ;; Required by LLDB's target.disable-stdio launch path (measured EPERM without
 ;; it). This character-device sink persists no filesystem data. No create,
 ;; unlink, metadata mutation, or other device writes are permitted here.

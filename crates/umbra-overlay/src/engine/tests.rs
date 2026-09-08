@@ -161,6 +161,7 @@ impl Fixture {
             context: context(binding.run_id, Some(lease.epoch)),
             recovery: recovery(binding.run_id),
             binding,
+            lease,
         };
         let mut overlay = Overlay::new(Box::new(shadow), Box::new(journal));
         overlay.bind(config, Box::new(base)).unwrap();

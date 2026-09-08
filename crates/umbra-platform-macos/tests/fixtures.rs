@@ -52,6 +52,10 @@ fn fixture(case: &str, expected: &[u8]) {
                 persistence: PersistencePolicy::LocalDevelopment,
                 inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
             },
+            // Direct tracer coverage, deliberately without enforcement: these
+            // cases measure interception, not the sandbox boundary. `umbra run`
+            // cannot select this; it always renders and requires a profile.
+            sandbox: SandboxRequirement::UnsandboxedExperiment,
         })
         .unwrap();
     let mut live = 1;

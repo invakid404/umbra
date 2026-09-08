@@ -8,6 +8,14 @@ Live NFSv4 storage backend for Umbra. Direct Umbra dependencies are
 and supported mutations through `umbra_storage::Storage` against an
 externally managed NFSv4 mount. Hard links, logical symlinks, xattrs,
 kernel-shadow qualification and strict remote persistence are unsupported.
+
+`connect` validates an existing exact NFSv4 mount before any run I/O, and only
+then does the backend advertise `mounted-nfsv4-v1`; a backend built with `new`,
+which validates nothing, never reports it. `experimental-open-rewrite-v1` is
+advertised alongside it, since runs supply real physical paths for kernel syscall
+rewriting and the sandbox write root. Nothing here advertises remote durability:
+`strict_remote_persistence` stays false and `durability` stays `Local`, because
+the boundary reached is the client fsync.
 Construction does not mount anything. `NfsStorage::new` retains the config and
 defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
 

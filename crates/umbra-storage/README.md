@@ -6,6 +6,15 @@ Shared request/result, identity, error, capability, and byte-path types belong t
 core and are re-exported here. There are no implementation-specific associated
 types: every backend can be injected as `Box<dyn Storage>` or `&mut dyn Storage`.
 
+`StorageCapabilities::features` is an open set of narrowly named qualified
+behaviors, alongside the existing booleans. It is the extension point for behavior
+too specific to deserve a boolean: a backend advertises only what it has actually
+qualified, and a consumer requires names rather than recognizing backend
+identities. `provider::serve_provider` maps that set into the handshake, so a
+descriptor requiring a name cannot connect to a backend that does not offer it.
+The field defaults to empty, keeping older encodings decodable; an empty set
+grants nothing.
+
 `Storage` owns one active run. Its required methods are `capabilities`, `open_run`,
 `acquire_writer`, `renew_writer`, `release_writer`, `execute`, `flush`, and
 `close_run`. Constructors and backend connection options live outside the trait.
