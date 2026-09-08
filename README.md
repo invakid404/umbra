@@ -6,18 +6,18 @@ mutation reaches the selected shadow or is denied by an independent enforcement
 boundary. Strict remote persistence requires qualified remote storage; local
 storage is an explicit development or local-persistence mode.
 
-Start with [ARCHITECTURE.md](ARCHITECTURE.md) for the 15-crate workspace,
+Start with [ARCHITECTURE.md](ARCHITECTURE.md) for the 16-crate workspace,
 per-trait extension points, runtime provider design, dependency rules, and links
 to crate documentation. The [engineering handoff](docs/handoff.md) explains the
 product contract, namespace semantics, feasibility plan, and qualification work.
 Its illustrative `fsvirt-*` crate names are superseded by the `umbra-*` topology
 in the architecture document.
 
-M1 and M1.5 have delivered the 15-crate pluggable workspace, a working
-[Darwin arm64 Rust tracer](crates/umbra-platform-macos/README.md), real local and
-NFS storage backends, and an overlay with copy-up, read-through, whiteouts and
-logical symlinks. All seven Rust fixture cases are CAPTURED and the M2
-post-exec breakpoint gap is closed.
+M1 and M1.5 have delivered the 16-crate pluggable workspace, a working
+[Darwin arm64 Rust tracer](crates/umbra-platform-macos/README.md), real local,
+NFS and tar storage backends, and an overlay with copy-up, read-through,
+whiteouts and logical symlinks. All seven Rust fixture cases are CAPTURED and
+the M2 post-exec breakpoint gap is closed.
 [M0 Gate 2](docs/m0/gate-2.md) preserves the separate Python prototype evidence.
 
 The end-to-end CLI is still not wired. Operational supervisor/CLI methods, the
@@ -30,4 +30,9 @@ The workspace uses Rust edition 2021 and the toolchain pinned in
 [CI](.github/workflows/ci.yml) runs formatting, Clippy with warnings denied,
 workspace checks, tests, and doctests on macOS and Linux for pushes to `master`
 and pull requests.
+
+If you're contributing, [the Memoria guide](docs/memoria.md) explains how we keep
+READMEs connected to the code they describe. It covers the review flow and the
+documentation check that runs in CI.
+
 Provider executables can be checked through the [runtime registry](docs/providers.md).
