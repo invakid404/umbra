@@ -176,8 +176,12 @@ gone. See the `reason:exec` branch in `src/native.rs`.
 `src/rsp.rs::tests::debugserver_reverse_connect_no_ack_handshake` spawns a
 real debugserver and asserts the negotiated `qHostInfo.ostype` is
 `macosx`, guarding the reverse-connect nonblocking-inheritance fix from
-regressing. It resolves `xcode-select -p` and checks the actual debugserver
-binary path before connecting; missing tools print `SKIP` and return.
+regressing. It resolves the binary through the same `discover_debugserver`
+helper `connect` uses — `UMBRA_DEBUGSERVER` first, then the path below
+`xcode-select -p` — and checks that the resolved path is a file before
+connecting; missing tools print `SKIP` and return. Sharing that helper is
+what stops the test from skipping on a host where only the environment
+override names a usable binary.
 That guard is implemented. A present debugger still requires socket and
 debugging permissions.
 
