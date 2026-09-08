@@ -160,6 +160,11 @@ pub(crate) fn rename(
     cvt(result, "renameat")?;
     Ok(())
 }
+// `st_nlink` and `st_mode` differ in width between Darwin (u16) and Linux
+// (nlink_t = u64, mode_t = u32). Explicit `as` widens on Darwin and is a
+// no-op on Linux; `#[allow(clippy::unnecessary_cast)]` keeps the same code
+// path clean on both targets without a per-platform helper.
+#[allow(clippy::unnecessary_cast)]
 pub(crate) fn stat(dir: &File, bytes: &[u8]) -> Result<BlobStat> {
     let name = name(if bytes.is_empty() { b"." } else { bytes })?;
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
