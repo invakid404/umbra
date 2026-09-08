@@ -32,6 +32,8 @@ pub fn fields(s: &str) -> BTreeMap<&str, &str> {
     s.split(';').filter_map(|f| f.split_once(':')).collect()
 }
 pub struct Rsp {
+    /// Debug aid: distinguishes concurrent connections in UMBRA_RSP_LOG output.
+    pub id: u32,
     stream: TcpStream,
     child: Child,
     buffer: Vec<u8>,
@@ -45,6 +47,11 @@ impl Rsp {
     pub fn connect(options: &Options, deadline: Instant) -> Result<Self> {
         let executable = match &options.debugserver {
             Some(p) => p.clone(),
+            // Debug aid: some Xcode layouts keep debugserver under
+            // SharedFrameworks, where the discovery path below cannot find it.
+            None if std::env::var_os("UMBRA_DEBUGSERVER").is_some() => {
+                std::path::PathBuf::from(std::env::var_os("UMBRA_DEBUGSERVER").unwrap())
+            }
             None => {
                 let out = Command::new("/usr/bin/xcode-select")
                     .arg("-p")
@@ -105,7 +112,9 @@ impl Rsp {
         stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .map_err(|e| error("rsp", e))?;
+        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let mut r = Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             stream,
             child,
             buffer: Vec::new(),
@@ -125,7 +134,7 @@ impl Rsp {
     }
     pub fn send(&mut self, body: &str) -> Result<()> {
         if std::env::var_os("UMBRA_RSP_LOG").is_some() {
-            eprintln!("RSP > {body}");
+            eprintln!("RSP[{}] > {body}", self.id);
         }
         if Instant::now() >= self.deadline {
             return Err(error("watchdog", "session deadline expired"));
@@ -229,7 +238,11 @@ impl Rsp {
                 Ok(0) => return Err(error("rsp", "debugserver disconnected")),
                 Ok(n) => {
                     if std::env::var_os("UMBRA_RSP_LOG").is_some() {
-                        eprintln!("RSP < {}", String::from_utf8_lossy(&bytes[..n]));
+                        eprintln!(
+                            "RSP[{}] < {}",
+                            self.id,
+                            String::from_utf8_lossy(&bytes[..n])
+                        );
                     }
                     self.buffer.extend_from_slice(&bytes[..n]);
                 }
