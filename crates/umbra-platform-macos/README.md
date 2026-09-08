@@ -119,7 +119,7 @@ All seven cases are enabled. Fixture cases:
 | `open-libc`         | **CAPTURED** — the M1 minimum acceptance bar |
 | `open-svc`          | **CAPTURED** |
 | `fork-write`        | **CAPTURED** |
-| `posix-spawn-write` | **CAPTURED** on macOS 26.5.1; refuses elsewhere (version pin, below) |
+| `posix-spawn-write` | **CAPTURED** |
 | `exec-write`        | **CAPTURED** — see the closed M2 gap below |
 | `grandchild-write`  | **CAPTURED** |
 | `dup-inherit-write` | **CAPTURED** |
@@ -136,11 +136,23 @@ rather than discarded across an exec — see the closed M2 gap below. A
 duplicate `Z0` at one address makes the matching `z0` decrement without
 restoring the instruction, and debugserver answers `OK` either way.
 
-`posix-spawn-write` additionally requires the qualified host: the spawn
-file-actions descriptor layout is pinned to macOS 26.5.1 in
-`src/native.rs`, and the case returns `UnsupportedCapability` on any other
-release rather than guessing at the layout. On macOS 27.0 the remaining
-six cases are CAPTURED and this one refuses by design.
+`posix_spawn` needs no per-release layout knowledge. `struct
+_posix_spawnattr` is private and moves between releases — `sizeof` 248 with
+`psa_ports` at 192 on macOS 26, 256 and 200 on 27.0 — so this crate never
+reconstructs it. `spawn_attributes` has the host's own libc build the block
+(`posix_spawnattr_init` plus `posix_spawnattr_setflags`), takes its length
+from `malloc_size` rather than a constant, and copies the bytes without
+interpreting them.
+
+The kernel copies `offsetof(_posix_spawnattr, psa_ports)` from the attribute
+block and `sizeof(struct _posix_spawn_args_desc)` from the descriptor, both
+its own constants, and tests `attr_size` only against zero
+(`bsd/kern/kern_exec.c`). Neither length is reported to userspace, so both
+buffers are padded to `SPAWN_BUFFER_BYTES` and zero-filled beyond the bytes
+written: every trailing field is a pointer or a size/pointer pair, so
+anything the kernel reads past the snapshot reads as absent rather than as
+neighbouring scratch. The one retained assumption is `psa_flags` leading the
+struct, checked before use so a future move refuses instead of misbehaving.
 
 
 ## Closed M2 gap: `exec-write` post-exec breakpoint loop

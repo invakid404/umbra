@@ -1030,20 +1030,20 @@ impl MacosTraceBackend {
                 bytes.push(0);
                 set(&mut regs, slot, s.allocate(&bytes)?)?;
                 if number == 244 {
-                    let version = cache::command(
-                        std::process::Command::new("/usr/bin/sw_vers").arg("-productVersion"),
-                        self.deadline.unwrap(),
-                    )?;
-                    if version.stdout != b"26.5.1\n" {
-                        return Err(unsupported("spawn descriptor is pinned to macOS 26.5.1"));
-                    }
                     if get(&regs, 2)? != 0 {
                         return Err(unsupported("spawn requires null attributes/file actions"));
                     }
                     let data = spawn_attributes()?;
-                    let attr = s.allocate(&data)?;
-                    let mut descriptor = vec![0; 144];
-                    descriptor[..8].copy_from_slice(&248u64.to_le_bytes());
+                    // Pad both buffers: the kernel copies a length this crate
+                    // never learns, so anything it reads past the bytes written
+                    // here must be zero rather than neighbouring scratch.
+                    let mut block = vec![0; SPAWN_BUFFER_BYTES];
+                    block[..data.len()].copy_from_slice(&data);
+                    let attr = s.allocate(&block)?;
+                    let mut descriptor = vec![0; SPAWN_BUFFER_BYTES];
+                    // attr_size only has to be non-zero; the kernel reads its
+                    // own offsetof and ignores this value.
+                    descriptor[..8].copy_from_slice(&(data.len() as u64).to_le_bytes());
                     descriptor[8..16].copy_from_slice(&attr.to_le_bytes());
                     set(&mut regs, 2, s.allocate(&descriptor)?)?;
                     let mut pid_pointer = get(&regs, 0)?;
@@ -1164,6 +1164,23 @@ impl MacosTraceBackend {
         ))
     }
 }
+/// Upper bound for both spawn buffers handed to the tracee. The kernel copies
+/// its own `sizeof`/`offsetof` out of them and never reports what it wants, so
+/// each buffer is padded well past any released layout. Every field beyond the
+/// content written here stays zero, which the descriptor reads as "not
+/// provided" and the attribute block as a null extension pointer.
+const SPAWN_BUFFER_BYTES: usize = 512;
+
+/// Snapshot a libc-initialised attribute block requesting only a suspended
+/// start.
+///
+/// `posix_spawnattr_t` is an opaque pointer to a private, per-release struct,
+/// so the length comes from the allocator rather than a pinned constant:
+/// `malloc_size` reports at least `sizeof` for a block libc allocated, and
+/// reading it stays inside that allocation. The kernel copies
+/// `offsetof(_posix_spawnattr, psa_ports)` bytes, always less than `sizeof`,
+/// so a full-length snapshot covers whatever this release's kernel reads
+/// without this crate knowing either offset.
 fn spawn_attributes() -> Result<Vec<u8>> {
     unsafe {
         let mut attr = std::mem::zeroed();
@@ -1173,9 +1190,16 @@ fn spawn_attributes() -> Result<Vec<u8>> {
                 libc::posix_spawnattr_setflags(&mut attr, 0x80),
                 "spawnattr_setflags",
             )?;
-            // This private size is validated only on 26.5.1, checked before calling.
-            let bytes = std::slice::from_raw_parts(attr as *const u8, 248).to_vec();
-            if bytes[..2] != [0x80, 0] || bytes[192..].iter().any(|b| *b != 0) {
+            let size = libc::malloc_size(attr as *const libc::c_void);
+            // A block outside this range is not the struct this expects; refuse
+            // rather than hand the kernel a truncated or oversized attribute.
+            if !(16..=SPAWN_BUFFER_BYTES).contains(&size) {
+                return Err(unsupported("unexpected spawn attribute allocation"));
+            }
+            let bytes = std::slice::from_raw_parts(attr as *const u8, size).to_vec();
+            // psa_flags is the leading short in every released layout, so this
+            // confirms the snapshot is the block that was just configured.
+            if bytes[..2] != [0x80, 0] {
                 return Err(unsupported("unexpected spawn attribute layout"));
             }
             Ok(bytes)
