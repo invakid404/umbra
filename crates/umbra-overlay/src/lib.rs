@@ -29,6 +29,39 @@ pub trait NamespaceResolver {
 
 /// Transaction lifecycle; errors require retaining a stopped or recovery-required run.
 pub trait NamespaceSession: NamespaceResolver {
+    /// Read the exact logical target, following ancestors but not the final symlink.
+    fn read_link(&mut self, _path: &StoragePath) -> Result<BytePath> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.read_link",
+            "provider does not expose typed readlink",
+        ))
+    }
+    /// Return logical metadata, optionally following the final symlink.
+    fn stat(&mut self, _path: &StoragePath, _follow: bool) -> Result<umbra_core::BlobStat> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.stat",
+            "provider does not expose typed stat",
+        ))
+    }
+    /// Bind the next ReadLink syscall's buffer; returns bytes without a NUL terminator.
+    /// The binding is consumed on resolution, including a failed path lookup.
+    fn set_readlink_buffer(&mut self, _address: u64, _len: u32) -> Result<()> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.readlink_buffer",
+            "provider does not support readlink buffers",
+        ))
+    }
+    /// Inject native stat layout and the current syscall's output-buffer binding.
+    fn set_stat_encoder(&mut self, _encoder: Box<dyn StatEncoder>) -> Result<()> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.stat_encoder",
+            "provider does not support stat encoding",
+        ))
+    }
     /// Inject native directory encoding and the current syscall's output-buffer binding.
     /// The encoder owns ABI knowledge; the overlay owns merged names and continuation.
     fn set_directory_encoder(&mut self, _encoder: Box<dyn DirectoryEncoder>) -> Result<()> {
@@ -183,7 +216,10 @@ pub fn components(path: &BytePath) -> impl Iterator<Item = Component<'_>> {
 }
 
 mod engine;
-pub use engine::{Base, DirectoryEncoder, EncodedDirectory, Overlay, SessionConfig, StorageBase};
+pub use engine::{
+    Base, DirectoryEncoder, EncodedDirectory, Overlay, SessionConfig, StatEncoder, StorageBase,
+    MAX_SYMLINK_EXPANSIONS,
+};
 
 #[cfg(test)]
 mod tests {

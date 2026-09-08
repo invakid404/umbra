@@ -330,7 +330,21 @@ pub fn accept<B>(
         .filter(|n| *n > 0 && *n <= 60_000)
         .ok_or_else(|| protocol_error("invalid timeout"))?;
     let stream = UnixStream::connect(&args[1]).map_err(unavailable)?;
-    let mut connection = Connection::new(stream, Duration::from_millis(timeout_ms));
+    accept_connection(
+        Connection::new(stream, Duration::from_millis(timeout_ms)),
+        id,
+        role,
+        factory,
+    )
+}
+
+/// Negotiate the same provider handshake on an injected private connection.
+pub fn accept_connection<B>(
+    mut connection: Connection,
+    id: &str,
+    role: &str,
+    factory: impl FnOnce(&[u8]) -> Result<(B, std::collections::BTreeSet<String>)>,
+) -> Result<(Connection, B)> {
     let hello: Hello = connection.receive()?;
     let result = (|| {
         if hello.id != id || hello.role != role || hello.version != PROTOCOL_VERSION {

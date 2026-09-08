@@ -100,6 +100,8 @@ injection points that cross worker boundaries.
    integration uses a shared platform server harness and paired control/ABI
    proxy: use `provider::serve_provider` and `provider::connect`. Both are
    implemented, including nested read-only control calls during ABI memory callbacks.
+   `provider::serve_provider_on` runs the same handshake and dispatcher on an
+   injected private connection, allowing in-process socketpair integration tests.
    Adding a backend requires no factory match arm, supervisor dependency, CLI
    feature, or changes to existing backend crates.
 

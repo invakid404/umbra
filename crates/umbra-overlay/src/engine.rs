@@ -1,5 +1,5 @@
 use super::{Journal, NamespaceResolver, NamespaceSession, Storage};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use umbra_core::*;
 
@@ -54,11 +54,101 @@ fn physical(binding: &RuntimeDirectoryBinding, path: &StoragePath) -> Result<Phy
     Ok(PhysicalPath(BytePath::new(bytes)?))
 }
 
+/// Maximum number of logical symlinks expanded by one path lookup.
+pub const MAX_SYMLINK_EXPANSIONS: usize = 40;
+
+fn symlink_target(object: ObjectId) -> Result<StoragePath> {
+    StoragePath::new(
+        StorageAnchor::Control,
+        format!("symlinks/targets/{}", object.0).into_bytes(),
+    )
+}
+fn symlink_index(object: ObjectId) -> Result<StoragePath> {
+    StoragePath::new(
+        StorageAnchor::Control,
+        format!("symlinks/objects/{}", object.0).into_bytes(),
+    )
+}
+fn read_control(
+    storage: &mut dyn Storage,
+    context: &RequestContext,
+    path: &StoragePath,
+) -> Result<Option<Vec<u8>>> {
+    let Some(stat) = absent(storage.stat(context, path))? else {
+        return Ok(None);
+    };
+    if stat.kind != ObjectKind::File || stat.len > MAX_IO_BYTES as u64 {
+        return Err(error(ErrorKind::CorruptJournal, "invalid symlink metadata"));
+    }
+    let max = (storage.capabilities().max_io_bytes as usize).min(MAX_IO_BYTES);
+    if max == 0 {
+        return Err(error(ErrorKind::ProtocolMismatch, "zero storage I/O limit"));
+    }
+    let mut bytes = vec![0; stat.len as usize];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = bytes.len().min(offset + max);
+        let count = storage.read_at(context, path, offset as u64, &mut bytes[offset..end])?;
+        if count == 0 {
+            return Err(error(
+                ErrorKind::CorruptJournal,
+                "truncated symlink metadata",
+            ));
+        }
+        offset += count;
+    }
+    Ok(Some(bytes))
+}
+fn logical_stat(
+    storage: &mut dyn Storage,
+    context: &RequestContext,
+    mut stat: BlobStat,
+) -> Result<BlobStat> {
+    if stat.kind == ObjectKind::File {
+        if let Some(index) = read_control(storage, context, &symlink_index(stat.object_id)?)? {
+            let id = std::str::from_utf8(&index)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| {
+                    error(
+                        ErrorKind::CorruptJournal,
+                        "invalid logical symlink identity",
+                    )
+                })?;
+            stat.object_id = ObjectId(id);
+            let target = read_control(storage, context, &symlink_target(stat.object_id)?)?
+                .ok_or_else(|| error(ErrorKind::CorruptJournal, "missing symlink target"))?;
+            BytePath::new(target.clone())?;
+            stat.kind = ObjectKind::LogicalSymlink;
+            stat.len = target.len() as u64;
+            stat.mode = 0o777;
+        }
+    }
+    Ok(stat)
+}
+
+/// Injected ABI boundary for stat of a logical symlink placeholder.
+/// The adapter binds the stopped syscall's output buffer and native stat layout.
+pub trait StatEncoder: Send {
+    /// Encode logical metadata, never the placeholder's native file kind or size.
+    fn encode(
+        &mut self,
+        context: &ProcessContext,
+        operation: &FsOp,
+        stat: &BlobStat,
+    ) -> Result<EmulatedResult>;
+}
+
 /// Read-only access to a supervisor-approved immutable base; no arbitrary host paths.
-/// Implementations must reject symlink traversal and keep object bytes stable.
+/// Implementations must reject kernel symlink traversal and keep object bytes stable.
+/// Final logical symlinks may be exposed through stat/read_link for overlay expansion.
 pub trait Base: Send {
     /// Inspect an anchored logical object, returning NotFound for absence.
     fn stat(&mut self, path: &StoragePath) -> Result<BlobStat>;
+    /// Read a logical target without following the final component.
+    fn read_link(&mut self, _path: &StoragePath) -> Result<BytePath> {
+        Err(unsupported("base does not expose logical symlink targets"))
+    }
     /// Read bounded file bytes at an explicit offset.
     fn read_at(&mut self, path: &StoragePath, offset: u64, out: &mut [u8]) -> Result<usize>;
     /// Enumerate a bounded page of immutable names.
@@ -120,7 +210,34 @@ impl StorageBase {
 }
 impl Base for StorageBase {
     fn stat(&mut self, path: &StoragePath) -> Result<BlobStat> {
-        self.storage.stat(&self.context, path)
+        let stat = self.storage.stat(&self.context, path)?;
+        logical_stat(self.storage.as_mut(), &self.context, stat)
+    }
+    fn read_link(&mut self, path: &StoragePath) -> Result<BytePath> {
+        let stat = self.stat(path)?;
+        if stat.kind != ObjectKind::LogicalSymlink {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "readlink target is not a symlink",
+            ));
+        }
+        if let Some(target) = read_control(
+            self.storage.as_mut(),
+            &self.context,
+            &symlink_target(stat.object_id)?,
+        )? {
+            return BytePath::new(target);
+        }
+        match self.storage.execute(&StorageRequest {
+            context: self.context.clone(),
+            operation: StorageOperation::ReadLink { path: path.clone() },
+        })? {
+            StorageResponse::ReadLink(target) => Ok(target),
+            _ => Err(error(
+                ErrorKind::ProtocolMismatch,
+                "invalid base readlink response",
+            )),
+        }
     }
     fn read_at(&mut self, path: &StoragePath, offset: u64, out: &mut [u8]) -> Result<usize> {
         let len = out
@@ -173,6 +290,7 @@ struct Pending {
     plan: Plan,
     outcome: Option<OperationOutcome>,
     whiteouts: Vec<(StoragePath, bool)>,
+    retired_index: Option<StoragePath>,
 }
 
 /// Standard storage-independent namespace engine. Construction performs no I/O.
@@ -192,6 +310,8 @@ pub struct Overlay {
     directory_encoder: Option<Box<dyn DirectoryEncoder>>,
     directories: BTreeMap<DirectoryKey, Vec<DirectoryEntry>>,
     used_operations: BTreeSet<OperationId>,
+    readlink_buffer: Option<(u64, u32)>,
+    stat_encoder: Option<Box<dyn StatEncoder>>,
 }
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 impl Overlay {
@@ -212,6 +332,8 @@ impl Overlay {
             directory_encoder: None,
             directories: BTreeMap::new(),
             used_operations: BTreeSet::new(),
+            readlink_buffer: None,
+            stat_encoder: None,
         }
     }
     /// Report the injected storage capabilities without claiming qualification.
@@ -296,16 +418,14 @@ impl Overlay {
             return Err(error(ErrorKind::Denied, "control is not tracee-visible"));
         }
         let found = if let Some(stat) = self.shadow_stat(path)? {
-            (stat, true)
+            let context = self.context()?;
+            (logical_stat(self.storage.as_mut(), &context, stat)?, true)
         } else {
             if self.whiteouted(path)? {
                 return Err(error(ErrorKind::NotFound, "logical path is whiteouted"));
             }
             (self.base().stat(path)?, false)
         };
-        if found.0.kind == ObjectKind::LogicalSymlink {
-            return Err(unsupported("logical symlinks are deferred to M1.5"));
-        }
         Ok(found)
     }
     fn directory(&mut self, path: &StoragePath) -> Result<()> {
@@ -326,13 +446,31 @@ impl Overlay {
         path: &BytePath,
         create_parents: bool,
     ) -> Result<StoragePath> {
+        self.resolve_path_follow(context, dir, path, create_parents, true)
+    }
+    fn resolve_path_follow(
+        &mut self,
+        context: &ProcessContext,
+        dir: DirRef,
+        path: &BytePath,
+        create_parents: bool,
+        follow_final: bool,
+    ) -> Result<StoragePath> {
         self.idle()?;
+        if path.as_bytes().is_empty() {
+            return Err(error(ErrorKind::NotFound, "empty path"));
+        }
         let logical_root = absolute_components(&context.root)?;
-        let mut parts = if path.as_bytes().first() == Some(&b'/') {
+        // The process root is a trusted canonical boundary, never a link alias.
+        for n in 0..=logical_root.len() {
+            self.directory(&root(&logical_root[..n].join(&b'/'))?)?;
+        }
+        let mut expansions = 0;
+        let parts = if path.as_bytes().first() == Some(&b'/') {
             logical_root.clone()
         } else {
-            let anchor = match dir {
-                DirRef::Cwd => context.cwd.clone(),
+            let (anchor, expected) = match dir {
+                DirRef::Cwd => (context.cwd.clone(), None),
                 DirRef::Fd(fd) => {
                     let state = context
                         .fds
@@ -344,26 +482,59 @@ impl Overlay {
                     let name = state.logical_path.clone().ok_or_else(|| {
                         error(ErrorKind::StaleHandle, "dirfd has no logical anchor")
                     })?;
-                    let anchored = root(&absolute_components(&name)?.join(&b'/'))?;
-                    if self.lookup(&anchored)?.0.object_id != state.object {
-                        return Err(error(ErrorKind::StaleHandle, "dirfd identity changed"));
-                    }
-                    name
+                    (name, Some(state.object))
                 }
             };
             let parts = absolute_components(&anchor)?;
             if !parts.starts_with(&logical_root) {
                 return Err(error(ErrorKind::InvalidPath, "anchor outside logical root"));
             }
-            parts
+            let suffix = if parts.len() == logical_root.len() {
+                BytePath::new(b".".to_vec())?
+            } else {
+                BytePath::new(parts[logical_root.len()..].join(&b'/'))?
+            };
+            let anchored = self.walk(
+                logical_root.clone(),
+                &logical_root,
+                &suffix,
+                false,
+                true,
+                &mut expansions,
+            )?;
+            self.directory(&anchored)?;
+            if let Some(object) = expected {
+                if self.lookup(&anchored)?.0.object_id != object {
+                    return Err(error(ErrorKind::StaleHandle, "dirfd identity changed"));
+                }
+            }
+            absolute_components(&logical(&anchored)?)?
         };
-        // Validate the supplied root and anchor component-by-component too.
-        for n in 0..=parts.len() {
-            self.directory(&root(&parts[..n].join(&b'/'))?)?;
-        }
-        let components: Vec<_> = path.as_bytes().split(|b| *b == b'/').collect();
-        for (index, component) in components.iter().enumerate() {
-            match *component {
+        self.walk(
+            parts,
+            &logical_root,
+            path,
+            create_parents,
+            follow_final,
+            &mut expansions,
+        )
+    }
+    fn walk(
+        &mut self,
+        mut parts: Vec<Vec<u8>>,
+        logical_root: &[Vec<u8>],
+        path: &BytePath,
+        create_parents: bool,
+        follow_final: bool,
+        expansions: &mut usize,
+    ) -> Result<StoragePath> {
+        let mut queue: VecDeque<Vec<u8>> = path
+            .as_bytes()
+            .split(|b| *b == b'/')
+            .map(<[u8]>::to_vec)
+            .collect();
+        while let Some(component) = queue.pop_front() {
+            match component.as_slice() {
                 b"" | b"." => {}
                 b".." => {
                     if parts.len() == logical_root.len() {
@@ -373,9 +544,35 @@ impl Overlay {
                 }
                 name => {
                     parts.push(name.to_vec());
+                    let prefix = root(&parts.join(&b'/'))?;
+                    if let Some((stat, shadow)) = absent(self.lookup(&prefix))? {
+                        if stat.kind == ObjectKind::LogicalSymlink
+                            && (follow_final || !queue.is_empty())
+                        {
+                            *expansions += 1;
+                            if *expansions > MAX_SYMLINK_EXPANSIONS {
+                                return Err(error(
+                                    ErrorKind::InvalidPath,
+                                    "symlink expansion limit exceeded",
+                                ));
+                            }
+                            let target = self.target(&prefix, &stat, shadow)?;
+                            if target.as_bytes().is_empty() {
+                                return Err(error(ErrorKind::NotFound, "empty symlink target"));
+                            }
+                            parts.pop();
+                            if target.as_bytes().first() == Some(&b'/') {
+                                parts = logical_root.to_vec();
+                            }
+                            for part in target.as_bytes().split(|b| *b == b'/').rev() {
+                                queue.push_front(part.to_vec());
+                            }
+                            continue;
+                        }
+                    }
                 }
             }
-            if index + 1 < components.len() {
+            if !queue.is_empty() {
                 let prefix = root(&parts.join(&b'/'))?;
                 match self.directory(&prefix) {
                     Err(e) if create_parents && e.kind == ErrorKind::NotFound => {}
@@ -384,6 +581,88 @@ impl Overlay {
             }
         }
         root(&parts.join(&b'/'))
+    }
+    fn typed_path(&mut self, path: &StoragePath, follow: bool) -> Result<StoragePath> {
+        self.idle()?;
+        if path.anchor() != StorageAnchor::Root {
+            return Err(error(ErrorKind::Denied, "control is not tracee-visible"));
+        }
+        self.directory(&root(b"")?)?;
+        self.walk(vec![], &[], &logical(path)?, false, follow, &mut 0)
+    }
+    fn target(&mut self, path: &StoragePath, stat: &BlobStat, shadow: bool) -> Result<BytePath> {
+        if stat.kind != ObjectKind::LogicalSymlink {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "readlink target is not a symlink",
+            ));
+        }
+        if !shadow {
+            return self.base().read_link(path);
+        }
+        let context = self.context()?;
+        let bytes = read_control(
+            self.storage.as_mut(),
+            &context,
+            &symlink_target(stat.object_id)?,
+        )?
+        .ok_or_else(|| error(ErrorKind::CorruptJournal, "missing symlink target"))?;
+        BytePath::new(bytes)
+    }
+    fn write_control(&mut self, path: &StoragePath, bytes: &[u8]) -> Result<()> {
+        self.create(path, CreateKind::File, 0o600)?;
+        let max = self.storage.capabilities().max_io_bytes as usize;
+        if max == 0 {
+            return Err(error(ErrorKind::ProtocolMismatch, "zero storage I/O limit"));
+        }
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let context = self.context()?;
+            let end = bytes.len().min(offset + max.min(MAX_IO_BYTES));
+            let count =
+                self.storage
+                    .write_at(&context, path, offset as u64, &bytes[offset..end])?;
+            if count == 0 {
+                return Err(error(ErrorKind::Io, "metadata write made no progress"));
+            }
+            offset += count;
+        }
+        Ok(())
+    }
+    fn create_symlink(
+        &mut self,
+        path: &StoragePath,
+        target: &BytePath,
+        object: ObjectId,
+    ) -> Result<()> {
+        let metadata = symlink_target(object)?;
+        let context = self.context()?;
+        match read_control(self.storage.as_mut(), &context, &metadata)? {
+            Some(existing) if existing != target.as_bytes() => {
+                return Err(error(
+                    ErrorKind::CorruptJournal,
+                    "conflicting logical symlink identity",
+                ))
+            }
+            Some(_) => {}
+            None => self.write_control(&metadata, target.as_bytes())?,
+        }
+        self.create(path, CreateKind::File, 0o444)?;
+        let backend = self
+            .shadow_stat(path)?
+            .expect("created placeholder")
+            .object_id;
+        self.write_control(&symlink_index(backend)?, object.0.to_string().as_bytes())
+    }
+    fn remove_symlink_index(&mut self, path: &StoragePath) -> Result<()> {
+        if let Some(stat) = self.shadow_stat(path)? {
+            let index = symlink_index(stat.object_id)?;
+            if self.shadow_stat(&index)?.is_some() {
+                let context = self.context()?;
+                self.storage.unlink(&context, &index)?;
+            }
+        }
+        Ok(())
     }
     fn parents(&mut self, path: &StoragePath) -> Result<()> {
         let parts: Vec<_> = path.as_bytes().split(|b| *b == b'/').collect();
@@ -421,6 +700,10 @@ impl Overlay {
         let (stat, shadow) = self.lookup(path)?;
         if shadow {
             return Ok(());
+        }
+        if stat.kind == ObjectKind::LogicalSymlink {
+            let target = self.base().read_link(path)?;
+            return self.create_symlink(path, &target, stat.object_id);
         }
         if stat.kind != ObjectKind::File {
             return Err(unsupported("recursive directory copy-up is deferred"));
@@ -597,6 +880,9 @@ impl Overlay {
                 cursor = page.next;
             }
         }
+        for (name, entry) in &mut entries {
+            entry.stat = self.lookup(&join(path, name)?)?.0;
+        }
         Ok(entries.into_values().collect())
     }
 }
@@ -649,16 +935,33 @@ impl NamespaceResolver for Overlay {
             FsOp::Open {
                 dir, path, flags, ..
             } => (*dir, path, flags.create),
-            FsOp::Stat { dir, path, .. } | FsOp::Unlink { dir, path, .. } => (*dir, path, false),
+            FsOp::Stat { dir, path, .. }
+            | FsOp::Unlink { dir, path, .. }
+            | FsOp::ReadLink { dir, path } => (*dir, path, false),
+            FsOp::Symlink {
+                link_dir,
+                link_name,
+                ..
+            } => (*link_dir, link_name, true),
             FsOp::Mkdir { dir, path, .. } => (*dir, path, true),
             FsOp::Rename { from_dir, from, .. } => (*from_dir, from, false),
             _ => {
                 return Err(unsupported(
-                    "operation requires descriptor or symlink ABI support beyond MVP",
+                    "operation requires descriptor or metadata support beyond MVP",
                 ))
             }
         };
-        let path = self.resolve_path(context, dir, name, create_parents)?;
+        let readlink_buffer = if matches!(operation, FsOp::ReadLink { .. }) {
+            self.readlink_buffer.take()
+        } else {
+            None
+        };
+        let follow_final = match operation {
+            FsOp::Open { flags, .. } => !(flags.no_follow || flags.create && flags.exclusive),
+            FsOp::Stat { follow, .. } => *follow,
+            _ => false,
+        };
+        let path = self.resolve_path_follow(context, dir, name, create_parents, follow_final)?;
         let existing = absent(self.lookup(&path))?;
         let mutation = matches!(
             super::dispatch(operation),
@@ -680,6 +983,9 @@ impl NamespaceResolver for Overlay {
                     ));
                 }
                 if let Some((stat, _)) = &existing {
+                    if stat.kind == ObjectKind::LogicalSymlink {
+                        return Err(error(ErrorKind::InvalidPath, "open refuses final symlink"));
+                    }
                     if flags.directory && stat.kind != ObjectKind::Directory {
                         return Err(error(ErrorKind::InvalidPath, "open requires directory"));
                     }
@@ -688,6 +994,17 @@ impl NamespaceResolver for Overlay {
                     }
                 } else if flags.directory {
                     return Err(unsupported("open cannot create a directory"));
+                }
+            }
+            FsOp::Symlink { target, .. } => {
+                if target.as_bytes().is_empty() || target.as_bytes().len() > MAX_IO_BYTES {
+                    return Err(error(
+                        ErrorKind::InvalidInput,
+                        "invalid symlink target length",
+                    ));
+                }
+                if existing.is_some() {
+                    return Err(error(ErrorKind::AlreadyExists, "symlink target exists"));
                 }
             }
             FsOp::Mkdir { .. } => {
@@ -712,16 +1029,18 @@ impl NamespaceResolver for Overlay {
                 let (stat, _) = existing
                     .as_ref()
                     .ok_or_else(|| error(ErrorKind::NotFound, "rename source absent"))?;
-                if stat.kind != ObjectKind::File {
+                if !matches!(stat.kind, ObjectKind::File | ObjectKind::LogicalSymlink) {
                     return Err(unsupported(
                         "directory rename requires subtree materialisation",
                     ));
                 }
-                let dest = self.resolve_path(context, *to_dir, to, true)?;
+                let dest = self.resolve_path_follow(context, *to_dir, to, true, false)?;
                 if dest.as_bytes().is_empty() {
                     return Err(error(ErrorKind::Denied, "cannot replace root"));
                 }
-                if absent(self.lookup(&dest))?.is_some_and(|(s, _)| s.kind != ObjectKind::File) {
+                if absent(self.lookup(&dest))?.is_some_and(|(s, _)| {
+                    !matches!(s.kind, ObjectKind::File | ObjectKind::LogicalSymlink)
+                }) {
                     return Err(error(
                         ErrorKind::InvalidPath,
                         "rename destination is not a file",
@@ -736,7 +1055,48 @@ impl NamespaceResolver for Overlay {
             }
         }
         let action = match operation {
-            FsOp::Mkdir { .. } | FsOp::Unlink { .. } => success(),
+            FsOp::Symlink { .. } | FsOp::Mkdir { .. } | FsOp::Unlink { .. } => success(),
+            FsOp::ReadLink { .. } => {
+                let (stat, shadow) = existing.as_ref().expect("validated existence");
+                let target = self.target(&path, stat, *shadow)?;
+                let (address, len) = readlink_buffer.ok_or_else(|| {
+                    unsupported(
+                        "ReadLink requires set_readlink_buffer; typed read_link is available",
+                    )
+                })?;
+                let bytes = target.as_bytes()[..target.as_bytes().len().min(len as usize)].to_vec();
+                ResolvedAction::Emulate(EmulatedResult {
+                    outcome: OperationOutcome::Success {
+                        return_value: bytes.len() as u64,
+                    },
+                    memory_writes: vec![MemoryWrite { address, bytes }],
+                })
+            }
+            FsOp::Stat { .. }
+                if existing
+                    .as_ref()
+                    .is_some_and(|(s, _)| s.kind == ObjectKind::LogicalSymlink) =>
+            {
+                let stat = &existing.as_ref().unwrap().0;
+                let encoded = self
+                    .stat_encoder
+                    .as_mut()
+                    .ok_or_else(|| {
+                        unsupported(
+                    "logical symlink stat requires native stat encoder; typed stat is available")
+                    })?
+                    .encode(context, operation, stat)?;
+                let total = encoded.memory_writes.iter().try_fold(0usize, |n, w| {
+                    w.address.checked_add(w.bytes.len() as u64)?;
+                    n.checked_add(w.bytes.len())
+                });
+                if total.is_none_or(|n| n == 0 || n > MAX_IO_BYTES)
+                    || encoded.outcome != (OperationOutcome::Success { return_value: 0 })
+                {
+                    return Err(error(ErrorKind::ProtocolMismatch, "invalid stat encoding"));
+                }
+                ResolvedAction::Emulate(encoded)
+            }
             FsOp::Rename { .. } if destination.as_ref() == Some(&path) => success(),
             _ => self.rewrite(
                 operation,
@@ -758,6 +1118,30 @@ impl NamespaceResolver for Overlay {
 }
 
 impl NamespaceSession for Overlay {
+    fn set_readlink_buffer(&mut self, address: u64, len: u32) -> Result<()> {
+        self.idle()?;
+        self.readlink_buffer = None;
+        if len == 0 || len as usize > MAX_IO_BYTES || address.checked_add(len as u64).is_none() {
+            return Err(error(ErrorKind::InvalidInput, "invalid readlink buffer"));
+        }
+        self.readlink_buffer = Some((address, len));
+        Ok(())
+    }
+    fn set_stat_encoder(&mut self, encoder: Box<dyn StatEncoder>) -> Result<()> {
+        self.idle()?;
+        self.stat_encoder = Some(encoder);
+        Ok(())
+    }
+    fn read_link(&mut self, path: &StoragePath) -> Result<BytePath> {
+        let path = self.typed_path(path, false)?;
+        let (stat, shadow) = self.lookup(&path)?;
+        self.target(&path, &stat, shadow)
+    }
+    fn stat(&mut self, path: &StoragePath, follow: bool) -> Result<BlobStat> {
+        let path = self.typed_path(path, follow)?;
+        Ok(self.lookup(&path)?.0)
+    }
+
     fn set_directory_encoder(&mut self, encoder: Box<dyn DirectoryEncoder>) -> Result<()> {
         if self.pending.is_some() || self.poisoned {
             return Err(error(
@@ -796,7 +1180,8 @@ impl NamespaceSession for Overlay {
     }
     fn read_at(&mut self, path: &StoragePath, offset: u64, out: &mut [u8]) -> Result<usize> {
         self.idle()?;
-        self.validate_ancestors(path)?;
+        let resolved = self.typed_path(path, true)?;
+        let path = &resolved;
         let (stat, shadow) = self.lookup(path)?;
         if stat.kind != ObjectKind::File {
             return Err(error(ErrorKind::InvalidPath, "read target is not a file"));
@@ -837,8 +1222,8 @@ impl NamespaceSession for Overlay {
             }
             entries.clone()
         } else {
-            self.validate_ancestors(path)?;
-            self.merged(path)?
+            let resolved = self.typed_path(path, true)?;
+            self.merged(&resolved)?
         };
         let next = if entries.len() > limit as usize {
             let remainder = entries.split_off(limit as usize);
@@ -884,6 +1269,7 @@ impl NamespaceSession for Overlay {
             plan: plan.clone(),
             outcome: None,
             whiteouts: vec![],
+            retired_index: None,
         });
         // Any failure after append may have left durable intent or storage effects.
         // Keep the session stopped for explicit recovery instead of guessing rollback.
@@ -916,11 +1302,20 @@ impl NamespaceSession for Overlay {
                         }
                     }
                 }
+                FsOp::Symlink { target, .. } => {
+                    self.create_symlink(&plan.path, target, ObjectId(operation.0))?;
+                    self.pending
+                        .as_mut()
+                        .unwrap()
+                        .whiteouts
+                        .push((plan.path.clone(), false));
+                }
                 FsOp::Mkdir { mode, .. } => {
                     self.create(&plan.path, CreateKind::Directory, *mode)?;
                     // Keep an existing directory whiteout as an opaque-base marker.
                 }
                 FsOp::Unlink { .. } => {
+                    self.remove_symlink_index(&plan.path)?;
                     if self.shadow_stat(&plan.path)?.is_some() {
                         let context = self.context()?;
                         self.storage.unlink(&context, &plan.path)?;
@@ -936,6 +1331,12 @@ impl NamespaceSession for Overlay {
                     if destination != &plan.path {
                         self.copy_up(&plan.path)?;
                         self.parents(destination)?;
+                        if let Some(stat) = self.shadow_stat(destination)? {
+                            let index = symlink_index(stat.object_id)?;
+                            if self.shadow_stat(&index)?.is_some() {
+                                self.pending.as_mut().unwrap().retired_index = Some(index);
+                            }
+                        }
                         self.pending.as_mut().unwrap().whiteouts =
                             vec![(plan.path.clone(), true), (destination.clone(), false)];
                     }
@@ -1000,7 +1401,12 @@ impl NamespaceSession for Overlay {
             });
         }
         let whiteouts = pending.whiteouts.clone();
+        let retired_index = pending.retired_index.clone();
         let result = (|| {
+            if let Some(index) = retired_index {
+                let context = self.context()?;
+                self.storage.unlink(&context, &index)?;
+            }
             for (path, present) in whiteouts {
                 self.set_whiteout(&path, present)?;
             }
@@ -1178,16 +1584,6 @@ impl Overlay {
             .filter(|p| p.id == id)
             .ok_or_else(|| error(ErrorKind::InvalidState, "operation is not pending"))
     }
-    fn validate_ancestors(&mut self, path: &StoragePath) -> Result<()> {
-        if path.anchor() != StorageAnchor::Root {
-            return Err(error(ErrorKind::Denied, "control is not tracee-visible"));
-        }
-        let components: Vec<_> = path.as_bytes().split(|b| *b == b'/').collect();
-        for n in 0..components.len() {
-            self.directory(&root(&components[..n].join(&b'/'))?)?;
-        }
-        Ok(())
-    }
     fn intent(&mut self, plan: &Plan, operation: OperationId) -> Result<JournalIntent> {
         let existing = absent(self.lookup(&plan.path))?;
         let object = existing
@@ -1209,6 +1605,11 @@ impl Overlay {
                     offset: None,
                     length: 0,
                 },
+            },
+            FsOp::Symlink { target, .. } => JournalIntent::Symlink {
+                object,
+                path,
+                target: target.clone(),
             },
             FsOp::Mkdir { mode, .. } => JournalIntent::Create {
                 object,

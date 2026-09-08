@@ -56,15 +56,15 @@ new resolutions are blocked while a transaction is pending.
   umask, owner/group, timestamps, ACLs and xattrs needs richer backend support.
 - Unlink removes an existing shadow file through Storage and prepares a base
   whiteout, including for base-only files. Recreation clears its exact whiteout.
-- Rename materializes a regular-file source, creates shadow destination parents,
+- Rename materializes a regular-file or logical-symlink source, creates shadow destination parents,
   and returns source/destination kernel rewrites for one native shadow rename.
   On observed success the source whiteout is set and destination whiteout cleared.
   A same-path rename is a validated no-op. The local backend does not implement
   `StorageOperation::Rename`; the test caller executes the prepared native rename.
   Kernel rewrites require trusted, qualified runtime bindings and caller execution.
 
-`NamespaceSession` typed reads and directory pages also have provider IPC request/
-response variants. Provider factories bind the engine and install any ABI encoder
+`NamespaceSession` typed reads, readlink, stat, and directory pages also have provider IPC
+request/response variants. `set_readlink_buffer` is available through IPC as well. Provider factories bind the engine and install any ABI encoder
 before entering `serve_provider`; trait objects are not serialized over IPC.
 
 ## Journal and whiteouts
@@ -112,12 +112,56 @@ identity, ignores dirfd for absolute paths, preserves non-UTF-8 names, and rejec
 establish containment. Runtime path composition happens only after anchored
 storage/base validation.
 
-Full first-class symlinks from handoff §4.3 are deferred to M1.5. Both base and
-storage must reject symlink traversal; the overlay rejects logical symlink objects,
-including a link before `..`. Logical target storage, readlink, bounded expansion,
-and absolute-link handling are not implemented. Physical rewrites assume a trusted
-immutable base and serialized namespace; race-proof native dirfd execution still
-needs platform qualification.
+## Logical symlinks
+
+Symlinks use the component-wise logical resolver from handoff §4.3. Creation is
+emulated through injected Storage after a flushed `JournalIntent::Symlink` Prepare;
+ObservedResult and Commit follow the existing transaction protocol. Shadow entries
+are empty regular files requested with mode `0444`. They contain no physical
+symlink, so unchecked kernel traversal cannot follow their target or descend
+through them. Readlink and no-follow stat never expose the placeholder as a file.
+
+Control metadata lives outside tracee listings:
+
+- `control/symlinks/targets/<logical-object-uuid>` contains the exact raw target
+  bytes, without UTF-8 conversion, escaping, or a NUL terminator. New symlinks use
+  their journal operation UUID as logical object identity.
+- `control/symlinks/objects/<backend-object-uuid>` contains the logical UUID as
+  ASCII. This index identifies placeholders across rename and exposes the same
+  logical identity in stat and merged directory entries. Unlink and successful
+  replacement remove the retired index so backend inode reuse cannot inherit a
+  deleted link. Immutable target records remain for future journal reconciliation.
+
+The iterative resolver expands at most **40 symlinks per lookup**, including cwd
+or dirfd anchor expansion, and returns structured `InvalidPath` on overflow.
+Absolute targets restart at `ProcessContext::root`; relative targets start at the
+link's containing logical directory. Expansion precedes `..` processing, and a
+parent above the logical root returns the existing containment error before any
+physical operation is prepared. Non-UTF-8 bytes, repeated separators, and dots are
+preserved in stored targets. Typed reads and directory pages use the same resolver
+from the storage logical root; native calls honor their process root and dirfd.
+
+Open and following stat resolve the final link; readlink, unlink, rename operands,
+and symlink creation preserve the final object. No-follow open rejects a final
+link; exclusive create detects even dangling links. Renaming a base logical link
+copies its target and identity into a safe shadow placeholder. `Base::read_link`
+provides logical target access; `StorageBase` understands this control format and
+can also use a backend's typed logical ReadLink operation. Base/storage contracts
+still prohibit unchecked physical symlink traversal.
+
+`NamespaceSession::read_link` returns the complete logical `BytePath`.
+`FsOp::ReadLink` covers both readlink and readlinkat: bind the next stopped syscall's
+buffer with `set_readlink_buffer(address, len)`. Resolution consumes the binding,
+returns up to `len` target bytes without a NUL, and reports the copied byte count.
+The core FsOp has no output address, so a native call without a binding fails with
+`UnsupportedCapability`. Typed `stat(path, follow)` exposes logical symlink kind,
+identity, and target length. Native no-follow stat of a link requires an injected
+`StatEncoder` via `set_stat_encoder`, analogous to the directory ABI boundary;
+without it the operation fails explicitly. Provider factories install ABI encoders.
+
+Physical rewrites assume a trusted immutable base and serialized namespace;
+race-proof native dirfd execution still needs platform qualification. The existing
+refusal to reopen nonempty journals also applies to symlink transactions.
 
 Directory subtree rename/rmdir, hard links, metadata mutations, pathless native
 read/write emulation, descriptor duplication/close/reuse bookkeeping, renamed or
@@ -132,6 +176,8 @@ Run `cargo test -p umbra-overlay`. Tests inject real `umbra-storage-local` base 
 shadow runs, with no NFS or fixture environment variables. They exercise copy-up,
 shadow/stat precedence, create parents, whiteouts and recreation, merged snapshot
 pages, native-encoder continuation, rename journal grouping, containment, non-UTF-8
-bytes, symlink rejection, journal failures, transaction ordering and checkpoints.
+bytes, logical symlink creation/readlink/traversal, absolute and relative targets,
+loop bounds, symlink escape and unchecked physical-link rejection, rename identity,
+base symlink copy-up, journal failures, transaction ordering and checkpoints.
 APFS configurations that reject non-UTF-8 filenames still run byte resolver and
 marker checks; actual raw-name filesystem I/O is conditional on native support.

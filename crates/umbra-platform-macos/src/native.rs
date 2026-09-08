@@ -153,6 +153,7 @@ enum ReturnKind {
 }
 struct Pending {
     entry: u64,
+    entry_breakpoint: Breakpoint,
     gate: u64,
     kind: ReturnKind,
     hardware: bool,
@@ -164,6 +165,8 @@ struct Session {
     thread: ThreadId,
     parent: Option<usize>,
     twin: PathBuf,
+    // Only software breakpoints installed on this session's RSP connection.
+    // Disabled entry sites live in Pending; inherited bytes are not ownership.
     breaks: BTreeMap<u64, Breakpoint>,
     pending: Option<Pending>,
     waiting: Vec<usize>,
@@ -344,9 +347,34 @@ impl Session {
                 format!("expected svc #0x80 at {address:x}, got {original:?}"),
             ));
         }
+        self.install_breakpoint(address, Breakpoint { original, raw })
+    }
+    fn install_breakpoint(&mut self, address: u64, breakpoint: Breakpoint) -> Result<()> {
+        debug_assert!(!self.breaks.contains_key(&address));
         self.rsp.ok(&format!("Z0,{address:x},4"))?;
-        self.breaks.insert(address, Breakpoint { original, raw });
+        self.breaks.insert(address, breakpoint);
         Ok(())
+    }
+    fn remove_breakpoint(&mut self, address: u64) -> Result<Breakpoint> {
+        let breakpoint = self
+            .breaks
+            .get(&address)
+            .cloned()
+            .ok_or_else(|| error("breakpoint", format!("session does not own {address:x}")))?;
+        self.rsp.ok(&format!("z0,{address:x},4"))?;
+        self.breaks.remove(&address);
+        Ok(breakpoint)
+    }
+    fn temporary_breakpoint(&mut self, address: u64) -> Result<()> {
+        let mut original = [0; 4];
+        self.task.read(address, &mut original)?;
+        self.install_breakpoint(
+            address,
+            Breakpoint {
+                original,
+                raw: false,
+            },
+        )
     }
     fn continue_run(&mut self) -> Result<()> {
         self.rsp.send("c")?;
@@ -365,14 +393,16 @@ impl Session {
         let pc = get(&regs, PC)?;
         let gate = pc + 4;
         let hardware = matches!(kind, ReturnKind::Fork { .. });
-        self.rsp.ok(&format!("z0,{pc:x},4"))?;
+        let entry_breakpoint = self.remove_breakpoint(pc)?;
         if hardware {
             self.write(gate, &[0, 0, 0, 0x14])?;
+            self.rsp.ok(&format!("Z1,{gate:x},4"))?;
+        } else {
+            self.temporary_breakpoint(gate)?;
         }
-        self.rsp
-            .ok(&format!("Z{},{gate:x},4", u8::from(hardware)))?;
         self.pending = Some(Pending {
             entry: pc,
+            entry_breakpoint,
             gate,
             kind,
             hardware,
@@ -451,7 +481,7 @@ impl Session {
             .checked_sub(symbol("_dyld_all_image_infos")?)
             .and_then(|base| base.checked_add(symbol("_lldb_image_notifier").ok()?))
             .ok_or_else(|| error("dyld", "invalid notification address"))?;
-        self.rsp.ok(&format!("Z0,{notify:x},4"))?;
+        self.temporary_breakpoint(notify)?;
         loop {
             let stop = self.rsp.request("c")?;
             if !stop.starts_with('T') {
@@ -468,7 +498,7 @@ impl Session {
             );
             let regs = self.regs()?;
             if get(&regs, PC)? == notify {
-                self.rsp.ok(&format!("z0,{notify:x},4"))?;
+                self.remove_breakpoint(notify)?;
                 return Ok(());
             }
             let signal = rsp::number(&stop[1..3])? as i32;
@@ -584,6 +614,8 @@ pub struct MacosTraceBackend {
     options: Options,
     sessions: Vec<Session>,
     events: VecDeque<TraceEvent>,
+    // Stop replies consumed by quiesce still belong to the normal event loop.
+    quiesced_stops: VecDeque<(usize, String)>,
     deadline: Option<Instant>,
     watchdog: Option<Watchdog>,
     generation: u64,
@@ -600,6 +632,7 @@ impl MacosTraceBackend {
             options,
             sessions: vec![],
             events: VecDeque::new(),
+            quiesced_stops: VecDeque::new(),
             deadline: None,
             watchdog: None,
             generation: 0,
@@ -631,10 +664,12 @@ impl MacosTraceBackend {
         }
         Ok(())
     }
-    /// Explicit feasibility entry point. Unlike TraceBackend::launch, this does
-    /// not claim the independent sandbox required by the production contract.
+    /// Compatibility entry point for the same LocalDevelopment tracer as trait launch.
     pub fn launch_experimental(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
-        if !self.sessions.is_empty() {
+        self.launch_traced(spec)
+    }
+    fn launch_traced(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
+        if self.deadline.is_some() {
             return Err(error("launch", "one run per backend"));
         }
         if self.options.timeout_ms == 0 || self.options.timeout_ms > 3_600_000 {
@@ -826,6 +861,8 @@ impl MacosTraceBackend {
             self.deadline.unwrap(),
             self.watchdog.as_ref().unwrap(),
         )?;
+        // The parent supplied memory repairs, not breakpoints owned by this RSP.
+        debug_assert!(child.breaks.is_empty());
         if let Some(restore) = restore {
             for (address, bytes) in restore {
                 child.write(address, &bytes)?;
@@ -849,15 +886,15 @@ impl MacosTraceBackend {
     fn finish_return(&mut self, index: usize, regs: RegisterSet) -> Result<()> {
         let pending = self.sessions[index].pending.take().unwrap();
         let s = &mut self.sessions[index];
-        s.rsp.ok(&format!(
-            "z{},{:x},4",
-            u8::from(pending.hardware),
-            pending.gate
-        ))?;
+        if pending.hardware {
+            s.rsp.ok(&format!("z1,{:x},4", pending.gate))?;
+        } else {
+            s.remove_breakpoint(pending.gate)?;
+        }
         if let ReturnKind::Fork { restore } = &pending.kind {
             s.write(pending.gate, &restore[&pending.gate])?;
         }
-        s.rsp.ok(&format!("Z0,{:x},4", pending.entry))?;
+        s.install_breakpoint(pending.entry, pending.entry_breakpoint)?;
         match pending.kind {
             ReturnKind::Open => {
                 self.events.push_back(TraceEvent::SyscallExit {
@@ -1019,7 +1056,7 @@ impl MacosTraceBackend {
         }
         Ok(())
     }
-    fn stop(&mut self, index: usize, reply: String) -> Result<()> {
+    fn stop(&mut self, index: usize, reply: String, interrupted: bool) -> Result<()> {
         if reply.starts_with('O') {
             return Ok(());
         }
@@ -1063,6 +1100,9 @@ impl MacosTraceBackend {
             s.scratch.clear();
             s.entry = None;
             s.exec_generation += 1;
+            let task = Arc::new(Task::acquire(s.id.0.native_id as i32)?);
+            self.watchdog.as_ref().unwrap().add(task.clone());
+            s.task = task;
             // Debugserver removes obsolete address breakpoints on exec; resolve the new image.
             s.install()?;
             self.events.push_back(TraceEvent::Exec {
@@ -1093,6 +1133,7 @@ impl MacosTraceBackend {
             libc::SIGIO,
         ]
         .contains(&signal)
+            || (interrupted && signal == libc::SIGINT)
         {
             s.continue_run()?;
             return Ok(());
@@ -1124,14 +1165,18 @@ fn spawn_attributes() -> Result<Vec<u8>> {
     }
 }
 impl TraceBackend for MacosTraceBackend {
-    fn launch(&mut self, _spec: LaunchSpec) -> Result<ProcessHandle> {
-        Err(unsupported("independent sandbox enforcement is unqualified; use launch_experimental for the M1 feasibility tracer"))
+    fn launch(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
+        self.launch_traced(spec)
     }
     fn next_event(&mut self) -> Result<TraceEvent> {
         loop {
             self.check_deadline()?;
             if let Some(event) = self.events.pop_front() {
                 return Ok(event);
+            }
+            if let Some((index, reply)) = self.quiesced_stops.pop_front() {
+                self.stop(index, reply, true)?;
+                continue;
             }
             if self.sessions.is_empty() || self.sessions.iter().all(|s| s.done) {
                 return Err(error("next_event", "no live processes"));
@@ -1155,7 +1200,7 @@ impl TraceBackend for MacosTraceBackend {
                     continue;
                 }
                 if let Some(reply) = self.sessions[i].rsp.poll(Duration::from_millis(2))? {
-                    self.stop(i, reply)?;
+                    self.stop(i, reply, false)?;
                 }
                 if !self.events.is_empty() {
                     break;
@@ -1188,6 +1233,12 @@ impl TraceBackend for MacosTraceBackend {
     fn resume(&mut self, command: ResumeCommand) -> Result<()> {
         self.check_deadline()?;
         let i = self.thread_index(command.thread)?;
+        if self.quiesced_stops.iter().any(|(index, _)| *index == i) {
+            return Err(error(
+                "resume",
+                "consume quiesced stop with next_event first",
+            ));
+        }
         let s = &mut self.sessions[i];
         if !s.stopped || !s.waiting.is_empty() {
             return Err(error("resume", "not externally stopped"));
@@ -1223,10 +1274,79 @@ impl TraceControl for MacosTraceBackend {
             capabilities: ["darwin-arm64-abi-v1".to_owned()].into_iter().collect(),
         }
     }
-    fn quiesce(&mut self, _process: ProcessHandle) -> Result<QuiescedTree> {
-        Err(unsupported(
-            "transaction-boundary tree quiescence is unqualified",
-        ))
+    fn quiesce(&mut self, process: ProcessHandle) -> Result<QuiescedTree> {
+        if self.sessions.first().is_none_or(|s| s.id != process.0) {
+            return Err(UmbraError::new(
+                ErrorKind::StaleHandle,
+                "quiesce",
+                "unknown root",
+            ));
+        }
+        self.check_deadline()?;
+        let result = (|| {
+            // Interrupt all live connections before waiting on any one of them.
+            for s in &mut self.sessions {
+                if !s.done && !s.stopped {
+                    s.rsp.interrupt()?;
+                }
+            }
+            for i in 0..self.sessions.len() {
+                while !self.sessions[i].done && !self.sessions[i].stopped {
+                    self.check_deadline()?;
+                    let Some(reply) = self.sessions[i].rsp.poll(Duration::from_millis(10))? else {
+                        continue;
+                    };
+                    if reply.starts_with('O') {
+                        continue;
+                    }
+                    if reply.starts_with('W') || reply.starts_with('X') {
+                        self.stop(i, reply, false)?;
+                        continue;
+                    }
+                    if !reply.starts_with('T') || reply.len() < 3 {
+                        return Err(error(
+                            "quiesce",
+                            format!("expected stopped acknowledgement: {reply}"),
+                        ));
+                    }
+                    let fields = rsp::fields(&reply[3..]);
+                    let thread = rsp::number(
+                        fields
+                            .get("thread")
+                            .ok_or_else(|| error("quiesce", "no stopped thread"))?,
+                    )?;
+                    let s = &mut self.sessions[i];
+                    s.thread = tid(thread, s.id.0.generation);
+                    s.stopped = true;
+                    // Do not dispatch here: process-control stops can resume or attach
+                    // children. Preserve the reply so no syscall trap is skipped.
+                    self.quiesced_stops.push_back((i, reply));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            // A failed interrupt/ack must not leave part of the tree running.
+            for s in &self.sessions {
+                s.task.kill();
+            }
+            return Err(e);
+        }
+        if self.sessions.iter().any(|s| !s.done && s.pending.is_some()) {
+            return Err(error(
+                "quiesce",
+                "syscall return in flight; drain next_event before retrying",
+            ));
+        }
+        Ok(QuiescedTree {
+            process,
+            tasks: self
+                .sessions
+                .iter()
+                .filter(|s| !s.done)
+                .map(|s| s.id)
+                .collect(),
+        })
     }
     fn terminate(&mut self, process: ProcessHandle, policy: TerminationPolicy) -> Result<()> {
         if self.sessions.first().is_none_or(|s| s.id != process.0) {
@@ -1242,6 +1362,7 @@ impl TraceControl for MacosTraceBackend {
         }
         self.sessions.clear();
         self.events.clear();
+        self.quiesced_stops.clear();
         self.watchdog.take();
         Ok(())
     }

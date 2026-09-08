@@ -398,6 +398,21 @@ pub fn serve_provider(
     serve_session(connection, platform)
 }
 
+/// Run the provider handshake and dispatcher on an injected private connection.
+/// This is the socketpair equivalent of `serve_provider`'s process-argument transport.
+pub fn serve_provider_on(
+    connection: Connection,
+    id: &str,
+    factory: impl FnOnce(&[u8]) -> Result<PlatformSession>,
+) -> Result<()> {
+    let (connection, platform) = wire::accept_connection(connection, id, "platform", |options| {
+        let platform = factory(options)?;
+        let capabilities = platform.control.capabilities().capabilities;
+        Ok((platform, capabilities))
+    })?;
+    serve_session(connection, platform)
+}
+
 fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> Result<()> {
     let mut roots = Vec::new();
     let result = (|| {

@@ -619,7 +619,7 @@ fn journal_failures_block_mutation_or_require_recovery_without_false_success() {
 }
 
 #[test]
-fn rejects_symlinks_including_before_parent_components_and_trailing_file_slash() {
+fn rejects_unchecked_physical_symlinks_and_trailing_file_slash() {
     let mut f = Fixture::new(&[(b"dir/file", b"safe")]);
     std::os::unix::fs::symlink(f.base_root.join("dir"), f.shadow_root.join("link")).unwrap();
     for path in [b"link/file".as_slice(), b"link/../new", b"dir/file/"] {
@@ -826,5 +826,554 @@ fn standard_namespace_trait_object_uses_the_same_bound_engine() {
             .unwrap_err()
             .kind,
         ErrorKind::NotFound
+    );
+}
+
+fn symlink(name: &[u8], target: &[u8]) -> FsOp {
+    FsOp::Symlink {
+        target: bytes(target),
+        link_dir: DirRef::Cwd,
+        link_name: bytes(name),
+    }
+}
+
+#[test]
+fn symlink_create_has_safe_placeholder_identity_metadata_and_journal_order() {
+    let mut f = Fixture::new(&[]);
+    let op = symlink(b"a/link", b"/b//./file");
+    let action = f.overlay.resolve(&f.process, &op).unwrap();
+    assert!(!f.shadow_root.join("a").exists());
+    assert!(!f.control.join("symlinks").exists());
+    let id = OperationId(Uuid::new_v4());
+    let prepared = f.overlay.prepare(id, &action).unwrap();
+    let placeholder = f.shadow_root.join("a/link");
+    assert!(fs::symlink_metadata(&placeholder).unwrap().is_file());
+    assert!(fs::read_link(&placeholder).is_err());
+    assert!(fs::metadata(placeholder.join("escape")).is_err());
+    assert_eq!(
+        fs::read(f.control.join(format!("symlinks/targets/{}", id.0))).unwrap(),
+        b"/b//./file"
+    );
+    f.complete(prepared);
+    let stat = f.overlay.stat(&root(b"a/link").unwrap(), false).unwrap();
+    assert_eq!(stat.object_id, ObjectId(id.0));
+    assert_eq!(stat.kind, ObjectKind::LogicalSymlink);
+    assert_eq!(stat.len, 10);
+    assert_eq!(
+        f.overlay.read_link(&root(b"a/link").unwrap()).unwrap(),
+        bytes(b"/b//./file")
+    );
+    let page = f.overlay.list(&root(b"a").unwrap(), None, 10).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].stat, stat);
+    let page = f.overlay.list(&root(b"").unwrap(), None, 10).unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|e| e.name.as_bytes())
+            .collect::<Vec<_>>(),
+        vec![b"a"]
+    );
+    let log = f.log.lock().unwrap();
+    assert_eq!(log.records.len(), 3);
+    assert!(matches!(&log.records[0].payload,
+        JournalPayload::Prepare { intent: JournalIntent::Symlink { object, path, target } }
+        if *object == ObjectId(id.0) && path.as_bytes() == b"/a/link" && target.as_bytes() == b"/b//./file"));
+    assert!(matches!(
+        log.records[1].payload,
+        JournalPayload::ObservedResult { .. }
+    ));
+    assert!(matches!(log.records[2].payload, JournalPayload::Commit));
+}
+
+#[test]
+fn readlink_non_utf8_is_verbatim_and_native_buffer_truncates_without_nul() {
+    let mut f = Fixture::new(&[]);
+    let target = b"\xff/bad//.././tail";
+    f.run(&symlink(b"dir/link", target));
+    assert_eq!(
+        f.overlay
+            .read_link(&root(b"dir/link").unwrap())
+            .unwrap()
+            .as_bytes(),
+        target
+    );
+    let stat = f.overlay.stat(&root(b"dir").unwrap(), true).unwrap();
+    f.process.fds.insert(
+        TracedFd(9),
+        FdState {
+            object: stat.object_id,
+            logical_path: Some(bytes(b"/dir")),
+            directory: true,
+            flags: OpenFlags::default(),
+        },
+    );
+    for (dir, path, capacity) in [
+        (DirRef::Cwd, b"/dir/link".as_slice(), 100),
+        (DirRef::Fd(TracedFd(9)), b"link".as_slice(), 4),
+    ] {
+        f.overlay.set_readlink_buffer(0x1000, capacity).unwrap();
+        let op = FsOp::ReadLink {
+            dir,
+            path: bytes(path),
+        };
+        let prepared = f.prepare(&op);
+        let ResolvedAction::Emulate(result) = &prepared.action else {
+            panic!("readlink must emulate")
+        };
+        let expected = &target[..target.len().min(capacity as usize)];
+        assert_eq!(
+            result.memory_writes,
+            vec![MemoryWrite {
+                address: 0x1000,
+                bytes: expected.to_vec()
+            }]
+        );
+        assert_eq!(
+            result.outcome,
+            OperationOutcome::Success {
+                return_value: expected.len() as u64
+            }
+        );
+        f.overlay
+            .observe_result(prepared.operation_id, &result.outcome)
+            .unwrap();
+        f.overlay.commit(prepared.operation_id).unwrap();
+        assert_eq!(
+            f.overlay.resolve(&f.process, &op).unwrap_err().kind,
+            ErrorKind::UnsupportedCapability
+        );
+    }
+    assert!(f.overlay.set_readlink_buffer(0, 0).is_err());
+    assert!(f.overlay.set_readlink_buffer(u64::MAX, 2).is_err());
+    assert_eq!(
+        f.overlay
+            .read_link(&root(b"dir").unwrap())
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn symlink_traversal_opens_logical_target_and_copy_up_never_opens_placeholder() {
+    let mut f = Fixture::new(&[(b"b/file", b"base")]);
+    f.run(&symlink(b"a/link", b"/b/file"));
+    let prepared = f.prepare(&open(
+        b"/a/link",
+        OpenFlags {
+            read: true,
+            ..OpenFlags::default()
+        },
+    ));
+    let ResolvedAction::Rewrite(rewrite) = &prepared.action else {
+        panic!("open rewrite")
+    };
+    assert_eq!(native(&rewrite.paths[0].path.0), f.base_root.join("b/file"));
+    assert_eq!(fs::read(native(&rewrite.paths[0].path.0)).unwrap(), b"base");
+    f.complete(prepared);
+    f.run(&open(
+        b"a/link",
+        OpenFlags {
+            write: true,
+            truncate: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert_eq!(f.read(b"a/link").unwrap(), b"");
+    assert_eq!(fs::read(f.base_root.join("b/file")).unwrap(), b"base");
+    assert!(f.shadow_root.join("b/file").is_file());
+    assert_eq!(
+        f.overlay.read_link(&root(b"a/link").unwrap()).unwrap(),
+        bytes(b"/b/file")
+    );
+    f.run(&symlink(b"alias", b"b"));
+    assert_eq!(
+        f.overlay
+            .list(&root(b"alias").unwrap(), None, 10)
+            .unwrap()
+            .entries[0]
+            .name
+            .as_bytes(),
+        b"file"
+    );
+    f.run(&rename(b"alias/file", b"alias/moved"));
+    f.run(&unlink(b"alias/moved"));
+    assert_eq!(f.read(b"b/moved").unwrap_err().kind, ErrorKind::NotFound);
+}
+
+#[test]
+fn symlink_parent_escape_is_rejected_before_prepare_including_process_root() {
+    let mut f = Fixture::new(&[(b"jail/a/file", b"safe")]);
+    f.run(&symlink(b"jail/a/link", b"../../../outside"));
+    f.process.root = bytes(b"/jail");
+    f.process.cwd = bytes(b"/jail");
+    let direct = f
+        .overlay
+        .resolve(&f.process, &stat(b"../outside"))
+        .unwrap_err();
+    let count = f.log.lock().unwrap().records.len();
+    for op in [
+        stat(b"a/link"),
+        open(
+            b"a/link",
+            OpenFlags {
+                create: true,
+                write: true,
+                ..OpenFlags::default()
+            },
+        ),
+        unlink(b"a/link/child"),
+        rename(b"a/link/child", b"safe"),
+    ] {
+        let err = f.overlay.resolve(&f.process, &op).unwrap_err();
+        assert_eq!(err.kind, direct.kind);
+        assert_eq!(err.context, direct.context);
+    }
+    assert_eq!(f.log.lock().unwrap().records.len(), count);
+    assert!(!f.shadow_root.join("outside").exists());
+    assert!(!f.shadow_root.parent().unwrap().join("outside").exists());
+}
+
+#[test]
+fn symlink_loop_and_long_chain_have_a_bounded_iterative_expansion() {
+    let mut f = Fixture::new(&[(b"file", b"safe")]);
+    f.run(&symlink(b"a", b"b"));
+    f.run(&symlink(b"b", b"a"));
+    for path in [b"a".as_slice(), b"a/../file"] {
+        let err = f.overlay.resolve(&f.process, &stat(path)).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidPath);
+        assert_eq!(err.context, "symlink expansion limit exceeded");
+    }
+    for n in (0..=MAX_SYMLINK_EXPANSIONS).rev() {
+        let target = if n == MAX_SYMLINK_EXPANSIONS {
+            "file".to_string()
+        } else {
+            format!("link{}", n + 1)
+        };
+        f.run(&symlink(format!("link{n}").as_bytes(), target.as_bytes()));
+    }
+    assert_eq!(f.read(b"link1").unwrap(), b"safe");
+    assert_eq!(
+        f.read(b"link0").unwrap_err().context,
+        "symlink expansion limit exceeded"
+    );
+}
+
+#[test]
+fn absolute_symlink_targets_start_at_logical_process_root() {
+    let mut f = Fixture::new(&[(b"jail/x/y", b"inside"), (b"x/y", b"outside")]);
+    f.run(&symlink(b"jail/a/b/link", b"/x/y"));
+    f.process.root = bytes(b"/jail");
+    f.process.cwd = bytes(b"/jail/a/b");
+    assert_eq!(
+        f.overlay
+            .resolve_path(&f.process, DirRef::Cwd, &bytes(b"link"), false)
+            .unwrap(),
+        root(b"jail/x/y").unwrap()
+    );
+    let action = f
+        .overlay
+        .resolve(
+            &f.process,
+            &open(
+                b"link",
+                OpenFlags {
+                    read: true,
+                    ..OpenFlags::default()
+                },
+            ),
+        )
+        .unwrap();
+    let ResolvedAction::Rewrite(rewrite) = action else {
+        panic!("open rewrite")
+    };
+    assert_eq!(
+        fs::read(native(&rewrite.paths[0].path.0)).unwrap(),
+        b"inside"
+    );
+}
+
+#[test]
+fn relative_symlink_targets_start_at_link_parent_and_expand_before_dotdot() {
+    let mut f = Fixture::new(&[
+        (b"a/c", b"relative"),
+        (b"x/y/file", b"nested"),
+        (b"x/file", b"parent"),
+    ]);
+    f.run(&symlink(b"a/b/link", b"../c"));
+    assert_eq!(f.read(b"a/b/link").unwrap(), b"relative");
+    assert_eq!(
+        f.overlay
+            .resolve_path(&f.process, DirRef::Cwd, &bytes(b"/a/b/link"), false)
+            .unwrap(),
+        root(b"a/c").unwrap()
+    );
+    f.run(&symlink(b"dir", b"x/y"));
+    assert_eq!(
+        f.overlay
+            .resolve_path(&f.process, DirRef::Cwd, &bytes(b"dir/../file"), false)
+            .unwrap(),
+        root(b"x/file").unwrap()
+    );
+    assert!(f.overlay.resolve(&f.process, &stat(b"a/b/link/")).is_err());
+}
+
+#[test]
+fn symlink_rename_unlink_exclusive_and_nofollow_act_on_link_identity() {
+    let mut f = Fixture::new(&[(b"file", b"preserved")]);
+    f.run(&symlink(b"link", b"file"));
+    let id = f
+        .overlay
+        .stat(&root(b"link").unwrap(), false)
+        .unwrap()
+        .object_id;
+    for flags in [
+        OpenFlags {
+            read: true,
+            no_follow: true,
+            ..OpenFlags::default()
+        },
+        OpenFlags {
+            create: true,
+            exclusive: true,
+            ..OpenFlags::default()
+        },
+    ] {
+        assert!(f
+            .overlay
+            .resolve(&f.process, &open(b"link", flags))
+            .is_err());
+    }
+    f.run(&rename(b"link", b"moved"));
+    assert_eq!(
+        f.overlay
+            .stat(&root(b"moved").unwrap(), false)
+            .unwrap()
+            .object_id,
+        id
+    );
+    assert_eq!(f.read(b"moved").unwrap(), b"preserved");
+    f.run(&symlink(b"dest", b"absent"));
+    f.run(&rename(b"moved", b"dest"));
+    assert_eq!(
+        f.overlay.read_link(&root(b"dest").unwrap()).unwrap(),
+        bytes(b"file")
+    );
+    f.run(&unlink(b"dest"));
+    assert_eq!(f.read(b"file").unwrap(), b"preserved");
+    assert_eq!(
+        fs::read_dir(f.control.join("symlinks/objects"))
+            .unwrap()
+            .count(),
+        0
+    );
+    f.run(&symlink(b"dest", b"missing"));
+    assert_eq!(f.read(b"dest").unwrap_err().kind, ErrorKind::NotFound);
+    f.run(&open(
+        b"dest",
+        OpenFlags {
+            create: true,
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert!(f.shadow_root.join("missing").is_file());
+    assert_eq!(
+        f.overlay.read_link(&root(b"dest").unwrap()).unwrap(),
+        bytes(b"missing")
+    );
+}
+
+#[test]
+fn symlink_prepare_failure_leaves_no_placeholder_or_metadata() {
+    let mut f = Fixture::new(&[]);
+    f.log.lock().unwrap().fail_prepare = true;
+    let action = f
+        .overlay
+        .resolve(&f.process, &symlink(b"link", b"target"))
+        .unwrap();
+    assert!(f
+        .overlay
+        .prepare(OperationId(Uuid::new_v4()), &action)
+        .is_err());
+    assert!(!f.shadow_root.join("link").exists());
+    assert!(!f.control.join("symlinks").exists());
+}
+
+#[test]
+fn native_lstat_receives_logical_metadata_and_never_rewrites_to_placeholder() {
+    struct Encoder;
+    impl StatEncoder for Encoder {
+        fn encode(
+            &mut self,
+            _: &ProcessContext,
+            _: &FsOp,
+            stat: &BlobStat,
+        ) -> Result<EmulatedResult> {
+            assert_eq!(stat.kind, ObjectKind::LogicalSymlink);
+            assert_eq!(stat.len, 4);
+            assert_eq!(stat.mode, 0o777);
+            Ok(EmulatedResult {
+                outcome: OperationOutcome::Success { return_value: 0 },
+                memory_writes: vec![MemoryWrite {
+                    address: 0x2000,
+                    bytes: stat.len.to_le_bytes().to_vec(),
+                }],
+            })
+        }
+    }
+    let mut f = Fixture::new(&[(b"file", b"target")]);
+    f.run(&symlink(b"link", b"file"));
+    let op = FsOp::Stat {
+        dir: DirRef::Cwd,
+        path: bytes(b"link"),
+        follow: false,
+    };
+    assert_eq!(
+        f.overlay.resolve(&f.process, &op).unwrap_err().kind,
+        ErrorKind::UnsupportedCapability
+    );
+    f.overlay.set_stat_encoder(Box::new(Encoder)).unwrap();
+    let prepared = f.prepare(&op);
+    assert!(matches!(prepared.action, ResolvedAction::Emulate(_)));
+    f.complete(prepared);
+    f.run(&stat(b"link"));
+    assert_eq!(
+        f.overlay.stat(&root(b"link").unwrap(), true).unwrap().kind,
+        ObjectKind::File
+    );
+}
+
+#[test]
+fn immutable_base_symlinks_resolve_and_copy_up_preserves_identity_and_target() {
+    let mut base = Fixture::new(&[]);
+    base.run(&open(
+        b"file",
+        OpenFlags {
+            create: true,
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    fs::write(base.shadow_root.join("file"), b"base bytes").unwrap();
+    base.run(&symlink(b"link", b"file"));
+    let id = base
+        .overlay
+        .stat(&root(b"link").unwrap(), false)
+        .unwrap()
+        .object_id;
+    let config = base.overlay.config().unwrap().clone();
+    let (storage, _) = base.overlay.into_backends();
+    let mut reader = config.context;
+    reader.writer_epoch = None;
+    let mut f = Fixture::new(&[]);
+    f.overlay.base = Some(Box::new(
+        StorageBase::new(storage, config.binding, reader).unwrap(),
+    ));
+    assert_eq!(f.read(b"link").unwrap(), b"base bytes");
+    assert_eq!(
+        f.overlay.read_link(&root(b"link").unwrap()).unwrap(),
+        bytes(b"file")
+    );
+    assert_eq!(
+        f.overlay
+            .list(&root(b"").unwrap(), None, 10)
+            .unwrap()
+            .entries[1]
+            .stat
+            .kind,
+        ObjectKind::LogicalSymlink
+    );
+    f.run(&rename(b"link", b"moved"));
+    assert_eq!(
+        f.overlay
+            .stat(&root(b"moved").unwrap(), false)
+            .unwrap()
+            .object_id,
+        id
+    );
+    assert_eq!(
+        f.overlay.read_link(&root(b"moved").unwrap()).unwrap(),
+        bytes(b"file")
+    );
+    assert_eq!(f.read(b"link").unwrap_err().kind, ErrorKind::NotFound);
+    assert!(base.shadow_root.join("link").exists());
+    f.run(&unlink(b"moved"));
+    assert_eq!(f.read(b"file").unwrap(), b"base bytes");
+}
+
+#[test]
+fn missing_control_target_fails_before_rewrite_and_failed_readlink_consumes_buffer() {
+    let mut f = Fixture::new(&[]);
+    f.run(&symlink(b"link", b"target"));
+    f.overlay.set_readlink_buffer(0x1000, 4).unwrap();
+    let op = FsOp::ReadLink {
+        dir: DirRef::Cwd,
+        path: bytes(b"missing"),
+    };
+    assert_eq!(
+        f.overlay.resolve(&f.process, &op).unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+    let op = FsOp::ReadLink {
+        dir: DirRef::Cwd,
+        path: bytes(b"link"),
+    };
+    assert_eq!(
+        f.overlay.resolve(&f.process, &op).unwrap_err().kind,
+        ErrorKind::UnsupportedCapability
+    );
+    let id = f
+        .overlay
+        .stat(&root(b"link").unwrap(), false)
+        .unwrap()
+        .object_id;
+    fs::remove_file(f.control.join(format!("symlinks/targets/{}", id.0))).unwrap();
+    let count = f.log.lock().unwrap().records.len();
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &stat(b"link"))
+            .unwrap_err()
+            .kind,
+        ErrorKind::CorruptJournal
+    );
+    assert_eq!(f.log.lock().unwrap().records.len(), count);
+}
+
+#[test]
+fn symlink_cwd_and_dirfd_anchors_are_resolved_before_identity_checks() {
+    let mut f = Fixture::new(&[(b"dir/file", b"anchored")]);
+    f.run(&symlink(b"alias", b"dir"));
+    let object = f
+        .overlay
+        .stat(&root(b"dir").unwrap(), true)
+        .unwrap()
+        .object_id;
+    f.process.fds.insert(
+        TracedFd(7),
+        FdState {
+            object,
+            logical_path: Some(bytes(b"/alias")),
+            directory: true,
+            flags: OpenFlags::default(),
+        },
+    );
+    f.process.cwd = bytes(b"/alias");
+    for dir in [DirRef::Cwd, DirRef::Fd(TracedFd(7))] {
+        assert_eq!(
+            f.overlay
+                .resolve_path(&f.process, dir, &bytes(b"file"), false)
+                .unwrap(),
+            root(b"dir/file").unwrap()
+        );
+    }
+    f.process.fds.get_mut(&TracedFd(7)).unwrap().object = ObjectId(Uuid::new_v4());
+    assert_eq!(
+        f.overlay
+            .resolve_path(&f.process, DirRef::Fd(TracedFd(7)), &bytes(b"file"), false)
+            .unwrap_err()
+            .kind,
+        ErrorKind::StaleHandle
     );
 }

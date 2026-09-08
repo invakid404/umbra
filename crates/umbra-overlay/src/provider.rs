@@ -63,6 +63,25 @@ pub enum Request {
         /// Request.
         request: CheckpointRequest,
     },
+    /// Read the logical symlink target verbatim.
+    ReadLink {
+        /// Logical path beneath the root anchor.
+        path: StoragePath,
+    },
+    /// Read logical metadata.
+    Stat {
+        /// Logical path beneath the root anchor.
+        path: StoragePath,
+        /// Follow the final symlink.
+        follow: bool,
+    },
+    /// Bind the next native readlink or readlinkat buffer.
+    SetReadLinkBuffer {
+        /// Tracee virtual address.
+        address: u64,
+        /// Output capacity, without a NUL terminator.
+        len: u32,
+    },
 }
 /// Method-tagged successful responses; errors travel in the transport envelope.
 #[derive(Serialize, Deserialize)]
@@ -83,6 +102,12 @@ pub enum Response {
     Abort(()),
     /// Checkpoint.
     Checkpoint(Box<Checkpoint>),
+    /// Logical target bytes.
+    ReadLink(BytePath),
+    /// Logical object metadata.
+    Stat(umbra_core::BlobStat),
+    /// Readlink buffer bound.
+    SetReadLinkBuffer(()),
 }
 /// Synchronous proxy owning its provider process and connection.
 pub struct Proxy {
@@ -116,6 +141,29 @@ impl NamespaceResolver for Proxy {
     }
 }
 impl NamespaceSession for Proxy {
+    fn read_link(&mut self, path: &StoragePath) -> Result<BytePath> {
+        match self.call(&Request::ReadLink { path: path.clone() })? {
+            Response::ReadLink(target) => Ok(target),
+            _ => Err(protocol_error("namespace.read_link response mismatch")),
+        }
+    }
+    fn stat(&mut self, path: &StoragePath, follow: bool) -> Result<umbra_core::BlobStat> {
+        match self.call(&Request::Stat {
+            path: path.clone(),
+            follow,
+        })? {
+            Response::Stat(stat) => Ok(stat),
+            _ => Err(protocol_error("namespace.stat response mismatch")),
+        }
+    }
+    fn set_readlink_buffer(&mut self, address: u64, len: u32) -> Result<()> {
+        match self.call(&Request::SetReadLinkBuffer { address, len })? {
+            Response::SetReadLinkBuffer(()) => Ok(()),
+            _ => Err(protocol_error(
+                "namespace.readlink_buffer response mismatch",
+            )),
+        }
+    }
     fn read_at(&mut self, path: &StoragePath, offset: u64, out: &mut [u8]) -> Result<usize> {
         if out.len() > umbra_core::MAX_IO_BYTES || offset.checked_add(out.len() as u64).is_none() {
             return Err(protocol_error("namespace read exceeds bounds"));
@@ -204,6 +252,11 @@ pub fn serve_provider<B: NamespaceSession>(
         Ok((backend, capabilities))
     })?;
     wire::serve(connection, |request| match request {
+        Request::ReadLink { path } => backend.read_link(&path).map(Response::ReadLink),
+        Request::Stat { path, follow } => backend.stat(&path, follow).map(Response::Stat),
+        Request::SetReadLinkBuffer { address, len } => backend
+            .set_readlink_buffer(address, len)
+            .map(Response::SetReadLinkBuffer),
         Request::ReadAt { path, offset, len } => {
             if len as usize > umbra_core::MAX_IO_BYTES || offset.checked_add(len as u64).is_none() {
                 return Err(protocol_error("namespace read exceeds bounds"));

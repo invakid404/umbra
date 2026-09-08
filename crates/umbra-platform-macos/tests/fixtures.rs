@@ -156,36 +156,23 @@ fn open_libc() {
 fn open_svc() {
     fixture("open-svc", b"libc\n")
 }
-// Multi-process fixture cases are gated behind `#[ignore]` for M1: the
-// post-fork breakpoint teardown path (native.rs::ReturnKind::Fork{restore})
-// currently emits `z0,ADDR,4` to the child's freshly attached debugserver
-// session for addresses that session never installed, so debugserver returns
-// `E08`. Fix is deferred to M1.5 alongside the symlink first-class handling
-// deferral documented in umbra-overlay. Minimum M1 acceptance bar is
-// `open-libc CAPTURED`; that plus `open-svc` are CAPTURED without ignore.
-// Opt in with `cargo test -p umbra-platform-macos --test fixtures -- --ignored`.
 #[test]
-#[ignore = "M1.5: fork-gate breakpoint teardown returns debugserver E08"]
 fn fork_write() {
     fixture("fork-write", b"fork\n")
 }
 #[test]
-#[ignore = "M1.5: fork-gate breakpoint teardown returns debugserver E08"]
 fn posix_spawn_write() {
     fixture("posix-spawn-write", b"libc\n")
 }
 #[test]
-#[ignore = "M1.5: fork-gate breakpoint teardown returns debugserver E08"]
 fn exec_write() {
     fixture("exec-write", b"libc\n")
 }
 #[test]
-#[ignore = "M1.5: fork-gate breakpoint teardown returns debugserver E08"]
 fn grandchild_write() {
     fixture("grandchild-write", b"grandchild\n")
 }
 #[test]
-#[ignore = "M1.5: fork-gate breakpoint teardown returns debugserver E08"]
 fn dup_inherit_write() {
     fixture("dup-inherit-write", b"dup\n")
 }
