@@ -15,4 +15,4 @@ serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2.workspace = true
-libc = "0.2"
+libc = "=0.2.189"
