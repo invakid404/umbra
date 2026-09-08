@@ -1,0 +1,31 @@
+version = 2
+
+# Not documentation inputs.
+# - experiments/**: scratch playground; docs there are self-owned scratch notes.
+# - target/**: build output.
+# - **/.dSYM/**: macOS debug bundles that can appear under target or ad-hoc.
+# - .jj/**: jj internal state (colocated with .git; .git is already jj-invisible).
+# - Cargo.lock: dependency resolution; avoid review churn on lockfile-only updates.
+ignore = ["experiments/**", "target/**", "**/.dSYM/**", ".jj/**", "Cargo.lock"]
+include = []
+
+[documentation]
+# Umbra's writing rules. Deliberately DOES NOT depend on the Memoria author's
+# personal skills (`simple-english`, `i-have-adhd`); umbra contributors and
+# agents must not be forced to load those.
+guidance = [
+    "Write in umbra's house style: concise, technically precise, and honest about current state. Distinguish what ships from what is a stub, prototype, or planned. Never use marketing language, superlatives, or forward-looking claims dressed as present-tense capability.",
+    "Every README states its current state near the top, and every nested README also declares its ownership boundary there; the root README leads with product and problem instead. State what the crate/module does today, what is stubbed, and what depends on unshipped work. When a claim is quantitative (LOC, test count, syscall number, matrix dimensions), quote it from source; otherwise omit the number.",
+    "Cross-check every prose claim against the code in the ownership boundary before acknowledgement. If the README describes exported names, modules, or behaviour that no longer matches source, edit the README rather than acknowledging the drift.",
+    "Root README.md is the one document written for a new consumer: lead with product, problem, quick start, and links to ARCHITECTURE.md and docs/. Nested READMEs stay inside their crate boundary; they may import short summaries from providers via `memoria render` but must not duplicate whole sections.",
+    "Use GitHub-flavoured Markdown; use Mermaid for diagrams with neutral wording and default rendering (no theme/color overrides). Give each diagram one claim. Keep code fences, paths, identifiers, and quoted errors byte-exact.",
+    "Prefer short sections with clear takeaways and progressive detail over long walls. Explain each term the first time it appears. Number multi-step procedures.",
+]
+guidance_files = []
+
+[fingerprints]
+default = "raw"
+languages = {}
+
+[lint]
+missing_import_hint = true
