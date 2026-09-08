@@ -15,14 +15,14 @@ remain incomplete. Per-crate READMEs describe local implementation status.
 
 The [engineering handoff](docs/handoff.md) supplies the product and filesystem
 semantics. Its illustrative `fsvirt-*` decomposition is superseded by the following
-15-member `umbra-*` workspace. [M0 Gate 2](docs/m0/gate-2.md) records the prototype
+16-member `umbra-*` workspace. [M0 Gate 2](docs/m0/gate-2.md) records the prototype
 evidence and outstanding qualification work.
 
 ## Crate topology
 
 Each package lives under `crates/` and owns its README. A backend's
 library and provider binary belong to the same package. Existing
-[fixtures](experiments/fixtures/README.md) are not a sixteenth workspace member.
+[fixtures](experiments/fixtures/README.md) are not a seventeenth workspace member.
 
 | Crate documentation | Responsibility | Allowed direct Umbra dependencies |
 | --- | --- | --- |
@@ -33,6 +33,7 @@ library and provider binary belong to the same package. Existing
 | [umbra-storage](crates/umbra-storage/README.md) | Run storage operations, capabilities, durability and writer authority; storage protocol | `umbra-core` |
 | [umbra-storage-nfs](crates/umbra-storage-nfs/README.md) | Validated mounted NFS layout, shadow primitives, remote durability and fencing | `umbra-storage`, `umbra-core` |
 | [umbra-storage-local](crates/umbra-storage-local/README.md) | Equivalent semantic API for development and local persistence | `umbra-storage`, `umbra-core` |
+| [umbra-storage-tar](crates/umbra-storage-tar/README.md) | Indexed tar snapshots, persistent staging and local durability for small runs | `umbra-storage`, `umbra-core` |
 | [umbra-overlay](crates/umbra-overlay/README.md) | Namespace contracts and shared copy-up, read-through and whiteout engine; namespace protocol | `umbra-core`, `umbra-storage`, `umbra-journal` |
 | [umbra-journal](crates/umbra-journal/README.md) | Durable operation, replay and checkpoint contracts; journal protocol | `umbra-core` |
 | [umbra-journal-file](crates/umbra-journal-file/README.md) | Framed checksummed append-only journal, snapshots and recovery | `umbra-journal`, `umbra-core` |
@@ -44,7 +45,7 @@ library and provider binary belong to the same package. Existing
 
 The five trait crates are platform, storage, overlay, journal, and agent. Overlay
 also owns the backend-independent namespace engine: it receives `dyn Storage` and
-`dyn Journal` and does not select NFS, local storage, or a file journal.
+`dyn Journal` and does not select NFS, local storage, tar storage, or a file journal.
 
 ## Dependency direction
 

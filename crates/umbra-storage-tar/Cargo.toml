@@ -1,0 +1,17 @@
+[package]
+name = "umbra-storage-tar"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+umbra-core = { path = "../umbra-core" }
+umbra-storage = { path = "../umbra-storage" }
+tar.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
