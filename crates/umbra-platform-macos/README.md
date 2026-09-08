@@ -3,17 +3,19 @@
 Darwin arm64 tracing backend. Direct Umbra dependencies are `umbra-core` and
 `umbra-platform`; `mach2` and `libc` are gated to `cfg(target_os = "macos")`.
 Non-arm64-macOS builds still compile (through `src/unsupported.rs`) — this
-covers non-macOS targets and macOS on x86_64 — but every runtime call
-structurally reports `UnsupportedCapability`.
+covers non-macOS targets and macOS on x86_64. Fallible tracing/control calls
+report `UnsupportedCapability`, and capabilities are empty. The pure arm64 ABI
+module remains available on those hosts.
 
 The crate implements the v2 experimental tracer described in
 `experiments/tracer/umbra_tracer.py` and `experiments/tracer/REPORT-v2.md`
 using a hybrid debugger interface: **Apple's `debugserver` over GDB Remote
 Serial Protocol** for stop-and-control, and **`mach2` (`task_for_pid` +
 `mach_vm_read_overwrite`) for victim-side memory reads**. Rationale: the
-signed Apple debugserver keeps working across OS releases and maps cleanly
-onto the Python v2's attach model; direct Mach for memory keeps the decode
-callback out of the RSP round-trip. The RSP client (`src/rsp.rs`) is a
+signed Apple debugserver provides the attach model used by Python v2;
+runtime behavior still requires qualification on each supported OS release.
+Direct Mach for memory keeps the decode callback out of the RSP round-trip.
+The RSP client (`src/rsp.rs`) is a
 small, bounded reverse-connect implementation with framed `$…#CC` packets,
 RLE decode, and a per-request deadline.
 
@@ -129,13 +131,15 @@ travels with the tree. Its assertions remain intact.
 
 ## M2 gap: `exec-write` post-exec breakpoint loop
 
-M1.5 closed the fork-gate teardown E08 for the other five multi-process
-fixtures and reacquired the child's Mach task port on `reason:exec`
+M1.5 closed the fork-gate teardown E08 affecting fork descendants
+in the passing multi-process fixtures and reacquired the child's Mach task
+port on `reason:exec`
 (fixing the pre-M1.5 `mach_vm_read` status `268435459` /
 `MACH_SEND_INVALID_DEST` failure). `exec-write` now advances past the
-`reason:exec` boundary, emits an `Exec` event, and reaches its first
-post-exec `SyscallEntry` at PC `0x18c9d2690` — an `__openat`-family stub
-in the shared cache. From there it enters a bounded live-lock:
+`reason:exec` boundary and emits an `Exec` event. The recorded diagnosis
+observed its first post-exec `SyscallEntry` at PC `0x18c9d2690` — an
+`__openat`-family stub in that run's shared cache — followed by a bounded
+live-lock. Addresses and iteration counts are run-specific:
 
 - The tracer sends `z0,18c9d2690,4` (`OK`) + `Z0,18c9d2694,4` (`OK`) +
   `c` — remove the entry BP, install the return-gate BP at `pc+4`,
@@ -161,14 +165,15 @@ clear the trap. Two live hypotheses, neither yet distinguished:
   BRK on this cycle is not coherent with the instruction fetch
   pipeline), the CPU loops on the same BRK site.
 
-Reproducing the forensic signature: run
-`cargo test -p umbra-platform-macos --test fixtures exec_write --
---nocapture` with `UMBRA_RSP_LOG=1`; the log will contain 3024 identical
-`T…thread:<id>;` stops at PC `0x18c9d2690`, each followed by successful
-register reads and a `c` continuation. Distinguishing the hypotheses
-requires interactive debug: `qMemoryRegionInfo` around the entry PC,
-`M` reads of the four bytes at the entry PC immediately after the `z0`
-ACK, and single-stepping (`vCont;s`) the first post-exec continuation
+Reproduce with the fixture environment variables set as below and
+`UMBRA_RSP_LOG=1 cargo test -p umbra-platform-macos --test fixtures exec_write -- --nocapture`.
+Look for repeated `T…thread:<id>;` stops at the same post-exec entry PC,
+with successful register reads and `c` continuations; the PC and count
+need not match the recorded run. Distinguishing the hypotheses requires
+interactive debug: `qMemoryRegionInfo` around the entry PC, `m` reads of
+the four instruction bytes immediately after the `z0` ACK (`M` writes
+memory; see the [GDB packet reference](https://www.sourceware.org/gdb/download/onlinedocs/gdb.html/Packets.html)),
+and single-stepping (`vCont;s`) the first post-exec continuation
 instead of `c`.
 
 Run with verdicts visible:
@@ -181,8 +186,10 @@ UMBRA_TEST_FIXTURE_PATH=<abs> UMBRA_TEST_REDIRECT_ROOT=<abs> \
 `src/rsp.rs::tests::debugserver_reverse_connect_no_ack_handshake` spawns a
 real debugserver and asserts the negotiated `qHostInfo.ostype` is
 `macosx`, guarding the reverse-connect nonblocking-inheritance fix from
-regressing. It requires `xcode-select -p` to resolve; adding a
-skip-on-missing-tools guard is on the M1.5 polish list.
+regressing. It resolves `xcode-select -p` and checks the actual debugserver
+binary path before connecting; missing tools print `SKIP` and return.
+That guard is implemented. A present debugger still requires socket and
+debugging permissions.
 
 ## Verification
 

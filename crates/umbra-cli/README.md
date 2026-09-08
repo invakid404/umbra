@@ -15,7 +15,8 @@ umbra [--storage-root PATH] inspect RUN_ID
 
 `RUN_ID` is a UUID. Defaults are `.umbra` for local development storage, `codex` for
 the run agent ID, and `.` for the logical workspace. `--storage-root` also works
-after a subcommand. Agent IDs are open strings; provider selection is not implemented.
+after a subcommand. Agent IDs are open strings; operational commands do not yet
+select providers. Runtime selection works through the `providers` command below.
 Resume will eventually use the recorded agent identity. These flags are an initial
 parsing interface; handoff §5 specifies the command names but no exact flag syntax.
 

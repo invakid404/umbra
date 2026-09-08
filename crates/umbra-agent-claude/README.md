@@ -1,6 +1,6 @@
 # umbra-agent-claude
 
-Claude adapter scaffold. Returns declarative launch/resume/stop plans and observations
+Claude adapter scaffold. Declares methods for launch/resume/stop plans and observations
 through the Agent contract; current fallible methods return NotImplemented and capabilities
 are empty. It never launches processes or invents session IDs. Logical configuration,
 project and temporary paths must remain stable across handoff; credentials remain external.

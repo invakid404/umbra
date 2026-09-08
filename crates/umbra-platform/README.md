@@ -3,7 +3,7 @@
 Pure synchronous tracing contracts, depending only on `umbra-core`. This crate has
 no native bindings, backend selection, implementation dependencies, or mandatory
 `Send` bound. Shared DTOs are defined in core and re-exported here. The workspace
-uses Rust 1.93.0 and edition 2021.
+uses Rust 1.98.1 and edition 2021.
 
 The public contracts preserve the spec's signatures:
 
