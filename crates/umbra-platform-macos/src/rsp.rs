@@ -280,14 +280,27 @@ mod tests {
 
     #[test]
     fn debugserver_reverse_connect_no_ack_handshake() {
-        let developer_tools_present = std::process::Command::new("/usr/bin/xcode-select")
+        // GitHub's macos-14 runner has `xcode-select -p` returning a valid SDK
+        // path, but the LLDB.framework debugserver binary is not present in
+        // that layout. Probe the actual binary path — not just the SDK — so
+        // the test skips cleanly rather than panicking during connect().
+        let debugserver_path = std::process::Command::new("/usr/bin/xcode-select")
             .arg("-p")
             .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
-        if !developer_tools_present {
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| {
+                std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+                    .join("Library/PrivateFrameworks/LLDB.framework/Resources/debugserver")
+            });
+        let debugserver_present = debugserver_path.as_ref().is_some_and(|p| p.is_file());
+        if !debugserver_present {
+            let where_ = debugserver_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<xcode-select unavailable>".into());
             eprintln!(
-                "SKIP debugserver_reverse_connect_no_ack_handshake: xcode-select -p unavailable"
+                "SKIP debugserver_reverse_connect_no_ack_handshake: debugserver missing at {where_}"
             );
             return;
         }
