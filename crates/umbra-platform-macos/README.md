@@ -119,7 +119,7 @@ All seven cases are enabled. Fixture cases:
 | `open-libc`         | **CAPTURED** — the M1 minimum acceptance bar |
 | `open-svc`          | **CAPTURED** |
 | `fork-write`        | **CAPTURED** |
-| `posix-spawn-write` | **CAPTURED** |
+| `posix-spawn-write` | **CAPTURED** on macOS 26.5.1; refuses elsewhere (version pin, below) |
 | `exec-write`        | **CAPTURED** — see the closed M2 gap below |
 | `grandchild-write`  | **CAPTURED** |
 | `dup-inherit-write` | **CAPTURED** |
