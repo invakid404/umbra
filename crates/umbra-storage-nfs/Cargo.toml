@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 umbra-core = { path = "../umbra-core" }
 umbra-storage = { path = "../umbra-storage" }
-libc = "0.2"
+libc = "=0.2.189"
 uuid.workspace = true
 serde_json.workspace = true
 

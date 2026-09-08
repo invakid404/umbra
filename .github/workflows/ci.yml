@@ -17,7 +17,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
 
       - name: Verify Apple Silicon runner
         if: runner.os == 'macOS'
@@ -28,7 +28,7 @@ jobs:
         run: rustup component add rustfmt clippy
 
       - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v4.3.0
         with:
           path: |
             ~/.cargo/registry
