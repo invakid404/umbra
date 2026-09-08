@@ -16,10 +16,8 @@ in the architecture document.
 M1 and M1.5 have delivered the 15-crate pluggable workspace, a working
 [Darwin arm64 Rust tracer](crates/umbra-platform-macos/README.md), real local and
 NFS storage backends, and an overlay with copy-up, read-through, whiteouts and
-logical symlinks. All seven Rust fixture cases are CAPTURED on the
-qualified host and the M2 post-exec breakpoint gap is closed; on newer
-macOS releases `posix-spawn-write` refuses by design against its pinned
-descriptor layout.
+logical symlinks. All seven Rust fixture cases are CAPTURED and the M2
+post-exec breakpoint gap is closed.
 [M0 Gate 2](docs/m0/gate-2.md) preserves the separate Python prototype evidence.
 
 The end-to-end CLI is still not wired. Operational supervisor/CLI methods, the
