@@ -12,9 +12,9 @@ Running list of setup steps, snags, and per-user configuration umbra needs on ma
 sudo /usr/sbin/DevToolsSecurity -enable
 ```
 
-**Why:** adds the current user to `_developer`. On macOS 26.5.1 this is **sufficient** — kernel `taskgated` then grants `task_for_pid` to LLDB / `debugserver` (which carries Apple's `com.apple.private.cs.debugger` entitlement) non-interactively for callers in `_developer`. No prompt, no auth db modification, no signed umbra binary needed for the tracer to attach.
+**Why:** changes developer-tool authorization policy so users already in `admin` or `_developer` can use Apple's signed debugger tools without an additional password prompt; it does not add group membership (see `man DevToolsSecurity`). This enabled LLDB / `debugserver` attachment in the recorded macOS 26.5.1 M0 run. The Rust tracer also calls `task_for_pid` directly for memory reads, so verify its fixture from the intended execution environment; the M0 result does not establish permissions inside another sandbox.
 
-**Common misdiagnosis:** the user-space `security authorize -e system.privilege.taskport` CLI still returns `NO (-60007)` after `DevToolsSecurity -enable`. That's a *separate* code path (`AuthorizationServices`) that debuggers do not use. Do not use this CLI as a health check for umbra's tracer — it will always fail and it doesn't matter.
+**Common misdiagnosis:** in the recorded M0 run, `security authorize -e system.privilege.taskport` returned `NO (-60007)` even after debugger attachment worked. That authorization probe is not a tracer health check; use the Rust fixture's `CAPTURED` verdict instead.
 
 **Discovered during:** M0 Gate 2 verification. Full analysis in [`docs/m0/gate-2.md`](m0/gate-2.md).
 
@@ -24,13 +24,13 @@ sudo /usr/sbin/DevToolsSecurity -enable
 xcode-select --install   # if not already installed
 ```
 
-**Why:** umbra depends on `codesign`, `codesign --entitlements`, `debugserver` (from `/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Resources/debugserver`), and LLDB's Python bindings — all shipped with CLT.
+**Why:** the Rust tracer uses `codesign` and Apple's `debugserver`, discovered below `xcode-select -p` at `Library/PrivateFrameworks/LLDB.framework/Resources/debugserver` (or overridden by `Options::debugserver`). Check that the binary exists; some Xcode layouts lack that path. LLDB's Python bindings are needed only for the historical Python experiment.
 
-## Behaviour umbra encapsulates for you (not manual steps, documented for transparency)
+## Implemented behaviour and planned runtime integration
 
 ### Ad-hoc re-signing of traced binaries
 
-Vendor-shipped `codex` and `claude` binaries have hardened runtime enabled and lack the `com.apple.security.get-task-allow` entitlement, so Apple's AMFI denies debugger attach as-shipped. Umbra re-signs each binary it traces with an ad-hoc identity + `get-task-allow`, preserving the hardened-runtime flag. The signed twin is cached under:
+The vendor `codex` 0.153.4 and `claude` 2.1.263 binaries tested in M0 had hardened runtime enabled and lacked the `com.apple.security.get-task-allow` entitlement, so Apple's AMFI denies debugger attach as-shipped. Umbra re-signs each binary it traces with an ad-hoc identity + `get-task-allow`, preserving the hardened-runtime flag. The signed twin is cached under:
 
 ```
 ~/Library/Caches/umbra/twins/<sha256>/<basename>
@@ -44,19 +44,19 @@ The vendor binary at `/opt/homebrew/bin/codex` (etc.) is not modified. Vendor up
 
 ### Per-run NFS mount path (not `/mnt`)
 
-macOS's sealed system root prevents `/mnt` creation without a system config change + reboot. Umbra places its per-run NFS mount under the user's data directory instead:
+macOS's sealed system root prevented `/mnt` creation in M0. The NFS backend consumes an externally managed mount; Umbra does not create or mount it. The proposed per-run location is:
 
 ```
 ~/.local/state/umbra/runs/<run-id>/mount/
 ```
 
-The mount root is a per-run runtime configuration, not a compile-time constant. Persistent run metadata records **logical** paths only, never physical mount points, so a run can be resumed on another machine with the mount at a different physical location.
+The tested mount is `~/umbra-scratch/nfs/mnt/umbra-nfs`. Configure its absolute path in the NFS provider options; the mount root is runtime configuration, not a compile-time constant. Persistent run metadata records **logical** paths only, never physical mount points, so a run can be resumed on another machine with the mount at a different physical location.
 
 **Discovered during:** M0 Track B (NFS infra). Full context in `experiments/nfs/README.md`.
 
 ### Sandbox profile — parameterised mount path
 
-The Seatbelt profile umbra installs (`experiments/seatbelt/umbra.sb` for reference) requires two carve-outs beyond the obvious deny-default + read + write-under-mount rules:
+The historical Seatbelt profile (`experiments/seatbelt/umbra.sb`) uses the literal `/mnt/umbra-nfs`. Runtime rendering, mount-path parameterisation and installation by the Rust tracer are not implemented. The experiment includes two carve-outs beyond the deny-default + read + write-under-mount rules:
 
 - `(allow mach-priv-task-port (target same-sandbox))` — LLDB launches `debugserver` and the tracee as siblings, so a children-only rule is insufficient.
 - `(allow file-write-data (literal "/dev/null"))` — required by LLDB's `target.disable-stdio` launch path.
@@ -67,7 +67,7 @@ The Seatbelt profile umbra installs (`experiments/seatbelt/umbra.sb` for referen
 
 ### Endpoint Security (audit only)
 
-Umbra's fail-closed enforcement is `sandbox-exec`-based. Endpoint Security can provide an additional audit signal but requires a restricted entitlement from Apple (`com.apple.developer.endpoint-security.client`). Not needed for M0; plan the entitlement request during M3 if the shipping story requires it.
+The M0 fail-closed enforcement experiment uses `sandbox-exec`; it is not integrated into the Rust tracer. Endpoint Security can provide an additional audit signal but requires a restricted entitlement from Apple (`com.apple.developer.endpoint-security.client`). Not needed for M0; plan the entitlement request during M3 if the shipping story requires it.
 
 ### Rosetta / x86-64 process trees
 

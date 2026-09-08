@@ -24,9 +24,10 @@ Path("/tmp/umbra-providers.json").write_text(json.dumps({
 Run `target/debug/umbra providers --registry /tmp/umbra-providers.json --role storage`.
 The command uses the real contract proxy and handshake, then closes the provider.
 It starts no tracee or run; constructing local storage creates its configured directory.
-Without `--role`, the same command calls supervisor assembly and requires platform,
-agent, storage and journal descriptors. An optional namespace descriptor replaces the
-standard overlay. Alternative namespace providers can decode the core
+Without `--role`, the same command calls supervisor assembly and requires platform
+and agent descriptors. Standard overlay assembly also requires storage and journal;
+a configured namespace provider replaces that branch and owns those connections.
+Alternative namespace providers can decode the core
 `NamespaceConnections` DTO from their options, connect its storage/journal descriptors
 through the contracts re-exported by overlay, and inject their own engine. This avoids
 opening duplicate role sessions in CLI assembly.
@@ -34,7 +35,10 @@ opening duplicate role sessions in CLI assembly.
 Storage-local and storage-nfs options encode a physical-root BytePath as JSON byte arrays.
 Codex options encode `CodexConfig`; the template's `UNQUALIFIED` version is a placeholder
 requiring replacement and qualification before runtime use. Claude, file journal and
-both platform stubs require empty options. Descriptor capabilities are required open
+the Linux platform stub require empty options. The macOS provider accepts JSON
+`Options { debugserver, twin_cache, timeout_ms }`, or empty options for defaults;
+it implements experimental arm64 tracing and advertises `darwin-arm64-abi-v1`.
+Descriptor capabilities are required open
 capability names, verified against the provider handshake. Stubs advertise no runtime
 support. An empty capability requirement permits connection testing, never authorization
 to run a tracee. The supervisor's operational methods still return NotImplemented.
@@ -67,4 +71,7 @@ session cursor and one bounded record per page, propagates streaming errors and 
 the cursor on early iterator drop. Records never accumulate unboundedly in the proxy.
 
 CI checks Rust targets and doctests on Linux and macOS. These checks do not qualify
-tracing, kernel enforcement, NFS durability or vendor agent behavior, which remain stubs.
+production tracing coverage, kernel enforcement, remote NFS durability or vendor
+agent behavior. The Rust macOS tracer and NFS/local storage are implemented;
+the Linux tracer, file journal and agent adapters remain stubs. Environment-gated
+fixture and mounted-NFS tests require explicit executed verdicts for qualification.

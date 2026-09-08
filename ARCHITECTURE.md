@@ -7,11 +7,13 @@ boundary prevents host writes when translation is unsupported or fails. Strict
 remote-backed runs require qualified remote persistence. Local storage is an
 explicit development or local-persistence choice and cannot satisfy that claim.
 
-This document describes the required buildout architecture. The Rust workspace is
-under construction: contract declarations and backend scaffolds do not establish
-working supervision or durability. Provider harnesses/proxies and namespace lifecycle
-contracts are implemented; tracing, namespace transactions and backend qualification
-remain incomplete. Per-crate READMEs describe local implementation status.
+This document describes the required buildout architecture and current M1/M1.5
+implementation. Provider harnesses/proxies, Darwin arm64 tracing, local and NFS
+storage, and overlay transactions with logical symlinks are implemented. Six of
+seven Rust tracer fixtures are CAPTURED; `exec-write` remains the documented M2
+gap. End-to-end CLI/supervisor execution, file-journal persistence and vendor agent
+plans remain unimplemented. Backend qualification, recovery and production
+enforcement remain incomplete. Per-crate READMEs describe local implementation status.
 
 The [engineering handoff](docs/handoff.md) supplies the product and filesystem
 semantics. Its illustrative `fsvirt-*` decomposition is superseded by the following
@@ -52,8 +54,10 @@ Dependencies point from consumers to contracts to core. Leaf implementations
 depend on their own contract and core. The table specifies allowed edges, not a
 requirement to import every allowed crate.
 
-- Core and trait crates never depend on or re-export implementation crates. This
-  includes optional, feature-selected, target-specific, build, and dev dependencies.
+- Core and trait crates have no runtime dependencies on or re-exports of
+  implementation crates, including optional, feature-selected, target-specific
+  and build dependencies. Overlay currently uses `umbra-storage-local` as a
+  dev-dependency for real-filesystem tests; the other trait crates do not.
 - Each leaf backend has only its own trait crate and core as direct Umbra
   dependencies. NFS cannot import local storage; the file journal cannot import
   storage; agent adapters cannot import platform implementations. Transitive trait
@@ -61,10 +65,12 @@ requirement to import every allowed crate.
 - Supervisor and CLI depend on contracts, never concrete backends, even in tests.
   Backend-selecting Cargo features and closed backend enums are forbidden. Open
   provider IDs are configuration data; operation/event/error enums remain useful.
-- Native OS bindings and target-specific build settings stay in platform backends.
+- Native OS bindings and target-specific build settings stay in platform and
+  storage backends.
   Shared DTOs belong in core, and per-trait protocols/factories in the trait crate.
 - Conformance helpers belong with contracts and use fakes or injected trait objects.
-  Tests obey the same dependency boundaries as production code.
+  Tests obey the same dependency boundaries as production code except for the
+  overlay's local-storage dev-dependency described above.
 
 Contracts are synchronous and object-safe: constructors stay outside the runtime
 trait surface, which has no generic methods, unconstrained associated types, or
@@ -75,16 +81,19 @@ messages with explicit ordering rather than making the debugger state machine as
 
 ## Pluggability, per trait
 
-Each trait README contains the backend-author walkthrough, signatures, registration
-requirements, and conformance obligations. The lifecycle and IPC surfaces described
-here are required design contracts; consult those READMEs for implementation gaps.
+Platform, storage, journal and agent READMEs contain backend-author walkthroughs,
+signatures, registration requirements and conformance obligations. The overlay
+README describes namespace binding, its engine and validation; namespace provider
+registration is covered in [runtime providers](docs/providers.md). The lifecycle
+and IPC surfaces described here are required design contracts; consult those
+READMEs for implementation gaps.
 
 | Extension point | Contract and responsibilities | Local walkthrough |
 | --- | --- | --- |
 | Platform | `TraceBackend` launches stopped processes, reports events, reads/writes memory and registers, and resumes execution. `TraceControl` adds capabilities, whole-tree quiescence and safe termination. | [Adding a new platform backend](crates/umbra-platform/README.md#adding-a-new-platform-backend) |
 | Syscall ABI and memory | `SyscallAbi` decodes entries, applies rewrites and emulates results. `TraceMemory` binds reads to the stopped task. A platform supplies a paired control/ABI session with negotiated architecture support. | [Platform contracts](crates/umbra-platform/README.md) |
 | Storage | `Storage` owns one run binding, typed shadow operations, atomic writer acquisition/renewal/release, durability receipts and close errors. Namespace policy stays in overlay. | [Adding a new storage backend](crates/umbra-storage/README.md#adding-a-new-storage-backend) |
-| Namespace | `NamespaceResolver::resolve` classifies an operation without unjournaled mutation. The required `NamespaceSession` extension prepares, observes results, commits, aborts/reconciles and checkpoints. | [Adding a new namespace backend](crates/umbra-overlay/README.md#adding-a-new-namespace-backend) |
+| Namespace | `NamespaceResolver::resolve` classifies an operation without unjournaled mutation. The required `NamespaceSession` extension prepares, observes results, commits, aborts/reconciles and checkpoints. | [Namespace engine and binding](crates/umbra-overlay/README.md) |
 | Journal | `Journal` opens recovery state, appends ordered records, flushes explicitly, replays validated records, publishes checkpoints and reports close failures. Append alone is not durability. | [Adding a new journal backend](crates/umbra-journal/README.md#adding-a-new-journal-backend) |
 | Agent | `Agent` supplies capabilities and launch/resume/stop plans, and observes bounded session evidence. Plans carry argv, environment, logical cwd/state roots and stable session identity. | [Adding a new agent backend](crates/umbra-agent/README.md#adding-a-new-agent-backend) |
 
@@ -156,7 +165,8 @@ bindings, never persistent identity. Records retain logical paths, stable IDs,
 format and agent/supervisor versions, base/toolchain fingerprints, operation
 sequences and fencing epochs. The tracee's `root/` cannot expose `control/`.
 
-The supervisor owns process/thread/fd state and orders each transaction:
+The supervisor declares process/thread/fd state; its event loop must eventually
+order each transaction as follows:
 
 ```text
 ObservedEntry -> Decoded -> Resolved -> Prepared
@@ -175,10 +185,10 @@ classified non-filesystem operation.
 Storage owns fenced single-writer authority; the journal records its evidence.
 Lease expiry alone cannot permit takeover while old descriptors or mappings remain
 writable. Renewal must not depend on indefinitely blocked trace-event reads. Lease
-loss prevents mutation and requests quiescence. The file journal stores framed,
-checksummed records in the injected control directory on the selected backing
-store. A torn final frame may be recovered under documented rules; interior
-corruption is an error.
+loss prevents mutation and requests quiescence. The file journal is required to
+store framed, checksummed records in the injected control directory on the selected
+backing store; its runtime methods currently return `NotImplemented`. A torn final
+frame may be recovered under documented rules; interior corruption is an error.
 
 For checkpoint/handoff, reject new mutations and children, quiesce the whole tree,
 request orderly agent exit and handle remaining descendants, reconcile transactions,
@@ -192,13 +202,17 @@ using its stable recorded session. External credentials remain external.
 
 [Gate 2](docs/m0/gate-2.md) passed six disposable Python fixture cases on macOS
 26.5.1 arm64 with SIP enabled and permits moving to M1. It used a local NFS stub.
-Outstanding qualification includes multithreaded fork, raw vfork, non-null spawn
-attributes/file actions, broader wait semantics, exec argv[0], copy-up/read-through,
-relative paths/dirfds/symlinks/hard links, inherited descriptors, Rosetta/JIT, real
-NFS durability, and composition with the independent fail-closed sandbox.
+M1/M1.5 subsequently implemented the Rust tracer (six of seven fixture cases
+CAPTURED), storage backends and overlay copy-up/read-through, byte path/dirfd
+resolution and logical symlinks. These components are not yet wired into an
+end-to-end CLI. Outstanding qualification includes the Rust `exec-write` gap,
+multithreaded fork, raw vfork, non-null spawn attributes/file actions, broader
+wait semantics, exec argv[0], native namespace/descriptor integration, hard links,
+Rosetta/JIT, real NFS durability and independent fail-closed sandbox composition.
 
 [CI](.github/workflows/ci.yml) runs the four workspace formatting/lint/check/test
-commands plus doctests on `macos-14` and `ubuntu-latest`, using the pinned toolchain and cached Cargo registry/build
+commands plus doctests on pushes to `master` and pull requests, on `macos-14` and
+`ubuntu-latest`, using the pinned toolchain and cached Cargo registry/build
 directories. This runner label maps to Apple Silicon in the
 [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners);
 the workflow also checks the host architecture. Each matrix job builds on its native host. CI compilation does not reproduce
