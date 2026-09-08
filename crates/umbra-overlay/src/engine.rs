@@ -274,6 +274,10 @@ pub struct SessionConfig {
     pub context: RequestContext,
     /// Validated journal recovery inventory from the owner of the journal session.
     pub recovery: RecoveryState,
+    /// The writer lease this session mutates under. It is kept next to the
+    /// storage session that issued it so renewal, release and mutation share one
+    /// owner; nothing else may hold a second mutable session for this run.
+    pub lease: WriterLease,
 }
 
 #[derive(Clone)]
@@ -362,9 +366,14 @@ impl Overlay {
     fn context(&mut self) -> Result<RequestContext> {
         let mut context = self.config()?.context.clone();
         self.serial += 1;
-        if let Some(pending) = &self.pending {
-            context.operation_id = pending.id;
-        }
+        // One logical transaction issues several storage requests: a copy-up, its
+        // parent directories, the create itself. A backend may bind an operation
+        // ID to the one idempotency key it was first used with and refuse a
+        // second, different request under it, so each request gets its own
+        // derived identity. The transaction's own ID still seeds the derivation,
+        // keeping requests attributable to the operation the journal recorded.
+        let seed = self.pending.as_ref().map_or(context.operation_id, |p| p.id);
+        context.operation_id = seed.derive(self.session, self.serial);
         context.idempotency_key.0 = format!(
             "{}/{}/{}",
             context.idempotency_key.0, self.session, self.serial
@@ -1163,6 +1172,8 @@ impl NamespaceSession for Overlay {
         if config.binding.run_id != config.context.run_id
             || config.recovery.run_id != config.context.run_id
             || config.context.writer_epoch.is_none()
+            || config.lease.run_id != config.context.run_id
+            || Some(config.lease.epoch) != config.context.writer_epoch
         {
             return Err(error(
                 ErrorKind::InvalidInput,
@@ -1504,6 +1515,86 @@ impl NamespaceSession for Overlay {
             ));
         }
         Ok(checkpoint)
+    }
+    fn renew_writer(&mut self) -> Result<WriterLease> {
+        // Renewal is allowed with a transaction pending: an in-flight syscall
+        // must not be able to starve the lease it is mutating under.
+        let lease = self.config()?.lease.clone();
+        let renewed = self.storage.renew_writer(&lease)?;
+        if renewed.run_id != lease.run_id || renewed.writer_id != lease.writer_id {
+            return Err(error(ErrorKind::LeaseLost, "invalid lease renewal"));
+        }
+        if renewed.epoch != lease.epoch {
+            // A new epoch means this was a takeover, not a renewal of ours.
+            return Err(error(ErrorKind::LeaseLost, "writer epoch advanced"));
+        }
+        self.config.as_mut().expect("bound").lease = renewed.clone();
+        Ok(renewed)
+    }
+    fn finish_run(&mut self, request: &FinishRunRequest) -> Result<FinishRunReceipt> {
+        self.idle()?;
+        let config = self.config()?;
+        if config.context.run_id != request.run_id {
+            return Err(error(ErrorKind::InvalidInput, "finish targets another run"));
+        }
+        let lease = config.lease.clone();
+        // Session-level operation identity, distinct from the per-syscall IDs the
+        // supervisor allocates for transactions.
+        let session_operation = config.context.operation_id;
+        let context = self.context()?;
+        // Tracee-written data first: a completion record that outlives its data
+        // would describe a run that does not exist on the backing store.
+        let durability = self.storage.flush(&FlushRequest {
+            context,
+            scope: FlushScope::EntireRun,
+        })?;
+        let completed_through = self.record(
+            session_operation,
+            JournalPayload::Lifecycle(JournalLifecycle::RunCompleted {
+                through: self.last_committed,
+            }),
+            true,
+        )?;
+        self.journal.close()?;
+        self.storage.release_writer(&lease)?;
+        self.storage.close_run()?;
+        self.config = None;
+        self.base = None;
+        Ok(FinishRunReceipt {
+            run_id: request.run_id,
+            durability,
+            completed_through,
+        })
+    }
+    fn fail_run(&mut self, request: &FailedRunRequest) -> Result<()> {
+        let config = self.config()?;
+        if config.context.run_id != request.run_id {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "failure targets another run",
+            ));
+        }
+        let lease = config.lease.clone();
+        // No completion record, no checkpoint: a failed run must not look clean.
+        // Close the journal so its accepted records are not silently discarded,
+        // but keep its error rather than reporting a tidy shutdown.
+        let closed = self.journal.close();
+        if !request.tree_terminated {
+            // Something may still hold a writable descriptor into this run.
+            // Retaining the writer marker blocks takeover; storage stays open
+            // because closing it would invalidate that evidence for this session.
+            self.poisoned = true;
+            return closed.and(Err(error(
+                ErrorKind::LeaseLost,
+                "run left recovery-required: supervised tree termination unproven",
+            )));
+        }
+        let released = self.storage.release_writer(&lease);
+        let closed_run = self.storage.close_run();
+        self.config = None;
+        self.base = None;
+        self.poisoned = true;
+        closed.and(released).and(closed_run)
     }
 }
 impl Overlay {

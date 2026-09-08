@@ -1,39 +1,100 @@
 # umbra-cli
 
-Clap command interface for the `umbra` binary. Every valid run/stop/checkpoint/resume/inspect command prints
-its parsed arguments to stdout, reports `not implemented` on stderr, and exits 1.
-Help/version exit 0; invalid arguments exit 2. No run, checkpoint, or agent process is
-created. Paths and trailing agent arguments preserve native OS bytes.
+Clap command interface for the `umbra` binary, plus the in-process composition that
+turns an explicit provider registry into a run request. This crate owns
+`src/lib.rs`, `src/main.rs`, `src/composition.rs`, the `src/commands/` handlers and
+the CLI tests; it has no implementation-crate dependencies, including in tests.
+
+`run` is operational. `stop`, `checkpoint`, `resume` and `inspect` are stubs that
+report `not implemented` on stderr and exit 1; they no longer echo their parsed
+arguments, because argv and environment carry paths and secrets.
 
 ```text
-umbra [--storage-root PATH] run [--agent ID] [--workspace PATH] [-- AGENT_ARGS...]
-umbra [--storage-root PATH] stop RUN_ID
-umbra [--storage-root PATH] checkpoint RUN_ID
+umbra [--storage-root PATH] run --registry PATH [--workspace PATH] --experimental
+      [--local-dev | --strict-remote] [--agent ID]
+      [--env NAME=VALUE]... [--inherit-env NAME]... -- COMMAND [ARGS...]
+umbra [--storage-root PATH] stop|checkpoint|inspect RUN_ID
 umbra [--storage-root PATH] resume RUN_ID [--workspace PATH] [-- AGENT_ARGS...]
-umbra [--storage-root PATH] inspect RUN_ID
+umbra providers --registry PATH [--role ROLE]
 ```
 
-`RUN_ID` is a UUID. Defaults are `.umbra` for local development storage, `codex` for
-the run agent ID, and `.` for the logical workspace. `--storage-root` also works
-after a subcommand. Agent IDs are open strings; operational commands do not yet
-select providers. Runtime selection works through the `providers` command below.
-Resume will eventually use the recorded agent identity. These flags are an initial
-parsing interface; handoff §5 specifies the command names but no exact flag syntax.
+## No prompts
 
-`composition::build_supervisor(run_id, registry)` connects platform, agent, storage
-and journal providers from an explicit `ProviderRegistry`, then delegates standard
-namespace construction to `umbra-overlay`. A configured `namespace` provider replaces
-the standard engine and owns its storage/journal connections through opaque options.
-The CLI has no implementation-crate dependencies, including in tests.
+Missing configuration, capabilities, permissions, tools or mount prerequisites
+produce an actionable error and a nonzero exit. The CLI never asks for
+confirmation, reads stdin for setup, invokes `sudo`, runs an installer, mounts
+anything, or falls back from the requested storage to something weaker. stdin
+belongs to the supervised program; the CLI's own tests run with it closed.
 
-`umbra providers --registry PATH [--role ROLE]` validates installed provider connections.
-Without `--role`, it uses the actual supervisor assembly path; with a role, it checks
-that contract's generic proxy. This command starts trusted provider processes but no
-tracees. Local storage provider construction creates its configured directory.
-Operational run/stop/checkpoint/resume/inspect handlers remain explicit stubs.
-See [registry configuration](../../docs/providers.md) for format and installation.
+## Selecting a run
+
+`--registry` is required and is the single source of storage configuration.
+`--experimental` is required: it acknowledges a bounded experimental tracing mode
+as an argument, and disables nothing.
+
+Storage mode is chosen by flag and enforced by negotiated capability, not by
+provider identity. The default is a validated NFSv4 mount with client-fsync
+durability, requiring the storage descriptor to declare `mounted-nfsv4-v1`;
+`--local-dev` requires `local-development-v1` instead. Both additionally require
+`experimental-open-rewrite-v1`, and the platform descriptor must declare
+`sandboxed-stopped-launch-v1` and `experimental-syscall-rewrite-v1`. Descriptors
+are checked before any provider is started, and the provider handshake then
+rejects a connection whose backend does not actually advertise the name.
+`--strict-remote` is a deterministic `UnsupportedCapability` error: no storage
+provider qualifies strict remote durability.
+
+Omitting `--agent` runs the trailing `--` arguments as a command; the executable
+argument must be absolute, because PATH is never searched. Under the required
+sandbox profile, the target observes `argv[0]` as its resigned twin cache path:
+`sandbox-exec` provides no way to preserve the requested `argv[0]`. `argv[1..]`
+and `_NSGetExecutablePath` are unaffected by enforcement (the latter already
+returns the twin path on both launch paths). Supplying
+`--agent ID` requires the registry's agent provider to have that exact ID and then
+reports `NotImplemented`, since adapters are not implemented.
+
+The supervised environment is built, not inherited: `--env NAME=VALUE` sets a
+variable and `--inherit-env NAME` forwards one from the caller, failing if it is
+unset rather than passing an empty value. The supervisor adds `TMPDIR`.
+
+## Exit codes and streams
+
+Clap usage diagnostics exit 2. Every structured failure exits 1, including a
+supervised program that exited nonzero, which surfaces as `ProcessFailed` after a
+clean teardown. Exit 0 means the root process succeeded **and** the run's data,
+journal and writer lease were closed cleanly. The child's own exit code is not
+propagated: a 0 would describe the child while saying nothing about persistence.
+Run status goes to stderr; stdout stays the supervised program's.
+
+## Compatibility changes
+
+`--agent` no longer defaults to `codex`; the default prevented a raw command
+route. `--storage-root` no longer defaults to `.umbra` and is rejected outright by
+`run` rather than silently ignored, since storage lives in the registry.
+
+## Composition
+
+`composition::load_registry(path)` performs a bounded read, decode and validate.
+`composition::run_spec(args, registry, observer)` builds a `RunSpec` without
+provider I/O: it canonicalizes the workspace, preserves argument and path bytes,
+rejects NUL, and constructs the explicit environment.
+`composition::build_supervisor(run_id, registry)` remains the `providers`
+diagnostic path, connecting platform, agent, storage and journal and delegating
+standard namespace construction to `umbra-overlay`. A configured `namespace`
+provider replaces the standard engine there; `run` refuses one, because the
+namespace protocol has no run lifecycle.
+
+`umbra providers --registry PATH [--role ROLE]` validates installed provider
+connections and starts trusted provider processes but no tracees. See
+[registry configuration](../../docs/providers.md).
 
 ```sh
 cargo check -p umbra-cli
-cargo build -p umbra-cli
+cargo test -p umbra-cli
 ```
+
+The committed `tests/run_fixtures.rs` runs seven cases each against local storage
+and an existing NFSv4 mount. Build providers with `cargo build --workspace --bins`
+and compile `experiments/fixtures/umbra-test-child.c` first. Set
+`UMBRA_TEST_FIXTURE_PATH` and `UMBRA_TEST_NFS_ROOT`, then run
+`UMBRA_INTEGRATION_REQUIRED=1 cargo test -p umbra-cli --test run_fixtures -- --nocapture`.
+Required mode fails on missing inputs; ordinary developer tests may skip.

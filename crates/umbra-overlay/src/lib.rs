@@ -9,8 +9,8 @@
 #![deny(missing_docs)]
 
 pub use umbra_core::{
-    AbortReason, Checkpoint, CheckpointRequest, CommitReceipt, OperationId, OperationOutcome,
-    PreparedAction,
+    AbortReason, Checkpoint, CheckpointRequest, CommitReceipt, FailedRunRequest, FinishRunReceipt,
+    FinishRunRequest, OperationId, OperationOutcome, PreparedAction, WriterLease,
 };
 use umbra_core::{BytePath, FsOp, MapFlags, ProcessContext, ResolvedAction, Result};
 pub use umbra_journal::Journal;
@@ -114,9 +114,49 @@ pub trait NamespaceSession: NamespaceResolver {
     fn abort(&mut self, operation: OperationId, reason: &AbortReason) -> Result<()>;
     /// Request a logical checkpoint after the caller establishes quiescence.
     fn checkpoint(&mut self, request: &CheckpointRequest) -> Result<Checkpoint>;
+    /// Renew the injected writer lease through this session's own storage.
+    ///
+    /// The namespace owns its storage session, so renewal must go through it
+    /// rather than a second mutable storage session opened to hold the lease.
+    /// Failure means authority is lost or unproven: the caller must stop
+    /// resuming tracees, not retry into a mutation.
+    fn renew_writer(&mut self) -> Result<WriterLease> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "namespace.renew_writer",
+            "provider does not support the managed run lifecycle",
+        ))
+    }
+    /// Durably complete a fresh run: flush data, append and flush a completion
+    /// record, close the journal, release the writer, close storage.
+    ///
+    /// Return a receipt only when every step succeeded. A failure part-way
+    /// through must not release authority or claim completion.
+    fn finish_run(&mut self, _request: &FinishRunRequest) -> Result<FinishRunReceipt> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "namespace.finish_run",
+            "provider does not support the managed run lifecycle",
+        ))
+    }
+    /// Leave the run explicitly failed, preserving evidence.
+    ///
+    /// Never writes a completion record. Releases the writer lease only when the
+    /// request carries independent evidence that the supervised tree is gone.
+    fn fail_run(&mut self, _request: &FailedRunRequest) -> Result<()> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "namespace.fail_run",
+            "provider does not support the managed run lifecycle",
+        ))
+    }
 }
 
 /// Construct the standard namespace engine without I/O or backend selection.
+///
+/// The returned engine owns both sessions but is not yet bound; call
+/// [`NamespaceSession::bind`] with an already-open run, its writer lease and an
+/// approved base before use.
 pub fn standard_namespace(
     storage: Box<dyn Storage>,
     journal: Box<dyn Journal>,

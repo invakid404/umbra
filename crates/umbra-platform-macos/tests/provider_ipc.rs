@@ -51,6 +51,10 @@ fn open_libc_provider_ipc() {
         std::env::var_os("UMBRA_TEST_FIXTURE_PATH"),
         std::env::var_os("UMBRA_TEST_REDIRECT_ROOT"),
     ) else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT"
+        );
         eprintln!(
             "SKIP open-libc provider IPC: set UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT"
         );
@@ -119,7 +123,26 @@ fn open_libc_provider_ipc() {
             persistence: PersistencePolicy::LocalDevelopment,
             inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
         },
+        // The contract path always installs enforcement. The overbroad profile
+        // below is refused because it grants the filesystem root.
+        sandbox: SandboxRequirement::Required(
+            SandboxProfile::new(
+                SEATBELT_PROFILE_FORMAT,
+                include_str!("../../../experiments/seatbelt/umbra.sb")
+                    .replace("{{UMBRA_RUN_ROOT}}", &format!("\"{}\"", root.display()))
+                    .into_bytes(),
+                byte_path(&root),
+            )
+            .unwrap(),
+        ),
     };
+    let mut unsandboxed = spec.clone();
+    unsandboxed.sandbox = SandboxRequirement::UnsandboxedExperiment;
+    let refused: Result<Response> = client.call(&Request::Launch(unsandboxed));
+    assert_eq!(
+        refused.err().unwrap().kind,
+        ErrorKind::UnsupportedCapability
+    );
     for invalid in 0..5 {
         let mut rejected = spec.clone();
         match invalid {
@@ -132,6 +155,31 @@ fn open_libc_provider_ipc() {
         let result: Result<Response> = client.call(&Request::Launch(rejected));
         assert!(result.is_err(), "invalid launch policy {invalid} accepted");
     }
+    // A profile whose write root is the filesystem root is refused before any
+    // process is created: enforcement that grants everything is not enforcement.
+    let mut overbroad = spec.clone();
+    overbroad.sandbox = SandboxRequirement::Required(
+        SandboxProfile::new(
+            SEATBELT_PROFILE_FORMAT,
+            b"(version 1)\n(deny default)\n".to_vec(),
+            BytePath::new(b"/".to_vec()).unwrap(),
+        )
+        .unwrap(),
+    );
+    let refused: Result<Response> = client.call(&Request::Launch(overbroad));
+    let Err(refused) = refused else {
+        panic!("a sandbox profile granting the filesystem root must not launch");
+    };
+    assert_eq!(refused.kind, ErrorKind::InvalidPath);
+    // Both qualified capabilities are advertised over the handshake.
+    assert!(client
+        .welcome
+        .capabilities
+        .contains(umbra_core::capabilities::PLATFORM_SANDBOXED_LAUNCH_V1));
+    assert!(client
+        .welcome
+        .capabilities
+        .contains(umbra_core::capabilities::PLATFORM_SYSCALL_REWRITE_V1));
     let Response::Process(process) = call(&mut client, Request::Launch(spec.clone())) else {
         panic!("launch response");
     };

@@ -7,6 +7,10 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+tracing.workspace = true
+# Run and operation identities are allocated here, so the generator is a direct
+# dependency rather than something borrowed from a backend crate.
+uuid.workspace = true
 umbra-core = { path = "../umbra-core" }
 umbra-platform = { path = "../umbra-platform" }
 umbra-storage = { path = "../umbra-storage" }

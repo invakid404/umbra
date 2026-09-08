@@ -84,6 +84,10 @@ impl NfsStorageConfig {
 pub struct NfsStorage {
     config: NfsStorageConfig,
     run: Option<Run>,
+    /// True only once an existing exact NFSv4 mount was actually validated.
+    /// Capability advertisement reads this, so a backend built with `new` (which
+    /// performs no validation) cannot claim a mount it never checked.
+    validated: bool,
 }
 #[derive(Debug)]
 struct Run {
@@ -153,13 +157,19 @@ fn object(stat: BlobStat) -> ObjectResult {
 impl NfsStorage {
     /// Retain runtime configuration; open_run validates before any run I/O.
     pub fn new(config: NfsStorageConfig) -> Self {
-        Self { config, run: None }
+        Self {
+            config,
+            run: None,
+            validated: false,
+        }
     }
     /// Validate configuration and negotiated NFSv4 immediately, for provider IPC.
     pub fn connect(config: NfsStorageConfig) -> Result<Self> {
         config.validate()?;
         mount::validate(&config.mount_root)?;
-        Ok(Self::new(config))
+        let mut storage = Self::new(config);
+        storage.validated = true;
+        Ok(storage)
     }
     /// Return the runtime mount point.
     pub fn mount_root(&self) -> &Path {
@@ -241,6 +251,17 @@ impl NfsStorage {
 impl Storage for NfsStorage {
     fn capabilities(&self) -> StorageCapabilities {
         StorageCapabilities {
+            // The mount capability is advertised only after `connect` actually
+            // validated an existing exact NFSv4 mount. Configuration alone never
+            // earns it, and `new` (which validates nothing) never reports it.
+            features: {
+                let mut features = std::collections::BTreeSet::new();
+                features.insert(umbra_core::capabilities::STORAGE_OPEN_REWRITE_V1.to_owned());
+                if self.validated {
+                    features.insert(umbra_core::capabilities::STORAGE_MOUNTED_NFSV4_V1.to_owned());
+                }
+                features
+            },
             durability: Durability::Local,
             strict_remote_persistence: false,
             fencing: Fencing::ConfirmedTermination,
