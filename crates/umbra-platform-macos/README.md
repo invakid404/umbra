@@ -45,7 +45,8 @@ The M1 mechanisms named in the tracker spec are all present:
    `ent.plist` alongside `src/`.
 2. **Arm64 `svc #0x80` breakpoints** verified byte-for-byte in
    `libsystem_kernel` for `__open`, `__open_nocancel`, `__openat`,
-   `__openat_nocancel`, `__execve`, `__posix_spawn`, `__fork`.
+   `__openat_nocancel`, `__execve`, `__posix_spawn`, `__fork`,
+   `__wait4`, `__wait4_nocancel`, and the dirfd-relative family below.
 3. **Bounded 4 KiB path decode** from `x0`/`x1` with page-boundary-aware
    chunked reads (`abi::read_path`).
 4. **Rewrite** via scratch allocation on the tracee task plus register
@@ -59,10 +60,126 @@ The M1 mechanisms named in the tracker spec are all present:
 6. **`__wait4` / `__wait4_nocancel` deferred wait**: debugger attach
    transiently reparents children, so parents get `ECHILD`; the tracer
    intercepts and defers, and return breakpoints track reaped children.
-   See `native.rs::ReturnKind::Wait`.
+   See `native.rs::ReturnKind::Wait` and **Wait decisions** below.
 7. **SIGHUP suppression** on newly attached children.
 8. **Embedded watchdog**: an `mpsc`-cancellable worker thread terminates
    all held Mach tasks on deadline (`native.rs::Watchdog`).
+
+### Dirfd-relative filesystem calls
+
+`src/abi.rs` classifies these numbers, resolved from the selected SDK's
+`sys/syscall.h`, and decodes each operand layout. Slot N is register xN.
+
+| Syscall | Number | Installed stub | Operands | Decoded as |
+|---|---:|---|---|---|
+| `renameat` | 465 | `__renameat` | x0/x1 source, x2/x3 destination | `FsOp::Rename` |
+| `renameatx_np` | 488 | `__renameatx_np` | renameat plus flags in x4 | `FsOp::Rename` when flags are zero |
+| `linkat` | 471 | `linkat` | renameat plus flags in x4 | `FsOp::Link` |
+| `unlinkat` | 472 | `__unlinkat`, `unlinkat` | x0 dirfd, x1 path, x2 flags | `FsOp::Unlink` |
+| `symlinkat` | 474 | `symlinkat` | x0 target, x1 dirfd, x2 name | `FsOp::Symlink` |
+| `mkdirat` | 475 | `mkdirat` | x0 dirfd, x1 path, x2 mode | `FsOp::Mkdir` |
+| `fchmodat` | 467 | `fchmodat` | x0 dirfd, x1 path, x2 mode, x3 flags | `FsOp::Chmod` |
+| `fstatat` | 469 | `__fstatat` | x0 dirfd, x1 path, x2 buffer, x3 flags | `FsOp::Stat` |
+| `fstatat64` | 470 | `fstatat` | same layout | `FsOp::Stat` |
+| `readlinkat` | 473 | `readlinkat` | x0 dirfd, x1 path, x2 buffer, x3 length | `FsOp::ReadLink` |
+| `symlink` | 57 | `symlink` | x0 target, x1 link name | `FsOp::Symlink` |
+| `readlink` | 58 | `readlink` | x0 path, x1 buffer, x2 length | `FsOp::ReadLink` |
+| `faccessat` | 466 | `faccessat` | x0 dirfd, x1 path, x2 mode, x3 flags | refused, see below |
+| `fchownat` | 468 | `fchownat` | x0 dirfd, x1 path, x2 uid, x3 gid, x4 flags | refused, see below |
+
+Stub names are the ones that actually carry the `svc`, checked per host rather
+than assumed. Several have no `__`-prefixed form; `unlinkat`'s public wrapper
+carries its own `svc` instead of tail-calling `__unlinkat`, so both are
+installed. `fstatat` and `fstatat64` are **one symbol reaching 470**, while
+`__fstatat` is a separate stub reaching 469 — libc's `fstatat()` does not reach
+469, so both numbers are decoded.
+
+- **Dirfds are signed 32-bit.** `abi::dir_ref` reads the low word, maps
+  `AT_FDCWD` (-2) to `DirRef::Cwd` and every other value to `DirRef::Fd`, and
+  keeps relative path bytes as they are. Anchors are resolved by the namespace
+  against the tracee's own root, cwd and tracked descriptor identity — never
+  the tracer's cwd, `/dev/fd`, or an `F_GETPATH` host path, which would make a
+  physical path stand in for a logical one. An invalid descriptor is decoded
+  rather than rejected: an absolute path ignores its anchor.
+- **Unmodelled flags are refused, not dropped.** `abi::at_flags` truncates the
+  flag register to its `int` and rejects any bit outside the ones the decode
+  represents. `renameatx_np` with `RENAME_SWAP`, `RENAME_EXCL` or
+  `RENAME_NOFOLLOW_ANY` is refused rather than downgraded to an ordinary
+  rename; flags zero is an ordinary rename.
+- **`symlink`/`symlinkat` x0 is not a pathname operand.** It holds the literal
+  target bytes the tracee reads back, so it is never physicalized. `symlink`
+  has no dirfd, so its link name anchors at the process cwd.
+- **`faccessat` and `fchownat` are intercepted and refused.** Core has no
+  access-mode/effective-id operation and no owner/group operation, and the
+  overlay MVP has no metadata mutation semantics. They return
+  `UnsupportedCapability` at decode, so neither a host metadata mutation nor a
+  host existence probe runs behind the namespace's back. Decoding them as a
+  neighbouring operation would be worse than refusing.
+- **`linkat` and `fchmodat` decode but do not execute.** The overlay MVP
+  answers `FsOp::Link` and `FsOp::Chmod` with
+  `operation requires descriptor or metadata support beyond MVP`; hard links
+  and metadata need copy-up, identity and mode semantics that are not built.
+
+`abi::path_operands` gives each syscall's operand-to-slot map, and
+`abi::prepare_paths` (with `MacosTraceBackend::prepare_physical`) allocates one
+bounded, separately NUL-terminated scratch buffer per operand. Every declared
+operand must appear exactly once, so a missing, duplicated or unexpected
+operand is an error rather than a half-applied rewrite. Non-path arguments,
+dirfds included, keep their original registers: a qualified physical path is
+absolute and the kernel ignores the anchor for an absolute path.
+`abi::prepare_path` and `prepare_rewrite` remain the single-path wrappers.
+
+### Logical symlinks
+
+The overlay stores a symlink as a placeholder object plus its target bytes in
+control metadata, never as a filesystem symlink, so creation resolves to an
+emulated result: the tracer steps the PC past the `svc` and the syscall never
+runs. Reads are answered from that metadata. Three ABI pieces make that work:
+
+- **Readlink output buffer.** `abi::readlink_buffer` reads the tracee's buffer
+  and length — x1/x2 for `readlink`, x2/x3 for `readlinkat` — and the caller
+  binds them with `NamespaceSession::set_readlink_buffer` before resolution.
+  The ABI reads the full 64-bit `size_t` length and rejects values above
+  `MAX_IO_BYTES` before narrowing to the buffer contract.
+  The overlay then truncates the target to that length, appends no NUL, and
+  returns the number of bytes copied.
+- **No-follow stat.** `abi::encode_stat` writes Darwin's `struct stat` (the
+  144-byte `__DARWIN_INODE64` layout; offsets read from the host's `sys/stat.h`
+  through `offsetof`) at the buffer `abi::stat_buffer` reads from x2. A logical
+  symlink is reported as `S_IFLNK` with its target length, so a no-follow stat
+  never exposes the empty placeholder as a regular file. Object kinds and modes
+  the layout cannot represent fail explicitly rather than guessing.
+- **Link loops.** `umbra_core::ErrorKind::SymlinkLoop` is a distinct kind, so a
+  caller answers loop exhaustion with its own native errno — `ELOOP`, 62 on
+  Darwin — without reading an error message, and containment failures stay
+  `InvalidPath`. The overlay's 40-expansion bound is unchanged. There is no
+  fallback to native symlink traversal when logical resolution fails.
+
+### Wait decisions
+
+`native.rs::wait_plan` is the whole decision for an intercepted `wait4` (7) or
+`wait4_nocancel` (400), separated from session I/O
+so it has a truth table for a test. That test —
+`native.rs::tests::wait_plan_decides_from_the_callee_visible_arguments` —
+needs no debugger, fixture or environment variable.
+
+- `Poll` — `WNOHANG` over children that are live but unfinished. The tracer
+  writes `x0 = 0`, clears the CPSR carry bit, steps past the `svc` and resumes.
+  The syscall never runs, `status`/`rusage` are not touched, and no child is
+  marked reaped.
+- `Park` — a blocking wait in the same state: the thread parks until a child
+  finishes, then takes the return breakpoint.
+- `Native` — nothing tracked matches, or a match has already finished. The
+  kernel answers, so `ECHILD` and the real `status`/`rusage` writes survive.
+- `Unsupported` — process-group selectors (`pid` 0 or negative other than -1)
+  and any option bit outside `WNOHANG`, refused rather than mis-emulated.
+
+`WNOHANG` is mask value 1 — the least significant bit, not `1 << 1`. The
+option register `x2` is truncated to 32 bits before it is read: arm64 leaves
+the upper half of a register holding an `int` argument unspecified and the
+kernel's argument munger drops it, so reading all 64 bits turned legal
+`WNOHANG` callers into refused option masks. The `wnohang-wait` fixture case
+exposed that; the raw-`svc` leg with high bits set in `x2` guards it.
 
 ## Provider binary
 
@@ -78,9 +195,18 @@ decodes JSON `Options` from opaque provider options (empty falls back to
 both launch suspended, sanitize inherited descriptors, and install the same
 syscall interception loop before returning. Launch requires explicit
 `LocalDevelopment`, stdio descriptors only, absolute executable/cwd, and
-non-empty argv. A backend accepts one run, including after termination.
-The caller must rewrite write-intent opens before resuming; this remains the
-M1 feasibility tracer, without independent production sandbox qualification.
+non-empty argv. A backend accepts one run, including after termination. The
+caller must rewrite write-intent opens before resuming; this remains the M1
+feasibility tracer, without independent production sandbox qualification.
+
+**`argv[0]` at launch.** The image executed is the signed twin, but the tracee
+must see its own vendor identity, so `launch_traced` replaces `argv[0]` with
+`LaunchSpec::executable` — the absolute vendor path — whatever `argv[0]` the
+caller supplied. `argv[1..]` and the executed twin path are unchanged. The
+caller's `argv[0]` is still rejected if it contains a NUL, rather than being
+silently discarded. This applies to the initial launch only; nested
+`execve`/`posix_spawn` keep their existing executable-path rewrite and their
+own argument vectors.
 
 Invoke the shipped binary through a platform `ProviderDescriptor` and
 `umbra_core::provider::Client::connect`, then send `Request::Capabilities`,
@@ -112,7 +238,7 @@ It reads `UMBRA_TEST_FIXTURE_PATH` (path to `umbra-test-child`) and
 `UMBRA_TEST_REDIRECT_ROOT` (shadow root); when either env var is unset,
 each test body skips via `eprintln` — the binary still reports the cases as
 passed, so qualification requires the `CAPTURED <case>` stderr verdict.
-All seven cases are enabled. Fixture cases:
+All eleven cases are enabled. Fixture cases:
 
 | Case | State |
 |---|---|
@@ -123,6 +249,43 @@ All seven cases are enabled. Fixture cases:
 | `exec-write`        | **CAPTURED** — see the closed M2 gap below |
 | `grandchild-write`  | **CAPTURED** |
 | `dup-inherit-write` | **CAPTURED** |
+| `argv0-check`       | **CAPTURED** — the `argv[0]` contract above |
+| `wnohang-wait`      | **CAPTURED** — the wait decisions above |
+| `dirfd-rename`      | **CAPTURED** — the dirfd family above |
+| `symlink-cycle`     | **CAPTURED** — the logical symlinks above |
+
+`wnohang-wait` polls through the public `wait4`, both stubs resolved with
+`dlsym(RTLD_DEFAULT, …)`, and raw `svc #0x80` naming numbers 7 and 400, because
+one public call does not reach both stubs: on this host `wait4` routes through
+`__wait4_nocancel`, and removing `__wait4` from the installed list above leaves
+that case failing only on its explicit `__wait4` leg. Its child is held on a
+pipe, so a poll that wrongly blocks fails against the session deadline instead
+of passing on timing.
+
+`dirfd-rename` and `symlink-cycle` do not use the redirect harness above. It binds a real
+`umbra-storage-local` shadow run, an approved empty immutable base and a
+recording journal, and drives every operation the case performs through the
+overlay transaction flow: `resolve` → `prepare` → apply the rewrite or the
+emulated result → `observe_result` → `commit` or `abort`. Directory opens that
+succeed are tracked into `ProcessContext.fds` with the logical path and the
+object identity the overlay reports, which is what lets a later `DirRef::Fd`
+resolve. A refused resolution is translated to an errno and emulated, because
+the case deliberately looks up a name the rename removed. dyld and library
+startup reads are left pointing at the host, unrewritten — the bound base is
+empty, so the tracee could not otherwise start; that carve-out is by logical
+root and tracked descriptor, and is a property of the test harness, not of the
+tracer. The overlay dev-dependencies are test-only: the crate itself still
+depends on no namespace or storage backend.
+
+`argv0-check`, `wnohang-wait`, `dirfd-rename` and `symlink-cycle` are the cases
+whose `CAPTURED` line the C fixture prints rather than the harness: only the
+tracee can observe its own `argv[0]`, a poll that did not block, or its own
+view of a renamed name or a followed link. The harness hands
+the launcher a decoy `argv[0]`, and the fixture captures only when `argv[0]`
+equals the vendor path passed as its operand and differs from the running image
+reported by `_NSGetExecutablePath`. The shadow bytes the harness then asserts
+are written only after that check passes, so a redirect failure still fails the
+test.
 
 Software breakpoint ownership is per debugserver connection: successful
 `Z0` installs populate that session's registry, and successful `z0`

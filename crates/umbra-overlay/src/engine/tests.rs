@@ -1042,7 +1042,9 @@ fn symlink_loop_and_long_chain_have_a_bounded_iterative_expansion() {
     f.run(&symlink(b"b", b"a"));
     for path in [b"a".as_slice(), b"a/../file"] {
         let err = f.overlay.resolve(&f.process, &stat(path)).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::InvalidPath);
+        // A distinct kind, so a caller can answer with ELOOP without reading
+        // the message; containment failures stay InvalidPath.
+        assert_eq!(err.kind, ErrorKind::SymlinkLoop);
         assert_eq!(err.context, "symlink expansion limit exceeded");
     }
     for n in (0..=MAX_SYMLINK_EXPANSIONS).rev() {

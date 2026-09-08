@@ -548,8 +548,14 @@ dependencies = [
  "mach2",
  "serde",
  "serde_json",
+ "tempfile",
  "umbra-core",
+ "umbra-journal",
+ "umbra-overlay",
  "umbra-platform",
+ "umbra-storage",
+ "umbra-storage-local",
+ "uuid",
 ]
 
 [[package]]

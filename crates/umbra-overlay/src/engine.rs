@@ -551,8 +551,12 @@ impl Overlay {
                         {
                             *expansions += 1;
                             if *expansions > MAX_SYMLINK_EXPANSIONS {
+                                // A distinct kind, not a distinguishing
+                                // message: the platform answers a link loop
+                                // with its own native errno, and containment
+                                // failures must not be mistaken for one.
                                 return Err(error(
-                                    ErrorKind::InvalidPath,
+                                    ErrorKind::SymlinkLoop,
                                     "symlink expansion limit exceeded",
                                 ));
                             }
