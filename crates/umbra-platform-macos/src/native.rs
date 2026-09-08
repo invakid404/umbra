@@ -1103,14 +1103,27 @@ impl MacosTraceBackend {
         s.thread = tid(thread, s.id.0.generation);
         if fields.get("reason") == Some(&"exec") {
             s.pending = None;
-            s.breaks.clear();
             s.scratch.clear();
             s.entry = None;
             s.exec_generation += 1;
             let task = Arc::new(Task::acquire(s.id.0.native_id as i32)?);
             self.watchdog.as_ref().unwrap().add(task.clone());
             s.task = task;
-            // Debugserver removes obsolete address breakpoints on exec; resolve the new image.
+            // Debugserver keeps its breakpoint registrations across exec on this
+            // connection, and its Z0 handler is reference counted. Dropping our
+            // own registry without releasing them would let install() below
+            // re-register the same shared-cache addresses at count two, so the
+            // single z0 that retires an entry site would decrement without
+            // restoring the instruction and the tracee would re-trap forever.
+            // Release every address this session still owns first.
+            for address in s.breaks.keys().copied().collect::<Vec<_>>() {
+                // The new image need not map an address the old one did. A
+                // refused release is not fatal: it means the registration is
+                // already gone, which is the state being asked for.
+                let _ = s.rsp.request(&format!("z0,{address:x},4"))?;
+            }
+            s.breaks.clear();
+            // Resolve the new image.
             s.install()?;
             self.events.push_back(TraceEvent::Exec {
                 task: s.id,
