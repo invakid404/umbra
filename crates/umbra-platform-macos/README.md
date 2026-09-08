@@ -164,7 +164,10 @@ tracer uses and invokes `posix_spawn` directly, so the live kernel judges
 them. It needs no debugger, fixture or environment variable and runs anywhere
 the crate compiles. Mutation-checked in both directions: shrinking the
 descriptor below the kernel's struct fails with `EINVAL`, and clearing the
-suspend flag fails on the marker the child then leaves behind.
+suspend flag fails on the marker the child then leaves behind. The marker
+command is exec'd directly rather than through a shell, so a temporary
+directory containing whitespace cannot split the path and turn a regression
+into a silent pass; both mutations were re-confirmed under such a `TMPDIR`.
 
 
 ## Closed M2 gap: `exec-write` post-exec breakpoint loop
