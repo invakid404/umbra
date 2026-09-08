@@ -1033,18 +1033,9 @@ impl MacosTraceBackend {
                     if get(&regs, 2)? != 0 {
                         return Err(unsupported("spawn requires null attributes/file actions"));
                     }
-                    let data = spawn_attributes()?;
-                    // Pad both buffers: the kernel copies a length this crate
-                    // never learns, so anything it reads past the bytes written
-                    // here must be zero rather than neighbouring scratch.
-                    let mut block = vec![0; SPAWN_BUFFER_BYTES];
-                    block[..data.len()].copy_from_slice(&data);
-                    let attr = s.allocate(&block)?;
-                    let mut descriptor = vec![0; SPAWN_BUFFER_BYTES];
-                    // attr_size only has to be non-zero; the kernel reads its
-                    // own offsetof and ignores this value.
-                    descriptor[..8].copy_from_slice(&(data.len() as u64).to_le_bytes());
-                    descriptor[8..16].copy_from_slice(&attr.to_le_bytes());
+                    let attributes = spawn_attributes()?;
+                    let attr = s.allocate(&attributes.block)?;
+                    let descriptor = spawn_descriptor(attr, attributes.len);
                     set(&mut regs, 2, s.allocate(&descriptor)?)?;
                     let mut pid_pointer = get(&regs, 0)?;
                     if pid_pointer == 0 {
@@ -1181,7 +1172,25 @@ const SPAWN_BUFFER_BYTES: usize = 512;
 /// `offsetof(_posix_spawnattr, psa_ports)` bytes, always less than `sizeof`,
 /// so a full-length snapshot covers whatever this release's kernel reads
 /// without this crate knowing either offset.
-fn spawn_attributes() -> Result<Vec<u8>> {
+/// A libc-built attribute block, padded for the tracee.
+struct SpawnAttributes {
+    /// Padded buffer to place in the tracee.
+    block: Vec<u8>,
+    /// Leading bytes of `block` that libc wrote; the descriptor's `attr_size`.
+    len: usize,
+}
+
+/// Lay out the argument descriptor pointing at an already-placed attribute
+/// block. `attr_size` only has to be non-zero: the kernel copies its own
+/// `offsetof(_posix_spawnattr, psa_ports)` and never validates this value.
+fn spawn_descriptor(attr_address: u64, attr_len: usize) -> Vec<u8> {
+    let mut descriptor = vec![0; SPAWN_BUFFER_BYTES];
+    descriptor[..8].copy_from_slice(&(attr_len as u64).to_le_bytes());
+    descriptor[8..16].copy_from_slice(&attr_address.to_le_bytes());
+    descriptor
+}
+
+fn spawn_attributes() -> Result<SpawnAttributes> {
     unsafe {
         let mut attr = std::mem::zeroed();
         errno(libc::posix_spawnattr_init(&mut attr), "spawnattr_init")?;
@@ -1196,13 +1205,18 @@ fn spawn_attributes() -> Result<Vec<u8>> {
             if !(16..=SPAWN_BUFFER_BYTES).contains(&size) {
                 return Err(unsupported("unexpected spawn attribute allocation"));
             }
-            let bytes = std::slice::from_raw_parts(attr as *const u8, size).to_vec();
+            let bytes = std::slice::from_raw_parts(attr as *const u8, size);
             // psa_flags is the leading short in every released layout, so this
             // confirms the snapshot is the block that was just configured.
             if bytes[..2] != [0x80, 0] {
                 return Err(unsupported("unexpected spawn attribute layout"));
             }
-            Ok(bytes)
+            // Pad: the kernel copies a length this crate never learns, so
+            // anything it reads past these bytes must be zero rather than
+            // neighbouring scratch.
+            let mut block = vec![0; SPAWN_BUFFER_BYTES];
+            block[..size].copy_from_slice(bytes);
+            Ok(SpawnAttributes { block, len: size })
         })();
         libc::posix_spawnattr_destroy(&mut attr);
         result
@@ -1409,5 +1423,97 @@ impl TraceControl for MacosTraceBackend {
         self.quiesced_stops.clear();
         self.watchdog.take();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drift detector for the private `posix_spawn` structures.
+    ///
+    /// `struct _posix_spawnattr` and `struct _posix_spawn_args_desc` are
+    /// private and move between releases, and the kernel reports neither the
+    /// `offsetof` nor the `sizeof` it copies out of the buffers handed to it.
+    /// The attribute side is sound by construction — libc ships with the
+    /// kernel, so a `malloc_size` snapshot always covers the prefix the kernel
+    /// reads — but the descriptor's length is not measurable from userspace and
+    /// is only assumed to fit in `SPAWN_BUFFER_BYTES`.
+    ///
+    /// So let the live kernel judge instead of asserting remembered offsets:
+    /// build the buffers through the same helpers the tracer uses and invoke
+    /// `posix_spawn` directly. A layout that outgrew the padding, or an
+    /// attribute block the kernel no longer accepts, fails here rather than
+    /// inside a traced process on a user's machine.
+    #[test]
+    fn live_kernel_accepts_the_spawn_buffers() {
+        let attributes = spawn_attributes().expect("build attribute block");
+        assert_eq!(attributes.block.len(), SPAWN_BUFFER_BYTES);
+        assert!(
+            attributes.len <= SPAWN_BUFFER_BYTES,
+            "libc attribute block ({}) outgrew SPAWN_BUFFER_BYTES ({SPAWN_BUFFER_BYTES})",
+            attributes.len
+        );
+
+        // The kernel reads the block at this address, so the descriptor points
+        // into the local buffer rather than into tracee scratch.
+        let descriptor = spawn_descriptor(attributes.block.as_ptr() as u64, attributes.len);
+
+        // A child that would leave an observable mark if it were not suspended.
+        let directory =
+            std::env::temp_dir().join(format!("umbra-spawn-probe-{}", unsafe { libc::getpid() }));
+        std::fs::create_dir_all(&directory).expect("probe directory");
+        let marker = directory.join("ran");
+        let script = std::ffi::CString::new(format!("touch {}", marker.display())).unwrap();
+        let shell = c"/bin/sh";
+        let dash_c = c"-c";
+        let argv = [
+            shell.as_ptr(),
+            dash_c.as_ptr(),
+            script.as_ptr(),
+            std::ptr::null(),
+        ];
+        let envp: [*const libc::c_char; 1] = [std::ptr::null()];
+
+        let mut pid: libc::pid_t = 0;
+        // Syscall 244 is posix_spawn; this is the call the tracer rewrites.
+        let rc = unsafe {
+            libc::syscall(
+                244,
+                &mut pid as *mut libc::pid_t,
+                shell.as_ptr(),
+                descriptor.as_ptr(),
+                argv.as_ptr(),
+                envp.as_ptr(),
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "kernel rejected the spawn buffers: {} (attr_size {}, buffers {SPAWN_BUFFER_BYTES}); \
+             the private layout likely outgrew the padding",
+            std::io::Error::last_os_error(),
+            attributes.len
+        );
+        assert!(pid > 0, "spawn reported success without a pid");
+
+        // POSIX_SPAWN_START_SUSPENDED holds the task before its first
+        // instruction, so the marker must not appear. Absence cannot fail
+        // spuriously on a slow machine: a child that never ran leaves nothing
+        // either way, and only a child that ran can create the file.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let ran = marker.exists();
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert!(
+            !ran,
+            "child was not suspended; POSIX_SPAWN_START_SUSPENDED did not take effect"
+        );
     }
 }

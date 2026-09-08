@@ -154,6 +154,18 @@ anything the kernel reads past the snapshot reads as absent rather than as
 neighbouring scratch. The one retained assumption is `psa_flags` leading the
 struct, checked before use so a future move refuses instead of misbehaving.
 
+`native.rs::tests::live_kernel_accepts_the_spawn_buffers` is the drift
+detector for that arrangement. The attribute side is sound by construction —
+libc ships with the kernel, so a `malloc_size` snapshot always covers the
+prefix the kernel reads — but the descriptor's length is not measurable from
+userspace and is only assumed to fit `SPAWN_BUFFER_BYTES`. Rather than assert
+remembered offsets, the test builds both buffers through the helpers the
+tracer uses and invokes `posix_spawn` directly, so the live kernel judges
+them. It needs no debugger, fixture or environment variable and runs anywhere
+the crate compiles. Mutation-checked in both directions: shrinking the
+descriptor below the kernel's struct fails with `EINVAL`, and clearing the
+suspend flag fails on the marker the child then leaves behind.
+
 
 ## Closed M2 gap: `exec-write` post-exec breakpoint loop
 
