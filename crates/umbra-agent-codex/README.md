@@ -14,7 +14,10 @@ need qualification against the pinned CLI version.
 
 All four fallible Agent methods return `UmbraError::not_implemented`; capabilities
 are empty. Construction only stores configuration. No plans, process launches,
-filesystem changes, session discovery, credentials handling or provider IPC are
-implemented. Process control and enforcement belong to the supervisor.
+filesystem changes, session discovery or credentials handling are implemented.
+The package does supply provider IPC through the agent contract harness, with a
+provider binary and `provider.json` template; its options encode `CodexConfig`.
+See [provider setup](../../docs/providers.md). Process control and enforcement
+belong to the supervisor.
 
 Validate with `cargo check -p umbra-agent-codex`.

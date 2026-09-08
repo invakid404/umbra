@@ -3,7 +3,7 @@
 The object-safe `Agent: Send` contract describes agent launch, resume, session
 discovery, and orderly stop. This crate depends only on `umbra-core`; it contains no
 vendor CLI implementation or process launcher. Rust edition 2021 and the workspace's
-pinned Rust 1.93.0 toolchain apply.
+pinned Rust 1.98.1 toolchain apply.
 
 ```rust,ignore
 pub trait Agent: Send {

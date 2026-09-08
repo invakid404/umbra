@@ -91,8 +91,9 @@ partially reconciled state.
 
 **Persistence assumption / TODO:** `umbra-journal-file` still returns
 `NotImplemented` for all operations. The actual Journal interface has
-`append(JournalPayload::Commit)` and `flush`, not a `journal.commit` method. This
-engine calls those real methods and propagates failures; it does not replace them
+`append(&JournalRecord)` and `flush`, not a `journal.commit` method. The
+record's payload carries `JournalPayload::Commit`. This engine calls those real
+methods and propagates failures; it does not replace them
 with a successful stub. Tests inject an in-memory Journal that models record
 ordering and failure boundaries, with no production durability claim. A usable
 persistent session awaits file-journal persistence and recovery reconciliation.
@@ -103,7 +104,7 @@ flushes storage and journal, takes whiteouts from authoritative control markers,
 and publishes a logical checkpoint with `clean: false`. Only the supervisor can
 establish the broader clean-handoff conditions.
 
-## Byte resolution and M1.5 deferrals
+## Byte resolution
 
 Resolution walks raw byte components from `ProcessContext::cwd`, logical root, or
 tracked dirfd logical anchors. It checks directory prefixes, validates dirfd object
