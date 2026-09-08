@@ -13,13 +13,21 @@ product contract, namespace semantics, feasibility plan, and qualification work.
 Its illustrative `fsvirt-*` crate names are superseded by the `umbra-*` topology
 in the architecture document.
 
-The Rust buildout is incomplete. [M0 Gate 2](docs/m0/gate-2.md) records six passing
-cases in the disposable macOS Python tracer; it does not establish production
-coverage, working Rust tracing, or real NFS durability. Resume means restarting
-an agent from persisted filesystem and session state, not migrating a live process.
+M1 and M1.5 have delivered the 15-crate pluggable workspace, a working
+[Darwin arm64 Rust tracer](crates/umbra-platform-macos/README.md), real local and
+NFS storage backends, and an overlay with copy-up, read-through, whiteouts and
+logical symlinks. Six of seven Rust fixture cases are CAPTURED; `exec-write`
+remains an enabled, failing repro for the documented M2 post-exec breakpoint gap.
+[M0 Gate 2](docs/m0/gate-2.md) preserves the separate Python prototype evidence.
+
+The end-to-end CLI is still not wired. Operational supervisor/CLI methods, the
+file journal and vendor agent adapters remain stubs; production enforcement,
+recovery and remote durability are not qualified. Resume means restarting an
+agent from persisted filesystem and session state, not migrating a live process.
 
 The workspace uses Rust edition 2021 and the toolchain pinned in
 [rust-toolchain.toml](rust-toolchain.toml).
 [CI](.github/workflows/ci.yml) runs formatting, Clippy with warnings denied,
-workspace checks, tests, and doctests on macOS and Linux for pushes and pull requests.
+workspace checks, tests, and doctests on macOS and Linux for pushes to `master`
+and pull requests.
 Provider executables can be checked through the [runtime registry](docs/providers.md).
