@@ -1,6 +1,6 @@
 # Runtime providers
 
-Build installed executables with `cargo build --workspace --bins`. Each of the seven
+Build installed executables with `cargo build --workspace --bins`. Each of the eight
 implementation packages supplies a `provider.json` installation template. Copy the
 selected descriptors into a JSON registry keyed by contract role, set each executable
 to an explicit absolute path, and configure opaque options. No PATH scan or Rust backend
@@ -33,6 +33,20 @@ through the contracts re-exported by overlay, and inject their own engine. This 
 opening duplicate role sessions in CLI assembly.
 
 Storage-local and storage-nfs options encode a physical-root BytePath as JSON byte arrays.
+Storage-tar options encode an absolute archive filename BytePath in the same format.
+Its parent directory must exist; no mount, service, or environment variables are needed.
+
+| Storage provider | Options (JSON BytePath) | Persistence |
+| --- | --- | --- |
+| `local` | Local directory | Local filesystem |
+| `nfs` | Existing NFSv4 mount root | Client fsync; remote durability unqualified |
+| `tar` | Absolute tar archive filename | Indexed run with persistent staging; flush publishes a locally fsynced tar. Retry budget allows ~3 MiB cumulative written bytes per archive for three-digit byte values (capacity varies with payload/metadata); not reclaimed by flush or reopen. |
+
+For tar, use `crates/umbra-storage-tar/provider.json` and the
+`target/debug/umbra-storage-tar` executable in the registration example above, and
+encode an archive filename such as `/tmp/umbra-run.tar` as options. See the
+[tar provider README](../crates/umbra-storage-tar/README.md) for its format and limits.
+
 Codex options encode `CodexConfig`; the template's `UNQUALIFIED` version is a placeholder
 requiring replacement and qualification before runtime use. Claude, file journal and
 the Linux platform stub require empty options. The macOS provider accepts JSON
