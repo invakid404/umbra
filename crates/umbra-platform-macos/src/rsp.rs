@@ -16,7 +16,9 @@ pub fn unhex(s: &str) -> Result<Vec<u8>> {
         return Err(error("rsp", "odd hex length"));
     }
     s.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| {
             let s = std::str::from_utf8(b).map_err(|e| error("rsp", e))?;
             u8::from_str_radix(s, 16).map_err(|e| error("rsp", e))
