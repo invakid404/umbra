@@ -177,6 +177,13 @@ fn crud_bytes_pagination_and_durability() {
         })
         .unwrap();
     assert_eq!(receipt.durability, Durability::Local);
+    assert_eq!(receipt.run_id, req.run_id);
+    assert_eq!(receipt.writer_epoch, lease.epoch);
+    assert_eq!(receipt.scope, FlushScope::EntireRun);
+    let evidence = String::from_utf8(receipt.evidence).unwrap();
+    assert!(evidence.contains("OS sync_all completed"));
+    assert!(evidence.contains("remote stable storage unqualified"));
+    assert!(evidence.contains("cannot be independently checked"));
     assert_eq!(
         storage.close_run().unwrap_err().kind,
         ErrorKind::InvalidState

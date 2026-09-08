@@ -59,9 +59,27 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
   existing kernel descriptors or mappings. Exact retries with the same
   idempotency key recover recorded results from `.provider/retries`;
   reusing an operation ID with a different key is rejected, and incomplete
-  intents require reconciliation. `flush` returns
-  `Durability::Local`; the evidence string names the persistence boundary
-  and explicitly declines to claim qualified remote NFS durability.
+  intents require reconciliation.
+- **Persistence barrier** (`src/native.rs::flush`): `EntireRun` synchronizes
+  regular files, directories after their children, and the pinned run parent.
+  It does not follow symlinks. Device boundaries, changed entries and directory
+  stamps, excessive depth, mount replacement, and lost writer authority fail
+  the barrier. These checks detect some races; the caller must keep writers
+  and writable mappings quiescent for a coherent checkpoint.
+  A completed OS `sync_all` returns `Durability::Local` with evidence stating
+  that NFS COMMIT/verifier recovery belongs to the kernel, cannot be independently
+  checked through `File`, and remote stable storage is unqualified. Local does
+  not promise a durable client replica. There is no separate COMMIT RPC,
+  `fdatasync` follow-up, or qualified Remote mode.
+  Exposed transport errors retain their errno and use `StorageUnavailable`;
+  stale filehandles use `StaleHandle`. Failed barriers and known mutation I/O
+  failures are retained for the provider instance, blocking further mutations,
+  lease release, and close/reopen. A failed OS sync returns an error, not a
+  Local receipt. Hard-mounted NFS can block in the kernel; an IPC timeout does
+  not cancel writeback or authorize takeover. External tracee error collection
+  and recovery across process restart still require supervisor integration;
+  a fresh tree walk cannot recover already-lost writes. Same-device bind mounts
+  and server failover/storage configuration are not independently qualified.
 - **Runtime config**: mount root, `run_parent`, `root_anchor`,
   `control_anchor` all flow through `NfsStorageConfig`. The mount root is
   supplied at runtime; `root`/`control` are configurable library defaults,
@@ -80,7 +98,12 @@ misconfigured export fails fast. Register it via `umbra providers
 
 ## Test coverage
 
-`tests/mounted.rs` (396 lines) contains six cases. Five exercise supported
+Unit tests inject sync failures and authority loss, check child-before-parent
+ordering and symlink containment, and reject namespace changes, stale identities,
+depth overflow, and retries after a persistence failure. They do not qualify
+server storage or exercise NFS wire recovery.
+
+`tests/mounted.rs` contains six cases. Five exercise supported
 operations against a live mount when `UMBRA_TEST_NFS_MOUNT` is set and
 skip when unset; `absent_mount_rejected_without_creating_it` always runs.
 Cases:

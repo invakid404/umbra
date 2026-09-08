@@ -11,7 +11,7 @@ use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use umbra_core::*;
@@ -84,11 +84,14 @@ impl NfsStorageConfig {
 pub struct NfsStorage {
     config: NfsStorageConfig,
     run: Option<Run>,
+    health: native::FlushHealth,
 }
 #[derive(Debug)]
 struct Run {
     request: OpenRunRequest,
     directory: File,
+    parent: File,
+    mount: File,
     root: File,
     control: File,
     private: File,
@@ -153,7 +156,11 @@ fn object(stat: BlobStat) -> ObjectResult {
 impl NfsStorage {
     /// Retain runtime configuration; open_run validates before any run I/O.
     pub fn new(config: NfsStorageConfig) -> Self {
-        Self { config, run: None }
+        Self {
+            config,
+            run: None,
+            health: native::FlushHealth::default(),
+        }
     }
     /// Validate configuration and negotiated NFSv4 immediately, for provider IPC.
     pub fn connect(config: NfsStorageConfig) -> Result<Self> {
@@ -188,6 +195,7 @@ impl NfsStorage {
         native::stat(&dir, &name)
     }
     fn check_lease(&self, lease: &WriterLease, require_live: bool) -> Result<()> {
+        self.health.check()?;
         let run = self.run()?;
         let Some((current, deadline)) = &run.lease else {
             return Err(error(ErrorKind::LeaseLost, "writer", "no writer"));
@@ -207,6 +215,64 @@ impl NfsStorage {
             ));
         }
         Ok(())
+    }
+    fn flush_run(&self, authority: &mut impl FnMut() -> Result<()>) -> Result<()> {
+        self.health.check()?;
+        authority()?;
+        let run = self.run()?;
+        let validate_mount = || {
+            mount::validate(&self.config.mount_root)?;
+            let current = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&self.config.mount_root)
+                .map_err(|e| io("flush mount", e))?;
+            if native::stat(&current, b"")?.object_id != native::stat(&run.mount, b"")?.object_id {
+                return Err(error(
+                    ErrorKind::StaleHandle,
+                    "flush mount",
+                    "mount identity changed",
+                ));
+            }
+            let parent = native::walk(&current, self.config.run_parent.as_bytes(), false)?;
+            if native::stat(&parent, b"")?.object_id != native::stat(&run.parent, b"")?.object_id {
+                return Err(error(
+                    ErrorKind::StaleHandle,
+                    "flush parent",
+                    "run parent identity changed",
+                ));
+            }
+            native::same_device(
+                &run.parent,
+                current
+                    .metadata()
+                    .map_err(|e| io("flush mount fstat", e))?
+                    .dev(),
+            )?;
+            Ok(())
+        };
+        let result = (|| {
+            validate_mount()?;
+            let id = run.request.run_id.0.to_string();
+            native::flush(&run.directory, &run.parent, &self.health, &mut || {
+                authority()?;
+                native::verify_entry(&run.parent, id.as_bytes(), &run.directory)?;
+                native::verify_entry(
+                    &run.directory,
+                    self.config.root_anchor.as_bytes(),
+                    &run.root,
+                )?;
+                native::verify_entry(
+                    &run.directory,
+                    self.config.control_anchor.as_bytes(),
+                    &run.control,
+                )?;
+                native::verify_entry(&run.directory, b".provider", &run.private)
+            })?;
+            validate_mount()?;
+            authority()
+        })();
+        result.map_err(|e| self.health.fail(e))
     }
     fn context(&self, context: &RequestContext, mutation: bool) -> Result<()> {
         let run = self.run()?;
@@ -258,6 +324,7 @@ impl Storage for NfsStorage {
         }
     }
     fn open_run(&mut self, request: &OpenRunRequest) -> Result<RunBinding> {
+        self.health.check()?;
         if self.run.is_some() {
             return Err(error(ErrorKind::InvalidState, "open_run", "already open"));
         }
@@ -297,19 +364,32 @@ impl Storage for NfsStorage {
         ))
         .map_err(json_error)?;
         if request.intent == OpenRunIntent::CreateNew {
-            native::mkdir(&parent, id.as_bytes(), 0o700)?;
+            self.health
+                .observe(native::mkdir(&parent, id.as_bytes(), 0o700))?;
         }
         let directory = native::walk(&parent, id.as_bytes(), false)?;
         if request.intent == OpenRunIntent::CreateNew {
-            native::mkdir(&directory, self.config.root_anchor.as_bytes(), 0o700)?;
-            native::mkdir(&directory, self.config.control_anchor.as_bytes(), 0o700)?;
-            native::mkdir(&directory, b".provider", 0o700)?;
+            self.health.observe(native::mkdir(
+                &directory,
+                self.config.root_anchor.as_bytes(),
+                0o700,
+            ))?;
+            self.health.observe(native::mkdir(
+                &directory,
+                self.config.control_anchor.as_bytes(),
+                0o700,
+            ))?;
+            self.health
+                .observe(native::mkdir(&directory, b".provider", 0o700))?;
             let private = native::walk(&directory, b".provider", false)?;
-            native::mkdir(&private, b"retries", 0o700)?;
-            create_file(&private, b"epoch", &0u64.to_le_bytes())?;
-            create_file(&private, b"manifest", &expected)?;
-            native::sync(&directory)?;
-            native::sync(&parent)?;
+            self.health
+                .observe(native::mkdir(&private, b"retries", 0o700))?;
+            self.health
+                .observe(create_file(&private, b"epoch", &0u64.to_le_bytes()))?;
+            self.health
+                .observe(create_file(&private, b"manifest", &expected))?;
+            self.health.observe(native::sync(&directory))?;
+            self.health.observe(native::sync(&parent))?;
         }
         let root = native::walk(&directory, self.config.root_anchor.as_bytes(), false)?;
         let control = native::walk(&directory, self.config.control_anchor.as_bytes(), false)?;
@@ -337,6 +417,8 @@ impl Storage for NfsStorage {
         self.run = Some(Run {
             request: request.clone(),
             directory,
+            parent,
+            mount,
             root,
             control,
             private,
@@ -360,30 +442,36 @@ impl Storage for NfsStorage {
         if request.takeover != TakeoverPolicy::Refuse {
             return Err(unsupported("writer takeover"));
         }
-        let token = Uuid::new_v4().as_bytes().to_vec();
-        // Exclusive NFS CREATE arbitrates across processes and clients. All later
-        // failures retain the lock; elapsed time is never takeover proof.
-        create_file(&run.private, b"writer.lock", &token)?;
-        let bytes: [u8; 8] = read_file(&run.private, b"epoch")?
-            .try_into()
-            .map_err(|_| error(ErrorKind::CorruptJournal, "epoch", "invalid epoch"))?;
-        let epoch = u64::from_le_bytes(bytes)
-            .checked_add(1)
-            .ok_or_else(|| error(ErrorKind::InvalidState, "epoch", "epoch exhausted"))?;
-        replace_file(&run.private, b"epoch", &epoch.to_le_bytes())?;
-        let lease = WriterLease {
-            run_id: request.run_id,
-            writer_id: request.writer_id.clone(),
-            epoch: LeaseEpoch(epoch),
-            renewal_token: token,
-            renew_after_millis: LEASE_MILLIS,
-        };
-        self.run.as_mut().unwrap().lease = Some((
-            lease.clone(),
-            Instant::now() + Duration::from_millis(LEASE_MILLIS),
-        ));
-        Ok(lease)
+        self.health.check()?;
+        let result = (|| {
+            let run = self.run()?;
+            let token = Uuid::new_v4().as_bytes().to_vec();
+            // Exclusive NFS CREATE arbitrates across processes and clients. All later
+            // failures retain the lock; elapsed time is never takeover proof.
+            create_file(&run.private, b"writer.lock", &token)?;
+            let bytes: [u8; 8] = read_file(&run.private, b"epoch")?
+                .try_into()
+                .map_err(|_| error(ErrorKind::CorruptJournal, "epoch", "invalid epoch"))?;
+            let epoch = u64::from_le_bytes(bytes)
+                .checked_add(1)
+                .ok_or_else(|| error(ErrorKind::InvalidState, "epoch", "epoch exhausted"))?;
+            replace_file(&run.private, b"epoch", &epoch.to_le_bytes())?;
+            let lease = WriterLease {
+                run_id: request.run_id,
+                writer_id: request.writer_id.clone(),
+                epoch: LeaseEpoch(epoch),
+                renewal_token: token,
+                renew_after_millis: LEASE_MILLIS,
+            };
+            self.run.as_mut().unwrap().lease = Some((
+                lease.clone(),
+                Instant::now() + Duration::from_millis(LEASE_MILLIS),
+            ));
+            Ok(lease)
+        })();
+        self.health.observe(result)
     }
+
     fn renew_writer(&mut self, lease: &WriterLease) -> Result<WriterLease> {
         self.check_lease(lease, true)?;
         self.run.as_mut().unwrap().lease.as_mut().unwrap().1 =
@@ -392,11 +480,14 @@ impl Storage for NfsStorage {
     }
     fn release_writer(&mut self, lease: &WriterLease) -> Result<()> {
         self.check_lease(lease, false)?;
-        native::sync_tree(&self.run()?.directory)?;
-        native::unlink(&self.run()?.private, b"writer.lock", false)?;
-        // Stop authority immediately, even if the following fsync fails.
-        self.run.as_mut().unwrap().lease = None;
-        native::sync(&self.run()?.private)
+        self.flush_run(&mut || self.check_lease(lease, false))?;
+        let result = (|| {
+            native::unlink(&self.run()?.private, b"writer.lock", false)?;
+            // Stop authority immediately, even if the following fsync fails.
+            self.run.as_mut().unwrap().lease = None;
+            native::sync(&self.run()?.private)
+        })();
+        self.health.observe(result)
     }
     fn execute(&mut self, request: &StorageRequest) -> Result<StorageResponse> {
         umbra_storage::validate_request(&self.capabilities(), request)?;
@@ -422,88 +513,92 @@ impl Storage for NfsStorage {
         if !mutation {
             return self.dispatch(&request.operation);
         }
-        let journal = native::walk(&self.run()?.private, b"retries", false)?;
-        let key = format!(
-            "key-{}",
-            request
-                .context
-                .idempotency_key
-                .0
-                .as_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        );
-        type Record = (StorageRequest, Option<Result<StorageResponse>>);
-        match read_file(&journal, key.as_bytes()) {
-            Ok(bytes) => {
-                let (previous, result): Record =
-                    serde_json::from_slice(&bytes).map_err(json_error)?;
-                if previous != *request {
+        let result = (|| {
+            let journal = native::walk(&self.run()?.private, b"retries", false)?;
+            let key = format!(
+                "key-{}",
+                request
+                    .context
+                    .idempotency_key
+                    .0
+                    .as_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
+            type Record = (StorageRequest, Option<Result<StorageResponse>>);
+            match read_file(&journal, key.as_bytes()) {
+                Ok(bytes) => {
+                    let (previous, result): Record =
+                        serde_json::from_slice(&bytes).map_err(json_error)?;
+                    if previous != *request {
+                        return Err(error(
+                            ErrorKind::InvalidInput,
+                            "retry",
+                            "conflicting idempotency key",
+                        ));
+                    }
+                    return result.unwrap_or_else(|| {
+                        Err(error(
+                            ErrorKind::StorageUnavailable,
+                            "retry",
+                            "indeterminate operation requires reconciliation",
+                        ))
+                    });
+                }
+                Err(e) if e.kind == ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+            }
+            let op = format!("op-{}", request.context.operation_id.0);
+            match read_file(&journal, op.as_bytes()) {
+                Ok(_) => {
                     return Err(error(
                         ErrorKind::InvalidInput,
                         "retry",
-                        "conflicting idempotency key",
-                    ));
-                }
-                return result.unwrap_or_else(|| {
-                    Err(error(
-                        ErrorKind::StorageUnavailable,
-                        "retry",
-                        "indeterminate operation requires reconciliation",
+                        "operation ID already used",
                     ))
-                });
+                }
+                Err(e) if e.kind == ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
             }
-            Err(e) if e.kind == ErrorKind::NotFound => (),
-            Err(e) => return Err(e),
-        }
-        let op = format!("op-{}", request.context.operation_id.0);
-        match read_file(&journal, op.as_bytes()) {
-            Ok(_) => {
-                return Err(error(
-                    ErrorKind::InvalidInput,
-                    "retry",
-                    "operation ID already used",
-                ))
-            }
-            Err(e) if e.kind == ErrorKind::NotFound => (),
-            Err(e) => return Err(e),
-        }
-        create_file(&journal, op.as_bytes(), key.as_bytes())?;
-        let intent: Record = (request.clone(), None);
-        create_file(
-            &journal,
-            key.as_bytes(),
-            &serde_json::to_vec(&intent).map_err(json_error)?,
-        )?;
-        self.run.as_mut().unwrap().pages.clear();
-        let result = self.dispatch(&request.operation);
-        let record: Record = (request.clone(), Some(result.clone()));
-        replace_file(
-            &journal,
-            key.as_bytes(),
-            &serde_json::to_vec(&record).map_err(json_error)?,
-        )?;
-        result
+            create_file(&journal, op.as_bytes(), key.as_bytes())?;
+            let intent: Record = (request.clone(), None);
+            create_file(
+                &journal,
+                key.as_bytes(),
+                &serde_json::to_vec(&intent).map_err(json_error)?,
+            )?;
+            self.run.as_mut().unwrap().pages.clear();
+            let result = self.dispatch(&request.operation);
+            let result = self.health.observe(result);
+            self.health.check()?;
+            let record: Record = (request.clone(), Some(result.clone()));
+            replace_file(
+                &journal,
+                key.as_bytes(),
+                &serde_json::to_vec(&record).map_err(json_error)?,
+            )?;
+            result
+        })();
+        self.health.observe(result)
     }
+
     fn flush(&mut self, request: &FlushRequest) -> Result<DurabilityReceipt> {
-        self.context(&request.context, true)?;
         if request.scope != FlushScope::EntireRun {
             return Err(unsupported("object-scoped flush"));
         }
-        native::sync_tree(&self.run()?.directory)?;
         self.context(&request.context, true)?;
+        self.flush_run(&mut || self.context(&request.context, true))?;
         Ok(DurabilityReceipt {
             run_id: request.context.run_id,
             writer_epoch: request.context.writer_epoch.unwrap(),
             scope: request.scope.clone(),
             durability: Durability::Local,
-            evidence:
-                b"NFS client fsync of run files and directories; remote stable media unqualified"
-                    .to_vec(),
+            evidence: native::LOCAL_FLUSH_EVIDENCE.to_vec(),
         })
     }
     fn close_run(&mut self) -> Result<()> {
+        self.health.check()?;
         if self.run()?.lease.is_some() {
             return Err(error(
                 ErrorKind::InvalidState,
@@ -512,9 +607,12 @@ impl Storage for NfsStorage {
             ));
         }
         if !self.run()?.request.policy.read_only {
-            native::sync_tree(&self.run()?.directory)?;
+            self.flush_run(&mut || Ok(()))?;
         }
         self.run = None;
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
