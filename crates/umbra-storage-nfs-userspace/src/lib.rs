@@ -31,18 +31,36 @@
 //!
 //! # Current state
 //!
-//! Interfaces only. Every [`Storage`](umbra_storage::Storage) method returns
-//! `NotImplemented` naming the node that will wire it, or
-//! `UnsupportedCapability` where the semantics will not be offered. No live
-//! transport is bound and no capability is advertised.
+//! The operations surface is wired against the frozen facades: anchoring, path
+//! resolution, stat, bounded enumeration, read, exclusive and plain create, and
+//! WRITE with `UNSTABLE`/COMMIT verifier accounting all run over whatever
+//! [`RawTransport`](transport::RawTransport) is injected. Writer authority,
+//! admission, epochs and durability receipts still answer `NotImplemented`
+//! naming `authority_recovery`, and no live transport is bound here — that is
+//! `m1_integrate`'s seam.
+//!
+//! Namespace mutation — REMOVE, RENAME, CREATE of a directory, SETATTR — is
+//! typed and reachable through [`namespace::NamespaceDispatcher`] but has no
+//! in-crate implementation, because the frozen [`transport::Nfs4Op`] carries no
+//! argument variant for those NFSv4.0 operations. See [`capability`] for the
+//! full matrix and [`namespace`] for why the seam is unbound rather than faked.
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod anchor;
+pub mod capability;
+pub mod crud;
 pub mod error;
 pub mod fake;
+#[cfg(test)]
+mod fixture;
 pub mod handle;
+pub mod identity;
 pub mod integration;
+pub mod namespace;
+pub mod ops;
+pub mod pages;
 pub mod replay;
 pub mod state;
 pub mod storage;
