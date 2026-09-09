@@ -593,6 +593,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "umbra-storage-nfs-userspace"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "umbra-core",
+ "umbra-storage",
+ "uuid",
+]
+
+[[package]]
 name = "umbra-storage-tar"
 version = "0.1.0"
 dependencies = [
