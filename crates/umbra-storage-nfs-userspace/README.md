@@ -1,11 +1,13 @@
 # umbra-storage-nfs-userspace
 
-**Current state: frozen interfaces and a provider scaffold. No I/O.** This crate
-holds the private facade contracts for Umbra's userspace NFSv4.0 backend and a
-`Storage` implementation whose methods return `NotImplemented` naming the node
-that will wire them, or `UnsupportedCapability` where the semantics will not be
-offered. No live NFS transport is bound, no capability is advertised, and no test
-here contacts a server.
+**Current state: frozen facade interfaces, the Umbra-owned NFSv4.0 protocol state
+machine, and a provider scaffold. No I/O.** This crate holds the private facade
+contracts for Umbra's userspace NFSv4.0 backend, the client state machine in
+`src/state/` that drives them, and a `Storage` implementation whose methods
+return `NotImplemented` naming the node that will wire them, or
+`UnsupportedCapability` where the semantics will not be offered. No live NFS
+transport is bound, no capability is advertised, and no test here contacts a
+server: the state machine runs against the in-memory fake in `src/fake.rs`.
 
 **Ownership boundary.** This README owns `crates/umbra-storage-nfs-userspace/`:
 `src/`, `tests/`, `Cargo.toml` and `provider.json`. The mounted adapter is a
@@ -53,7 +55,43 @@ by the other, and one-session-one-Umbra admission remains product-wide.
 | Fake | `src/fake.rs` | In-memory transport and replay log behind the same traits |
 
 `src/storage.rs` holds the provider configuration and the `Storage` scaffold;
-`src/lib.rs` exports the provider id and the run-layout constants.
+`src/lib.rs` exports the provider id and the run-layout constants. `src/state/`
+consumes the facades rather than adding to them.
+
+## Protocol state
+
+`src/state/` is the client state machine: everything that makes raw RPC an NFSv4.0
+*client*. It binds no transport of its own.
+
+| Module | Owns |
+| --- | --- |
+| `state::seqid` | Owner seqids for the window before an `OpenFile` exists |
+| `state::client_id` | `SETCLIENTID` then `SETCLIENTID_CONFIRM`, and the retained client verifier |
+| `state::open_owner` | Owner allocation, `OPEN`, `OPEN_CONFIRM`, `CLOSE`, `OPEN_DOWNGRADE` |
+| `state::lease` | `RENEW` while idle, and the connection-epoch rule |
+| `state::reclaim` | `CLAIM_PREVIOUS` reclaim within a bounded grace |
+| `state::verifier` | `EXCLUSIVE4` create verifiers, and WRITE/COMMIT matching |
+| `state::retained_errors` | Which failures are settled, and for how long |
+
+Three rules shape it.
+
+1. **Illegal transitions do not compile.** A `ConfirmedClient` is reachable only
+   through a `SETCLIENTID_CONFIRM` the server accepted; an `OwnerLease` is consumed
+   by its OPEN attempt; `close` consumes the `OpenFile`; an unconfirmed open's
+   `stateid()` keeps refusing. None of these is a runtime guard.
+2. **Nothing advances further than the server proved.** A server answer resolves
+   the seqid by the RFC 7530 section 9.1.7 rule and leaves the owner reusable. An
+   answer that never arrived poisons the owner instead, because the seqid the
+   server observed cannot be inferred from silence. The cost is one retired owner
+   name per lost reply.
+3. **Renewal is not authority.** `LeaseClock::takeover_by_timeout` always returns
+   `AuthorityError::TakeoverRefused`. An expired lease means this client's own
+   state may be gone; it is never evidence that another session terminated.
+
+`OPEN_DOWNGRADE` is a partial seam. `state::open_owner::downgrade_with` owns the
+seqid and the share-bit narrowing and takes the wire step as a closure, because
+`transport::Nfs4Op` has no `OpenDowngrade` variant to submit. The state transition
+is implemented and tested; the operation cannot yet be put on the wire.
 
 ### Safe-wrapper invariants
 
@@ -82,7 +120,8 @@ which makes two concurrent sequenced operations for one owner impossible. The
 guard must be resolved: `commit` advances the seqid, `abort` applies the RFC 7530
 section 9.1.7 rule about which failures hold it, and both an explicit `abandon`
 and an unresolved drop poison the sequence so the next caller is told to recover
-rather than silently desynchronising.
+rather than silently desynchronising. `OpenFile::next_seqid` reads the same
+counter without creating a guard, so inspecting an owner cannot poison it.
 
 ## Configuration and registration
 
@@ -121,16 +160,32 @@ review the diff.
 
 ## Tests
 
-`cargo test -p umbra-storage-nfs-userspace` runs unit tests plus the golden and
-provider-template suites. There is no network, mount, service, fixture directory
-or environment gate. The fake transport is a shape fake: it answers the operations
-M1 needs and models OPEN_CONFIRM, exclusive-create verifier reuse, short writes,
-write/commit verifiers, grace and reclaim, and cookie invalidation. Everything else
-answers `NFS4ERR_NOTSUPP` rather than pretending.
+`cargo test -p umbra-storage-nfs-userspace` runs 80 tests across six suites: unit
+tests, the golden and provider-template suites, and `tests/fake_fault_matrix.rs`.
+There is no network, mount, service, fixture directory or environment gate.
+
+The fake transport is a shape fake: it answers the operations M1 needs and models
+OPEN_CONFIRM, exclusive-create verifier reuse, short writes, write/commit
+verifiers, grace and reclaim, and cookie invalidation. Everything else answers
+`NFS4ERR_NOTSUPP` rather than pretending.
+
+`tests/fake_fault_matrix.rs` drives ten state transitions against all five
+`FaultPoint` values and all five `FaultAction` values, and asserts each
+transition's invariant rather than one expected outcome — a fault may
+legitimately produce success, a server rejection or an unknown result, and what
+must hold in all three is that no state advanced beyond what the transport
+proved. The fake acts on a given action only where it means something (`Fail` at
+`BeforeDispatch` and `BeforeReturn`, `Substitute` at `AfterDispatch`,
+`DropReply` at `OnDeadline`, `RotateVerifier` at `BeforeReturn`); `OnConnection`
+is never consulted and short writes are driven by `FakeTransport::set_write_cap`.
+Cells where the action is inert at that point still run and still assert the
+invariant, so no cell claims coverage the fake does not provide.
 
 ## Deferred
 
-Transport implementation, protocol state, operations, admission and recovery
-wiring, and every acceptance criterion in the M1 plan. Overlay and session
-recovery, fencing, and remote-storage power-loss qualification are later
-milestones. Nothing in this crate qualifies remote durability.
+Transport implementation, operations, admission and recovery wiring, and every
+acceptance criterion in the M1 plan that needs a live server. Within protocol
+state, the `OPEN_DOWNGRADE` wire operation is unavailable and `LOCK`/`LOCKU` are
+allocated and sequenced but never dispatched. Overlay and session recovery,
+fencing, and remote-storage power-loss qualification are later milestones.
+Nothing in this crate qualifies remote durability.
