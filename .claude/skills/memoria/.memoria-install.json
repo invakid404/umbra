@@ -1,12 +1,12 @@
 {
   "backup": null,
   "hashes": {
-    "SKILL.md": "8eb03ce84a391324"
+    "SKILL.md": "660db82ad6b522b6"
   },
   "managed_paths": [
     "SKILL.md"
   ],
-  "package_version": "0.2.0",
+  "package_version": "0.3.0",
   "schema_version": 2,
   "scope": "local",
   "target": "claude"

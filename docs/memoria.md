@@ -28,6 +28,13 @@ Use the [skill's procedure](../.claude/skills/memoria/SKILL.md#procedure-after-c
 for exact commands, review order, and packet/token rules. Review packets belong
 outside the repository so they do not become documentation inputs.
 
+To ask why a README is pending without preparing a packet, run
+`memoria explain <README.md>`. It is read-only, records no review, and reports the
+changed paths, their hashes, the selection policy, the guidance state, and the Git
+hunks it could verify. A hunk it cannot verify carries an explicit reason, such as
+a file added since the last review. Use it to triage the gate; use the review
+packet to perform the review.
+
 ## CI gate
 
 The existing `rust` job in [CI](../.github/workflows/ci.yml) installs Memoria and
@@ -36,6 +43,12 @@ runs `memoria --root . check` after the contract doctests on both `macos-14` and
 a README has not been reviewed against its current inputs; it does not by itself
 prove the prose is wrong. Read the diagnostics for outdated imports or structural
 errors too. Passing the gate validates recorded reviews, not proof of prose accuracy.
+
+The job pins the CLI to a release tag. Bump that pin and your local install
+together so CI diagnostics match what you see locally. From 0.3.0 the human output
+groups repeated diagnostics under a counted header, wraps to the terminal width,
+and ends with a `Next action:` block. The JSON output and the exit codes are
+unchanged.
 
 ## How to invalidate for policy changes
 
