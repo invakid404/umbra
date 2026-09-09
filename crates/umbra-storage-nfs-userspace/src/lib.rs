@@ -42,6 +42,7 @@
 pub mod error;
 pub mod fake;
 pub mod handle;
+pub mod integration;
 pub mod replay;
 pub mod state;
 pub mod storage;

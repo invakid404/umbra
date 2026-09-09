@@ -173,6 +173,27 @@ into a ZDR bump allocator with four-byte granularity, while `nfs_resop4` and
 `entry4` contain `uint64_t` fields, and a misaligned reference is undefined
 behaviour in Rust even where C tolerates the same address.
 
+## Joining the two
+
+`integration::StateSession` is the seam where the protocol state machine and a
+wire transport meet. It owns one `Box<dyn RawTransport>` and one `ProtocolState`
+driven over it, and it is constructed either way:
+
+- `StateSession::over_fake` — the in-memory shape fake, no I/O.
+- `StateSession::over_libnfs` — the live libnfs transport, behind the
+  `transport-raw` feature.
+
+The state machine already consumed `&mut dyn RawTransport`, so joining the two
+implementations changed no state-machine code and moved no public surface; the
+session only makes the choice explicit and reports which backend answered through
+`StateSession::backend`. `split` hands out both halves at once because the driver
+methods need `&mut ProtocolState` and `&mut dyn RawTransport` in one call, and
+`observe` expresses the epoch comparison that needs both by shared reference.
+
+**No `Storage` method reaches any transport.** `NfsUserspaceStorage` still binds
+nothing and still answers `NotImplemented`. Binding a live transport into the
+provider, and exposing it to the operations and authority modules, is deferred.
+
 ## Configuration and registration
 
 `NfsUserspaceConfig` carries the server host and port, a server-relative `export`
@@ -239,6 +260,28 @@ every `FaultAction` — `assert_eq!(cells.len(), 30, "5 fault points x 6 fault
 actions")` — asserting for each cell both that the transport consulted that fault
 point and that the outcome matched, so an action that carries no meaning at a
 point is asserted to be ignored rather than left untested.
+
+`tests/live_state.rs` is the same idea one layer up: the protocol state machine
+driven over the **live** transport. It runs the six transitions this layer can
+fault meaningfully (SETCLIENTID, SETCLIENTID_CONFIRM, OPEN, OPEN_CONFIRM, CLOSE,
+`OP_RENEW`) against all five fault points and five fault actions, asserting the
+one-directional invariant the fake matrix settled on: the client may never claim
+more than the transport proved. It matters alongside the fake matrix because the
+fake never consults `OnConnection` and honours each action at a single point,
+while `LibnfsRawTransport` consults all five, so cells that are inert against the
+fake are real here. The same file carries the acceptance scenarios — anchored
+OPEN with the OPEN_CONFIRM the server actually demands, bounded READDIR paging
+with cookie-verifier continuity, WRITE UNSTABLE to COMMIT with verifier matching
+and a typed retained error when a restart changes the verifier, an idle longer
+than the lease held open by `OP_RENEW`, and v4.0 `CLAIM_PREVIOUS` reclaim in
+grace with a safe surrender outside it.
+
+Tests that restart the server additionally need
+`UMBRA_NFS_FIXTURE_CONTAINER=<name>` and skip without it rather than proving
+less. **Run the live suite with `-- --test-threads=1`**: several tests restart
+the shared fixture. A server that has just restarted answers `NFS4ERR_GRACE` to
+any open that is not a reclaim, which is correct behaviour, so the harness waits
+that window out under a bounded budget instead of reading it as a failure.
 
 ## Deferred
 
