@@ -213,6 +213,22 @@ fn local_fixture_matrix() {
 }
 #[test]
 fn nfs_fixture_matrix() {
+    // Opt-out for CI environments where a real NFSv4 mount is unavailable
+    // (e.g. macOS Sequoia/Tahoe self-hosted runners under launchd: TCC's
+    // SystemPolicyNetworkVolumes gate blocks openat on the mount point and
+    // installing a bypass PPPC profile requires user-approved MDM). Local
+    // dev runs skip this env var so the test still exercises the live
+    // mount. A userspace NFSv4 client that removes the local-mount
+    // requirement is planned to replace this workaround.
+    if std::env::var_os("UMBRA_TEST_SKIP_NFS_MATRIX")
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        eprintln!(
+            "SKIP nfs_fixture_matrix: UMBRA_TEST_SKIP_NFS_MATRIX set (real NFSv4 mount unavailable in this environment)"
+        );
+        return;
+    }
     matrix(true);
 }
 

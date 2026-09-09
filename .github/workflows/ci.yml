@@ -75,7 +75,14 @@ jobs:
     timeout-minutes: 15
     env:
       UMBRA_INTEGRATION_REQUIRED: "1"
-      UMBRA_TEST_NFS_ROOT: ${{ vars.UMBRA_TEST_NFS_ROOT }}
+      # Opt out of nfs_fixture_matrix in CI. The live-NFSv4-mount end-to-end
+      # test remains in the suite and runs in local dev; on macOS Sequoia/Tahoe
+      # self-hosted runners the TCC SystemPolicyNetworkVolumes gate blocks
+      # openat on the mount point from a launchd context, and the PPPC
+      # bypass would require user-approved MDM. A userspace NFSv4 client
+      # backend that removes the local-mount requirement is planned; when
+      # it lands the skip can be removed.
+      UMBRA_TEST_SKIP_NFS_MATRIX: "1"
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -83,14 +90,13 @@ jobs:
       - name: Build providers and fixture
         run: |
           test "$(uname -m)" = arm64
-          test -n "$UMBRA_TEST_NFS_ROOT"
           cargo build --workspace --bins
           fixture_dir=$(mktemp -d)
           clang -arch arm64 experiments/fixtures/umbra-test-child.c -o "$fixture_dir/umbra-test-child"
           mkdir "$fixture_dir/shadow"
           echo "UMBRA_TEST_FIXTURE_PATH=$fixture_dir/umbra-test-child" >> "$GITHUB_ENV"
           echo "UMBRA_TEST_REDIRECT_ROOT=$fixture_dir/shadow" >> "$GITHUB_ENV"
-      - name: Qualify enforcement, IPC, and all fourteen run fixtures
+      - name: Qualify enforcement, IPC, and the local run-fixture matrix
         run: |
           cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures -- --nocapture --test-threads=1
           cargo test -p umbra-cli --test run_fixtures -- --nocapture --test-threads=1

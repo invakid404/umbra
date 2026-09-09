@@ -104,3 +104,10 @@ Required mode fails on missing inputs; ordinary developer tests may skip. Failed
 commands report their captured stderr before any required run-ID parse. Cleanup
 uses an emitted prepared ID even when that status assertion fails; without one,
 it touches no directory in the shared NFS mount.
+
+Set `UMBRA_TEST_SKIP_NFS_MATRIX=1` to skip the `nfs_fixture_matrix` case even
+under `UMBRA_INTEGRATION_REQUIRED=1`. CI uses this because the current
+storage-nfs adapter needs a real NFSv4 kernel mount and macOS Sequoia/Tahoe
+gates that path from a launchd context without user-approved MDM. Local dev
+runs the case normally; the escape hatch retires once a userspace NFSv4
+backend lands.
