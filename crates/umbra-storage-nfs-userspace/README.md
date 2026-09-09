@@ -201,7 +201,8 @@ provider, and exposing it to the operations and authority modules, is deferred.
 `src/authority/` owns the two questions the protocol state machine deliberately
 refuses: whether this session may mutate at all, and what happens when it is
 interrupted. `state::lease::LeaseClock::takeover_by_timeout` and
-`state::ProtocolState::takeover` both answer `TakeoverRefused` and point here.
+`state::ProtocolState::takeover` both answer `TakeoverRefused` rather than
+owning the question; this is where it is owned.
 
 | Module | Owns |
 | --- | --- |
@@ -325,12 +326,15 @@ is never consulted and short writes are driven by `FakeTransport::set_write_cap`
 Cells where the action is inert at that point still run and still assert the
 invariant, so no cell claims coverage the fake does not provide.
 
-`tests/authority_recovery.rs` is one test per row of the failure model's crash
-taxonomy, driven through a `StateSession::over_fake` under fault injection. Each
-asserts three things rather than one: which of the five states the run reached,
-that the original `NFS4ERR_*` is still readable verbatim afterwards, and what the
-durable marker says once the dust settles — who holds it, at which epoch, and
-that no timeout moved either. The competing-session test runs two genuinely
+`tests/authority_recovery.rs` is one test per crash window in
+`authority::outage::CrashWindow::ALL` — the failure model's taxonomy, with its
+umbra-crash row split into the before, mid and after-write windows — driven
+through a `StateSession::over_fake` under fault injection. Each asserts the
+state-machine transition and, wherever the window produced a failure, that the
+original `NFS4ERR_*` is still readable verbatim afterwards; the tracee-crash and
+in-grace-reclaim windows produce none and assert no status. Every crash-window
+test then reads the durable marker back and asserts who holds it, at which epoch,
+and that no timeout moved either. The competing-session test runs two genuinely
 separate sessions, with separate client ids and separate open owners, over one
 shared fake server: the first is admitted at epoch 1 and the second is denied,
 repeatedly, naming the actual holder.

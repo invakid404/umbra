@@ -1,15 +1,20 @@
 //! Per-crash-window authority and recovery coverage, over the fake facade.
 //!
-//! One test per row of the crash taxonomy in `docs/design/failure-model.md`.
-//! Each drives the window through a real [`StateSession`] over
-//! [`FakeTransport`], then asserts three things rather than one:
+//! One test per crash window in [`CrashWindow::ALL`] — the taxonomy in
+//! `docs/design/failure-model.md`, with its umbra-crash row split into the
+//! before, mid and after-write windows the M1 node must separate. Each drives
+//! the window through a real [`StateSession`] over [`FakeTransport`], then
+//! asserts more than the transition:
 //!
 //! 1. **The state-machine transition.** Which of the five states the run reached.
-//! 2. **The retained-error surface.** That the original `NFS4ERR_*` or I/O
-//!    failure is still readable verbatim afterwards, never folded into a generic
-//!    error by having passed through recovery.
-//! 3. **Admission and epoch.** What the durable marker says once the dust
-//!    settles: who holds it, at which epoch, and that no timeout moved either.
+//! 2. **The retained-error surface**, for every window that produced a failure:
+//!    that the original `NFS4ERR_*` or I/O error is still readable verbatim
+//!    afterwards, never folded into a generic error by having passed through
+//!    recovery. The tracee-crash and in-grace-reclaim windows produce no failure
+//!    and assert no status, because inventing one to assert would be a fiction.
+//! 3. **Admission and epoch.** Every crash-window test reads the durable marker
+//!    back afterwards and asserts who holds it, at which epoch, and that no
+//!    timeout moved either.
 //!
 //! # Why no live server
 //!
@@ -1319,6 +1324,12 @@ fn server_power_loss_is_not_qualified_by_anything_here() {
         .expect("deferral")
         .note()
         .contains("not power-loss qualification"));
+    assert_marker(
+        run.marker(),
+        "session-a",
+        AdmissionPhase::Held,
+        LeaseEpoch(1),
+    );
 }
 
 // --- Coverage ----------------------------------------------------------------
