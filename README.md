@@ -57,9 +57,11 @@ real NFSv4 kernel mount and macOS Sequoia/Tahoe blocks that path from a
 launchd context without user-approved MDM; that test still runs in local dev
 when `UMBRA_TEST_NFS_ROOT` is set. The
 [userspace NFSv4 backend](crates/umbra-storage-nfs-userspace/README.md) that
-would remove the local-mount requirement exists so far as frozen facade
-interfaces and a provider scaffold; it performs no I/O, so the opt-out stays
-until that backend is implemented and qualified.
+would remove the local-mount requirement carries frozen facade interfaces, a raw
+NFSv4.0/TCP/AUTH_SYS transport behind an off-by-default feature, Umbra-owned
+protocol state, and an operations surface that anchors, reads, writes and
+enumerates over whichever transport is injected. No live transport is bound into
+the provider and none of it is qualified, so the opt-out stays.
 Fork pull requests cannot run the qualification job, and its checkout does
 not persist job credentials. A labeled runner must be provisioned before this
 check can supply a CI signal; a queued qualification job is not enforcement

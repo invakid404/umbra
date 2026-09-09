@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use umbra_core::provider::decode;
 use umbra_core::{
     BytePath, Durability, ErrorKind, Fencing, FlushRequest, OpenRunRequest, RequestContext, Result,
-    RunBinding, StorageAnchor, StorageCapabilities, StoragePath, StorageRequest, StorageResponse,
-    UmbraError, WriterLease,
+    RunBinding, StorageAnchor, StorageCapabilities, StorageOperation, StoragePath, StorageRequest,
+    StorageResponse, UmbraError, WriterLease,
 };
 use umbra_storage::{AcquireWriterRequest, DurabilityReceipt, Storage};
 
+use crate::ops::{Operations, OpsContext};
 use crate::replay::ReplayLog;
 use crate::transport::{Deadline, RawTransport, WireProfile};
 
@@ -131,6 +132,11 @@ pub struct NfsUserspaceStorage {
     config: NfsUserspaceConfig,
     transport: Option<Box<dyn RawTransport>>,
     replay: Option<Box<dyn ReplayLog>>,
+    operations: Option<Operations>,
+    /// Serial of the next run session, folded into every issued
+    /// [`StorageHandle`](umbra_core::StorageHandle) so a token from a closed run
+    /// cannot be replayed against the next one.
+    serial: u64,
 }
 
 impl std::fmt::Debug for NfsUserspaceStorage {
@@ -139,6 +145,7 @@ impl std::fmt::Debug for NfsUserspaceStorage {
             .field("config", &self.config)
             .field("transport_bound", &self.transport.is_some())
             .field("replay_bound", &self.replay.is_some())
+            .field("run_open", &self.operations.is_some())
             .finish()
     }
 }
@@ -154,6 +161,8 @@ impl NfsUserspaceStorage {
             config,
             transport: None,
             replay: None,
+            operations: None,
+            serial: 0,
         })
     }
 
@@ -175,6 +184,8 @@ impl NfsUserspaceStorage {
             config,
             transport: Some(transport),
             replay: Some(replay),
+            operations: None,
+            serial: 0,
         })
     }
 
@@ -215,35 +226,113 @@ impl NfsUserspaceStorage {
             )),
         }
     }
+
+    /// The operations surface of the currently open run, if one is open.
+    pub fn operations(&self) -> Option<&Operations> {
+        self.operations.as_ref()
+    }
+
+    /// Borrow the three pieces one request needs, or report what is missing.
+    ///
+    /// Taken together rather than through three accessors because a request needs
+    /// all three at once and each accessor would borrow the whole provider.
+    /// `mutations` is always `None` here: a mutation needs open owners from a
+    /// confirmed client incarnation, and establishing one is `authority_recovery`'s
+    /// work, not this method's.
+    fn request(&mut self, operation: &str) -> Result<(&Operations, OpsContext<'_>)> {
+        let deadline = self.config.deadline;
+        let operations = self.operations.as_ref().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::InvalidState,
+                operation,
+                "no run is open on this provider",
+            )
+        })?;
+        let transport = self.transport.as_deref_mut().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::StorageUnavailable,
+                operation,
+                "no transport facade is bound to this provider",
+            )
+        })?;
+        let replay = self.replay.as_deref_mut().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::StorageUnavailable,
+                operation,
+                "no replay facade is bound to this provider",
+            )
+        })?;
+        Ok((
+            operations,
+            OpsContext {
+                transport,
+                replay,
+                mutations: None,
+                deadline,
+            },
+        ))
+    }
 }
 
 impl Storage for NfsUserspaceStorage {
-    /// Nothing is qualified yet, so nothing is advertised.
+    /// Only what an open run can actually meet.
     ///
-    /// `Durability::None` and `Fencing::ReadOnly` are the honest floor: this
-    /// provider has not qualified a persistence boundary and has no independent
-    /// termination verifier, so it must not claim either.
+    /// `Durability::None` and `Fencing::ReadOnly` are the honest floor and stay
+    /// there: this provider has qualified no persistence boundary and has no
+    /// independent termination verifier, so it must not claim either, and neither
+    /// the WRITE/COMMIT verifier flow nor a live NFS lease changes that.
+    ///
+    /// The finite I/O and page limits are zero until a run is open, because
+    /// without a bound transport there is no bound to honour. Advertising a limit
+    /// the provider could not meet would fail a caller's request after it had
+    /// already been shaped around the claim.
     fn capabilities(&self) -> StorageCapabilities {
-        StorageCapabilities {
-            features: Default::default(),
-            durability: Durability::None,
-            strict_remote_persistence: false,
-            fencing: Fencing::ReadOnly,
-            // No kernel-visible path exists: this is a userspace client.
-            kernel_shadow: false,
-            complete_emulation: false,
-            hard_links: false,
-            logical_symlinks: false,
-            xattrs: false,
-            atomic_replace: false,
-            atomic_swap: false,
-            max_io_bytes: 0,
-            max_directory_entries: 0,
+        match &self.operations {
+            Some(operations) => operations.capabilities(),
+            None => StorageCapabilities {
+                features: Default::default(),
+                durability: Durability::None,
+                strict_remote_persistence: false,
+                fencing: Fencing::ReadOnly,
+                // No kernel-visible path exists: this is a userspace client.
+                kernel_shadow: false,
+                complete_emulation: false,
+                hard_links: false,
+                logical_symlinks: false,
+                xattrs: false,
+                atomic_replace: false,
+                atomic_swap: false,
+                max_io_bytes: 0,
+                max_directory_entries: 0,
+            },
         }
     }
 
-    fn open_run(&mut self, _request: &OpenRunRequest) -> Result<RunBinding> {
-        gated("open_run", "storage-ops")
+    fn open_run(&mut self, request: &OpenRunRequest) -> Result<RunBinding> {
+        if self.operations.is_some() {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidState,
+                "open_run",
+                "a run is already open; close it before opening another",
+            ));
+        }
+        let deadline = self.config.deadline;
+        let serial = self.serial;
+        let config = self.config.clone();
+        let transport = self.transport.as_deref_mut().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::StorageUnavailable,
+                "open_run",
+                "no transport facade is bound to this provider",
+            )
+        })?;
+        // Failure must not publish a partially usable binding, so the surface is
+        // built completely before anything is stored on the provider.
+        let operations = Operations::open(transport, &config, request, serial, deadline)?;
+        let binding = operations.binding();
+        self.serial = self.serial.saturating_add(1);
+        self.operations = Some(operations);
+        Ok(binding)
     }
 
     fn acquire_writer(&mut self, request: &AcquireWriterRequest) -> Result<WriterLease> {
@@ -266,8 +355,10 @@ impl Storage for NfsUserspaceStorage {
         gated("release_writer", "authority-recovery")
     }
 
-    fn execute(&mut self, _request: &StorageRequest) -> Result<StorageResponse> {
-        gated("execute", "storage-ops")
+    fn execute(&mut self, request: &StorageRequest) -> Result<StorageResponse> {
+        let operation = crate::capability::operation_name(&request.operation);
+        let (operations, mut context) = self.request(operation)?;
+        operations.execute(&mut context, request)
     }
 
     fn flush(&mut self, _request: &FlushRequest) -> Result<DurabilityReceipt> {
@@ -277,19 +368,56 @@ impl Storage for NfsUserspaceStorage {
     }
 
     fn close_run(&mut self) -> Result<()> {
-        gated("close_run", "storage-ops")
+        if self.operations.take().is_none() {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidState,
+                "close_run",
+                "no run is open on this provider",
+            ));
+        }
+        // Every handle this session issued carries its serial, which `open_run`
+        // has already advanced, so all of them are now rejected on presentation.
+        // No writer lease is released here: this provider acquires none, and a
+        // close never implies a flush.
+        Ok(())
     }
 
     fn read_at(
         &mut self,
-        _context: &RequestContext,
-        _path: &umbra_core::StoragePath,
-        _offset: u64,
-        _out: &mut [u8],
+        context: &RequestContext,
+        path: &umbra_core::StoragePath,
+        offset: u64,
+        out: &mut [u8],
     ) -> Result<usize> {
-        // Overridden so the default helper cannot report a short read of zero
-        // from an unwired backend, which a caller would read as EOF.
-        gated("read_at", "storage-ops")
+        // Overridden so an unopened run is reported as such. The default helper
+        // would fail the advertised-limit check first, which is true but says
+        // nothing about the actual problem, and a caller reading `Ok(0)` as EOF
+        // is the failure this override exists to keep impossible.
+        let response = self.execute(&StorageRequest {
+            context: context.clone(),
+            operation: StorageOperation::ReadAt {
+                path: path.clone(),
+                offset,
+                len: u32::try_from(out.len()).map_err(|_| {
+                    UmbraError::new(
+                        ErrorKind::InvalidInput,
+                        "read_at",
+                        "the output buffer exceeds the largest representable read",
+                    )
+                })?,
+            },
+        })?;
+        match response {
+            StorageResponse::ReadAt(bytes) if bytes.len() <= out.len() => {
+                out[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+            _ => Err(UmbraError::new(
+                ErrorKind::ProtocolMismatch,
+                "read_at",
+                "unexpected response kind or invalid response bounds",
+            )),
+        }
     }
 }
 
@@ -350,13 +478,15 @@ mod tests {
     }
 
     #[test]
-    fn an_unwired_provider_reports_the_gate_and_advertises_nothing() {
+    fn an_unwired_provider_advertises_nothing_and_names_what_is_missing() {
         let mut storage = NfsUserspaceStorage::connect(config()).unwrap();
         let capabilities = storage.capabilities();
         assert_eq!(capabilities.durability, Durability::None);
         assert_eq!(capabilities.fencing, Fencing::ReadOnly);
         assert!(capabilities.features.is_empty());
+        // Without a transport there is no bound to honour, so none is advertised.
         assert_eq!(capabilities.max_io_bytes, 0);
+        assert_eq!(capabilities.max_directory_entries, 0);
 
         let request = OpenRunRequest {
             run_id: RunId(Uuid::nil()),
@@ -372,14 +502,35 @@ mod tests {
                 format_version: FORMAT_VERSION,
             },
         };
+        // The operations surface is wired; what is absent here is the facade it
+        // would run over, and the error says exactly that rather than reporting a
+        // gate that no longer exists.
         assert_eq!(
             storage.open_run(&request).unwrap_err().kind,
-            ErrorKind::NotImplemented
+            ErrorKind::StorageUnavailable
         );
         assert_eq!(
             storage.close_run().unwrap_err().kind,
-            ErrorKind::NotImplemented
+            ErrorKind::InvalidState
         );
+        // Writer authority, renewal, release and durability receipts still belong
+        // to `authority_recovery` and still report their gate.
+        for kind in [
+            storage.renew_writer(&lease()).unwrap_err().kind,
+            storage.release_writer(&lease()).unwrap_err().kind,
+        ] {
+            assert_eq!(kind, ErrorKind::NotImplemented);
+        }
+    }
+
+    fn lease() -> WriterLease {
+        WriterLease {
+            run_id: RunId(Uuid::nil()),
+            writer_id: umbra_core::WriterId("writer".into()),
+            epoch: umbra_core::LeaseEpoch(1),
+            renewal_token: Vec::new(),
+            renew_after_millis: 1_000,
+        }
     }
 
     #[test]

@@ -1,19 +1,23 @@
 # umbra-storage-nfs-userspace
 
 **Current state: frozen facades, the Umbra-owned NFSv4.0 protocol state machine,
-and a raw-RPC transport behind an off-by-default feature.** This crate holds the
+a raw-RPC transport behind an off-by-default feature, and a storage operations
+surface running over whichever transport is injected.** This crate holds the
 private facade contracts for Umbra's userspace NFSv4.0 backend, the client state
-machine in `src/state/` that drives them, and a `Storage` implementation whose
-methods return `NotImplemented` naming the node that will wire them, or
-`UnsupportedCapability` where the semantics will not be offered.
+machine in `src/state/` that drives them, the operations surface in `src/ops.rs`
+and the modules beside it, and a `Storage` implementation that opens an existing
+run, resolves paths, stats, enumerates, reads, creates files and writes. Writer
+authority, admission and durability receipts still answer `NotImplemented`
+naming `authority_recovery`; semantics this provider will not offer answer
+`UnsupportedCapability`.
 
-A default build performs no I/O: it binds no transport, advertises no capability,
-needs no native toolchain, and no test contacts a server — the state machine runs
-against the in-memory fake in `src/fake.rs`. Building with `--features
-transport-raw` adds `transport::raw::LibnfsRawTransport`, which does speak
-NFSv4.0 to a server, and lets the same state machine drive a real one. `Storage`
-is unaffected either way — no `Storage` method reaches the transport, so the
-provider still opens no run.
+A default build needs no native toolchain and no test contacts a server: every
+suite in this crate runs against the in-memory fake in `src/fake.rs`. Building
+with `--features transport-raw` adds `transport::raw::LibnfsRawTransport`, which
+speaks NFSv4.0 to a server, and lets the same code drive a real one. A transport
+is injected through `NfsUserspaceStorage::with_facades`; nothing here constructs
+a live one for the provider, so `Storage` performs I/O only against what the
+caller supplied.
 
 **Ownership boundary.** This README owns `crates/umbra-storage-nfs-userspace/`:
 `src/`, `tests/`, `Cargo.toml`, `build.rs`, `libnfs.pin` and `provider.json`. The
@@ -65,9 +69,10 @@ by the other, and one-session-one-Umbra admission remains product-wide.
 `src/transport/raw/` implements the transport facade against libnfs and is
 compiled only under `transport-raw`; see [Raw transport](#raw-transport) below.
 
-`src/storage.rs` holds the provider configuration and the `Storage` scaffold;
-`src/lib.rs` exports the provider id and the run-layout constants. `src/state/`
-consumes the facades rather than adding to them.
+`src/storage.rs` holds the provider configuration and the `Storage`
+implementation; `src/lib.rs` exports the provider id and the run-layout
+constants. `src/state/` and the operations modules consume the facades rather
+than adding to them.
 
 ## Protocol state
 
@@ -134,6 +139,81 @@ and an unresolved drop poison the sequence so the next caller is told to recover
 rather than silently desynchronising. `OpenFile::next_seqid` reads the same
 counter without creating a guard, so inspecting an owner cannot poison it.
 
+## Operations
+
+`src/ops.rs` is the operations surface: one typed `Storage` primitive in, one
+typed response out. Every request ends in the typed response, a refusal naming a
+capability this provider will not offer, or a refusal naming the node that owes
+the wiring — never a success it did not perform.
+
+| Module | Owns |
+| --- | --- |
+| `anchor` | The `run`, `root`, `control` and `.provider` anchors, containment-checked path resolution, and the session-bound `StorageHandle` mint |
+| `identity` | `(fsid, fileid)` as stable object identity, its mapping to `ObjectId`, and the `PinnedObject` every operation addresses |
+| `pages` | Bounded `READDIR` paging, cookie-verifier continuity, and the noise filter |
+| `crud` | `OPEN` dispositions, reads, writes, and the WRITE/COMMIT verifier flow |
+| `namespace` | The typed seam for `REMOVE`, `RENAME`, `CREATE` and `SETATTR` |
+| `capability` | The capability matrix, and the error each verdict produces |
+
+Four rules shape it.
+
+1. **An anchor is a handle, never a path.** A userspace client has no mount root
+   and no host path, so every `RuntimeDirectoryBinding::physical_path` is `None`.
+   A fabricated one would name a path no `open` could use.
+2. **Identity is the `(fsid, fileid)` pair, never the name and never the
+   filehandle bytes.** An `OpenObject` records the name it was opened under for
+   diagnostics and never re-resolves it. A rename therefore cannot retarget it, a
+   pathname replacement leaves it on the original object while a fresh lookup
+   finds the replacement, and an object whose last name is gone stays readable
+   through the open until `CLOSE`.
+3. **Escaping an anchor is unrepresentable, not merely checked.** `StoragePath`
+   refuses empty, `.` and `..` components; `ComponentName` refuses those again
+   along with `/` and NUL; and every intermediate component must resolve to a
+   directory, so a server-side symlink stops the walk instead of being followed.
+4. **A page is bounded at every level.** One `List` issues at most
+   `pages::MAX_SERVER_PAGES` `READDIR` operations, each capped by `max_count`,
+   and returns at most the requested limit; nothing accumulates a whole
+   directory. A changed `cookieverf` invalidates outstanding cursors explicitly
+   rather than restarting silently or answering from a cached snapshot.
+
+A `WriteAt` records a durable intent through the replay facade before dispatch,
+reports the count and stability the server actually reached rather than the ones
+requested, and writes `UNSTABLE`. An unstable write is durable only once a
+`COMMIT` returns the verifier the `WRITE` did; a changed verifier is
+`ReplayError::VerifierChanged`, meaning the bytes must be rewritten from the
+retained payload. No receipt is issued here, so nothing claims persistence.
+
+### Capabilities
+
+`capability::CONTRACT_SURFACE` is the single source of truth for what each
+`Storage` operation does, and `capability::OUT_OF_SURFACE` records a verdict for
+the syscall-matrix entries no contract operation maps to. Three verdicts:
+
+- **Supported**, implemented here and exercised by this crate's tests: `Lookup`,
+  `Stat`, `List`, `ReadAt`, `WriteAt`, and `Create` of a file.
+- **Unsupported**, answered with `ErrorKind::UnsupportedCapability`: hard links;
+  logical symlinks and `ReadLink`, which are overlay-owned; extended attributes;
+  whiteouts; `AtomicSwap`. `OUT_OF_SURFACE` adds file-backed `mmap`, ACLs,
+  `flock`, and — out of scope by the syscall matrix's notifications decision —
+  `kqueue`/`kevent` with `EVFILT_VNODE` and FSEvents. Nothing in this crate
+  registers, delivers or emulates a file-change notification.
+- **Deferred**, answered with `ErrorKind::NotImplemented` naming the owner:
+  `Unlink`, `RemoveDirectory`, `Rename`, `Create` of a directory,
+  `CreateParents`, `SetMetadata`, `Truncate`, and `OpenRunIntent::CreateNew`.
+
+The deferred set is a contracts gap, not a capability decision. The frozen
+`transport::OpCode` enumerates `Remove`, `Rename`, `Create` and `SetAttr`, but
+the frozen `transport::Nfs4Op` — the union that carries arguments into a
+COMPOUND — has no variant for any of them, so no COMPOUND this crate can build
+encodes one. `namespace::NamespaceDispatcher` is the typed seam, injected and
+unbound, exactly as `state::open_owner::downgrade_with` already handles the same
+gap for `OPEN_DOWNGRADE`. Closing it is a contracts revision, not work a
+consumer may do by widening the facade.
+
+`namespace::apply` enforces one rule whoever dispatches: a rename moves a name,
+not an object, so an outcome reporting an identity other than the one the caller
+pinned is refused rather than believed.
+
 ## Raw transport
 
 `transport::raw::LibnfsRawTransport` implements `RawTransport` over
@@ -190,9 +270,10 @@ session only makes the choice explicit and reports which backend answered throug
 methods need `&mut ProtocolState` and `&mut dyn RawTransport` in one call, and
 `observe` expresses the epoch comparison that needs both by shared reference.
 
-**No `Storage` method reaches any transport.** `NfsUserspaceStorage` still binds
-nothing and still answers `NotImplemented`. Binding a live transport into the
-provider, and exposing it to the operations and authority modules, is deferred.
+**No live transport is constructed for `Storage` here.** `NfsUserspaceStorage`
+runs its operations over whatever `with_facades` was given, which is the fake in
+every test in this crate. Constructing a `LibnfsRawTransport` for the provider,
+and the acceptance that goes with it, is deferred.
 
 ## Configuration and registration
 
@@ -204,9 +285,16 @@ can be absolute or contain `.` or `..`. There is no mount root and no host path.
 Options are the JSON encoding of that struct, carried as descriptor option bytes.
 `provider.json` is an installation template; `tests/provider_template.rs` checks it
 decodes as a storage descriptor for id `nfs-userspace` and that its options
-validate. A userspace client has no kernel-visible run root, so this provider will
-supply opaque handles and no `physical_path`, and `umbra run` will not be able to
-select it. It binds no run today: `open_run` reports the gate.
+validate. A userspace client has no kernel-visible run root, so this provider
+supplies opaque session-bound handles and no `physical_path`, and `umbra run`
+cannot select it.
+
+`open_run` resolves an existing run's anchors over the bound transport and
+publishes a binding whose advertised `max_io_bytes` and `max_directory_entries`
+come from that transport's own limits. `Durability::None` and `Fencing::ReadOnly`
+stay: no persistence boundary is qualified and no independent termination
+verifier exists. `OpenRunIntent::CreateNew` is deferred, because creating the run
+directories needs the `CREATE` operation the frozen `Nfs4Op` cannot encode.
 
 ## Golden fixtures
 
@@ -232,8 +320,9 @@ review the diff.
 ## Tests
 
 `cargo test -p umbra-storage-nfs-userspace` runs the unit tests, the golden and
-provider-template suites, and `tests/fake_fault_matrix.rs`. There is no network,
-mount, service, fixture directory or environment gate.
+provider-template suites, `tests/fake_fault_matrix.rs`, and
+`tests/operations_surface.rs`. There is no network, mount, service, fixture
+directory or environment gate.
 
 The fake transport is a shape fake: it answers the operations M1 needs and models
 OPEN_CONFIRM, exclusive-create verifier reuse, short writes, write/commit
@@ -251,6 +340,17 @@ proved. The fake acts on a given action only where it means something (`Fail` at
 is never consulted and short writes are driven by `FakeTransport::set_write_cap`.
 Cells where the action is inert at that point still run and still assert the
 invariant, so no cell claims coverage the fake does not provide.
+
+`tests/operations_surface.rs` drives the operations surface over
+`integration::StateSession` carrying a real client incarnation — SETCLIENTID,
+SETCLIENTID_CONFIRM, open-owner minting, OPEN_CONFIRM sequencing and CLOSE all
+happen as they would on the wire, with only the transport faked. It asserts
+`Backend::is_live` is false, so no result there can be read as a live-server
+one. It covers identity across a rename, in-place edit visibility through an
+open handle, a pathname replacement leaving open handles on the original object,
+retention until `CLOSE`, bounded paging with explicit cursor invalidation,
+`UNSTABLE` to `COMMIT` verifier matching and its typed failure, and the refusal
+of every unsupported and deferred operation.
 
 The suites that use a server — `tests/raw_smoke.rs`, `tests/fault_matrix.rs` and
 `tests/live_state.rs` — need `--features transport-raw` and skip unless
@@ -286,10 +386,19 @@ that window out under a bounded budget instead of reading it as a failure.
 
 ## Deferred
 
-Operations, admission and recovery wiring, and every acceptance criterion in the
-M1 plan that belongs to a downstream node. No `Storage` method reaches the raw
-transport. Within protocol state, the `OPEN_DOWNGRADE` wire operation is
-unavailable and `LOCK`/`LOCKU` are allocated and sequenced but never dispatched.
-Overlay and session recovery, fencing, and remote-storage power-loss
-qualification are later milestones. Nothing in this crate qualifies remote
-durability.
+Writer authority, admission, epochs, retry policy and durability receipts:
+`acquire_writer`, `renew_writer`, `release_writer` and `flush` report the gate
+naming `authority_recovery`. A mutation without a writer epoch, or without open
+owners from a confirmed incarnation, is refused rather than performed.
+
+Namespace mutation — `REMOVE`, `RENAME`, `CREATE` of a directory, `SETATTR` —
+is typed and seamed but has no wire encoding in the frozen `Nfs4Op`; closing
+that is a contracts revision. `OPEN_DOWNGRADE` is unavailable for the same
+reason, and `LOCK`/`LOCKU` are allocated and sequenced but never dispatched.
+`CopyUp` needs an immutable-base materialisation seam this provider does not
+have.
+
+No live transport is constructed for the provider here. Overlay and session
+recovery, fencing, and remote-storage power-loss qualification are later
+milestones. Nothing in this crate qualifies remote durability, and nothing in it
+has been run against a live server.
