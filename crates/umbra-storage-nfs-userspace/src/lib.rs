@@ -39,6 +39,7 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod authority;
 pub mod error;
 pub mod fake;
 pub mod handle;

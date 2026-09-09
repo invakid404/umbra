@@ -1,11 +1,13 @@
 # umbra-storage-nfs-userspace
 
 **Current state: frozen facades, the Umbra-owned NFSv4.0 protocol state machine,
-and a raw-RPC transport behind an off-by-default feature.** This crate holds the
-private facade contracts for Umbra's userspace NFSv4.0 backend, the client state
-machine in `src/state/` that drives them, and a `Storage` implementation whose
-methods return `NotImplemented` naming the node that will wire them, or
-`UnsupportedCapability` where the semantics will not be offered.
+a raw-RPC transport behind an off-by-default feature, and the writer-authority
+and outage-recovery modules built on all three.** This crate holds the private
+facade contracts for Umbra's userspace NFSv4.0 backend, the client state machine
+in `src/state/` that drives them, the admission, journal and outage machine in
+`src/authority/`, and a `Storage` implementation whose methods return
+`NotImplemented` naming the node that will wire them, or `UnsupportedCapability`
+where the semantics will not be offered.
 
 A default build performs no I/O: it binds no transport, advertises no capability,
 needs no native toolchain, and no test contacts a server — the state machine runs
@@ -194,6 +196,76 @@ methods need `&mut ProtocolState` and `&mut dyn RawTransport` in one call, and
 nothing and still answers `NotImplemented`. Binding a live transport into the
 provider, and exposing it to the operations and authority modules, is deferred.
 
+## Authority and recovery
+
+`src/authority/` owns the two questions the protocol state machine deliberately
+refuses: whether this session may mutate at all, and what happens when it is
+interrupted. `state::lease::LeaseClock::takeover_by_timeout` and
+`state::ProtocolState::takeover` both answer `TakeoverRefused` and point here.
+
+| Module | Owns |
+| --- | --- |
+| `authority::marker` | The durable ownership record, its fixed-width codec, and the `MarkerStore` seam |
+| `authority::server_marker` | That store on the server, over the frozen transport facade |
+| `authority::admission` | Acquire, deny, cooperatively release; the epoch ladder |
+| `authority::journal` | Durable intent, payload and committed result over the frozen `ReplayLog` |
+| `authority::outage` | The finite state machine over the failure model's five states |
+
+Four rules shape it.
+
+1. **A held marker denies every acquirer.** Not until a lease elapses, and not
+   unless the token matches — denies. No code path leads from elapsed time to
+   admission, and a restarted process presenting its predecessor's token has
+   proven only that it can read a file, not that the predecessor is dead. A
+   crashed owner's own restart is therefore denied exactly like a stranger's and
+   the run stops as `BLOCKED_RECOVERABLE` with the marker, the replay data and
+   the diagnostic all retained. Every `TakeoverPolicy` other than `Refuse` is
+   answered with `TakeoverRefused` before the store is touched.
+2. **Release is recorded, never deleted.** The store has no `remove`, so no
+   recovery path can reach for one under pressure. A graceful shutdown writes
+   `AdmissionPhase::Released` in place, which is the evidence a follow-on process
+   reads before acquiring at exactly one higher epoch. A release is withheld
+   entirely while outstanding I/O cannot be excluded: `ReleaseOutcome::Retained`
+   hands the proof back rather than publishing a handover the session cannot
+   stand behind.
+3. **Nothing dispatches before its intent is durable.** `DispatchTicket` has no
+   public constructor; the only way to get one is `MutationJournal::begin`
+   returning `Acknowledged::Dispatch`, which happens after the intent, the
+   payload and the authorising epoch have reached the log. Backpressure is
+   applied before that admit, so an exhausted buffer refuses the mutation instead
+   of letting it reach the wire with nowhere to record its outcome.
+4. **The first error is latched.** `OutageMachine` keeps the failure that opened
+   a window in a frozen `RetainedError` and counts later attempts without
+   replacing it, so an `NFS4ERR_NOSPC` is still 28 after three reconnects. A
+   digest-only payload is `PayloadMissing` rather than reconstructed bytes, and a
+   namespace intent whose reply was lost is `Indeterminate` rather than a guess:
+   its record carries a name, not the before/after proof the failure model
+   requires.
+
+`AdmissionMarker` decodes two encodings and produces one. The 16-byte legacy
+lock the mounted adapter writes — the one `tests/goldens/writer-lock.bin` pins —
+reads as *held* by an unnamed writer, never as released, because absence of a
+phase is not evidence of a release. Records this provider writes are a
+fixed-width extended encoding: the frozen transport has no `SETATTR`, so a
+shorter record written over a longer one would leave the old tail readable, and
+a constant width makes every overwrite total.
+
+`ServerMarkerStore` is the one place an operation is expressed here rather than
+left to the operations node, because the failure model requires *server-atomic*
+admission and that atomicity is an authority requirement. It uses `OPEN` with
+`GUARDED4`, not `EXCLUSIVE4`: an exclusive create is designed to let a replay
+with the same verifier succeed again, which is right for a retried create and
+wrong for admission, where the second session must be told the name exists. It
+is three calls on one name and nothing else — no path resolution, no anchoring,
+no capability. Binding it into `Storage` is deferred.
+
+**Split brain and hard partition are not implemented here.** Two hosts holding
+conflicting valid ownership evidence needs a fence receipt and a cutoff before a
+winner may be selected. `CrashWindow::SplitBrain` and `CrashWindow::HardPartition`
+stop *both* sides and record `Deferral::M3Fencing`; `CrashWindow::ServerPowerLoss`
+records `Deferral::M3Qualification`. An increasing epoch is not a fence and
+nothing here pretends otherwise.
+
 ## Configuration and registration
 
 `NfsUserspaceConfig` carries the server host and port, a server-relative `export`
@@ -232,8 +304,9 @@ review the diff.
 ## Tests
 
 `cargo test -p umbra-storage-nfs-userspace` runs the unit tests, the golden and
-provider-template suites, and `tests/fake_fault_matrix.rs`. There is no network,
-mount, service, fixture directory or environment gate.
+provider-template suites, `tests/fake_fault_matrix.rs` and
+`tests/authority_recovery.rs`. There is no network, mount, service, fixture
+directory or environment gate.
 
 The fake transport is a shape fake: it answers the operations M1 needs and models
 OPEN_CONFIRM, exclusive-create verifier reuse, short writes, write/commit
@@ -251,6 +324,22 @@ proved. The fake acts on a given action only where it means something (`Fail` at
 is never consulted and short writes are driven by `FakeTransport::set_write_cap`.
 Cells where the action is inert at that point still run and still assert the
 invariant, so no cell claims coverage the fake does not provide.
+
+`tests/authority_recovery.rs` is one test per row of the failure model's crash
+taxonomy, driven through a `StateSession::over_fake` under fault injection. Each
+asserts three things rather than one: which of the five states the run reached,
+that the original `NFS4ERR_*` is still readable verbatim afterwards, and what the
+durable marker says once the dust settles — who holds it, at which epoch, and
+that no timeout moved either. The competing-session test runs two genuinely
+separate sessions, with separate client ids and separate open owners, over one
+shared fake server: the first is admitted at epoch 1 and the second is denied,
+repeatedly, naming the actual holder.
+
+Because `FakeReplayLog` is in memory, every `RetainedError` it carries reports
+`is_durable() == false`, and the suite asserts that. Consequently those tests
+assert the *recovery plan* a durable journal would license rather than performing
+a replay: under the fake no evidence survives a process to replay from, and a
+test that pretended otherwise would be passing on volatile evidence.
 
 The suites that use a server — `tests/raw_smoke.rs`, `tests/fault_matrix.rs` and
 `tests/live_state.rs` — need `--features transport-raw` and skip unless
@@ -286,10 +375,12 @@ that window out under a bounded budget instead of reading it as a failure.
 
 ## Deferred
 
-Operations, admission and recovery wiring, and every acceptance criterion in the
-M1 plan that belongs to a downstream node. No `Storage` method reaches the raw
-transport. Within protocol state, the `OPEN_DOWNGRADE` wire operation is
-unavailable and `LOCK`/`LOCKU` are allocated and sequenced but never dispatched.
-Overlay and session recovery, fencing, and remote-storage power-loss
-qualification are later milestones. Nothing in this crate qualifies remote
-durability.
+Operations, and every acceptance criterion in the M1 plan that belongs to a
+downstream node. No `Storage` method reaches the raw transport, and neither
+`authority::AdmissionControl` nor `authority::MutationJournal` is bound to one:
+they are driven over the frozen facades, and joining them to a live transport is
+`m1_integrate`'s seam. Within protocol state, the `OPEN_DOWNGRADE` wire operation
+is unavailable and `LOCK`/`LOCKU` are allocated and sequenced but never
+dispatched. Overlay and session recovery, fencing, and remote-storage power-loss
+qualification are later milestones; split-brain resolution is explicitly deferred
+to M3 fencing authority. Nothing in this crate qualifies remote durability.
