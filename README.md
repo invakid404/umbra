@@ -48,13 +48,19 @@ The workspace uses Rust edition 2021 and the toolchain pinned in
 [rust-toolchain.toml](rust-toolchain.toml).
 [CI](.github/workflows/ci.yml) runs formatting, Clippy with warnings denied,
 workspace checks, tests, and doctests on macOS and Linux for pushes to `master`
-and pull requests. The additional native qualification job runs the committed
-fourteen-case CLI matrix and sandbox/IPC suites with required inputs on an
-`umbra-integration` macOS ARM64 runner. It requires debugger permission and an
-existing NFSv4 mount configured as `UMBRA_TEST_NFS_ROOT`; missing inputs fail.
-Fork pull requests cannot run that job, and its checkout does not persist job
-credentials. A labeled runner must be provisioned before this check can supply
-a CI signal; a queued qualification job is not enforcement evidence.
+and pull requests. The additional native qualification job runs the sandbox,
+IPC, tracer fixture, and local-storage CLI matrix suites on an
+`umbra-integration` macOS ARM64 runner. It requires debugger permission. The
+NFS-backed CLI matrix (`nfs_fixture_matrix`) is opted out of CI via
+`UMBRA_TEST_SKIP_NFS_MATRIX` because the current storage-nfs adapter needs a
+real NFSv4 kernel mount and macOS Sequoia/Tahoe blocks that path from a
+launchd context without user-approved MDM; that test still runs in local dev
+when `UMBRA_TEST_NFS_ROOT` is set. A userspace NFSv4 backend that removes the
+local-mount requirement is planned; when it lands the opt-out is retired.
+Fork pull requests cannot run the qualification job, and its checkout does
+not persist job credentials. A labeled runner must be provisioned before this
+check can supply a CI signal; a queued qualification job is not enforcement
+evidence.
 
 If you're contributing, [the Memoria guide](docs/memoria.md) explains how we keep
 READMEs connected to the code they describe. It covers the review flow and the
