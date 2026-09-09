@@ -1,6 +1,7 @@
 use super::*;
 use std::cell::Cell;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::symlink;
 
 fn fixture() -> (tempfile::TempDir, File, File) {
@@ -112,6 +113,56 @@ fn namespace_change_during_flush_fails_the_whole_scope() {
         },
     );
     assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidState);
+}
+
+#[test]
+fn concurrent_external_write_during_barrier_is_rejected_and_retained() {
+    // Exercise the real mounted filesystem when selected, with deterministic
+    // scheduling at the private sync seam instead of a timing-dependent race.
+    let temp = match std::env::var_os("UMBRA_TEST_NFS_MOUNT") {
+        Some(mount) => tempfile::tempdir_in(mount).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
+    fs::create_dir(temp.path().join("run")).unwrap();
+    let filename = temp.path().join("run/payload");
+    let mut original = File::create(&filename).unwrap();
+    original.write_all(b"before").unwrap();
+    original.sync_all().unwrap();
+    let dir = File::open(temp.path().join("run")).unwrap();
+    let parent = File::open(temp.path()).unwrap();
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        start_rx.recv().unwrap();
+        original.write_all(b"concurrent generation").unwrap();
+        original.sync_all().unwrap();
+        done_tx.send(()).unwrap();
+    });
+    let health = FlushHealth::default();
+    let mut changed = false;
+    let result = flush_with(&dir, &parent, &health, &mut || Ok(()), &mut |fd| {
+        sync(fd)?;
+        if fd.metadata().unwrap().is_file() && !changed {
+            // The writer changes this file after sync, before the barrier's
+            // final stamp/entry check. No sleep or scheduler luck is needed.
+            start_tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+            changed = true;
+        }
+        Ok(())
+    });
+    drop(start_tx); // Unblock the worker even if the barrier failed earlier.
+    writer.join().unwrap();
+    assert!(changed);
+    let failure = result.unwrap_err();
+    assert_eq!(failure.kind, ErrorKind::InvalidState);
+    assert!(failure.context.contains("changed during barrier"));
+    assert!(failure.context.contains("persistence outcome unknown"));
+    // Quiescence restored after the race cannot erase the failed barrier.
+    assert_eq!(
+        flush(&dir, &parent, &health, &mut || Ok(())).unwrap_err(),
+        failure
+    );
 }
 
 #[test]
