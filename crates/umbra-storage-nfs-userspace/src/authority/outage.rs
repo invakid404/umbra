@@ -218,8 +218,13 @@ pub struct Evidence {
     pub identity_proven: Option<bool>,
     /// Whether every call this session issued is proven withdrawn or settled.
     pub outstanding_io_excluded: bool,
-    /// Whether a `CLAIM_PREVIOUS` pass recovered every target.
-    pub reclaim_complete: Option<bool>,
+    /// Whether a v4.0 `CLAIM_PREVIOUS` pass recovered every target.
+    ///
+    /// Named for what it reports rather than mirroring
+    /// `ReclaimReport::is_complete`, so nothing here reads as the v4.1
+    /// `RECLAIM_COMPLETE` operation, which is out of scope and unrepresentable
+    /// in the frozen transport.
+    pub reclaim_recovered_all: Option<bool>,
     /// The server's advertised grace, in seconds.
     pub grace_seconds: u32,
     /// Monotonic milliseconds the process was suspended.
@@ -242,7 +247,7 @@ impl Evidence {
             result_durable: false,
             identity_proven: None,
             outstanding_io_excluded: false,
-            reclaim_complete: None,
+            reclaim_recovered_all: None,
             grace_seconds: 0,
             suspend_gap_millis: 0,
             proven_loss: false,
@@ -288,8 +293,8 @@ impl Evidence {
     }
 
     /// The result of a `CLAIM_PREVIOUS` pass, and the grace it ran inside.
-    pub fn reclaim(mut self, complete: bool, grace_seconds: u32) -> Self {
-        self.reclaim_complete = Some(complete);
+    pub fn reclaim(mut self, recovered_all: bool, grace_seconds: u32) -> Self {
+        self.reclaim_recovered_all = Some(recovered_all);
         self.grace_seconds = grace_seconds;
         self
     }
@@ -544,7 +549,7 @@ impl OutageMachine {
             // establish valid object state."
             CrashWindow::GaneshaGracefulRestart => {
                 let budget = self.budget.grace_budget_millis(evidence.grace_seconds);
-                match evidence.reclaim_complete {
+                match evidence.reclaim_recovered_all {
                     _ if evidence.elapsed_millis > budget => RecoveryState::BlockedRecoverable,
                     Some(true) => RecoveryState::Running,
                     Some(false) => RecoveryState::BlockedRecoverable,
