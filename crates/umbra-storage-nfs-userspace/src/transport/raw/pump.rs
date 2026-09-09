@@ -23,7 +23,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::error::TransportError;
-use crate::transport::{CompoundReply, ConnectionEpoch, ConnectionState, TransportResult};
+use crate::transport::{ConnectionEpoch, ConnectionState, TransportResult};
 
 use super::decode::{self, ReplyBudget};
 use super::sys;
@@ -31,7 +31,7 @@ use super::sys;
 /// What a libnfs callback reported for one call.
 pub(super) enum Completion {
     /// A COMPOUND reply, already decoded into owned Rust values.
-    Reply(Box<TransportResult<CompoundReply>>),
+    Reply(Box<TransportResult<decode::DecodedReply>>),
     /// The connect attempt succeeded.
     Connected,
     /// libnfs reported an error; the string is its own diagnostic.
@@ -144,7 +144,7 @@ pub(super) struct CallSlot {
     /// Dropping the slot drops the arena. That ordering is the whole point:
     /// libnfs references the WRITE payload from the PDU's iovector, so the
     /// arena must not be released while a PDU can still reach it.
-    pub(super) _arena: super::args::CallArena,
+    pub(super) arena: super::args::CallArena,
     /// Whether a fault plan asked for this call's reply to be discarded.
     pub(super) drop_reply: bool,
 }
@@ -444,7 +444,7 @@ impl EventPump {
         Ok(CallSlot {
             id,
             dispatch: Dispatch::Queued(pdu),
-            _arena: arena,
+            arena,
             drop_reply: false,
         })
     }

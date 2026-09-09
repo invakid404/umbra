@@ -13,6 +13,17 @@
 //! opaque `attrlist4`, so the bytes are copied out first and then parsed by
 //! [`Attributes`] decoding that is ordinary safe Rust over a slice, and is unit
 //! tested without a server or an FFI call.
+//!
+//! # Alignment
+//!
+//! libnfs decodes a reply into a ZDR scratch buffer with a bump allocator that
+//! only guarantees XDR's four-byte granularity, while `nfs_resop4`, `entry4`
+//! and `COMPOUND4res` all contain `uint64_t` fields and therefore want eight.
+//! A misaligned `&nfs_resop4` is undefined behaviour in Rust even though the C
+//! library dereferences the same address happily, so every struct is lifted out
+//! of the reply with [`core::ptr::read_unaligned`] and read from the aligned
+//! local copy. Rust's debug alignment assertions caught this against a live
+//! Ganesha reply; it is not a theoretical concern.
 
 use crate::error::{Nfs4Status, ProtocolError, TransportError};
 use crate::handle::{ClientId, FileHandle, Stateid};
@@ -48,6 +59,20 @@ impl ReplyBudget {
     }
 }
 
+/// A decoded reply, plus where its READ data still has to come from.
+pub(super) struct DecodedReply {
+    /// The reply, owned.
+    pub(super) reply: CompoundReply,
+    /// `(result index, byte count)` when libnfs decoded READ data straight
+    /// into the caller's destination buffer instead of its own.
+    ///
+    /// `rpc_nfs4_read_task` is a zero-copy path: it leaves `READ4resok.data`
+    /// with a length but a null pointer, because the bytes were written into
+    /// the arena's buffer. The reply is completed from that buffer by the
+    /// dispatcher, which owns the arena; the callback cannot reach it.
+    pub(super) zero_copy_read: Option<(usize, usize)>,
+}
+
 /// Copy a libnfs `COMPOUND4res` into an owned reply.
 ///
 /// # Safety
@@ -58,8 +83,9 @@ impl ReplyBudget {
 pub(super) unsafe fn compound_reply(
     res: *const sys::COMPOUND4res,
     budget: &mut ReplyBudget,
-) -> TransportResult<CompoundReply> {
-    let res = &*res;
+) -> TransportResult<DecodedReply> {
+    // Copied out rather than referenced: see the alignment note above.
+    let res = core::ptr::read_unaligned(res);
     let tag = copy_bytes(
         res.tag.utf8string_val,
         res.tag.utf8string_len as usize,
@@ -75,11 +101,21 @@ pub(super) unsafe fn compound_reply(
 
     let mut results = Vec::with_capacity(count);
     let mut failure = None;
+    let mut zero_copy_read = None;
 
     for index in 0..count {
-        let entry = &*res.resarray.resarray_val.add(index);
-        match op_reply(entry, budget)? {
-            Decoded::Ok(reply) => results.push(reply),
+        let entry = core::ptr::read_unaligned(res.resarray.resarray_val.add(index));
+        match op_reply(&entry, budget)? {
+            Decoded::Ok(reply) => {
+                if let OpReply::Read(read) = &reply {
+                    if read.data.is_empty() {
+                        if let Some(declared) = pending_read_length(&entry) {
+                            zero_copy_read = Some((results.len(), declared));
+                        }
+                    }
+                }
+                results.push(reply)
+            }
             Decoded::Failed(status, op) => {
                 failure = Some(ProtocolError {
                     status,
@@ -105,11 +141,31 @@ pub(super) unsafe fn compound_reply(
         });
     }
 
-    Ok(CompoundReply {
-        tag,
-        results,
-        failure,
+    Ok(DecodedReply {
+        reply: CompoundReply {
+            tag,
+            results,
+            failure,
+        },
+        zero_copy_read,
     })
+}
+
+/// The byte count a zero-copy READ declared, if this result is one.
+///
+/// # Safety
+///
+/// `entry` is an aligned local copy of a result from the current reply.
+unsafe fn pending_read_length(entry: &sys::nfs_resop4) -> Option<usize> {
+    if entry.resop != 25 {
+        return None;
+    }
+    let read = entry.nfs_resop4_u.opread;
+    if read.status != sys::NFS4_OK {
+        return None;
+    }
+    let data = read.READ4res_u.resok4.data;
+    data.data_val.is_null().then_some(data.data_len as usize)
 }
 
 enum Decoded {
@@ -178,7 +234,18 @@ unsafe fn op_reply(entry: &sys::nfs_resop4, budget: &mut ReplyBudget) -> Transpo
         OpCode::Read => {
             guard!(opread);
             let ok = union.opread.READ4res_u.resok4;
-            let data = copy_bytes(ok.data.data_val, ok.data.data_len as usize, budget)?;
+            // A null pointer with a non-zero length is the zero-copy path: the
+            // bytes are already in the arena's destination buffer, and the
+            // dispatcher completes the reply from there. Charging the budget
+            // here still bounds it, because the destination was allocated at
+            // `min(requested count, max_reply_bytes)`.
+            let declared = ok.data.data_len as usize;
+            let data = if ok.data.data_val.is_null() {
+                budget.charge(declared)?;
+                Vec::new()
+            } else {
+                copy_bytes(ok.data.data_val, declared, budget)?
+            };
             OpReply::Read(ReadReply {
                 data,
                 eof: ok.eof != 0,
@@ -270,7 +337,7 @@ unsafe fn dir_page(ok: &sys::READDIR4resok, budget: &mut ReplyBudget) -> Transpo
     let mut cursor = ok.reply.entries;
 
     while !cursor.is_null() {
-        let entry = &*cursor;
+        let entry = core::ptr::read_unaligned(cursor);
         let name = copy_bytes(
             entry.name.utf8string_val,
             entry.name.utf8string_len as usize,
@@ -318,7 +385,7 @@ unsafe fn attr_word(bitmap: &sys::bitmap4, index: u32) -> u32 {
     if index >= bitmap.bitmap4_len || bitmap.bitmap4_val.is_null() {
         return 0;
     }
-    *bitmap.bitmap4_val.add(index as usize)
+    core::ptr::read_unaligned(bitmap.bitmap4_val.add(index as usize))
 }
 
 /// Copy `len` bytes out of C memory into an owned `Vec`.

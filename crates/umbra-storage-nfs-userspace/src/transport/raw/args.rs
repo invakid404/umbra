@@ -114,6 +114,16 @@ impl CallArena {
         &mut *self.compound
     }
 
+    /// Bytes libnfs decoded into the READ destination, bounded by `count`.
+    ///
+    /// Returns `None` when this arena has no destination buffer, and refuses a
+    /// count larger than the buffer that was actually allocated rather than
+    /// reading past it.
+    pub(super) fn read_bytes(&self, count: usize) -> Option<&[u8]> {
+        let buffer = self.io.as_deref()?;
+        buffer.get(..count)
+    }
+
     /// READ destination or WRITE source, if this COMPOUND has one.
     pub(super) fn io_buffer(&mut self) -> Option<(*mut u8, usize)> {
         self.io

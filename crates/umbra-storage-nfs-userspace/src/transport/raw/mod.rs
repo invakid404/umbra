@@ -214,6 +214,47 @@ impl LibnfsRawTransport {
         }
     }
 
+    /// Fill in a zero-copy READ's bytes from the arena that received them.
+    ///
+    /// `rpc_nfs4_read_task` writes reply data straight into the destination
+    /// buffer the arena owns and leaves the XDR pointer null, so the bytes are
+    /// only reachable here, while the slot still holds the arena.
+    fn complete_zero_copy_read(
+        &mut self,
+        id: u64,
+        decoded: decode::DecodedReply,
+    ) -> TransportResult<CompoundReply> {
+        let decode::DecodedReply {
+            mut reply,
+            zero_copy_read,
+        } = decoded;
+
+        let Some((index, count)) = zero_copy_read else {
+            return Ok(reply);
+        };
+
+        let slot = self.inflight.get(&id).ok_or_else(|| {
+            TransportError::Malformed(
+                "a zero-copy READ completed for a call that is no longer registered".into(),
+            )
+        })?;
+        let bytes = slot.arena.read_bytes(count).ok_or_else(|| {
+            TransportError::Malformed(format!(
+                "READ declared {count} bytes, more than the destination buffer holds"
+            ))
+        })?;
+
+        match reply.results.get_mut(index) {
+            Some(OpReply::Read(read)) => read.data = bytes.to_vec(),
+            _ => {
+                return Err(TransportError::Malformed(
+                    "a zero-copy READ completed against a result that is not a READ".into(),
+                ))
+            }
+        }
+        Ok(reply)
+    }
+
     /// Retire a slot and return the proof, never leaving a registration behind.
     fn retire(&mut self, token: CallToken) -> Retirement {
         match self.cancel(token) {
@@ -321,9 +362,13 @@ impl RawTransport for LibnfsRawTransport {
             ServiceOutcome::Completed => {
                 let completion = pump::take_completion(id);
                 let mut reply = match completion {
-                    Some(Completion::Reply(reply)) => {
+                    Some(Completion::Reply(decoded)) => {
+                        let decoded = (*decoded)?;
+                        // A zero-copy READ is completed from the arena before
+                        // the slot is retired, because retiring drops it.
+                        let reply = self.complete_zero_copy_read(id, decoded)?;
                         self.retire(token);
-                        (*reply)?
+                        reply
                     }
                     Some(Completion::Failed(detail)) => {
                         self.retire(token);
