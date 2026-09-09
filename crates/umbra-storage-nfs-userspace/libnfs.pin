@@ -1,0 +1,4 @@
+# Pinned libnfs source for the transport-raw (raw_rpc) FFI.
+# build.rs refuses to build unless third_party/libnfs is checked out at this commit.
+# libnfs-6.0.2 (2024-12-14) https://github.com/sahlberg/libnfs
+18c5c73ee88bb7dc8da0d55dc95164bb77e49dc6

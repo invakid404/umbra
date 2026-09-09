@@ -6,6 +6,12 @@ license.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Raw-RPC libnfs transport (`raw_rpc`). Off by default, so a default workspace
+# build needs no native toolchain: enabling it builds the pinned libnfs from
+# `third_party/libnfs` and generates the allowlisted raw FFI.
+transport-raw = []
+
 [dependencies]
 umbra-core = { path = "../umbra-core" }
 umbra-storage = { path = "../umbra-storage" }
@@ -13,3 +19,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+
+[build-dependencies]
+# Not optional: a build script cannot be conditionally compiled on a feature,
+# so bindgen is always available and `build.rs` returns early when the
+# `transport-raw` feature is off.
+bindgen = "=0.70.1"

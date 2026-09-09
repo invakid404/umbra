@@ -30,6 +30,15 @@ use serde::{Deserialize, Serialize};
 use crate::error::{FacadeError, Nfs4Status, ProtocolError, TransportError};
 use crate::handle::{ClientId, FileHandle, OpenOwner, Stateid};
 
+/// Raw-RPC libnfs implementation of [`RawTransport`] (`raw_rpc`).
+///
+/// Feature-gated so a default build carries no native dependency. This
+/// declaration is the only edit `raw_rpc` makes to this frozen file: it adds no
+/// signature and changes none, and the submodule it names is the
+/// `src/transport/` submodule the contracts assign to this node.
+#[cfg(feature = "transport-raw")]
+pub mod raw;
+
 /// Result alias for transport submissions.
 pub type TransportResult<T> = std::result::Result<T, TransportError>;
 
