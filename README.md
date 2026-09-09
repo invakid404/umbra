@@ -56,12 +56,13 @@ NFS-backed CLI matrix (`nfs_fixture_matrix`) is opted out of CI via
 real NFSv4 kernel mount and macOS Sequoia/Tahoe blocks that path from a
 launchd context without user-approved MDM; that test still runs in local dev
 when `UMBRA_TEST_NFS_ROOT` is set. The
-[userspace NFSv4 backend](crates/umbra-storage-nfs-userspace/README.md) that
-would remove the local-mount requirement carries frozen facade interfaces, a raw
-NFSv4.0/TCP/AUTH_SYS transport behind an off-by-default feature, the Umbra-owned
-NFSv4.0 client state machine, an operations surface that anchors, reads, writes
-and enumerates over whichever transport is injected, and writer admission with
-bounded outage recovery. None of it is qualified against a real server, so the
+[userspace NFSv4 backend](crates/umbra-storage-nfs-userspace/README.md) removes
+the local-mount requirement by speaking NFSv4.0/TCP/AUTH_SYS itself: it carries
+the Umbra-owned client state machine, a raw transport behind an off-by-default
+feature, an operations surface that creates and opens runs, and writer admission
+with bounded outage recovery. Its suites run against an isolated NFS-Ganesha
+container from user space, with no mount anywhere. It advertises no durability
+and no fencing, and nothing has yet switched the CLI matrix over to it, so the
 opt-out stays.
 Fork pull requests cannot run the qualification job, and its checkout does
 not persist job credentials. A labeled runner must be provisioned before this
