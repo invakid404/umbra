@@ -367,6 +367,20 @@ impl OpenFile {
         Ok(self.lock()?.confirmed)
     }
 
+    /// The seqid the next sequenced operation would carry, or `None` when the
+    /// owner's sequence is poisoned.
+    ///
+    /// Reading this does not begin an operation. [`OpenFile::sequence`] is the
+    /// only way to obtain a seqid to send, and its guard poisons the owner if it
+    /// is dropped unresolved — which makes `sequence` a hazardous way to ask a
+    /// question. This is the safe way to ask it.
+    pub fn next_seqid(&self) -> FacadeResult<Option<u32>> {
+        Ok(match self.lock()?.sequence {
+            SequenceState::Ready(seqid) => Some(seqid),
+            SequenceState::Poisoned => None,
+        })
+    }
+
     /// Begin one sequenced operation for this open owner.
     ///
     /// Holds the owner's lock for the whole operation, so a second sequenced
@@ -444,6 +458,26 @@ impl SequencedOp<'_> {
     pub fn commit_confirmed(mut self, stateid: Stateid) {
         self.state.stateid = stateid;
         self.state.confirmed = true;
+        self.advance();
+    }
+
+    /// Record a successful OPEN_DOWNGRADE: adopt the stateid and the narrower
+    /// share bits the server granted.
+    ///
+    /// The recorded bits are the server's answer, not the request, because a
+    /// downgrade the server declined to apply in full must not be remembered as
+    /// though it had been. Widening is impossible through this path: OPEN is the
+    /// only operation that grants share bits, so the narrowing is checked by the
+    /// caller before the operation is sequenced.
+    pub fn commit_downgraded(
+        mut self,
+        stateid: Stateid,
+        share_access: ShareAccess,
+        share_deny: ShareDeny,
+    ) {
+        self.state.stateid = stateid;
+        self.state.share_access = share_access;
+        self.state.share_deny = share_deny;
         self.advance();
     }
 
@@ -574,6 +608,18 @@ mod tests {
         let file = open_file();
         file.sequence().unwrap().abandon();
         assert!(file.sequence().is_err());
+        assert_eq!(file.next_seqid().unwrap(), None);
+    }
+
+    #[test]
+    fn next_seqid_inspects_the_owner_without_risking_a_poisoning_drop() {
+        let file = open_file();
+        assert_eq!(file.next_seqid().unwrap(), Some(0));
+        // Asking twice changes nothing, which is the whole point of not going
+        // through the guard to find out.
+        assert_eq!(file.next_seqid().unwrap(), Some(0));
+        file.sequence().unwrap().commit_without_stateid();
+        assert_eq!(file.next_seqid().unwrap(), Some(1));
     }
 
     #[test]
@@ -617,6 +663,24 @@ mod tests {
             share_deny: ShareDeny::NONE,
         };
         assert!(session.adopt_open(grant).is_err());
+    }
+
+    #[test]
+    fn a_downgrade_narrows_the_recorded_share_bits_and_advances_the_seqid() {
+        let file = open_file();
+        assert_eq!(file.share().unwrap(), (ShareAccess::BOTH, ShareDeny::NONE));
+        let op = file.sequence().unwrap();
+        assert_eq!(op.seqid(), 0);
+        let downgraded = Stateid {
+            seqid: 3,
+            other: [5; 12],
+        };
+        op.commit_downgraded(downgraded, ShareAccess::READ, ShareDeny::NONE);
+        assert_eq!(file.share().unwrap(), (ShareAccess::READ, ShareDeny::NONE));
+        assert_eq!(file.stateid().unwrap(), downgraded);
+        let next = file.sequence().unwrap();
+        assert_eq!(next.seqid(), 1);
+        next.commit_without_stateid();
     }
 
     #[test]

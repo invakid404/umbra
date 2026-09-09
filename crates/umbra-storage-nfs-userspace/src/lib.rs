@@ -43,6 +43,7 @@ pub mod error;
 pub mod fake;
 pub mod handle;
 pub mod replay;
+pub mod state;
 pub mod storage;
 pub mod transport;
 
