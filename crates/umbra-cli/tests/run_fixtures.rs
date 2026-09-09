@@ -7,6 +7,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::Path,
     process::{Command, Stdio},
+    time::Instant,
 };
 
 fn input(name: &str) -> Option<std::ffi::OsString> {
@@ -115,7 +116,10 @@ fn matrix(nfs: bool) {
         value["options"] = json!(options);
         value
     };
-    let registry = json!({"timeout_ms": 5000, "providers": {
+    // NFS fixture cases measure 5–8 seconds after the OS sync barrier work.
+    // Give their provider requests headroom while retaining the local budget.
+    let timeout_ms = if nfs { 25_000 } else { 5_000 };
+    let registry = json!({"timeout_ms": timeout_ms, "providers": {
         "platform": descriptor("umbra-platform-macos", &["sandboxed-stopped-launch-v1", "experimental-syscall-rewrite-v1"], vec![]),
         "journal": descriptor("umbra-journal-file", &[], vec![]),
         "storage": descriptor(if nfs {"umbra-storage-nfs"} else {"umbra-storage-local"},
@@ -148,6 +152,7 @@ fn matrix(nfs: bool) {
         if !nfs {
             command.arg("--local-dev");
         }
+        let started = Instant::now();
         let output = command
             .arg("--")
             .arg(&fixture)
@@ -156,12 +161,17 @@ fn matrix(nfs: bool) {
             .stdin(Stdio::null())
             .output()
             .unwrap();
+        let elapsed = started.elapsed();
         let stderr = String::from_utf8_lossy(&output.stderr);
         let _output_cleanup = RunOutputCleanup {
             store: &store,
             stderr: &stderr,
         };
-        assert!(output.status.success(), "{case}: {stderr}");
+        assert!(
+            output.status.success(),
+            "{case} after {:.3}s: {stderr}",
+            elapsed.as_secs_f64()
+        );
         let id = prepared_id(&stderr).expect("prepared run ID");
         let id = uuid::Uuid::parse_str(id).unwrap();
         let run_dir = store.join(id.to_string());
@@ -188,9 +198,10 @@ fn matrix(nfs: bool) {
             "{case}: no completion record"
         );
         eprintln!(
-            "PASS {} {case}: {} exact bytes, host absent, lease released, RunCompleted",
+            "PASS {} {case}: {} exact bytes, host absent, lease released, RunCompleted, elapsed={:.3}s",
             if nfs { "nfs" } else { "local" },
-            expected.len()
+            expected.len(),
+            elapsed.as_secs_f64()
         );
         std::fs::remove_dir_all(run_dir).unwrap();
     }
