@@ -9,6 +9,14 @@ provider, binary, and tests. Direct Umbra dependencies are
 and supported mutations through `umbra_storage::Storage` against an
 externally managed NFSv4 mount. Hard links, logical symlinks, xattrs,
 kernel-shadow qualification and strict remote persistence are unsupported.
+
+`connect` validates an existing exact NFSv4 mount before any run I/O. A backend
+built with `new` advertises `mounted-nfsv4-v1` only after `open_run` performs that
+validation; configuration alone never earns the capability. `experimental-open-rewrite-v1` is
+advertised alongside it, since runs supply real physical paths for kernel syscall
+rewriting and the sandbox write root. Nothing here advertises remote durability:
+`strict_remote_persistence` stays false and `durability` stays `Local`, because
+the boundary reached is the client fsync.
 Construction does not mount anything. `NfsStorage::new` retains the config and
 defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
 
@@ -120,13 +128,14 @@ failure. Exposed transport and writeback errors are injected to verify error
 classification and retention. These tests do not qualify server storage or
 exercise NFS wire recovery.
 
-`tests/mounted.rs` contains seven ordinary tests and two automated fault tests
-that are ignored by default. Six ordinary tests use `UMBRA_TEST_NFS_MOUNT` and
+`tests/mounted.rs` contains eight ordinary tests and two automated fault tests
+that are ignored by default. Seven ordinary tests use `UMBRA_TEST_NFS_MOUNT` and
 skip only when it is unset; an explicitly supplied mount that is not writable
 fails the fixture. `absent_mount_rejected_without_creating_it` always runs.
 Ordinary cases:
 
 - `flush_external_writes_reports_kernel_boundary_and_rechecks_repeated_key`
+- `open_run_qualifies_a_new_backend_after_mount_validation`
 - `absent_mount_rejected_without_creating_it`
 - `provider_protocol_handshake_and_crud`
 - `crud_bytes_pagination_and_durability`
@@ -204,3 +213,7 @@ and verify bytes and namespace directly on the server or through a fresh client.
 Capture NFS WRITE/COMMIT/verifier changes and replay, and exercise lost replies
 and writeback errors separately. A server-process SIGKILL with the backing
 volume still powered cannot substitute for these checks or qualify Remote.
+
+`new` advertises no mounted capability. Successful mount validation in either
+`connect` or `open_run` enables `mounted-nfsv4-v1`; a returned run binding therefore
+reflects validation performed by `open_run` too.

@@ -53,14 +53,15 @@ Limitations and integration notes:
   must remain accessible. Inherited-fd coverage uses fork inheritance, without
   an explicit dup syscall.
 - `--argv0-check` is the one case smoke.sh does not run. It asserts the tracer's
-  launch contract: `argv[0]` must equal the `<vendor-argv0>` operand byte for
+  unsandboxed launch contract: `argv[0]` must equal the `<vendor-argv0>` operand byte for
   byte *and* differ from the image actually running (`_NSGetExecutablePath`,
   compared raw and through `realpath`). Only then does it write `argv0\n` and
   print `CAPTURED argv0-check` to stderr. Running the binary directly makes
   `argv[0]` the running image, so the second leg fails by construction; POSIX
   `sh` cannot set a different `argv[0]`. Its coverage is
   `tests/fixtures.rs::argv0_check` in `umbra-platform-macos`, which launches a
-  signed twin with a decoy `argv[0]`.
+  signed twin with a decoy `argv[0]`. Required-profile launches instead expose
+  the twin path as `argv[0]`, so this case is outside the enforced CLI matrix.
 - `--wnohang-wait` polls with `WNOHANG` — mask value 1, the least significant
   bit, not `1 << 1` — through five entry points: the public `wait4`, the
   `__wait4` and `__wait4_nocancel` stubs resolved with `dlsym(RTLD_DEFAULT, …)`

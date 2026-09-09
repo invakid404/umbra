@@ -351,6 +351,7 @@ mod tests {
     impl Storage for Fake {
         fn capabilities(&self) -> StorageCapabilities {
             StorageCapabilities {
+                features: Default::default(),
                 durability: Durability::None,
                 strict_remote_persistence: false,
                 fencing: Fencing::ReadOnly,
