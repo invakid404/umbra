@@ -43,6 +43,10 @@ The M1 mechanisms named in the tracker spec are all present:
    via `codesign -f -s - --entitlements … --preserve-metadata=identifier,flags,runtime`.
    Entitlements match `experiments/gate-1/ent.plist`; a copy is shipped as
    `ent.plist` alongside `src/`.
+   Both the cache root and each digest folder are created with mode `0700`,
+   and that mode is enforced on existing directories. A cache directory owned
+   by another user causes a hard error when permissions cannot be enforced;
+   the cache is not silently trusted.
 2. **Arm64 `svc #0x80` breakpoints** verified byte-for-byte in
    `libsystem_kernel` for `__open`, `__open_nocancel`, `__openat`,
    `__openat_nocancel`, `__execve`, `__posix_spawn`, `__fork`,
