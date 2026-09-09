@@ -965,9 +965,9 @@ fn unsupported_capabilities_are_refused_and_deferred_ones_name_their_owner() {
         assert_eq!(
             error.kind,
             ErrorKind::NotImplemented,
-            "{operation:?} is authorised but has no wire encoding"
+            "{operation:?} needs a dispatcher this context does not carry"
         );
-        assert!(error.context.contains("Nfs4Op"));
+        assert!(error.context.contains("no namespace dispatcher is bound"));
     }
 }
 

@@ -39,10 +39,19 @@ pub const CONTRACTS_REVISION: &str = "contracts (frozen transport facade)";
 /// The node that owns binding a live transport into the provider.
 pub const M1_INTEGRATE: &str = "m1_integrate";
 
-/// Why a deferred namespace mutation cannot be dispatched from this crate.
+/// Why a namespace mutation cannot be dispatched.
+///
+/// This used to be the contracts gap itself: the frozen `Nfs4Op` carried no
+/// argument variant for `REMOVE`, `RENAME`, `CREATE` or `SETATTR`, so no COMPOUND
+/// in this crate could encode one. The authorised hotfix at `m1_integrate` added
+/// those variants, and
+/// [`TransportDispatcher`](crate::namespace::dispatch::TransportDispatcher) binds
+/// them. What remains is the caller-side condition: a request that carries no
+/// dispatcher — because it holds no writer authority — still has nothing to put
+/// the mutation on the wire with, and must be told so rather than answered.
 pub const NO_WIRE_OPERATION: &str =
-    "the frozen Nfs4Op carries no argument variant for this NFSv4.0 operation, \
-     so no COMPOUND in this crate can encode it";
+    "no namespace dispatcher is bound to this request, so nothing can put the \
+     mutation on the wire";
 
 /// What this provider does with one operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,10 +199,7 @@ pub const CONTRACT_SURFACE: &[CapabilityRow] = &[
     CapabilityRow {
         operation: "Create { kind: Directory }",
         syscalls: &["mkdir, mkdirat"],
-        support: Support::Deferred {
-            owner: CONTRACTS_REVISION,
-            reason: NO_WIRE_OPERATION,
-        },
+        support: Support::Supported,
     },
     CapabilityRow {
         operation: "Create { kind: LogicalSymlink }",
@@ -205,43 +211,32 @@ pub const CONTRACT_SURFACE: &[CapabilityRow] = &[
     CapabilityRow {
         operation: "CreateParents",
         syscalls: &["mkdir, mkdirat (recursive)"],
-        support: Support::Deferred {
-            owner: CONTRACTS_REVISION,
-            reason: NO_WIRE_OPERATION,
-        },
+        support: Support::Supported,
     },
     CapabilityRow {
         operation: "CopyUp",
         syscalls: &["immutable-base materialisation (no direct syscall)"],
         support: Support::Deferred {
-            owner: M1_INTEGRATE,
+            owner: "overlay (immutable-base materialisation)",
             reason: "this provider issues no ApprovedBaseObject handle, so a \
-                     presented one names nothing it can prove",
+                     presented one names nothing it can prove; copy-up needs a \
+                     base-materialisation seam that lives above storage",
         },
     },
     CapabilityRow {
         operation: "Unlink",
         syscalls: &["unlink, unlinkat"],
-        support: Support::Deferred {
-            owner: CONTRACTS_REVISION,
-            reason: NO_WIRE_OPERATION,
-        },
+        support: Support::Supported,
     },
     CapabilityRow {
         operation: "RemoveDirectory",
         syscalls: &["rmdir", "unlinkat with AT_REMOVEDIR"],
-        support: Support::Deferred {
-            owner: CONTRACTS_REVISION,
-            reason: NO_WIRE_OPERATION,
-        },
+        support: Support::Supported,
     },
     CapabilityRow {
         operation: "Rename",
         syscalls: &["rename, renameat", "renameat2 with flags = 0"],
-        support: Support::Deferred {
-            owner: CONTRACTS_REVISION,
-            reason: NO_WIRE_OPERATION,
-        },
+        support: Support::Supported,
     },
     CapabilityRow {
         operation: "Link",
@@ -267,18 +262,12 @@ pub const CONTRACT_SURFACE: &[CapabilityRow] = &[
             "fchown",
             "utimensat, futimens",
         ],
-        support: Support::Deferred {
-            owner: CONTRACTS_REVISION,
-            reason: NO_WIRE_OPERATION,
-        },
+        support: Support::Supported,
     },
     CapabilityRow {
         operation: "Truncate",
         syscalls: &["truncate, ftruncate", "open, openat with O_TRUNC"],
-        support: Support::Deferred {
-            owner: CONTRACTS_REVISION,
-            reason: NO_WIRE_OPERATION,
-        },
+        support: Support::Supported,
     },
     CapabilityRow {
         operation: "GetXattr",

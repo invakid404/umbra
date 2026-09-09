@@ -37,7 +37,6 @@ use umbra_core::{
     StorageHandle, StoragePath, UmbraError,
 };
 
-use crate::capability::{Support, CONTRACTS_REVISION, NO_WIRE_OPERATION};
 use crate::handle::FileHandle;
 use crate::identity::PinnedObject;
 use crate::layout;
@@ -184,11 +183,19 @@ pub struct RunAnchors {
 }
 
 impl RunAnchors {
-    /// Resolve every anchor of an existing run from the export root.
+    /// Resolve every anchor of a run from the export root.
     ///
-    /// `CreateNew` is refused: creating the run directories needs `OP_CREATE`,
-    /// which the frozen [`Nfs4Op`](crate::transport::Nfs4Op) cannot encode. The
-    /// refusal names that gap rather than reporting a run it did not create.
+    /// `CreateNew` creates the run directory and its four children with
+    /// `OP_CREATE`, which the authorised contracts hotfix added to
+    /// [`Nfs4Op`](crate::transport::Nfs4Op). The layout it writes — `<run>/`,
+    /// the two contract anchors and `.provider/` at
+    /// [`layout::DIRECTORY_MODE`] — is the one the mounted adapter's goldens
+    /// pin, so a run created here opens under the mounted adapter and the other
+    /// way round.
+    ///
+    /// The export and run-parent directories are **not** created: they are
+    /// deployment configuration, and creating a missing one would silently
+    /// relocate every run rather than reporting a misconfigured export.
     pub fn open(
         transport: &mut dyn RawTransport,
         config: &NfsUserspaceConfig,
@@ -196,13 +203,7 @@ impl RunAnchors {
         intent: OpenRunIntent,
         deadline: Deadline,
     ) -> Result<Self> {
-        if intent == OpenRunIntent::CreateNew {
-            return Support::Deferred {
-                owner: CONTRACTS_REVISION,
-                reason: NO_WIRE_OPERATION,
-            }
-            .refuse("open_run.create_new");
-        }
+        let creating = intent == OpenRunIntent::CreateNew;
         let export_root = transport
             .root_filehandle(deadline)
             .map_err(|error| error.to_umbra("open_run"))?;
@@ -214,28 +215,48 @@ impl RunAnchors {
             }
         }
         let run_name = component(run_id.0.hyphenated().to_string().into_bytes())?;
-        let run = descend(transport, &current, &run_name, deadline)?;
-        let root = descend(
+        let run = if creating {
+            // GUARDED semantics: a run directory that already exists is a real
+            // collision, not a resumption, because `CreateNew` asked for a run
+            // nobody had written yet.
+            if descend_any(transport, &current, &run_name, deadline).is_ok() {
+                return Err(UmbraError::new(
+                    ErrorKind::AlreadyExists,
+                    "open_run",
+                    format!("run {run_id:?} already exists under the configured run parent"),
+                ));
+            }
+            create_directory(transport, &current, &run_name, deadline)?
+        } else {
+            descend(transport, &current, &run_name, deadline)?
+        };
+        let root = anchor_child(
             transport,
             &run,
             &component(config.root_anchor.as_bytes())?,
+            creating,
             deadline,
         )?;
-        let control = descend(
+        let control = anchor_child(
             transport,
             &run,
             &component(config.control_anchor.as_bytes())?,
+            creating,
             deadline,
         )?;
-        // A run written by the mounted adapter always has `.provider`, but a run
-        // that lost it is a real state and reporting it as present would be a
-        // claim about state this provider never observed.
-        let private = descend(transport, &run, &component(layout::PRIVATE_DIR)?, deadline)
-            .ok()
-            .map(|pin| Anchor {
-                kind: AnchorKind::Private,
-                pin,
-            });
+        let private_name = component(layout::PRIVATE_DIR)?;
+        let private = if creating {
+            Some(create_directory(transport, &run, &private_name, deadline)?)
+        } else {
+            // A run written by the mounted adapter always has `.provider`, but a
+            // run that lost it is a real state and reporting it as present would
+            // be a claim about state this provider never observed.
+            descend(transport, &run, &private_name, deadline).ok()
+        }
+        .map(|pin| Anchor {
+            kind: AnchorKind::Private,
+            pin,
+        });
         Ok(Self {
             run: Anchor {
                 kind: AnchorKind::Run,
@@ -385,6 +406,208 @@ fn descend(
     }
 }
 
+/// Write the provider-private state a newly created run must carry.
+///
+/// `RunAnchors::open` creates the directories; this creates what lives inside
+/// `.provider`, because these are files and a file needs an OPEN sequenced
+/// through the session's open owners while a directory needs only CREATE.
+///
+/// The names, modes and byte encodings are the mounted `nfs` adapter's, pinned by
+/// `tests/goldens/`: a run this provider creates has to be one the mounted
+/// adapter can later open, and the other way round. `writer.lock` is deliberately
+/// **not** written here — admission creates it exclusively, and pre-creating it
+/// would hand the next `GUARDED4` an existing name and turn every acquisition
+/// into a collision.
+pub fn provision_private_state(
+    transport: &mut dyn RawTransport,
+    owners: &mut crate::state::open_owner::OpenOwnerRegistry,
+    private: &Anchor,
+    run_id: RunId,
+    immutable_base: &umbra_core::ImmutableBaseContract,
+    format_version: u32,
+    deadline: Deadline,
+) -> Result<()> {
+    create_directory_at(
+        transport,
+        private.pin().handle(),
+        &component(layout::RETRIES_DIR)?,
+        deadline,
+    )?;
+    // A little-endian u64, created as zero. The writer epoch this file records
+    // is the mounted adapter's; admission keeps its own in the marker.
+    create_file(
+        transport,
+        owners,
+        private.pin(),
+        &component(layout::EPOCH_FILE)?,
+        &0u64.to_le_bytes(),
+        deadline,
+    )?;
+    let manifest = serde_json::to_vec(&(run_id, immutable_base, format_version)).map_err(|e| {
+        UmbraError::new(
+            ErrorKind::InvalidState,
+            "open_run",
+            format!("the run manifest could not be encoded: {e}"),
+        )
+    })?;
+    create_file(
+        transport,
+        owners,
+        private.pin(),
+        &component(layout::MANIFEST_FILE)?,
+        &manifest,
+        deadline,
+    )
+}
+
+/// `GUARDED4` create one file and write its whole contents.
+fn create_file(
+    transport: &mut dyn RawTransport,
+    owners: &mut crate::state::open_owner::OpenOwnerRegistry,
+    parent: &PinnedObject,
+    name: &ComponentName,
+    bytes: &[u8],
+    deadline: Deadline,
+) -> Result<()> {
+    use crate::crud::{CreateDisposition, OpenObject};
+    use crate::state::open_owner::CloseOutcome;
+    use crate::transport::{ShareAccess, Stability};
+
+    let open = OpenObject::open(
+        owners,
+        transport,
+        parent,
+        name,
+        CreateDisposition::CreateNew { mode: 0o600 },
+        ShareAccess::WRITE,
+        deadline,
+    )
+    .map_err(|error| error.to_umbra("open_run"))?;
+    let stateid = match open.stateid() {
+        Ok(stateid) => stateid,
+        Err(error) => {
+            let _ = open.close(transport, deadline);
+            return Err(error.to_umbra("open_run"));
+        }
+    };
+    // `FILE_SYNC` because this is run-identifying state a later reader must find,
+    // and this path issues no COMMIT of its own. It is a request for stability,
+    // not a durability claim: the provider still advertises `Durability::None`.
+    let written = transport.write(
+        open.handle(),
+        stateid,
+        0,
+        Stability::FileSync,
+        bytes.to_vec(),
+        deadline,
+    );
+    let result = match written {
+        // A short write here would leave a truncated manifest that decodes as
+        // nothing, so the count is checked rather than assumed.
+        Ok(reply) if reply.count as usize == bytes.len() => Ok(()),
+        Ok(reply) => Err(UmbraError::new(
+            ErrorKind::Io,
+            "open_run",
+            format!(
+                "the server accepted {} of {} bytes of {}",
+                reply.count,
+                bytes.len(),
+                String::from_utf8_lossy(name.as_bytes())
+            ),
+        )),
+        Err(error) => Err(error.to_umbra("open_run")),
+    };
+    match open.close(transport, deadline) {
+        CloseOutcome::Closed(_) => result,
+        // A CLOSE the server refused leaves the open live and its outcome
+        // unknown; the write's own error still wins when there is one.
+        CloseOutcome::Rejected { error, .. } | CloseOutcome::Abandoned { error } => {
+            result.and(Err(error.to_umbra("open_run")))
+        }
+    }
+}
+
+/// Resolve an anchor child, creating it when the run is being created.
+fn anchor_child(
+    transport: &mut dyn RawTransport,
+    run: &PinnedObject,
+    name: &ComponentName,
+    creating: bool,
+    deadline: Deadline,
+) -> Result<PinnedObject> {
+    if creating {
+        create_directory(transport, run, name, deadline)
+    } else {
+        descend(transport, run, name, deadline)
+    }
+}
+
+/// `PUTFH; CREATE NF4DIR; GETFH; GETATTR`: make one directory and pin it.
+///
+/// The pin is taken from the CREATE reply's own GETFH and GETATTR rather than by
+/// looking the name up again, so the anchor is the object this call created and
+/// not whatever the name resolves to a moment later.
+fn create_directory(
+    transport: &mut dyn RawTransport,
+    parent: &PinnedObject,
+    name: &ComponentName,
+    deadline: Deadline,
+) -> Result<PinnedObject> {
+    create_directory_at(transport, parent.handle(), name, deadline)
+}
+
+/// The same, addressed by filehandle rather than by pin.
+fn create_directory_at(
+    transport: &mut dyn RawTransport,
+    parent: &FileHandle,
+    name: &ComponentName,
+    deadline: Deadline,
+) -> Result<PinnedObject> {
+    use crate::transport::{AttrValues, Compound, CreateType, Nfs4Op, OpReply};
+
+    let reply = transport
+        .submit(
+            Compound::new(
+                *b"mkanchor",
+                vec![
+                    Nfs4Op::PutFh(parent.clone()),
+                    Nfs4Op::Create {
+                        object_type: CreateType::Directory,
+                        name: name.clone(),
+                        attributes: AttrValues {
+                            mode: Some(layout::DIRECTORY_MODE),
+                            ..AttrValues::default()
+                        },
+                    },
+                    Nfs4Op::GetFh,
+                ],
+            ),
+            deadline,
+        )
+        .map_err(|error| crate::error::FacadeError::Transport(error).to_umbra("open_run"))?;
+    match reply.expect(1).map_err(|e| e.to_umbra("open_run"))? {
+        OpReply::Create { .. } => {}
+        other => {
+            return Err(UmbraError::new(
+                ErrorKind::ProtocolMismatch,
+                "open_run",
+                format!("expected a CREATE reply, got {:?}", other.opcode()),
+            ))
+        }
+    }
+    let handle = match reply.expect(2).map_err(|e| e.to_umbra("open_run"))? {
+        OpReply::GetFh(handle) => handle.clone(),
+        other => {
+            return Err(UmbraError::new(
+                ErrorKind::ProtocolMismatch,
+                "open_run",
+                format!("expected a GETFH reply, got {:?}", other.opcode()),
+            ))
+        }
+    };
+    PinnedObject::pin(transport, handle, deadline).map_err(|error| error.to_umbra("open_run"))
+}
+
 /// Look one name up without constraining its type.
 fn descend_any(
     transport: &mut dyn RawTransport,
@@ -413,6 +636,7 @@ fn descend_any(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake::FakeTransport;
     use umbra_core::StorageAnchor;
 
     use crate::fixture;
@@ -493,7 +717,55 @@ mod tests {
     }
 
     #[test]
-    fn creating_a_run_names_the_contracts_gap_instead_of_reporting_success() {
+    fn creating_a_run_writes_the_layout_the_mounted_adapter_reads() {
+        // An empty run parent: only the export and run-parent directories exist,
+        // which are deployment configuration this call must not create.
+        let mut fake = FakeTransport::new();
+        let mut current = fake.root();
+        for part in fixture::EXPORT.split(|byte| *byte == b'/') {
+            current = fake.insert_directory(&current, part);
+        }
+        fake.insert_directory(&current, fixture::RUN_PARENT);
+
+        let anchors = RunAnchors::open(
+            &mut fake,
+            &fixture::config(),
+            fixture::run_id(),
+            OpenRunIntent::CreateNew,
+            deadline(),
+        )
+        .expect("CreateNew builds the run layout");
+
+        // Every anchor is a distinct directory object, and `.provider` exists,
+        // because admission has nowhere to record a marker without it.
+        assert_eq!(anchors.run().kind(), AnchorKind::Run);
+        assert!(anchors.private().is_some());
+        let ids = [
+            anchors.run().pin().identity().fileid,
+            anchors.root().pin().identity().fileid,
+            anchors.control().pin().identity().fileid,
+            anchors.private().expect("private").pin().identity().fileid,
+        ];
+        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "anchors must be distinct objects");
+
+        // The run it created is the run a later OpenExisting resolves.
+        let reopened = RunAnchors::open(
+            &mut fake,
+            &fixture::config(),
+            fixture::run_id(),
+            OpenRunIntent::OpenExisting,
+            deadline(),
+        )
+        .expect("the created run reopens");
+        assert_eq!(
+            reopened.root().pin().identity(),
+            anchors.root().pin().identity()
+        );
+    }
+
+    #[test]
+    fn creating_a_run_that_already_exists_is_a_collision_not_a_resumption() {
         let (mut fake, _) = fixture::server();
         let error = RunAnchors::open(
             &mut fake,
@@ -503,8 +775,23 @@ mod tests {
             deadline(),
         )
         .unwrap_err();
-        assert_eq!(error.kind, ErrorKind::NotImplemented);
-        assert!(error.context.contains("Nfs4Op"));
+        assert_eq!(error.kind, ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn creating_a_run_under_a_missing_export_is_refused_rather_than_relocated() {
+        // The export directory is deployment configuration. Creating it would
+        // silently move every run to a path nobody configured.
+        let mut fake = FakeTransport::new();
+        let error = RunAnchors::open(
+            &mut fake,
+            &fixture::config(),
+            fixture::run_id(),
+            OpenRunIntent::CreateNew,
+            deadline(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NotFound);
     }
 
     #[test]

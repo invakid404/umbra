@@ -32,29 +32,16 @@ use super::{
 /// Puts namespace mutations on the wire over whichever [`RawTransport`] the
 /// request is running on.
 ///
-/// Holds no transport of its own by design — see [`NamespaceDispatcher`].
+/// Stateless: it holds no transport (see [`NamespaceDispatcher`]) and no
+/// stateid, because the one operation that needs a stateid —
+/// [`NamespaceMutation::Truncate`] — carries its own.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct TransportDispatcher {
-    write_stateid: Option<Stateid>,
-}
+pub struct TransportDispatcher;
 
 impl TransportDispatcher {
-    /// A dispatcher with no write stateid.
-    ///
-    /// Every mutation except truncation works without one. A truncation is
-    /// refused rather than sent with the anonymous stateid, because RFC 7530
-    /// §16.32 requires an open stateid with WRITE access for `FATTR4_SIZE` and a
-    /// server is entitled to refuse it — reporting a truncation that the server
-    /// declined would be the worst possible answer.
+    /// A dispatcher.
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Authorise truncation with the stateid of an open that holds WRITE access.
-    pub fn with_write_stateid(stateid: Stateid) -> Self {
-        Self {
-            write_stateid: Some(stateid),
-        }
+        Self
     }
 
     /// Resolve one name and report its identity, filehandle and type.
@@ -258,19 +245,24 @@ impl NamespaceDispatcher for TransportDispatcher {
                 object,
                 target,
                 len,
+                stateid,
             } => {
-                let Some(stateid) = self.write_stateid else {
-                    return Err(FacadeError::Authority(AuthorityError::IdentityUnproven(
+                if *stateid == Stateid::ANONYMOUS {
+                    // Not a defensive check for its own sake: a server may accept
+                    // an anonymous SETATTR of FATTR4_SIZE or refuse it, and a
+                    // truncation whose success depends on which server it met is
+                    // not a truncation this provider will report.
+                    return Err(unproven(
                         "truncation sets FATTR4_SIZE, which RFC 7530 §16.32 requires an open \
-                         stateid with WRITE access for; this dispatcher was bound without one"
+                         stateid with WRITE access for; the anonymous stateid is not one"
                             .to_owned(),
-                    )));
-                };
+                    ));
+                }
                 let values = AttrValues {
                     size: Some(*len),
                     ..AttrValues::default()
                 };
-                self.set(transport, object, target, values, stateid, deadline)
+                self.set(transport, object, target, values, *stateid, deadline)
             }
         }
     }
@@ -679,6 +671,7 @@ mod tests {
                     object: handle,
                     target,
                     len: 4,
+                    stateid: Stateid::ANONYMOUS,
                 },
             )
             .unwrap_err();
@@ -707,7 +700,7 @@ mod tests {
             seqid: 1,
             other: [7u8; 12],
         };
-        let mut dispatcher = TransportDispatcher::with_write_stateid(stateid);
+        let mut dispatcher = TransportDispatcher::new();
         dispatcher
             .dispatch(
                 &mut fake,
@@ -715,6 +708,7 @@ mod tests {
                     object: handle,
                     target,
                     len: 4,
+                    stateid,
                 },
             )
             .expect("truncate dispatches");

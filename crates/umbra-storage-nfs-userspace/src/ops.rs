@@ -255,9 +255,9 @@ impl Operations {
                 }
                 CreateKind::LogicalSymlink { .. } => support.refuse(operation),
             },
-            // Recursive creation needs the same absent CREATE operation as a
-            // single directory, so it defers for the same reason.
-            StorageOperation::CreateParents { .. } => support.refuse(operation),
+            StorageOperation::CreateParents { path, mode } => {
+                self.create_parents(context, path, *mode, operation)
+            }
             StorageOperation::CopyUp { .. } => support.refuse(operation),
             StorageOperation::Unlink { path } => {
                 self.remove(context, path, RemoveKind::File, operation)?;
@@ -287,15 +287,7 @@ impl Operations {
             }
             StorageOperation::Truncate { path, len } => {
                 let object = self.resolve(context, path)?;
-                self.attributes(
-                    context,
-                    NamespaceMutation::Truncate {
-                        object: object.handle().clone(),
-                        target: object.identity(),
-                        len: *len,
-                    },
-                    operation,
-                )?;
+                self.truncate(context, path, &object, *len, operation)?;
                 Ok(StorageResponse::Truncated(self.stat(context, &object)?))
             }
             // Every remaining operation is `Support::Unsupported` and was refused
@@ -530,6 +522,81 @@ impl Operations {
         ))
     }
 
+    /// Create every missing component of `path`, like `mkdir -p`.
+    ///
+    /// A component that already exists as a directory is accepted and walked
+    /// through; one that exists as anything else stops the walk, because
+    /// continuing would mean treating a file as a directory. Nothing is rolled
+    /// back on a later failure: the contract has no transactional create, and
+    /// removing directories this call did not create would be worse than
+    /// leaving a partial path a retry can complete.
+    fn create_parents(
+        &self,
+        context: &mut OpsContext<'_>,
+        path: &StoragePath,
+        mode: u32,
+        operation: &str,
+    ) -> Result<StorageResponse> {
+        let mut current = self.anchors.for_contract(path.anchor()).pin().clone();
+        let mut created = None;
+        for raw in path.as_bytes().split(|byte| *byte == b'/') {
+            let name = crate::anchor::component(raw.to_vec())?;
+            current = match self.existing_child(context, &current, &name)? {
+                Some(existing) => {
+                    if !existing.is_directory() {
+                        return Err(UmbraError::new(
+                            ErrorKind::AlreadyExists,
+                            operation,
+                            format!(
+                                "{:?} exists and is not a directory",
+                                String::from_utf8_lossy(raw)
+                            ),
+                        ));
+                    }
+                    existing
+                }
+                None => {
+                    let effect = match dispatch_namespace(
+                        context,
+                        operation,
+                        &NamespaceMutation::CreateDirectory {
+                            parent: current.handle().clone(),
+                            name,
+                            mode,
+                        },
+                    )? {
+                        NamespaceOutcome::Created(effect) => effect,
+                        _ => unreachable!("apply proves the outcome kind matches the mutation"),
+                    };
+                    let pinned =
+                        PinnedObject::pin(context.transport, effect.handle, context.deadline)
+                            .map_err(|error| error.to_umbra(operation))?;
+                    created = Some(pinned.clone());
+                    pinned
+                }
+            };
+        }
+        // The response describes the leaf, whether this call made it or found it.
+        let leaf = created.unwrap_or(current);
+        Ok(StorageResponse::Created(
+            self.object_result(context, &leaf)?,
+        ))
+    }
+
+    /// Resolve one child, reporting absence as `None` rather than an error.
+    fn existing_child(
+        &self,
+        context: &mut OpsContext<'_>,
+        parent: &PinnedObject,
+        name: &ComponentName,
+    ) -> Result<Option<PinnedObject>> {
+        match self.child(context, parent, name, "create_parents") {
+            Ok(pinned) => Ok(Some(pinned)),
+            Err(error) if error.kind == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn rename(
         &self,
         context: &mut OpsContext<'_>,
@@ -585,6 +652,56 @@ impl Operations {
             NamespaceOutcome::AttributesSet(_) => Ok(()),
             _ => unreachable!("apply proves the outcome kind matches the mutation"),
         }
+    }
+
+    /// Truncate through SETATTR, holding an open with WRITE access for it.
+    ///
+    /// The open exists solely to authorise the SETATTR: RFC 7530 §16.32 requires
+    /// an open stateid with WRITE access to set `FATTR4_SIZE`. It is closed
+    /// either way, and a CLOSE failure never replaces the truncation's own error.
+    fn truncate(
+        &self,
+        context: &mut OpsContext<'_>,
+        path: &StoragePath,
+        object: &PinnedObject,
+        len: u64,
+        operation: &str,
+    ) -> Result<()> {
+        let (parent, name) = self.parent_and_name(context, path, operation)?;
+        let deadline = context.deadline;
+        let (owners, _) = require_owners(&mut context.mutations, operation)?;
+        let open = OpenObject::open(
+            owners,
+            &mut *context.transport,
+            &parent,
+            &name,
+            CreateDisposition::OpenExisting,
+            ShareAccess::WRITE,
+            deadline,
+        )
+        .map_err(|error| error.to_umbra(operation))?;
+        let stateid = match open.stateid() {
+            Ok(stateid) => stateid,
+            Err(error) => {
+                let _ = open.close(&mut *context.transport, deadline);
+                return Err(error.to_umbra(operation));
+            }
+        };
+        let outcome = self.attributes(
+            context,
+            NamespaceMutation::Truncate {
+                object: object.handle().clone(),
+                target: object.identity(),
+                len,
+                stateid,
+            },
+            operation,
+        );
+        if outcome.is_err() {
+            let _ = open.close(&mut *context.transport, deadline);
+            return outcome;
+        }
+        release(open, &mut *context.transport, deadline, operation)
     }
 
     fn remove(
@@ -757,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn creating_a_run_is_deferred_rather_than_reported_as_created() {
+    fn creating_a_run_that_already_exists_is_refused_rather_than_reopened() {
         let (mut fake, _) = fixture::server();
         let mut ask = fixture::open_run_request();
         ask.intent = OpenRunIntent::CreateNew;
@@ -769,7 +886,9 @@ mod tests {
             Deadline { millis: 5_000 },
         )
         .unwrap_err();
-        assert_eq!(error.kind, ErrorKind::NotImplemented);
+        // `CreateNew` over an existing run is a collision. Reopening it would
+        // hand the caller someone else's run under the name it asked to create.
+        assert_eq!(error.kind, ErrorKind::AlreadyExists);
     }
 
     #[test]

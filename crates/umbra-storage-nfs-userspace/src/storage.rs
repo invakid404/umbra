@@ -1,10 +1,21 @@
-//! Provider scaffold: configuration and the synchronous [`Storage`] surface.
+//! The provider: configuration, product admission and the synchronous
+//! [`Storage`] surface.
 //!
-//! Every contract method is wired to its facade seam and then stops at the M1
-//! gate. A method whose semantics this provider will never offer answers
+//! A method whose semantics this provider will never offer answers
 //! [`ErrorKind::UnsupportedCapability`]; a method that is authorised but not yet
 //! implemented answers [`ErrorKind::NotImplemented`] naming the node that owns it.
 //! Nothing here reports a success it did not perform.
+//!
+//! # Admission comes first
+//!
+//! [`NfsUserspaceStorage::open_run`] establishes a client incarnation, resolves
+//! the run's anchors, and then acquires product admission through
+//! [`session::Session`](crate::session::Session) **before** it publishes a
+//! [`RunBinding`]. A denied session gets an error and no binding, so
+//! one-session-one-Umbra is a property of the type flow rather than a rule a
+//! caller is asked to respect. `close_run` releases cooperatively; a release that
+//! cannot be proven clean keeps the marker held rather than freeing the run over
+//! unsettled I/O.
 
 use serde::{Deserialize, Serialize};
 use umbra_core::provider::decode;
@@ -15,9 +26,13 @@ use umbra_core::{
 };
 use umbra_storage::{AcquireWriterRequest, DurabilityReceipt, Storage};
 
+use crate::authority::admission::OutstandingIo;
+use crate::authority::marker::WriterToken;
 use crate::ops::{Operations, OpsContext};
 use crate::replay::ReplayLog;
-use crate::transport::{Deadline, RawTransport, WireProfile};
+use crate::session::Session;
+use crate::state::ProtocolState;
+use crate::transport::{Deadline, RawTransport, Verifier, WireProfile};
 
 /// Provider id under which this backend registers. Distinct from the mounted
 /// `nfs` adapter, which stays the qualified fallback.
@@ -133,6 +148,22 @@ pub struct NfsUserspaceStorage {
     transport: Option<Box<dyn RawTransport>>,
     replay: Option<Box<dyn ReplayLog>>,
     operations: Option<Operations>,
+    /// Umbra-owned NFSv4.0 client state: client id, open owners, seqids, lease.
+    state: ProtocolState,
+    /// Puts namespace mutations on the wire. Held as a field so a request can
+    /// borrow it alongside the transport instead of creating one whose lifetime
+    /// would end inside the call that built the context.
+    dispatcher: crate::namespace::dispatch::TransportDispatcher,
+    /// This provider session's writer identity.
+    ///
+    /// `OpenRunRequest` names no writer, so the session is the writer: admission
+    /// is per Umbra process, which is what one-session-one-Umbra means. A second
+    /// process gets a different id and is denied by the marker rather than
+    /// sharing this one's authority.
+    writer_id: umbra_core::WriterId,
+    /// Product admission for the open run. `Some` exactly while a run is open,
+    /// because a run that opened without admission is unrepresentable.
+    session: Option<Session>,
     /// Serial of the next run session, folded into every issued
     /// [`StorageHandle`](umbra_core::StorageHandle) so a token from a closed run
     /// cannot be replayed against the next one.
@@ -146,6 +177,7 @@ impl std::fmt::Debug for NfsUserspaceStorage {
             .field("transport_bound", &self.transport.is_some())
             .field("replay_bound", &self.replay.is_some())
             .field("run_open", &self.operations.is_some())
+            .field("admitted", &self.session.is_some())
             .finish()
     }
 }
@@ -157,11 +189,18 @@ impl NfsUserspaceStorage {
     /// work and is not authorised at this gate.
     pub fn connect(config: NfsUserspaceConfig) -> Result<Self> {
         config.validate()?;
+        let instance = NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state = ProtocolState::new(client_identity(&config, instance));
+        let config_for_writer = config.clone();
         Ok(Self {
             config,
             transport: None,
             replay: None,
             operations: None,
+            state,
+            dispatcher: crate::namespace::dispatch::TransportDispatcher::new(),
+            writer_id: writer_id(&config_for_writer, instance),
+            session: None,
             serial: 0,
         })
     }
@@ -180,11 +219,18 @@ impl NfsUserspaceStorage {
             .wire_profile()
             .check()
             .map_err(|error| crate::error::FacadeError::Transport(error).to_umbra("connect"))?;
+        let instance = NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state = ProtocolState::new(client_identity(&config, instance));
+        let config_for_writer = config.clone();
         Ok(Self {
             config,
             transport: Some(transport),
             replay: Some(replay),
             operations: None,
+            state,
+            dispatcher: crate::namespace::dispatch::TransportDispatcher::new(),
+            writer_id: writer_id(&config_for_writer, instance),
+            session: None,
             serial: 0,
         })
     }
@@ -232,6 +278,20 @@ impl NfsUserspaceStorage {
         self.operations.as_ref()
     }
 
+    /// The Umbra-owned protocol state: client id, open owners, seqids, lease.
+    pub fn state(&mut self) -> &mut ProtocolState {
+        &mut self.state
+    }
+
+    /// Product admission for the open run, when one is open.
+    ///
+    /// `None` whenever no run is open. There is no state in which a run is open
+    /// and this is `None`: `open_run` publishes a binding only after admission is
+    /// granted, and `close_run` drops both together.
+    pub fn admission(&self) -> Option<&Session> {
+        self.session.as_ref()
+    }
+
     /// Borrow the three pieces one request needs, or report what is missing.
     ///
     /// Taken together rather than through three accessors because a request needs
@@ -239,7 +299,12 @@ impl NfsUserspaceStorage {
     /// `mutations` is always `None` here: a mutation needs open owners from a
     /// confirmed client incarnation, and establishing one is `authority_recovery`'s
     /// work, not this method's.
-    fn request(&mut self, operation: &str) -> Result<(&Operations, OpsContext<'_>)> {
+    fn request(
+        &mut self,
+        operation: &str,
+        key: Option<&umbra_core::IdempotencyKey>,
+        operation_id: umbra_core::OperationId,
+    ) -> Result<(&Operations, OpsContext<'_>)> {
         let deadline = self.config.deadline;
         let operations = self.operations.as_ref().ok_or_else(|| {
             UmbraError::new(
@@ -262,16 +327,212 @@ impl NfsUserspaceStorage {
                 "no replay facade is bound to this provider",
             )
         })?;
+        // Writer authority is exactly the admission `open_run` acquired. Without
+        // it there is no mutation context at all, so the operations surface
+        // reports the authority gate rather than dispatching.
+        let create_verifier = key.map(|key| {
+            self.state
+                .create_verifiers()
+                .verifier_for(key, operation_id)
+        });
+        let mutations = self.session.as_ref().and_then(|_| {
+            self.state
+                .incarnation()
+                .map(|incarnation| crate::ops::MutationContext {
+                    owners: incarnation.open_owners(),
+                    create_verifier,
+                    namespace: Some(
+                        &mut self.dispatcher as &mut dyn crate::namespace::NamespaceDispatcher,
+                    ),
+                })
+        });
         Ok((
             operations,
             OpsContext {
                 transport,
                 replay,
-                mutations: None,
+                mutations,
                 deadline,
             },
         ))
     }
+
+    /// Borrow the three pieces an authority call needs.
+    ///
+    /// Returned together for the same reason as [`Self::request`]: each has to
+    /// come out of one `&mut self` without the others being borrowed twice.
+    #[allow(clippy::type_complexity)]
+    fn authority(
+        &mut self,
+        operation: &str,
+    ) -> Result<(
+        &Session,
+        &Operations,
+        &mut dyn RawTransport,
+        &mut ProtocolState,
+    )> {
+        let session = self.session.as_ref().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::InvalidState,
+                operation,
+                "no admission is held; open a run first",
+            )
+        })?;
+        let operations = self.operations.as_ref().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::InvalidState,
+                operation,
+                "no run is open on this provider",
+            )
+        })?;
+        let transport = self.transport.as_deref_mut().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::StorageUnavailable,
+                operation,
+                "no transport facade is bound to this provider",
+            )
+        })?;
+        Ok((session, operations, transport, &mut self.state))
+    }
+
+    /// Release the held admission, keeping it on a release that is not clean.
+    fn release(&mut self, operation: &str, deadline: Deadline) -> Result<()> {
+        let Some(session) = self.session.take() else {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidState,
+                operation,
+                "no admission is held",
+            ));
+        };
+        let Some(operations) = self.operations.as_ref() else {
+            // The run is gone, so the anchors the marker is addressed through are
+            // gone too. Putting the session back is the only safe answer: the
+            // marker stays held rather than being abandoned in an unknown phase.
+            self.session = Some(session);
+            return Err(UmbraError::new(
+                ErrorKind::InvalidState,
+                operation,
+                "no run is open, so the admission marker cannot be addressed",
+            ));
+        };
+        let Some(transport) = self.transport.as_deref_mut() else {
+            self.session = Some(session);
+            return Err(UmbraError::new(
+                ErrorKind::StorageUnavailable,
+                operation,
+                "no transport facade is bound to this provider",
+            ));
+        };
+        // This provider issues one COMPOUND per call and awaits each reply before
+        // returning, so nothing it dispatched is still in flight here. That is
+        // what `Excluded` asserts, and it is asserted because it is true of this
+        // dispatch model, not assumed.
+        match session.release(
+            transport,
+            &mut self.state,
+            operations.anchors(),
+            OutstandingIo::Excluded,
+            operation,
+            deadline,
+        ) {
+            Ok(_) => Ok(()),
+            Err(retained) => {
+                let (session, error) = *retained;
+                self.session = Some(session);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// A discriminator making each provider instance its own NFSv4 client.
+///
+/// RFC 7530 §9.1.1 identifies a client by its id *string*. Two providers sharing
+/// one string are one client to the server, so the second `SETCLIENTID_CONFIRM`
+/// with a different verifier is answered `NFS4ERR_CLID_INUSE` — the server
+/// correctly refusing to let one client silently displace another's state. Two
+/// providers are two clients, so they get two strings.
+static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The client identity this provider instance presents in SETCLIENTID.
+///
+/// Stable for the instance's lifetime, which is what a reconnect needs: a v4.0
+/// `CLAIM_PREVIOUS` reclaim inside the server's grace window works only if the
+/// reconnecting client presents the same id string it held before.
+///
+/// It is deliberately *not* stable across processes. The boot verifier changes on
+/// restart anyway, so a restarted process is a new incarnation that cannot prove
+/// it still owns the old state — and `authority_recovery` denies a restarted
+/// process the admission marker for the same reason.
+fn client_identity(
+    config: &NfsUserspaceConfig,
+    instance: u64,
+) -> crate::state::client_id::ClientIdentity {
+    let label = format!(
+        "umbra:{}:{}:{}:{}:{}:{instance}",
+        String::from_utf8_lossy(&config.host),
+        config.port,
+        String::from_utf8_lossy(config.export.as_bytes()),
+        String::from_utf8_lossy(config.run_parent.as_bytes()),
+        std::process::id(),
+    );
+    crate::integration::identity_for(&label, boot_verifier())
+}
+
+/// A per-process boot verifier.
+///
+/// Uniqueness matters more than unpredictability: its whole job is to tell the
+/// server that this incarnation is not the previous one. Two incarnations that
+/// shared a verifier would be indistinguishable to the server's client table.
+fn boot_verifier() -> Verifier {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    let pid = u64::from(std::process::id());
+    Verifier((nanos ^ pid.rotate_left(32)).to_be_bytes())
+}
+
+/// The token this session records in the run's admission marker.
+///
+/// Derived from the run and writer the caller named, so the same session
+/// re-presenting itself produces the same token. It is an identity, never a
+/// capability: `authority_recovery` denies a held marker *even to the same
+/// token*, so possessing this grants nothing on its own.
+fn writer_token(run: umbra_core::RunId, writer: &umbra_core::WriterId) -> WriterToken {
+    let mut bytes = *run.0.as_bytes();
+    for (slot, byte) in bytes
+        .iter_mut()
+        .zip(writer.0.as_bytes().iter().cycle().take(16))
+    {
+        *slot ^= byte;
+    }
+    WriterToken(bytes)
+}
+
+/// This provider session's writer identity.
+///
+/// Endpoint and layout so two providers pointed at different runs are different
+/// writers, plus the process id so two processes against the *same* run are too
+/// — which is the case admission exists to deny.
+fn writer_id(config: &NfsUserspaceConfig, instance: u64) -> umbra_core::WriterId {
+    umbra_core::WriterId(format!(
+        "{PROVIDER_ID}:{}:{}:{}:{}:{instance}",
+        String::from_utf8_lossy(&config.host),
+        config.port,
+        String::from_utf8_lossy(config.run_parent.as_bytes()),
+        std::process::id(),
+    ))
+}
+
+/// Milliseconds since the epoch, for the lease clock.
+///
+/// The lease clock measures this session's own idleness so it can renew before
+/// the server would drop it. It never decides admission: nothing in
+/// [`Session`](crate::session::Session) reads a clock.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
 impl Storage for NfsUserspaceStorage {
@@ -326,12 +587,81 @@ impl Storage for NfsUserspaceStorage {
                 "no transport facade is bound to this provider",
             )
         })?;
+
+        // A confirmed client incarnation first: the admission marker's opens are
+        // sequenced through this session's open owners, so admission cannot be
+        // taken by a client the server has not confirmed.
+        if self.state.incarnation().is_none() {
+            let root = transport
+                .root_filehandle(deadline)
+                .map_err(|error| error.to_umbra("open_run"))?;
+            let outcome = self
+                .state
+                .establish(transport, &root, now_millis(), deadline);
+            match outcome.error().cloned() {
+                None => {
+                    let incarnation = outcome
+                        .established()
+                        .expect("an outcome carrying no error is established");
+                    self.state.adopt(incarnation);
+                }
+                Some(error) => return Err(error.to_umbra("open_run")),
+            }
+        }
+
         // Failure must not publish a partially usable binding, so the surface is
         // built completely before anything is stored on the provider.
         let operations = Operations::open(transport, &config, request, serial, deadline)?;
+
+        // A newly created run gets the mounted adapter's `.provider` state, so
+        // the run this provider writes is one that adapter can later open.
+        if request.intent == umbra_core::OpenRunIntent::CreateNew {
+            let private = operations.anchors().private().ok_or_else(|| {
+                UmbraError::new(
+                    ErrorKind::InvalidState,
+                    "open_run",
+                    "a created run must have a .provider directory",
+                )
+            })?;
+            let owners = self
+                .state
+                .incarnation()
+                .ok_or_else(|| {
+                    UmbraError::new(
+                        ErrorKind::InvalidState,
+                        "open_run",
+                        "creating run state needs open owners from a confirmed incarnation",
+                    )
+                })?
+                .open_owners();
+            crate::anchor::provision_private_state(
+                transport,
+                owners,
+                private,
+                request.run_id,
+                &request.immutable_base,
+                FORMAT_VERSION,
+                deadline,
+            )?;
+        }
+
+        // Product admission, before the binding exists. A denial returns here and
+        // leaves `self.operations` untouched, so the caller has nothing to use.
+        let writer = self.writer_id.clone();
+        let session = Session::admit(
+            transport,
+            &mut self.state,
+            operations.anchors(),
+            request.run_id,
+            writer.clone(),
+            writer_token(request.run_id, &writer),
+            deadline,
+        )?;
+
         let binding = operations.binding();
         self.serial = self.serial.saturating_add(1);
         self.operations = Some(operations);
+        self.session = Some(session);
         Ok(binding)
     }
 
@@ -344,20 +674,65 @@ impl Storage for NfsUserspaceStorage {
                 "takeover requires independently confirmed termination",
             );
         }
-        gated("acquire_writer", "authority-recovery")
+        // Admission is acquired by `open_run`, not here: a run this provider has
+        // open is a run it was already admitted to. This method hands back the
+        // lease for that admission, and refuses to invent one for a different
+        // run or a different writer.
+        let session = self.session.as_ref().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::InvalidState,
+                "acquire_writer",
+                "no run is open on this provider, so no admission is held",
+            )
+        })?;
+        let lease = session.lease();
+        if lease.run_id != request.run_id {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidInput,
+                "acquire_writer",
+                "this provider holds admission for a different run",
+            ));
+        }
+        if lease.writer_id != request.writer_id {
+            // The marker names one writer. Handing this lease to a different
+            // writer id would report an admission that writer never obtained.
+            return Err(UmbraError::new(
+                ErrorKind::LeaseLost,
+                "acquire_writer",
+                "the run's admission marker records a different writer",
+            ));
+        }
+        Ok(lease)
     }
 
-    fn renew_writer(&mut self, _lease: &WriterLease) -> Result<WriterLease> {
-        gated("renew_writer", "authority-recovery")
+    fn renew_writer(&mut self, lease: &WriterLease) -> Result<WriterLease> {
+        let deadline = self.config.deadline;
+        let (session, operations, transport, state) = self.authority("renew_writer")?;
+        session.renew(transport, state, operations.anchors(), lease, deadline)
     }
 
-    fn release_writer(&mut self, _lease: &WriterLease) -> Result<()> {
-        gated("release_writer", "authority-recovery")
+    fn release_writer(&mut self, lease: &WriterLease) -> Result<()> {
+        let deadline = self.config.deadline;
+        {
+            let (session, _, _, _) = self.authority("release_writer")?;
+            if session.lease() != *lease {
+                return Err(UmbraError::new(
+                    ErrorKind::LeaseLost,
+                    "release_writer",
+                    "the presented lease is not the one this session holds",
+                ));
+            }
+        }
+        self.release("release_writer", deadline)
     }
 
     fn execute(&mut self, request: &StorageRequest) -> Result<StorageResponse> {
         let operation = crate::capability::operation_name(&request.operation);
-        let (operations, mut context) = self.request(operation)?;
+        let (operations, mut context) = self.request(
+            operation,
+            Some(&request.context.idempotency_key),
+            request.context.operation_id,
+        )?;
         operations.execute(&mut context, request)
     }
 
@@ -368,17 +743,25 @@ impl Storage for NfsUserspaceStorage {
     }
 
     fn close_run(&mut self) -> Result<()> {
-        if self.operations.take().is_none() {
+        if self.operations.is_none() {
             return Err(UmbraError::new(
                 ErrorKind::InvalidState,
                 "close_run",
                 "no run is open on this provider",
             ));
         }
+        let deadline = self.config.deadline;
+        // Release admission before dropping the run, so the next session can
+        // acquire. A release that cannot be proven clean keeps the marker held
+        // and keeps the run open: reporting a clean close over unsettled state
+        // would hand the run to a follow-on session that could overlap this one.
+        if self.session.is_some() {
+            self.release("close_run", deadline)?;
+        }
+        self.operations = None;
         // Every handle this session issued carries its serial, which `open_run`
         // has already advanced, so all of them are now rejected on presentation.
-        // No writer lease is released here: this provider acquires none, and a
-        // close never implies a flush.
+        // A close never implies a flush.
         Ok(())
     }
 
@@ -513,13 +896,43 @@ mod tests {
             storage.close_run().unwrap_err().kind,
             ErrorKind::InvalidState
         );
-        // Writer authority, renewal, release and durability receipts still belong
-        // to `authority_recovery` and still report their gate.
+        // Writer authority is wired to product admission now, and admission is
+        // acquired by `open_run`. With no run open there is no admission to
+        // renew or release, and the error says that rather than naming a gate
+        // that no longer exists.
         for kind in [
+            storage.acquire_writer(&acquire()).unwrap_err().kind,
             storage.renew_writer(&lease()).unwrap_err().kind,
             storage.release_writer(&lease()).unwrap_err().kind,
         ] {
-            assert_eq!(kind, ErrorKind::NotImplemented);
+            assert_eq!(kind, ErrorKind::InvalidState);
+        }
+        // Durability receipts remain unwired: a receipt would assert a
+        // persistence boundary this provider has not qualified.
+        assert_eq!(
+            storage
+                .flush(&FlushRequest {
+                    context: RequestContext {
+                        run_id: RunId(Uuid::nil()),
+                        operation_id: umbra_core::OperationId(Uuid::nil()),
+                        writer_epoch: None,
+                        idempotency_key: umbra_core::IdempotencyKey("k".into()),
+                    },
+                    scope: umbra_core::FlushScope::Data {
+                        objects: Vec::new(),
+                    },
+                })
+                .unwrap_err()
+                .kind,
+            ErrorKind::NotImplemented
+        );
+    }
+
+    fn acquire() -> AcquireWriterRequest {
+        AcquireWriterRequest {
+            run_id: RunId(Uuid::nil()),
+            writer_id: umbra_core::WriterId("writer".into()),
+            takeover: TakeoverPolicy::Refuse,
         }
     }
 

@@ -33,7 +33,7 @@ use umbra_core::{MetadataUpdate, RenameMode, Result};
 
 use crate::capability::{Support, CONTRACTS_REVISION, NO_WIRE_OPERATION};
 use crate::error::{AuthorityError, FacadeError, FacadeResult};
-use crate::handle::{FileHandle, ObjectIdentity};
+use crate::handle::{FileHandle, ObjectIdentity, Stateid};
 use crate::transport::{ComponentName, RawTransport};
 
 /// Which kind of object a REMOVE is expected to unlink.
@@ -111,6 +111,14 @@ pub enum NamespaceMutation {
         target: ObjectIdentity,
         /// The new length in bytes.
         len: u64,
+        /// Stateid of an open holding WRITE access on `object`.
+        ///
+        /// Carried by the mutation rather than configured on the dispatcher
+        /// because RFC 7530 §16.32 requires it *for this operation on this
+        /// object*: a truncation is a write, and a server is entitled to refuse
+        /// one presented with the anonymous stateid. Making it a field means a
+        /// `Truncate` that has not been authorised cannot be constructed.
+        stateid: Stateid,
     },
 }
 
@@ -314,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unbound_dispatcher_names_the_contracts_gap_rather_than_a_capability() {
+    fn an_unbound_dispatcher_names_the_missing_binding_rather_than_a_capability() {
         for mutation in [
             NamespaceMutation::Remove {
                 parent: handle(1),
@@ -338,14 +346,20 @@ mod tests {
                 object: handle(2),
                 target: identity(9),
                 len: 0,
+                stateid: Stateid {
+                    seqid: 1,
+                    other: [3u8; 12],
+                },
             },
         ] {
             let error = apply(None, &mut FakeTransport::new(), &mutation).unwrap_err();
             // Not `UnsupportedCapability`: the syscall matrix marks all of these
             // emulated, so calling them unsupported would understate the design
-            // exactly as calling them supported would overstate it.
+            // exactly as calling them supported would overstate it. A request
+            // with no dispatcher holds no writer authority, and that is a
+            // missing binding rather than a refused capability.
             assert_eq!(error.kind, ErrorKind::NotImplemented, "{mutation:?}");
-            assert!(error.context.contains("Nfs4Op"));
+            assert!(error.context.contains("no namespace dispatcher is bound"));
             assert!(error.context.contains(CONTRACTS_REVISION));
             assert_eq!(error.operation, mutation.operation());
         }
@@ -408,6 +422,10 @@ mod tests {
                 object: handle(2),
                 target: pinned,
                 len: 4,
+                stateid: Stateid {
+                    seqid: 1,
+                    other: [3u8; 12],
+                },
             },
         )
         .unwrap_err();

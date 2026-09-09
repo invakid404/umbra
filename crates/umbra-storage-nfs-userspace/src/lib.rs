@@ -63,6 +63,7 @@ pub mod namespace;
 pub mod ops;
 pub mod pages;
 pub mod replay;
+pub mod session;
 pub mod state;
 pub mod storage;
 pub mod transport;
