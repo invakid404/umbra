@@ -56,10 +56,13 @@ The tested mount is `~/umbra-scratch/nfs/mnt/umbra-nfs`. Configure its absolute 
 
 ### Sandbox profile — parameterised mount path
 
-The historical Seatbelt profile (`experiments/seatbelt/umbra.sb`) uses the literal `/mnt/umbra-nfs`. Runtime rendering, mount-path parameterisation and installation by the Rust tracer are not implemented. The experiment includes two carve-outs beyond the deny-default + read + write-under-mount rules:
+`experiments/seatbelt/umbra.sb` is now a template with a single `{{UMBRA_RUN_ROOT}}` token; the pinned `/mnt/umbra-nfs` literal is gone. The supervisor embeds that template and renders it per run against the opened run's own root (`umbra_supervisor::sandbox`), resolving the root first because Seatbelt matches resolved paths. The macOS backend launches a traced `sandbox-exec` bootstrap, installs the required
+profile, and returns only at the verified target exec stop. It advertises
+`sandboxed-stopped-launch-v1`; inability to prove enforcement fails the launch.
 
-- `(allow mach-priv-task-port (target same-sandbox))` — LLDB launches `debugserver` and the tracee as siblings, so a children-only rule is insufficient.
-- `(allow file-write-data (literal "/dev/null"))` — required by LLDB's `target.disable-stdio` launch path.
+The former LLDB-specific `/dev/null` write and `mach-priv-task-port` same-sandbox
+grants were removed after re-measurement with `sandbox-exec` and debugserver on
+2026-09-09. The shipped profile and required native qualification use no such grants.
 
 **Discovered during:** M0 Gate 3 / Track C. Full context in `docs/m0/gate-3.md`.
 
@@ -67,7 +70,7 @@ The historical Seatbelt profile (`experiments/seatbelt/umbra.sb`) uses the liter
 
 ### Endpoint Security (audit only)
 
-The M0 fail-closed enforcement experiment uses `sandbox-exec`; it is not integrated into the Rust tracer. Endpoint Security can provide an additional audit signal but requires a restricted entitlement from Apple (`com.apple.developer.endpoint-security.client`). Not needed for M0; plan the entitlement request during M3 if the shipping story requires it.
+The Rust tracer integrates fail-closed enforcement through a traced `sandbox-exec` bootstrap. Endpoint Security can provide an additional audit signal but requires a restricted entitlement from Apple (`com.apple.developer.endpoint-security.client`). Not needed for M0; plan the entitlement request during M3 if the shipping story requires it.
 
 ### Rosetta / x86-64 process trees
 

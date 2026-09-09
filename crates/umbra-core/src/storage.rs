@@ -125,6 +125,15 @@ pub enum Fencing {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Storage capabilities.
 pub struct StorageCapabilities {
+    /// Narrowly named qualified behaviors, as open capability strings.
+    ///
+    /// This is the extension point for behavior too specific to deserve a
+    /// boolean: a backend advertises only what it has actually qualified, and a
+    /// consumer requires names rather than recognizing backend identities. Names
+    /// shared across crates live in [`crate::capabilities`]. Defaulting to empty
+    /// keeps older encodings decodable, and an empty set grants nothing.
+    #[serde(default)]
+    pub features: std::collections::BTreeSet<String>,
     /// Durability.
     pub durability: Durability,
     /// Strict remote persistence.

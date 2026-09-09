@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::{cell::RefCell, rc::Rc};
 use umbra_core::{
     provider::{self as wire, protocol_error, Client, Connection, Frame, ProviderDescriptor},
-    MAX_IO_BYTES,
+    ErrorKind, SandboxRequirement, UmbraError, MAX_IO_BYTES,
 };
 
-/// Platform control and ABI methods in protocol version 1.
+/// Platform control and ABI methods in protocol version 2.
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     /// Capabilities.
@@ -73,6 +73,15 @@ pub enum Request {
         /// Result.
         result: EmulatedResult,
     },
+    /// Prepare rewrite.
+    PrepareRewrite {
+        /// Thread.
+        thread: ThreadId,
+        /// Path interpreted according to the enclosing operation and path type.
+        path: BytePath,
+        /// Operation.
+        operation: FsOp,
+    },
 }
 /// Owned method results, including buffers copied only after response validation.
 #[derive(Serialize, Deserialize)]
@@ -93,6 +102,8 @@ pub enum Response {
     Quiesced(QuiescedTree),
     /// Decoded.
     Decoded(Option<FsOp>),
+    /// Prepared.
+    Prepared(PreparedRewrite),
 }
 /// Callback bound to the stopped task by the caller's TraceMemory adapter.
 #[derive(Serialize, Deserialize)]
@@ -218,6 +229,33 @@ impl TraceControl for Control {
     fn terminate(&mut self, process: ProcessHandle, policy: TerminationPolicy) -> Result<()> {
         unit(call(&self.client, &Request::Terminate { process, policy })?)
     }
+    fn prepare_rewrite(
+        &mut self,
+        thread: ThreadId,
+        path: &BytePath,
+        operation: FsOp,
+    ) -> Result<PreparedRewrite> {
+        match call(
+            &self.client,
+            &Request::PrepareRewrite {
+                thread,
+                path: path.clone(),
+                operation: operation.clone(),
+            },
+        )? {
+            Response::Prepared(v)
+                if v.operation.operation == operation
+                    && v.operation.paths.as_slice()
+                        == [umbra_core::PathRewrite {
+                            operand: umbra_core::PathOperand::Path,
+                            path: umbra_core::PhysicalPath(path.clone()),
+                        }] =>
+            {
+                Ok(v)
+            }
+            _ => Err(protocol_error("platform.prepare_rewrite response")),
+        }
+    }
 }
 impl SyscallAbi for Abi {
     fn decode_entry(
@@ -301,7 +339,16 @@ impl SyscallAbi for Abi {
 fn control_request(control: &mut dyn TraceControl, request: Request) -> Result<Response> {
     match request {
         Request::Capabilities => Ok(Response::Capabilities(control.capabilities())),
-        Request::Launch(spec) => control.launch(spec).map(Response::Process),
+        Request::Launch(spec) => {
+            if matches!(spec.sandbox, SandboxRequirement::UnsandboxedExperiment) {
+                return Err(UmbraError::new(
+                    ErrorKind::UnsupportedCapability,
+                    "platform.launch",
+                    "supervised launch requires an installed sandbox",
+                ));
+            }
+            control.launch(spec).map(Response::Process)
+        }
         Request::NextEvent => control.next_event().map(Response::Event),
         Request::ReadMemory { task, address, len } => {
             bounds(address, len as usize)?;
@@ -328,6 +375,13 @@ fn control_request(control: &mut dyn TraceControl, request: Request) -> Result<R
         Request::Terminate { process, policy } => {
             control.terminate(process, policy).map(|()| Response::Unit)
         }
+        Request::PrepareRewrite {
+            thread,
+            path,
+            operation,
+        } => control
+            .prepare_rewrite(thread, &path, operation)
+            .map(Response::Prepared),
         _ => Err(protocol_error("ABI request in control lane")),
     }
 }
@@ -471,7 +525,94 @@ fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> R
 mod tests {
     use super::*;
     use std::{os::unix::net::UnixStream, time::Duration};
-    use umbra_core::{Architecture, TaskIdentity, UmbraError};
+    use umbra_core::{Architecture, TaskIdentity};
+
+    #[test]
+    fn prepared_response_must_match_the_requested_operation_and_single_path() {
+        use umbra_core::{PathOperand, PathRewrite, PhysicalOperation, PhysicalPath};
+        for mismatch in 0..6 {
+            let path = BytePath::new(b"/shadow/file".to_vec()).unwrap();
+            let operation = FsOp::GetCwd;
+            let requested_path = path.clone();
+            let requested_operation = operation.clone();
+            let (left, right) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut connection = Connection::new(right, Duration::from_secs(2));
+                connection.begin();
+                let Frame::Request { id, payload } = connection.receive_request().unwrap() else {
+                    panic!("request");
+                };
+                let Request::PrepareRewrite {
+                    path, operation, ..
+                } = wire::decode(&payload).unwrap()
+                else {
+                    panic!("prepare");
+                };
+                assert_eq!(path, requested_path);
+                assert_eq!(operation, requested_operation);
+                let mut plan = PreparedRewrite {
+                    operation: PhysicalOperation {
+                        operation,
+                        paths: vec![PathRewrite {
+                            operand: PathOperand::Path,
+                            path: PhysicalPath(path),
+                        }],
+                    },
+                    arguments: vec![],
+                    memory_writes: vec![],
+                };
+                match mismatch {
+                    0 => {}
+                    1 => {
+                        plan.operation.operation = FsOp::Close {
+                            fd: umbra_core::TracedFd(9),
+                        }
+                    }
+                    2 => {
+                        plan.operation.paths[0].path =
+                            PhysicalPath(BytePath::new(b"/wrong".to_vec()).unwrap())
+                    }
+                    3 => plan.operation.paths.clear(),
+                    4 => plan.operation.paths.push(plan.operation.paths[0].clone()),
+                    5 => plan.operation.paths[0].operand = PathOperand::Source,
+                    _ => unreachable!(),
+                }
+                connection
+                    .send(&Frame::Response {
+                        id,
+                        result: wire::encode(&Response::Prepared(plan)),
+                    })
+                    .unwrap();
+            });
+            let client = Rc::new(RefCell::new(Client::from_connection(
+                Connection::new(left, Duration::from_secs(2)),
+                wire::Welcome {
+                    id: "fake".into(),
+                    role: "platform".into(),
+                    version: wire::PROTOCOL_VERSION,
+                    capabilities: Default::default(),
+                },
+            )));
+            let mut control = Control {
+                client,
+                capabilities: Default::default(),
+            };
+            let result = control.prepare_rewrite(
+                ThreadId(TaskIdentity {
+                    native_id: 1,
+                    generation: 1,
+                }),
+                &path,
+                operation,
+            );
+            if mismatch == 0 {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().kind, ErrorKind::ProtocolMismatch);
+            }
+            worker.join().unwrap();
+        }
+    }
     struct FakeControl;
     impl TraceBackend for FakeControl {
         fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
@@ -576,6 +717,21 @@ mod tests {
             .decode_entry(&regs, &mut ReadThrough(&mut control))
             .unwrap();
         assert!(matches!(decoded, Some(FsOp::GetCwd)));
+        let refused = control
+            .launch(LaunchSpec {
+                executable: umbra_core::BytePath::new(b"/bin/true".to_vec()).unwrap(),
+                argv: vec![b"/bin/true".to_vec()],
+                environment: vec![],
+                cwd: umbra_core::BytePath::new(b"/".to_vec()).unwrap(),
+                policy: umbra_core::LaunchPolicy {
+                    persistence: umbra_core::PersistencePolicy::LocalDevelopment,
+                    inherited_fds: vec![],
+                },
+                sandbox: SandboxRequirement::UnsandboxedExperiment,
+            })
+            .unwrap_err();
+        // FakeControl would return NotImplemented if dispatch reached it.
+        assert_eq!(refused.kind, ErrorKind::UnsupportedCapability);
         assert!(control.next_event().is_err()); // A structured backend error does not poison the stream.
         drop(abi);
         drop(control);

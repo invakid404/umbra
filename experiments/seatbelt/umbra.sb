@@ -4,22 +4,21 @@
 
 ;; No read exclusions. Includes executable mappings and metadata reads.
 (allow file-read*)
-(allow file-write* (subpath "/mnt/umbra-nfs"))
-;; Required by LLDB's target.disable-stdio launch path (measured EPERM without
-;; it). This character-device sink persists no filesystem data. No create,
-;; unlink, metadata mutation, or other device writes are permitted here.
-(allow file-write-data (literal "/dev/null"))
-
+;; The UMBRA_RUN_ROOT token below is a template placeholder, not policy syntax.
+;; The supervisor replaces it with one complete, quoted Seatbelt literal naming the
+;; opened run's own root binding (`<store>/<run-id>/root`), so this is the only
+;; persistent write allowance and it never covers the whole backing store, a
+;; sibling run, control/, or the base snapshot. Rendering fails if the token is
+;; absent, appears more than once, or the template contains an unknown token.
+(allow file-write* (subpath {{UMBRA_RUN_ROOT}}))
+;; 2026-09-09: sandbox-exec + debugserver qualification passes without either
+;; /dev/null file-write-data or mach-priv-task-port same-sandbox. The sandbox
+;; pair and IPC capture pass with both grants absent; debugger is outside this
+;; installed tracee sandbox. Do not restore the superseded LLDB allowances.
 (allow process-fork)
 (allow process-exec)
 (allow signal (target self) (target children))
 (allow sysctl-read)
-;; LLDB launches debugserver and the twin as siblings. The measured denial is
-;; "mach-priv-task-port same-sandbox"; children-only would miss this relation.
-;; This allows debugger task-port requests within this sandbox, not host tasks.
-;; AMFI/get-task-allow checks still apply independently.
-(allow mach-priv-task-port (target same-sandbox))
-
 ;; M0 agents need network access (APIs, package downloads, debugger loopback).
 ;; This is a filesystem guard, not a network/exfiltration boundary.
 (allow network*)

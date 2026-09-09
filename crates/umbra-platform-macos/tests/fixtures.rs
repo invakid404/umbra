@@ -39,6 +39,10 @@ fn fixture_argv(
         std::env::var_os("UMBRA_TEST_FIXTURE_PATH"),
         std::env::var_os("UMBRA_TEST_REDIRECT_ROOT"),
     ) else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT"
+        );
         eprintln!("SKIP {case}: set UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT");
         return;
     };
@@ -66,6 +70,10 @@ fn fixture_argv(
                 persistence: PersistencePolicy::LocalDevelopment,
                 inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
             },
+            // Direct tracer coverage, deliberately without enforcement: these
+            // cases measure interception, not the sandbox boundary. `umbra run`
+            // cannot select this; it always renders and requires a profile.
+            sandbox: SandboxRequirement::UnsandboxedExperiment,
         })
         .unwrap();
     let mut live = 1;
@@ -466,6 +474,10 @@ fn overlay_fixture(
         std::env::var_os("UMBRA_TEST_FIXTURE_PATH"),
         std::env::var_os("UMBRA_TEST_REDIRECT_ROOT"),
     ) else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT"
+        );
         eprintln!("SKIP {case}: set UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT");
         return;
     };
@@ -503,6 +515,7 @@ fn overlay_fixture(
         context: request(binding.run_id, Some(lease.epoch)),
         recovery: recovery(binding.run_id),
         binding,
+        lease,
     };
     let mut overlay = Overlay::new(Box::new(shadow), Box::new(journal));
     overlay.bind(config, Box::new(base)).unwrap();
@@ -520,6 +533,7 @@ fn overlay_fixture(
             executable: byte_path(&fixture),
             argv: vec![bytes(&fixture), option.as_bytes().to_vec(), root.to_vec()],
             environment: vec![],
+            sandbox: SandboxRequirement::UnsandboxedExperiment,
             cwd: byte_path(&std::env::current_dir().unwrap()),
             policy: LaunchPolicy {
                 persistence: PersistencePolicy::LocalDevelopment,

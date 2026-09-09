@@ -14,6 +14,8 @@ struct Log {
     records: Vec<JournalRecord>,
     fail_prepare: bool,
     fail_commit: bool,
+    fail_close: bool,
+    closes: usize,
 }
 struct MemoryJournal {
     log: Arc<Mutex<Log>>,
@@ -65,6 +67,11 @@ impl Journal for MemoryJournal {
         Ok(checkpoint.id)
     }
     fn close(&mut self) -> Result<()> {
+        let mut log = self.log.lock().unwrap();
+        log.closes += 1;
+        if log.fail_close {
+            return Err(error(ErrorKind::Io, "injected close failure"));
+        }
         Ok(())
     }
 }
@@ -130,8 +137,50 @@ struct Fixture {
     log: Arc<Mutex<Log>>,
     _dirs: [TempDir; 2],
 }
+
+struct BadReceipt {
+    inner: LocalStorage,
+    mismatch: u8,
+}
+impl Storage for BadReceipt {
+    fn capabilities(&self) -> StorageCapabilities {
+        self.inner.capabilities()
+    }
+    fn open_run(&mut self, request: &OpenRunRequest) -> Result<RunBinding> {
+        self.inner.open_run(request)
+    }
+    fn acquire_writer(&mut self, request: &AcquireWriterRequest) -> Result<WriterLease> {
+        self.inner.acquire_writer(request)
+    }
+    fn renew_writer(&mut self, lease: &WriterLease) -> Result<WriterLease> {
+        self.inner.renew_writer(lease)
+    }
+    fn release_writer(&mut self, lease: &WriterLease) -> Result<()> {
+        self.inner.release_writer(lease)
+    }
+    fn execute(&mut self, request: &StorageRequest) -> Result<StorageResponse> {
+        self.inner.execute(request)
+    }
+    fn close_run(&mut self) -> Result<()> {
+        self.inner.close_run()
+    }
+    fn flush(&mut self, request: &FlushRequest) -> Result<DurabilityReceipt> {
+        let mut receipt = self.inner.flush(request)?;
+        match self.mismatch {
+            0 => receipt.run_id = RunId(Uuid::new_v4()),
+            1 => receipt.writer_epoch = LeaseEpoch(receipt.writer_epoch.0 + 1),
+            2 => receipt.durability = Durability::None,
+            _ => unreachable!(),
+        }
+        Ok(receipt)
+    }
+}
+
 impl Fixture {
     fn new(files: &[(&[u8], &[u8])]) -> Self {
+        Self::with_bad_receipt(files, None)
+    }
+    fn with_bad_receipt(files: &[(&[u8], &[u8])], mismatch: Option<u8>) -> Self {
         let base_dir = tempfile::tempdir().unwrap();
         let shadow_dir = tempfile::tempdir().unwrap();
         let (mut base, base_binding, base_lease) = open_storage(&base_dir);
@@ -161,8 +210,16 @@ impl Fixture {
             context: context(binding.run_id, Some(lease.epoch)),
             recovery: recovery(binding.run_id),
             binding,
+            lease,
         };
-        let mut overlay = Overlay::new(Box::new(shadow), Box::new(journal));
+        let storage: Box<dyn Storage> = match mismatch {
+            Some(mismatch) => Box::new(BadReceipt {
+                inner: shadow,
+                mismatch,
+            }),
+            None => Box::new(shadow),
+        };
+        let mut overlay = Overlay::new(storage, Box::new(journal));
         overlay.bind(config, Box::new(base)).unwrap();
         let process = ProcessContext {
             task: TaskId(TaskIdentity {
@@ -1377,5 +1434,79 @@ fn symlink_cwd_and_dirfd_anchors_are_resolved_before_identity_checks() {
             .unwrap_err()
             .kind,
         ErrorKind::StaleHandle
+    );
+}
+
+#[test]
+fn failed_completion_cleanup_is_terminal_and_is_not_repeated() {
+    let mut f = Fixture::new(&[]);
+    let run_id = f.overlay.config().unwrap().binding.run_id;
+    f.log.lock().unwrap().fail_close = true;
+    let e = f
+        .overlay
+        .finish_run(&FinishRunRequest {
+            run_id,
+            root_status: Some(ExitStatus::Code(0)),
+            processes_exited: 1,
+        })
+        .unwrap_err();
+    assert!(e.context.contains("journal close after durable completion"));
+    assert!(f.overlay.poisoned);
+    assert!(f.overlay.config.is_none());
+    assert!(f.overlay.base.is_none());
+    assert!(f.overlay.renew_writer().is_err());
+    f.overlay
+        .fail_run(&FailedRunRequest {
+            run_id,
+            reason: e.to_string(),
+            tree_terminated: true,
+        })
+        .unwrap();
+    assert_eq!(f.log.lock().unwrap().closes, 1);
+}
+
+#[test]
+fn invalid_completion_receipts_never_publish_completion_or_release_authority() {
+    for mismatch in 0..3 {
+        let mut f = Fixture::with_bad_receipt(&[], Some(mismatch));
+        let run_id = f.overlay.config().unwrap().binding.run_id;
+        let e = f
+            .overlay
+            .finish_run(&FinishRunRequest {
+                run_id,
+                root_status: Some(ExitStatus::Code(0)),
+                processes_exited: 1,
+            })
+            .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::ProtocolMismatch);
+        assert!(f.overlay.completed_run.is_none());
+        assert!(f.overlay.config.is_some());
+        assert!(f.log.lock().unwrap().records.iter().all(|r| !matches!(
+            r.payload,
+            JournalPayload::Lifecycle(JournalLifecycle::RunCompleted { .. })
+        )));
+        assert_eq!(f.log.lock().unwrap().closes, 0);
+        // Pre-completion failure still permits the ordinary failure cleanup.
+        f.overlay
+            .fail_run(&FailedRunRequest {
+                run_id,
+                reason: e.to_string(),
+                tree_terminated: true,
+            })
+            .unwrap();
+        assert_eq!(f.log.lock().unwrap().closes, 1);
+    }
+}
+
+#[test]
+fn renewal_failure_latches_and_a_poisoned_session_cannot_renew() {
+    let mut f = Fixture::new(&[]);
+    let lease = f.overlay.config().unwrap().lease.clone();
+    f.overlay.storage.release_writer(&lease).unwrap();
+    assert!(f.overlay.renew_writer().is_err());
+    assert!(f.overlay.poisoned);
+    assert_eq!(
+        f.overlay.renew_writer().unwrap_err().kind,
+        ErrorKind::InvalidState
     );
 }
