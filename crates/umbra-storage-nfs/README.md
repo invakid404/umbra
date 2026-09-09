@@ -74,9 +74,10 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
   ("persistence outcome unknown; entry changed during barrier") and retains
   the failure. This is the intended contract, covered by
   `native::tests::concurrent_external_write_during_barrier_is_rejected_and_retained`.
-  A completed OS `sync_all` returns `Durability::Local` with evidence stating
-  that NFS WRITE/COMMIT and verifier recovery belong to the kernel and cannot be independently
-  checked through `File`, and remote stable storage is unqualified. Local does
+  Only a completed OS sync barrier with all final checks passing returns
+  `Durability::Local`. Its evidence states that NFS WRITE/COMMIT and verifier
+  recovery belong to the kernel and cannot be independently checked through
+  `File`, and remote stable storage is unqualified. Local does
   not promise a durable client replica. There is no separate COMMIT RPC,
   `fdatasync` follow-up, or qualified Remote mode.
   The existing stronger `Durability::Remote` would require a qualified client,
