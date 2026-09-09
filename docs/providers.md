@@ -1,6 +1,6 @@
 # Runtime providers
 
-Build installed executables with `cargo build --workspace --bins`. Each of the eight
+Build installed executables with `cargo build --workspace --bins`. Each of the nine
 implementation packages supplies a `provider.json` installation template. Copy the
 selected descriptors into a JSON registry keyed by contract role, set each executable
 to an explicit absolute path, and configure opaque options. No PATH scan or Rust backend
@@ -32,6 +32,12 @@ Alternative namespace providers can decode the core
 through the contracts re-exported by overlay, and inject their own engine. This avoids
 opening duplicate role sessions in CLI assembly.
 
+Storage-nfs-userspace is a scaffold: its descriptor connects and handshakes, and every
+storage method then reports `NotImplemented` or `UnsupportedCapability`. It needs no mount,
+because it speaks NFSv4.0 from user space; it exposes opaque handles and no physical path,
+so `umbra run` cannot select it. See its
+[README](../crates/umbra-storage-nfs-userspace/README.md).
+
 Storage-local and storage-nfs options encode a physical-root BytePath as JSON byte arrays.
 Storage-tar options encode an absolute archive filename BytePath in the same format.
 Its parent directory must exist; no mount, service, or environment variables are needed.
@@ -40,6 +46,7 @@ Its parent directory must exist; no mount, service, or environment variables are
 | --- | --- | --- |
 | `local` | Local directory | Local filesystem |
 | `nfs` | Existing NFSv4 mount root | Client fsync; remote durability unqualified |
+| `nfs-userspace` | JSON `NfsUserspaceConfig` (server host/port, server-relative export and run parent, anchors, deadline) | None; interfaces are frozen and no I/O is wired |
 | `tar` | Absolute tar archive filename | Indexed run with persistent staging; flush publishes a locally fsynced tar. Retry budget allows ~3 MiB cumulative written bytes per archive for three-digit byte values (capacity varies with payload/metadata); not reclaimed by flush or reopen. |
 
 For tar, use `crates/umbra-storage-tar/provider.json` and the

@@ -1,0 +1,10 @@
+# umbra run layout, format version 1
+# <path>	<kind>	<mode>
+<run>	dir	0o700
+<run>/control	dir	0o700
+<run>/root	dir	0o700
+<run>/.provider	dir	0o700
+<run>/.provider/epoch	file	0o600
+<run>/.provider/manifest	file	0o600
+<run>/.provider/retries	dir	0o700
+<run>/.provider/writer.lock	file	0o600
