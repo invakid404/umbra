@@ -197,7 +197,9 @@ provider that does not implement them cannot be handed a run:
   the session poisoned, and an already-poisoned session refuses renewal.
 - `finish_run` durably completes a fresh command run: flush run data, append and
   flush a `RunCompleted` record, close the journal, release the writer, close
-  storage. Once completion is durable, the session is terminal: each cleanup
+  storage. The storage flush receipt must match the run and writer epoch and
+  report non-None durability before completion is recorded. Once completion is
+  durable, the session is terminal: each cleanup
   stage is attempted once, errors retain stage context, and bindings are cleared.
   A subsequent `fail_run` does not repeat those closed stages. Failures before
   durable completion retain the binding for `fail_run` cleanup. A receipt is

@@ -331,7 +331,7 @@ impl Journal for FileJournal {
                 return Err(error(
                     ErrorKind::UnsupportedCapability,
                     "journal_file.open",
-                    "journal log exceeds the supported replay size",
+                    "journal log is full: its size exceeds the replay limit",
                 ));
             }
             let mut magic = [0u8; 8];

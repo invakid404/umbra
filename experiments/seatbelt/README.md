@@ -74,31 +74,16 @@ operation or durability; inspect the recorded mount table.
 | --- | --- |
 | File reads | `file-read*` globally, with no exclusions; host Unix permissions and other security policies still apply |
 | Persistent filesystem writes | `file-write*` only under the single rendered run root |
-| Runtime device writes | `file-write-data` only to literal `/dev/null` |
 | Process launch | `process-fork`, `process-exec` |
 | Signals | Self and children |
 | System information | `sysctl-read` |
 | Mach lookups | Seven named basic system services, listed explicitly in the profile |
-| Debugger task ports | `mach-priv-task-port` only for `target same-sandbox` |
 | Network | `network*`, permissive for M0 agent APIs, downloads, and debugger transport |
 | Everything else | Denied by default |
 
-The `/dev/null` carve-out is a character-device data sink, not persistent storage.
-It is required by LLDB's `target.disable-stdio` launch path on this machine:
-without it, launch fails with `Operation not permitted` and a corresponding
-`file-write-data /dev/null` denial. The rule grants no create, unlink, or metadata
-mutation rights there. No `/tmp`, `/private/var/folders`, home-directory, cache,
-PTY, or `/dev/dtracehelper` write allowance was added. Tools that need writable
-runtime directories must use paths under the rendered run root; broad tool
-usability is not established by these probes.
-
-The task-port rule addresses an observed
-`mach-priv-task-port same-sandbox [ls-c-test(...)]` denial. LLDB launches the twin
-and `debugserver` as siblings, so a children-only rule is insufficient. This
-rule grants no task-port access to host processes outside the sandbox and does
-not replace signing/AMFI checks. Apple documents the separate relationship
-between debugger and get-task-allow entitlements in its
-[debugging entitlement reference](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger).
+The current profile has no device-write or debugger task-port grants. Tools that
+need writable runtime directories must use paths under the rendered run root;
+broad tool usability is not established by these probes.
 
 Network access and the named system-service IPC mean this is an M0 filesystem
 policy, not a complete boundary against exfiltration or service-mediated effects.
@@ -177,8 +162,9 @@ error: shell expansion failed (reason: Operation not permitted). consider launch
 
 `process launch -X false` avoids that dependency. With terminal allocation
 disabled, the next measured blocker was `/dev/null`; allowing its data writes
-exposed the same-sandbox task-port denial. The final profile includes both
-measured rules. Evidence before and after is in
+exposed the same-sandbox task-port denial. The historical LLDB profile included both
+measured rules; the shipped template no longer grants either. Evidence from that
+earlier qualification is in
 [sandbox-outside-violations.log](results/sandbox-outside-violations.log),
 [sandbox-outside-null-violations.log](results/sandbox-outside-null-violations.log),
 and [sandbox-outside-task-port-violations.log](results/sandbox-outside-task-port-violations.log).

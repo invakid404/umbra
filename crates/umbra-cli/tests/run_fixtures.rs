@@ -36,6 +36,52 @@ impl Drop for RunDirectory {
     }
 }
 
+// Arm cleanup without parsing before the status assertion. On a failed run,
+// Drop uses any prepared ID emitted before the error; a preparation failure
+// without an ID still reports its original stderr and touches no shared run.
+struct RunOutputCleanup<'a> {
+    store: &'a Path,
+    stderr: &'a str,
+}
+impl Drop for RunOutputCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = prepared_id(self.stderr).and_then(|id| uuid::Uuid::parse_str(id).ok()) {
+            drop(RunDirectory(self.store.join(id.to_string())));
+        }
+    }
+}
+
+fn prepared_id(stderr: &str) -> Option<&str> {
+    stderr.lines().find_map(|line| {
+        line.strip_prefix("umbra: run ")
+            .and_then(|line| line.strip_suffix(" prepared"))
+    })
+}
+
+#[test]
+fn failed_status_keeps_diagnostics_and_cleans_only_the_reported_run() {
+    let store = tempfile::tempdir().unwrap();
+    let id = uuid::Uuid::new_v4();
+    let run = store.path().join(id.to_string());
+    std::fs::create_dir(&run).unwrap();
+    for stderr in [
+        "mount qualification failed".to_owned(),
+        format!("umbra: run {id} prepared\nchild failed"),
+    ] {
+        let panic = std::panic::catch_unwind(|| {
+            let _cleanup = RunOutputCleanup {
+                store: store.path(),
+                stderr: &stderr,
+            };
+            panic!("{stderr}");
+        })
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<String>().unwrap(), &stderr);
+        assert_eq!(run.exists(), !stderr.contains(" prepared"));
+    }
+    assert!(store.path().exists());
+}
+
 fn matrix(nfs: bool) {
     let Some(fixture) = input("UMBRA_TEST_FIXTURE_PATH") else {
         return;
@@ -111,17 +157,15 @@ fn matrix(nfs: bool) {
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let id = stderr
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("umbra: run ")
-                    .and_then(|line| line.strip_suffix(" prepared"))
-            })
-            .expect("prepared run ID");
+        let _output_cleanup = RunOutputCleanup {
+            store: &store,
+            stderr: &stderr,
+        };
+        assert!(output.status.success(), "{case}: {stderr}");
+        let id = prepared_id(&stderr).expect("prepared run ID");
         let id = uuid::Uuid::parse_str(id).unwrap();
         let run_dir = store.join(id.to_string());
         let _cleanup = RunDirectory(run_dir.clone());
-        assert!(output.status.success(), "{case}: {stderr}");
         assert!(!destination.exists(), "host destination created for {case}");
         let shadow = run_dir
             .join("root")

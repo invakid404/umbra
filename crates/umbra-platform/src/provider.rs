@@ -240,10 +240,19 @@ impl TraceControl for Control {
             &Request::PrepareRewrite {
                 thread,
                 path: path.clone(),
-                operation,
+                operation: operation.clone(),
             },
         )? {
-            Response::Prepared(v) => Ok(v),
+            Response::Prepared(v)
+                if v.operation.operation == operation
+                    && v.operation.paths.as_slice()
+                        == [umbra_core::PathRewrite {
+                            operand: umbra_core::PathOperand::Path,
+                            path: umbra_core::PhysicalPath(path.clone()),
+                        }] =>
+            {
+                Ok(v)
+            }
             _ => Err(protocol_error("platform.prepare_rewrite response")),
         }
     }
@@ -517,6 +526,93 @@ mod tests {
     use super::*;
     use std::{os::unix::net::UnixStream, time::Duration};
     use umbra_core::{Architecture, TaskIdentity};
+
+    #[test]
+    fn prepared_response_must_match_the_requested_operation_and_single_path() {
+        use umbra_core::{PathOperand, PathRewrite, PhysicalOperation, PhysicalPath};
+        for mismatch in 0..6 {
+            let path = BytePath::new(b"/shadow/file".to_vec()).unwrap();
+            let operation = FsOp::GetCwd;
+            let requested_path = path.clone();
+            let requested_operation = operation.clone();
+            let (left, right) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut connection = Connection::new(right, Duration::from_secs(2));
+                connection.begin();
+                let Frame::Request { id, payload } = connection.receive_request().unwrap() else {
+                    panic!("request");
+                };
+                let Request::PrepareRewrite {
+                    path, operation, ..
+                } = wire::decode(&payload).unwrap()
+                else {
+                    panic!("prepare");
+                };
+                assert_eq!(path, requested_path);
+                assert_eq!(operation, requested_operation);
+                let mut plan = PreparedRewrite {
+                    operation: PhysicalOperation {
+                        operation,
+                        paths: vec![PathRewrite {
+                            operand: PathOperand::Path,
+                            path: PhysicalPath(path),
+                        }],
+                    },
+                    arguments: vec![],
+                    memory_writes: vec![],
+                };
+                match mismatch {
+                    0 => {}
+                    1 => {
+                        plan.operation.operation = FsOp::Close {
+                            fd: umbra_core::TracedFd(9),
+                        }
+                    }
+                    2 => {
+                        plan.operation.paths[0].path =
+                            PhysicalPath(BytePath::new(b"/wrong".to_vec()).unwrap())
+                    }
+                    3 => plan.operation.paths.clear(),
+                    4 => plan.operation.paths.push(plan.operation.paths[0].clone()),
+                    5 => plan.operation.paths[0].operand = PathOperand::Source,
+                    _ => unreachable!(),
+                }
+                connection
+                    .send(&Frame::Response {
+                        id,
+                        result: wire::encode(&Response::Prepared(plan)),
+                    })
+                    .unwrap();
+            });
+            let client = Rc::new(RefCell::new(Client::from_connection(
+                Connection::new(left, Duration::from_secs(2)),
+                wire::Welcome {
+                    id: "fake".into(),
+                    role: "platform".into(),
+                    version: wire::PROTOCOL_VERSION,
+                    capabilities: Default::default(),
+                },
+            )));
+            let mut control = Control {
+                client,
+                capabilities: Default::default(),
+            };
+            let result = control.prepare_rewrite(
+                ThreadId(TaskIdentity {
+                    native_id: 1,
+                    generation: 1,
+                }),
+                &path,
+                operation,
+            );
+            if mismatch == 0 {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().kind, ErrorKind::ProtocolMismatch);
+            }
+            worker.join().unwrap();
+        }
+    }
     struct FakeControl;
     impl TraceBackend for FakeControl {
         fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {

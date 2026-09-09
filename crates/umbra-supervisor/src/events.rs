@@ -205,7 +205,8 @@ impl Supervisor {
                     self.root_status = Some(status);
                 }
                 self.exited += 1;
-                self.live -= 1;
+                debug_assert!(self.live > 0, "known process exit must have been counted");
+                self.live = self.live.saturating_sub(1);
                 Ok(())
             }
             TraceEvent::Signal {

@@ -24,6 +24,19 @@ use umbra_core::{
 
 use crate::sandbox::{self, SandboxSpec};
 
+fn select_architecture(
+    architectures: &[umbra_core::Architecture],
+) -> Result<umbra_core::Architecture> {
+    match architectures {
+        [architecture] => Ok(architecture.clone()),
+        _ => Err(UmbraError::new(
+            ErrorKind::UnsupportedCapability,
+            "run.platform",
+            "platform must advertise exactly one architecture until architecture negotiation is supported",
+        )),
+    }
+}
+
 /// Match ABI identities to the negotiated architecture, ignoring unrelated ABIs.
 fn select_abi(
     names: &std::collections::BTreeSet<String>,
@@ -576,29 +589,19 @@ mod unix {
                 Err(e) => return Err(fail(namespace, run_id, e, true)),
             };
         let capabilities = platform.control.capabilities();
-        let architecture = match capabilities.architectures.first() {
-            Some(architecture) => architecture.clone(),
-            None => {
-                return Err(fail(
-                    namespace,
-                    run_id,
-                    error(
-                        ErrorKind::UnsupportedCapability,
-                        "run.platform",
-                        "platform provider advertises no architecture",
-                    ),
-                    true,
-                ))
-            }
+        let architecture = match select_architecture(&capabilities.architectures) {
+            Ok(architecture) => architecture,
+            Err(e) => return Err(fail(namespace, run_id, e, true)),
         };
         let abi = match select_abi(&capabilities.capabilities, &architecture) {
             Ok(abi) => abi,
             Err(e) => return Err(fail(namespace, run_id, e, true)),
         };
         let budget = RunBudget {
-            // Renew at half the interval so one blocking event read cannot
-            // consume the whole budget before the next renewal check.
-            renew_after: Duration::from_millis(lease.renew_after_millis / 2),
+            // Renewal is serviced at every provider boundary, including ABI
+            // memory reads. Half the lease adds headroom; the admitted floor
+            // avoids near-zero renewal intervals between those boundaries.
+            renew_after: renewal_interval(lease.renew_after_millis),
             cwd: command.cwd.clone(),
             architecture,
             abi,
@@ -686,15 +689,28 @@ mod unix {
         with_cleanup(primary, cleanup)
     }
 
-    /// A blocking event read must not be able to outlast the renewal budget.
+    /// Avoid a renewal round-trip on every fast provider boundary.
+    const MIN_RENEWAL_MILLIS: u64 = 100;
+
+    fn renewal_interval(lease_millis: u64) -> Duration {
+        Duration::from_millis((lease_millis / 2).max(MIN_RENEWAL_MILLIS))
+    }
+
+    /// Each provider boundary services renewal; retain timeout headroom even
+    /// when the minimum interval raises the usual half-lease schedule.
     fn check_renewal_budget(lease: &umbra_core::WriterLease, timeout_ms: u64) -> Result<()> {
-        if lease.renew_after_millis == 0 || lease.renew_after_millis / 2 <= timeout_ms {
+        let interval = renewal_interval(lease.renew_after_millis).as_millis();
+        if timeout_ms == 0
+            || lease.renew_after_millis / 2 <= timeout_ms
+            || interval + u128::from(timeout_ms) >= u128::from(lease.renew_after_millis)
+        {
             return Err(error(
                 ErrorKind::InvalidState,
                 "run.lease",
                 format!(
-                    "writer lease renews every {} ms, which a {timeout_ms} ms provider \
-                     deadline could overrun; lower timeout_ms in the registry",
+                    "writer lease renews every {} ms; timeout_ms must be positive and \
+                     leave renewal headroom with a {MIN_RENEWAL_MILLIS} ms minimum interval \
+                     (configured timeout_ms: {timeout_ms})",
                     lease.renew_after_millis
                 ),
             ));
@@ -736,11 +752,44 @@ mod unix {
         }
         BytePath::new(resolved.as_os_str().as_bytes().to_vec())
     }
+
+    #[test]
+    fn renewal_floor_preserves_headroom_and_zero_timeouts_are_refused() {
+        let mut lease = umbra_core::WriterLease {
+            run_id: RunId(Uuid::new_v4()),
+            writer_id: WriterId("test".into()),
+            epoch: umbra_core::LeaseEpoch(1),
+            renewal_token: vec![],
+            renew_after_millis: 3,
+        };
+        assert!(check_renewal_budget(&lease, 0).is_err());
+        assert!(check_renewal_budget(&lease, 1).is_err());
+        lease.renew_after_millis = 101;
+        assert!(check_renewal_budget(&lease, 1).is_err());
+        lease.renew_after_millis = 150;
+        assert!(check_renewal_budget(&lease, 1).is_ok());
+        assert_eq!(renewal_interval(150), Duration::from_millis(100));
+        lease.renew_after_millis = 10_000;
+        assert!(check_renewal_budget(&lease, 5000).is_err());
+        assert!(check_renewal_budget(&lease, 4999).is_ok());
+        assert_eq!(renewal_interval(10_000), Duration::from_secs(5));
+    }
 }
 
 #[cfg(test)]
 mod abi_tests {
     use super::*;
+    #[test]
+    fn architecture_advertisement_must_be_unambiguous() {
+        use umbra_core::Architecture::{Aarch64, X86_64};
+        assert_eq!(select_architecture(&[Aarch64]).unwrap(), Aarch64);
+        for architectures in [vec![], vec![Aarch64, X86_64], vec![X86_64, Aarch64]] {
+            assert_eq!(
+                select_architecture(&architectures).unwrap_err().kind,
+                ErrorKind::UnsupportedCapability
+            );
+        }
+    }
     #[test]
     fn universal_provider_selects_the_negotiated_architecture() {
         let mut names = ["aaa-feature", "darwin-arm64-abi-v1", "darwin-x86_64-abi-v1"]

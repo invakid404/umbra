@@ -130,8 +130,12 @@ pub trait NamespaceSession: NamespaceResolver {
     /// Durably complete a fresh run: flush data, append and flush a completion
     /// record, close the journal, release the writer, close storage.
     ///
-    /// Return a receipt only when every step succeeded. A failure part-way
-    /// through must not release authority or claim completion.
+    /// Return a receipt only when every step succeeded. Before the completion
+    /// record is durable, a failure leaves authority for failure cleanup. Once
+    /// that record is durable, completion is terminal: attempt every remaining
+    /// cleanup stage exactly once, including writer release and storage close,
+    /// and return their errors. Withhold the receipt on any failure; subsequent
+    /// failure cleanup must not repeat those terminal stages.
     fn finish_run(&mut self, _request: &FinishRunRequest) -> Result<FinishRunReceipt> {
         Err(umbra_core::UmbraError::new(
             umbra_core::ErrorKind::UnsupportedCapability,

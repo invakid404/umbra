@@ -100,4 +100,7 @@ and an existing NFSv4 mount. Build providers with `cargo build --workspace --bin
 and compile `experiments/fixtures/umbra-test-child.c` first. Set
 `UMBRA_TEST_FIXTURE_PATH` and `UMBRA_TEST_NFS_ROOT`, then run
 `UMBRA_INTEGRATION_REQUIRED=1 cargo test -p umbra-cli --test run_fixtures -- --nocapture`.
-Required mode fails on missing inputs; ordinary developer tests may skip.
+Required mode fails on missing inputs; ordinary developer tests may skip. Failed
+commands report their captured stderr before any required run-ID parse. Cleanup
+uses an emitted prepared ID even when that status assertion fails; without one,
+it touches no directory in the shared NFS mount.

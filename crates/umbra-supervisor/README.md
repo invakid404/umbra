@@ -29,8 +29,8 @@ The staged order is fixed, and each stage's failure decides what may be released
 5. Bind the namespace over those already-open sessions, handing it the lease so
    one owner renews, releases and mutates.
 6. Render enforcement from the run's own root, re-verify the workspace inventory,
-   then connect the platform, require exactly one ABI capability matching
-   `<platform>-<arch>-abi-v<decimal version>` for the negotiated architecture,
+   then connect the platform, require exactly one advertised architecture and one
+   matching ABI capability `<platform>-<arch>-abi-v<decimal version>`,
    and launch stopped.
 7. Drive events, then tear down in order: flush run data, append and flush a
    completion record, close the journal, release the writer, close storage.
@@ -47,6 +47,11 @@ A provider bookkeeping error after all process exits preserves the run's success
 semantics and is reported through `RunObserver::teardown_warning` (or tracing
 when no observer is installed). A `finish_run` error enters the namespace failure
 path, preserving the original error and appending cleanup failures.
+
+Provider `timeout_ms` must be positive. Renewal is checked at every provider
+boundary and scheduled at half the lease interval, with a 100 ms floor.
+Configurations are rejected when the provider timeout consumes half the lease
+or the floored interval leaves no timeout headroom before expiry.
 
 ## Event loop
 
@@ -92,7 +97,9 @@ preserve pre-run bytes, and a content-addressed snapshot under `control/base`
 is not implemented.
 
 `base::HostReadOnlyBase` serves the overlay's base layer as a read-only view of
-the host filesystem, mapping logical paths back to host paths. Freezing is
+the host filesystem, mapping logical paths back to host paths. Directory pages
+skip unrepresentable special entries and advance past them; listings of `/dev`
+and its descendants, including resolved aliases, are refused. Freezing is
 enforced by the installed sandbox — a tracee may write only inside its own run
 root — not by copying the host. One consequence is deliberate: when the namespace
 resolves a non-mutating open to `NotFound`, the syscall resumes unmodified,

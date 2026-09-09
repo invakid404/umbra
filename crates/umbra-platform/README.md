@@ -48,7 +48,8 @@ pub trait TraceControl: TraceBackend {
 `prepare_rewrite` plans a path redirection for a stopped thread's current syscall:
 the backend allocates bounded scratch memory in the tracee, validates the operand
 slots for its ABI, and returns the argument and memory writes that would perform
-the rewrite. It writes nothing and resumes nothing. `operation` is the *prepared*
+the rewrite. The client proxy requires the returned operation and single path
+operand to match the request before exposing the plan. It writes nothing and resumes nothing. `operation` is the *prepared*
 operation, whose flags may differ from the ones the tracee issued, because the
 namespace may already have created the target. It is the one method with a default
 implementation, and that default refuses, so a backend without a qualified scratch

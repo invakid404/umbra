@@ -1563,6 +1563,15 @@ impl NamespaceSession for Overlay {
             context,
             scope: FlushScope::EntireRun,
         })?;
+        if durability.run_id != request.run_id
+            || durability.writer_epoch != lease.epoch
+            || durability.durability == Durability::None
+        {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "invalid storage durability receipt",
+            ));
+        }
         let completed_through = self.record(
             session_operation,
             JournalPayload::Lifecycle(JournalLifecycle::RunCompleted {

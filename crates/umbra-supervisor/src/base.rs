@@ -375,6 +375,14 @@ impl Base for HostReadOnlyBase {
         let host = self.host_path(path)?;
         // Read the whole directory and page over a stable ordering: a host
         // directory offset is not a durable cursor across mutations.
+        let host = fs::canonicalize(&host).map_err(|e| not_found(&host, e))?;
+        if host.starts_with("/dev") {
+            return Err(error(
+                ErrorKind::UnsupportedCapability,
+                "base.list",
+                "listing the host device namespace is unsupported",
+            ));
+        }
         let mut names = BTreeMap::new();
         for entry in fs::read_dir(&host).map_err(|e| not_found(&host, e))? {
             let entry = entry.map_err(|e| io_error("base.list", &host, e))?;
@@ -388,11 +396,18 @@ impl Base for HostReadOnlyBase {
             }
             let metadata =
                 fs::symlink_metadata(child).map_err(|e| io_error("base.list", child, e))?;
+            // The cursor counts all names, including unsupported entries, so
+            // a page containing only special files still makes progress.
+            index += 1;
+            let stat = match blob_stat(&metadata) {
+                Ok(stat) => stat,
+                Err(e) if e.kind == ErrorKind::UnsupportedCapability => continue,
+                Err(e) => return Err(e),
+            };
             entries.push(DirectoryEntry {
                 name: BytePath::new(name.clone())?,
-                stat: blob_stat(&metadata)?,
+                stat,
             });
-            index += 1;
         }
         let next = (index < names.len()).then(|| ListCursor((index as u64).to_be_bytes().to_vec()));
         Ok(DirectoryPage { entries, next })
@@ -409,6 +424,56 @@ impl Base for HostReadOnlyBase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn storage_path(path: &Path) -> StoragePath {
+        StoragePath::new(
+            StorageAnchor::Root,
+            path.strip_prefix("/")
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn listing_skips_special_entries_across_pages_and_refuses_device_aliases() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut base = HostReadOnlyBase::new(WorkspaceInventory::capture(scratch.path()).unwrap());
+        let mut sockets = Vec::new();
+        for name in ["a-socket", "c-socket", "e-socket"] {
+            sockets
+                .push(std::os::unix::net::UnixListener::bind(scratch.path().join(name)).unwrap());
+        }
+        for name in ["b-file", "d-file"] {
+            fs::write(scratch.path().join(name), b"regular").unwrap();
+        }
+        let path = storage_path(scratch.path());
+        let mut cursor = None;
+        let mut names = Vec::new();
+        for page_number in 0..4 {
+            let page = base.list(&path, cursor.as_ref(), 1).unwrap();
+            names.extend(page.entries.into_iter().map(|e| e.name.as_bytes().to_vec()));
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+            assert!(
+                page_number < 3,
+                "paging must terminate despite skipped entries"
+            );
+        }
+        assert_eq!(names, [b"b-file".to_vec(), b"d-file".to_vec()]);
+        let alias = scratch.path().join("devices");
+        std::os::unix::fs::symlink("/dev", &alias).unwrap();
+        for path in [Path::new("/dev"), alias.as_path()] {
+            assert_eq!(
+                base.list(&storage_path(path), None, 1).unwrap_err().kind,
+                ErrorKind::UnsupportedCapability
+            );
+        }
+    }
 
     #[test]
     fn special_host_entries_are_not_reported_as_symlinks() {

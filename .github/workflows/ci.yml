@@ -68,6 +68,8 @@ jobs:
 
   native-qualification:
     name: Enforced macOS fixture qualification
+    # Fork PR code must never run on this persistent, privileged runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # This runner must provide debugger permission and an existing NFSv4 mount.
     runs-on: [self-hosted, macOS, ARM64, umbra-integration]
     timeout-minutes: 15
@@ -76,6 +78,8 @@ jobs:
       UMBRA_TEST_NFS_ROOT: ${{ vars.UMBRA_TEST_NFS_ROOT }}
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - name: Build providers and fixture
         run: |
           test "$(uname -m)" = arm64

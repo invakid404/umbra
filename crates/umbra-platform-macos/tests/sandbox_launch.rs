@@ -220,7 +220,12 @@ fn inputs() -> Option<(PathBuf, PathBuf)> {
         eprintln!("SKIP: set UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT");
         return None;
     };
-    Some((PathBuf::from(fixture), PathBuf::from(root)))
+    let root = PathBuf::from(root);
+    assert!(
+        root.is_absolute(),
+        "UMBRA_TEST_REDIRECT_ROOT must be absolute"
+    );
+    Some((PathBuf::from(fixture), root))
 }
 
 #[test]

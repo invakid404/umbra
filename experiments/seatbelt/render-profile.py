@@ -41,9 +41,18 @@ def main(argv: list[str]) -> int:
     # Validate the supplied representation before resolving aliases, like the
     # supervisor's preparation stage. Seatbelt matches canonical paths.
     quote(argv[1])
-    root = str(Path(argv[1]).resolve(strict=True))
+    try:
+        root_path = Path(argv[1]).resolve(strict=True)
+        if not root_path.is_dir():
+            raise SystemExit(f"write root is not a directory: {argv[1]}")
+        output = Path(argv[2])
+        if output.resolve() == TEMPLATE or (output.exists() and output.samefile(TEMPLATE)):
+            raise SystemExit("output profile must not overwrite the template")
+    except (OSError, RuntimeError) as error:
+        raise SystemExit(f"cannot resolve profile paths: {error}") from None
+    root = str(root_path)
     rendered = source.replace(TOKEN, quote(root))
-    Path(argv[2]).write_text(rendered)
+    output.write_text(rendered)
     print(f"rendered {TEMPLATE} for {root} into {argv[2]}")
     return 0
 
