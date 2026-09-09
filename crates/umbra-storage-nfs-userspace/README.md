@@ -264,17 +264,18 @@ point is asserted to be ignored rather than left untested.
 `tests/live_state.rs` is the same idea one layer up: the protocol state machine
 driven over the **live** transport. It runs the six transitions this layer can
 fault meaningfully (SETCLIENTID, SETCLIENTID_CONFIRM, OPEN, OPEN_CONFIRM, CLOSE,
-`OP_RENEW`) against all five fault points and five fault actions, asserting the
-one-directional invariant the fake matrix settled on: the client may never claim
-more than the transport proved. It matters alongside the fake matrix because the
-fake never consults `OnConnection` and honours each action at a single point,
-while `LibnfsRawTransport` consults all five, so cells that are inert against the
-fake are real here. The same file carries the acceptance scenarios — anchored
-OPEN with the OPEN_CONFIRM the server actually demands, bounded READDIR paging
-with cookie-verifier continuity, WRITE UNSTABLE to COMMIT with verifier matching
-and a typed retained error when a restart changes the verifier, an idle longer
-than the lease held open by `OP_RENEW`, and v4.0 `CLAIM_PREVIOUS` reclaim in
-grace with a safe surrender outside it.
+`OP_RENEW`) against all five fault points and five fault actions —
+`assert_eq!(cells, 150, "6 transitions x 5 fault points x 5 fault actions")` —
+asserting the one-directional invariant the fake matrix settled on: the client
+may never claim more than the transport proved. It matters alongside the fake
+matrix because the fake never consults `OnConnection` and honours each action at
+a single point, while `LibnfsRawTransport` consults all five, so cells that are
+inert against the fake are real here. The same file carries the acceptance
+scenarios — anchored OPEN with the OPEN_CONFIRM the server actually demands,
+bounded READDIR paging with cookie-verifier continuity, WRITE UNSTABLE to COMMIT
+with verifier matching and a typed retained error when a restart changes the
+verifier, an idle longer than the lease held open by `OP_RENEW`, and v4.0
+`CLAIM_PREVIOUS` reclaim in grace with a safe surrender outside it.
 
 Tests that restart the server additionally need
 `UMBRA_NFS_FIXTURE_CONTAINER=<name>` and skip without it rather than proving
