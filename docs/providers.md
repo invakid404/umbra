@@ -89,3 +89,7 @@ production tracing coverage, kernel enforcement, remote NFS durability or vendor
 agent behavior. The Rust macOS tracer and NFS/local storage are implemented;
 the Linux tracer, file journal and agent adapters remain stubs. Environment-gated
 fixture and mounted-NFS tests require explicit executed verdicts for qualification.
+
+The common transport is version 2. Installation descriptors must set
+`protocol_version` to 2; version 1 peers are refused during handshake rather than
+at decoding the required sandbox launch policy or rewrite messages.

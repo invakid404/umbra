@@ -229,3 +229,10 @@ denials. Prefer a trusted supervisor outside the sandbox once that control works
 
 Gate 3 looks plausible as an M0 path but remains unverified on this OS/session.
 Actual task control and a live-NFS allowed-write result are still required.
+
+The historical `lldb_composition.py` experiment requires the former LLDB grants;
+the current template removed them after sandbox-exec + debugserver qualification
+on 2026-09-09, so rerunning that LLDB experiment against it can fail by design.
+
+`render-profile.py` requires an existing run root and resolves path aliases before
+rendering, matching the supervisor's canonical-root preparation.

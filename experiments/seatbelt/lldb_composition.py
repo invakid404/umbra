@@ -152,6 +152,7 @@ def lldb_command(executable, arguments, address, raw=False):
 
 
 def main():
+    PROFILE = rendered_profile()
     RESULTS.mkdir(exist_ok=True)
     # Keep all setup and original signatures in the report artifacts.
     with (RESULTS / "setup.log").open("w") as log:
@@ -171,7 +172,6 @@ def main():
                            stdout=log, stderr=subprocess.STDOUT, check=True)
             subprocess.run(["/usr/bin/codesign", "-dvv", "--entitlements", ":-", str(destination)],
                            stdout=log, stderr=subprocess.STDOUT, check=True)
-    PROFILE = rendered_profile()
     address = entry_address()
     print("ls LC_MAIN file address: {:#x} (stripped main symbol fallback)".format(address), flush=True)
     arguments = ["-f", PROFILE, TWIN, "-d", ROOT]

@@ -30,7 +30,8 @@ The staged order is fixed, and each stage's failure decides what may be released
    one owner renews, releases and mutates.
 6. Render enforcement from the run's own root, re-verify the workspace inventory,
    then connect the platform, require exactly one ABI capability matching
-   `<platform>-<arch>-abi-v<decimal version>`, and launch stopped.
+   `<platform>-<arch>-abi-v<decimal version>` for the negotiated architecture,
+   and launch stopped.
 7. Drive events, then tear down in order: flush run data, append and flush a
    completion record, close the journal, release the writer, close storage.
 
@@ -39,6 +40,8 @@ signalled child after a clean teardown is `ErrorKind::ProcessFailed`. A failure
 after the lease is taken releases writer authority only when the supervised tree
 is provably gone; otherwise the run is left recovery-required with the writer
 marker retained, and the primary error is preserved with cleanup damage appended.
+A failed launch releases writer authority only when the backend supplies explicit
+`launch_tree_terminated` evidence; an error category is never evidence.
 
 A provider bookkeeping error after all process exits preserves the run's success
 semantics and is reported through `RunObserver::teardown_warning` (or tracing
@@ -49,7 +52,8 @@ path, preserving the original error and appending cleanup failures.
 
 `Supervisor::launch_prepared` takes ownership of the stopped tree.
 `run`/`step`/`handle_event` maintain process, thread and exec-generation
-inventory, service lease renewal before each event, and process one syscall at a
+inventory, service lease renewal between provider/namespace calls (including
+ABI memory callbacks and before resuming), and process one syscall at a
 time: decode through the negotiated ABI, resolve through the namespace, prepare
 (which journals intent and performs copy-up or creation), ask the platform to
 prepare the physical rewrite, apply it, then resume to the matching exit, observe
@@ -60,7 +64,9 @@ Any failure in that chain poisons the run: nothing resumes afterwards. Denial an
 emulation fail closed, because skipping a trapped syscall is not in the platform
 contract and rewriting return registers alone would execute the very call the
 namespace refused. The loop ends when every process has exited, not when the root
-does.
+does. Fork preserves every inherited descriptor; only Exec drops close-on-exec
+entries. An Exit for an uncaptured task poisons the run without reducing its live
+process count, and duplicate exits do not count twice.
 
 `Supervisor::new` and `with_namespace` take `Option<Box<dyn Agent>>`; a raw
 command run has no adapter. Construction still performs no I/O and starts in

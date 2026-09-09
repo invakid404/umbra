@@ -93,6 +93,8 @@ pub fn resign(source: &Path, options: &Options, deadline: Instant) -> Result<Pat
         )
         .join("Library/Caches/umbra/twins"),
     };
+    fs::create_dir_all(&root).map_err(|e| error("twin cache", e))?;
+    let root = fs::canonicalize(&root).map_err(|e| error("twin cache", e))?;
     let digest = hash(&source, deadline)?;
     // Executables may exec/spawn their already resigned self; avoid chains of twins.
     if source.starts_with(&root) {

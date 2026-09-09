@@ -91,6 +91,7 @@ pub struct FileJournal {
 struct SessionState {
     directory: PathBuf,
     log: PathBuf,
+    file: Option<File>,
     run_id: RunId,
     epoch: Option<LeaseEpoch>,
     last_sequence: Sequence,
@@ -180,9 +181,14 @@ struct Frame {
     bytes: u64,
 }
 
-/// Read one frame. `Ok(None)` means a clean end of data; an incomplete trailing
-/// frame is reported separately so only the tail can ever be excluded.
-fn read_frame(reader: &mut impl Read) -> Result<Option<std::result::Result<Frame, ()>>> {
+enum FrameOutcome {
+    Eof,
+    Frame(Frame),
+    Incomplete,
+}
+
+/// Read a frame, distinguishing intact EOF from an incomplete trailing frame.
+fn read_frame(reader: &mut impl Read) -> Result<FrameOutcome> {
     let mut header = [0u8; 8];
     let mut read = 0;
     while read < header.len() {
@@ -194,10 +200,10 @@ fn read_frame(reader: &mut impl Read) -> Result<Option<std::result::Result<Frame
         }
     }
     if read == 0 {
-        return Ok(None);
+        return Ok(FrameOutcome::Eof);
     }
     if read < header.len() {
-        return Ok(Some(Err(())));
+        return Ok(FrameOutcome::Incomplete);
     }
     let length = u32::from_be_bytes(header[..4].try_into().expect("4 bytes")) as usize;
     let checksum = u32::from_be_bytes(header[4..].try_into().expect("4 bytes"));
@@ -215,7 +221,7 @@ fn read_frame(reader: &mut impl Read) -> Result<Option<std::result::Result<Frame
         }
     }
     if read < length {
-        return Ok(Some(Err(())));
+        return Ok(FrameOutcome::Incomplete);
     }
     if crc32(&payload) != checksum {
         return Err(corrupt(
@@ -224,10 +230,10 @@ fn read_frame(reader: &mut impl Read) -> Result<Option<std::result::Result<Frame
     }
     let record: JournalRecord = umbra_core::provider::decode(&payload)
         .map_err(|e| corrupt(format!("undecodable frame payload: {e}")))?;
-    Ok(Some(Ok(Frame {
+    Ok(FrameOutcome::Frame(Frame {
         record,
         bytes: (8 + length) as u64,
-    })))
+    }))
 }
 
 fn encode_frame(record: &JournalRecord) -> Result<Vec<u8>> {
@@ -298,6 +304,18 @@ impl Journal for FileJournal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(io_error("journal_file.open", &log, e)),
         };
+        // Creation may have reached disk before the first header write. With
+        // zero bytes there are no records to lose; writer open reinstalls MAGIC.
+        if let Some(file) = &existing {
+            if file
+                .metadata()
+                .map_err(|e| io_error("journal_file.open", &log, e))?
+                .len()
+                == 0
+            {
+                existing = None;
+            }
+        }
         let mut valid_bytes = MAGIC.len() as u64;
         let mut last_sequence = Sequence(0);
         let mut pending: BTreeMap<umbra_core::OperationId, JournalPendingOperation> =
@@ -325,8 +343,8 @@ impl Journal for FileJournal {
             let mut reader = BufReader::new(file);
             loop {
                 match read_frame(&mut reader)? {
-                    None => break,
-                    Some(Err(())) => {
+                    FrameOutcome::Eof => break,
+                    FrameOutcome::Incomplete => {
                         let discarded = length - valid_bytes;
                         tail = JournalTailRecovery::IncompleteFinalFrame {
                             valid_bytes,
@@ -337,7 +355,7 @@ impl Journal for FileJournal {
                         };
                         break;
                     }
-                    Some(Ok(frame)) => {
+                    FrameOutcome::Frame(frame) => {
                         if frame.record.format_version != FORMAT_VERSION {
                             return Err(corrupt("frame declares an unsupported format version"));
                         }
@@ -355,7 +373,7 @@ impl Journal for FileJournal {
             }
         }
 
-        if writable {
+        let session_file = if writable {
             let mut file = OpenOptions::new()
                 .create(true)
                 .read(true)
@@ -378,7 +396,10 @@ impl Journal for FileJournal {
                 file.sync_all()
                     .map_err(|e| io_error("journal_file.open", &log, e))?;
             }
-        }
+            Some(file)
+        } else {
+            existing
+        };
 
         let checkpoint = read_checkpoint(&directory)?;
         if let Some(checkpoint) = &checkpoint {
@@ -390,6 +411,7 @@ impl Journal for FileJournal {
         self.session = Some(Box::new(SessionState {
             directory,
             log,
+            file: session_file,
             run_id: request.control.run_id,
             epoch,
             last_sequence,
@@ -438,13 +460,10 @@ impl Journal for FileJournal {
             return Err(error(
                 ErrorKind::UnsupportedCapability,
                 "journal_file.append",
-                "journal log reached the supported replay size",
+                "journal log is full: appending would exceed the replay size limit",
             ));
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&state.log)
-            .map_err(|e| io_error("journal_file.append", &state.log, e))?;
+        let file = state.file.as_mut().expect("writer has a log handle");
         file.seek(SeekFrom::Start(state.valid_bytes))
             .map_err(|e| io_error("journal_file.append", &state.log, e))?;
         file.write_all(&frame)
@@ -463,8 +482,7 @@ impl Journal for FileJournal {
                 "cannot flush a sequence beyond the end of the log",
             ));
         }
-        let file =
-            File::open(&state.log).map_err(|e| io_error("journal_file.flush", &state.log, e))?;
+        let file = state.file.as_ref().expect("writer has a log handle");
         file.sync_all()
             .map_err(|e| io_error("journal_file.flush", &state.log, e))?;
         // The receipt covers everything accepted so far, which is at least the
@@ -483,8 +501,11 @@ impl Journal for FileJournal {
         after: Sequence,
     ) -> Result<Box<dyn Iterator<Item = Result<JournalRecord>> + Send + '_>> {
         let state = self.state()?;
-        let mut file =
-            File::open(&state.log).map_err(|e| io_error("journal_file.replay", &state.log, e))?;
+        let Some(file) = state.file.as_mut() else {
+            return Ok(Box::new(std::iter::empty()));
+        };
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| io_error("journal_file.replay", &state.log, e))?;
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)
             .map_err(|_| corrupt("journal log is missing its format header"))?;
@@ -570,24 +591,28 @@ impl Journal for FileJournal {
         }
         let result = if state.epoch.is_some() {
             // Surface a failed final flush rather than reporting a clean close.
-            File::open(&state.log)
-                .and_then(|file| file.sync_all())
+            state
+                .file
+                .as_ref()
+                .expect("writer has a log handle")
+                .sync_all()
                 .map_err(|e| io_error("journal_file.close", &state.log, e))
         } else {
             Ok(())
         };
         state.closed = true;
+        state.file = None;
         result
     }
 }
 
-struct Replay {
-    reader: BufReader<File>,
+struct Replay<'a> {
+    reader: BufReader<&'a mut File>,
     after: Sequence,
     finished: bool,
 }
 
-impl Iterator for Replay {
+impl Iterator for Replay<'_> {
     type Item = Result<JournalRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -600,17 +625,17 @@ impl Iterator for Replay {
                     self.finished = true;
                     return Some(Err(e));
                 }
-                Ok(None) => {
+                Ok(FrameOutcome::Eof) => {
                     self.finished = true;
                     return None;
                 }
                 // An incomplete final frame ends the stream; it is reported by
                 // `open` as recoverable tail damage, not as a silent EOF here.
-                Ok(Some(Err(()))) => {
+                Ok(FrameOutcome::Incomplete) => {
                     self.finished = true;
                     return None;
                 }
-                Ok(Some(Ok(frame))) => {
+                Ok(FrameOutcome::Frame(frame)) => {
                     if frame.record.sequence.0 > self.after.0 {
                         return Some(Ok(frame.record));
                     }
@@ -700,11 +725,11 @@ mod tests {
         ObjectId, OperationId, PhysicalPath,
     };
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("umbra-journal-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("umbra-journal-{name}-"))
+            .tempdir()
+            .unwrap()
     }
 
     fn request(directory: &Path, run_id: RunId, epoch: u64) -> JournalOpenRequest {
@@ -747,10 +772,11 @@ mod tests {
 
     #[test]
     fn append_assigns_sequences_and_replay_returns_them_in_order() {
-        let dir = scratch("append");
+        let scratch = scratch("append");
+        let dir = scratch.path();
         let run_id = RunId(uuid_v4());
         let mut journal = FileJournal::new();
-        let state = journal.open(&request(&dir, run_id, 7)).unwrap();
+        let state = journal.open(&request(dir, run_id, 7)).unwrap();
         assert_eq!(state.last_valid_sequence, Sequence(0));
         assert!(state.clean);
         assert_eq!(state.tail, JournalTailRecovery::Intact);
@@ -795,18 +821,18 @@ mod tests {
         assert_eq!(tail, vec![Sequence(2)]);
         journal.close().unwrap();
         let mut reopened = FileJournal::new();
-        let recovered = reopened.open(&request(&dir, run_id, 8)).unwrap();
+        let recovered = reopened.open(&request(dir, run_id, 8)).unwrap();
         assert!(recovered.pending.is_empty());
         assert!(recovered.clean, "a fully committed intact journal is clean");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_stale_epoch_cannot_append_and_flush_cannot_run_ahead() {
-        let dir = scratch("epoch");
+        let scratch = scratch("epoch");
+        let dir = scratch.path();
         let run_id = RunId(uuid_v4());
         let mut journal = FileJournal::new();
-        journal.open(&request(&dir, run_id, 3)).unwrap();
+        journal.open(&request(dir, run_id, 3)).unwrap();
         let id = OperationId(uuid_v4());
         assert_eq!(
             journal
@@ -819,17 +845,17 @@ mod tests {
             journal.flush(Sequence(9)).unwrap_err().kind,
             ErrorKind::InvalidInput
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn reopening_recovers_prepared_operations_and_excludes_only_a_torn_tail() {
-        let dir = scratch("recover");
+        let scratch = scratch("recover");
+        let dir = scratch.path();
         let run_id = RunId(uuid_v4());
         let id = OperationId(uuid_v4());
         {
             let mut journal = FileJournal::new();
-            journal.open(&request(&dir, run_id, 1)).unwrap();
+            journal.open(&request(dir, run_id, 1)).unwrap();
             journal
                 .append(&record(
                     1,
@@ -853,7 +879,7 @@ mod tests {
         drop(file);
 
         let mut journal = FileJournal::new();
-        let state = journal.open(&request(&dir, run_id, 2)).unwrap();
+        let state = journal.open(&request(dir, run_id, 2)).unwrap();
         assert!(matches!(
             state.tail,
             JournalTailRecovery::IncompleteFinalFrame { repaired: true, .. }
@@ -868,16 +894,16 @@ mod tests {
                 .unwrap(),
             Sequence(2)
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_corrupt_interior_frame_is_an_error_not_a_short_replay() {
-        let dir = scratch("corrupt");
+        let scratch = scratch("corrupt");
+        let dir = scratch.path();
         let run_id = RunId(uuid_v4());
         {
             let mut journal = FileJournal::new();
-            journal.open(&request(&dir, run_id, 1)).unwrap();
+            journal.open(&request(dir, run_id, 1)).unwrap();
             for _ in 0..2 {
                 journal
                     .append(&record(1, OperationId(uuid_v4()), JournalPayload::Commit))
@@ -894,18 +920,18 @@ mod tests {
 
         let mut journal = FileJournal::new();
         assert_eq!(
-            journal.open(&request(&dir, run_id, 1)).unwrap_err().kind,
+            journal.open(&request(dir, run_id, 1)).unwrap_err().kind,
             ErrorKind::CorruptJournal
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn checkpoint_publication_requires_a_flushed_sequence() {
-        let dir = scratch("checkpoint");
+        let scratch = scratch("checkpoint");
+        let dir = scratch.path();
         let run_id = RunId(uuid_v4());
         let mut journal = FileJournal::new();
-        journal.open(&request(&dir, run_id, 5)).unwrap();
+        journal.open(&request(dir, run_id, 5)).unwrap();
         journal
             .append(&record(5, OperationId(uuid_v4()), JournalPayload::Commit))
             .unwrap();
@@ -948,25 +974,25 @@ mod tests {
 
         // A fresh open finds the published snapshot through its reference.
         let mut reopened = FileJournal::new();
-        let state = reopened.open(&request(&dir, run_id, 6)).unwrap();
+        let state = reopened.open(&request(dir, run_id, 6)).unwrap();
         assert_eq!(state.checkpoint.unwrap().id, checkpoint.id);
         assert!(!dir.join("journal/checkpoint.tmp").exists());
         // Simulate the empty reference left by an older truncate-based writer.
         std::fs::write(dir.join("journal/checkpoint"), b"").unwrap();
         let mut recovered = FileJournal::new();
-        let state = recovered.open(&request(&dir, run_id, 7)).unwrap();
+        let state = recovered.open(&request(dir, run_id, 7)).unwrap();
         assert!(state.checkpoint.is_none());
         assert_eq!(state.last_valid_sequence, Sequence(1));
         assert_eq!(recovered.replay(Sequence(0)).unwrap().count(), 1);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn append_refuses_to_make_the_log_unreplayable() {
-        let dir = scratch("append-bound");
+        let scratch = scratch("append-bound");
+        let dir = scratch.path();
         let run_id = RunId(uuid_v4());
         let mut journal = FileJournal::new();
-        journal.open(&request(&dir, run_id, 1)).unwrap();
+        journal.open(&request(dir, run_id, 1)).unwrap();
         // Place the append cursor at the bound without allocating a huge log.
         journal.session.as_mut().unwrap().valid_bytes = MAX_LOG_BYTES;
         let e = journal
@@ -987,10 +1013,53 @@ mod tests {
             .unwrap();
         let mut reopened = FileJournal::new();
         assert_eq!(
-            reopened.open(&request(&dir, run_id, 2)).unwrap_err().kind,
+            reopened.open(&request(dir, run_id, 2)).unwrap_err().kind,
             ErrorKind::UnsupportedCapability
         );
-        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn empty_log_recovers_but_partial_header_remains_corrupt() {
+        let scratch = scratch("empty-log");
+        let dir = scratch.path();
+        let run = RunId(uuid_v4());
+        std::fs::create_dir_all(dir.join("journal")).unwrap();
+        std::fs::write(dir.join("journal/log"), b"").unwrap();
+        let mut journal = FileJournal::new();
+        assert!(journal.open(&request(dir, run, 1)).unwrap().clean);
+        assert_eq!(std::fs::read(dir.join("journal/log")).unwrap(), MAGIC);
+        journal.close().unwrap();
+        std::fs::write(dir.join("journal/log"), &MAGIC[..3]).unwrap();
+        assert_eq!(
+            FileJournal::new()
+                .open(&request(dir, run, 2))
+                .unwrap_err()
+                .kind,
+            ErrorKind::CorruptJournal
+        );
+    }
+
+    #[test]
+    fn a_live_session_keeps_its_log_when_the_path_is_replaced() {
+        let scratch = scratch("replace-log");
+        let dir = scratch.path();
+        let run = RunId(uuid_v4());
+        let mut journal = FileJournal::new();
+        journal.open(&request(dir, run, 1)).unwrap();
+        let original = dir.join("original-log");
+        std::fs::rename(dir.join("journal/log"), &original).unwrap();
+        std::fs::write(dir.join("journal/log"), b"replacement").unwrap();
+        journal
+            .append(&record(1, OperationId(uuid_v4()), JournalPayload::Commit))
+            .unwrap();
+        journal.flush(Sequence(1)).unwrap();
+        assert_eq!(journal.replay(Sequence(0)).unwrap().count(), 1);
+        journal.close().unwrap();
+        assert!(std::fs::metadata(original).unwrap().len() > MAGIC.len() as u64);
+        assert_eq!(
+            std::fs::read(dir.join("journal/log")).unwrap(),
+            b"replacement"
+        );
     }
 
     #[test]

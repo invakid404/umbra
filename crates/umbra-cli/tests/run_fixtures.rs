@@ -25,6 +25,17 @@ fn bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()
 }
 
+struct RunDirectory(std::path::PathBuf);
+impl Drop for RunDirectory {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("fixture cleanup {}: {e}", self.0.display());
+            }
+        }
+    }
+}
+
 fn matrix(nfs: bool) {
     let Some(fixture) = input("UMBRA_TEST_FIXTURE_PATH") else {
         return;
@@ -100,7 +111,6 @@ fn matrix(nfs: bool) {
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{case}: {stderr}");
         let id = stderr
             .lines()
             .find_map(|line| {
@@ -110,6 +120,8 @@ fn matrix(nfs: bool) {
             .expect("prepared run ID");
         let id = uuid::Uuid::parse_str(id).unwrap();
         let run_dir = store.join(id.to_string());
+        let _cleanup = RunDirectory(run_dir.clone());
+        assert!(output.status.success(), "{case}: {stderr}");
         assert!(!destination.exists(), "host destination created for {case}");
         let shadow = run_dir
             .join("root")
@@ -147,4 +159,17 @@ fn local_fixture_matrix() {
 #[test]
 fn nfs_fixture_matrix() {
     matrix(true);
+}
+
+#[test]
+fn run_directory_is_removed_when_a_case_panics() {
+    let root = tempfile::tempdir().unwrap();
+    let run = root.path().join("run");
+    std::fs::create_dir(&run).unwrap();
+    let result = std::panic::catch_unwind(|| {
+        let _cleanup = RunDirectory(run.clone());
+        panic!("fixture failed");
+    });
+    assert!(result.is_err());
+    assert!(!run.exists());
 }

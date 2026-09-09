@@ -10,7 +10,7 @@ report `not implemented` on stderr and exit 1; they no longer echo their parsed
 arguments, because argv and environment carry paths and secrets.
 
 ```text
-umbra [--storage-root PATH] run --registry PATH [--workspace PATH] --experimental
+umbra run --registry PATH [--workspace PATH] --experimental
       [--local-dev | --strict-remote] [--agent ID]
       [--env NAME=VALUE]... [--inherit-env NAME]... -- COMMAND [ARGS...]
 umbra [--storage-root PATH] stop|checkpoint|inspect RUN_ID
@@ -54,7 +54,9 @@ reports `NotImplemented`, since adapters are not implemented.
 
 The supervised environment is built, not inherited: `--env NAME=VALUE` sets a
 variable and `--inherit-env NAME` forwards one from the caller, failing if it is
-unset rather than passing an empty value. The supervisor adds `TMPDIR`.
+unset rather than passing an empty value. Repeated names across either flag are
+rejected, so the child never receives duplicate environment entries. The supervisor
+adds `TMPDIR`.
 
 ## Exit codes and streams
 
@@ -78,7 +80,8 @@ route. `--storage-root` no longer defaults to `.umbra` and is rejected outright 
 provider I/O: it canonicalizes the workspace, preserves argument and path bytes,
 rejects NUL, and constructs the explicit environment.
 `composition::build_supervisor(run_id, registry)` remains the `providers`
-diagnostic path, connecting platform, agent, storage and journal and delegating
+diagnostic path, connecting platform, storage and journal, optionally connecting
+an agent when the registry declares one, and delegating
 standard namespace construction to `umbra-overlay`. A configured `namespace`
 provider replaces the standard engine there; `run` refuses one, because the
 namespace protocol has no run lifecycle.

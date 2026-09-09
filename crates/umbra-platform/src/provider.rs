@@ -10,7 +10,7 @@ use umbra_core::{
     ErrorKind, SandboxRequirement, UmbraError, MAX_IO_BYTES,
 };
 
-/// Platform control and ABI methods in protocol version 1.
+/// Platform control and ABI methods in protocol version 2.
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     /// Capabilities.

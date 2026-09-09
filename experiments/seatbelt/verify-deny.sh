@@ -101,6 +101,9 @@ SIBLING=$(dirname -- "$UMBRA_WRITE_ROOT")/umbra-sibling-should-be-denied
 if [[ -e "$SIBLING" || -L "$SIBLING" ]]; then
     report "FAIL sibling write denied: preexisting fixture $SIBLING; refusing to touch"
     failed=1
+elif ! output=$(/usr/bin/touch "$SIBLING" && /bin/rm "$SIBLING" 2>&1); then
+    report "FAIL sibling write control: configuration error: $output"
+    failed=1
 elif output=$(/usr/bin/sandbox-exec -f "$PROFILE" /bin/sh -c \
     '/usr/bin/touch "$1"' sh "$SIBLING" 2>&1); then
     report 'FAIL sibling write denied: touch succeeded'

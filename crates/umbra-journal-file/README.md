@@ -20,7 +20,9 @@ Boundaries the implementation keeps:
   last valid sequence and the prepared-but-uncommitted operations for the
   namespace owner to reconcile. Recovery is clean only with no pending operations
   and an intact tail. Readable frames are never treated as evidence of a
-  previous flush receipt.
+  previous flush receipt. A zero-length log left by interrupted creation is
+  treated as absent; writer open reinstalls its header. A nonempty invalid header
+  remains corruption.
 - A demonstrably incomplete final frame is the only recoverable log damage, reported as
   `IncompleteFinalFrame`; truncating it requires writer authority, so a read-only
   open reports it without repairing. A complete frame with a bad checksum, or any
@@ -29,7 +31,9 @@ Boundaries the implementation keeps:
   authority to place a frame. A record whose epoch does not match the session's
   writer authority is `LeaseLost`. Appends refuse to exceed the 512 MiB replay
   limit; an oversized existing log is `UnsupportedCapability`, not corruption.
-  Acceptance is not durability.
+  Acceptance is not durability. The session retains its opened log handle for
+  append, flush, replay and close, so replacing the pathname does not redirect
+  a live session's writes.
 - `flush` fsyncs and returns a receipt; a sequence beyond the log is rejected.
 - `write_checkpoint` requires the checkpoint's last committed sequence to have been
   flushed, and writes snapshot contents durably before the reference that names

@@ -14,6 +14,8 @@ struct Log {
     records: Vec<JournalRecord>,
     fail_prepare: bool,
     fail_commit: bool,
+    fail_close: bool,
+    closes: usize,
 }
 struct MemoryJournal {
     log: Arc<Mutex<Log>>,
@@ -65,6 +67,11 @@ impl Journal for MemoryJournal {
         Ok(checkpoint.id)
     }
     fn close(&mut self) -> Result<()> {
+        let mut log = self.log.lock().unwrap();
+        log.closes += 1;
+        if log.fail_close {
+            return Err(error(ErrorKind::Io, "injected close failure"));
+        }
         Ok(())
     }
 }
@@ -1378,5 +1385,46 @@ fn symlink_cwd_and_dirfd_anchors_are_resolved_before_identity_checks() {
             .unwrap_err()
             .kind,
         ErrorKind::StaleHandle
+    );
+}
+
+#[test]
+fn failed_completion_cleanup_is_terminal_and_is_not_repeated() {
+    let mut f = Fixture::new(&[]);
+    let run_id = f.overlay.config().unwrap().binding.run_id;
+    f.log.lock().unwrap().fail_close = true;
+    let e = f
+        .overlay
+        .finish_run(&FinishRunRequest {
+            run_id,
+            root_status: Some(ExitStatus::Code(0)),
+            processes_exited: 1,
+        })
+        .unwrap_err();
+    assert!(e.context.contains("journal close after durable completion"));
+    assert!(f.overlay.poisoned);
+    assert!(f.overlay.config.is_none());
+    assert!(f.overlay.base.is_none());
+    assert!(f.overlay.renew_writer().is_err());
+    f.overlay
+        .fail_run(&FailedRunRequest {
+            run_id,
+            reason: e.to_string(),
+            tree_terminated: true,
+        })
+        .unwrap();
+    assert_eq!(f.log.lock().unwrap().closes, 1);
+}
+
+#[test]
+fn renewal_failure_latches_and_a_poisoned_session_cannot_renew() {
+    let mut f = Fixture::new(&[]);
+    let lease = f.overlay.config().unwrap().lease.clone();
+    f.overlay.storage.release_writer(&lease).unwrap();
+    assert!(f.overlay.renew_writer().is_err());
+    assert!(f.overlay.poisoned);
+    assert_eq!(
+        f.overlay.renew_writer().unwrap_err().kind,
+        ErrorKind::InvalidState
     );
 }

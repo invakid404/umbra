@@ -417,3 +417,12 @@ IPC and direct tracer suites. CI's `native-qualification` job runs these and the
 CLI's fourteen-case matrix on a runner labelled `umbra-integration`; that runner
 requires debugger permission and an existing NFSv4 mount configured through the
 `UMBRA_TEST_NFS_ROOT` repository variable. No test provisions a mount or prompts.
+
+Sandbox handoff compares canonical target paths with `proc_pidpath`. The twin
+cache root is also canonicalized so a symlinked cache recognizes already-resigned
+executables instead of creating a second twin during bootstrap. Both installed
+sandbox qualification tests exercise a symlinked cache root.
+
+Failed attach and sandbox-handoff paths set `launch_tree_terminated` on the returned
+error only when `waitpid` confirms reaping every created tracee. Missing evidence
+remains false so the supervisor retains writer authority after uncertain launch failure.

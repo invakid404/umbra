@@ -36,7 +36,7 @@ fn registry_with_agent(path: &std::path::Path, capabilities: &str, agent: bool) 
     let executable = executable.join(",");
     let descriptor = |id: &str, role: &str, caps: &str| {
         format!(
-            r#""{role}":{{"id":"{id}","role":"{role}","protocol_version":1,"executable":[{executable}],"capabilities":[{caps}],"options":[]}}"#
+            r#""{role}":{{"id":"{id}","role":"{role}","protocol_version":2,"executable":[{executable}],"capabilities":[{caps}],"options":[]}}"#
         )
     };
     let mut roles = vec![
@@ -290,4 +290,33 @@ fn a_configured_agent_reports_that_adapters_are_unimplemented() {
     assert_eq!(code, 1);
     assert!(stderr.contains("is 'codex', not 'claude'"), "{stderr}");
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn repeated_environment_names_are_rejected_across_both_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("registry.json");
+    registry(
+        &path,
+        r#""local-development-v1","experimental-open-rewrite-v1""#,
+    );
+    for flags in [
+        vec!["--env", "UMBRA_REPEAT=a", "--env", "UMBRA_REPEAT=b"],
+        vec!["--env", "UMBRA_REPEAT=a", "--inherit-env", "UMBRA_REPEAT"],
+    ] {
+        let output = umbra()
+            .env("UMBRA_REPEAT", "inherited")
+            .args(["run", "--registry"])
+            .arg(&path)
+            .arg("--workspace")
+            .arg(dir.path())
+            .args(["--experimental", "--local-dev"])
+            .args(flags)
+            .args(["--", "/bin/true"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("duplicate environment name: UMBRA_REPEAT"));
+    }
 }

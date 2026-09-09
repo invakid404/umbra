@@ -102,6 +102,10 @@ pub struct UmbraError {
     pub context: String,
     /// Optional native error number, retained without translation.
     pub errno: Option<Errno>,
+    /// Launch failure evidence from the backend: every created tracee was reaped.
+    /// Absent/false is no evidence; callers must never infer this from ErrorKind.
+    #[serde(default)]
+    pub launch_tree_terminated: bool,
 }
 
 impl UmbraError {
@@ -117,6 +121,7 @@ impl UmbraError {
             operation: operation.into(),
             context: context.into(),
             errno: None,
+            launch_tree_terminated: false,
         }
     }
 
@@ -909,5 +914,31 @@ mod tests {
         assert_eq!(oversized.unwrap_err().kind, ErrorKind::InvalidInput);
         let unknown = RegisterSet::new(Architecture::Unsupported("unknown".into()), vec![]);
         assert_eq!(unknown.unwrap_err().kind, ErrorKind::UnsupportedCapability);
+    }
+}
+
+#[cfg(test)]
+mod launch_evidence_tests {
+    use super::*;
+    #[test]
+    fn termination_evidence_is_explicit_and_survives_transport() {
+        let mut e = UmbraError::new(ErrorKind::InvalidInput, "launch", "failed");
+        assert!(!e.launch_tree_terminated);
+        e.launch_tree_terminated = true;
+        let mut encoded = serde_json::to_value(&e).unwrap();
+        assert!(
+            serde_json::from_value::<UmbraError>(encoded.clone())
+                .unwrap()
+                .launch_tree_terminated
+        );
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("launch_tree_terminated");
+        assert!(
+            !serde_json::from_value::<UmbraError>(encoded)
+                .unwrap()
+                .launch_tree_terminated
+        );
     }
 }

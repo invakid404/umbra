@@ -129,7 +129,16 @@ fn open_libc_provider_ipc() {
             SandboxProfile::new(
                 SEATBELT_PROFILE_FORMAT,
                 include_str!("../../../experiments/seatbelt/umbra.sb")
-                    .replace("{{UMBRA_RUN_ROOT}}", &format!("\"{}\"", root.display()))
+                    .replace(
+                        "{{UMBRA_RUN_ROOT}}",
+                        &format!(
+                            "\"{}\"",
+                            root.to_str()
+                                .expect("UTF-8 Seatbelt root")
+                                .replace('\\', "\\\\")
+                                .replace('"', "\\\"")
+                        ),
+                    )
                     .into_bytes(),
                 byte_path(&root),
             )

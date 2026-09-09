@@ -12,3 +12,5 @@ umbra-journal = { path = "../umbra-journal" }
 
 [dev-dependencies]
 uuid.workspace = true
+
+tempfile.workspace = true

@@ -38,9 +38,13 @@ def main(argv: list[str]) -> int:
     remaining = source.replace(TOKEN, "")
     if "{{" in remaining or "}}" in remaining:
         raise SystemExit("template contains an unknown unresolved token")
-    rendered = source.replace(TOKEN, quote(argv[1]))
+    # Validate the supplied representation before resolving aliases, like the
+    # supervisor's preparation stage. Seatbelt matches canonical paths.
+    quote(argv[1])
+    root = str(Path(argv[1]).resolve(strict=True))
+    rendered = source.replace(TOKEN, quote(root))
     Path(argv[2]).write_text(rendered)
-    print(f"rendered {TEMPLATE} for {argv[1]} into {argv[2]}")
+    print(f"rendered {TEMPLATE} for {root} into {argv[2]}")
     return 0
 
 

@@ -307,6 +307,7 @@ pub struct Overlay {
     planned: Option<Plan>,
     pending: Option<Pending>,
     poisoned: bool,
+    completed_run: Option<RunId>,
     serial: u64,
     last_committed: Sequence,
     pages: BTreeMap<Vec<u8>, (StoragePath, Vec<DirectoryEntry>)>,
@@ -329,6 +330,7 @@ impl Overlay {
             planned: None,
             pending: None,
             poisoned: false,
+            completed_run: None,
             serial: 0,
             last_committed: Sequence(0),
             pages: BTreeMap::new(),
@@ -1166,8 +1168,11 @@ impl NamespaceSession for Overlay {
         Ok(())
     }
     fn bind(&mut self, config: SessionConfig, base: Box<dyn Base>) -> Result<()> {
-        if self.config.is_some() {
-            return Err(error(ErrorKind::InvalidState, "namespace already bound"));
+        if self.config.is_some() || self.poisoned {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "namespace already bound or poisoned",
+            ));
         }
         if config.binding.run_id != config.context.run_id
             || config.recovery.run_id != config.context.run_id
@@ -1517,19 +1522,29 @@ impl NamespaceSession for Overlay {
         Ok(checkpoint)
     }
     fn renew_writer(&mut self) -> Result<WriterLease> {
-        // Renewal is allowed with a transaction pending: an in-flight syscall
-        // must not be able to starve the lease it is mutating under.
-        let lease = self.config()?.lease.clone();
-        let renewed = self.storage.renew_writer(&lease)?;
-        if renewed.run_id != lease.run_id || renewed.writer_id != lease.writer_id {
-            return Err(error(ErrorKind::LeaseLost, "invalid lease renewal"));
+        // Renewal is allowed during a transaction, but never after poisoning.
+        if self.poisoned {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "cannot renew a poisoned session",
+            ));
         }
-        if renewed.epoch != lease.epoch {
-            // A new epoch means this was a takeover, not a renewal of ours.
-            return Err(error(ErrorKind::LeaseLost, "writer epoch advanced"));
+        let result = (|| {
+            let lease = self.config()?.lease.clone();
+            let renewed = self.storage.renew_writer(&lease)?;
+            if renewed.run_id != lease.run_id
+                || renewed.writer_id != lease.writer_id
+                || renewed.epoch != lease.epoch
+            {
+                return Err(error(ErrorKind::LeaseLost, "invalid lease renewal"));
+            }
+            self.config.as_mut().expect("bound").lease = renewed.clone();
+            Ok(renewed)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
         }
-        self.config.as_mut().expect("bound").lease = renewed.clone();
-        Ok(renewed)
+        result
     }
     fn finish_run(&mut self, request: &FinishRunRequest) -> Result<FinishRunReceipt> {
         self.idle()?;
@@ -1555,11 +1570,36 @@ impl NamespaceSession for Overlay {
             }),
             true,
         )?;
-        self.journal.close()?;
-        self.storage.release_writer(&lease)?;
-        self.storage.close_run()?;
+        // A durable completion record is terminal. Attempt each cleanup stage
+        // once, retaining every error; fail_run must not repeat closed stages.
+        self.poisoned = true;
+        self.completed_run = Some(request.run_id);
+        let mut cleanup: Result<()> = Ok(());
+        for (stage, result) in [
+            (
+                "journal close after durable completion",
+                self.journal.close(),
+            ),
+            (
+                "writer release after journal close",
+                self.storage.release_writer(&lease),
+            ),
+            (
+                "storage close after writer release",
+                self.storage.close_run(),
+            ),
+        ] {
+            if let Err(mut e) = result {
+                e.context = format!("{stage}: {}", e.context);
+                match &mut cleanup {
+                    Ok(()) => cleanup = Err(e),
+                    Err(primary) => primary.context.push_str(&format!("; {e}")),
+                }
+            }
+        }
         self.config = None;
         self.base = None;
+        cleanup?;
         Ok(FinishRunReceipt {
             run_id: request.run_id,
             durability,
@@ -1567,6 +1607,11 @@ impl NamespaceSession for Overlay {
         })
     }
     fn fail_run(&mut self, request: &FailedRunRequest) -> Result<()> {
+        // finish_run already attempted every terminal cleanup stage and returned
+        // their errors to the caller. Do not close or release those resources twice.
+        if self.completed_run == Some(request.run_id) {
+            return Ok(());
+        }
         let config = self.config()?;
         if config.context.run_id != request.run_id {
             return Err(error(

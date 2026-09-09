@@ -16,6 +16,10 @@ enforcement policy attached to every `LaunchSpec`. The requirement has no defaul
 and no `Option`, so a launch cannot become unsandboxed by omitting a field;
 running without a policy is the explicitly named `UnsandboxedExperiment`.
 
+`UmbraError::launch_tree_terminated` carries explicit backend evidence that a
+failed launch's tracees were reaped; it defaults to false, including when absent
+on the wire. Error categories alone provide no termination evidence.
+
 `ErrorKind::ProcessFailed` reports a supervised child that exited nonzero or was
 signalled, which is a run result rather than an Umbra malfunction.
 `PersistencePolicy::NfsClientFsync` distinguishes a mounted run whose durability
@@ -31,7 +35,9 @@ a backend may bind an operation ID to the single idempotency key it was first
 used with.
 
 `provider` contains runtime registry descriptors, JSON encoding and bounded private
-Unix transport primitives. Role-specific schemas, proxies and dispatch belong in the
+Unix transport primitives. Common protocol version 2 requires current installation
+descriptors and rejects older peers before sandbox/rewrite request decoding.
+Role-specific schemas, proxies and dispatch belong in the
 five trait crates. Runtime executable paths/options never belong in checkpoint identity.
 `provider::accept_connection` exposes the same identity/role/version/capability
 handshake as `accept` for injected private connections such as test socketpairs.

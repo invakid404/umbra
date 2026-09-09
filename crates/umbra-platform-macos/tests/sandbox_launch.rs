@@ -39,6 +39,7 @@ fn profile(write_root: &Path) -> SandboxProfile {
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
     );
+    // Like the supervisor renderer, this test requires the shipped experiments template.
     let source = include_str!("../../../experiments/seatbelt/umbra.sb")
         .replace("{{UMBRA_RUN_ROOT}}", &literal);
     SandboxProfile::new(
@@ -70,7 +71,12 @@ fn drive(case: &str, fixture: &Path, root: &Path, rewrite: bool) -> Outcome {
     let shadow = root.join(host.strip_prefix("/").unwrap());
     let _ = std::fs::remove_file(&shadow);
 
+    // Qualify handoff with a symlinked cache root: proc_pidpath resolves it.
+    let cache = tempfile::tempdir().unwrap();
+    let alias = cache.path().join("alias");
+    std::os::unix::fs::symlink(cache.path(), &alias).unwrap();
     let mut tracer = MacosTraceBackend::new(Options {
+        twin_cache: Some(alias),
         timeout_ms: 40_000,
         ..Options::default()
     });
@@ -128,6 +134,10 @@ fn drive(case: &str, fixture: &Path, root: &Path, rewrite: bool) -> Outcome {
                         pending_open = Some(thread);
                     }
                     if write_intent && rewrite {
+                        assert!(
+                            path.is_absolute(),
+                            "fixture rewrite requires an absolute operand"
+                        );
                         let physical = root.join(
                             Path::new(std::ffi::OsStr::from_bytes(path.as_bytes()))
                                 .strip_prefix("/")
@@ -261,4 +271,42 @@ fn an_unrewritten_write_outside_the_run_root_is_denied_by_the_installed_policy()
         "the host destination must stay absent"
     );
     assert_eq!(outcome.shadow, None);
+}
+
+#[test]
+fn failed_installer_reports_checked_reaping_evidence() {
+    let Some((fixture, root)) = inputs() else {
+        return;
+    };
+    let denied = String::from_utf8(profile(&root).source().to_vec())
+        .unwrap()
+        .replace("(allow process-exec)", "(deny process-exec)");
+    let mut tracer = MacosTraceBackend::new(Options {
+        timeout_ms: 40_000,
+        ..Options::default()
+    });
+    let e = tracer
+        .launch(LaunchSpec {
+            executable: byte_path(&fixture),
+            argv: vec![fixture.as_os_str().as_bytes().to_vec()],
+            environment: vec![],
+            cwd: byte_path(&std::env::current_dir().unwrap()),
+            policy: LaunchPolicy {
+                persistence: PersistencePolicy::LocalDevelopment,
+                inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+            },
+            sandbox: SandboxRequirement::Required(
+                SandboxProfile::new(
+                    SEATBELT_PROFILE_FORMAT,
+                    denied.into_bytes(),
+                    byte_path(&root),
+                )
+                .unwrap(),
+            ),
+        })
+        .unwrap_err();
+    assert!(
+        e.launch_tree_terminated,
+        "failed installer must report checked reaping: {e}"
+    );
 }

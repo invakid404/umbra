@@ -268,10 +268,14 @@ fn blob_stat(metadata: &fs::Metadata) -> Result<BlobStat> {
         ObjectKind::Directory
     } else if file_type.is_file() {
         ObjectKind::File
-    } else {
-        // Logical symlinks are shadow-only; a host symlink is reported by kind so
-        // the overlay refuses it rather than silently following it.
+    } else if file_type.is_symlink() {
         ObjectKind::LogicalSymlink
+    } else {
+        return Err(error(
+            ErrorKind::UnsupportedCapability,
+            "base.stat",
+            "special host entries (devices, sockets, FIFOs) are unsupported",
+        ));
     };
     Ok(BlobStat {
         // Stable within this host: hard links share (device, inode) and so share
@@ -407,12 +411,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn special_host_entries_are_not_reported_as_symlinks() {
+        assert_eq!(
+            blob_stat(&fs::symlink_metadata("/dev/null").unwrap())
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsupportedCapability
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        assert_eq!(
+            blob_stat(&fs::symlink_metadata(link).unwrap())
+                .unwrap()
+                .kind,
+            ObjectKind::LogicalSymlink
+        );
+    }
+
+    #[test]
     fn inventory_refuses_symlinks_and_detects_change() {
-        let dir = std::env::temp_dir().join(format!("umbra-inv-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path();
         fs::create_dir_all(dir.join("nested")).unwrap();
         fs::write(dir.join("nested/file"), b"one").unwrap();
-        let inventory = WorkspaceInventory::capture(&dir).unwrap();
+        let inventory = WorkspaceInventory::capture(dir).unwrap();
         assert_eq!(inventory.entries().len(), 3);
         inventory.verify_unchanged().unwrap();
 
@@ -424,18 +447,17 @@ mod tests {
 
         std::os::unix::fs::symlink("/etc", dir.join("link")).unwrap();
         assert_eq!(
-            WorkspaceInventory::capture(&dir).unwrap_err().kind,
+            WorkspaceInventory::capture(dir).unwrap_err().kind,
             ErrorKind::UnsupportedCapability
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn base_paths_map_logical_roots_to_host_paths_without_a_control_namespace() {
-        let dir = std::env::temp_dir().join(format!("umbra-base-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let base = HostReadOnlyBase::new(WorkspaceInventory::capture(&dir).unwrap());
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path();
+        fs::create_dir_all(dir).unwrap();
+        let base = HostReadOnlyBase::new(WorkspaceInventory::capture(dir).unwrap());
         let path = StoragePath::new(StorageAnchor::Root, b"etc/hosts".to_vec()).unwrap();
         assert_eq!(
             base.physical_path(&path).unwrap().0.as_bytes(),
@@ -446,6 +468,5 @@ mod tests {
             base.physical_path(&control).unwrap_err().kind,
             ErrorKind::InvalidPath
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 }

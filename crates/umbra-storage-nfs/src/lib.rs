@@ -251,9 +251,8 @@ impl NfsStorage {
 impl Storage for NfsStorage {
     fn capabilities(&self) -> StorageCapabilities {
         StorageCapabilities {
-            // The mount capability is advertised only after `connect` actually
-            // validated an existing exact NFSv4 mount. Configuration alone never
-            // earns it, and `new` (which validates nothing) never reports it.
+            // Only successful mount validation in connect or open_run earns
+            // this capability. Construction/configuration alone does not.
             features: {
                 let mut features = std::collections::BTreeSet::new();
                 features.insert(umbra_core::capabilities::STORAGE_OPEN_REWRITE_V1.to_owned());
@@ -298,6 +297,7 @@ impl Storage for NfsStorage {
         }
         self.config.validate()?;
         mount::validate(&self.config.mount_root)?;
+        self.validated = true;
         // Walk the configured absolute path from /, rejecting every symlink.
         let slash = OpenOptions::new()
             .read(true)

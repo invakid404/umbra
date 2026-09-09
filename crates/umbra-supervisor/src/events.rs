@@ -10,7 +10,7 @@
 //! tree is terminated by the caller, and the original error is preserved. A
 //! mutation is never allowed to proceed because a step could not be completed.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use umbra_core::{
     AbortReason, ErrorKind, ExitStatus, FsOp, LaunchSpec, OperationId, OperationOutcome,
@@ -29,10 +29,32 @@ use crate::{
 struct TaskMemory<'a> {
     control: &'a mut dyn TraceControl,
     task: TaskId,
+    namespace: &'a mut dyn umbra_overlay::NamespaceSession,
+    renew_at: &'a mut Option<Instant>,
+    interval: Option<Duration>,
+}
+
+fn renew_due(
+    namespace: &mut dyn umbra_overlay::NamespaceSession,
+    renew_at: &mut Option<Instant>,
+    interval: Option<Duration>,
+) -> Result<()> {
+    let (Some(deadline), Some(interval)) = (*renew_at, interval) else {
+        return Ok(());
+    };
+    let now = Instant::now();
+    if now >= deadline {
+        namespace.renew_writer()?;
+        // Account for renewal's own provider latency, rather than adding it to
+        // the next interval after the call returns.
+        *renew_at = Some(now + interval);
+    }
+    Ok(())
 }
 
 impl TraceMemory for TaskMemory<'_> {
     fn read(&mut self, address: u64, out: &mut [u8]) -> Result<()> {
+        renew_due(self.namespace, self.renew_at, self.interval)?;
         self.control.read_memory(self.task, address, out)
     }
 }
@@ -110,7 +132,7 @@ impl Supervisor {
 
     /// Dispatch one event and issue at most one resume for it.
     pub fn handle_event(&mut self, event: TraceEvent) -> Result<()> {
-        let result = self.dispatch(event);
+        let result = self.service_renewal().and_then(|()| self.dispatch(event));
         if result.is_err() {
             self.poisoned = true;
             self.state.lifecycle = RunLifecycle::RecoveryRequired;
@@ -159,21 +181,31 @@ impl Supervisor {
                 self.resume_thread(thread)
             }
             TraceEvent::Exit { task, status } => {
+                let process = self
+                    .state
+                    .processes
+                    .processes
+                    .get_mut(&task)
+                    .ok_or_else(|| {
+                        error(
+                            ErrorKind::InvalidState,
+                            "supervisor.exit",
+                            "exit for an uncaptured task",
+                        )
+                    })?;
+                if matches!(process.lifecycle, ProcessLifecycle::Exited(_)) {
+                    return Ok(());
+                }
+                process.lifecycle = ProcessLifecycle::Exited(status);
+                for thread in process.threads.keys() {
+                    self.operations.remove(thread);
+                }
+                process.threads.clear();
                 if Some(ProcessHandle(task)) == self.state.processes.root {
                     self.root_status = Some(status);
                 }
-                if let Some(process) = self.state.processes.processes.get_mut(&task) {
-                    if matches!(process.lifecycle, ProcessLifecycle::Exited(_)) {
-                        return Ok(());
-                    }
-                    process.lifecycle = ProcessLifecycle::Exited(status);
-                    for thread in process.threads.keys() {
-                        self.operations.remove(thread);
-                    }
-                    process.threads.clear();
-                }
                 self.exited += 1;
-                self.live = self.live.saturating_sub(1);
+                self.live -= 1;
                 Ok(())
             }
             TraceEvent::Signal {
@@ -182,6 +214,7 @@ impl Supervisor {
                 signal,
             } => {
                 self.track_thread(task, thread, StopReason::Signal(signal))?;
+                self.service_renewal()?;
                 self.platform.control.resume(ResumeCommand {
                     thread,
                     mode: ResumeMode::Syscall,
@@ -219,6 +252,9 @@ impl Supervisor {
             let mut memory = TaskMemory {
                 control: &mut *self.platform.control,
                 task,
+                namespace: &mut *self.namespace,
+                renew_at: &mut self.renew_at,
+                interval: self.budget.as_ref().map(|b| b.renew_after),
             };
             self.platform.abi.decode_entry(&registers, &mut memory)?
         };
@@ -232,6 +268,7 @@ impl Supervisor {
             umbra_overlay::Dispatch::Materialise | umbra_overlay::Dispatch::Whiteout
         );
         let context = self.process(task)?.context.clone();
+        self.service_renewal()?;
         let action = match self.namespace.resolve(&context, &operation) {
             Ok(action) => action,
             Err(e) if e.kind == ErrorKind::NotFound && !mutation => {
@@ -245,6 +282,7 @@ impl Supervisor {
             Err(e) => return Err(e),
         };
         let id = OperationId(Uuid::new_v4());
+        self.service_renewal()?;
         let prepared = self.namespace.prepare(id, &action)?;
         self.operations.insert(thread, id);
         match &prepared.action {
@@ -284,17 +322,20 @@ impl Supervisor {
         // already created or copied up the target and cleared create/exclusive, so
         // replacing only the path pointer would re-run stale O_EXCL semantics.
         let _ = original;
+        self.service_renewal()?;
         let plan = self.platform.control.prepare_rewrite(
             thread,
             &target.path.0,
             physical.operation.clone(),
         )?;
         for write in &plan.memory_writes {
+            self.service_renewal()?;
             self.platform
                 .control
                 .write_memory(task, write.address, &write.bytes)?;
         }
         self.platform.abi.apply_rewrite(registers, &plan)?;
+        self.service_renewal()?;
         self.platform.control.set_registers(thread, registers)
     }
 
@@ -310,7 +351,9 @@ impl Supervisor {
             // the kernel result stands as-is.
             return self.resume_thread(thread);
         };
+        self.service_renewal()?;
         self.namespace.observe_result(id, &outcome)?;
+        self.service_renewal()?;
         match outcome {
             OperationOutcome::Success { .. } => {
                 self.namespace.commit(id)?;
@@ -335,22 +378,19 @@ impl Supervisor {
     }
 
     fn service_renewal(&mut self) -> Result<()> {
-        let (Some(deadline), Some(budget)) = (self.renew_at, self.budget.as_ref()) else {
-            return Ok(());
-        };
-        if Instant::now() < deadline {
-            return Ok(());
-        }
-        let interval = budget.renew_after;
-        self.namespace.renew_writer().inspect_err(|_| {
-            // Without proven authority nothing may resume; the caller terminates.
+        renew_due(
+            &mut *self.namespace,
+            &mut self.renew_at,
+            self.budget.as_ref().map(|b| b.renew_after),
+        )
+        .inspect_err(|_| {
             self.poisoned = true;
-        })?;
-        self.renew_at = Some(Instant::now() + interval);
-        Ok(())
+            self.state.lifecycle = RunLifecycle::RecoveryRequired;
+        })
     }
 
     fn resume_thread(&mut self, thread: ThreadId) -> Result<()> {
+        self.service_renewal()?;
         if self.poisoned {
             return Err(error(
                 ErrorKind::InvalidState,
@@ -375,7 +415,6 @@ impl Supervisor {
             Some(mut context) => {
                 context.task = task;
                 context.parent = parent;
-                context.fds.retain(|_, fd| !fd.flags.close_on_exec);
                 context
             }
             None => ProcessContext {
@@ -487,5 +526,192 @@ impl Supervisor {
         self.platform.control.terminate(process, policy)?;
         self.live = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use umbra_core::*;
+    use umbra_overlay::{NamespaceResolver, NamespaceSession};
+    use umbra_platform::{PlatformSession, SyscallAbi, TraceBackend};
+
+    struct Fake;
+    impl TraceBackend for Fake {
+        fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
+            unreachable!()
+        }
+        fn next_event(&mut self) -> Result<TraceEvent> {
+            unreachable!()
+        }
+        fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
+            panic!("renewal failure must precede memory read")
+        }
+        fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
+            unreachable!()
+        }
+        fn set_registers(&mut self, _: ThreadId, _: &RegisterSet) -> Result<()> {
+            unreachable!()
+        }
+        fn resume(&mut self, _: ResumeCommand) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl TraceControl for Fake {
+        fn capabilities(&self) -> PlatformCapabilities {
+            PlatformCapabilities::default()
+        }
+        fn quiesce(&mut self, _: ProcessHandle) -> Result<QuiescedTree> {
+            unreachable!()
+        }
+        fn terminate(&mut self, _: ProcessHandle, _: TerminationPolicy) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl SyscallAbi for Fake {
+        fn decode_entry(&self, _: &RegisterSet, _: &mut dyn TraceMemory) -> Result<Option<FsOp>> {
+            unreachable!()
+        }
+        fn apply_rewrite(&self, _: &mut RegisterSet, _: &PreparedRewrite) -> Result<()> {
+            unreachable!()
+        }
+        fn emulate_result(&self, _: &mut RegisterSet, _: &EmulatedResult) -> Result<()> {
+            unreachable!()
+        }
+    }
+    impl NamespaceResolver for Fake {
+        fn resolve(&mut self, _: &ProcessContext, _: &FsOp) -> Result<ResolvedAction> {
+            unreachable!()
+        }
+    }
+    impl NamespaceSession for Fake {
+        fn prepare(&mut self, _: OperationId, _: &ResolvedAction) -> Result<PreparedAction> {
+            unreachable!()
+        }
+        fn observe_result(&mut self, _: OperationId, _: &OperationOutcome) -> Result<()> {
+            unreachable!()
+        }
+        fn commit(&mut self, _: OperationId) -> Result<CommitReceipt> {
+            unreachable!()
+        }
+        fn abort(&mut self, _: OperationId, _: &AbortReason) -> Result<()> {
+            unreachable!()
+        }
+        fn checkpoint(&mut self, _: &CheckpointRequest) -> Result<Checkpoint> {
+            unreachable!()
+        }
+        fn renew_writer(&mut self) -> Result<WriterLease> {
+            Err(UmbraError::new(
+                ErrorKind::LeaseLost,
+                "test",
+                "renewal failed",
+            ))
+        }
+    }
+    fn task(id: u64) -> TaskId {
+        TaskId(TaskIdentity {
+            native_id: id,
+            generation: 1,
+        })
+    }
+    fn supervisor() -> Supervisor {
+        let mut s = Supervisor::with_namespace(
+            RunId(Uuid::new_v4()),
+            PlatformSession {
+                control: Box::new(Fake),
+                abi: Box::new(Fake),
+            },
+            Box::new(Fake),
+            None,
+        );
+        s.track_process(task(1), None);
+        s.state.processes.root = Some(ProcessHandle(task(1)));
+        s.live = 1;
+        s.state.lifecycle = RunLifecycle::Running;
+        s
+    }
+    #[test]
+    fn fork_keeps_cloexec_dirfd_until_child_exec() {
+        let mut s = supervisor();
+        s.process_mut(task(1)).unwrap().context.fds.insert(
+            TracedFd(3),
+            FdState {
+                object: ObjectId(Uuid::new_v4()),
+                logical_path: Some(BytePath::new(b"/directory".to_vec()).unwrap()),
+                directory: true,
+                flags: OpenFlags {
+                    close_on_exec: true,
+                    ..OpenFlags::default()
+                },
+            },
+        );
+        s.handle_event(TraceEvent::Child {
+            parent: task(1),
+            child: ProcessHandle(task(2)),
+            kind: ChildKind::Fork,
+        })
+        .unwrap();
+        assert_eq!(
+            s.process(task(2)).unwrap().context.fds,
+            s.process(task(1)).unwrap().context.fds
+        );
+        s.handle_event(TraceEvent::Exec {
+            task: task(2),
+            thread: ThreadId(task(2).0),
+            exec_generation: 1,
+        })
+        .unwrap();
+        assert!(s.process(task(2)).unwrap().context.fds.is_empty());
+        assert!(s
+            .process(task(1))
+            .unwrap()
+            .context
+            .fds
+            .contains_key(&TracedFd(3)));
+    }
+    #[test]
+    fn unknown_exit_cannot_complete_a_live_tree_and_duplicates_do_not_count() {
+        let mut s = supervisor();
+        assert_eq!(
+            s.handle_event(TraceEvent::Exit {
+                task: task(99),
+                status: ExitStatus::Code(0)
+            })
+            .unwrap_err()
+            .kind,
+            ErrorKind::InvalidState
+        );
+        assert_eq!((s.live, s.exited), (1, 0));
+        assert!(s.poisoned);
+        assert!(s.run().is_err());
+        let mut s = supervisor();
+        for _ in 0..2 {
+            s.handle_event(TraceEvent::Exit {
+                task: task(1),
+                status: ExitStatus::Code(0),
+            })
+            .unwrap();
+        }
+        assert_eq!((s.live, s.exited), (0, 1));
+    }
+    #[test]
+    fn decoder_callback_renews_before_another_provider_read() {
+        let mut control = Fake;
+        let mut namespace = Fake;
+        let mut deadline = Some(Instant::now());
+        let mut memory = TaskMemory {
+            control: &mut control,
+            namespace: &mut namespace,
+            task: task(1),
+            renew_at: &mut deadline,
+            interval: Some(Duration::from_secs(1)),
+        };
+        assert_eq!(
+            memory.read(0, &mut [0]).unwrap_err().kind,
+            ErrorKind::LeaseLost
+        );
     }
 }

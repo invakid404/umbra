@@ -24,6 +24,40 @@ use umbra_core::{
 
 use crate::sandbox::{self, SandboxSpec};
 
+/// Match ABI identities to the negotiated architecture, ignoring unrelated ABIs.
+fn select_abi(
+    names: &std::collections::BTreeSet<String>,
+    architecture: &umbra_core::Architecture,
+) -> Result<String> {
+    let suffix = match architecture {
+        umbra_core::Architecture::Aarch64 => "-arm64",
+        umbra_core::Architecture::X86_64 => "-x86_64",
+        umbra_core::Architecture::Unsupported(_) => {
+            return Err(UmbraError::new(
+                ErrorKind::UnsupportedCapability,
+                "run.platform",
+                "unsupported ABI architecture",
+            ))
+        }
+    };
+    let mut matching = names.iter().filter(|name| {
+        name.rsplit_once("-abi-v").is_some_and(|(prefix, version)| {
+            prefix.ends_with(suffix)
+                && prefix.len() > suffix.len()
+                && !version.is_empty()
+                && version.bytes().all(|b| b.is_ascii_digit())
+        })
+    });
+    match (matching.next(), matching.next()) {
+        (Some(abi), None) => Ok(abi.clone()),
+        _ => Err(UmbraError::new(
+            ErrorKind::UnsupportedCapability,
+            "run.platform",
+            "platform must advertise exactly one ABI identity for the negotiated architecture",
+        )),
+    }
+}
+
 /// How a run's persistent state is stored, chosen explicitly by the caller.
 ///
 /// There is no automatic selection and no fallback between these: a run that
@@ -557,21 +591,9 @@ mod unix {
                 ))
             }
         };
-        // ABI identities use the documented `<platform>-<arch>-abi-v<version>`
-        // capability suffix. Exactly one identity must be negotiated.
-        let mut abi_names = capabilities.capabilities.iter().filter(|name| {
-            name.rsplit_once("-abi-v").is_some_and(|(prefix, version)| {
-                !prefix.is_empty()
-                    && !version.is_empty()
-                    && version.bytes().all(|b| b.is_ascii_digit())
-            })
-        });
-        let abi = match (abi_names.next(), abi_names.next()) {
-            (Some(abi), None) => abi.clone(),
-            _ => return Err(fail(namespace, run_id, error(
-                ErrorKind::UnsupportedCapability, "run.platform",
-                "platform must advertise exactly one ABI identity (<platform>-<arch>-abi-v<version>)",
-            ), true)),
+        let abi = match select_abi(&capabilities.capabilities, &architecture) {
+            Ok(abi) => abi,
+            Err(e) => return Err(fail(namespace, run_id, e, true)),
         };
         let budget = RunBudget {
             // Renew at half the interval so one blocking event read cannot
@@ -588,16 +610,9 @@ mod unix {
 
         let mut supervisor = Supervisor::with_namespace(run_id, platform, namespace, None);
         if let Err(e) = supervisor.launch_prepared(launch_spec, budget) {
-            // A rejected launch never created a process; anything else may have.
-            let terminated = matches!(
-                e.kind,
-                ErrorKind::UnsupportedCapability
-                    | ErrorKind::NotImplemented
-                    | ErrorKind::InvalidInput
-                    | ErrorKind::InvalidPath
-                    | ErrorKind::InvalidState
-                    | ErrorKind::ProtocolMismatch
-            );
+            // The backend's explicit cleanup evidence survives launch_prepared
+            // and IPC. Error category alone says nothing about a spawned tree.
+            let terminated = e.launch_tree_terminated;
             return Err(fail(
                 supervisor.into_parts().namespace,
                 run_id,
@@ -720,5 +735,27 @@ mod unix {
             ));
         }
         BytePath::new(resolved.as_os_str().as_bytes().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    #[test]
+    fn universal_provider_selects_the_negotiated_architecture() {
+        let mut names = ["aaa-feature", "darwin-arm64-abi-v1", "darwin-x86_64-abi-v1"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            select_abi(&names, &umbra_core::Architecture::Aarch64).unwrap(),
+            "darwin-arm64-abi-v1"
+        );
+        assert_eq!(
+            select_abi(&names, &umbra_core::Architecture::X86_64).unwrap(),
+            "darwin-x86_64-abi-v1"
+        );
+        names.insert("darwin-arm64-abi-v2".into());
+        assert!(select_abi(&names, &umbra_core::Architecture::Aarch64).is_err());
     }
 }

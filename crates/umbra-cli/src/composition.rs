@@ -27,15 +27,18 @@ pub fn load_registry(path: &std::path::Path) -> Result<ProviderRegistry> {
 }
 
 /// Connect every required role before handing the contracts to the supervisor.
-#[cfg(unix)]
 pub fn build_supervisor(run_id: RunId, registry: &ProviderRegistry) -> Result<Supervisor> {
     registry.validate()?;
     let timeout = registry.timeout_ms;
     let platform = umbra_platform::provider::connect(registry.get("platform")?, timeout)?;
-    let agent = Box::new(umbra_agent::provider::Proxy::connect(
-        registry.get("agent")?,
-        timeout,
-    )?);
+    let agent = registry
+        .providers
+        .get("agent")
+        .map(|descriptor| {
+            umbra_agent::provider::Proxy::connect(descriptor, timeout)
+                .map(|agent| Box::new(agent) as Box<dyn umbra_agent::Agent>)
+        })
+        .transpose()?;
     let namespace: Box<dyn umbra_overlay::NamespaceSession + Send> =
         if let Some(descriptor) = registry.providers.get("namespace") {
             Box::new(umbra_overlay::provider::Proxy::connect(
@@ -53,20 +56,7 @@ pub fn build_supervisor(run_id: RunId, registry: &ProviderRegistry) -> Result<Su
             umbra_overlay::standard_namespace(storage, journal)
         };
     Ok(Supervisor::with_namespace(
-        run_id,
-        platform,
-        namespace,
-        Some(agent),
-    ))
-}
-
-/// Unsupported hosts return an explicit error without importing Unix backend types.
-#[cfg(not(unix))]
-pub fn build_supervisor(_run_id: RunId, _registry: &ProviderRegistry) -> Result<Supervisor> {
-    Err(umbra_core::UmbraError::new(
-        umbra_core::ErrorKind::UnsupportedCapability,
-        "providers",
-        "local provider transport requires Unix",
+        run_id, platform, namespace, agent,
     ))
 }
 
@@ -113,6 +103,17 @@ pub fn run_spec(
     full_argv.extend(argv);
 
     let mut environment = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
+    let mut add = |entry: EnvironmentVariable| -> Result<()> {
+        if !names.insert(entry.name.clone()) {
+            return Err(invalid(format!(
+                "duplicate environment name: {}",
+                String::from_utf8_lossy(&entry.name)
+            )));
+        }
+        environment.push(entry);
+        Ok(())
+    };
     for entry in &args.env {
         let bytes = os_bytes(entry);
         let split = bytes
@@ -123,10 +124,10 @@ pub fn run_spec(
         if name.is_empty() {
             return Err(invalid("--env name must not be empty"));
         }
-        environment.push(EnvironmentVariable {
+        add(EnvironmentVariable {
             name: name.to_vec(),
             value: value[1..].to_vec(),
-        });
+        })?;
     }
     for name in &args.inherit_env {
         let value = std::env::var_os(name).ok_or_else(|| {
@@ -135,10 +136,10 @@ pub fn run_spec(
                 name.to_string_lossy()
             ))
         })?;
-        environment.push(EnvironmentVariable {
+        add(EnvironmentVariable {
             name: os_bytes(name),
             value: value.as_os_str().as_bytes().to_vec(),
-        });
+        })?;
     }
 
     let cwd = BytePath::new(workspace.as_os_str().as_bytes().to_vec())?;

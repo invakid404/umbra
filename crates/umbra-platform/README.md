@@ -149,4 +149,6 @@ trait-object smoke example with `cargo test -p umbra-platform --doc`.
 
 The provider dispatcher rejects `UnsandboxedExperiment` before calling a backend:
 IPC launch is exclusively the supervised contract path. ABI capability identities
-use `<platform>-<arch>-abi-v<decimal version>`; run composition requires exactly one.
+use `<platform>-<arch>-abi-v<decimal version>`; run composition requires exactly
+one for its negotiated architecture. Protocol version 2 rejects stale providers
+before decoding the required sandbox policy and rewrite messages.

@@ -940,10 +940,10 @@ impl MacosTraceBackend {
         );
         let session = match session {
             Ok(s) => s,
-            Err(e) => {
+            Err(mut e) => {
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
-                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+                    e.launch_tree_terminated = reap_launched_child(pid);
                 }
                 self.deadline = None;
                 self.watchdog = None;
@@ -958,21 +958,18 @@ impl MacosTraceBackend {
             thread: self.sessions[0].thread,
         });
         if matches!(spec.sandbox, SandboxRequirement::Required(_)) {
-            if let Err(e) = self.complete_sandboxed_handoff(handle, &twin) {
+            if let Err(mut e) = self.complete_sandboxed_handoff(handle, &twin) {
                 // Never return a live tree from a launch that could not prove the
                 // boundary: the caller would have no handle to terminate it with.
                 for session in &self.sessions {
                     session.task.kill();
                 }
+                let mut reaped = !self.sessions.is_empty();
                 for session in &self.sessions {
-                    unsafe {
-                        while libc::waitpid(session.id.0.native_id as i32, std::ptr::null_mut(), 0)
-                            == -1
-                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
-                        {
-                        }
-                    }
+                    reaped &= (session.parent.is_none() && session.reaped)
+                        || reap_launched_child(session.id.0.native_id as i32);
                 }
+                e.launch_tree_terminated = reaped;
                 self.sessions.clear();
                 self.events.clear();
                 self.quiesced_stops.clear();
@@ -1000,6 +997,8 @@ impl MacosTraceBackend {
             let resume = match self.next_event()? {
                 TraceEvent::Exec { task, thread, .. } if task == handle.0 => {
                     let image = image_path(task.0.native_id as i32)?;
+                    let target = std::fs::canonicalize(target)
+                        .map_err(|e| error("sandbox handoff target", e.to_string()))?;
                     if image != target {
                         return Err(error(
                             "sandbox.launch",
@@ -1362,7 +1361,9 @@ impl MacosTraceBackend {
             // Root was spawned by this process. Debugserver hands it back on exit.
             if s.parent.is_none() {
                 unsafe {
-                    libc::waitpid(s.id.0.native_id as i32, std::ptr::null_mut(), libc::WNOHANG);
+                    s.reaped =
+                        libc::waitpid(s.id.0.native_id as i32, std::ptr::null_mut(), libc::WNOHANG)
+                            == s.id.0.native_id as i32;
                 }
             }
             return Ok(());
@@ -1509,6 +1510,20 @@ fn spawn_attributes() -> Result<SpawnAttributes> {
         result
     }
 }
+// Only a successful waitpid is evidence that this launch's child was reaped.
+fn reap_launched_child(pid: i32) -> bool {
+    loop {
+        let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        if result == pid {
+            return true;
+        }
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return false;
+    }
+}
+
 impl TraceBackend for MacosTraceBackend {
     fn launch(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
         if matches!(spec.sandbox, SandboxRequirement::UnsandboxedExperiment) {

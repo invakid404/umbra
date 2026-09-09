@@ -193,12 +193,15 @@ provider that does not implement them cannot be handed a run:
 - `renew_writer` renews the injected lease through this session's own storage. A
   refused or epoch-advanced renewal is `LeaseLost`: authority is gone or unproven,
   and the caller must stop resuming tracees rather than retry into a mutation.
-  Renewal is permitted while a transaction is pending, so an in-flight syscall
-  cannot starve the lease it mutates under.
+  Renewal is permitted while a transaction is pending. A failed renewal latches
+  the session poisoned, and an already-poisoned session refuses renewal.
 - `finish_run` durably completes a fresh command run: flush run data, append and
   flush a `RunCompleted` record, close the journal, release the writer, close
-  storage. A receipt is returned only when every step succeeded. This is not a
-  resumable checkpoint and authorizes no takeover.
+  storage. Once completion is durable, the session is terminal: each cleanup
+  stage is attempted once, errors retain stage context, and bindings are cleared.
+  A subsequent `fail_run` does not repeat those closed stages. Failures before
+  durable completion retain the binding for `fail_run` cleanup. A receipt is
+  returned only when every step succeeded; it authorizes no takeover.
 - `fail_run` leaves the run explicitly failed. It writes no completion record and
   publishes no checkpoint, and it releases the writer lease only when the request
   carries evidence that the supervised tree is gone. Without that evidence the

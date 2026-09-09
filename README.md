@@ -16,7 +16,7 @@ in the architecture document.
 M1 and M1.5 have delivered the 16-crate pluggable workspace, a working
 [Darwin arm64 Rust tracer](crates/umbra-platform-macos/README.md), real local,
 NFS and tar storage backends, and an overlay with copy-up, read-through,
-whiteouts and logical symlinks. All seven Rust fixture cases are CAPTURED and
+whiteouts and logical symlinks. All eleven Rust fixture cases are CAPTURED and
 the M2 post-exec breakpoint gap is closed.
 [M0 Gate 2](docs/m0/gate-2.md) preserves the separate Python prototype evidence.
 

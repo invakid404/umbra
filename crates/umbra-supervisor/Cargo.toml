@@ -17,3 +17,6 @@ umbra-storage = { path = "../umbra-storage" }
 umbra-overlay = { path = "../umbra-overlay" }
 umbra-journal = { path = "../umbra-journal" }
 umbra-agent = { path = "../umbra-agent" }
+
+[dev-dependencies]
+tempfile.workspace = true
