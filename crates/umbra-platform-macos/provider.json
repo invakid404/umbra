@@ -1,7 +1,7 @@
 {
   "id": "macos",
   "role": "platform",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "executable": [
     47,
     117,

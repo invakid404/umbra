@@ -12,12 +12,13 @@ use std::path::PathBuf;
 use clap::{Args, Parser};
 use umbra_core::Result;
 
-/// Umbra's parsing skeleton. Operational commands are not implemented yet.
+/// Umbra's command-line surface. `run` is operational; the run-management
+/// commands remain unimplemented and report that explicitly.
 #[derive(Debug, Parser)]
 #[command(
     name = "umbra",
     version,
-    about = "Supervised agent runs (CLI skeleton)"
+    about = "Supervised runs over an explicitly configured provider registry"
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -31,13 +32,16 @@ pub struct Cli {
 #[derive(Debug, Args)]
 /// Storage args.
 pub struct StorageArgs {
-    /// Local development storage directory; does not provide remote persistence.
-    #[arg(long, global = true, default_value = ".umbra", value_name = "PATH")]
-    pub storage_root: PathBuf,
+    /// Legacy local storage directory, retained only so existing invocations
+    /// still parse. `run` rejects an explicit value rather than ignoring it:
+    /// storage is configured in the provider registry.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub storage_root: Option<PathBuf>,
 }
 
 impl Cli {
-    /// Dispatch only to argument-reporting stubs; do not construct or open storage.
+    /// Dispatch to the selected command. Commands that are not implemented say
+    /// so; none of them prompts, and none reads stdin for configuration.
     pub fn execute(self) -> Result<()> {
         self.command.execute(&self.storage)
     }

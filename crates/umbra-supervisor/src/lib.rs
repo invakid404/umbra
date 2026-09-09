@@ -5,25 +5,40 @@
 //! require bounded messages and explicit ordering; trace polling must not starve
 //! writer renewal. Provider loss must retain enforcement and block mutations.
 //!
-//! Construction performs no I/O. All operational methods fail with NotImplemented.
-//! Namespace lifecycle contracts are injected; execution remains unimplemented.
+//! Construction performs no I/O. [`run`] owns the staged composition of one
+//! command run: validate, connect storage, open the run, take the writer lease,
+//! open the journal, bind the namespace, render enforcement, launch stopped, drive
+//! events, then tear down in order. Checkpoint, resume and recovery remain
+//! unimplemented and say so.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
+
 use umbra_agent::Agent;
 pub use umbra_core::CheckpointRequest;
 use umbra_core::{
     AgentLaunchRequest, AgentResumeRequest, AgentSession, BytePath, Checkpoint, ExitStatus, FsOp,
     ObjectId, OperationId, OperationOutcome, PreparedRewrite, ProcessContext, ProcessHandle, Prot,
     QuiescedTree, RecoveryState, RegisterSet, ResolvedAction, Result, RunId, TaskId,
-    TerminationPolicy, ThreadId, TraceEvent, UmbraError,
+    TerminationPolicy, ThreadId, UmbraError,
 };
 use umbra_journal::Journal;
 use umbra_overlay::{standard_namespace, NamespaceSession};
 use umbra_platform::PlatformSession;
 use umbra_storage::Storage;
+
+/// Approved workspace inventory and the read-only base built from it.
+pub mod base;
+mod events;
+/// Staged composition of one command run.
+pub mod run;
+/// Runtime rendering of the single Seatbelt policy template.
+pub mod sandbox;
+
+pub use run::{run, CommandLaunch, RunLaunch, RunObserver, RunOutcome, RunPersistence, RunSpec};
 
 /// Runtime inventory, never persisted or restored across hosts.
 #[derive(Clone, Debug, Default)]
@@ -274,12 +289,34 @@ pub struct SupervisorState {
     pub session: Option<AgentSession>,
 }
 
+/// Bounds on one run's event loop, validated before the target is launched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunBudget {
+    /// Renew the writer lease at least this often.
+    pub renew_after: Duration,
+    /// Logical working directory the target was launched in.
+    pub cwd: BytePath,
+    /// Architecture and ABI label negotiated with the platform provider.
+    pub architecture: umbra_core::Architecture,
+    /// Abi.
+    pub abi: String,
+}
+
 /// Contracts only: no backend-kind enum, concrete backend import, or provider I/O.
 pub struct Supervisor {
     platform: PlatformSession,
     namespace: Box<dyn NamespaceSession + Send>,
-    agent: Box<dyn Agent>,
+    agent: Option<Box<dyn Agent>>,
     state: SupervisorState,
+    budget: Option<RunBudget>,
+    live: u64,
+    exited: u64,
+    root_status: Option<ExitStatus>,
+    renew_at: Option<Instant>,
+    operations: BTreeMap<ThreadId, OperationId>,
+    /// Set once an interception, provider or authority failure makes further
+    /// resumes unsafe. Nothing is resumed after this, in any code path.
+    poisoned: bool,
 }
 
 /// Returned ownership does not imply providers were closed or a clean shutdown.
@@ -288,8 +325,8 @@ pub struct SupervisorParts {
     pub platform: PlatformSession,
     /// Namespace.
     pub namespace: Box<dyn NamespaceSession + Send>,
-    /// Agent.
-    pub agent: Box<dyn Agent>,
+    /// Agent, absent for a raw command run.
+    pub agent: Option<Box<dyn Agent>>,
     /// State.
     pub state: SupervisorState,
 }
@@ -302,7 +339,7 @@ impl Supervisor {
         platform: PlatformSession,
         storage: Box<dyn Storage>,
         journal: Box<dyn Journal>,
-        agent: Box<dyn Agent>,
+        agent: Option<Box<dyn Agent>>,
     ) -> Self {
         Self::with_namespace(
             run_id,
@@ -317,7 +354,7 @@ impl Supervisor {
         run_id: RunId,
         platform: PlatformSession,
         namespace: Box<dyn NamespaceSession + Send>,
-        agent: Box<dyn Agent>,
+        agent: Option<Box<dyn Agent>>,
     ) -> Self {
         Self {
             platform,
@@ -329,6 +366,13 @@ impl Supervisor {
                 processes: ProcessTree::default(),
                 session: None,
             },
+            budget: None,
+            live: 0,
+            exited: 0,
+            root_status: None,
+            renew_at: None,
+            operations: BTreeMap::new(),
+            poisoned: false,
         }
     }
 
@@ -347,28 +391,19 @@ impl Supervisor {
         }
     }
 
-    /// Validate capabilities and plans, acquire writer authority, open/recover the
-    /// journal, and prepare roots before a stopped launch with enforcement installed.
-    pub fn launch(&mut self, _request: &AgentLaunchRequest) -> Result<ProcessHandle> {
-        Err(UmbraError::not_implemented("supervisor.launch"))
-    }
-
-    /// Ordered event loop. Bounded polling must service control requests and avoid
-    /// starving lease renewal. No tracee may resume after required provider loss.
-    pub fn run(&mut self) -> Result<()> {
-        Err(UmbraError::not_implemented("supervisor.run"))
-    }
-
-    /// Process at most one event on the debug-control thread.
-    pub fn step(&mut self) -> Result<()> {
-        Err(UmbraError::not_implemented("supervisor.step"))
-    }
-
-    /// Entry: decode -> resolve -> prepare -> execute/emulate. Exit: observe result
-    /// -> commit namespace/fd effects -> resume. Children require stopped capture;
-    /// exec replaces mappings and re-arms interception through the platform.
-    pub fn handle_event(&mut self, _event: TraceEvent) -> Result<()> {
-        Err(UmbraError::not_implemented("supervisor.handle_event"))
+    /// Describe an adapter session's launch. Storage, authority, journal and
+    /// enforcement are prepared by [`run`]; this only asks the injected adapter
+    /// for its plan, and fails when no adapter was selected.
+    pub fn launch(&mut self, request: &AgentLaunchRequest) -> Result<ProcessHandle> {
+        let agent = self.agent.as_ref().ok_or_else(|| {
+            UmbraError::new(
+                umbra_core::ErrorKind::InvalidState,
+                "supervisor.launch",
+                "no agent adapter was selected for this run",
+            )
+        })?;
+        let _plan = agent.launch_plan(request)?;
+        Err(UmbraError::not_implemented("supervisor.launch.agent_plan"))
     }
 
     /// Reject new children/mutations and stop the entire tree at known boundaries.

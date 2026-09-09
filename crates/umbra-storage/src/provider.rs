@@ -156,7 +156,9 @@ pub fn serve_provider<B: Storage>(
     let (connection, mut backend) = wire::accept(id, "storage", |options| {
         let backend = factory(options)?;
         let actual = backend.capabilities();
-        let mut capabilities = std::collections::BTreeSet::new();
+        // The open feature set is the extension point; the two legacy boolean
+        // names are kept so existing registries keep resolving.
+        let mut capabilities = actual.features.clone();
         if actual.strict_remote_persistence {
             capabilities.insert("strict_remote_persistence".into());
         }

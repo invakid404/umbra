@@ -394,3 +394,21 @@ fn absent_mount_rejected_without_creating_it() {
     assert!(!absent.exists());
     assert!(NfsStorage::connect(NfsStorageConfig::new(temp.path())).is_err());
 }
+
+#[test]
+fn open_run_qualifies_a_new_backend_after_mount_validation() {
+    let Some((_temp, config)) = fixture() else {
+        return;
+    };
+    let mut storage = NfsStorage::new(config);
+    assert!(!storage
+        .capabilities()
+        .features
+        .contains(capabilities::STORAGE_MOUNTED_NFSV4_V1));
+    storage.open_run(&request()).unwrap();
+    assert!(storage
+        .capabilities()
+        .features
+        .contains(capabilities::STORAGE_MOUNTED_NFSV4_V1));
+    storage.close_run().unwrap();
+}

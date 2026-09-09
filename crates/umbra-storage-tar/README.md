@@ -4,7 +4,9 @@ A synchronous Unix storage provider requiring only an absolute tar archive filen
 No external mount, daemon, credentials, environment variables, or registry changes in
 Umbra's CLI code are required. The archive's parent directory must already exist.
 The provider is for API-driven storage; it supplies opaque root/control handles, not
-physical paths for kernel syscall rewriting.
+physical paths for kernel syscall rewriting. It therefore advertises no storage
+mode feature and cannot be selected by `umbra run`, which needs a kernel-visible
+run root for both rewriting and sandbox enforcement.
 
 ## Architecture and format
 
