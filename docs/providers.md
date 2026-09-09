@@ -1,6 +1,6 @@
 # Runtime providers
 
-Build installed executables with `cargo build --workspace --bins`. Each of the eight
+Build installed executables with `cargo build --workspace --bins`. Each of the nine
 implementation packages supplies a `provider.json` installation template. Copy the
 selected descriptors into a JSON registry keyed by contract role, set each executable
 to an explicit absolute path, and configure opaque options. No PATH scan or Rust backend
@@ -32,6 +32,16 @@ Alternative namespace providers can decode the core
 through the contracts re-exported by overlay, and inject their own engine. This avoids
 opening duplicate role sessions in CLI assembly.
 
+Storage-nfs-userspace speaks NFSv4.0/TCP/AUTH_SYS from user space, so it needs no mount.
+It opens and creates runs, resolves paths, stats, enumerates, reads, writes, creates,
+renames, removes and sets metadata, and acquires product admission (one-session-one-Umbra)
+before it publishes a run binding. It advertises `durability: None` and `fencing: ReadOnly`:
+no persistence boundary and no termination verifier is qualified, and `flush` reports the
+gate rather than issuing a receipt. It exposes opaque handles and no physical path, so
+`umbra run` cannot select it. Its live transport is behind the off-by-default `transport-raw`
+feature; a default build binds none. See its
+[README](../crates/umbra-storage-nfs-userspace/README.md).
+
 Storage-local and storage-nfs options encode a physical-root BytePath as JSON byte arrays.
 Storage-tar options encode an absolute archive filename BytePath in the same format.
 Its parent directory must exist; no mount, service, or environment variables are needed.
@@ -40,6 +50,7 @@ Its parent directory must exist; no mount, service, or environment variables are
 | --- | --- | --- |
 | `local` | Local directory | Local filesystem |
 | `nfs` | Existing NFSv4 mount root | Client fsync; remote durability unqualified |
+| `nfs-userspace` | JSON `NfsUserspaceConfig` (server host/port, server-relative export and run parent, anchors, deadline) | None; no persistence boundary is qualified and `flush` issues no receipt |
 | `tar` | Absolute tar archive filename | Indexed run with persistent staging; flush publishes a locally fsynced tar. Retry budget allows ~3 MiB cumulative written bytes per archive for three-digit byte values (capacity varies with payload/metadata); not reclaimed by flush or reopen. |
 
 For tar, use `crates/umbra-storage-tar/provider.json` and the
