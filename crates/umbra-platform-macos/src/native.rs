@@ -811,10 +811,10 @@ impl MacosTraceBackend {
                 "absolute executable/cwd and argv[0] required",
             ));
         }
-        // The tracee runs from a signed twin, but must see its own vendor
-        // identity: argv[0] is always the absolute executable the caller asked
-        // for, whatever argv[0] they supplied. argv[1..] and the launched image
-        // (the twin) are passed through byte for byte. The caller's argv[0] is
+        // On the UnsandboxedExperiment branch, the tracee runs from a signed
+        // twin but sees its own vendor identity: argv[0] is the absolute executable
+        // the caller asked for, whatever argv[0] they supplied. argv[1..] and the
+        // launched image (the twin) are passed through byte for byte. The caller's argv[0] is
         // still validated before it is dropped, so a malformed one is an error
         // rather than a silent substitution.
         let mut args = spec

@@ -298,27 +298,27 @@ fn host_object_bytes(metadata: &fs::Metadata) -> [u8; 16] {
     bytes
 }
 
-fn not_found(path: &Path, e: std::io::Error) -> UmbraError {
+fn not_found(operation: &str, path: &Path, e: std::io::Error) -> UmbraError {
     if e.kind() == std::io::ErrorKind::NotFound {
         return error(
             ErrorKind::NotFound,
-            "base.stat",
+            operation,
             format!("{}: not present in the immutable base", path.display()),
         );
     }
-    io_error("base.stat", path, e)
+    io_error(operation, path, e)
 }
 
 impl Base for HostReadOnlyBase {
     fn stat(&mut self, path: &StoragePath) -> Result<BlobStat> {
         let host = self.host_path(path)?;
-        let metadata = fs::symlink_metadata(&host).map_err(|e| not_found(&host, e))?;
+        let metadata = fs::symlink_metadata(&host).map_err(|e| not_found("base.stat", &host, e))?;
         blob_stat(&metadata)
     }
 
     fn read_link(&mut self, path: &StoragePath) -> Result<BytePath> {
         let host = self.host_path(path)?;
-        let target = fs::read_link(&host).map_err(|e| not_found(&host, e))?;
+        let target = fs::read_link(&host).map_err(|e| not_found("base.read_link", &host, e))?;
         BytePath::new(target.as_os_str().as_bytes().to_vec())
     }
 
@@ -331,7 +331,7 @@ impl Base for HostReadOnlyBase {
             ));
         }
         let host = self.host_path(path)?;
-        let mut file = fs::File::open(&host).map_err(|e| not_found(&host, e))?;
+        let mut file = fs::File::open(&host).map_err(|e| not_found("base.read_at", &host, e))?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| io_error("base.read_at", &host, e))?;
         let mut read = 0;
@@ -375,7 +375,7 @@ impl Base for HostReadOnlyBase {
         let host = self.host_path(path)?;
         // Read the whole directory and page over a stable ordering: a host
         // directory offset is not a durable cursor across mutations.
-        let host = fs::canonicalize(&host).map_err(|e| not_found(&host, e))?;
+        let host = fs::canonicalize(&host).map_err(|e| not_found("base.list", &host, e))?;
         if host.starts_with("/dev") {
             return Err(error(
                 ErrorKind::UnsupportedCapability,
@@ -384,7 +384,7 @@ impl Base for HostReadOnlyBase {
             ));
         }
         let mut names = BTreeMap::new();
-        for entry in fs::read_dir(&host).map_err(|e| not_found(&host, e))? {
+        for entry in fs::read_dir(&host).map_err(|e| not_found("base.list", &host, e))? {
             let entry = entry.map_err(|e| io_error("base.list", &host, e))?;
             names.insert(entry.file_name().as_bytes().to_vec(), entry.path());
         }
