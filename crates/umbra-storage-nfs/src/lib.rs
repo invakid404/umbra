@@ -85,6 +85,10 @@ pub struct NfsStorage {
     config: NfsStorageConfig,
     run: Option<Run>,
     health: native::FlushHealth,
+    /// True only once an existing exact NFSv4 mount was actually validated.
+    /// Capability advertisement reads this, so a backend built with `new` (which
+    /// performs no validation) cannot claim a mount it never checked.
+    validated: bool,
 }
 #[derive(Debug)]
 struct Run {
@@ -160,13 +164,16 @@ impl NfsStorage {
             config,
             run: None,
             health: native::FlushHealth::default(),
+            validated: false,
         }
     }
     /// Validate configuration and negotiated NFSv4 immediately, for provider IPC.
     pub fn connect(config: NfsStorageConfig) -> Result<Self> {
         config.validate()?;
         mount::validate(&config.mount_root)?;
-        Ok(Self::new(config))
+        let mut storage = Self::new(config);
+        storage.validated = true;
+        Ok(storage)
     }
     /// Return the runtime mount point.
     pub fn mount_root(&self) -> &Path {
@@ -307,6 +314,16 @@ impl NfsStorage {
 impl Storage for NfsStorage {
     fn capabilities(&self) -> StorageCapabilities {
         StorageCapabilities {
+            // Only successful mount validation in connect or open_run earns
+            // this capability. Construction/configuration alone does not.
+            features: {
+                let mut features = std::collections::BTreeSet::new();
+                features.insert(umbra_core::capabilities::STORAGE_OPEN_REWRITE_V1.to_owned());
+                if self.validated {
+                    features.insert(umbra_core::capabilities::STORAGE_MOUNTED_NFSV4_V1.to_owned());
+                }
+                features
+            },
             durability: Durability::Local,
             strict_remote_persistence: false,
             fencing: Fencing::ConfirmedTermination,
@@ -344,6 +361,7 @@ impl Storage for NfsStorage {
         }
         self.config.validate()?;
         mount::validate(&self.config.mount_root)?;
+        self.validated = true;
         // Walk the configured absolute path from /, rejecting every symlink.
         let slash = OpenOptions::new()
             .read(true)

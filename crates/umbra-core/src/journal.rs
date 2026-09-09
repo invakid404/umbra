@@ -200,6 +200,12 @@ pub enum JournalLifecycle {
         /// Through.
         through: Sequence,
     },
+    /// A fresh command run finished and its effects were made durable. This is
+    /// not a resumable checkpoint and does not authorize writer takeover.
+    RunCompleted {
+        /// Through.
+        through: Sequence,
+    },
     /// Clean handoff.
     CleanHandoff {
         /// Request a logical checkpoint after the caller establishes quiescence.

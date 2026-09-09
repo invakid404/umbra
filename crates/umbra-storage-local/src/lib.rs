@@ -363,6 +363,14 @@ fn check_io(offset: u64, len: usize) -> Result<()> {
 impl Storage for LocalStorage {
     fn capabilities(&self) -> StorageCapabilities {
         StorageCapabilities {
+            // Explicitly a development store: it advertises the local mode and
+            // the narrow rewrite surface, and nothing about remote durability.
+            features: [
+                umbra_core::capabilities::STORAGE_LOCAL_DEVELOPMENT_V1.to_owned(),
+                umbra_core::capabilities::STORAGE_OPEN_REWRITE_V1.to_owned(),
+            ]
+            .into_iter()
+            .collect(),
             durability: Durability::Local,
             strict_remote_persistence: false,
             fencing: Fencing::ConfirmedTermination,

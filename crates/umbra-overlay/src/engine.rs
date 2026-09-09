@@ -274,6 +274,10 @@ pub struct SessionConfig {
     pub context: RequestContext,
     /// Validated journal recovery inventory from the owner of the journal session.
     pub recovery: RecoveryState,
+    /// The writer lease this session mutates under. It is kept next to the
+    /// storage session that issued it so renewal, release and mutation share one
+    /// owner; nothing else may hold a second mutable session for this run.
+    pub lease: WriterLease,
 }
 
 #[derive(Clone)]
@@ -303,6 +307,7 @@ pub struct Overlay {
     planned: Option<Plan>,
     pending: Option<Pending>,
     poisoned: bool,
+    completed_run: Option<RunId>,
     serial: u64,
     last_committed: Sequence,
     pages: BTreeMap<Vec<u8>, (StoragePath, Vec<DirectoryEntry>)>,
@@ -325,6 +330,7 @@ impl Overlay {
             planned: None,
             pending: None,
             poisoned: false,
+            completed_run: None,
             serial: 0,
             last_committed: Sequence(0),
             pages: BTreeMap::new(),
@@ -362,9 +368,14 @@ impl Overlay {
     fn context(&mut self) -> Result<RequestContext> {
         let mut context = self.config()?.context.clone();
         self.serial += 1;
-        if let Some(pending) = &self.pending {
-            context.operation_id = pending.id;
-        }
+        // One logical transaction issues several storage requests: a copy-up, its
+        // parent directories, the create itself. A backend may bind an operation
+        // ID to the one idempotency key it was first used with and refuse a
+        // second, different request under it, so each request gets its own
+        // derived identity. The transaction's own ID still seeds the derivation,
+        // keeping requests attributable to the operation the journal recorded.
+        let seed = self.pending.as_ref().map_or(context.operation_id, |p| p.id);
+        context.operation_id = seed.derive(self.session, self.serial);
         context.idempotency_key.0 = format!(
             "{}/{}/{}",
             context.idempotency_key.0, self.session, self.serial
@@ -1157,12 +1168,17 @@ impl NamespaceSession for Overlay {
         Ok(())
     }
     fn bind(&mut self, config: SessionConfig, base: Box<dyn Base>) -> Result<()> {
-        if self.config.is_some() {
-            return Err(error(ErrorKind::InvalidState, "namespace already bound"));
+        if self.config.is_some() || self.poisoned {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "namespace already bound or poisoned",
+            ));
         }
         if config.binding.run_id != config.context.run_id
             || config.recovery.run_id != config.context.run_id
             || config.context.writer_epoch.is_none()
+            || config.lease.run_id != config.context.run_id
+            || Some(config.lease.epoch) != config.context.writer_epoch
         {
             return Err(error(
                 ErrorKind::InvalidInput,
@@ -1504,6 +1520,135 @@ impl NamespaceSession for Overlay {
             ));
         }
         Ok(checkpoint)
+    }
+    fn renew_writer(&mut self) -> Result<WriterLease> {
+        // Renewal is allowed during a transaction, but never after poisoning.
+        if self.poisoned {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "cannot renew a poisoned session",
+            ));
+        }
+        let result = (|| {
+            let lease = self.config()?.lease.clone();
+            let renewed = self.storage.renew_writer(&lease)?;
+            if renewed.run_id != lease.run_id
+                || renewed.writer_id != lease.writer_id
+                || renewed.epoch != lease.epoch
+            {
+                return Err(error(ErrorKind::LeaseLost, "invalid lease renewal"));
+            }
+            self.config.as_mut().expect("bound").lease = renewed.clone();
+            Ok(renewed)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+    fn finish_run(&mut self, request: &FinishRunRequest) -> Result<FinishRunReceipt> {
+        self.idle()?;
+        let config = self.config()?;
+        if config.context.run_id != request.run_id {
+            return Err(error(ErrorKind::InvalidInput, "finish targets another run"));
+        }
+        let lease = config.lease.clone();
+        // Session-level operation identity, distinct from the per-syscall IDs the
+        // supervisor allocates for transactions.
+        let session_operation = config.context.operation_id;
+        let context = self.context()?;
+        // Tracee-written data first: a completion record that outlives its data
+        // would describe a run that does not exist on the backing store.
+        let durability = self.storage.flush(&FlushRequest {
+            context,
+            scope: FlushScope::EntireRun,
+        })?;
+        if durability.run_id != request.run_id
+            || durability.writer_epoch != lease.epoch
+            || durability.durability == Durability::None
+        {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "invalid storage durability receipt",
+            ));
+        }
+        let completed_through = self.record(
+            session_operation,
+            JournalPayload::Lifecycle(JournalLifecycle::RunCompleted {
+                through: self.last_committed,
+            }),
+            true,
+        )?;
+        // A durable completion record is terminal. Attempt each cleanup stage
+        // once, retaining every error; fail_run must not repeat closed stages.
+        self.poisoned = true;
+        self.completed_run = Some(request.run_id);
+        let mut cleanup: Result<()> = Ok(());
+        for (stage, result) in [
+            (
+                "journal close after durable completion",
+                self.journal.close(),
+            ),
+            (
+                "writer release after journal close",
+                self.storage.release_writer(&lease),
+            ),
+            (
+                "storage close after writer release",
+                self.storage.close_run(),
+            ),
+        ] {
+            if let Err(mut e) = result {
+                e.context = format!("{stage}: {}", e.context);
+                match &mut cleanup {
+                    Ok(()) => cleanup = Err(e),
+                    Err(primary) => primary.context.push_str(&format!("; {e}")),
+                }
+            }
+        }
+        self.config = None;
+        self.base = None;
+        cleanup?;
+        Ok(FinishRunReceipt {
+            run_id: request.run_id,
+            durability,
+            completed_through,
+        })
+    }
+    fn fail_run(&mut self, request: &FailedRunRequest) -> Result<()> {
+        // finish_run already attempted every terminal cleanup stage and returned
+        // their errors to the caller. Do not close or release those resources twice.
+        if self.completed_run == Some(request.run_id) {
+            return Ok(());
+        }
+        let config = self.config()?;
+        if config.context.run_id != request.run_id {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "failure targets another run",
+            ));
+        }
+        let lease = config.lease.clone();
+        // No completion record, no checkpoint: a failed run must not look clean.
+        // Close the journal so its accepted records are not silently discarded,
+        // but keep its error rather than reporting a tidy shutdown.
+        let closed = self.journal.close();
+        if !request.tree_terminated {
+            // Something may still hold a writable descriptor into this run.
+            // Retaining the writer marker blocks takeover; storage stays open
+            // because closing it would invalidate that evidence for this session.
+            self.poisoned = true;
+            return closed.and(Err(error(
+                ErrorKind::LeaseLost,
+                "run left recovery-required: supervised tree termination unproven",
+            )));
+        }
+        let released = self.storage.release_writer(&lease);
+        let closed_run = self.storage.close_run();
+        self.config = None;
+        self.base = None;
+        self.poisoned = true;
+        closed.and(released).and(closed_run)
     }
 }
 impl Overlay {

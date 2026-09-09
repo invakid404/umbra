@@ -245,6 +245,9 @@ impl TarStorage {
 impl Storage for TarStorage {
     fn capabilities(&self) -> StorageCapabilities {
         StorageCapabilities {
+            // The tar backend qualifies neither run mode, so it advertises no
+            // mode feature and cannot be selected by `umbra run`.
+            features: Default::default(),
             durability: Durability::Local,
             strict_remote_persistence: false,
             fencing: Fencing::ConfirmedTermination,
