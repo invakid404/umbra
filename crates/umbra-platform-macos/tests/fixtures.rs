@@ -1,4 +1,5 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod support;
 use std::{
     collections::BTreeMap,
     os::unix::ffi::OsStrExt,
@@ -47,8 +48,7 @@ fn fixture_argv(
         return;
     };
     let fixture = PathBuf::from(fixture);
-    let root = PathBuf::from(root);
-    assert!(root.is_absolute());
+    let root = support::redirect_root(root);
     let host_dir =
         std::env::temp_dir().join(format!("umbra-rust-fixture-{}-{case}", std::process::id()));
     std::fs::create_dir_all(&host_dir).unwrap();

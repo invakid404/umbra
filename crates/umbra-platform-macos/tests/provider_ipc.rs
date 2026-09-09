@@ -1,4 +1,5 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod support;
 use std::{
     os::unix::{ffi::OsStrExt, net::UnixStream},
     path::{Path, PathBuf},
@@ -61,8 +62,7 @@ fn open_libc_provider_ipc() {
         return;
     };
     let fixture = PathBuf::from(fixture);
-    let root = PathBuf::from(root);
-    assert!(root.is_absolute());
+    let root = support::redirect_root(root);
     let host_dir = std::env::temp_dir().join(format!("umbra-ipc-fixture-{}", std::process::id()));
     std::fs::create_dir_all(&host_dir).unwrap();
     let host = host_dir.join("output");

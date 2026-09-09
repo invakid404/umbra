@@ -33,16 +33,16 @@ jobs:
         # rustup honors the repository's rust-toolchain.toml.
         run: rustup component add rustfmt clippy
 
-      - name: Cache Cargo registry and build artifacts
+      - name: Cache Cargo registry and git dependencies
         uses: actions/cache@v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          # New namespace excludes older archives that contained target/.
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+            cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
 
       - name: Check formatting
         run: cargo fmt --all -- --check

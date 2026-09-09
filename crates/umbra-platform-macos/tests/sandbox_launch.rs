@@ -8,6 +8,8 @@
 //! it. A launch that merely fails would prove nothing, so the same fixture and
 //! path are exercised in both directions.
 
+mod support;
+
 use std::{
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -61,9 +63,10 @@ struct Outcome {
 
 fn drive(case: &str, fixture: &Path, root: &Path, rewrite: bool) -> Outcome {
     let host_dir = std::env::temp_dir().join(format!(
-        "umbra-sandbox-{}-{case}-{}",
+        "umbra-sandbox-{}-{case}-{}-{}",
         std::process::id(),
-        u32::from(rewrite)
+        u32::from(rewrite),
+        uuid::Uuid::new_v4()
     ));
     let _ = std::fs::remove_dir_all(&host_dir);
     std::fs::create_dir_all(&host_dir).unwrap();
@@ -220,11 +223,7 @@ fn inputs() -> Option<(PathBuf, PathBuf)> {
         eprintln!("SKIP: set UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT");
         return None;
     };
-    let root = PathBuf::from(root);
-    assert!(
-        root.is_absolute(),
-        "UMBRA_TEST_REDIRECT_ROOT must be absolute"
-    );
+    let root = support::redirect_root(root);
     Some((PathBuf::from(fixture), root))
 }
 
@@ -244,6 +243,26 @@ fn launch_returns_with_the_target_stopped_past_the_installer_exec() {
         "expected a stopped target, got {:?}",
         outcome.first_event_after_launch
     );
+    assert_eq!(outcome.rewrites, 1);
+    assert_eq!(outcome.root_status, Some(ExitStatus::Code(0)));
+    assert!(
+        !outcome.host_exists,
+        "the host destination must stay absent"
+    );
+    assert_eq!(outcome.shadow.as_deref(), Some(b"libc\n".as_slice()));
+}
+
+#[test]
+fn a_symlinked_run_root_allows_rewritten_writes() {
+    let Some((fixture, root)) = inputs() else {
+        return;
+    };
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("redirect-root");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    let resolved = support::redirect_root(&alias);
+    assert_eq!(resolved, root);
+    let outcome = drive("open-libc", &fixture, &resolved, true);
     assert_eq!(outcome.rewrites, 1);
     assert_eq!(outcome.root_status, Some(ExitStatus::Code(0)));
     assert!(

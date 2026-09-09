@@ -416,6 +416,15 @@ UMBRA_TEST_FIXTURE_PATH=<abs> UMBRA_TEST_REDIRECT_ROOT=<abs> \
 Successful compilation does not qualify tracing on any target — the M1
 minimum bar is what `open-libc` CAPTURED demonstrates.
 
+The fixture, IPC, and sandbox-launch harnesses resolve `UMBRA_TEST_REDIRECT_ROOT`
+through `tests/support/mod.rs` and require an existing directory. They reuse that
+resolved root for rewrite destinations and, where enforcement is installed, both
+the profile source and its declared write root. This matches production preparation:
+Seatbelt matches resolved paths, so a raw `/var/...` rule does not grant the
+corresponding `/private/var/...` write. The sandbox-launch suite also qualifies a
+root reached through an explicit symlink, asserting the rewritten write succeeds
+and the host destination remains absent.
+
 Set `UMBRA_INTEGRATION_REQUIRED=1` to make missing fixture inputs fail the sandbox,
 IPC and direct tracer suites. CI's `native-qualification` job runs these and the
 CLI's fourteen-case matrix on a runner labelled `umbra-integration`; that runner
@@ -424,7 +433,7 @@ requires debugger permission and an existing NFSv4 mount configured through the
 
 Sandbox handoff compares canonical target paths with `proc_pidpath`. The twin
 cache root is also canonicalized so a symlinked cache recognizes already-resigned
-executables instead of creating a second twin during bootstrap. Both installed
+executables instead of creating a second twin during bootstrap. Installed
 sandbox qualification tests exercise a symlinked cache root.
 
 Failed attach and sandbox-handoff paths set `launch_tree_terminated` on the returned
