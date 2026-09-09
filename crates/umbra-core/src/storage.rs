@@ -99,13 +99,15 @@ pub struct RuntimeDirectoryBinding {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-/// Durability.
+/// Persistence boundary acknowledged by a provider for a receipt scope.
+/// Neither level establishes fencing, an atomic snapshot, or continuous persistence.
 pub enum Durability {
-    /// None.
+    /// No persistence claim.
     None,
-    /// Local.
+    /// Provider-documented local/OS synchronization, without qualified remote persistence.
+    /// On a mounted network filesystem this does not promise a durable client replica.
     Local,
-    /// Remote.
+    /// Acknowledged persistence at a qualified remote stable-storage boundary.
     Remote,
 }
 
@@ -649,7 +651,8 @@ pub struct DurabilityReceipt {
     pub scope: FlushScope,
     /// Durability.
     pub durability: Durability,
-    /// Evidence.
+    /// Provider evidence identifying the synchronization method and any qualification.
+    /// This is not an independent attestation of storage hardware or writer fencing.
     pub evidence: Vec<u8>,
 }
 

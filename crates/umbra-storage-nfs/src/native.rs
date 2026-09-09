@@ -1,4 +1,5 @@
 //! Descriptor-relative Unix syscall boundary.
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -13,6 +14,17 @@ pub(crate) fn io(op: &str, e: std::io::Error) -> UmbraError {
     let kind = match e.raw_os_error() {
         Some(libc::ELOOP | libc::ENOTDIR) => ErrorKind::InvalidPath,
         Some(libc::ENOTSUP | libc::ENOSYS) => ErrorKind::UnsupportedCapability,
+        Some(
+            libc::ETIMEDOUT
+            | libc::ECONNRESET
+            | libc::ECONNABORTED
+            | libc::ENETDOWN
+            | libc::ENETUNREACH
+            | libc::EHOSTUNREACH
+            | libc::ENOTCONN
+            | libc::EPIPE,
+        ) => ErrorKind::StorageUnavailable,
+        Some(libc::ESTALE) => ErrorKind::StaleHandle,
         _ => match e.kind() {
             std::io::ErrorKind::NotFound => ErrorKind::NotFound,
             std::io::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
@@ -209,7 +221,13 @@ pub(crate) fn regular(dir: &File, bytes: &[u8], flags: i32) -> Result<File> {
     Ok(file)
 }
 pub(crate) fn sync(file: &File) -> Result<()> {
-    file.sync_all().map_err(|e| io("fsync", e))
+    file.sync_all().map_err(|e| {
+        let mut err = io("sync_all", e);
+        if matches!(err.errno, Some(Errno(libc::EINVAL | libc::ENOTTY))) {
+            err.kind = ErrorKind::UnsupportedCapability;
+        }
+        uncertain(err)
+    })
 }
 
 /// libc readdir uses Darwin getdirentries64; legacy getdirentries cannot handle
@@ -271,18 +289,158 @@ impl Drop for Entries {
         }
     }
 }
-pub(crate) fn sync_tree(dir: &File) -> Result<()> {
-    let mut entries = Entries::new(dir)?;
-    while let Some(name) = entries.next()? {
-        match stat(dir, &name)?.kind {
-            ObjectKind::File => sync(&regular(dir, &name, libc::O_RDONLY)?)?,
-            ObjectKind::Directory => {
-                sync_tree(&open(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?)?
+/// OS acknowledgement only: File does not expose WRITE/COMMIT verifiers.
+pub(crate) const LOCAL_FLUSH_EVIDENCE: &[u8] = b"OS sync_all completed for run files, directories and run parent; NFS COMMIT/write-verifier recovery is managed by the kernel and cannot be independently checked through File; remote stable storage unqualified; no durable client replica claimed";
+const MAX_FLUSH_DEPTH: usize = 256;
+
+/// Keep errors even when a later sync no longer reports the original failure.
+/// This provider instance never clears health on close/reopen.
+#[derive(Debug, Default)]
+pub(crate) struct FlushHealth(RefCell<Option<UmbraError>>);
+impl FlushHealth {
+    pub(crate) fn check(&self) -> Result<()> {
+        self.0.borrow().as_ref().map_or(Ok(()), |e| Err(e.clone()))
+    }
+    pub(crate) fn fail(&self, err: UmbraError) -> UmbraError {
+        let mut first = self.0.borrow_mut();
+        first.get_or_insert_with(|| uncertain(err)).clone()
+    }
+    pub(crate) fn observe<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(err) = &result {
+            if err.operation == "sync_all"
+                || matches!(
+                    err.kind,
+                    ErrorKind::Io | ErrorKind::StorageUnavailable | ErrorKind::StaleHandle
+                )
+            {
+                return Err(self.fail(err.clone()));
             }
-            ObjectKind::LogicalSymlink => (),
+        }
+        result
+    }
+}
+fn uncertain(mut err: UmbraError) -> UmbraError {
+    const PREFIX: &str = "persistence outcome unknown; ";
+    if !err.context.starts_with(PREFIX) {
+        err.context.insert_str(0, PREFIX);
+    }
+    err
+}
+
+/// Blocking OS barrier; no independent userspace COMMIT or weaker retry.
+pub(crate) fn flush(
+    dir: &File,
+    parent: &File,
+    health: &FlushHealth,
+    guard: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    flush_with(dir, parent, health, guard, &mut sync)
+}
+fn flush_with(
+    dir: &File,
+    parent: &File,
+    health: &FlushHealth,
+    guard: &mut impl FnMut() -> Result<()>,
+    synchronize: &mut impl FnMut(&File) -> Result<()>,
+) -> Result<()> {
+    health.check()?;
+    guard()?;
+    let result = (|| {
+        let device = dir.metadata().map_err(|e| io("flush fstat", e))?.dev();
+        same_device(parent, device)?;
+        flush_tree(dir, device, 0, guard, synchronize)?;
+        guard()?;
+        synchronize(parent)?;
+        guard()
+    })();
+    result.map_err(|err| health.fail(err))
+}
+pub(crate) fn same_device(file: &File, device: u64) -> Result<()> {
+    if file.metadata().map_err(|e| io("flush fstat", e))?.dev() != device {
+        return Err(unsupported("flush across filesystems"));
+    }
+    Ok(())
+}
+/// Compare the directory entry with the descriptor, without following links.
+pub(crate) fn verify_entry(parent: &File, name: &[u8], file: &File) -> Result<()> {
+    let entry = stat(parent, name)?;
+    let metadata = file.metadata().map_err(|e| io("flush fstat", e))?;
+    let identity = ObjectId(Uuid::from_u128(
+        ((metadata.dev() as u128) << 64) | metadata.ino() as u128,
+    ));
+    if entry.object_id != identity {
+        return Err(error(
+            ErrorKind::StaleHandle,
+            "flush identity",
+            "directory entry replaced",
+        ));
+    }
+    Ok(())
+}
+fn flush_tree(
+    dir: &File,
+    device: u64,
+    depth: usize,
+    guard: &mut impl FnMut() -> Result<()>,
+    synchronize: &mut impl FnMut(&File) -> Result<()>,
+) -> Result<()> {
+    guard()?;
+    if depth >= MAX_FLUSH_DEPTH {
+        return Err(unsupported("flush depth limit"));
+    }
+    same_device(dir, device)?;
+    let before = stamp(dir)?;
+    let mut entries = Entries::new(dir)?;
+    loop {
+        guard()?;
+        let Some(name) = entries.next()? else { break };
+        guard()?;
+        let entry = stat(dir, &name)?;
+        match entry.kind {
+            ObjectKind::File => {
+                let file = regular(dir, &name, libc::O_RDONLY)?;
+                same_device(&file, device)?;
+                verify_entry(dir, &name, &file)?;
+                let before = stamp(&file)?;
+                guard()?;
+                synchronize(&file)?;
+                guard()?;
+                verify_entry(dir, &name, &file)?;
+                if stamp(&file)? != before {
+                    return Err(error(
+                        ErrorKind::InvalidState,
+                        "flush",
+                        "file changed during barrier",
+                    ));
+                }
+            }
+            ObjectKind::Directory => {
+                let child = open(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                verify_entry(dir, &name, &child)?;
+                flush_tree(&child, device, depth + 1, guard, synchronize)?;
+                verify_entry(dir, &name, &child)?;
+            }
+            ObjectKind::LogicalSymlink => (), // only the entry; parent sync covers it
+        }
+        if stat(dir, &name)? != entry {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "flush",
+                "entry changed during barrier",
+            ));
         }
     }
-    sync(dir)
+    guard()?;
+    synchronize(dir)?;
+    guard()?;
+    if stamp(dir)? != before {
+        return Err(error(
+            ErrorKind::InvalidState,
+            "flush",
+            "directory changed during barrier",
+        ));
+    }
+    Ok(())
 }
 pub(crate) fn stamp(dir: &File) -> Result<(u64, i64, i64, i64, i64)> {
     let m = dir.metadata().map_err(|e| io("fstat", e))?;
@@ -294,3 +452,7 @@ pub(crate) fn stamp(dir: &File) -> Result<(u64, i64, i64, i64, i64)> {
         m.ctime_nsec(),
     ))
 }
+
+#[cfg(test)]
+#[path = "flush_tests.rs"]
+mod tests;
