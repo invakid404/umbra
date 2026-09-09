@@ -1,9 +1,13 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::fs;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
 use umbra_core::*;
 use umbra_storage::Storage;
 use umbra_storage_nfs::{NfsStorage, NfsStorageConfig};
@@ -14,19 +18,10 @@ fn fixture() -> Option<(tempfile::TempDir, NfsStorageConfig)> {
         eprintln!("skipping live NFS test: UMBRA_TEST_NFS_MOUNT is unset");
         return None;
     };
-    let dir = match tempfile::Builder::new()
+    let dir = tempfile::Builder::new()
         .prefix("umbra-nfs-test-")
         .tempdir_in(&mount)
-    {
-        Ok(dir) => dir,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!(
-                "skipping live NFS test: writing under {mount:?} requires elevated FS access ({e})"
-            );
-            return None;
-        }
-        Err(e) => panic!("tempdir under NFS mount failed: {e}"),
-    };
+        .unwrap_or_else(|e| panic!("explicit live NFS mount {mount:?} is not writable: {e}"));
     let mut config = NfsStorageConfig::new(mount);
     config.run_parent = path(dir.path().file_name().unwrap().as_bytes());
     Some((dir, config))
@@ -75,6 +70,252 @@ fn physical(binding: &RuntimeDirectoryBinding) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(
         binding.physical_path.as_ref().unwrap().as_bytes(),
     ))
+}
+
+fn assert_local_barrier(receipt: &DurabilityReceipt, lease: &WriterLease) {
+    assert_eq!(receipt.durability, Durability::Local);
+    assert_eq!(receipt.run_id, lease.run_id);
+    assert_eq!(receipt.writer_epoch, lease.epoch);
+    assert_eq!(receipt.scope, FlushScope::EntireRun);
+    let evidence = std::str::from_utf8(&receipt.evidence).unwrap();
+    for expected in [
+        "OS sync_all completed",
+        "run files, directories and run parent",
+        "NFS COMMIT/write-verifier recovery is managed by the kernel",
+        "cannot be independently checked through File",
+        "remote stable storage unqualified",
+        "no durable client replica claimed",
+    ] {
+        assert!(
+            evidence.contains(expected),
+            "missing {expected:?}: {evidence}"
+        );
+    }
+}
+
+fn payload() -> Vec<u8> {
+    // Exceeds the scratch mount's 32 KiB write size, with binary bytes and a tail.
+    (0..256 * 1024 + 37).map(|i| (i % 251) as u8).collect()
+}
+
+#[test]
+fn flush_external_writes_reports_kernel_boundary_and_rechecks_repeated_key() {
+    let Some((_temp, config)) = fixture() else {
+        return;
+    };
+    let mut storage = NfsStorage::connect(config).unwrap();
+    assert_eq!(storage.capabilities().durability, Durability::Local);
+    let req = request();
+    let binding = storage.open_run(&req).unwrap();
+    let lease = storage.acquire_writer(&writer(req.run_id)).unwrap();
+    let flush = FlushRequest {
+        context: ctx(&lease),
+        scope: FlushScope::EntireRun,
+    };
+    let mut expected = payload();
+    let root = physical(&binding.root);
+    fs::create_dir_all(root.join("nested")).unwrap();
+    let filename = root.join("nested/payload");
+    let mut original = fs::File::create(&filename).unwrap();
+    original.write_all(&expected).unwrap();
+    // Collect the original writer's sync error before the barrier, allowing
+    // pending NFS attributes to settle. Keep the descriptor open: an open FD
+    // alone does not violate quiescence. Readback cannot cover prior errors.
+    original.sync_all().unwrap();
+    assert_local_barrier(&storage.flush(&flush).unwrap(), &lease);
+    assert_eq!(fs::read(&filename).unwrap(), expected);
+
+    original.write_all(b"second generation").unwrap();
+    expected.extend_from_slice(b"second generation");
+    original.sync_all().unwrap();
+    // A repeated key must perform a new barrier, never return cached evidence.
+    assert_local_barrier(&storage.flush(&flush).unwrap(), &lease);
+    drop(original);
+    assert_eq!(fs::read(&filename).unwrap(), expected);
+
+    // Readback can hit the client cache, so it cannot prove a repeated barrier
+    // ran. An unsupported entry forces a fresh traversal to fail with this same
+    // key; returning a cached successful receipt would incorrectly pass it.
+    let fifo = root.join("unsupported-fifo");
+    let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    let failure = storage.flush(&flush).unwrap_err();
+    assert_eq!(failure.kind, ErrorKind::UnsupportedCapability);
+    fs::remove_file(fifo).unwrap();
+    // Removing the obstacle must not clear the retained failed-barrier state.
+    assert_eq!(storage.flush(&flush).unwrap_err(), failure);
+    drop(storage); // Failed runs cannot release their writer; fixture cleans up.
+}
+
+// Disruptive tests are ignored by default and serialize with one another.
+// Run only these tests, with --ignored --test-threads=1, on the idle scratch
+// export. The explicit opt-in and identity checks prevent targeting other NFS.
+static FAULT_TEST_LOCK: Mutex<()> = Mutex::new(());
+const SCRATCH_CONTAINER: &str = "umbra-nfs-nfs-1";
+
+fn docker(args: &[&str]) -> Vec<u8> {
+    let output = Command::new("docker").args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "docker {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn check_fault_target(config: &NfsStorageConfig) {
+    assert_eq!(std::env::var("UMBRA_TEST_NFS_FAULTS").as_deref(), Ok("1"));
+    let scratch =
+        PathBuf::from(std::env::var_os("HOME").unwrap()).join("umbra-scratch/nfs/mnt/umbra-nfs");
+    assert_eq!(
+        fs::canonicalize(&config.mount_root).unwrap(),
+        fs::canonicalize(scratch).unwrap()
+    );
+    let inspect: serde_json::Value =
+        serde_json::from_slice(&docker(&["inspect", SCRATCH_CONTAINER])).unwrap();
+    let server = &inspect[0];
+    assert_eq!(
+        server["Config"]["Labels"]["com.docker.compose.project"],
+        "umbra-nfs"
+    );
+    assert_eq!(
+        server["Config"]["Labels"]["com.docker.compose.service"],
+        "nfs"
+    );
+    assert_eq!(server["State"]["Running"], true);
+    assert_eq!(server["State"]["Paused"], false);
+    assert!(server["Mounts"].as_array().unwrap().iter().any(|mount| {
+        mount["Name"] == "umbra-nfs_export-data" && mount["Destination"] == "/export/umbra"
+    }));
+}
+
+struct RestoreServer(Option<&'static str>);
+impl RestoreServer {
+    fn restore(&mut self) {
+        if let Some(action) = self.0 {
+            docker(&[action, SCRATCH_CONTAINER]);
+            self.0 = None;
+        }
+    }
+}
+impl Drop for RestoreServer {
+    fn drop(&mut self) {
+        if let Some(action) = self.0 {
+            // Also restore on an assertion failure, without panicking in Drop.
+            let result = Command::new("docker")
+                .args([action, SCRATCH_CONTAINER])
+                .status();
+            eprintln!("scratch server recovery ({action}): {result:?}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "pauses the scratch NFS server; requires UMBRA_TEST_NFS_FAULTS=1 and an idle export"]
+fn scratch_transport_outage_recovers_to_local_without_remote_claim() {
+    let _serial = FAULT_TEST_LOCK.lock().unwrap();
+    let (_temp, config) = fixture().expect("UMBRA_TEST_NFS_MOUNT is required");
+    check_fault_target(&config);
+    let mut storage = NfsStorage::connect(config).unwrap();
+    let req = request();
+    let binding = storage.open_run(&req).unwrap();
+    let lease = storage.acquire_writer(&writer(req.run_id)).unwrap();
+    let filename = physical(&binding.root).join("payload");
+    let expected = payload();
+    let mut original = fs::File::create(&filename).unwrap();
+    original.write_all(&expected).unwrap();
+    original.sync_all().unwrap();
+    drop(original);
+    let flush = FlushRequest {
+        context: ctx(&lease),
+        scope: FlushScope::EntireRun,
+    };
+    let mut restore = RestoreServer(Some("unpause"));
+    docker(&["pause", SCRATCH_CONTAINER]);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = storage.flush(&flush);
+        tx.send((storage, result)).unwrap();
+    });
+    started_rx.recv().unwrap();
+    let while_paused = rx.recv_timeout(Duration::from_secs(2));
+    restore.restore(); // Resume before assertions or waiting for blocked I/O.
+    assert!(
+        matches!(while_paused, Err(mpsc::RecvTimeoutError::Timeout)),
+        "hard-mounted barrier must not return a receipt during this outage"
+    );
+    let (mut storage, result) = rx
+        .recv_timeout(Duration::from_secs(45))
+        .expect("barrier did not finish after server resumed; completion remains unknown");
+    worker.join().unwrap();
+    assert_local_barrier(&result.unwrap(), &lease);
+    assert_eq!(fs::read(filename).unwrap(), expected);
+    storage.release_writer(&lease).unwrap();
+    storage.close_run().unwrap();
+    // This is transparent kernel recovery, not an exposed transport errno.
+    // sync_all includes any required COMMIT; no userspace COMMIT gap exists.
+}
+
+#[test]
+#[ignore = "SIGKILLs the scratch NFS server; requires UMBRA_TEST_NFS_FAULTS=1 and an idle export"]
+fn scratch_server_killed_after_flush_preserves_export_bytes() {
+    let _serial = FAULT_TEST_LOCK.lock().unwrap();
+    let (_temp, config) = fixture().expect("UMBRA_TEST_NFS_MOUNT is required");
+    check_fault_target(&config);
+    let mount = config.mount_root.clone();
+    let mut storage = NfsStorage::connect(config).unwrap();
+    let req = request();
+    let binding = storage.open_run(&req).unwrap();
+    let lease = storage.acquire_writer(&writer(req.run_id)).unwrap();
+    let filename = physical(&binding.root).join("payload");
+    let expected = payload();
+    let mut original = fs::File::create(&filename).unwrap();
+    original.write_all(&expected).unwrap();
+    original.sync_all().unwrap();
+    drop(original);
+    let receipt = storage
+        .flush(&FlushRequest {
+            context: ctx(&lease),
+            scope: FlushScope::EntireRun,
+        })
+        .unwrap();
+    assert_local_barrier(&receipt, &lease);
+    // No read or further provider sync before SIGKILL. Dropping retains the
+    // writer lock; this test never claims takeover/recovery of an abandoned run.
+    drop(storage);
+    let mut restore = RestoreServer(Some("start"));
+    docker(&["kill", "--signal=KILL", SCRATCH_CONTAINER]);
+    restore.restore();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let health = docker(&[
+            "inspect",
+            "--format",
+            "{{.State.Health.Status}}",
+            SCRATCH_CONTAINER,
+        ]);
+        if health == b"healthy\n" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scratch server did not become healthy after SIGKILL"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let export_file = PathBuf::from("/export/umbra").join(filename.strip_prefix(mount).unwrap());
+    // Direct server read bypasses the original NFS client's data cache. The
+    // VM/volume survives: this tests a server-process crash, not power loss.
+    let actual = docker(&[
+        "exec",
+        SCRATCH_CONTAINER,
+        "cat",
+        export_file.to_str().unwrap(),
+    ]);
+    assert_eq!(actual, expected);
+    assert_eq!(fs::read(filename).unwrap(), expected);
 }
 
 #[test]
