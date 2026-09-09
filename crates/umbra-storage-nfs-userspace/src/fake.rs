@@ -22,12 +22,12 @@ use crate::replay::{
     VerifierMatch,
 };
 use crate::transport::{
-    AttrMask, Attributes, CallToken, CloseReply, CommitReply, Compound, CompoundReply,
-    ConnectionEpoch, ConnectionState, Deadline, DelegationType, DirCookie, DirEntry, DirPage,
-    DirVerifier, FaultAction, FaultContext, FaultPlan, FaultPoint, Fsid, LockReply, Nfs4Op,
-    Nfs4Type, NoFaults, OpCode, OpReply, OpenClaim, OpenHow, OpenReply, RawTransport, ReadReply,
-    Retirement, SetClientIdReply, TransportLimits, TransportResult, Verifier, WireProfile,
-    WriteReply, WriteVerifier,
+    AttrMask, AttrValues, Attributes, CallToken, ChangeInfo, CloseReply, CommitReply, Compound,
+    CompoundReply, ConnectionEpoch, ConnectionState, CreateType, Deadline, DelegationType,
+    DirCookie, DirEntry, DirPage, DirVerifier, FaultAction, FaultContext, FaultPlan, FaultPoint,
+    Fsid, LockReply, Nfs4Op, Nfs4Time, Nfs4Type, NoFaults, OpCode, OpReply, OpenClaim, OpenHow,
+    OpenReply, RawTransport, ReadReply, Retirement, SetClientIdReply, TransportLimits,
+    TransportResult, Verifier, WireProfile, WriteReply, WriteVerifier,
 };
 
 /// One in-memory object.
@@ -40,6 +40,18 @@ struct FakeObject {
     children: BTreeMap<Vec<u8>, usize>,
     /// Verifier of the `EXCLUSIVE4` create that made this object, if any.
     create_verifier: Option<Verifier>,
+    /// `FATTR4_CHANGE`. Bumped by every mutation of this object, which is what
+    /// lets a `change_info4` pair describe a namespace change rather than
+    /// repeating a constant.
+    change: u64,
+    /// `FATTR4_OWNER`, verbatim bytes. Settable, so SETATTR has somewhere to land.
+    owner: Vec<u8>,
+    /// `FATTR4_OWNER_GROUP`, verbatim bytes.
+    owner_group: Vec<u8>,
+    /// `FATTR4_TIME_ACCESS`.
+    time_access: Nfs4Time,
+    /// `FATTR4_TIME_MODIFY`.
+    time_modify: Nfs4Time,
 }
 
 /// A scriptable in-memory transport implementing [`RawTransport`].
@@ -96,6 +108,11 @@ impl FakeTransport {
             mode: 0o700,
             children: BTreeMap::new(),
             create_verifier: None,
+            change: 1,
+            owner: b"0".to_vec(),
+            owner_group: b"0".to_vec(),
+            time_access: Nfs4Time::default(),
+            time_modify: Nfs4Time::default(),
         };
         Self {
             objects: vec![root],
@@ -198,6 +215,11 @@ impl FakeTransport {
             mode,
             children: BTreeMap::new(),
             create_verifier,
+            change: 1,
+            owner: b"0".to_vec(),
+            owner_group: b"0".to_vec(),
+            time_access: Nfs4Time::default(),
+            time_modify: Nfs4Time::default(),
         });
         self.objects.len() - 1
     }
@@ -207,9 +229,7 @@ impl FakeTransport {
         Attributes {
             returned: mask,
             file_type: mask.contains(AttrMask::TYPE).then_some(object.kind),
-            change: mask
-                .contains(AttrMask::CHANGE)
-                .then_some(object.data.len() as u64),
+            change: mask.contains(AttrMask::CHANGE).then_some(object.change),
             size: mask
                 .contains(AttrMask::SIZE)
                 .then_some(object.data.len() as u64),
@@ -221,11 +241,13 @@ impl FakeTransport {
                 .then_some(object.identity.fileid),
             numlinks: mask.contains(AttrMask::NUMLINKS).then_some(1),
             mode: mask.contains(AttrMask::MODE).then_some(object.mode),
-            owner: mask.contains(AttrMask::OWNER).then(|| b"0".to_vec()),
-            owner_group: mask.contains(AttrMask::OWNER_GROUP).then(|| b"0".to_vec()),
+            owner: mask.contains(AttrMask::OWNER).then(|| object.owner.clone()),
+            owner_group: mask
+                .contains(AttrMask::OWNER_GROUP)
+                .then(|| object.owner_group.clone()),
             time_modify: mask
                 .contains(AttrMask::TIME_MODIFY)
-                .then_some(Default::default()),
+                .then_some(object.time_modify),
             lease_time: mask.contains(AttrMask::LEASE_TIME).then_some(90),
             rdattr_error: None,
         }
@@ -242,6 +264,9 @@ impl FakeTransport {
     fn evaluate(&mut self, call: &Compound) -> CompoundReply {
         let mut results = Vec::with_capacity(call.ops.len());
         let mut current: Option<usize> = None;
+        // RENAME names its source directory through the saved filehandle, so the
+        // slot is per-COMPOUND state exactly as the current filehandle is.
+        let mut saved: Option<usize> = None;
         for (position, op) in call.ops.iter().enumerate() {
             let index = position as u32;
             let context = FaultContext {
@@ -254,7 +279,7 @@ impl FakeTransport {
             {
                 return failure(call, results, status, op.opcode(), index);
             }
-            match self.apply(op, &mut current, index) {
+            match self.apply(op, &mut current, &mut saved, index) {
                 Ok(reply) => results.push(reply),
                 Err(error) => {
                     return CompoundReply {
@@ -276,6 +301,7 @@ impl FakeTransport {
         &mut self,
         op: &Nfs4Op,
         current: &mut Option<usize>,
+        saved: &mut Option<usize>,
         index: u32,
     ) -> Result<OpReply, ProtocolError> {
         let fail = |status: Nfs4Status| ProtocolError {
@@ -400,6 +426,7 @@ impl FakeTransport {
                     object.data.resize(start + accepted, 0);
                 }
                 object.data[start..start + accepted].copy_from_slice(&data[..accepted]);
+                self.bump(target);
                 Ok(OpReply::Write(WriteReply {
                     count: accepted as u32,
                     // The fake models protocol shape, not durability: it echoes the
@@ -486,7 +513,193 @@ impl FakeTransport {
                 self.confirmed_clients.insert(client_id.0);
                 Ok(OpReply::SetClientIdConfirm)
             }
+            Nfs4Op::SaveFh => {
+                let target = current.ok_or_else(|| fail(Nfs4Status::NOFILEHANDLE))?;
+                *saved = Some(target);
+                Ok(OpReply::SaveFh)
+            }
+            Nfs4Op::Remove { name } => {
+                let parent = current.ok_or_else(|| fail(Nfs4Status::NOFILEHANDLE))?;
+                if self.objects[parent].kind != Nfs4Type::Directory {
+                    return Err(fail(Nfs4Status::NOTDIR));
+                }
+                let victim = *self.objects[parent]
+                    .children
+                    .get(name.as_bytes())
+                    .ok_or_else(|| fail(Nfs4Status::NOENT))?;
+                // A non-empty directory is NFS4ERR_NOTEMPTY, never a silent
+                // recursive delete.
+                if self.objects[victim].kind == Nfs4Type::Directory
+                    && !self.objects[victim].children.is_empty()
+                {
+                    return Err(fail(Nfs4Status::NOTEMPTY));
+                }
+                let before = self.objects[parent].change;
+                self.objects[parent].children.remove(name.as_bytes());
+                let after = self.bump(parent);
+                // The object itself is deliberately NOT removed from `objects`:
+                // an open handle keeps addressing it after its last name is
+                // gone, which is the retention property CLOSE settles.
+                Ok(OpReply::Remove(ChangeInfo {
+                    atomic: true,
+                    before,
+                    after,
+                }))
+            }
+            Nfs4Op::Rename { old_name, new_name } => {
+                let source = saved.ok_or_else(|| fail(Nfs4Status::NOFILEHANDLE))?;
+                let target = current.ok_or_else(|| fail(Nfs4Status::NOFILEHANDLE))?;
+                if self.objects[source].kind != Nfs4Type::Directory
+                    || self.objects[target].kind != Nfs4Type::Directory
+                {
+                    return Err(fail(Nfs4Status::NOTDIR));
+                }
+                let moving = *self.objects[source]
+                    .children
+                    .get(old_name.as_bytes())
+                    .ok_or_else(|| fail(Nfs4Status::NOENT))?;
+                if let Some(existing) = self.objects[target].children.get(new_name.as_bytes()) {
+                    // POSIX rename replaces a regular destination, but never
+                    // replaces a non-empty directory and never crosses type.
+                    let existing = *existing;
+                    if self.objects[existing].kind == Nfs4Type::Directory
+                        && !self.objects[existing].children.is_empty()
+                    {
+                        return Err(fail(Nfs4Status::NOTEMPTY));
+                    }
+                }
+                let source_before = self.objects[source].change;
+                let target_before = self.objects[target].change;
+                self.objects[source].children.remove(old_name.as_bytes());
+                self.objects[target]
+                    .children
+                    .insert(new_name.as_bytes().to_vec(), moving);
+                // The moved object keeps its fileid: a rename moves a name, not
+                // an object, so every open handle on it stays valid.
+                let source_after = self.bump(source);
+                let target_after = if source == target {
+                    source_after
+                } else {
+                    self.bump(target)
+                };
+                Ok(OpReply::Rename {
+                    source: ChangeInfo {
+                        atomic: true,
+                        before: source_before,
+                        after: source_after,
+                    },
+                    target: ChangeInfo {
+                        atomic: true,
+                        before: target_before,
+                        after: target_after,
+                    },
+                })
+            }
+            Nfs4Op::Create {
+                object_type,
+                name,
+                attributes,
+            } => {
+                let parent = current.ok_or_else(|| fail(Nfs4Status::NOFILEHANDLE))?;
+                if self.objects[parent].kind != Nfs4Type::Directory {
+                    return Err(fail(Nfs4Status::NOTDIR));
+                }
+                if self.objects[parent].children.contains_key(name.as_bytes()) {
+                    return Err(fail(Nfs4Status::EXIST));
+                }
+                let before = self.objects[parent].change;
+                let kind = match object_type {
+                    CreateType::Directory => Nfs4Type::Directory,
+                };
+                let child = self.allocate(kind, Vec::new(), attributes.mode.unwrap_or(0o700), None);
+                let attrset = self.set_attributes(child, attributes)?;
+                self.objects[parent]
+                    .children
+                    .insert(name.as_bytes().to_vec(), child);
+                let after = self.bump(parent);
+                *current = Some(child);
+                Ok(OpReply::Create {
+                    info: ChangeInfo {
+                        atomic: true,
+                        before,
+                        after,
+                    },
+                    attrset,
+                })
+            }
+            Nfs4Op::SetAttr {
+                attributes,
+                stateid,
+            } => {
+                let target = current.ok_or_else(|| fail(Nfs4Status::NOFILEHANDLE))?;
+                // RFC 7530 §16.32: setting FATTR4_SIZE needs an open stateid with
+                // WRITE access. The fake enforces the shape so a caller that
+                // truncates with the anonymous stateid is caught here, not on a
+                // real server later.
+                if attributes.size.is_some()
+                    && *stateid == Stateid::ANONYMOUS
+                    && self.objects[target].kind == Nfs4Type::Regular
+                {
+                    return Err(fail(Nfs4Status::BAD_STATEID));
+                }
+                if self.objects[target].kind == Nfs4Type::Directory && attributes.size.is_some() {
+                    return Err(fail(Nfs4Status::ISDIR));
+                }
+                let attrset = self.set_attributes(target, attributes)?;
+                self.bump(target);
+                Ok(OpReply::SetAttr(attrset))
+            }
         }
+    }
+
+    /// Bump an object's change value and report the new one.
+    fn bump(&mut self, index: usize) -> u64 {
+        let object = &mut self.objects[index];
+        object.change += 1;
+        object.change
+    }
+
+    /// Apply one [`AttrValues`] to an object, reporting the bits actually set.
+    ///
+    /// The returned mask is built from the fields that landed rather than echoed
+    /// from the request, so a caller cannot read a set it did not get.
+    fn set_attributes(
+        &mut self,
+        index: usize,
+        values: &AttrValues,
+    ) -> Result<AttrMask, ProtocolError> {
+        let mut set = AttrMask::default();
+        let object = &mut self.objects[index];
+        if let Some(size) = values.size {
+            let size = usize::try_from(size).map_err(|_| ProtocolError {
+                status: Nfs4Status::INVAL,
+                op: OpCode::SetAttr,
+                index: 0,
+            })?;
+            object.data.resize(size, 0);
+            set = set.union(AttrMask::SIZE);
+        }
+        if let Some(mode) = values.mode {
+            object.mode = mode;
+            set = set.union(AttrMask::MODE);
+        }
+        if let Some(owner) = &values.owner {
+            object.owner.clone_from(owner);
+            set = set.union(AttrMask::OWNER);
+        }
+        if let Some(group) = &values.owner_group {
+            object.owner_group.clone_from(group);
+            set = set.union(AttrMask::OWNER_GROUP);
+        }
+        if let Some(time) = values.time_access {
+            object.time_access = time;
+            set = set.union(AttrMask::TIME_ACCESS_SET);
+        }
+        if let Some(time) = values.time_modify {
+            object.time_modify = time;
+            set = set.union(AttrMask::TIME_MODIFY_SET);
+        }
+        Ok(set)
     }
 
     fn open_by_name(

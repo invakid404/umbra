@@ -657,11 +657,15 @@ fn dispatch_namespace(
     operation: &str,
     mutation: &NamespaceMutation,
 ) -> Result<NamespaceOutcome> {
+    // Disjoint field borrows: the dispatcher and the transport it dispatches on
+    // come out of the same `&mut OpsContext` without aliasing, which is what lets
+    // the mutation travel on this request's own connection.
+    let transport = &mut *context.transport;
     let mutations = context
         .mutations
         .as_mut()
         .ok_or_else(|| no_authority(operation))?;
-    apply_namespace(mutations.namespace.as_deref_mut(), mutation)
+    apply_namespace(mutations.namespace.as_deref_mut(), transport, mutation)
 }
 
 fn no_authority(operation: &str) -> UmbraError {

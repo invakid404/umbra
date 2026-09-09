@@ -220,6 +220,14 @@ impl AttrMask {
     pub const OWNER_GROUP: Self = Self::word1(37);
     /// `FATTR4_TIME_MODIFY` (attribute 53).
     pub const TIME_MODIFY: Self = Self::word1(53);
+    /// `FATTR4_TIME_ACCESS_SET` (attribute 48).
+    ///
+    /// SETATTR sets times through the `_SET` attributes, which carry a
+    /// `settime4`, not through `FATTR4_TIME_ACCESS`, which is read-only. Asking
+    /// for the read-only bit in a SETATTR is `NFS4ERR_INVAL`.
+    pub const TIME_ACCESS_SET: Self = Self::word1(48);
+    /// `FATTR4_TIME_MODIFY_SET` (attribute 54).
+    pub const TIME_MODIFY_SET: Self = Self::word1(54);
 
     /// `FATTR4_FSID` plus `FATTR4_FILEID`: the stable-identity pair.
     ///
@@ -634,6 +642,95 @@ pub struct LockReply {
     pub stateid: Stateid,
 }
 
+/// `change_info4`: the directory change value either side of a namespace
+/// mutation.
+///
+/// `atomic` is the server's own claim that `before` and `after` were sampled
+/// atomically with the operation. It is reported, never assumed: a consumer that
+/// treats a non-atomic pair as a proof of ordering would be inventing a
+/// guarantee the server declined to make.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeInfo {
+    /// `cinfo.atomic` as the server reported it.
+    pub atomic: bool,
+    /// Directory change value before the operation.
+    pub before: u64,
+    /// Directory change value after the operation.
+    pub after: u64,
+}
+
+/// Settable attributes for CREATE and SETATTR, encoded as one `fattr4`.
+///
+/// Every field is optional and only the present ones are encoded, so a caller
+/// cannot accidentally reset an attribute it never named. This is the write-side
+/// counterpart of [`Attributes`], which is decode-only; keeping them separate is
+/// what stops a read-only attribute such as `FATTR4_FILEID` from being offered
+/// to a server that would answer `NFS4ERR_INVAL`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttrValues {
+    /// `FATTR4_SIZE`. On SETATTR this is a truncation.
+    pub size: Option<u64>,
+    /// `FATTR4_MODE`, POSIX mode bits.
+    pub mode: Option<u32>,
+    /// `FATTR4_OWNER`, verbatim AUTH_SYS name-string bytes, not a uid.
+    pub owner: Option<Vec<u8>>,
+    /// `FATTR4_OWNER_GROUP`, verbatim bytes.
+    pub owner_group: Option<Vec<u8>>,
+    /// `FATTR4_TIME_ACCESS_SET`, an explicit client-supplied time.
+    pub time_access: Option<Nfs4Time>,
+    /// `FATTR4_TIME_MODIFY_SET`, an explicit client-supplied time.
+    pub time_modify: Option<Nfs4Time>,
+}
+
+impl AttrValues {
+    /// The bitmap these values encode, in attribute order.
+    pub fn mask(&self) -> AttrMask {
+        let mut mask = AttrMask::default();
+        if self.size.is_some() {
+            mask = mask.union(AttrMask::SIZE);
+        }
+        if self.mode.is_some() {
+            mask = mask.union(AttrMask::MODE);
+        }
+        if self.owner.is_some() {
+            mask = mask.union(AttrMask::OWNER);
+        }
+        if self.owner_group.is_some() {
+            mask = mask.union(AttrMask::OWNER_GROUP);
+        }
+        if self.time_access.is_some() {
+            mask = mask.union(AttrMask::TIME_ACCESS_SET);
+        }
+        if self.time_modify.is_some() {
+            mask = mask.union(AttrMask::TIME_MODIFY_SET);
+        }
+        mask
+    }
+
+    /// Whether this names no attribute at all.
+    ///
+    /// An empty SETATTR is a request that cannot fail and cannot do anything,
+    /// which is exactly the shape that lets a caller report a metadata change it
+    /// never made. Callers refuse it rather than dispatching it.
+    pub fn is_empty(&self) -> bool {
+        self.mask() == AttrMask::default()
+    }
+}
+
+/// `createtype4` restricted to what M1 will put on the wire.
+///
+/// NFSv4.0 CREATE also makes symlinks, block/character devices, sockets and
+/// FIFOs. None of them is in this provider's surface — `docs/design/syscall-matrix.md`
+/// makes physical symlinks an escape risk and the device types have no contract
+/// operation — so the enum stops at the one type the capability table supports.
+/// Widening it later is a visible edit here, the same scope-lock checkpoint
+/// [`OpCode`] uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CreateType {
+    /// `NF4DIR`.
+    Directory,
+}
+
 /// One operation in a COMPOUND. Every variant owns its arguments.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Nfs4Op {
@@ -720,6 +817,56 @@ pub enum Nfs4Op {
         /// Verifier from SETCLIENTID.
         confirm: Verifier,
     },
+    /// `SAVEFH`: remember the current filehandle.
+    ///
+    /// Present because RENAME addresses its *source* directory through the saved
+    /// filehandle (RFC 7530 §16.26) and has no other way to name it. Without
+    /// this variant the [`Rename`](Self::Rename) arguments below cannot be put on
+    /// the wire at all.
+    SaveFh,
+    /// `REMOVE`: unlink one name from the current filehandle's directory.
+    ///
+    /// The parent is the current filehandle, set by a preceding PUTFH, so this
+    /// cannot be asked to act on an unanchored path.
+    Remove {
+        /// Name to unlink within the current directory.
+        name: ComponentName,
+    },
+    /// `RENAME`: move a name from the saved directory to the current directory.
+    ///
+    /// `SAVEFH` sets the source directory and `PUTFH` sets the target directory,
+    /// which is how NFSv4.0 addresses a rename. A same-directory rename still
+    /// needs both, because the operation reads the saved filehandle either way.
+    Rename {
+        /// Name in the saved (source) directory.
+        old_name: ComponentName,
+        /// Name to create in the current (target) directory.
+        new_name: ComponentName,
+    },
+    /// `CREATE`: make a non-regular object in the current filehandle's directory.
+    ///
+    /// Regular files are created by `OPEN`, never by `CREATE`; that is RFC 7530's
+    /// split, and it is why [`CreateType`] carries no `Regular`.
+    Create {
+        /// Which kind of object to create.
+        object_type: CreateType,
+        /// Name for the new object.
+        name: ComponentName,
+        /// Initial attributes.
+        attributes: AttrValues,
+    },
+    /// `SETATTR`: change attributes of the current filehandle.
+    ///
+    /// The stateid is `Stateid::ANONYMOUS` except when setting `FATTR4_SIZE`,
+    /// where RFC 7530 §16.32 requires the stateid of an open with WRITE access:
+    /// a truncation is a write, and a server is entitled to refuse it without
+    /// one.
+    SetAttr {
+        /// Stateid authorising the change.
+        stateid: Stateid,
+        /// Attributes to set.
+        attributes: AttrValues,
+    },
 }
 
 impl Nfs4Op {
@@ -744,6 +891,11 @@ impl Nfs4Op {
             Self::Renew(_) => OpCode::Renew,
             Self::SetClientId(_) => OpCode::SetClientId,
             Self::SetClientIdConfirm { .. } => OpCode::SetClientIdConfirm,
+            Self::SaveFh => OpCode::SaveFh,
+            Self::Remove { .. } => OpCode::Remove,
+            Self::Rename { .. } => OpCode::Rename,
+            Self::Create { .. } => OpCode::Create,
+            Self::SetAttr { .. } => OpCode::SetAttr,
         }
     }
 
@@ -761,6 +913,10 @@ impl Nfs4Op {
                 | Self::Locku(_)
                 | Self::SetClientId(_)
                 | Self::SetClientIdConfirm { .. }
+                | Self::Remove { .. }
+                | Self::Rename { .. }
+                | Self::Create { .. }
+                | Self::SetAttr { .. }
         )
     }
 }
@@ -804,6 +960,29 @@ pub enum OpReply {
     SetClientId(SetClientIdReply),
     /// `SETCLIENTID_CONFIRM` succeeded.
     SetClientIdConfirm,
+    /// `SAVEFH` succeeded.
+    SaveFh,
+    /// `REMOVE` returned the parent directory's change info.
+    Remove(ChangeInfo),
+    /// `RENAME` returned change info for both directories.
+    Rename {
+        /// Change info for the source directory.
+        source: ChangeInfo,
+        /// Change info for the target directory.
+        target: ChangeInfo,
+    },
+    /// `CREATE` returned change info and the attributes it actually set.
+    Create {
+        /// Change info for the parent directory.
+        info: ChangeInfo,
+        /// Bits the server reports it set, which may be fewer than requested.
+        attrset: AttrMask,
+    },
+    /// `SETATTR` returned the attributes it actually set.
+    ///
+    /// A server may set fewer bits than asked for and still return `NFS4_OK`, so
+    /// this bitmap is the only evidence of what really changed.
+    SetAttr(AttrMask),
 }
 
 impl OpReply {
@@ -828,6 +1007,11 @@ impl OpReply {
             Self::Renew => OpCode::Renew,
             Self::SetClientId(_) => OpCode::SetClientId,
             Self::SetClientIdConfirm => OpCode::SetClientIdConfirm,
+            Self::SaveFh => OpCode::SaveFh,
+            Self::Remove(_) => OpCode::Remove,
+            Self::Rename { .. } => OpCode::Rename,
+            Self::Create { .. } => OpCode::Create,
+            Self::SetAttr(_) => OpCode::SetAttr,
         }
     }
 }
@@ -1578,5 +1762,203 @@ mod tests {
             reply.expect(0).unwrap_err().status(),
             Some(Nfs4Status::GRACE)
         );
+    }
+
+    // --- the authorised contracts hotfix: Remove / Rename / Create / SetAttr ---
+
+    fn component(bytes: &[u8]) -> ComponentName {
+        ComponentName::new(bytes.to_vec()).expect("valid component")
+    }
+
+    #[test]
+    fn every_namespace_mutation_variant_reports_its_rfc_7530_opcode() {
+        let cases = [
+            (
+                Nfs4Op::Remove {
+                    name: component(b"x"),
+                },
+                OpCode::Remove,
+                28,
+            ),
+            (
+                Nfs4Op::Rename {
+                    old_name: component(b"a"),
+                    new_name: component(b"b"),
+                },
+                OpCode::Rename,
+                29,
+            ),
+            (
+                Nfs4Op::Create {
+                    object_type: CreateType::Directory,
+                    name: component(b"d"),
+                    attributes: AttrValues::default(),
+                },
+                OpCode::Create,
+                6,
+            ),
+            (
+                Nfs4Op::SetAttr {
+                    stateid: Stateid::ANONYMOUS,
+                    attributes: AttrValues::default(),
+                },
+                OpCode::SetAttr,
+                34,
+            ),
+            (Nfs4Op::SaveFh, OpCode::SaveFh, 32),
+        ];
+        for (op, code, number) in cases {
+            assert_eq!(op.opcode(), code);
+            assert_eq!(code as u32, number, "{code:?} must keep its RFC number");
+        }
+    }
+
+    #[test]
+    fn the_four_namespace_mutations_are_mutations_and_savefh_is_not() {
+        assert!(Nfs4Op::Remove {
+            name: component(b"x")
+        }
+        .is_mutation());
+        assert!(Nfs4Op::Rename {
+            old_name: component(b"a"),
+            new_name: component(b"b"),
+        }
+        .is_mutation());
+        assert!(Nfs4Op::Create {
+            object_type: CreateType::Directory,
+            name: component(b"d"),
+            attributes: AttrValues::default(),
+        }
+        .is_mutation());
+        assert!(Nfs4Op::SetAttr {
+            stateid: Stateid::ANONYMOUS,
+            attributes: AttrValues::default(),
+        }
+        .is_mutation());
+        // SAVEFH moves a client-side filehandle slot. It changes nothing on the
+        // server, so requiring a durable intent for it would make the replay
+        // ledger record work that cannot be lost.
+        assert!(!Nfs4Op::SaveFh.is_mutation());
+    }
+
+    #[test]
+    fn the_eighteen_frozen_variants_kept_their_mutation_classification() {
+        // The hotfix is additive: nothing that was a mutation stopped being one,
+        // and nothing that was not became one.
+        for (op, expected) in [
+            (Nfs4Op::PutRootFh, false),
+            (Nfs4Op::GetFh, false),
+            (Nfs4Op::GetAttr(AttrMask::STAT), false),
+            (Nfs4Op::Lookup(component(b"n")), false),
+            (Nfs4Op::LookupParent, false),
+            (
+                Nfs4Op::Read {
+                    stateid: Stateid::ANONYMOUS,
+                    offset: 0,
+                    count: 1,
+                },
+                false,
+            ),
+            (
+                Nfs4Op::Write {
+                    stateid: Stateid::ANONYMOUS,
+                    offset: 0,
+                    stability: Stability::Unstable,
+                    data: vec![0],
+                },
+                true,
+            ),
+            (
+                Nfs4Op::Commit {
+                    offset: 0,
+                    count: 0,
+                },
+                true,
+            ),
+            (Nfs4Op::Renew(ClientId(1)), false),
+        ] {
+            assert_eq!(op.is_mutation(), expected, "{op:?}");
+        }
+    }
+
+    #[test]
+    fn attr_values_name_exactly_the_bits_they_carry() {
+        assert!(AttrValues::default().is_empty());
+
+        let values = AttrValues {
+            size: Some(4),
+            mode: Some(0o644),
+            owner: Some(b"501".to_vec()),
+            owner_group: Some(b"20".to_vec()),
+            time_access: Some(Nfs4Time::default()),
+            time_modify: Some(Nfs4Time::default()),
+        };
+        let mask = values.mask();
+        assert!(!values.is_empty());
+        for bit in [
+            AttrMask::SIZE,
+            AttrMask::MODE,
+            AttrMask::OWNER,
+            AttrMask::OWNER_GROUP,
+            AttrMask::TIME_ACCESS_SET,
+            AttrMask::TIME_MODIFY_SET,
+        ] {
+            assert!(mask.contains(bit));
+        }
+        // SETATTR must never ask for the read-only time attributes; asking is
+        // NFS4ERR_INVAL on a real server.
+        assert!(!mask.contains(AttrMask::TIME_MODIFY));
+        assert!(!mask.contains(AttrMask::FILEID));
+
+        // One field set names one bit, so a partial update cannot silently carry
+        // an attribute the caller never asked to change.
+        let only_mode = AttrValues {
+            mode: Some(0o600),
+            ..AttrValues::default()
+        };
+        assert_eq!(only_mode.mask(), AttrMask::MODE);
+    }
+
+    #[test]
+    fn the_settable_time_bits_are_the_rfc_7530_numbers() {
+        assert_eq!(AttrMask::TIME_ACCESS_SET.word1, 1 << (48 - 32));
+        assert_eq!(AttrMask::TIME_MODIFY_SET.word1, 1 << (54 - 32));
+    }
+
+    #[test]
+    fn every_new_reply_reports_the_opcode_it_belongs_to() {
+        let info = ChangeInfo {
+            atomic: true,
+            before: 1,
+            after: 2,
+        };
+        assert_eq!(OpReply::Remove(info).opcode(), OpCode::Remove);
+        assert_eq!(
+            OpReply::Rename {
+                source: info,
+                target: info
+            }
+            .opcode(),
+            OpCode::Rename
+        );
+        assert_eq!(
+            OpReply::Create {
+                info,
+                attrset: AttrMask::MODE
+            }
+            .opcode(),
+            OpCode::Create
+        );
+        assert_eq!(OpReply::SetAttr(AttrMask::MODE).opcode(), OpCode::SetAttr);
+        assert_eq!(OpReply::SaveFh.opcode(), OpCode::SaveFh);
+    }
+
+    #[test]
+    fn create_type_cannot_express_a_physical_symlink_or_a_device() {
+        // The enum is the scope-lock: `docs/design/syscall-matrix.md` makes a
+        // physical symlink an anchor-escape risk and gives the device types no
+        // contract operation. Widening this has to be a visible edit.
+        let all = [CreateType::Directory];
+        assert_eq!(all.len(), 1);
     }
 }

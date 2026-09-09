@@ -1,26 +1,23 @@
 //! Namespace mutation: the typed seam for REMOVE, RENAME, CREATE and SETATTR.
 //!
-//! # Why this seam exists unbound
+//! # Why this seam exists
 //!
 //! The pinned `docs/design/syscall-matrix.md` marks `unlink`, `rmdir`, `rename`,
 //! `mkdir`, `chmod`, `chown`, `utimensat` and `truncate` **emulated** — all of
-//! them are in scope. The frozen [`OpCode`](crate::transport::OpCode) enumerates
-//! `Remove`, `Rename`, `Create` and `SetAttr` too. But the frozen
-//! [`Nfs4Op`](crate::transport::Nfs4Op) — the union that actually carries
-//! arguments into a COMPOUND — has no variant for any of them, so no COMPOUND
-//! this crate can build encodes one.
+//! them are in scope. When `operations` was built, the frozen
+//! [`Nfs4Op`](crate::transport::Nfs4Op) carried no argument variant for any of
+//! them, so the shape was typed here and the dispatch injected rather than
+//! faked, exactly as
+//! [`downgrade_with`](crate::state::open_owner::downgrade_with) still does for
+//! `OPEN_DOWNGRADE`.
 //!
-//! That is a contracts gap, not a capability decision, and closing it is a
-//! contracts revision rather than work this node may do: the frozen facades are
-//! byte-identical since `contract-author` and weakening one here would silently
-//! move the seam every other M1 node is building against.
-//!
-//! So the shape lives here and the dispatch is injected, exactly as
-//! [`downgrade_with`](crate::state::open_owner::downgrade_with) already does for
-//! `OPEN_DOWNGRADE`, which hit the same gap. The operations surface is complete
-//! and typed; a caller with no dispatcher receives
-//! [`umbra_core::ErrorKind::NotImplemented`] naming the owner, never a fabricated
-//! success and never a capability claim this provider cannot honour.
+//! The authorised contracts hotfix at `m1_integrate` closed that gap: `Nfs4Op`
+//! now carries `Remove`, `Rename`, `Create`, `SetAttr` and the `SaveFh` a
+//! RENAME needs to name its source directory. The seam stays, because it is
+//! still the thing that proves a dispatcher acted on the object it was given —
+//! see below — and because a caller with no dispatcher bound must still receive
+//! [`umbra_core::ErrorKind::NotImplemented`] rather than a fabricated success.
+//! [`dispatch::TransportDispatcher`] is the bound implementation.
 //!
 //! # The rule this module enforces regardless of who dispatches
 //!
@@ -30,12 +27,14 @@
 //! dispatcher that "renamed" by creating a copy therefore fails here rather than
 //! quietly breaking every open handle.
 
+pub mod dispatch;
+
 use umbra_core::{MetadataUpdate, RenameMode, Result};
 
 use crate::capability::{Support, CONTRACTS_REVISION, NO_WIRE_OPERATION};
 use crate::error::{AuthorityError, FacadeError, FacadeResult};
 use crate::handle::{FileHandle, ObjectIdentity};
-use crate::transport::ComponentName;
+use crate::transport::{ComponentName, RawTransport};
 
 /// Which kind of object a REMOVE is expected to unlink.
 ///
@@ -159,13 +158,23 @@ pub enum NamespaceOutcome {
 
 /// Puts one namespace mutation on the wire.
 ///
-/// No implementation exists in this crate, and that is deliberate: see the module
-/// documentation. An implementation must address the mutation exactly as given —
-/// a dispatcher that substitutes a different object, or that emulates a rename
-/// with a copy, is rejected by [`apply`].
+/// An implementation must address the mutation exactly as given — a dispatcher
+/// that substitutes a different object, or that emulates a rename with a copy,
+/// is rejected by [`apply`].
+///
+/// The transport arrives as a parameter rather than being captured at
+/// construction. A dispatcher that owned its own transport would be speaking on
+/// a different connection from the request that called it — a different client
+/// incarnation, different open owners, and no relationship between the epoch
+/// that authorised the mutation and the one that carried it. Taking it per call
+/// means the mutation provably travels on the session's own transport.
 pub trait NamespaceDispatcher {
     /// Dispatch one mutation and report what it settled.
-    fn dispatch(&mut self, mutation: &NamespaceMutation) -> FacadeResult<NamespaceOutcome>;
+    fn dispatch(
+        &mut self,
+        transport: &mut dyn RawTransport,
+        mutation: &NamespaceMutation,
+    ) -> FacadeResult<NamespaceOutcome>;
 }
 
 /// Apply one namespace mutation through an optionally bound dispatcher.
@@ -181,6 +190,7 @@ pub trait NamespaceDispatcher {
 /// to the request.
 pub fn apply<'d>(
     dispatcher: Option<&mut (dyn NamespaceDispatcher + 'd)>,
+    transport: &mut dyn RawTransport,
     mutation: &NamespaceMutation,
 ) -> Result<NamespaceOutcome> {
     let operation = mutation.operation();
@@ -192,7 +202,7 @@ pub fn apply<'d>(
         .refuse(operation);
     };
     let outcome = dispatcher
-        .dispatch(mutation)
+        .dispatch(transport, mutation)
         .map_err(|error| error.to_umbra(operation))?;
     verify(mutation, &outcome).map_err(|error| error.to_umbra(operation))?;
     Ok(outcome)
@@ -254,6 +264,7 @@ mod tests {
     use super::*;
     use umbra_core::ErrorKind;
 
+    use crate::fake::FakeTransport;
     use crate::transport::Fsid;
 
     fn identity(fileid: u64) -> ObjectIdentity {
@@ -292,7 +303,11 @@ mod tests {
     }
 
     impl NamespaceDispatcher for Scripted {
-        fn dispatch(&mut self, mutation: &NamespaceMutation) -> FacadeResult<NamespaceOutcome> {
+        fn dispatch(
+            &mut self,
+            _: &mut dyn RawTransport,
+            mutation: &NamespaceMutation,
+        ) -> FacadeResult<NamespaceOutcome> {
             self.seen.push(mutation.clone());
             Ok(self.answer.clone())
         }
@@ -325,7 +340,7 @@ mod tests {
                 len: 0,
             },
         ] {
-            let error = apply(None, &mutation).unwrap_err();
+            let error = apply(None, &mut FakeTransport::new(), &mutation).unwrap_err();
             // Not `UnsupportedCapability`: the syscall matrix marks all of these
             // emulated, so calling them unsupported would understate the design
             // exactly as calling them supported would overstate it.
@@ -346,7 +361,12 @@ mod tests {
             }),
             seen: Vec::new(),
         };
-        let outcome = apply(Some(&mut good), &rename_of(moved)).expect("identity preserved");
+        let outcome = apply(
+            Some(&mut good),
+            &mut FakeTransport::new(),
+            &rename_of(moved),
+        )
+        .expect("identity preserved");
         assert!(matches!(outcome, NamespaceOutcome::Renamed(_)));
         assert_eq!(good.seen.len(), 1);
 
@@ -359,7 +379,12 @@ mod tests {
             }),
             seen: Vec::new(),
         };
-        let error = apply(Some(&mut copied), &rename_of(moved)).unwrap_err();
+        let error = apply(
+            Some(&mut copied),
+            &mut FakeTransport::new(),
+            &rename_of(moved),
+        )
+        .unwrap_err();
         assert_eq!(error.kind, ErrorKind::LeaseLost);
         assert!(error
             .context
@@ -378,6 +403,7 @@ mod tests {
         };
         let error = apply(
             Some(&mut wrong),
+            &mut FakeTransport::new(),
             &NamespaceMutation::Truncate {
                 object: handle(2),
                 target: pinned,
@@ -394,7 +420,12 @@ mod tests {
             answer: NamespaceOutcome::Removed,
             seen: Vec::new(),
         };
-        let error = apply(Some(&mut confused), &rename_of(identity(9))).unwrap_err();
+        let error = apply(
+            Some(&mut confused),
+            &mut FakeTransport::new(),
+            &rename_of(identity(9)),
+        )
+        .unwrap_err();
         assert!(error.context.contains("for a RENAME"));
 
         let mut also_confused = Scripted {
@@ -406,6 +437,7 @@ mod tests {
         };
         let error = apply(
             Some(&mut also_confused),
+            &mut FakeTransport::new(),
             &NamespaceMutation::Remove {
                 parent: handle(1),
                 name: name(b"gone"),
@@ -421,7 +453,11 @@ mod tests {
     fn a_dispatcher_failure_is_reported_verbatim() {
         struct Failing;
         impl NamespaceDispatcher for Failing {
-            fn dispatch(&mut self, _: &NamespaceMutation) -> FacadeResult<NamespaceOutcome> {
+            fn dispatch(
+                &mut self,
+                _: &mut dyn RawTransport,
+                _: &NamespaceMutation,
+            ) -> FacadeResult<NamespaceOutcome> {
                 Err(FacadeError::protocol(
                     crate::error::Nfs4Status::NOTEMPTY,
                     crate::transport::OpCode::Remove,
@@ -432,6 +468,7 @@ mod tests {
         let mut failing = Failing;
         let error = apply(
             Some(&mut failing),
+            &mut FakeTransport::new(),
             &NamespaceMutation::Remove {
                 parent: handle(1),
                 name: name(b"dir"),

@@ -217,7 +217,11 @@ struct StandIn {
 }
 
 impl NamespaceDispatcher for StandIn {
-    fn dispatch(&mut self, mutation: &NamespaceMutation) -> FacadeResult<NamespaceOutcome> {
+    fn dispatch(
+        &mut self,
+        _: &mut dyn RawTransport,
+        mutation: &NamespaceMutation,
+    ) -> FacadeResult<NamespaceOutcome> {
         self.calls += 1;
         let effect = || {
             self.effect

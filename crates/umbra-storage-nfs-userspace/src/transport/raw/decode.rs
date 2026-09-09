@@ -317,6 +317,37 @@ unsafe fn op_reply(entry: &sys::nfs_resop4, budget: &mut ReplyBudget) -> Transpo
             let ok = union.opreaddir.READDIR4res_u.resok4;
             OpReply::ReadDir(dir_page(&ok, budget)?)
         }
+        OpCode::SaveFh => {
+            guard!(opsavefh);
+            OpReply::SaveFh
+        }
+        OpCode::Remove => {
+            guard!(opremove);
+            OpReply::Remove(change_info(&union.opremove.REMOVE4res_u.resok4.cinfo))
+        }
+        OpCode::Rename => {
+            guard!(oprename);
+            let ok = union.oprename.RENAME4res_u.resok4;
+            OpReply::Rename {
+                source: change_info(&ok.source_cinfo),
+                target: change_info(&ok.target_cinfo),
+            }
+        }
+        OpCode::Create => {
+            guard!(opcreate);
+            let ok = union.opcreate.CREATE4res_u.resok4;
+            OpReply::Create {
+                info: change_info(&ok.cinfo),
+                attrset: mask(&ok.attrset),
+            }
+        }
+        OpCode::SetAttr => {
+            // SETATTR reports `attrsset` on success *and* on failure, but only
+            // the success path is a set. The guard keeps the failure path a
+            // failure rather than a partial claim.
+            guard!(opsetattr);
+            OpReply::SetAttr(mask(&union.opsetattr.attrsset))
+        }
         other => {
             return Err(TransportError::Malformed(format!(
                 "server returned a {other:?} result this transport never requests"
@@ -374,6 +405,36 @@ unsafe fn attributes(attrs: &sys::fattr4, budget: &mut ReplyBudget) -> Transport
         budget,
     )?;
     decode_attributes(mask, &values)
+}
+
+/// Copy a `change_info4` out of the reply.
+///
+/// `atomic` is reported exactly as the server set it. A server that says the
+/// pair was not sampled atomically is telling the caller the two values do not
+/// bracket the operation, and coercing that to `true` would fabricate ordering
+/// evidence.
+///
+/// # Safety
+///
+/// `info` must belong to the reply currently being decoded.
+unsafe fn change_info(info: &sys::change_info4) -> crate::transport::ChangeInfo {
+    crate::transport::ChangeInfo {
+        atomic: info.atomic != 0,
+        before: info.before,
+        after: info.after,
+    }
+}
+
+/// Copy a `bitmap4` into the frozen two-word [`AttrMask`].
+///
+/// # Safety
+///
+/// `bitmap` must belong to the reply currently being decoded.
+unsafe fn mask(bitmap: &sys::bitmap4) -> AttrMask {
+    AttrMask {
+        word0: attr_word(bitmap, 0),
+        word1: attr_word(bitmap, 1),
+    }
 }
 
 /// Read one word of a `bitmap4`, treating an absent word as zero.

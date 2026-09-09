@@ -18,8 +18,8 @@ use core::ffi::c_char;
 
 use crate::error::TransportError;
 use crate::transport::{
-    AttrMask, Compound, Nfs4Op, OpCode, OpenClaim, OpenHow, Stability, TransportLimits,
-    TransportResult,
+    AttrMask, AttrValues, Compound, CreateType, Nfs4Op, OpCode, OpenClaim, OpenHow, Stability,
+    TransportLimits, TransportResult,
 };
 
 use super::sys;
@@ -180,7 +180,7 @@ impl CallArena {
         };
 
         match op {
-            Nfs4Op::PutRootFh | Nfs4Op::GetFh | Nfs4Op::LookupParent => {}
+            Nfs4Op::PutRootFh | Nfs4Op::GetFh | Nfs4Op::LookupParent | Nfs4Op::SaveFh => {}
 
             Nfs4Op::PutFh(handle) => {
                 let (pointer, length) = self.own_bytes(handle.as_bytes().to_vec());
@@ -398,9 +398,116 @@ impl CallArena {
                     setclientid_confirm: to_c_bytes(confirm.0),
                 };
             }
+
+            Nfs4Op::Remove { name } => {
+                let (pointer, length) = self.own_bytes(name.as_bytes().to_vec());
+                out.nfs_argop4_u.opremove = sys::REMOVE4args {
+                    target: sys::utf8string {
+                        utf8string_len: length,
+                        utf8string_val: pointer,
+                    },
+                };
+            }
+
+            Nfs4Op::Rename { old_name, new_name } => {
+                let (old_ptr, old_len) = self.own_bytes(old_name.as_bytes().to_vec());
+                let (new_ptr, new_len) = self.own_bytes(new_name.as_bytes().to_vec());
+                out.nfs_argop4_u.oprename = sys::RENAME4args {
+                    oldname: sys::utf8string {
+                        utf8string_len: old_len,
+                        utf8string_val: old_ptr,
+                    },
+                    newname: sys::utf8string {
+                        utf8string_len: new_len,
+                        utf8string_val: new_ptr,
+                    },
+                };
+            }
+
+            Nfs4Op::Create {
+                object_type,
+                name,
+                attributes,
+            } => {
+                let (name_ptr, name_len) = self.own_bytes(name.as_bytes().to_vec());
+                let createattrs = self.encode_fattr(attributes);
+                // NF4DIR selects no arm of `createtype4_u`; zeroing it is the
+                // encoding, not an omission. NF4LNK and the device types would
+                // need `linkdata`/`devdata`, and `CreateType` has no variant
+                // that reaches them.
+                let objtype = sys::createtype4 {
+                    type_: match object_type {
+                        CreateType::Directory => NF4DIR,
+                    },
+                    createtype4_u: unsafe { core::mem::zeroed() },
+                };
+                out.nfs_argop4_u.opcreate = sys::CREATE4args {
+                    objtype,
+                    objname: sys::utf8string {
+                        utf8string_len: name_len,
+                        utf8string_val: name_ptr,
+                    },
+                    createattrs,
+                };
+            }
+
+            Nfs4Op::SetAttr {
+                stateid,
+                attributes,
+            } => {
+                if attributes.is_empty() {
+                    return Err(malformed(
+                        "SETATTR names no attribute; an empty set would report a change \
+                         that never happened",
+                    ));
+                }
+                let obj_attributes = self.encode_fattr(attributes);
+                out.nfs_argop4_u.opsetattr = sys::SETATTR4args {
+                    stateid: to_stateid(stateid),
+                    obj_attributes,
+                };
+            }
         }
 
         Ok(out)
+    }
+
+    /// Encode [`AttrValues`] as one `fattr4`.
+    ///
+    /// The `attrlist4` is the XDR encoding of each present value **in ascending
+    /// attribute number**, which is what the bitmap means; emitting them in any
+    /// other order would hand the server a correctly-sized blob it parses into
+    /// the wrong fields. [`AttrValues::mask`] walks the same order, so the two
+    /// cannot disagree.
+    fn encode_fattr(&mut self, values: &AttrValues) -> sys::fattr4 {
+        let bitmap = self.own_bitmap(values.mask());
+        let mut blob = Vec::new();
+        if let Some(size) = values.size {
+            blob.extend_from_slice(&size.to_be_bytes());
+        }
+        if let Some(mode) = values.mode {
+            blob.extend_from_slice(&mode.to_be_bytes());
+        }
+        for name in [&values.owner, &values.owner_group].into_iter().flatten() {
+            push_utf8(&mut blob, name);
+        }
+        for time in [values.time_access, values.time_modify]
+            .into_iter()
+            .flatten()
+        {
+            // settime4: SET_TO_CLIENT_TIME4 then the nfstime4 itself.
+            blob.extend_from_slice(&SET_TO_CLIENT_TIME4.to_be_bytes());
+            blob.extend_from_slice(&time.seconds.to_be_bytes());
+            blob.extend_from_slice(&time.nanoseconds.to_be_bytes());
+        }
+        let (values_ptr, length) = self.own_bytes(blob);
+        sys::fattr4 {
+            attrmask: bitmap,
+            attr_vals: sys::attrlist4 {
+                attrlist4_len: length,
+                attrlist4_val: values_ptr,
+            },
+        }
     }
 
     /// Encode `OPEN4args.openhow`.
@@ -511,6 +618,13 @@ fn classify(call: &Compound) -> TransportResult<DispatchKind> {
     }
 }
 
+/// Append one XDR `utf8str_mixed`: a length then the bytes, padded to four.
+fn push_utf8(blob: &mut Vec<u8>, text: &[u8]) {
+    blob.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    blob.extend_from_slice(text);
+    blob.resize(blob.len().next_multiple_of(4), 0);
+}
+
 /// Allocate an owned buffer, never zero-sized: a zero-length `Box<[u8]>` has a
 /// dangling pointer, and libnfs hands argument pointers to `writev`.
 fn own(mut bytes: Vec<u8>) -> Box<[u8]> {
@@ -574,6 +688,8 @@ const CLAIM_PREVIOUS: sys::open_claim_type4 = 1;
 const OPEN_DELEGATE_NONE: sys::open_delegation_type4 = 0;
 const OPEN_DELEGATE_READ: sys::open_delegation_type4 = 1;
 const OPEN_DELEGATE_WRITE: sys::open_delegation_type4 = 2;
+const NF4DIR: sys::nfs_ftype4 = 2;
+const SET_TO_CLIENT_TIME4: u32 = 1;
 const READ_LT: sys::nfs_lock_type4 = 1;
 const WRITE_LT: sys::nfs_lock_type4 = 2;
 const READW_LT: sys::nfs_lock_type4 = 3;
