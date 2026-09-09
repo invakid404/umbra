@@ -7,6 +7,7 @@ members = [
     "crates/umbra-platform-linux",
     "crates/umbra-storage",
     "crates/umbra-storage-nfs",
+    "crates/umbra-storage-nfs-userspace",
     "crates/umbra-storage-local",
     "crates/umbra-storage-tar",
     "crates/umbra-overlay",

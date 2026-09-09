@@ -24,7 +24,7 @@ evidence and outstanding qualification work.
 
 Each package lives under `crates/` and owns its README. A backend's
 library and provider binary belong to the same package. Existing
-[fixtures](experiments/fixtures/README.md) are not a seventeenth workspace member.
+[fixtures](experiments/fixtures/README.md) are not an eighteenth workspace member.
 
 | Crate documentation | Responsibility | Allowed direct Umbra dependencies |
 | --- | --- | --- |
@@ -34,6 +34,7 @@ library and provider binary belong to the same package. Existing
 | [umbra-platform-linux](crates/umbra-platform-linux/README.md) | Linux ptrace, aarch64/x86-64 ABIs and enforcement | `umbra-platform`, `umbra-core` |
 | [umbra-storage](crates/umbra-storage/README.md) | Run storage operations, capabilities, durability and writer authority; storage protocol | `umbra-core` |
 | [umbra-storage-nfs](crates/umbra-storage-nfs/README.md) | Validated mounted NFS layout, shadow primitives, remote durability and fencing | `umbra-storage`, `umbra-core` |
+| [umbra-storage-nfs-userspace](crates/umbra-storage-nfs-userspace/README.md) | Frozen userspace NFSv4.0 facade interfaces and a provider scaffold; no I/O is wired | `umbra-storage`, `umbra-core` |
 | [umbra-storage-local](crates/umbra-storage-local/README.md) | Equivalent semantic API for development and local persistence | `umbra-storage`, `umbra-core` |
 | [umbra-storage-tar](crates/umbra-storage-tar/README.md) | Indexed tar snapshots, persistent staging and local durability for small runs | `umbra-storage`, `umbra-core` |
 | [umbra-overlay](crates/umbra-overlay/README.md) | Namespace contracts and shared copy-up, read-through and whiteout engine; namespace protocol | `umbra-core`, `umbra-storage`, `umbra-journal` |
