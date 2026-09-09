@@ -10,7 +10,10 @@ is no NFS dependency and no host filesystem I/O in the library.
 Construction does no I/O. The owner must call `NamespaceSession::bind` with:
 
 - `SessionConfig`: the opened shadow run's `RunBinding`, fenced `RequestContext`
-  (with a unique session idempotency prefix), and the journal's `RecoveryState`.
+  (with a unique session idempotency prefix), the journal's `RecoveryState`, and
+  the `WriterLease` those sessions mutate under. The lease lives here so that one
+  owner renews, releases and mutates through the same storage session, rather than
+  a second mutable session being opened just to hold authority.
 - An approved, immutable `Box<dyn Base>`. `StorageBase` adapts another opened
   `Storage` run to this read-only contract. The owner freezes that base for the
   session and validates its fingerprint; the overlay never opens arbitrary host
@@ -19,9 +22,8 @@ Construction does no I/O. The owner must call `NamespaceSession::bind` with:
 The owner opens the injected Journal against `binding.control` with the same run
 and writer epoch. Binding validates matching identities and accepts only an empty,
 intact journal with no checkpoint or pending transactions. Nonempty recovery is
-explicitly unsupported until reconciliation is implemented. The existing
-supervisor constructor does not yet supply this extra initialization; deployment
-wiring is outside this track. Unbound engines return `InvalidState`.
+explicitly unsupported until reconciliation is implemented. The supervisor's
+`run` composition supplies this initialization. Unbound engines return `InvalidState`.
 
 ## MVP behavior
 
@@ -89,14 +91,11 @@ failure. Crash-atomic recovery requires replay/reconciliation of the intent and
 both markers. This MVP refuses reopening nonempty journals rather than exposing
 partially reconciled state.
 
-**Persistence assumption / TODO:** `umbra-journal-file` still returns
-`NotImplemented` for all operations. The actual Journal interface has
-`append(&JournalRecord)` and `flush`, not a `journal.commit` method. The
-record's payload carries `JournalPayload::Commit`. This engine calls those real
-methods and propagates failures; it does not replace them
-with a successful stub. Tests inject an in-memory Journal that models record
-ordering and failure boundaries, with no production durability claim. A usable
-persistent session awaits file-journal persistence and recovery reconciliation.
+The injected Journal owns persistence. The shipped `umbra-journal-file` backend
+implements append and fsync-backed flush; the record payload carries
+`JournalPayload::Commit`. This engine calls those methods and propagates failures.
+Unit tests inject an in-memory Journal to model ordering and failure boundaries;
+restart recovery still requires reconciliation that this engine does not implement.
 
 Abort never claims that copy-up, creation, unlink, or a kernel mutation was undone.
 An aborted mutation requires recovery and leaves the session stopped. Checkpoint
@@ -185,3 +184,39 @@ loop bounds, symlink escape and unchecked physical-link rejection, rename identi
 base symlink copy-up, journal failures, transaction ordering and checkpoints.
 APFS configurations that reject non-UTF-8 filenames still run byte resolver and
 marker checks; actual raw-name filesystem I/O is conditional on native support.
+
+## Run lifecycle
+
+`NamespaceSession` adds three lifecycle methods, each defaulting to a refusal so a
+provider that does not implement them cannot be handed a run:
+
+- `renew_writer` renews the injected lease through this session's own storage. A
+  refused or epoch-advanced renewal is `LeaseLost`: authority is gone or unproven,
+  and the caller must stop resuming tracees rather than retry into a mutation.
+  Renewal is permitted while a transaction is pending. A failed renewal latches
+  the session poisoned, and an already-poisoned session refuses renewal.
+- `finish_run` durably completes a fresh command run: flush run data, append and
+  flush a `RunCompleted` record, close the journal, release the writer, close
+  storage. The storage flush receipt must match the run and writer epoch and
+  report non-None durability before completion is recorded. Once completion is
+  durable, the session is terminal: each cleanup
+  stage is attempted once, errors retain stage context, and bindings are cleared.
+  A subsequent `fail_run` does not repeat those closed stages. Failures before
+  durable completion retain the binding for `fail_run` cleanup. A receipt is
+  returned only when every step succeeded; it authorizes no takeover.
+- `fail_run` leaves the run explicitly failed. It writes no completion record and
+  publishes no checkpoint, and it releases the writer lease only when the request
+  carries evidence that the supervised tree is gone. Without that evidence the
+  writer marker is retained and the session is poisoned, so a later writer cannot
+  take over a run whose effects are uncertain.
+
+Each storage request derives its own `OperationId` from the pending transaction's
+identity (or the session's) plus a serial. One logical transaction issues several
+storage requests — a copy-up, its parent directories, the create itself — and a
+backend may bind an operation ID to the single idempotency key it was first used
+with, refusing a second, different request under it. Derivation is deterministic,
+so requests stay attributable to the operation the journal recorded.
+
+`umbra_supervisor` is the in-process owner that supplies all of the above; the
+namespace provider protocol carries no lifecycle calls, so an alternative
+namespace provider cannot yet own a run.

@@ -43,6 +43,10 @@ The M1 mechanisms named in the tracker spec are all present:
    via `codesign -f -s - --entitlements … --preserve-metadata=identifier,flags,runtime`.
    Entitlements match `experiments/gate-1/ent.plist`; a copy is shipped as
    `ent.plist` alongside `src/`.
+   Both the cache root and each digest folder are created with mode `0700`,
+   and that mode is enforced on existing directories. A cache directory owned
+   by another user causes a hard error when permissions cannot be enforced;
+   the cache is not silently trusted.
 2. **Arm64 `svc #0x80` breakpoints** verified byte-for-byte in
    `libsystem_kernel` for `__open`, `__open_nocancel`, `__openat`,
    `__openat_nocancel`, `__execve`, `__posix_spawn`, `__fork`,
@@ -190,23 +194,46 @@ decodes JSON `Options` from opaque provider options (empty falls back to
 `Options::default()`). Register it via `umbra providers --registry <path>
 --role platform`.
 
-**Provider IPC.** `TraceBackend::launch` and the compatibility method
-`launch_experimental` share `native.rs::MacosTraceBackend::launch_traced`:
-both launch suspended, sanitize inherited descriptors, and install the same
-syscall interception loop before returning. Launch requires explicit
-`LocalDevelopment`, stdio descriptors only, absolute executable/cwd, and
-non-empty argv. A backend accepts one run, including after termination. The
-caller must rewrite write-intent opens before resuming; this remains the M1
-feasibility tracer, without independent production sandbox qualification.
+**Launch and enforcement.** `TraceBackend::launch` and `launch_experimental`
+share `native.rs::MacosTraceBackend::launch_traced`: both launch suspended,
+sanitize inherited descriptors, and install the same syscall interception loop
+before returning. Launch requires explicit `LocalDevelopment` or
+`NfsClientFsync` persistence, stdio descriptors only, absolute executable/cwd,
+and non-empty argv. A backend accepts one run, including after termination.
+The caller must rewrite write-intent opens before resuming.
 
-**`argv[0]` at launch.** The image executed is the signed twin, but the tracee
-must see its own vendor identity, so `launch_traced` replaces `argv[0]` with
-`LaunchSpec::executable` — the absolute vendor path — whatever `argv[0]` the
-caller supplied. `argv[1..]` and the executed twin path are unchanged. The
-caller's `argv[0]` is still rejected if it contains a NUL, rather than being
-silently discarded. This applies to the initial launch only; nested
-`execve`/`posix_spawn` keep their existing executable-path rewrite and their
-own argument vectors.
+The `SandboxRequirement` on the spec decides enforcement, and there is no
+default. `Required(profile)` launches an explicitly addressed
+`/usr/bin/sandbox-exec` — resigned as a twin, never reached through a shell —
+with the rendered profile as bounded argv and the target's own twin as the
+command. The backend then drives that trusted bootstrap internally, consuming
+its startup events rather than exposing them as workspace syscalls, and returns
+only at the target's exec stop, verified with `proc_pidpath` to be the intended
+image. That exec stop is the handoff boundary: the policy is in force and the
+target has not run an instruction. An installer that exits, forks, execs
+something else, or does not reach the exec within its event budget fails the
+launch, and the tree is killed rather than returned without a handle.
+`UnsandboxedExperiment` is the only way to run unenforced, it is a named
+selection rather than an omission, and `launch_experimental` accepts nothing
+else. `TraceBackend::launch` and the provider IPC dispatcher reject that selection.
+
+For `UnsandboxedExperiment`, initial launch normalizes `argv[0]` to the
+absolute vendor executable path, after validating the caller's value for NULs.
+The executed image remains the resigned twin. Nested `execve` and `posix_spawn`
+retain their own argument vectors and executable-path rewriting.
+
+Under a required profile the target observes `argv[0]` as its resigned twin cache
+path: `sandbox-exec` provides no way to preserve the requested value. `argv[1..]`
+and `_NSGetExecutablePath` are unaffected by enforcement; the latter already
+returns the twin path on both launch paths.
+
+The backend advertises `sandboxed-stopped-launch-v1` and
+`experimental-syscall-rewrite-v1`. `tests/sandbox_launch.rs` qualifies the first
+in both directions on this host: with interception rewriting the open, the
+payload lands in the shadow and the host destination stays absent; with the
+identical fixture and destination but no rewrite, the open fails `EPERM` and
+neither file appears, which is the only way to show the policy is real rather
+than that a launch merely failed.
 
 Invoke the shipped binary through a platform `ProviderDescriptor` and
 `umbra_core::provider::Client::connect`, then send `Request::Capabilities`,
@@ -238,7 +265,10 @@ It reads `UMBRA_TEST_FIXTURE_PATH` (path to `umbra-test-child`) and
 `UMBRA_TEST_REDIRECT_ROOT` (shadow root); when either env var is unset,
 each test body skips via `eprintln` — the binary still reports the cases as
 passed, so qualification requires the `CAPTURED <case>` stderr verdict.
-All eleven cases are enabled. Fixture cases:
+These are direct tracer tests: they exercise interception without enforcement,
+and are lower-level than the integrated `umbra run` matrix, which drives the
+original seven cases through storage, journal, namespace and an installed sandbox.
+All eleven direct tracer cases are enabled. Fixture cases:
 
 | Case | State |
 |---|---|
@@ -249,7 +279,7 @@ All eleven cases are enabled. Fixture cases:
 | `exec-write`        | **CAPTURED** — see the closed M2 gap below |
 | `grandchild-write`  | **CAPTURED** |
 | `dup-inherit-write` | **CAPTURED** |
-| `argv0-check`       | **CAPTURED** — the `argv[0]` contract above |
+| `argv0-check`       | **CAPTURED** — the unsandboxed `argv[0]` contract above |
 | `wnohang-wait`      | **CAPTURED** — the wait decisions above |
 | `dirfd-rename`      | **CAPTURED** — the dirfd family above |
 | `symlink-cycle`     | **CAPTURED** — the logical symlinks above |
@@ -385,3 +415,18 @@ UMBRA_TEST_FIXTURE_PATH=<abs> UMBRA_TEST_REDIRECT_ROOT=<abs> \
 
 Successful compilation does not qualify tracing on any target — the M1
 minimum bar is what `open-libc` CAPTURED demonstrates.
+
+Set `UMBRA_INTEGRATION_REQUIRED=1` to make missing fixture inputs fail the sandbox,
+IPC and direct tracer suites. CI's `native-qualification` job runs these and the
+CLI's fourteen-case matrix on a runner labelled `umbra-integration`; that runner
+requires debugger permission and an existing NFSv4 mount configured through the
+`UMBRA_TEST_NFS_ROOT` repository variable. No test provisions a mount or prompts.
+
+Sandbox handoff compares canonical target paths with `proc_pidpath`. The twin
+cache root is also canonicalized so a symlinked cache recognizes already-resigned
+executables instead of creating a second twin during bootstrap. Both installed
+sandbox qualification tests exercise a symlinked cache root.
+
+Failed attach and sandbox-handoff paths set `launch_tree_terminated` on the returned
+error only when `waitpid` confirms reaping every created tracee. Missing evidence
+remains false so the supervisor retains writer authority after uncertain launch failure.

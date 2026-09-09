@@ -3,8 +3,8 @@ use crate::{BytePath, ErrorKind, Result, UmbraError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Current common transport version; role schemas share this initial version.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Common transport version 2 adds required sandbox launch policy and rewrite messages.
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Maximum encoded frame size, checked before allocating a payload.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// Explicit installed executable; runtime paths/options never enter checkpoints.

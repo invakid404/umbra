@@ -473,6 +473,8 @@ name = "umbra-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde_json",
+ "tempfile",
  "umbra-agent",
  "umbra-core",
  "umbra-journal",
@@ -507,8 +509,10 @@ dependencies = [
 name = "umbra-journal-file"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "umbra-core",
  "umbra-journal",
+ "uuid",
 ]
 
 [[package]]
@@ -604,12 +608,15 @@ dependencies = [
 name = "umbra-supervisor"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
+ "tracing",
  "umbra-agent",
  "umbra-core",
  "umbra-journal",
  "umbra-overlay",
  "umbra-platform",
  "umbra-storage",
+ "uuid",
 ]
 
 [[package]]

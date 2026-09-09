@@ -16,6 +16,9 @@ pub struct PlatformCapabilities {
     /// Architectures.
     pub architectures: Vec<Architecture>,
     /// Supported behavior advertised by the provider; qualification is required.
+    /// ABI identities use `<platform>-<arch>-abi-v<decimal version>`; a run
+    /// requires exactly one such name for its architecture (`arm64` or `x86_64`),
+    /// independent of capabilities for other architectures.
     pub capabilities: BTreeSet<String>,
 }
 

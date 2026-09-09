@@ -352,10 +352,23 @@ pub fn accept_connection<B>(
         }
         let (backend, capabilities) = factory(&hello.options)?;
         if !hello.required_capabilities.is_subset(&capabilities) {
+            // Name what is missing and what is on offer: these errors are the
+            // whole configuration interface, since nothing here may prompt.
+            let missing: Vec<&str> = hello
+                .required_capabilities
+                .difference(&capabilities)
+                .map(String::as_str)
+                .collect();
+            let advertised: Vec<&str> = capabilities.iter().map(String::as_str).collect();
             return Err(UmbraError::new(
                 ErrorKind::UnsupportedCapability,
                 "provider.handshake",
-                "required capabilities unavailable",
+                format!(
+                    "provider '{id}' (role {role}) does not advertise required \
+                     capabilities [{}]; it advertises [{}]",
+                    missing.join(", "),
+                    advertised.join(", ")
+                ),
             ));
         }
         Ok((

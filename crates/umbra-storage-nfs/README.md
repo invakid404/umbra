@@ -8,6 +8,14 @@ Live NFSv4 storage backend for Umbra. Direct Umbra dependencies are
 and supported mutations through `umbra_storage::Storage` against an
 externally managed NFSv4 mount. Hard links, logical symlinks, xattrs,
 kernel-shadow qualification and strict remote persistence are unsupported.
+
+`connect` validates an existing exact NFSv4 mount before any run I/O. A backend
+built with `new` advertises `mounted-nfsv4-v1` only after `open_run` performs that
+validation; configuration alone never earns the capability. `experimental-open-rewrite-v1` is
+advertised alongside it, since runs supply real physical paths for kernel syscall
+rewriting and the sandbox write root. Nothing here advertises remote durability:
+`strict_remote_persistence` stays false and `durability` stays `Local`, because
+the boundary reached is the client fsync.
 Construction does not mount anything. `NfsStorage::new` retains the config and
 defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
 
@@ -80,11 +88,12 @@ misconfigured export fails fast. Register it via `umbra providers
 
 ## Test coverage
 
-`tests/mounted.rs` (396 lines) contains six cases. Five exercise supported
-operations against a live mount when `UMBRA_TEST_NFS_MOUNT` is set and
+`tests/mounted.rs` exercises supported operations and mount qualification
+against a live mount when `UMBRA_TEST_NFS_MOUNT` is set. Live cases
 skip when unset; `absent_mount_rejected_without_creating_it` always runs.
 Cases:
 
+- `open_run_qualifies_a_new_backend_after_mount_validation`
 - `absent_mount_rejected_without_creating_it`
 - `provider_protocol_handshake_and_crud`
 - `crud_bytes_pagination_and_durability`
@@ -94,7 +103,7 @@ Cases:
 
 When creating the run tempdir under the mount hits
 `ErrorKind::PermissionDenied`, the fixture returns `None` with an `eprintln`,
-and the five live tests skip. The error alone does not identify whether
+and the live tests skip. The error alone does not identify whether
 permissions, TCC or an enclosing sandbox caused the denial.
 `cargo test -p umbra-storage-nfs` still exits 0 even in that unprivileged
 case. Note: a green run under skip is not
@@ -107,3 +116,7 @@ unimplemented; inspect `--nocapture` output for skips when qualifying a mount.
 cargo check -p umbra-storage-nfs
 UMBRA_TEST_NFS_MOUNT=<abs> cargo test -p umbra-storage-nfs
 ```
+
+`new` advertises no mounted capability. Successful mount validation in either
+`connect` or `open_run` enables `mounted-nfsv4-v1`; a returned run binding therefore
+reflects validation performed by `open_run` too.
