@@ -1,15 +1,15 @@
 # umbra-storage-nfs-userspace
 
 **Current state: frozen facades, the Umbra-owned NFSv4.0 protocol state machine,
-a raw-RPC transport behind an off-by-default feature, and a storage operations
-surface running over whichever transport is injected.** This crate holds the
-private facade contracts for Umbra's userspace NFSv4.0 backend, the client state
-machine in `src/state/` that drives them, the operations surface in `src/ops.rs`
-and the modules beside it, and a `Storage` implementation that opens an existing
-run, resolves paths, stats, enumerates, reads, creates files and writes. Writer
-authority, admission and durability receipts still answer `NotImplemented`
-naming `authority_recovery`; semantics this provider will not offer answer
-`UnsupportedCapability`.
+a raw-RPC transport behind an off-by-default feature, a storage operations
+surface running over whichever transport is injected, and the writer-authority
+and outage-recovery modules built on all three.** This crate holds the private
+facade contracts for Umbra's userspace NFSv4.0 backend, the client state machine
+in `src/state/` that drives them, the operations surface in `src/ops.rs` and the
+modules beside it, the admission, journal and outage machine in `src/authority/`,
+and a `Storage` implementation that opens an existing run, resolves paths, stats,
+enumerates, reads, creates files and writes. Semantics this provider will not
+offer answer `UnsupportedCapability`.
 
 A default build needs no native toolchain and no test contacts a server: every
 suite in this crate runs against the in-memory fake in `src/fake.rs`. Building
@@ -275,6 +275,77 @@ runs its operations over whatever `with_facades` was given, which is the fake in
 every test in this crate. Constructing a `LibnfsRawTransport` for the provider,
 and the acceptance that goes with it, is deferred.
 
+## Authority and recovery
+
+`src/authority/` owns the two questions the protocol state machine deliberately
+refuses: whether this session may mutate at all, and what happens when it is
+interrupted. `state::lease::LeaseClock::takeover_by_timeout` and
+`state::ProtocolState::takeover` both answer `TakeoverRefused` rather than
+owning the question; this is where it is owned.
+
+| Module | Owns |
+| --- | --- |
+| `authority::marker` | The durable ownership record, its fixed-width codec, and the `MarkerStore` seam |
+| `authority::server_marker` | That store on the server, over the frozen transport facade |
+| `authority::admission` | Acquire, deny, cooperatively release; the epoch ladder |
+| `authority::journal` | Durable intent, payload and committed result over the frozen `ReplayLog` |
+| `authority::outage` | The finite state machine over the failure model's five states |
+
+Four rules shape it.
+
+1. **A held marker denies every acquirer.** Not until a lease elapses, and not
+   unless the token matches — denies. No code path leads from elapsed time to
+   admission, and a restarted process presenting its predecessor's token has
+   proven only that it can read a file, not that the predecessor is dead. A
+   crashed owner's own restart is therefore denied exactly like a stranger's and
+   the run stops as `BLOCKED_RECOVERABLE` with the marker, the replay data and
+   the diagnostic all retained. Every `TakeoverPolicy` other than `Refuse` is
+   answered with `TakeoverRefused` before the store is touched.
+2. **Release is recorded, never deleted.** The store has no `remove`, so no
+   recovery path can reach for one under pressure. A graceful shutdown writes
+   `AdmissionPhase::Released` in place, which is the evidence a follow-on process
+   reads before acquiring at exactly one higher epoch. A release is withheld
+   entirely while outstanding I/O cannot be excluded: `ReleaseOutcome::Retained`
+   hands the proof back rather than publishing a handover the session cannot
+   stand behind.
+3. **Nothing dispatches before its intent is durable.** `DispatchTicket` has no
+   public constructor; the only way to get one is `MutationJournal::begin`
+   returning `Acknowledged::Dispatch`, which happens after the intent, the
+   payload and the authorising epoch have reached the log. Backpressure is
+   applied before that admit, so an exhausted buffer refuses the mutation instead
+   of letting it reach the wire with nowhere to record its outcome.
+4. **The first error is latched.** `OutageMachine` keeps the failure that opened
+   a window in a frozen `RetainedError` and counts later attempts without
+   replacing it, so an `NFS4ERR_NOSPC` is still 28 after three reconnects. A
+   digest-only payload is `PayloadMissing` rather than reconstructed bytes, and a
+   namespace intent whose reply was lost is `Indeterminate` rather than a guess:
+   its record carries a name, not the before/after proof the failure model
+   requires.
+
+`AdmissionMarker` decodes two encodings and produces one. The 16-byte legacy
+lock the mounted adapter writes — the one `tests/goldens/writer-lock.bin` pins —
+reads as *held* by an unnamed writer, never as released, because absence of a
+phase is not evidence of a release. Records this provider writes are a
+fixed-width extended encoding: the frozen transport has no `SETATTR`, so a
+shorter record written over a longer one would leave the old tail readable, and
+a constant width makes every overwrite total.
+
+`ServerMarkerStore` is the one place an operation is expressed here rather than
+left to the operations node, because the failure model requires *server-atomic*
+admission and that atomicity is an authority requirement. It uses `OPEN` with
+`GUARDED4`, not `EXCLUSIVE4`: an exclusive create is designed to let a replay
+with the same verifier succeed again, which is right for a retried create and
+wrong for admission, where the second session must be told the name exists. It
+is three calls on one name and nothing else — no path resolution, no anchoring,
+no capability. Binding it into `Storage` is deferred.
+
+**Split brain and hard partition are not implemented here.** Two hosts holding
+conflicting valid ownership evidence needs a fence receipt and a cutoff before a
+winner may be selected. `CrashWindow::SplitBrain` and `CrashWindow::HardPartition`
+stop *both* sides and record `Deferral::M3Fencing`; `CrashWindow::ServerPowerLoss`
+records `Deferral::M3Qualification`. An increasing epoch is not a fence and
+nothing here pretends otherwise.
+
 ## Configuration and registration
 
 `NfsUserspaceConfig` carries the server host and port, a server-relative `export`
@@ -320,8 +391,9 @@ review the diff.
 ## Tests
 
 `cargo test -p umbra-storage-nfs-userspace` runs the unit tests, the golden and
-provider-template suites, `tests/fake_fault_matrix.rs`, and
-`tests/operations_surface.rs`. There is no network, mount, service, fixture
+provider-template suites, `tests/fake_fault_matrix.rs`,
+`tests/operations_surface.rs` and `tests/authority_recovery.rs`. There is no
+network, mount, service, fixture
 directory or environment gate.
 
 The fake transport is a shape fake: it answers the operations M1 needs and models
@@ -351,6 +423,25 @@ open handle, a pathname replacement leaving open handles on the original object,
 retention until `CLOSE`, bounded paging with explicit cursor invalidation,
 `UNSTABLE` to `COMMIT` verifier matching and its typed failure, and the refusal
 of every unsupported and deferred operation.
+
+`tests/authority_recovery.rs` is one test per crash window in
+`authority::outage::CrashWindow::ALL` — the failure model's taxonomy, with its
+umbra-crash row split into the before, mid and after-write windows — driven
+through a `StateSession::over_fake` under fault injection. Each asserts the
+state-machine transition and, wherever the window produced a failure, that the
+original `NFS4ERR_*` is still readable verbatim afterwards; the tracee-crash and
+in-grace-reclaim windows produce none and assert no status. Every crash-window
+test then reads the durable marker back and asserts who holds it, at which epoch,
+and that no timeout moved either. The competing-session test runs two genuinely
+separate sessions, with separate client ids and separate open owners, over one
+shared fake server: the first is admitted at epoch 1 and the second is denied,
+repeatedly, naming the actual holder.
+
+Because `FakeReplayLog` is in memory, every `RetainedError` it carries reports
+`is_durable() == false`, and the suite asserts that. Consequently those tests
+assert the *recovery plan* a durable journal would license rather than performing
+a replay: under the fake no evidence survives a process to replay from, and a
+test that pretended otherwise would be passing on volatile evidence.
 
 The suites that use a server — `tests/raw_smoke.rs`, `tests/fault_matrix.rs` and
 `tests/live_state.rs` — need `--features transport-raw` and skip unless
@@ -386,10 +477,10 @@ that window out under a bounded budget instead of reading it as a failure.
 
 ## Deferred
 
-Writer authority, admission, epochs, retry policy and durability receipts:
-`acquire_writer`, `renew_writer`, `release_writer` and `flush` report the gate
-naming `authority_recovery`. A mutation without a writer epoch, or without open
-owners from a confirmed incarnation, is refused rather than performed.
+Binding `authority::AdmissionControl` and `authority::MutationJournal` into the
+`Storage` surface, and constructing a live transport for the provider, are
+`m1_integrate`'s seam. `acquire_writer`, `renew_writer`, `release_writer` and
+`flush` report the gate until that binding lands.
 
 Namespace mutation — `REMOVE`, `RENAME`, `CREATE` of a directory, `SETATTR` —
 is typed and seamed but has no wire encoding in the frozen `Nfs4Op`; closing
@@ -398,7 +489,7 @@ reason, and `LOCK`/`LOCKU` are allocated and sequenced but never dispatched.
 `CopyUp` needs an immutable-base materialisation seam this provider does not
 have.
 
-No live transport is constructed for the provider here. Overlay and session
-recovery, fencing, and remote-storage power-loss qualification are later
-milestones. Nothing in this crate qualifies remote durability, and nothing in it
-has been run against a live server.
+Overlay and session recovery, fencing, and remote-storage power-loss
+qualification are later milestones; split-brain resolution is explicitly deferred
+to M3 fencing authority. Nothing in this crate qualifies remote durability, and
+nothing in it has been run against a live server.

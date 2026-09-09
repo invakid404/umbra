@@ -49,6 +49,7 @@
 #![deny(missing_docs)]
 
 pub mod anchor;
+pub mod authority;
 pub mod capability;
 pub mod crud;
 pub mod error;
