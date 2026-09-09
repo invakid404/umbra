@@ -20,3 +20,7 @@ umbra-platform = { path = "../umbra-platform" }
 umbra-storage = { path = "../umbra-storage" }
 umbra-journal = { path = "../umbra-journal" }
 umbra-overlay = { path = "../umbra-overlay" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

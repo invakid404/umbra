@@ -7,6 +7,11 @@ session-local retry deduplication. It rejects symlink components and non-UTF-8 p
 retain their bytes. Path-based checks are not a race-proof sandbox: callers must keep
 the directory private and prevent concurrent external changes.
 
+It advertises `local-development-v1` and `experimental-open-rewrite-v1`, so a run
+must select local development explicitly; it advertises nothing about remote
+durability. Runs supply real physical paths, so the supervisor can bind kernel
+syscall rewrites and the sandbox write root to `<root>/<run-id>/root`.
+
 Kernel shadow qualification, remote persistence, writer takeover, arbitrary xattrs,
 logical symlinks and crash-persistent idempotency are unsupported. Abandoned writer
 markers require recovery outside this implementation; expiry never proves termination.

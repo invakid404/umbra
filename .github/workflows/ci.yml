@@ -33,16 +33,16 @@ jobs:
         # rustup honors the repository's rust-toolchain.toml.
         run: rustup component add rustfmt clippy
 
-      - name: Cache Cargo registry and build artifacts
+      - name: Cache Cargo registry and git dependencies
         uses: actions/cache@v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          # New namespace excludes older archives that contained target/.
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+            cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -65,3 +65,32 @@ jobs:
 
       - name: Memoria documentation gate
         run: memoria --root . check
+
+  native-qualification:
+    name: Enforced macOS fixture qualification
+    # Fork PR code must never run on this persistent, privileged runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # This runner must provide debugger permission and an existing NFSv4 mount.
+    runs-on: [self-hosted, macOS, ARM64, umbra-integration]
+    timeout-minutes: 15
+    env:
+      UMBRA_INTEGRATION_REQUIRED: "1"
+      UMBRA_TEST_NFS_ROOT: ${{ vars.UMBRA_TEST_NFS_ROOT }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build providers and fixture
+        run: |
+          test "$(uname -m)" = arm64
+          test -n "$UMBRA_TEST_NFS_ROOT"
+          cargo build --workspace --bins
+          fixture_dir=$(mktemp -d)
+          clang -arch arm64 experiments/fixtures/umbra-test-child.c -o "$fixture_dir/umbra-test-child"
+          mkdir "$fixture_dir/shadow"
+          echo "UMBRA_TEST_FIXTURE_PATH=$fixture_dir/umbra-test-child" >> "$GITHUB_ENV"
+          echo "UMBRA_TEST_REDIRECT_ROOT=$fixture_dir/shadow" >> "$GITHUB_ENV"
+      - name: Qualify enforcement, IPC, and all fourteen run fixtures
+        run: |
+          cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures -- --nocapture --test-threads=1
+          cargo test -p umbra-cli --test run_fixtures -- --nocapture --test-threads=1

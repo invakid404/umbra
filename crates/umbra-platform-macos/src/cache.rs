@@ -2,6 +2,7 @@
 use crate::{error, Options};
 use std::{
     fs,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -93,6 +94,14 @@ pub fn resign(source: &Path, options: &Options, deadline: Instant) -> Result<Pat
         )
         .join("Library/Caches/umbra/twins"),
     };
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&root)
+        .map_err(|e| error("twin cache", e))?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .map_err(|e| error("twin cache", e))?;
+    let root = fs::canonicalize(&root).map_err(|e| error("twin cache", e))?;
     let digest = hash(&source, deadline)?;
     // Executables may exec/spawn their already resigned self; avoid chains of twins.
     if source.starts_with(&root) {
@@ -107,7 +116,13 @@ pub fn resign(source: &Path, options: &Options, deadline: Instant) -> Result<Pat
         }
     }
     let folder = root.join(&digest);
-    fs::create_dir_all(&folder).map_err(|e| error("twin cache", e))?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&folder)
+        .map_err(|e| error("twin cache", e))?;
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700))
+        .map_err(|e| error("twin cache", e))?;
     let name = source
         .file_name()
         .ok_or_else(|| error("twin", "missing basename"))?;
