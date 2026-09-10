@@ -14,6 +14,13 @@
 set -euo pipefail
 
 BASE_REF="${BASE_REF:-origin/master}"
+# When the workflow invokes this script from master's checkout with the
+# PR head worktree as cwd (the `pull_request_target` topology), the
+# workflow sets SCRIPTS_ROOT to master's `scripts/` so this script never
+# resolves its helper via cwd — which would be untrusted PR-head content.
+# For local dev / manual use, fall back to `scripts/` relative to cwd
+# (the auto-ack worktree in that context is fully trusted).
+SCRIPTS_ROOT="${SCRIPTS_ROOT:-scripts}"
 
 # ---- 1. What actually changed vs base? -------------------------------
 
@@ -53,7 +60,7 @@ fi
 changed_manifests=$(printf '%s\n' "$changed" | grep -E '(^|/)Cargo\.toml$' || true)
 if [ -n "$changed_manifests" ]; then
     while IFS= read -r manifest; do
-        if ! python3 scripts/check-cargo-toml-diff.py "$BASE_REF" "$manifest"; then
+        if ! python3 "$SCRIPTS_ROOT/check-cargo-toml-diff.py" "$BASE_REF" "$manifest"; then
             echo "auto-ack: SKIP — $manifest diff isn't pure version-literal bumps; human ack required"
             exit 0
         fi
