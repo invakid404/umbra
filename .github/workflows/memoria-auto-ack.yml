@@ -1,0 +1,238 @@
+name: Memoria Auto-Ack on Renovate
+
+# `pull_request_target` runs from the BASE branch's workflow file, not
+# from the PR head. This is the security anchor: an attacker who can push
+# to a matching branch (or the Renovate app itself, if compromised)
+# cannot modify the logic that reviews the PR by editing this workflow.
+#
+# We deliberately never `actions/checkout` the PR head — the PAT would
+# otherwise be available to untrusted `renovate/**` branch code, which
+# runs before the safe-diff allowlist has a chance to reject it. Instead
+# we check out master (trusted), fetch the PR head as a `refs/remotes`
+# ref, and use `git worktree` + git-plumbing commands to inspect the
+# head's content and produce the ack commit without executing any code
+# from the head.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [master]
+
+concurrency:
+  # One in-flight run per PR. A `github-actions[bot]` push produced by
+  # this workflow does NOT open a new PR event, so a concurrency
+  # author-name selective cancel is unnecessary — every trigger here is
+  # a genuine PR update.
+  group: memoria-auto-ack-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Minimal default token scope; the auto-ack job elevates `contents: write`
+# for itself only.
+permissions:
+  contents: read
+
+jobs:
+  auto-ack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    # Only Renovate PRs from within this repo (no forks — a fork could
+    # otherwise open a Renovate-looking PR against master and receive
+    # a write-scoped token). `pull_request_target` gates on branch of
+    # the BASE, but not on the HEAD or the author, so we filter here.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login == 'renovate[bot]' &&
+      startsWith(github.event.pull_request.head.ref, 'renovate/')
+
+    steps:
+      # Checkout the BASE branch (master) — the trusted source of the
+      # scripts and workflow. Actions pinned to commit SHAs (zizmor
+      # policy: `uses:` refs must be immutable, not floating tags).
+      - name: Checkout master (trusted scripts source)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+          # PAT (not GITHUB_TOKEN): a GITHUB_TOKEN-authored push is
+          # suppressed from re-triggering downstream workflows, so the
+          # memoria gate in ci.yml would never re-run against the acked
+          # head. A fine-grained PAT with Contents:Read+Write on this
+          # repo re-triggers CI as expected. actions/checkout writes a
+          # URL-scoped Basic extraheader (`x-access-token:<PAT>`) into
+          # the runner's git config and removes it during post-job
+          # cleanup.
+          token: ${{ secrets.MEMORIA_AUTO_ACK_TOKEN }}
+
+      - name: Fetch PR head as a ref (no checkout of head content)
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          # `refs/pull/<n>/head` is populated by GitHub for every PR and
+          # points at the exact head commit even if the branch is later
+          # force-pushed. Fetching to `refs/remotes/pr-head` keeps the
+          # commit graph available for `git diff`/`git worktree` without
+          # ever writing PR-head files into the trusted checkout.
+          git fetch origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr-head"
+          # Sanity: the fetched tip must match the PR event's advertised head.
+          fetched=$(git rev-parse refs/remotes/pr-head)
+          expected="${{ github.event.pull_request.head.sha }}"
+          if [ "$fetched" != "$expected" ]; then
+            echo "ERROR: fetched PR head $fetched != event head $expected"
+            exit 1
+          fi
+
+      - name: Verify PAT push auth
+        # Preflight: fail here with a clear error if the PAT lost its
+        # Contents:write scope or has otherwise been revoked, instead
+        # of after producing an auto-ack commit that has nowhere to go.
+        # We dry-run a push to the PR head branch specifically, since
+        # that's what the auto-ack will target later.
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: git push --dry-run origin "refs/remotes/pr-head:refs/heads/${PR_HEAD_REF}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+
+      # Cache the cargo registry/git/bin so the memoria CLI is not
+      # rebuilt from source on every Renovate PR. Key against the
+      # pinned memoria tag so a bump busts the cache automatically.
+      # Follow-up #32 (`--tag` → `--rev`) will make this key
+      # commit-precise; until then, the tag string is sufficient.
+      - name: Cache Cargo registry, git deps, and installed binaries
+        uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          # Include the memoria tag in the shared key so different
+          # tag pins get different caches.
+          shared-key: memoria-cli-v0.3.0
+          cache-directories: |
+            ~/.cargo/bin
+
+      - name: Install memoria CLI
+        # Same source-install invocation as .github/workflows/ci.yml's
+        # `Install memoria CLI` step; keep the two in sync when the
+        # memoria tag bumps. Follow-up issue #32 tracks pinning `--rev`
+        # instead of `--tag` for both call sites.
+        run: cargo install --locked --git https://github.com/viktordanov/rs-memoria --tag v0.3.0 rs-memoria
+
+      - name: Create PR head worktree (isolated data checkout)
+        env:
+          PR_HEAD_WORKTREE: ${{ runner.temp }}/pr-head
+        run: |
+          # `git worktree add` gives us a working directory pinned at the
+          # PR head's tree, sharing the trusted repo's .git dir. Memoria
+          # commands (which only READ files) will run here, and the
+          # eventual ack commit + push will happen in this worktree so
+          # it lands on the PR head branch. We never execute code that
+          # comes from this worktree — the auto-ack script is invoked
+          # via absolute path from the master checkout.
+          git worktree add "$PR_HEAD_WORKTREE" refs/remotes/pr-head
+          echo "PR_HEAD_WORKTREE=$PR_HEAD_WORKTREE" >> "$GITHUB_ENV"
+
+      - name: Attempt auto-ack (trusted script, PR head worktree cwd)
+        env:
+          BASE_REF: origin/${{ github.event.pull_request.base.ref }}
+          # Absolute path to master's scripts dir — the auto-ack script
+          # references its helper (check-cargo-toml-diff.py) through this
+          # so it never resolves to the PR head's copy of the file.
+          SCRIPTS_ROOT: ${{ github.workspace }}/scripts
+        working-directory: ${{ env.PR_HEAD_WORKTREE }}
+        run: "${{ github.workspace }}/scripts/memoria-auto-ack.sh"
+
+      - name: Validate diff allowlist, commit, and push
+        env:
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        working-directory: ${{ env.PR_HEAD_WORKTREE }}
+        run: |
+          # The auto-ack script (or an unrelated bug) must NOT produce
+          # any file change outside memoria.lock. If anything else is
+          # dirty (tracked or untracked), refuse to commit so a human
+          # inspects the drift instead of silently pushing.
+          #
+          # NUL-delimited path streams: `git status --porcelain` collapses
+          # whitespace and quotes special names, so `awk`-on-status would
+          # mis-parse a path like `weird name/x`. Pair `git diff -z HEAD`
+          # (tracked changes incl. deletes) with
+          # `git ls-files --others --exclude-standard -z` (untracked) for
+          # a clean NUL-terminated stream of one literal path each.
+          validate_outbound_allowlist() {
+            local violators
+            violators=$(
+              {
+                git diff --name-only -z HEAD
+                git ls-files --others --exclude-standard -z
+              } | while IFS= read -r -d '' path; do
+                  case "$path" in
+                    (memoria.lock) ;;
+                    ("") ;;
+                    (*) printf '%s\n' "$path" ;;
+                  esac
+                done
+            )
+            if [ -n "$violators" ]; then
+              echo "ERROR: auto-ack produced changes outside the outbound allowlist:"
+              echo "$violators"
+              echo
+              echo "Full git status:"
+              git status --porcelain --untracked-files=all
+              exit 1
+            fi
+          }
+
+          commit_msg() {
+            printf '%s\n\n%s\n' \
+              'chore(memoria): auto-ack safe dep bump' \
+              'Renovate bumped only dependency version literals; the root README ack was refreshed automatically by .github/workflows/memoria-auto-ack.yml.'
+          }
+
+          git_push() {
+            git push origin "HEAD:refs/heads/${PR_HEAD_REF}"
+          }
+
+          validate_outbound_allowlist
+
+          if [ -z "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "No memoria.lock change; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add memoria.lock
+          if git diff --cached --quiet; then
+            echo "Nothing staged after allowlisted add; treating as no-op."
+            exit 0
+          fi
+          git commit -m "$(commit_msg)"
+
+          if git_push; then
+            exit 0
+          fi
+
+          # Single retry on non-fast-forward — Renovate may have force-
+          # pushed a rebase mid-run. Reset the worktree to the freshly
+          # fetched head, rerun the trusted script, revalidate, retry once.
+          echo "Initial push rejected; attempting one rebase/retry."
+          git fetch origin "+refs/heads/${PR_HEAD_REF}:refs/remotes/pr-head"
+          git reset --hard refs/remotes/pr-head
+          BASE_REF="origin/${{ github.event.pull_request.base.ref }}" \
+            SCRIPTS_ROOT="${{ github.workspace }}/scripts" \
+            "${{ github.workspace }}/scripts/memoria-auto-ack.sh"
+          validate_outbound_allowlist
+          if [ -z "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "Auto-ack is a no-op on top of the rebased tip; nothing to push."
+            exit 0
+          fi
+          git add memoria.lock
+          if git diff --cached --quiet; then
+            echo "Nothing staged after retry; nothing to push."
+            exit 0
+          fi
+          git commit -m "$(commit_msg)"
+          if ! git_push; then
+            echo "ERROR: push still rejected after one retry; aborting."
+            exit 1
+          fi
