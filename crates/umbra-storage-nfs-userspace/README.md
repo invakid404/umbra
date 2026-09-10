@@ -177,11 +177,30 @@ Four rules shape it.
    refuses empty, `.` and `..` components; `ComponentName` refuses those again
    along with `/` and NUL; and every intermediate component must resolve to a
    directory, so a server-side symlink stops the walk instead of being followed.
+   Path bytes are not containment on their own: the walk also pins the server
+   filesystem. `RunAnchors::open` records the `fsid` of the resolved export — the
+   pseudo-root to configured-export transition is the one deliberate crossing —
+   and every descent below it, including the final component of a resolved path,
+   must report that same `fsid`. A `LOOKUP` into a nested exported filesystem
+   returns an ordinary directory that no byte check and no symlink check can see,
+   so it is refused on its own terms.
 4. **A page is bounded at every level.** One `List` issues at most
    `pages::MAX_SERVER_PAGES` `READDIR` operations, each capped by `max_count`,
    and returns at most the requested limit; nothing accumulates a whole
    directory. A changed `cookieverf` invalidates outstanding cursors explicitly
-   rather than restarting silently or answering from a cached snapshot.
+   rather than restarting silently or answering from a cached snapshot. The
+   invalidation keeps the server's own diagnosis: a `NFS4ERR_BAD_COOKIE` is
+   reported as an invalidated cursor *and* carries the original status number and
+   failing operation, so a caller can tell why enumeration restarted. Absence and
+   failure stay distinct throughout — a `.provider` lookup answered `NFS4ERR_IO`
+   is that failure, not a run without a private directory.
+
+Creating a file applies the mode that was requested. The provider supplies a
+create verifier for every keyed operation, so a create is `EXCLUSIVE4`, which
+carries that verifier in the field `GUARDED4` uses for initial attributes. The
+attributes therefore follow in a `SETATTR`, whose returned attrset is checked
+before the create reports success; a `SETATTR` failure is surfaced with its
+partial effect rather than undone by removing a name another writer may own.
 
 A `WriteAt` records a durable intent through the replay facade before dispatch,
 reports the count and stability the server actually reached rather than the ones
@@ -202,7 +221,13 @@ the syscall-matrix entries no contract operation maps to. Three verdicts:
   `Truncate`.
 - **Unsupported**, answered with `ErrorKind::UnsupportedCapability`: hard links;
   logical symlinks and `ReadLink`, which are overlay-owned; extended attributes;
-  whiteouts; `AtomicSwap`. `OUT_OF_SURFACE` adds file-backed `mmap`, ACLs,
+  whiteouts; `AtomicSwap`; and `RenameMode::NoReplace`, because NFSv4.0 `RENAME`
+  always replaces and no v4.0 operation makes "only if the destination is absent"
+  atomic. Probing the destination first and renaming second is the
+  check-then-rename the syscall matrix prohibits: another client can create the
+  destination between the two round trips, and a probe that fails for any reason
+  other than `NFS4ERR_NOENT` says nothing about what is there. `RenameMode::Replace`
+  is supported and unaffected. `OUT_OF_SURFACE` adds file-backed `mmap`, ACLs,
   `flock`, and — out of scope by the syscall matrix's notifications decision —
   `kqueue`/`kevent` with `EVFILT_VNODE` and FSEvents. Nothing in this crate
   registers, delivers or emulates a file-change notification.
@@ -259,6 +284,23 @@ Two hazards the audited spike carried are closed by construction:
   proven withdrawn. `rpc_cancel_pdu` dereferences the PDU it is given before
   checking that libnfs still owns it, so the pointer is reachable exactly once,
   through `Dispatch::take_for_cancel`.
+- **A connection failure frees every outstanding PDU, not just one.** Reachable
+  once is not enough on its own: when `rpc_service` returns a negative value,
+  `rpc_reconnect_requeue` has already errored every outstanding call and freed
+  each PDU, so every pointer the wrapper holds is dangling at once. `pdu`
+  counts those connection-wide disposals, each `CallSlot` records the generation
+  it was queued in, and retirement makes a stale slot's pointer unreachable
+  instead of cancelling it. The rule lives in `src/pdu.rs` rather than behind the
+  `transport-raw` feature so it is compiled and tested in a default build.
+- **Every service return is reconciled before any cancellation.** The same
+  requeue path calls each outstanding completion on its way out, so a connection
+  failure can carry a settled answer. The pump consults the completion registry
+  on every return, including the failure paths, rather than reporting
+  `Disconnected` over a completion that had already arrived.
+- **Retirement happens on every return path.** A reply that fails to decode
+  retires its registration, slot and arena before the error propagates. Leaving
+  them in flight would accumulate retained slots until `max_inflight` was spent
+  and every later submission was refused `QueueFull`.
 
 Replies are copied out of libnfs's buffers inside the completion callback, so no
 reply borrows C memory. They are copied with `read_unaligned`: libnfs decodes
@@ -320,14 +362,32 @@ Four rules shape it.
    reads before acquiring at exactly one higher epoch. A release is withheld
    entirely while outstanding I/O cannot be excluded: `ReleaseOutcome::Retained`
    hands the proof back rather than publishing a handover the session cannot
-   stand behind.
-3. **Nothing dispatches before its intent is durable.** `DispatchTicket` has no
+   stand behind. `OutstandingIo` is derived from the calls the provider actually
+   observed — a lost connection or an elapsed deadline leaves a request that may
+   already have been applied — not asserted from the shape of the dispatch loop.
+
+   A release whose write fails is reconciled against the marker rather than
+   assumed not to have landed. If the marker reads `Released` at this session's
+   epoch the write did land and only its reply was lost; if it still reads `Held`
+   by this session the release provably did not happen and the proof is handed
+   back; anything else is `ReleaseOutcome::Uncertain`, which consumes the proof.
+   Reviving authority over evidence the session cannot account for is how one
+   failed round trip becomes two live owners.
+3. **Succession is decided by the server, not by a read.** Reading a released
+   marker and overwriting it is two round trips, so two contenders can both read
+   the release and both write themselves in. `MarkerStore::claim_succession`
+   serialises it: a `GUARDED4` create of the epoch's claim name means the loser is
+   told `NFS4ERR_EXIST` by the server rather than by a local guess. Claims are
+   durable evidence of which contender took which epoch and are never deleted, so
+   a run that has been succeeded carries one `writer.lock.claim.<epoch>` per
+   handover alongside the untouched predecessor evidence.
+4. **Nothing dispatches before its intent is durable.** `DispatchTicket` has no
    public constructor; the only way to get one is `MutationJournal::begin`
    returning `Acknowledged::Dispatch`, which happens after the intent, the
    payload and the authorising epoch have reached the log. Backpressure is
    applied before that admit, so an exhausted buffer refuses the mutation instead
    of letting it reach the wire with nowhere to record its outcome.
-4. **The first error is latched.** `OutageMachine` keeps the failure that opened
+5. **The first error is latched.** `OutageMachine` keeps the failure that opened
    a window in a frozen `RetainedError` and counts later attempts without
    replacing it, so an `NFS4ERR_NOSPC` is still 28 after three reconnects. A
    digest-only payload is `PayloadMissing` rather than reconstructed bytes, and a
@@ -351,8 +411,10 @@ admission and that atomicity is an authority requirement. It uses `OPEN` with
 `GUARDED4`, not `EXCLUSIVE4`: an exclusive create is designed to let a replay
 with the same verifier succeed again, which is right for a retried create and
 wrong for admission, where the second session must be told the name exists. It
-is three calls on one name and nothing else — no path resolution, no anchoring,
-no capability. Binding it into `Storage` is deferred.
+is four calls on two names and nothing else — the marker, and the per-epoch
+succession claim that serialises a cooperative handover — with no path
+resolution, no anchoring and no capability. `session::Session` binds it into
+`Storage`.
 
 **Split brain and hard partition are not implemented here.** Two hosts holding
 conflicting valid ownership evidence needs a fence receipt and a cutoff before a
@@ -386,6 +448,26 @@ contract anchors, `.provider/`, `.provider/retries/`, `.provider/epoch` and
 does not create the export or run-parent directories: those are deployment
 configuration, and creating a missing one would silently relocate every run.
 
+The `StoragePolicy` is enforced rather than recorded. `require_kernel_shadow` and
+`require_strict_remote_persistence` are refused before the run is touched, since
+this provider offers neither; a read-only run cannot be created, because creation
+is itself a mutation, and an opened read-only run refuses mutations while still
+serving reads.
+
+`OpenRunIntent::OpenExisting` reads the run's own evidence before admission.
+`.provider/manifest` must decode and must name the requested run, immutable base
+and format version; a manifest that is absent or malformed is refused with its
+bytes left on the server, never adopted and never read as a release.
+`.provider/epoch` supplies an epoch floor, so a run the mounted adapter released
+cleanly at epoch 7 is admitted at 8 rather than restarting the ladder at 1. An
+epoch file that is not eight bytes is refused rather than treated as zero.
+
+Every request is checked against the admission it claims: a mutation naming a
+different run than the open one, or presenting a writer epoch other than the
+admitted one, is refused before dispatch. Neither check exists upstream —
+`umbra_storage::validate_request` deliberately leaves bound-run and lease checks
+to the backend and only requires that some epoch is present.
+
 ## Golden fixtures
 
 `tests/goldens/` pins the on-server bytes an existing run has, so the mounted and
@@ -411,10 +493,21 @@ review the diff.
 
 `cargo test -p umbra-storage-nfs-userspace` runs the unit tests, the golden and
 provider-template suites, `tests/fake_fault_matrix.rs`,
-`tests/operations_surface.rs`, `tests/authority_recovery.rs`, and the fake half of
-`tests/m1_conformance.rs` and `tests/golden_compat.rs`. There is no network,
-mount, service, fixture directory or environment gate: the two harnesses that can
-use a server compare against the fake when none is configured.
+`tests/operations_surface.rs`, `tests/authority_recovery.rs`,
+`tests/review_round_1.rs`, and the fake half of `tests/m1_conformance.rs` and
+`tests/golden_compat.rs`. There is no network, mount, service, fixture directory
+or environment gate: the two harnesses that can use a server compare against the
+fake when none is configured.
+
+`tests/review_round_1.rs` covers the findings of the first independent review,
+one case per finding id, each stating in its own doc comment what the pre-fix
+code did and asserting the corrected behaviour: latched authority loss and
+outstanding-I/O derivation, bound-run and writer-epoch validation, run-policy
+refusal, persisted-manifest and epoch-floor validation, durable replay through
+the retry journal, the no-replace refusal, the applied create mode, preserved
+NFS statuses, and the filesystem-boundary check. Two of them install a transport
+decorator rather than a fault plan, because a nested export and a changed `fsid`
+are answers a server gives rather than faults it injects.
 
 The fake transport is a shape fake: it answers the operations M1 needs and models
 OPEN_CONFIRM, exclusive-create verifier reuse, short writes, write/commit
@@ -479,7 +572,10 @@ fencing, no kernel shadow and no physical path.
 `tests/golden_compat.rs` is the sequential existing-run compatibility half:
 it creates a run through the provider, reads the result back over NFSv4.0, and
 compares the layout, `.provider/manifest` and `.provider/epoch` byte for byte
-against `tests/goldens/`. It also asserts the one-way `writer.lock` limit rather
+against `tests/goldens/`. The layout comparison is taken on the run as
+`CreateNew` left it; a cooperative succession additionally leaves a
+`writer.lock.claim.<epoch>`, which is this provider's own state rather than part
+of the layout the mounted adapter writes, so it is asserted separately. It also asserts the one-way `writer.lock` limit rather
 than leaving it to prose. `fault_matrix.rs` drives every `FaultPoint` against
 every `FaultAction` — `assert_eq!(cells.len(), 30, "5 fault points x 6 fault
 actions")` — asserting for each cell both that the transport consulted that fault
@@ -530,6 +626,15 @@ server for stability; it does not qualify a persistence boundary, and no
 remote-durability claim is made from it. `authority::MutationJournal` remains the
 typed lower-layer model over the `ReplayLog` facade and is not itself on the
 `Storage` path.
+
+**Held-object coherence is proven against the fake, not against a server.**
+`tests/operations_surface.rs` shows an open handle surviving an in-place edit, a
+rename and a pathname replacement, but its backend is the fake, whose object
+table is permanent by construction. That cannot qualify how a real server behaves
+for an open whose last name is gone, and no live case yet holds one client's open
+while an independent second client edits, truncates, renames, unlinks and
+replaces the name. Until one runs, treat the retention property as modelled
+rather than demonstrated.
 
 `OPEN_DOWNGRADE` remains unavailable: `transport::Nfs4Op` has no variant for it,
 and the hotfix that added the four namespace mutations deliberately did not widen
