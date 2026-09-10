@@ -1014,9 +1014,29 @@ fn read_record(
 
     // One chunk never exceeds what the transport will decode, so a chunk is never
     // refused for being too large to reply to.
-    let chunk = u32::try_from(transport.limits().max_reply_bytes)
+    //
+    // **R2-02, adjacent.** The same tag arithmetic `crud::read_whole` needed. The
+    // reply budget is spent on the echoed COMPOUND tag as well as the READ data,
+    // so a chunk sized at the whole budget always overruns it by the tag length.
+    // This reader has the same shape and the same `b"read"` tag — it goes through
+    // `read_anonymous` — and had the same defect; it was simply not the one the
+    // review reproduced.
+    let available = transport.limits().max_read_payload();
+    if available == 0 {
+        return Err(UmbraError::new(
+            ErrorKind::StorageUnavailable,
+            "retry",
+            format!(
+                "the transport's {}-byte reply budget leaves no room for READ data beside \
+                 the COMPOUND tag it charges against the same bound, so no retry record can \
+                 be read",
+                transport.limits().max_reply_bytes
+            ),
+        ));
+    }
+    let chunk = u32::try_from(available)
         .unwrap_or(u32::MAX)
-        .clamp(1, MAX_RECORD_BYTES);
+        .min(MAX_RECORD_BYTES);
 
     let mut bytes: Vec<u8> = Vec::new();
     loop {

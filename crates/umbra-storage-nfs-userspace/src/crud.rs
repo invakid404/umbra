@@ -487,9 +487,26 @@ pub fn read_whole(
 ) -> FacadeResult<WholeRead> {
     // One chunk never exceeds what the transport will decode, so a chunk is
     // never refused for being too large to reply to.
-    let chunk = u32::try_from(transport.limits().max_reply_bytes)
-        .unwrap_or(u32::MAX)
-        .clamp(1, limit.max(1));
+    //
+    // **R2-02.** The budget is not all payload. The reply carries the echoed
+    // [`READ_TAG`](crate::transport::READ_TAG) too, and the raw decoder charges
+    // both against the same figure, so asking for the whole budget asks for a
+    // reply that cannot fit inside it: under a 128-byte budget a full reply costs
+    // 132 and is refused as malformed. `max_read_payload` is what remains.
+    let available = transport.limits().max_read_payload();
+    if available == 0 {
+        // No chunk size makes progress here, and there is nothing to be gained by
+        // dispatching to find that out. Rounding back up to one byte would issue
+        // exactly the over-budget request the reservation prevents, and asking for
+        // zero bytes would loop forever without advancing.
+        return Err(FacadeError::Transport(TransportError::Malformed(format!(
+            "the transport's {}-byte reply budget leaves no room for READ data \
+             beside the {}-byte COMPOUND tag it charges against the same bound",
+            transport.limits().max_reply_bytes,
+            crate::transport::READ_TAG.len()
+        ))));
+    }
+    let chunk = u32::try_from(available).unwrap_or(u32::MAX).min(limit);
 
     let mut data: Vec<u8> = Vec::new();
     loop {

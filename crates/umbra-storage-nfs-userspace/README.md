@@ -810,6 +810,20 @@ with no bytes *and* no end of file is refused rather than looped on, and reachin
 the bound before end of file is reported to the caller, which decides what its
 own format makes of it.
 
+How much it asks for is derived from `TransportLimits::max_read_payload`, not
+from `max_reply_bytes`. A reply's budget is not all payload: `RawTransport::read`
+sends the four-byte `READ_TAG`, the server echoes it, and the raw decoder charges
+the echoed tag and the READ data against the same figure. Asking for the whole
+budget therefore asks for a reply that cannot fit inside it — under a 128-byte
+budget a full reply costs 132 and is refused as malformed, so a healthy file
+failed to read. A budget with no room for the tag *and* a byte of progress is
+refused before anything is dispatched, because there is no chunk size that would
+work and rounding back up to one byte would reissue the over-budget request. The
+retry journal's own record reader derives its chunk the same way, and the
+`max_io_bytes` a binding advertises is the read payload rather than the whole
+budget, so a `ReadAt` of exactly the advertised size is one the provider can
+actually answer.
+
 A write commits and compares verifiers before its open is released: an `UNSTABLE`
 write is durable only once a `COMMIT` returns the verifier the `WRITE` did. A
 journalled mutation that fails with an I/O status is latched — later mutations

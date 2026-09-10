@@ -277,6 +277,397 @@ fn f04_e_a_failed_read_is_propagated_not_absorbed_as_absence() {
     );
 }
 
+// --- R2-02: the whole-file reader reserves budget for the COMPOUND tag -------
+
+/// A transport that enforces the raw decoder's shared reply budget.
+///
+/// `transport::raw::decode` charges the echoed COMPOUND tag *and* the READ
+/// payload — the zero-copy path included — against one `max_reply_bytes`
+/// figure. `FakeTransport` models protocol shape and does not account for that,
+/// so this wrapper supplies the accounting the raw decoder does. It also counts
+/// submissions, which is how "refused before dispatch" is asserted rather than
+/// assumed.
+struct Budgeted {
+    inner: FakeTransport,
+    budget: usize,
+    submits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Budgeted {
+    fn new(inner: FakeTransport, budget: usize) -> Self {
+        Self {
+            inner,
+            budget,
+            submits: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn submits(&self) -> usize {
+        self.submits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl RawTransport for Budgeted {
+    fn wire_profile(&self) -> umbra_storage_nfs_userspace::transport::WireProfile {
+        self.inner.wire_profile()
+    }
+    fn limits(&self) -> umbra_storage_nfs_userspace::transport::TransportLimits {
+        umbra_storage_nfs_userspace::transport::TransportLimits {
+            max_reply_bytes: self.budget,
+            ..self.inner.limits()
+        }
+    }
+    fn connection(&self) -> umbra_storage_nfs_userspace::transport::ConnectionState {
+        self.inner.connection()
+    }
+    fn submit(
+        &mut self,
+        call: umbra_storage_nfs_userspace::transport::Compound,
+        call_deadline: Deadline,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::CompoundReply,
+    > {
+        use umbra_storage_nfs_userspace::transport::OpReply;
+        self.submits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reply = self.inner.submit(call, call_deadline)?;
+        let charged = reply.tag.len()
+            + reply
+                .results
+                .iter()
+                .map(|op| match op {
+                    OpReply::Read(read) => read.data.len(),
+                    _ => 0,
+                })
+                .sum::<usize>();
+        if charged > self.budget {
+            return Err(
+                umbra_storage_nfs_userspace::error::TransportError::Malformed(format!(
+                    "tag plus READ payload {charged} exceeds budget {}",
+                    self.budget
+                )),
+            );
+        }
+        Ok(reply)
+    }
+    fn cancel(
+        &mut self,
+        token: umbra_storage_nfs_userspace::transport::CallToken,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::Retirement,
+    > {
+        self.inner.cancel(token)
+    }
+    fn reconnect(
+        &mut self,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::ConnectionEpoch,
+    > {
+        self.inner.reconnect()
+    }
+    fn install_faults(&mut self, plan: Box<dyn umbra_storage_nfs_userspace::transport::FaultPlan>) {
+        self.inner.install_faults(plan)
+    }
+}
+
+/// A `Budgeted` transport over a fake holding one file of `bytes` under the root.
+fn budgeted(
+    bytes: Vec<u8>,
+    budget: usize,
+) -> (Budgeted, umbra_storage_nfs_userspace::handle::FileHandle) {
+    let mut inner = FakeTransport::new();
+    let root = inner.root();
+    let handle = inner.insert_file(&root, b"budgeted", bytes);
+    (Budgeted::new(inner, budget), handle)
+}
+
+/// **R2-02.** A constrained reply budget still reads a whole file, because the
+/// chunk leaves room for the tag the reply carries with it.
+///
+/// The round-1 helper sized its chunk at the *whole* `max_reply_bytes`. The
+/// budget is not all payload: `RawTransport::read` sends a four-byte tag, the
+/// server echoes it, and `transport::raw::decode` charges the echoed tag and the
+/// READ data to the same figure. So a full reply to a full-budget request always
+/// overruns by the tag length, and a perfectly healthy file became
+/// `Malformed: tag plus READ payload 132 exceeds budget 128`.
+#[test]
+fn f04_f_a_constrained_budget_still_reads_the_whole_file() {
+    use umbra_storage_nfs_userspace::crud::read_whole;
+    use umbra_storage_nfs_userspace::handle::Stateid;
+
+    let (mut transport, handle) = budgeted(vec![42u8; 256], 128);
+    let whole = read_whole(
+        &mut transport,
+        &handle,
+        Stateid::ANONYMOUS,
+        1024,
+        deadline(),
+    )
+    .expect("a 128-byte budget carries a 124-byte payload plus its 4-byte tag");
+
+    assert!(whole.complete, "end of file was reached inside the limit");
+    assert_eq!(whole.data, vec![42u8; 256]);
+    assert!(
+        transport.submits() >= 3,
+        "256 bytes cannot arrive in fewer than three 124-byte payloads: {}",
+        transport.submits()
+    );
+}
+
+/// **R2-02.** A final read that exactly fills the available payload and carries
+/// `eof` is still a complete read, not a boundary the loop mistakes for more.
+#[test]
+fn f04_g_an_exact_fit_final_read_reports_end_of_file() {
+    use umbra_storage_nfs_userspace::crud::read_whole;
+    use umbra_storage_nfs_userspace::handle::Stateid;
+
+    // Two payloads of exactly 124 bytes: 128 budget minus the four-byte tag.
+    let (mut transport, handle) = budgeted(vec![7u8; 248], 128);
+    let whole = read_whole(
+        &mut transport,
+        &handle,
+        Stateid::ANONYMOUS,
+        1024,
+        deadline(),
+    )
+    .expect("an exact fit is not an overrun");
+
+    assert!(whole.complete);
+    assert_eq!(whole.data.len(), 248);
+    assert_eq!(
+        transport.submits(),
+        2,
+        "exactly two full payloads, the second carrying eof"
+    );
+}
+
+/// **R2-02.** Intermediate short replies still advance, and every one of them
+/// stays inside the budget. The round-1 short-read behaviour is unchanged; only
+/// the size the reader asks for is.
+#[test]
+fn f04_g_short_replies_under_a_constrained_budget_still_advance() {
+    use umbra_storage_nfs_userspace::crud::read_whole;
+    use umbra_storage_nfs_userspace::handle::Stateid;
+
+    let (mut transport, handle) = budgeted(vec![9u8; 300], 128);
+    // The server answers with far less than the 124 asked for, and never sets
+    // eof early. Advancing by what arrived is what finishes the file.
+    transport.inner.set_read_cap(Some(30));
+    let whole = read_whole(
+        &mut transport,
+        &handle,
+        Stateid::ANONYMOUS,
+        1024,
+        deadline(),
+    )
+    .expect("short replies are legal and are followed");
+
+    assert!(whole.complete);
+    assert_eq!(whole.data, vec![9u8; 300]);
+    assert!(
+        transport.submits() >= 10,
+        "300 bytes in 30-byte replies takes at least ten: {}",
+        transport.submits()
+    );
+}
+
+/// **R2-02.** The caller's total bound still wins over the budget-derived chunk,
+/// and reaching it without end of file is still reported rather than refused.
+#[test]
+fn f04_g_the_total_bound_still_bounds_a_constrained_read() {
+    use umbra_storage_nfs_userspace::crud::read_whole;
+    use umbra_storage_nfs_userspace::handle::Stateid;
+
+    let (mut transport, handle) = budgeted(vec![3u8; 256], 128);
+    let bounded = read_whole(&mut transport, &handle, Stateid::ANONYMOUS, 100, deadline())
+        .expect("a limit below one chunk is a legal request");
+
+    assert!(
+        !bounded.complete,
+        "the bound was reached before end of file, which is an answer not a failure"
+    );
+    assert_eq!(bounded.data.len(), 100);
+    assert_eq!(bounded.data, vec![3u8; 100]);
+}
+
+/// **R2-02.** A budget that cannot hold the tag plus a byte of progress is
+/// refused *before* anything is dispatched.
+///
+/// The lower-bound edge matters as much as the reservation itself: clamping zero
+/// available payload back up to one byte would issue exactly the over-budget
+/// request the reservation exists to prevent, and looping on a zero-byte request
+/// would hang.
+#[test]
+fn f04_h_a_budget_too_small_for_the_tag_is_refused_before_dispatch() {
+    use umbra_storage_nfs_userspace::crud::read_whole;
+    use umbra_storage_nfs_userspace::handle::Stateid;
+
+    for budget in [0usize, 1, 4] {
+        let (mut transport, handle) = budgeted(vec![1u8; 64], budget);
+        let refused = read_whole(
+            &mut transport,
+            &handle,
+            Stateid::ANONYMOUS,
+            1024,
+            deadline(),
+        )
+        .expect_err("a budget with no room for payload cannot read anything");
+        assert!(
+            matches!(
+                refused,
+                umbra_storage_nfs_userspace::error::FacadeError::Transport(
+                    umbra_storage_nfs_userspace::error::TransportError::Malformed(_)
+                )
+            ),
+            "budget {budget}: {refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("budget"),
+            "budget {budget}: the diagnosis must name the bound it cannot meet: {refused}"
+        );
+        assert_eq!(
+            transport.submits(),
+            0,
+            "budget {budget}: nothing may reach the wire when no request could fit"
+        );
+    }
+
+    // One byte over the tag is enough to make progress.
+    let (mut transport, handle) = budgeted(vec![1u8; 8], 5);
+    let whole = read_whole(
+        &mut transport,
+        &handle,
+        Stateid::ANONYMOUS,
+        1024,
+        deadline(),
+    )
+    .expect("a single byte of payload per reply is slow, not impossible");
+    assert!(whole.complete);
+    assert_eq!(whole.data, vec![1u8; 8]);
+}
+
+/// **R2-02.** The tag the reader reserves for is the tag that is actually sent,
+/// and the server echoes it back into the same budget.
+///
+/// The whole fix rests on those two facts. If `RawTransport::read` stopped using
+/// `READ_TAG`, or a server answered with a tag of its own choosing, the reserved
+/// figure would be wrong in a way no arithmetic test would catch.
+#[test]
+fn f04_h_the_reserved_tag_is_the_one_on_the_wire() {
+    use umbra_storage_nfs_userspace::handle::Stateid;
+    use umbra_storage_nfs_userspace::transport::READ_TAG;
+
+    let (mut transport, handle) = budgeted(vec![5u8; 16], 1024);
+    let reply = transport
+        .inner
+        .submit(
+            umbra_storage_nfs_userspace::transport::Compound::new(
+                READ_TAG,
+                vec![
+                    umbra_storage_nfs_userspace::transport::Nfs4Op::PutFh(handle.clone()),
+                    umbra_storage_nfs_userspace::transport::Nfs4Op::Read {
+                        stateid: Stateid::ANONYMOUS,
+                        offset: 0,
+                        count: 16,
+                    },
+                ],
+            ),
+            deadline(),
+        )
+        .expect("the read is answered");
+    assert_eq!(
+        reply.tag.len(),
+        READ_TAG.len(),
+        "the server echoes the tag, and it is charged to the same budget"
+    );
+
+    // And a whole-file read of the same object costs exactly tag + payload per
+    // reply, which the budgeted wrapper would have refused otherwise.
+    let whole = umbra_storage_nfs_userspace::crud::read_whole(
+        &mut transport,
+        &handle,
+        Stateid::ANONYMOUS,
+        1024,
+        deadline(),
+    )
+    .expect("a generous budget reads it in one reply");
+    assert!(whole.complete);
+    assert_eq!(whole.data.len(), 16);
+}
+
+/// **R2-02, adjacent.** The `max_io_bytes` the provider advertises is a size a
+/// `ReadAt` of exactly that many bytes can actually be answered with.
+///
+/// `OperationLimits::from_transport` says an advertised limit is "one the
+/// provider can meet rather than one it hopes to". Under a constrained budget it
+/// was not: it advertised the whole reply budget, and a `ReadAt` of exactly that
+/// produced a reply costing budget-plus-tag, which the decoder refuses.
+#[test]
+fn f04_h_the_advertised_io_bound_leaves_room_for_the_tag() {
+    use umbra_storage_nfs_userspace::ops::OperationLimits;
+    use umbra_storage_nfs_userspace::transport::READ_TAG;
+
+    let (transport, _) = budgeted(vec![0u8; 1], 4096);
+    let limits = OperationLimits::from_transport(&transport);
+    assert_eq!(
+        limits.max_io_bytes as usize,
+        4096 - READ_TAG.len(),
+        "the advertised read size plus its tag must fit the reply budget"
+    );
+    assert!(
+        limits.max_io_bytes as usize + READ_TAG.len() <= 4096,
+        "which is the property that makes it meetable"
+    );
+    assert!(limits.max_directory_entries > 0);
+}
+
+/// **R2-02, adjacent.** The retry journal's own record reader works under a
+/// constrained budget too.
+///
+/// `journal`'s bounded reader is the one `crud::read_whole` was modelled on, uses
+/// the same `b"read"` tag through `read_anonymous`, and had the identical
+/// arithmetic: a chunk sized at the whole reply budget. It was simply not the
+/// reader the review reproduced.
+///
+/// Driven through the provider, so every budgeted read on the path is exercised
+/// at once — the manifest, the epoch file, the 256-byte admission marker, and
+/// then the retry record read back on the second attempt at the same key.
+#[test]
+fn f04_h_a_constrained_budget_runs_the_whole_provider_read_path() {
+    let run_id = fresh_run();
+    let (budgeted_transport, _) = {
+        let seeded = seed_released_run(run_id, Some(0));
+        (Budgeted::new(seeded, 128), ())
+    };
+    let mut storage = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(budgeted_transport),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("provider");
+
+    // Opening reads the manifest and the epoch file; admission reads the marker,
+    // which is 256 bytes and so needs three 124-byte payloads on its own.
+    open_existing(&mut storage, run_id).expect("a constrained budget still opens the run");
+    let epoch = storage
+        .admission()
+        .expect("a run is open")
+        .admitted()
+        .epoch();
+
+    let request = create_request(run_id, epoch, "budgeted-key", b"budgeted.txt");
+    let created = storage
+        .execute(&request)
+        .expect("a create under a constrained budget still writes its record and dispatches");
+    assert!(matches!(created, umbra_core::StorageResponse::Created(_)));
+
+    // The retry reads that record back through the journal's own bounded reader.
+    let replayed = storage
+        .execute(&request)
+        .expect("the settled record is read back whole under the same budget");
+    assert!(matches!(replayed, umbra_core::StorageResponse::Created(_)));
+}
+
 /// Walk to a directory inside a seeded run.
 fn walk(
     transport: &mut dyn RawTransport,
