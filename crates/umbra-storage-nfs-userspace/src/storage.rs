@@ -20,9 +20,9 @@
 use serde::{Deserialize, Serialize};
 use umbra_core::provider::decode;
 use umbra_core::{
-    BytePath, Durability, ErrorKind, Fencing, FlushRequest, OpenRunRequest, RequestContext, Result,
-    RunBinding, StorageAnchor, StorageCapabilities, StorageOperation, StoragePath, StorageRequest,
-    StorageResponse, UmbraError, WriterLease,
+    BytePath, Durability, ErrorKind, Fencing, FlushRequest, IdempotencyKey, OpenRunRequest,
+    RequestContext, Result, RunBinding, StorageAnchor, StorageCapabilities, StorageOperation,
+    StoragePath, StorageRequest, StorageResponse, UmbraError, WriterLease,
 };
 use umbra_storage::{AcquireWriterRequest, DurabilityReceipt, Storage};
 
@@ -196,7 +196,59 @@ pub struct NfsUserspaceStorage {
     /// because `submit` had returned. Withdrawing a local registration does not
     /// prove the server never received the request, so the evidence is collected
     /// here as it happens and the release reports what it actually knows.
-    unsettled: Vec<String>,
+    ///
+    /// **I4-001.** Each entry carries the identity and the dispatch phase the
+    /// call was interrupted in, not only its error prose, because those are what
+    /// a later attempt needs in order to *discharge* it. A ledger of strings can
+    /// only ever be added to, which turned R4-001's "resolve bounded outstanding
+    /// operations" into a run that could neither mutate nor release.
+    unsettled: Vec<UnsettledCall>,
+}
+
+/// How far a call had got when its server-side disposition became unknown.
+///
+/// **I4-001.** Recorded at the call site, which knows structurally what had been
+/// submitted by then, rather than inferred from the error's kind or prose. The
+/// distinction the failure model needs is not "which error" but "could a mutation
+/// still land under this identity".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchPhase {
+    /// Strictly before any durable intent, and strictly read-only on the wire:
+    /// consulting the retry journal ([`crate::journal::lookup`], a LOOKUP plus an
+    /// anonymous read) or observing the request's preconditions
+    /// ([`Operations::observe`], LOOKUP and GETATTR). Neither submits an
+    /// operation that can change anything, so a later proof that this key holds
+    /// no record leaves nothing outstanding under it.
+    BeforeIntent,
+    /// The journal's own intent write. It creates the `key-`, `op-` and `pre-`
+    /// records `GUARDED4`, so a lost reply leaves a create that may still land;
+    /// absence observed now does not exclude it.
+    IntentWrite,
+    /// The mutation itself, or the settle that records its outcome. The server
+    /// may have applied it, and only this key's own settled record can say.
+    Effect,
+    /// An interrupted intent whose disposition could not be established from
+    /// evidence (**R3-001** / **R4-001**). Terminal: never discharged, and
+    /// `recovery_blocked` holds the diagnosis that stops the run.
+    UnresolvedRecovery,
+}
+
+/// One call whose server-side effect this provider cannot rule out.
+#[derive(Clone, Debug)]
+struct UnsettledCall {
+    /// The mutation identity the call was issued under, where it had one.
+    ///
+    /// **I4-001.** The *idempotency key*, not the operation id. The durable
+    /// record namespace (`.provider/retries/key-<hex>`) is keyed on it, and a
+    /// caller may mint a fresh `OperationId` for a retry — so an obligation
+    /// keyed on the operation id could never be recognised by the very attempt
+    /// that resolves it. `None` is a call made outside any request identity, such
+    /// as a renewal; nothing discharges those.
+    key: Option<IdempotencyKey>,
+    /// How far the call had got. See [`DispatchPhase`].
+    phase: DispatchPhase,
+    /// The original diagnosis, verbatim, for the refusal and the release to carry.
+    detail: String,
 }
 
 /// Why a provider stopped being able to act on its open run.
@@ -532,8 +584,9 @@ impl NfsUserspaceStorage {
             None => OutstandingIo::Excluded,
             Some(first) => OutstandingIo::Unknown {
                 detail: format!(
-                    "{} call(s) issued by this session have unproven server-side disposition;                      first: {first}",
-                    self.unsettled.len()
+                    "{} call(s) issued by this session have unproven server-side disposition;                      first: {}",
+                    self.unsettled.len(),
+                    first.detail
                 ),
             },
         };
@@ -794,14 +847,15 @@ impl NfsUserspaceStorage {
     /// failed with `InvalidPath` carries no blocked marker and is not
     /// `CorruptJournal`, but the run is in exactly the same state as if it had:
     /// an interrupted intent whose disposition could not be established.
-    fn block_recovery(&mut self, operation: &str, error: &UmbraError) {
+    fn block_recovery(&mut self, operation: &str, key: &IdempotencyKey, error: &UmbraError) {
         if self.recovery_blocked.is_none() {
             self.recovery_blocked = Some(error.clone());
         }
-        self.unsettled.push(format!(
-            "{operation}: unresolved recovery: {}",
-            error.context
-        ));
+        self.unsettled.push(UnsettledCall {
+            key: Some(key.clone()),
+            phase: DispatchPhase::UnresolvedRecovery,
+            detail: format!("{operation}: unresolved recovery: {}", error.context),
+        });
     }
 
     /// Note a failed request: its disposition, and the write latch it may trip.
@@ -811,8 +865,19 @@ impl NfsUserspaceStorage {
     /// because an `NFS4ERR_IO` during any of them leaves a write that did not
     /// complete, which is the failure model's "Server EIO / failed stable write"
     /// row whichever call reported it.
-    fn note_failure(&mut self, operation: &str, request: &StorageRequest, error: &UmbraError) {
-        self.observe_disposition(operation, error);
+    fn note_failure(
+        &mut self,
+        operation: &str,
+        request: &StorageRequest,
+        phase: DispatchPhase,
+        error: &UmbraError,
+    ) {
+        self.observe_disposition(
+            operation,
+            Some(&request.context.idempotency_key),
+            phase,
+            error,
+        );
         // R3-001: a blocked recovery becomes a provider state, and it counts as
         // unsettled work so the release that follows cannot be reported clean.
         // An interrupted intent that could not be settled is precisely "uncertain
@@ -825,10 +890,11 @@ impl NfsUserspaceStorage {
             crate::journal::is_blocked(error) || error.kind == ErrorKind::CorruptJournal;
         if stops_the_run && self.recovery_blocked.is_none() {
             self.recovery_blocked = Some(error.clone());
-            self.unsettled.push(format!(
-                "{operation}: unsettled recovery: {}",
-                error.context
-            ));
+            self.unsettled.push(UnsettledCall {
+                key: Some(request.context.idempotency_key.clone()),
+                phase: DispatchPhase::UnresolvedRecovery,
+                detail: format!("{operation}: unsettled recovery: {}", error.context),
+            });
         }
         // R2-003, widened by R3-001: any journalled mutation whose I/O failed —
         // not only a `WriteAt` — latches. A FILE_SYNC journal write for a Rename
@@ -839,10 +905,13 @@ impl NfsUserspaceStorage {
             && self.stable_write_failure.is_none()
         {
             self.stable_write_failure = Some(error.clone());
-            self.unsettled.push(format!(
-                "{operation}: latched write failure: {}",
-                error.context
-            ));
+            self.unsettled.push(UnsettledCall {
+                key: Some(request.context.idempotency_key.clone()),
+                // A write that did not complete is a latched, terminal state of
+                // its own (R2-003). It is never discharged by a later attempt.
+                phase: DispatchPhase::UnresolvedRecovery,
+                detail: format!("{operation}: latched write failure: {}", error.context),
+            });
         }
     }
 
@@ -851,11 +920,57 @@ impl NfsUserspaceStorage {
     /// **R1-002.** Only failures that leave the request possibly *received* count.
     /// A refusal before dispatch (`QueueFull`), a malformed reply, or a deadline
     /// whose retirement was proven drained leave nothing outstanding.
-    fn observe_disposition(&mut self, operation: &str, error: &UmbraError) {
+    fn observe_disposition(
+        &mut self,
+        operation: &str,
+        key: Option<&IdempotencyKey>,
+        phase: DispatchPhase,
+        error: &UmbraError,
+    ) {
         let Some(detail) = unsettled_detail(operation, error) else {
             return;
         };
-        self.unsettled.push(detail);
+        self.unsettled.push(UnsettledCall {
+            key: key.cloned(),
+            phase,
+            detail,
+        });
+    }
+
+    /// Retire the obligation a proven-absent record discharges (**I4-001**).
+    ///
+    /// Called only from the fresh-key branch, where `journal::lookup` has just
+    /// answered `Fresh` for this key over a healthy round trip. That answer
+    /// proves the key holds no durable intent, which resolves an obligation
+    /// raised *before* any intent write was attempted: nothing that mutates was
+    /// submitted under it, so there is no delayed write for absence to mis-read.
+    ///
+    /// Deliberately narrow. An obligation from the intent write itself, or from a
+    /// dispatch, is not discharged here — a `GUARDED4` record create or the
+    /// mutation itself may still land, and absence alone does not exclude that.
+    /// Obligations under every *other* key stay exactly where they were, so one
+    /// resolved call does not open the gate for the rest.
+    fn discharge_pre_intent(&mut self, key: &IdempotencyKey) {
+        self.unsettled.retain(|call| {
+            call.phase != DispatchPhase::BeforeIntent || call.key.as_ref() != Some(key)
+        });
+    }
+
+    /// Retire every obligation this key's settled record now accounts for
+    /// (**I4-001**).
+    ///
+    /// A record carrying a settled result — read back, reconstructed by recovery,
+    /// or written by the settle that follows a dispatch — *is* the disposition
+    /// the ledger was holding the run open for, so continuing to refuse new work
+    /// over it refuses it for an operation whose outcome is durably known.
+    ///
+    /// [`DispatchPhase::UnresolvedRecovery`] survives: a blocked recovery and a
+    /// latched write failure are terminal states with their own retained
+    /// diagnosis, not obligations a later settle can answer.
+    fn discharge_settled(&mut self, key: &IdempotencyKey) {
+        self.unsettled.retain(|call| {
+            call.phase == DispatchPhase::UnresolvedRecovery || call.key.as_ref() != Some(key)
+        });
     }
 }
 
@@ -1204,7 +1319,7 @@ impl Storage for NfsUserspaceStorage {
             // is terminal. Returning the error and leaving the session installed
             // let the very next mutation build a context and dispatch anyway.
             Err(error) => {
-                self.observe_disposition("renew_writer", &error);
+                self.observe_disposition("renew_writer", None, DispatchPhase::Effect, &error);
                 self.authority_loss = Some(AuthorityLoss::RenewalFailed(error.clone()));
                 Err(error)
             }
@@ -1263,13 +1378,22 @@ impl Storage for NfsUserspaceStorage {
             let found = match self.journal_lookup(operation, request) {
                 Ok(found) => found,
                 Err(error) => {
-                    self.note_failure(operation, request, &error);
+                    // I4-001: the lookup is a LOOKUP and an anonymous read. It
+                    // submits nothing that can change the run, so an obligation
+                    // it raises is one a later proof of absence can discharge.
+                    self.note_failure(operation, request, DispatchPhase::BeforeIntent, &error);
                     return Err(error);
                 }
             };
             match found {
                 // Settled: answered from the record, target untouched.
-                crate::journal::Lookup::Recorded(result) => return result,
+                crate::journal::Lookup::Recorded(result) => {
+                    // I4-001: the record settles this key's disposition, so any
+                    // obligation still standing under it is discharged rather
+                    // than left to refuse the run's next unrelated mutation.
+                    self.discharge_settled(&request.context.idempotency_key);
+                    return result;
+                }
                 crate::journal::Lookup::Fresh => {
                     // R4-001: a call whose server-side disposition this provider
                     // could not establish leaves the run in the failure model's
@@ -1284,8 +1408,17 @@ impl Storage for NfsUserspaceStorage {
                     // halves of that sentence pull in opposite directions.
                     // *Resolving* an outstanding operation means retrying its own
                     // key, and a gate that refused every mutation would make the
-                    // recovery it demands unreachable. A key with no record is new
-                    // work; a key with one is the resolution.
+                    // recovery it demands unreachable.
+                    //
+                    // I4-001: "a key with no record is new work" was the half that
+                    // did not hold. When the lost reply lands before the intent is
+                    // durable, the interrupted key has no record either, so the
+                    // only request that could resolve it was refused as new work
+                    // and the run could neither mutate nor release. The lookup
+                    // that just answered `Fresh` is the proof that discharges such
+                    // an obligation — for this key, and only for the phase where
+                    // absence really does exclude a delayed write.
+                    self.discharge_pre_intent(&request.context.idempotency_key);
                     if let Some(first) = self.unsettled.first() {
                         let refusal = UmbraError::new(
                             ErrorKind::InvalidState,
@@ -1293,8 +1426,9 @@ impl Storage for NfsUserspaceStorage {
                             format!(
                                 "this run has {} call(s) whose server-side disposition is \
                                  unknown and admits no new mutation until they are resolved; \
-                                 the first was: {first}",
-                                self.unsettled.len()
+                                 the first was: {}",
+                                self.unsettled.len(),
+                                first.detail
                             ),
                         );
                         return Err(refusal);
@@ -1305,14 +1439,22 @@ impl Storage for NfsUserspaceStorage {
                     let observed = match self.observe_now(operation, request) {
                         Ok(observed) => observed,
                         Err(error) => {
-                            self.note_failure(operation, request, &error);
+                            // Still read-only, still before any durable intent.
+                            self.note_failure(
+                                operation,
+                                request,
+                                DispatchPhase::BeforeIntent,
+                                &error,
+                            );
                             return Err(error);
                         }
                     };
                     if let Err(error) =
                         self.journal_admit_fresh(operation, request, &observed.evidence)
                     {
-                        self.note_failure(operation, request, &error);
+                        // I4-001: from here a `GUARDED4` record create is in
+                        // flight, so a later absence does not exclude it landing.
+                        self.note_failure(operation, request, DispatchPhase::IntentWrite, &error);
                         return Err(error);
                     }
                 }
@@ -1327,23 +1469,29 @@ impl Storage for NfsUserspaceStorage {
                     // or `ACCESS` leaves exactly the same unresolved record as a
                     // contradictory one.
                     recovering = true;
+                    let key = request.context.idempotency_key.clone();
                     let observed = match self.observe_now(operation, request) {
                         Ok(observed) => observed,
                         Err(error) => {
-                            self.block_recovery(operation, &error);
-                            self.note_failure(operation, request, &error);
+                            self.block_recovery(operation, &key, &error);
+                            self.note_failure(operation, request, DispatchPhase::Effect, &error);
                             return Err(error);
                         }
                     };
                     let settled = self.journal_recover(operation, request, &recorded, &observed);
                     match settled {
-                        Ok(crate::journal::Admission::Recorded(result)) => return result,
+                        Ok(crate::journal::Admission::Recorded(result)) => {
+                            // I4-001: recovery reconstructed this key's outcome
+                            // from evidence, which settles its disposition.
+                            self.discharge_settled(&key);
+                            return result;
+                        }
                         // The recorded evidence proves the interrupted attempt
                         // never landed, so dispatch proceeds under the same key.
                         Ok(_) => {}
                         Err(error) => {
-                            self.block_recovery(operation, &error);
-                            self.note_failure(operation, request, &error);
+                            self.block_recovery(operation, &key, &error);
+                            self.note_failure(operation, request, DispatchPhase::Effect, &error);
                             return Err(error);
                         }
                     }
@@ -1371,9 +1519,9 @@ impl Storage for NfsUserspaceStorage {
             // is a safe give-up with the original status retained, not an
             // ordinary settled failure a later retry would treat as final.
             if recovering && error.kind == ErrorKind::AlreadyExists {
-                self.block_recovery(operation, error);
+                self.block_recovery(operation, &request.context.idempotency_key, error);
             }
-            self.note_failure(operation, request, error);
+            self.note_failure(operation, request, DispatchPhase::Effect, error);
         }
         if journalled {
             // The outcome is recorded as it happened, a *settled* failure
@@ -1397,9 +1545,15 @@ impl Storage for NfsUserspaceStorage {
                 // record says the attempt is still in flight would leave a retry
                 // unable to tell.
                 if let Err(error) = self.journal_settle(operation, request, &outcome) {
-                    self.note_failure(operation, request, &error);
+                    self.note_failure(operation, request, DispatchPhase::Effect, &error);
                     return Err(error);
                 }
+                // I4-001: the record now carries this operation's settled result,
+                // which is the proof the ledger was holding the run open for. Only
+                // this key's obligations are retired; a blocked recovery, a
+                // latched write failure and every other key stay exactly as they
+                // were.
+                self.discharge_settled(&request.context.idempotency_key);
             }
         }
         outcome

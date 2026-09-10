@@ -444,6 +444,10 @@ impl FakeTransport {
             }
             Nfs4Op::Open(args) => {
                 let parent = current.ok_or_else(|| fail(Nfs4Status::NOFILEHANDLE))?;
+                // R5-P2: the directory's real change attribute, read before and
+                // after, so `cinfo` reports the transition this OPEN caused
+                // rather than a canned pair no GETATTR could corroborate.
+                let change_before = self.objects[parent].change;
                 let target = match &args.claim {
                     OpenClaim::Previous { .. } => {
                         if !self.in_grace {
@@ -457,6 +461,7 @@ impl FakeTransport {
                         })?
                     }
                 };
+                let change_after = self.objects[parent].change;
                 let owner_key = args.owner.as_bytes().to_vec();
                 let confirm_required = !self.confirmed_owners.contains(&owner_key);
                 let stateid = self.next_stateid();
@@ -466,8 +471,8 @@ impl FakeTransport {
                     stateid,
                     confirm_required,
                     change_atomic: true,
-                    change_before: 0,
-                    change_after: 1,
+                    change_before,
+                    change_after,
                     // No callback channel is offered, so no delegation is granted.
                     delegation: DelegationType::None,
                 }))
@@ -762,6 +767,12 @@ impl FakeTransport {
                 };
                 let index = self.allocate(Nfs4Type::Regular, Vec::new(), mode, verifier);
                 self.objects[parent].children.insert(name.to_vec(), index);
+                // R5-P2: a create through OPEN changes the directory it creates
+                // into, and RFC 7530 sec 5.8.1.4 requires FATTR4_CHANGE to differ
+                // whenever the object changes. CREATE already bumped its parent;
+                // OPEN silently did not, so an interrupted create's recovery
+                // compared parent evidence a conforming server never produces.
+                self.bump(parent);
                 Ok(index)
             }
         }

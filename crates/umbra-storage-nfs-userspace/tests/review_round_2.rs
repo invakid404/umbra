@@ -2648,6 +2648,21 @@ fn r4_002_an_interrupted_create_completes_its_mode_instead_of_reporting_success(
     .expect("provider");
     open_existing(&mut storage, run_id).expect("the run opens");
 
+    // R5-P2: pin the parent transition this recovery has to decide against. A
+    // conforming server changes the directory's FATTR4_CHANGE when the create
+    // lands, so the replay below is not being handed a directory that stood
+    // still; it faces the very change its own OPEN caused.
+    let parent_change = |server: &SharedFake| {
+        server.with(|fake| {
+            let root = walk(fake, run_id, &[b"root"]);
+            fake.getattr(&root, AttrMask::STAT, deadline())
+                .expect("the run root resolves")
+                .change
+                .expect("a directory reports FATTR4_CHANGE")
+        })
+    };
+    let parent_before = parent_change(&server);
+
     let interrupted = storage
         .execute(&request)
         .expect_err("the create is interrupted, not completed");
@@ -2655,6 +2670,11 @@ fn r4_002_an_interrupted_create_completes_its_mode_instead_of_reporting_success(
         interrupted.kind,
         ErrorKind::StorageUnavailable,
         "the disposition must be *unknown*, or the record settles as a failure: {interrupted:?}"
+    );
+    assert_ne!(
+        parent_change(&server),
+        parent_before,
+        "the interrupted create landed a name, so the parent's change must have moved"
     );
 
     // The object exists with the create default mode, not the requested one.
@@ -2920,8 +2940,9 @@ fn r4_003_an_unchanged_rename_still_redispatches() {
         .expect("an unchanged before-state authorises the replay");
 }
 
-/// **Integrator finding I4-001.** `#[ignore]`d because it currently FAILS, and
-/// the failure is the finding rather than a broken test. Round 5 owns the call.
+/// **Integrator finding I4-001**, adjudicated P1 by the round-5 review as
+/// `R5-001` and fixed here. Formerly `#[ignore]`d because it FAILED, and the
+/// failure was the finding rather than a broken test.
 ///
 /// Added at `collect_fix` round 4, not by the fixer. Their report records that
 /// their first R4-001 implementation put the gate in `preflight`, refusing every
@@ -2929,23 +2950,23 @@ fn r4_003_an_unchanged_rename_still_redispatches() {
 /// operations" unsatisfiable; they moved it to the fresh-key branch so that "a
 /// key with no record is new work; a key with one is the resolution".
 ///
-/// That correction only reaches the resolution branch when a record exists. When
+/// That correction only reached the resolution branch when a record existed. When
 /// the lost reply lands on an RPC *before* the intent record is durably written —
-/// the observation or the intent write itself, both real round trips — the ledger
-/// is armed with an unknown disposition and `.provider/retries` stays empty. Every
-/// later key, including the outstanding one, then looks `Fresh` and is refused,
-/// so the operation the error says must be "resolved" has no path to resolution.
-/// The release is refused too and the marker stays `Held`, so no future session
-/// can acquire the run either.
+/// the journal lookup or the observation, both real round trips — the ledger was
+/// armed with an unknown disposition and `.provider/retries` stayed empty. Every
+/// later key, including the outstanding one, then looked `Fresh` and was refused,
+/// so the operation the error said must be "resolved" had no path to resolution.
+/// The release was refused too and the marker stayed `Held`, so no future session
+/// could acquire the run either.
 ///
-/// This is a **safe stop, not a correctness hole**: nothing is lost and no false
-/// success is reported. Two readings are open and this node does not choose
-/// between them — it is either the failure model's BLOCKED_RECOVERABLE state
-/// working as intended, in which case the diagnostic promising resolution is
-/// misleading, or the unreachable-resolution defect the fixer set out to avoid.
+/// It was a safe stop rather than a correctness hole — nothing was lost and no
+/// false success was reported — but a safety-preserving deadlock is still a
+/// failure of the bounded recovery the failure model requires, so the second
+/// reading was the right one. The ledger now carries each obligation's identity
+/// and dispatch phase, and the same key's retry discharges the pre-intent one it
+/// proves absent; `i4_001_a_pre_intent_interruption_resolves_under_its_own_key`
+/// pins the mechanism, and this control pins the caller-visible outcome.
 #[test]
-#[ignore = "integrator finding I4-001: no resolution path exists in the no-record \
-            window; see /tmp/nfs-scope/m1/integration-4.md. Run with --ignored."]
 fn r4_001_the_unknown_disposition_gate_still_admits_the_resolving_retry() {
     let mut storage = provider();
     let run_id = fresh_run();
@@ -2990,28 +3011,328 @@ fn r4_001_the_unknown_disposition_gate_still_admits_the_resolving_retry() {
         .expect_err("the gate is armed");
     assert_eq!(refused.kind, ErrorKind::InvalidState);
 
-    // The same key is the resolution, and must be admitted. Whatever it settles
-    // to — the recorded effect, a completed replay, or a typed safe give-up —
-    // it must not be the fresh-work refusal, because that answer would leave the
-    // outstanding operation permanently unresolvable.
-    let resolved = storage.execute(&create_file(
-        authorised(&storage, run_id, "resolving-key"),
-        b"resolving.txt",
-    ));
-    match &resolved {
-        Ok(_) => {}
-        Err(error) => {
-            assert_ne!(
-                error.kind,
-                ErrorKind::InvalidState,
-                "the resolving retry was refused as new work: {}",
-                error.context
-            );
-            assert!(
-                !error.context.contains("disposition is unknown"),
-                "the resolving retry hit the fresh-work gate: {}",
-                error.context
-            );
-        }
-    }
+    // The same key is the resolution, and must be admitted. The expected outcome
+    // is exact rather than "any error but that one": the interrupted attempt is
+    // proven to have dispatched nothing, so its retry is its own create,
+    // completed. Asserting only that the kind is not `InvalidState` would also
+    // accept a legitimate blocked stop, which is a different answer entirely.
+    let resolved = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "resolving-key"),
+            b"resolving.txt",
+        ))
+        .expect("the resolving retry is admitted, not refused as new work");
+    let umbra_core::StorageResponse::Created(created) = resolved else {
+        panic!("a create answers with an object result");
+    };
+    assert_eq!(created.stat.mode & 0o7777, 0o644);
+
+    // The obligation is gone with it: the run mutates and releases again.
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "unrelated-key"),
+            b"unrelated.txt",
+        ))
+        .expect("the run resumes once its only obligation is discharged");
+    let lease = storage.admission().expect("admitted").lease();
+    storage
+        .release_writer(&lease)
+        .expect("and the cooperative release reports no unknown I/O");
+}
+
+// --- I4-001 / R5-P2: the round-5 blockers ------------------------------------
+
+/// **I4-001** (the round-5 reviewer's `R5-001`, P1), *resolution half*.
+///
+/// R4-001 armed the fresh-key gate so a run holding a call of unknown
+/// server-side disposition admits no new work. Its refusal half was tested; its
+/// resolution half was not, and it did not work. When the lost reply lands on a
+/// round trip *before* the durable intent record exists, `.provider/retries`
+/// stays empty, so the interrupted key itself looks `Fresh` — and the gate,
+/// which consulted nothing but "is the ledger non-empty", refused the only
+/// request that could have resolved it. The run could then neither mutate nor
+/// release, and no future session could acquire the run either.
+///
+/// The identity the fix turns on is the **idempotency key**, not the operation
+/// id: `.provider/retries/key-<hex>` is keyed on it, and a caller that mints a
+/// fresh `OperationId` for its retry — which the contract permits, and which
+/// `authorised` does here on purpose — still presents the same key. Paired with
+/// the dispatch *phase* recorded beside it, a pre-intent obligation whose key is
+/// then proven to hold no record is discharged: nothing that mutates was ever
+/// submitted for it, so there is no delayed write for absence to mis-read.
+#[test]
+fn i4_001_a_pre_intent_interruption_resolves_under_its_own_key() {
+    let (mut storage, wire) = recording_provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    let baseline = wire.lock().expect("not poisoned").modifying;
+
+    // One dropped reply leaves a call whose server-side disposition this
+    // provider cannot establish.
+    storage
+        .transport()
+        .expect("transport")
+        .install_faults(ScriptedFault::once(
+            FaultPoint::OnDeadline,
+            None,
+            FaultAction::DropReply,
+        ));
+    let lost = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "pre-intent-key"),
+            b"pre-intent.txt",
+        ))
+        .expect_err("the injected loss surfaces");
+    assert_eq!(lost.kind, ErrorKind::StorageUnavailable);
+
+    // This is the no-record window: the loss landed before any durable intent,
+    // so the retries directory is empty and nothing modifying reached the wire.
+    assert!(
+        retry_records(storage.transport().expect("transport"), run_id).is_empty(),
+        "with a record present the resolution branch is reached and this test \
+         would be characterising a different window"
+    );
+    assert_eq!(
+        wire.lock().expect("not poisoned").modifying,
+        baseline,
+        "the interrupted attempt dispatched nothing that modifies the server"
+    );
+
+    // The gate is armed: an unrelated key is new work, and stays refused.
+    let refused = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "unrelated-key"),
+            b"unrelated.txt",
+        ))
+        .expect_err("a run with an unresolved obligation admits no new mutation");
+    assert_eq!(refused.kind, ErrorKind::InvalidState);
+    assert!(
+        refused.context.contains("disposition is unknown"),
+        "the unrelated key must hit the fresh-work gate, not some other refusal: {}",
+        refused.context
+    );
+
+    // The resolution: the same idempotency key, under a fresh operation id.
+    let resolved = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "pre-intent-key"),
+            b"pre-intent.txt",
+        ))
+        .expect("the interrupted key's own retry resolves its obligation");
+    let umbra_core::StorageResponse::Created(created) = resolved else {
+        panic!("a create answers with an object result");
+    };
+    assert_eq!(created.stat.mode & 0o7777, 0o644);
+
+    // Only the matching obligation was discharged, and the run resumes.
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "unrelated-key"),
+            b"unrelated.txt",
+        ))
+        .expect("with the ledger discharged, unrelated work is admitted normally");
+
+    // And the cooperative release is clean, because no uncertain I/O remains.
+    let lease = storage.admission().expect("admitted").lease();
+    storage
+        .release_writer(&lease)
+        .expect("a release over a fully discharged ledger reports no unknown I/O");
+}
+
+/// **I4-001** (the round-5 reviewer's `R5-001`, P1), *discharge half*.
+///
+/// The same accounting gap survived when a record *did* exist. An interrupted
+/// create that is replayed to completion returned its result and left its ledger
+/// entry standing forever: the fresh-key gate went on refusing unrelated work,
+/// and the cooperative release went on reporting unknown I/O, for an operation
+/// whose disposition had just been settled durably. The only `clear` calls were
+/// run-lifecycle resets, and neither is reachable on a held run.
+///
+/// A successful settle is a *proof* of disposition, so it retires that key's
+/// obligation — and only that key's.
+#[test]
+fn i4_001_b_a_settled_replay_discharges_its_own_obligation() {
+    let run_id = fresh_run();
+    let request = StorageRequest {
+        context: RequestContext {
+            run_id,
+            operation_id: OperationId(Uuid::new_v4()),
+            idempotency_key: IdempotencyKey("replayed-key".into()),
+            writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+        },
+        operation: StorageOperation::Create {
+            path: path(b"replayed.txt"),
+            options: CreateOptions {
+                kind: CreateKind::File,
+                mode: 0o755,
+            },
+        },
+    };
+
+    let server = SharedFake::new(seed_released_run(run_id, Some(0)));
+    let mut storage = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(LoseFirstSetAttr {
+            inner: server.clone(),
+            fired: false,
+        }),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("provider");
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let interrupted = storage
+        .execute(&request)
+        .expect_err("the create is interrupted between its OPEN and its SETATTR");
+    assert_eq!(interrupted.kind, ErrorKind::StorageUnavailable);
+
+    // The intent is durable, so this is the recorded-replay window.
+    let held = retry_records(storage.transport().expect("transport"), run_id);
+    assert!(
+        held.iter().any(|entry| entry.starts_with("key-")),
+        "the interrupted intent must be on the server: {held:?}"
+    );
+
+    // While the obligation stands, unrelated work is refused.
+    let refused = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "before-replay"),
+            b"before.txt",
+        ))
+        .expect_err("a run with an unresolved dispatch admits no new mutation");
+    assert_eq!(refused.kind, ErrorKind::InvalidState);
+    assert!(
+        refused.context.contains("disposition is unknown"),
+        "the refusal must be the fresh-work gate: {}",
+        refused.context
+    );
+
+    // The replay settles the operation.
+    let recovered = storage
+        .execute(&request)
+        .expect("the replay recognises its own create and completes it");
+    let umbra_core::StorageResponse::Created(result) = recovered else {
+        panic!("a create answers with an object result");
+    };
+    assert_eq!(
+        result.stat.mode & 0o7777,
+        0o755,
+        "the replay completes the mode, which is what makes the settle a proof"
+    );
+
+    // Settled means discharged: unrelated work is admitted normally again.
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "after-replay"),
+            b"after.txt",
+        ))
+        .expect("with the obligation discharged, unrelated work resumes");
+
+    // And the cooperative release no longer reports unknown I/O.
+    let lease = storage.admission().expect("admitted").lease();
+    storage
+        .release_writer(&lease)
+        .expect("a release after every obligation is settled is clean");
+}
+
+/// **R5-P2** (the round-5 reviewer's `R5-002`, P2). A create through OPEN must
+/// advance the parent directory's `FATTR4_CHANGE`.
+///
+/// The fake inserted the new name into the parent's children without touching
+/// the parent's change attribute, and answered OPEN with a canned
+/// `change_before: 0, change_after: 1` that no GETATTR could corroborate.
+/// [RFC 7530 §5.8.1.4](https://www.rfc-editor.org/rfc/rfc7530.html#section-5.8.1.4)
+/// requires the change attribute to differ whenever the object changes, and a
+/// successful create changes the directory it creates into — which is exactly
+/// the evidence the interrupted-create recovery in `journal::recover` decides on.
+/// A conforming server bumps it; the fake did not, so the recovery evidence the
+/// R4-002 acceptance rested on was one a real server would not produce.
+///
+/// Driven through `RawTransport`, so the assertions are about the protocol and
+/// hold for any conforming implementation of it, not about the fake's internals.
+#[test]
+fn r5_p2_a_create_through_open_advances_the_parent_change() {
+    let mut transport = fake_server();
+    let root = transport.root();
+    let parent = transport.insert_directory(&root, b"opendir");
+
+    let before = transport
+        .getattr(&parent, AttrMask::STAT, deadline())
+        .expect("the parent's attributes")
+        .change
+        .expect("a directory reports FATTR4_CHANGE");
+
+    let owner = umbra_storage_nfs_userspace::handle::Session::establish(
+        umbra_storage_nfs_userspace::handle::SessionId(1),
+        umbra_storage_nfs_userspace::handle::ClientId(1),
+        ConnectionEpoch(1),
+    )
+    .open_owner(b"r5-p2".to_vec())
+    .expect("a fresh session mints owners");
+    let args = umbra_storage_nfs_userspace::transport::OpenArgs {
+        seqid: 0,
+        share_access: umbra_storage_nfs_userspace::transport::ShareAccess::BOTH,
+        share_deny: umbra_storage_nfs_userspace::transport::ShareDeny::NONE,
+        owner,
+        how: umbra_storage_nfs_userspace::transport::OpenHow::Guarded { mode: 0o600 },
+        claim: umbra_storage_nfs_userspace::transport::OpenClaim::Null {
+            name: name(b"created.txt"),
+        },
+    };
+    let (reply, _handle) = transport
+        .open(&parent, args, deadline())
+        .expect("the create-through-OPEN succeeds");
+
+    let after = transport
+        .getattr(&parent, AttrMask::STAT, deadline())
+        .expect("the parent's attributes")
+        .change
+        .expect("a directory reports FATTR4_CHANGE");
+
+    assert_ne!(
+        after, before,
+        "a successful create must change the directory it created into"
+    );
+    // The OPEN's own change info must be the same transition GETATTR reports,
+    // not a canned pair: the recovery evidence compares GETATTR values, and a
+    // reply that disagrees with them is not usable as proof of anything.
+    assert_eq!(
+        (reply.change_before, reply.change_after),
+        (before, after),
+        "OPEN's cinfo must report the directory transition it actually caused"
+    );
+
+    // The converse holds too, or "the parent changed" would carry no
+    // information: an OPEN that creates nothing leaves the directory alone.
+    let owner = umbra_storage_nfs_userspace::handle::Session::establish(
+        umbra_storage_nfs_userspace::handle::SessionId(2),
+        umbra_storage_nfs_userspace::handle::ClientId(2),
+        ConnectionEpoch(1),
+    )
+    .open_owner(b"r5-p2-nocreate".to_vec())
+    .expect("a fresh session mints owners");
+    transport
+        .open(
+            &parent,
+            umbra_storage_nfs_userspace::transport::OpenArgs {
+                seqid: 0,
+                share_access: umbra_storage_nfs_userspace::transport::ShareAccess::READ,
+                share_deny: umbra_storage_nfs_userspace::transport::ShareDeny::NONE,
+                owner,
+                how: umbra_storage_nfs_userspace::transport::OpenHow::NoCreate,
+                claim: umbra_storage_nfs_userspace::transport::OpenClaim::Null {
+                    name: name(b"created.txt"),
+                },
+            },
+            deadline(),
+        )
+        .expect("opening the existing name succeeds");
+    assert_eq!(
+        transport
+            .getattr(&parent, AttrMask::STAT, deadline())
+            .expect("the parent's attributes")
+            .change,
+        Some(after),
+        "an OPEN that creates nothing must not move the parent's change attribute"
+    );
 }

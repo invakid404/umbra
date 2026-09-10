@@ -518,10 +518,29 @@ fn recover(
         // decision to the server, which is the only party that can make it.
         StorageOperation::Create { .. } => match (recorded.target, observed.target) {
             // R4-003: concluding "redispatch" means asserting the namespace is
-            // still the one this create was addressed against. A parent whose
-            // change attribute moved is a directory something happened in, and
-            // this decision cannot attribute that to the interrupted operation.
-            (None, None) | (None, Some(_))
+            // still the one this create was addressed against. Where the name is
+            // *still absent*, a parent whose change attribute moved is a
+            // directory something else happened in, and this decision cannot
+            // attribute that to the interrupted operation.
+            //
+            // **R5-P2.** The gate stops there. Where the name is now *present*,
+            // the parent's change attribute has necessarily moved if the
+            // interrupted create is what put it there: RFC 7530 sec 5.8.1.4
+            // requires a conforming server to report a different `FATTR4_CHANGE`
+            // once the directory has changed, and creating a name changes the
+            // directory. Demanding an unchanged parent there is demanding
+            // evidence that a *successful* create rules out, so the arm was
+            // reachable only against a test backend that forgot to bump the
+            // parent on OPEN — which is the defect this finding names.
+            //
+            // Dropping it guesses nothing. `NotApplied` means "redispatch", and
+            // the redispatch presents the same `EXCLUSIVE4` verifier the first
+            // attempt used: the server answers success only if the object behind
+            // that name is the one this operation created, and `NFS4ERR_EXIST`
+            // otherwise, which `storage::execute` latches as a safe give-up. The
+            // verifier is the discriminator, and it is conclusive; the parent's
+            // change attribute never was.
+            (None, None)
                 if parent_unchanged("the parent directory", recorded.parent, observed.parent)
                     .is_err() =>
             {

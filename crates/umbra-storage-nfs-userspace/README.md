@@ -538,6 +538,17 @@ OPEN_CONFIRM, exclusive-create verifier reuse, short writes, write/commit
 verifiers, grace and reclaim, and cookie invalidation. Everything else answers
 `NFS4ERR_NOTSUPP` rather than pretending.
 
+Its directory change attribute is faithful in both directions, which matters
+because the interrupted-create recovery decides on that attribute. A create —
+through `CREATE` or through a creating `OPEN` — advances the parent's
+`FATTR4_CHANGE`, as [RFC 7530 §5.8.1.4][rfc-change] requires of a server whose
+directory has changed, and the operation's `cinfo` reports that same transition
+rather than a canned pair. An `OPEN` that creates nothing leaves it alone.
+A fake that suppressed the create-through-`OPEN` bump would let a recovery accept
+evidence no conforming server can produce.
+
+[rfc-change]: https://www.rfc-editor.org/rfc/rfc7530.html#section-5.8.1.4
+
 `tests/fake_fault_matrix.rs` drives ten state transitions against all five
 `FaultPoint` values and all five `FaultAction` values, and asserts each
 transition's invariant rather than one expected outcome — a fault may
@@ -656,7 +667,14 @@ sidecar so `key-<hex>` stays byte-identical to what the mounted adapter writes.
 Recovery compares that before-state against the server now: proven-not-applied
 re-dispatches under the same key, proven-applied settles the record from the
 observed state without repeating the effect, and evidence matching neither is a
-blocked-recoverable stop with the record and the server state both retained. A
+blocked-recoverable stop with the record and the server state both retained.
+A create is never settled from observation at all — the `EXCLUSIVE4` verifier is
+the only thing that can say whose object is behind the name, so the decision goes
+back to the server. Which is why the parent directory's change attribute does not
+gate a create whose name is now present: a successful create moves that attribute
+itself, so requiring it to stand still would require evidence success rules out.
+Where the name is still absent, a moved parent is somebody else's work and the
+run stops rather than guessing. A
 record with no sidecar is a legacy one, and an ambiguous legacy intent stops for
 the same reason. Nothing answers "requires reconciliation": the failure model
 forbids that standing in for recovery in a window this provider supports.
@@ -672,18 +690,27 @@ reopening the run, which is the operator intervention the state is for.
 Separately, a call whose server-side disposition could not be established stops
 the run admitting *new* work. The failure model asks for both halves — "stop new
 mutations and quiesce; resolve bounded outstanding operations" — and resolving an
-outstanding operation means retrying its own key, so a key with no record is
-refused while a key with one is the recovery.
+outstanding operation means retrying its own key, so a request under an unrelated
+key is refused while the outstanding key's own retry is the recovery.
 
-**That leaves the resolution reachable only once a record exists.** The intent is
-written after the preconditions are observed, and both are real round trips, so a
-reply lost before the record lands arms the ledger while `.provider/retries` stays
-empty. Every later key then looks fresh, including the outstanding one, and the
-run refuses every mutation and every release: the marker stays held and only
-reopening the run clears it. Nothing is lost and no false success is reported —
-this is a stop, not a correctness hole — but the diagnostic asks for a resolution
-that this window has no path to, and a reader should not take "resolution
-reachable" as unconditional.
+**The ledger is an obligation per call, not a list of error strings.** Each entry
+carries the mutation's *idempotency key* — the identity `.provider/retries` is
+keyed on, and the one a caller keeps when it mints a fresh operation id for a
+retry — and the dispatch phase the call was interrupted in. That is what makes
+the second half reachable. A reply lost on the journal lookup or the precondition
+observation is lost on a strictly read-only round trip, before any intent exists;
+when that key's next attempt reads the journal cleanly and finds no record, the
+absence proves the obligation discharged, because nothing that mutates was ever
+submitted under it. The gate then admits the retry as its own operation.
+
+The discharge is deliberately narrow. A reply lost on the intent write itself, or
+on the mutation, leaves a create or an effect that may still land, so absence
+alone proves nothing about it: only that key's own settled record discharges it —
+recovery reconstructing the outcome, or a redispatch that settles. Obligations
+under other keys are untouched by either, and a blocked recovery and a latched
+write failure are terminal states rather than obligations, so neither is ever
+discharged. A run whose obligations are all discharged mutates and releases
+normally again; one still holding any of them does neither.
 
 Records are read in bounded chunks to end of file and written in as many round
 trips as the server needs, because a short `READ` or `WRITE` is a legal answer
