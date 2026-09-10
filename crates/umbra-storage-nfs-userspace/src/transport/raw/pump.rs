@@ -23,7 +23,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::error::TransportError;
-use crate::pdu::{ownership, DisposalGeneration, Ownership};
+use crate::pdu::{ownership, DisposalGeneration, Ownership, ServiceFailure};
 use crate::transport::{ConnectionEpoch, ConnectionState, TransportResult};
 
 use super::decode::{self, ReplyBudget};
@@ -510,11 +510,9 @@ impl EventPump {
             // SAFETY: `self.rpc` is live for the lifetime of this value.
             let fd = unsafe { sys::rpc_get_fd(self.rpc) };
             if fd < 0 {
-                // R1-009: a context with no descriptor has already torn its
-                // queue down. Reconcile before reporting, so a completion that
-                // was delivered on the way out is not left behind for a
-                // cancellation to trip over.
-                return self.disconnected(id, discard);
+                // R2-005: a missing descriptor is observed *here*, not reported by
+                // libnfs. Nothing in C has been called, so nothing has been freed.
+                return self.stopped(ServiceFailure::Local, id, discard);
             }
             // SAFETY: as above.
             let events = unsafe { sys::rpc_which_events(self.rpc) };
@@ -532,7 +530,10 @@ impl EventPump {
                 if errno.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                return self.disconnected(id, discard);
+                // R2-005: `poll` failing is this process's problem. libnfs was not
+                // called, so every PDU is still C-owned and every argument arena
+                // is still referenced by one.
+                return self.stopped(ServiceFailure::Local, id, discard);
             }
             if ready == 0 {
                 continue;
@@ -542,40 +543,69 @@ impl EventPump {
             // Completion callbacks run inside this call.
             if unsafe { sys::rpc_service(self.rpc, c_int::from(descriptor.revents)) } < 0 {
                 self.state = ConnectionState::Broken(self.epoch);
-                return self.disconnected(id, discard);
+                // libnfs reported this one, so `rpc_reconnect_requeue` has already
+                // errored and freed every outstanding PDU.
+                return self.stopped(ServiceFailure::LibnfsReported, id, discard);
             }
         }
     }
 
-    /// Settle a connection failure: reconcile this call's completion, then record
-    /// that libnfs disposed of every outstanding PDU.
+    /// Settle a bounded service run that stopped without a reply for `id`.
     ///
-    /// **R1-009.** Both halves matter and the order matters. `rpc_service`
-    /// returning a negative value means `rpc_reconnect_requeue` has already run:
-    /// with `auto_reconnect` off it invoked *every* outstanding call's completion
-    /// and then freed each PDU (`lib/init.c`). So a completion for this call may
-    /// well be sitting in the registry — reporting `Disconnected` without looking
-    /// discards a settled answer — and every PDU pointer the wrapper holds is
-    /// now dangling, which is what [`Self::note_disposal`] records.
+    /// **R1-009.** Reconcile first, whatever stopped it: `rpc_reconnect_requeue`
+    /// calls every outstanding completion on its way out, so a connection failure
+    /// can carry a settled answer, and reporting `Disconnected` over it discards
+    /// one. A completion that *is* waiting also means libnfs already freed that
+    /// call's PDU, which [`ownership`] reads without any generation bookkeeping.
     ///
-    /// Previously this returned `Disconnected` immediately, the caller left the
-    /// slot in `Dispatch::Queued`, and retirement handed the freed pointer to
-    /// `rpc_cancel_pdu`, which dereferences it before looking it up.
-    fn disconnected(&mut self, id: u64, discard: bool) -> ServiceOutcome {
-        let outcome = if has_completion(id) {
-            if discard {
-                let _ = take(id);
-                ServiceOutcome::Discarded
-            } else {
-                ServiceOutcome::Completed
+    /// **R2-005.** What happens next depends on who reported the failure, and the
+    /// previous version got this wrong by treating every stop alike. A negative
+    /// `rpc_service` is proven disposal, so the generation advances and every
+    /// outstanding pointer becomes unreachable. A local `poll` error or a missing
+    /// descriptor proves nothing: libnfs was never called, so every PDU is still
+    /// C-owned and still referencing its argument arena. Advancing the generation
+    /// there made `retire` withdraw the registration without cancelling, and
+    /// `cancel` then dropped the slot and its arena while C still held a pointer
+    /// into it — a use-after-free in the opposite direction from R1-009's.
+    ///
+    /// So a local failure is *made* proven instead of assumed: `rpc_disconnect`
+    /// errors and frees every outstanding PDU exactly as the requeue path does,
+    /// and only then is the disposal recorded. The alternative the review allows —
+    /// cancelling while the PDU is live — is what an ordinary deadline already
+    /// does; this path is aborting the connection, so disconnecting is both
+    /// simpler and stronger.
+    fn stopped(&mut self, failure: ServiceFailure, id: u64, discard: bool) -> ServiceOutcome {
+        if let Some(settled) = self.take_settled(id, discard) {
+            // A completion is already in hand. The connection is not touched: for
+            // a local failure it may well still be usable, and for a reported one
+            // the caller learns from the completion itself.
+            if failure.disposed_pdus() {
+                self.note_disposal();
             }
+            return settled;
+        }
+        if failure.disposed_pdus() {
+            self.note_disposal();
         } else {
-            ServiceOutcome::Disconnected
-        };
-        // Recorded whichever way the completion went: the disposal is a property
-        // of the connection, not of this one call.
-        self.note_disposal();
-        outcome
+            // Turn an unproven state into a proven one before anything is
+            // released. `disconnect` frees every outstanding PDU and records the
+            // disposal itself.
+            self.disconnect();
+        }
+        ServiceOutcome::Disconnected
+    }
+
+    /// Take a delivered completion for `id`, if one is waiting.
+    fn take_settled(&mut self, id: u64, discard: bool) -> Option<ServiceOutcome> {
+        if !has_completion(id) {
+            return None;
+        }
+        if discard {
+            let _ = take(id);
+            Some(ServiceOutcome::Discarded)
+        } else {
+            Some(ServiceOutcome::Completed)
+        }
     }
 
     /// Withdraw a call from libnfs and report whether the pump is proven idle.
@@ -722,6 +752,47 @@ mod tests {
         assert!(
             slot_dispatch.take_for_cancel().is_none(),
             "a freed PDU's pointer must be unreachable, not merely unused"
+        );
+    }
+
+    /// **R2-005.** A local failure must not advance the disposal generation on its
+    /// own; it disconnects first, which is what actually frees the PDUs.
+    ///
+    /// Driven against a real `rpc_context` so the branch is exercised at the C
+    /// boundary rather than modelled. No connection is made: `rpc_init_context`
+    /// allocates the context, and `rpc_disconnect` on an unconnected context is
+    /// the same call the poll-error path makes.
+    #[test]
+    fn r2_005_a_local_failure_disconnects_before_recording_disposal() {
+        let mut pump = EventPump::new("127.0.0.1", 12112).expect("a context allocates");
+        let before = pump.disposals;
+
+        // No completion is registered for this id, so this is the "nothing in
+        // hand" branch the poll error takes.
+        let outcome = pump.stopped(ServiceFailure::Local, u64::MAX, false);
+        assert_eq!(outcome, ServiceOutcome::Disconnected);
+        assert!(
+            pump.disposals > before,
+            "the generation advances, but only because `disconnect` made disposal true"
+        );
+        assert!(
+            matches!(pump.state(), ConnectionState::Broken(_)),
+            "a local failure that disconnected must not leave the connection usable"
+        );
+    }
+
+    /// **R2-005.** A libnfs-reported failure records disposal without an extra
+    /// disconnect: `rpc_reconnect_requeue` already freed everything.
+    #[test]
+    fn r2_005_a_reported_failure_records_disposal_directly() {
+        let mut pump = EventPump::new("127.0.0.1", 12112).expect("a context allocates");
+        let before = pump.disposals;
+        let outcome = pump.stopped(ServiceFailure::LibnfsReported, u64::MAX, false);
+        assert_eq!(outcome, ServiceOutcome::Disconnected);
+        assert_eq!(
+            pump.disposals.get(),
+            before.get() + 1,
+            "exactly one disposal is recorded for one reported failure"
         );
     }
 
