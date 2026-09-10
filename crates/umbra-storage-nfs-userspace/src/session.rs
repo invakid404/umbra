@@ -42,6 +42,27 @@ pub const MARKER_NAME: &[u8] = b"writer.lock";
 /// crate reads a missed renewal as a release.
 pub const RENEW_AFTER_MILLIS: u64 = 30_000;
 
+/// What a session is claiming: which run, as whom, and above which epoch.
+///
+/// Grouped rather than passed as four positional arguments because they travel
+/// together and are individually easy to transpose — `run` and `writer` are both
+/// identities, and an `epoch_floor` silently swapped with anything else would
+/// weaken the ladder R1-005 added rather than fail loudly.
+#[derive(Clone, Debug)]
+pub struct Claim {
+    /// The run being claimed.
+    pub run: RunId,
+    /// The writer claiming it.
+    pub writer: WriterId,
+    /// The token this session records in the marker.
+    pub token: WriterToken,
+    /// The highest epoch the run's durable evidence already reached.
+    ///
+    /// A first marker written here lands above it, and a marker reading below it
+    /// is the regression it is.
+    pub epoch_floor: LeaseEpoch,
+}
+
 /// The admission a provider session holds while a run is open.
 #[derive(Debug)]
 pub struct Session {
@@ -49,7 +70,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Acquire admission for `run` over the run's durable marker.
+    /// Acquire admission for `claim.run` over the run's durable marker.
     ///
     /// Fails, rather than opening read-only or waiting, when another session
     /// holds it. The caller must not publish a run binding on a failure.
@@ -57,10 +78,7 @@ impl Session {
         transport: &mut dyn RawTransport,
         state: &mut ProtocolState,
         anchors: &RunAnchors,
-        run: RunId,
-        writer: WriterId,
-        token: WriterToken,
-        epoch_floor: LeaseEpoch,
+        claim: Claim,
         deadline: Deadline,
     ) -> Result<Self> {
         let private = anchors.private().ok_or_else(|| {
@@ -88,8 +106,8 @@ impl Session {
         // R1-005: the floor is the highest epoch the run's durable evidence says
         // it already reached, so a first marker written here lands above it and a
         // marker reading below it is the regression it is.
-        let mut control = AdmissionControl::with_epoch_floor(run, store, epoch_floor);
-        match control.acquire(&AdmissionRequest::cooperative(writer, token)) {
+        let mut control = AdmissionControl::with_epoch_floor(claim.run, store, claim.epoch_floor);
+        match control.acquire(&AdmissionRequest::cooperative(claim.writer, claim.token)) {
             AdmissionOutcome::Admitted(admitted) => Ok(Self { admitted }),
             AdmissionOutcome::Denied {
                 holder,
