@@ -115,6 +115,20 @@ impl Session {
         }
     }
 
+    /// Whether `lease` is the one this session actually holds.
+    ///
+    /// Separate from [`Self::renew`] because the two failures are different
+    /// facts: a lease this session never issued is a bad *argument*, while a
+    /// marker that no longer records this session is lost *authority*. Only the
+    /// second is terminal, so a caller latching authority loss (**R1-002**) has
+    /// to be able to tell them apart before it renews.
+    pub fn owns_lease(&self, lease: &WriterLease) -> bool {
+        lease.run_id == self.admitted.run()
+            && lease.writer_id == *self.admitted.writer()
+            && lease.epoch == self.admitted.epoch()
+            && lease.renewal_token == self.admitted.token().as_bytes()
+    }
+
     /// Re-prove that the durable marker still records this session.
     ///
     /// Reads the marker and compares it against the held proof. It never writes,
@@ -129,11 +143,7 @@ impl Session {
         lease: &WriterLease,
         deadline: Deadline,
     ) -> Result<WriterLease> {
-        if lease.run_id != self.admitted.run()
-            || lease.writer_id != *self.admitted.writer()
-            || lease.epoch != self.admitted.epoch()
-            || lease.renewal_token != self.admitted.token().as_bytes()
-        {
+        if !self.owns_lease(lease) {
             return Err(UmbraError::new(
                 ErrorKind::LeaseLost,
                 "renew_writer",
@@ -185,19 +195,32 @@ impl Session {
         outstanding: OutstandingIo,
         operation: &str,
         deadline: Deadline,
-    ) -> std::result::Result<LeaseEpoch, Box<(Self, UmbraError)>> {
+    ) -> SessionRelease {
         let mut control = match self.control(transport, state, anchors, operation, deadline) {
             Ok(control) => control,
-            Err(error) => return Err(Box::new((self, error))),
+            // Addressing the marker failed before anything was written, so the
+            // marker is untouched and this session provably still holds it.
+            Err(error) => {
+                return SessionRelease::Retained {
+                    session: self,
+                    error,
+                }
+            }
         };
         match control.release(self.admitted.clone(), outstanding) {
-            ReleaseOutcome::Released { epoch } => Ok(epoch),
-            ReleaseOutcome::Retained { admitted, error } => Err(Box::new((
-                Self {
+            ReleaseOutcome::Released { epoch } => SessionRelease::Released(epoch),
+            ReleaseOutcome::Retained { admitted, error } => SessionRelease::Retained {
+                session: Self {
                     admitted: *admitted,
                 },
-                error.to_umbra(operation),
-            ))),
+                error: error.to_umbra(operation),
+            },
+            // R1-002: the proof is deliberately *not* handed back. A release whose
+            // effect cannot be established may already have let a successor in, so
+            // this session stops rather than resuming authority over it.
+            ReleaseOutcome::Uncertain { error } => {
+                SessionRelease::Uncertain(error.to_umbra(operation))
+            }
         }
     }
 
@@ -233,6 +256,27 @@ impl Session {
             ServerMarkerStore::new(transport, owners, parent, name, deadline),
         ))
     }
+}
+
+/// What [`Session::release`] settled.
+///
+/// Three outcomes and not two, because "the release write failed" and "the
+/// release may or may not have happened" are different facts with different safe
+/// answers. Only [`Self::Retained`] carries a usable session back (**R1-002**).
+#[derive(Debug)]
+pub enum SessionRelease {
+    /// The marker durably records the cooperative release.
+    Released(LeaseEpoch),
+    /// The release provably did not happen; this session still holds admission.
+    Retained {
+        /// The session, still admitted.
+        session: Session,
+        /// Why the release was refused.
+        error: UmbraError,
+    },
+    /// The release could not be proven either way. Admission is consumed and the
+    /// caller must stop; reconciliation is an operator action, not a retry.
+    Uncertain(UmbraError),
 }
 
 /// A denial names the session that actually holds the run.

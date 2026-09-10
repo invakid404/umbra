@@ -322,6 +322,10 @@ pub enum ExclusiveCreate {
 ///    error rather than a truncated marker.
 /// 3. `read` returns the bytes verbatim. Decoding, and refusing to decode, is
 ///    this module's job.
+/// 4. `claim_succession` is atomic *at the server*, exactly as `create_exclusive`
+///    is. Two callers racing the same epoch must produce exactly one
+///    [`ExclusiveCreate::Created`]. This is what serialises the `Released` ->
+///    `Held` transition, which a read-then-overwrite cannot do (R1-001).
 pub trait MarkerStore {
     /// Create the marker, failing without modification if it already exists.
     fn create_exclusive(&mut self, bytes: &[u8]) -> FacadeResult<ExclusiveCreate>;
@@ -331,6 +335,20 @@ pub trait MarkerStore {
 
     /// Replace an existing marker's bytes.
     fn overwrite(&mut self, bytes: &[u8]) -> FacadeResult<()>;
+
+    /// Stake an exclusive, server-atomic claim on succeeding to `epoch`.
+    ///
+    /// Cooperative succession reads a `Released` marker and writes a `Held` one.
+    /// Those are two round trips, so two contenders can both read the release and
+    /// both write themselves in — the defect recorded as **R1-001**. The claim is
+    /// the serialisation point: whoever creates the epoch's claim name wins, and
+    /// every other contender is told [`ExclusiveCreate::Exists`] by the server
+    /// rather than by a local guess.
+    ///
+    /// A claim is never deleted. It is the durable evidence of which contender
+    /// took which epoch, and the release evidence the predecessor wrote stays
+    /// exactly where it was.
+    fn claim_succession(&mut self, epoch: LeaseEpoch) -> FacadeResult<ExclusiveCreate>;
 }
 
 /// Forwarding impl so one store can back two sessions in a test without either
@@ -347,6 +365,10 @@ impl<S: MarkerStore + ?Sized> MarkerStore for &mut S {
     fn overwrite(&mut self, bytes: &[u8]) -> FacadeResult<()> {
         (**self).overwrite(bytes)
     }
+
+    fn claim_succession(&mut self, epoch: LeaseEpoch) -> FacadeResult<ExclusiveCreate> {
+        (**self).claim_succession(epoch)
+    }
 }
 
 /// An in-memory [`MarkerStore`] whose contents survive the session that wrote
@@ -360,6 +382,10 @@ impl<S: MarkerStore + ?Sized> MarkerStore for &mut S {
 pub struct MemoryMarkerStore {
     bytes: Option<Vec<u8>>,
     fail_next: Option<FacadeError>,
+    /// Epochs some contender has already staked a succession claim on. Modelling
+    /// the server's atomic create is the whole point: a shared store is how a
+    /// concurrency test proves exactly one contender succeeds (R1-001).
+    claimed: std::collections::BTreeSet<u64>,
 }
 
 impl MemoryMarkerStore {
@@ -373,6 +399,7 @@ impl MemoryMarkerStore {
         Self {
             bytes: Some(bytes),
             fail_next: None,
+            claimed: std::collections::BTreeSet::new(),
         }
     }
 
@@ -416,6 +443,15 @@ impl MarkerStore for MemoryMarkerStore {
         self.take_fault()?;
         self.bytes = Some(bytes.to_vec());
         Ok(())
+    }
+
+    fn claim_succession(&mut self, epoch: LeaseEpoch) -> FacadeResult<ExclusiveCreate> {
+        self.take_fault()?;
+        if self.claimed.insert(epoch.0) {
+            Ok(ExclusiveCreate::Created)
+        } else {
+            Ok(ExclusiveCreate::Exists)
+        }
     }
 }
 

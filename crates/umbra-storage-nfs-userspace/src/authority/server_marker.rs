@@ -20,6 +20,8 @@
 //! CRUD surface, no capability: three calls over the frozen facade, on one name,
 //! for one purpose. Binding any of this into `Storage` is `m1_integrate`'s seam.
 
+use umbra_core::LeaseEpoch;
+
 use crate::error::{AuthorityError, FacadeError, FacadeResult, Nfs4Status};
 use crate::handle::FileHandle;
 use crate::state::open_owner::{close, CloseOutcome, OpenOutcome, OpenOwnerRegistry, OpenRequest};
@@ -134,6 +136,19 @@ impl<'a> ServerMarkerStore<'a> {
     }
 }
 
+impl ServerMarkerStore<'_> {
+    /// The name a succession claim for `epoch` occupies.
+    ///
+    /// A sibling of the marker inside the same `.provider` directory, so the one
+    /// GUARDED4 that decides succession is issued against a directory this
+    /// session has already proven it can address.
+    fn claim_name(&self, epoch: LeaseEpoch) -> FacadeResult<ComponentName> {
+        let mut bytes = self.name.as_bytes().to_vec();
+        bytes.extend_from_slice(format!(".claim.{}", epoch.0).as_bytes());
+        ComponentName::new(bytes).map_err(FacadeError::Transport)
+    }
+}
+
 impl MarkerStore for ServerMarkerStore<'_> {
     fn create_exclusive(&mut self, bytes: &[u8]) -> FacadeResult<ExclusiveCreate> {
         let payload = bytes.to_vec();
@@ -195,5 +210,39 @@ impl MarkerStore for ServerMarkerStore<'_> {
                 Ok(())
             },
         )
+    }
+
+    /// One `GUARDED4` create of the epoch's claim name.
+    ///
+    /// Identical in mechanism to [`Self::create_exclusive`], and for the same
+    /// reason: `NFS4ERR_EXIST` from the server is a denial the server issued, not
+    /// one this process inferred from a stale read. Cooperative succession is
+    /// only safe because this call, and not the marker overwrite that follows it,
+    /// is what decides the winner (R1-001).
+    fn claim_succession(&mut self, epoch: LeaseEpoch) -> FacadeResult<ExclusiveCreate> {
+        let claim = self.claim_name(epoch)?;
+        // The claim records who staked it, which keeps the durable evidence
+        // readable rather than leaving an opaque zero-length marker behind.
+        let payload = format!("{}\n", epoch.0).into_bytes();
+        let wanted = payload.len();
+        let held = std::mem::replace(&mut self.name, claim);
+        let outcome = self.with_open(
+            OpenHow::Guarded { mode: MARKER_MODE },
+            ShareAccess::WRITE,
+            move |transport, handle, stateid, deadline| {
+                let reply =
+                    transport.write(handle, stateid, 0, Stability::FileSync, payload, deadline)?;
+                if reply.count as usize != wanted {
+                    return Err(Self::short_write(reply.count, wanted));
+                }
+                Ok(())
+            },
+        );
+        self.name = held;
+        match outcome {
+            Ok(()) => Ok(ExclusiveCreate::Created),
+            Err(error) if error.status() == Some(Nfs4Status::EXIST) => Ok(ExclusiveCreate::Exists),
+            Err(error) => Err(error),
+        }
     }
 }

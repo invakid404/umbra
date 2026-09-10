@@ -45,7 +45,7 @@ use umbra_storage_nfs_userspace::authority::journal::{
     Acknowledged, CommittedResult, Durability, MutationJournal, MutationRequest,
 };
 use umbra_storage_nfs_userspace::authority::marker::{
-    AdmissionMarker, AdmissionPhase, MarkerStore, WriterToken,
+    AdmissionMarker, AdmissionPhase, ExclusiveCreate, MarkerStore, WriterToken,
 };
 use umbra_storage_nfs_userspace::authority::outage::{
     AdmissionStanding, CrashWindow, Deferral, Evidence, OutageBudget, OutageMachine, RecoveryState,
@@ -434,6 +434,188 @@ fn a_cooperative_release_is_the_only_way_the_next_session_gets_in() {
         "session-b",
         AdmissionPhase::Held,
         LeaseEpoch(2),
+    );
+}
+
+// --- R1-001: concurrent succession at a released marker ----------------------
+
+/// A marker store that models two clients racing the `Released` -> `Held`
+/// transition on one server.
+///
+/// The interleaving R1-001 describes is a *read* ordering: both contenders read
+/// the released marker before either writes, because reads and writes are
+/// separate round trips. `read` therefore serves each contender the snapshot the
+/// race started from, which is exactly what a client whose LOOKUP/READ was issued
+/// before the other's WRITE landed observes.
+///
+/// Everything else is the real thing: `overwrite` mutates shared state, and
+/// `claim_succession` is genuinely atomic across contenders — one shared set, one
+/// insert, one winner — because that is the property a server-side `GUARDED4`
+/// create actually has.
+#[derive(Clone)]
+struct RacingMarkerStore {
+    /// Durable bytes, shared by every contender.
+    bytes: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Epochs already claimed, shared and atomic.
+    claimed: Arc<Mutex<std::collections::BTreeSet<u64>>>,
+    /// What this contender's read returns: the pre-race snapshot.
+    snapshot: Option<Vec<u8>>,
+}
+
+impl RacingMarkerStore {
+    fn racing(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::new(Mutex::new(Some(bytes.clone()))),
+            claimed: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            snapshot: Some(bytes),
+        }
+    }
+
+    /// A second contender racing the same server from the same snapshot.
+    fn contender(&self) -> Self {
+        self.clone()
+    }
+
+    fn durable(&self) -> Vec<u8> {
+        self.bytes
+            .lock()
+            .expect("not poisoned")
+            .clone()
+            .expect("the marker exists")
+    }
+}
+
+impl MarkerStore for RacingMarkerStore {
+    fn create_exclusive(&mut self, _bytes: &[u8]) -> FacadeResult<ExclusiveCreate> {
+        // The marker already exists in every case this store models.
+        Ok(ExclusiveCreate::Exists)
+    }
+
+    fn read(&mut self) -> FacadeResult<Option<Vec<u8>>> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn overwrite(&mut self, bytes: &[u8]) -> FacadeResult<()> {
+        *self.bytes.lock().expect("not poisoned") = Some(bytes.to_vec());
+        Ok(())
+    }
+
+    fn claim_succession(&mut self, epoch: LeaseEpoch) -> FacadeResult<ExclusiveCreate> {
+        if self.claimed.lock().expect("not poisoned").insert(epoch.0) {
+            Ok(ExclusiveCreate::Created)
+        } else {
+            Ok(ExclusiveCreate::Exists)
+        }
+    }
+}
+
+/// **R1-001.** Two contenders that both read the same released marker must not
+/// both be admitted.
+///
+/// Pre-fix this asserted false: `acquire`'s `Released` arm was `inspect()`
+/// followed by an unconditional `overwrite()`, so B wrote `Held(B, 2)`, C wrote
+/// `Held(C, 2)`, and both returned `Admitted` at epoch 2 — two live owners of one
+/// run, with no partition and no external editor involved. The server-atomic
+/// per-epoch claim is what makes exactly one of them win.
+#[test]
+fn r1_001_two_contenders_racing_a_released_marker_admit_exactly_one() {
+    let released = AdmissionMarker::new(
+        WriterToken([0xA1; 16]),
+        WriterId("session-a".into()),
+        LeaseEpoch(1),
+        AdmissionPhase::Released,
+    )
+    .encode()
+    .expect("a released marker encodes");
+
+    let store_b = RacingMarkerStore::racing(released);
+    let store_c = store_b.contender();
+
+    let mut control_b = AdmissionControl::new(run_id(), store_b.clone());
+    let mut control_c = AdmissionControl::new(run_id(), store_c);
+
+    let b = control_b.acquire(&AdmissionRequest::cooperative(
+        WriterId("session-b".into()),
+        WriterToken([0xB2; 16]),
+    ));
+    let c = control_c.acquire(&AdmissionRequest::cooperative(
+        WriterId("session-c".into()),
+        WriterToken([0xC3; 16]),
+    ));
+
+    let admitted: Vec<&AdmissionOutcome> = [&b, &c]
+        .into_iter()
+        .filter(|outcome| matches!(outcome, AdmissionOutcome::Admitted(_)))
+        .collect();
+    assert_eq!(
+        admitted.len(),
+        1,
+        "exactly one contender may succeed a released marker; got b={b:?} c={c:?}"
+    );
+
+    // The loser is refused, not silently degraded, and it is not told a holder it
+    // never read.
+    let loser = if matches!(b, AdmissionOutcome::Admitted(_)) {
+        &c
+    } else {
+        &b
+    };
+    assert!(
+        matches!(loser, AdmissionOutcome::Refused(_)),
+        "the losing contender must safe-stop: {loser:?}"
+    );
+    assert_eq!(
+        loser.error().map(FacadeError::class),
+        Some(ErrorClass::SafeStop),
+        "losing a succession race is a safe stop, never a retriable condition"
+    );
+
+    // The durable marker records the winner, at exactly one epoch past the
+    // predecessor's, and the predecessor's release evidence was not destroyed by
+    // the loser writing over it.
+    let marker = AdmissionMarker::decode(&store_b.durable()).expect("the marker decodes");
+    assert_eq!(marker.epoch(), LeaseEpoch(2));
+    assert_eq!(marker.phase(), AdmissionPhase::Held);
+    let winner = if matches!(b, AdmissionOutcome::Admitted(_)) {
+        "session-b"
+    } else {
+        "session-c"
+    };
+    assert_eq!(
+        marker.writer().map(|id| id.0.as_str()),
+        Some(winner),
+        "the marker must record the contender that actually won the claim"
+    );
+}
+
+/// **R1-001.** A second succession to the *same* epoch is refused even when the
+/// contender re-reads a released marker later, because the claim is durable.
+#[test]
+fn r1_001_a_claimed_epoch_is_never_handed_to_a_second_contender() {
+    let released = AdmissionMarker::new(
+        WriterToken([0xA1; 16]),
+        WriterId("session-a".into()),
+        LeaseEpoch(1),
+        AdmissionPhase::Released,
+    )
+    .encode()
+    .expect("a released marker encodes");
+
+    let mut store = RacingMarkerStore::racing(released);
+    assert_eq!(
+        store.claim_succession(LeaseEpoch(2)).expect("first claim"),
+        ExclusiveCreate::Created
+    );
+    // A contender arriving now reads the same released snapshot but finds epoch 2
+    // already claimed.
+    let mut control = AdmissionControl::new(run_id(), store);
+    let outcome = control.acquire(&AdmissionRequest::cooperative(
+        WriterId("session-late".into()),
+        WriterToken([0xD4; 16]),
+    ));
+    assert!(
+        matches!(outcome, AdmissionOutcome::Refused(_)),
+        "an already-claimed epoch is refused: {outcome:?}"
     );
 }
 
