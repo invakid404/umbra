@@ -756,3 +756,247 @@ fn r2_010_a_record_larger_than_one_reply_round_trips() {
         other => panic!("expected a write response, got {other:?}"),
     }
 }
+
+// --- R2-007: the filesystem boundary covers every adoption path --------------
+
+/// A transport that reports a foreign `fsid` for one named object.
+///
+/// Any op naming the boundary component means the compound is about that object:
+/// LOOKUP resolves it, CREATE makes it, OPEN reaches a file leaf. Its fileid is
+/// remembered, so later GETATTRs on the same object stay consistent — which is
+/// what a nested export looks like.
+struct NestedExport {
+    inner: FakeTransport,
+    boundary: Vec<u8>,
+    /// Filehandles known to name the boundary object.
+    ///
+    /// Keyed by handle rather than by fileid on purpose: the OPEN compound is
+    /// `PUTFH; OPEN; GETFH` with no GETATTR, so there is no fileid in the reply
+    /// that first reaches the object. A later `PUTFH(handle); GETATTR` is how the
+    /// provider pins it, and that compound names only the handle.
+    foreign: Arc<Mutex<std::collections::BTreeSet<Vec<u8>>>>,
+}
+
+impl NestedExport {
+    fn new(inner: FakeTransport, boundary: &[u8]) -> Self {
+        Self {
+            inner,
+            boundary: boundary.to_vec(),
+            foreign: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+        }
+    }
+
+    fn names_boundary(&self, call: &Compound) -> bool {
+        call.ops.iter().any(|op| {
+            let named: Option<&[u8]> = match op {
+                Nfs4Op::Lookup(name) => Some(name.as_bytes()),
+                Nfs4Op::Create { name, .. } => Some(name.as_bytes()),
+                Nfs4Op::Remove { name } => Some(name.as_bytes()),
+                Nfs4Op::Open(args) => match &args.claim {
+                    umbra_storage_nfs_userspace::transport::OpenClaim::Null { name } => {
+                        Some(name.as_bytes())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            named == Some(self.boundary.as_slice())
+        })
+    }
+
+    fn rewrite(&self, call: &Compound, reply: &mut CompoundReply) {
+        use umbra_storage_nfs_userspace::transport::{Fsid, OpReply};
+        const FOREIGN: Fsid = Fsid {
+            major: 0xFEED,
+            minor: 0xFACE,
+        };
+        let names_boundary = self.names_boundary(call);
+        // The handle this compound is addressed to, if any.
+        let addressed: Option<Vec<u8>> = call.ops.iter().find_map(|op| match op {
+            Nfs4Op::PutFh(handle) => Some(handle.as_bytes().to_vec()),
+            _ => None,
+        });
+        let addressed_foreign = addressed
+            .is_some_and(|handle| self.foreign.lock().expect("not poisoned").contains(&handle));
+
+        // A compound that named the boundary hands back the object's handle,
+        // whether through GETFH or through LOOKUP's own reply.
+        if names_boundary {
+            let mut foreign = self.foreign.lock().expect("not poisoned");
+            for result in reply.results.iter() {
+                if let OpReply::GetFh(handle) = result {
+                    foreign.insert(handle.as_bytes().to_vec());
+                }
+            }
+        }
+
+        if names_boundary || addressed_foreign {
+            for result in reply.results.iter_mut() {
+                if let OpReply::GetAttr(attributes) = result {
+                    attributes.fsid = Some(FOREIGN);
+                }
+            }
+        }
+    }
+}
+
+impl RawTransport for NestedExport {
+    fn wire_profile(&self) -> WireProfile {
+        self.inner.wire_profile()
+    }
+    fn limits(&self) -> TransportLimits {
+        self.inner.limits()
+    }
+    fn connection(&self) -> ConnectionState {
+        self.inner.connection()
+    }
+    fn submit(&mut self, call: Compound, deadline: Deadline) -> TransportResult<CompoundReply> {
+        let mut reply = self.inner.submit(call.clone(), deadline)?;
+        self.rewrite(&call, &mut reply);
+        Ok(reply)
+    }
+    fn cancel(&mut self, token: CallToken) -> TransportResult<Retirement> {
+        self.inner.cancel(token)
+    }
+    fn reconnect(&mut self) -> TransportResult<ConnectionEpoch> {
+        self.inner.reconnect()
+    }
+    fn install_faults(&mut self, plan: Box<dyn FaultPlan>) {
+        self.inner.install_faults(plan)
+    }
+}
+
+fn nested_provider(boundary: &[u8]) -> NfsUserspaceStorage {
+    NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(NestedExport::new(fake_server(), boundary)),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("provider")
+}
+
+/// **R2-007.** `CreateParents` must not walk through a directory on another
+/// exported filesystem.
+///
+/// At the candidate, `create_parents` looped with `existing_child`, which calls
+/// `child`, which performed a LOOKUP and `PinnedObject::adopt` with no comparison
+/// to `anchors.filesystem()`. An ordinary `Create` of `nested/x` was refused by
+/// the fixed resolver, but `CreateParents` of the same path adopted `nested`, saw
+/// a directory, and sent CREATE beneath its handle.
+#[test]
+fn r2_007_create_parents_does_not_walk_through_a_foreign_filesystem() {
+    let mut storage = nested_provider(b"nested");
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    // Establish the boundary directory. Its own create is refused, because the
+    // created object is reported on the foreign filesystem — but the name now
+    // exists on the server, which is exactly the state the walk below meets.
+    let _ = storage.execute(&StorageRequest {
+        context: authorised(&storage, run_id, "seed-nested"),
+        operation: StorageOperation::Create {
+            path: path(b"nested"),
+            options: CreateOptions {
+                kind: CreateKind::Directory,
+                mode: 0o700,
+            },
+        },
+    });
+
+    // The ordinary resolver path already refuses a crossing (R1-015).
+    let ordinary = storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "ordinary"),
+            operation: StorageOperation::Create {
+                path: path(b"nested/x"),
+                options: CreateOptions {
+                    kind: CreateKind::Directory,
+                    mode: 0o700,
+                },
+            },
+        })
+        .expect_err("the resolver refuses a crossing");
+    assert_eq!(ordinary.kind, ErrorKind::InvalidPath);
+
+    // CreateParents must refuse it too, and for the same reason.
+    let parents = storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "create-parents"),
+            operation: StorageOperation::CreateParents {
+                path: path(b"nested/deep/deeper"),
+                mode: 0o700,
+            },
+        })
+        .expect_err("CreateParents must not walk through a filesystem crossing");
+    assert_eq!(parents.kind, ErrorKind::InvalidPath);
+    assert!(
+        parents.context.contains("another exported filesystem"),
+        "the refusal must name the crossing: {}",
+        parents.context
+    );
+}
+
+/// **R2-007.** `CreateParents` still builds an ordinary path.
+#[test]
+fn r2_007_create_parents_still_builds_an_ordinary_path() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "ordinary-parents"),
+            operation: StorageOperation::CreateParents {
+                path: path(b"a/b/c"),
+                mode: 0o700,
+            },
+        })
+        .expect("an ordinary mkdir -p is unaffected by the boundary check");
+    storage
+        .execute(&StorageRequest {
+            context: RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("stat-abc".into()),
+                writer_epoch: None,
+            },
+            operation: StorageOperation::Stat {
+                path: path(b"a/b/c"),
+            },
+        })
+        .expect("the whole path exists");
+}
+
+/// **R2-007.** A write whose final OPEN lands on another filesystem is refused.
+///
+/// `parent_and_name` checks the parent; the object the write actually lands on
+/// comes from the OPEN, which never passed the resolver.
+#[test]
+fn r2_007_a_write_to_a_foreign_final_target_is_refused() {
+    let mut storage = nested_provider(b"target.bin");
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    // The name exists on the server after this, even though its own create is
+    // refused for being reported across the boundary.
+    let _ = storage.execute(&create_file(
+        authorised(&storage, run_id, "seed-target"),
+        b"target.bin",
+    ));
+
+    let refused = storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "foreign-write"),
+            operation: StorageOperation::WriteAt {
+                path: path(b"target.bin"),
+                offset: 0,
+                bytes: b"must not land".to_vec(),
+            },
+        })
+        .expect_err("a write must not land on an object across the boundary");
+    assert_eq!(refused.kind, ErrorKind::InvalidPath);
+    assert!(
+        refused.context.contains("another exported filesystem"),
+        "the refusal must name the crossing: {}",
+        refused.context
+    );
+}

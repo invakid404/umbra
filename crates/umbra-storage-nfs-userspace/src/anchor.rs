@@ -780,19 +780,36 @@ fn descend_within(
 
 /// Reject a pin that is not on the run's pinned filesystem (**R1-015**).
 fn within(pin: PinnedObject, filesystem: Fsid, name: &ComponentName) -> Result<PinnedObject> {
+    within_labelled(
+        pin,
+        filesystem,
+        &String::from_utf8_lossy(name.as_bytes()).into_owned(),
+        "resolve",
+    )
+}
+
+/// Reject a pin that is not on `filesystem`, naming it however the caller wants.
+///
+/// **R2-007.** The resolver was not the only place an object gets adopted:
+/// `Operations::child` (which `create_parents` walks through) and the OPEN that
+/// `WriteAt` and `Create` finish with both produce pins that never reached
+/// `resolve`. A boundary enforced on one path is not a boundary, so this is the
+/// shared check every adoption point calls.
+pub fn within_labelled(
+    pin: PinnedObject,
+    filesystem: Fsid,
+    label: &str,
+    operation: &str,
+) -> Result<PinnedObject> {
     let observed = pin.identity().fsid;
     if observed != filesystem {
         return Err(UmbraError::new(
             ErrorKind::InvalidPath,
-            "resolve",
+            operation,
             format!(
-                "{:?} is on filesystem {}:{}, not the run's {}:{}; the walk does not cross \
+                "{label:?} is on filesystem {}:{}, not the run's {}:{}; the walk does not cross \
                  into another exported filesystem",
-                String::from_utf8_lossy(name.as_bytes()),
-                observed.major,
-                observed.minor,
-                filesystem.major,
-                filesystem.minor,
+                observed.major, observed.minor, filesystem.major, filesystem.minor,
             ),
         ));
     }

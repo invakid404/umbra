@@ -463,7 +463,24 @@ impl Operations {
             .transport
             .lookup(parent.handle(), name, AttrMask::STAT, context.deadline)
             .map_err(|error| error.to_umbra(operation))?;
-        PinnedObject::adopt(handle, &attributes).map_err(|error| error.to_umbra(operation))
+        let pinned =
+            PinnedObject::adopt(handle, &attributes).map_err(|error| error.to_umbra(operation))?;
+        // R2-007: this is the lookup `create_parents` walks through and `rename`
+        // pins its source with. Without the boundary check here, an existing
+        // directory on another exported filesystem became the next parent and
+        // CREATE ran beneath it.
+        self.within(pinned, &String::from_utf8_lossy(name.as_bytes()), operation)
+    }
+
+    /// Reject an object that is not on the run's pinned filesystem (**R2-007**).
+    ///
+    /// Every place this crate adopts a `PinnedObject` in an operation path goes
+    /// through here. `RunAnchors::resolve` enforced the boundary on its own walk,
+    /// but `create_parents` walks with [`Self::child`] and the create/write paths
+    /// finish with an OPEN, so an object on a nested exported filesystem could
+    /// still become a parent or a write target without ever passing the resolver.
+    fn within(&self, pinned: PinnedObject, label: &str, operation: &str) -> Result<PinnedObject> {
+        crate::anchor::within_labelled(pinned, self.anchors.filesystem(), label, operation)
     }
 
     fn stat(&self, context: &mut OpsContext<'_>, object: &PinnedObject) -> Result<BlobStat> {
@@ -514,6 +531,20 @@ impl Operations {
             deadline,
         )
         .map_err(|error| error.to_umbra(operation))?;
+        // R2-007: the OPEN result is the object this write lands on, and it never
+        // passed the resolver's boundary check — `parent_and_name` checks the
+        // parent, not the final component. An object on another exported
+        // filesystem must not be written through.
+        {
+            let pinned = PinnedObject::pin(&mut **transport, open.handle().clone(), deadline)
+                .map_err(|error| error.to_umbra(operation))?;
+            if let Err(error) =
+                self.within(pinned, &String::from_utf8_lossy(name.as_bytes()), operation)
+            {
+                let _ = open.close(&mut **transport, deadline);
+                return Err(error);
+            }
+        }
         // `UNSTABLE`, because a durability receipt is the only thing entitled to
         // claim persistence and this provider issues none. The verifier is
         // recorded against the idempotency key, so whichever node eventually
@@ -578,6 +609,12 @@ impl Operations {
             .map_err(|error| error.to_umbra(operation))?;
             let created = PinnedObject::pin(&mut **transport, open.handle().clone(), deadline)
                 .map_err(|error| error.to_umbra(operation))?;
+            // R2-007: the OPEN's own result, which never passed the resolver.
+            let created = self.within(
+                created,
+                &String::from_utf8_lossy(name.as_bytes()),
+                operation,
+            )?;
             (open, created, was_exclusive)
         };
 
@@ -645,6 +682,7 @@ impl Operations {
         };
         let created = PinnedObject::pin(context.transport, effect.handle, context.deadline)
             .map_err(|error| error.to_umbra(operation))?;
+        let created = self.within(created, "the created directory", operation)?;
         Ok(StorageResponse::Created(
             self.object_result(context, &created)?,
         ))
@@ -699,6 +737,7 @@ impl Operations {
                     let pinned =
                         PinnedObject::pin(context.transport, effect.handle, context.deadline)
                             .map_err(|error| error.to_umbra(operation))?;
+                    let pinned = self.within(pinned, &String::from_utf8_lossy(raw), operation)?;
                     created = Some(pinned.clone());
                     pinned
                 }
@@ -787,6 +826,7 @@ impl Operations {
         };
         let moved = PinnedObject::pin(context.transport, effect.handle, context.deadline)
             .map_err(|error| error.to_umbra(operation))?;
+        let moved = self.within(moved, "the renamed object", operation)?;
         Ok(StorageResponse::Renamed(
             self.object_result(context, &moved)?,
         ))
