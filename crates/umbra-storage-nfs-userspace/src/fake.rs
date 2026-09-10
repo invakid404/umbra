@@ -559,12 +559,39 @@ impl FakeTransport {
                     .get(old_name.as_bytes())
                     .ok_or_else(|| fail(Nfs4Status::NOENT))?;
                 if let Some(existing) = self.objects[target].children.get(new_name.as_bytes()) {
-                    // POSIX rename replaces a regular destination, but never
-                    // replaces a non-empty directory and never crosses type.
                     let existing = *existing;
-                    if self.objects[existing].kind == Nfs4Type::Directory
-                        && !self.objects[existing].children.is_empty()
-                    {
+                    // R1-008: source and destination naming the *same* object is a
+                    // no-op that succeeds, and it is checked first. Renaming a
+                    // non-empty directory to the name it already has used to be
+                    // answered NFS4ERR_NOTEMPTY, because the emptiness check ran
+                    // before the object was recognised as its own destination.
+                    if existing == moving {
+                        let change = self.objects[source].change;
+                        let info = ChangeInfo {
+                            atomic: true,
+                            before: change,
+                            after: change,
+                        };
+                        return Ok(OpReply::Rename {
+                            source: info,
+                            target: info,
+                        });
+                    }
+                    // R1-008: the kinds have to be compatible. The old code's
+                    // comment claimed it "never crosses type" and nothing checked
+                    // it: a regular file replaced an empty directory, and a
+                    // directory replaced a file, both with a successful reply.
+                    // RFC 7530 §16.27.4 requires the source and an existing
+                    // destination to be compatible — both directories or both
+                    // non-directories — and refuses the rename otherwise.
+                    let source_is_dir = self.objects[moving].kind == Nfs4Type::Directory;
+                    let target_is_dir = self.objects[existing].kind == Nfs4Type::Directory;
+                    if source_is_dir != target_is_dir {
+                        return Err(fail(Nfs4Status::EXIST));
+                    }
+                    // A directory destination must additionally be empty; POSIX
+                    // rename never removes a populated directory.
+                    if target_is_dir && !self.objects[existing].children.is_empty() {
                         return Err(fail(Nfs4Status::NOTEMPTY));
                     }
                 }
@@ -1004,6 +1031,158 @@ impl ReplayLog for FakeReplayLog {
         observed: WriteVerifier,
     ) -> VerifierMatch {
         VerifierMatch::compare(self.verifiers.get(key).copied(), observed)
+    }
+}
+
+#[cfg(test)]
+mod r1_008_rename_semantics {
+    use super::*;
+    use crate::transport::{ComponentName, Compound, Deadline, Nfs4Op, RawTransport};
+
+    fn name(bytes: &[u8]) -> ComponentName {
+        ComponentName::new(bytes.to_vec()).expect("a valid component")
+    }
+
+    fn deadline() -> Deadline {
+        Deadline { millis: 5_000 }
+    }
+
+    /// Drive `PUTFH(source); SAVEFH; PUTFH(target); RENAME` the way the dispatcher
+    /// does, and report the RENAME's status.
+    fn rename(
+        fake: &mut FakeTransport,
+        source_dir: &FileHandle,
+        old: &[u8],
+        target_dir: &FileHandle,
+        new: &[u8],
+    ) -> Result<(), Nfs4Status> {
+        let reply = fake
+            .submit(
+                Compound::new(
+                    *b"rename",
+                    vec![
+                        Nfs4Op::PutFh(source_dir.clone()),
+                        Nfs4Op::SaveFh,
+                        Nfs4Op::PutFh(target_dir.clone()),
+                        Nfs4Op::Rename {
+                            old_name: name(old),
+                            new_name: name(new),
+                        },
+                    ],
+                ),
+                deadline(),
+            )
+            .expect("the fake answers");
+        match reply.failure {
+            None => Ok(()),
+            Some(error) => Err(error.status),
+        }
+    }
+
+    fn exists(fake: &mut FakeTransport, parent: &FileHandle, child: &[u8]) -> bool {
+        fake.lookup(parent, &name(child), AttrMask::STAT, deadline())
+            .is_ok()
+    }
+
+    /// **R1-008.** A directory must not replace a file, and a file must not
+    /// replace a directory.
+    ///
+    /// Pre-fix both succeeded: the arm checked only whether an existing
+    /// destination *directory* was non-empty, and its comment claimed a type check
+    /// it never performed. The fake is the always-run acceptance backend, so a
+    /// wrong answer here is a wrong acceptance result everywhere.
+    #[test]
+    fn r1_008_incompatible_kinds_are_refused_in_both_directions() {
+        // A directory renamed onto a regular file.
+        let mut fake = FakeTransport::new();
+        let root = fake.root();
+        let dir = fake.insert_directory(&root, b"a-directory");
+        fake.insert_file(&root, b"a-file", b"contents".to_vec());
+        assert_eq!(
+            rename(&mut fake, &root, b"a-directory", &root, b"a-file"),
+            Err(Nfs4Status::EXIST),
+            "a directory must not replace a non-directory"
+        );
+        assert!(exists(&mut fake, &root, b"a-directory"), "the source stays");
+        assert!(exists(&mut fake, &root, b"a-file"), "the file survives");
+        let _ = dir;
+
+        // A regular file renamed onto an empty directory.
+        let mut fake = FakeTransport::new();
+        let root = fake.root();
+        fake.insert_file(&root, b"a-file", b"contents".to_vec());
+        fake.insert_directory(&root, b"empty-dir");
+        assert_eq!(
+            rename(&mut fake, &root, b"a-file", &root, b"empty-dir"),
+            Err(Nfs4Status::EXIST),
+            "a non-directory must not replace a directory, even an empty one"
+        );
+        assert!(exists(&mut fake, &root, b"a-file"));
+        assert!(exists(&mut fake, &root, b"empty-dir"));
+    }
+
+    /// **R1-008.** Renaming an object to the name it already has is a no-op that
+    /// succeeds, including for a non-empty directory.
+    ///
+    /// Pre-fix the emptiness check ran before the object was recognised as its own
+    /// destination, so this returned NFS4ERR_NOTEMPTY.
+    #[test]
+    fn r1_008_renaming_an_object_to_its_own_name_succeeds() {
+        let mut fake = FakeTransport::new();
+        let root = fake.root();
+        let populated = fake.insert_directory(&root, b"populated");
+        fake.insert_file(&populated, b"child", b"x".to_vec());
+
+        assert_eq!(
+            rename(&mut fake, &root, b"populated", &root, b"populated"),
+            Ok(()),
+            "renaming a non-empty directory to its own name is a no-op, not NOTEMPTY"
+        );
+        assert!(exists(&mut fake, &root, b"populated"));
+        assert!(
+            exists(&mut fake, &populated, b"child"),
+            "the no-op must not disturb the directory's contents"
+        );
+
+        // The same for an ordinary file.
+        fake.insert_file(&root, b"file", b"y".to_vec());
+        assert_eq!(rename(&mut fake, &root, b"file", &root, b"file"), Ok(()));
+        assert!(exists(&mut fake, &root, b"file"));
+    }
+
+    /// **R1-008.** Compatible replacement still works, and still preserves the
+    /// moved object's identity.
+    #[test]
+    fn r1_008_compatible_replacement_is_unaffected() {
+        let mut fake = FakeTransport::new();
+        let root = fake.root();
+        fake.insert_file(&root, b"src", b"new".to_vec());
+        fake.insert_file(&root, b"dst", b"old".to_vec());
+        let (_, before) = fake
+            .lookup(&root, &name(b"src"), AttrMask::STAT, deadline())
+            .expect("the source resolves");
+
+        assert_eq!(rename(&mut fake, &root, b"src", &root, b"dst"), Ok(()));
+        assert!(!exists(&mut fake, &root, b"src"));
+        let (_, after) = fake
+            .lookup(&root, &name(b"dst"), AttrMask::STAT, deadline())
+            .expect("the destination resolves");
+        assert_eq!(
+            after.fileid, before.fileid,
+            "a rename moves a name, not an object"
+        );
+
+        // A non-empty directory destination is still refused, now for the right
+        // reason and only when the kinds match.
+        let mut fake = FakeTransport::new();
+        let root = fake.root();
+        fake.insert_directory(&root, b"from");
+        let occupied = fake.insert_directory(&root, b"onto");
+        fake.insert_file(&occupied, b"child", b"z".to_vec());
+        assert_eq!(
+            rename(&mut fake, &root, b"from", &root, b"onto"),
+            Err(Nfs4Status::NOTEMPTY)
+        );
     }
 }
 
