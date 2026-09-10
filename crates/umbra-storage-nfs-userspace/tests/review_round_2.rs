@@ -2210,3 +2210,142 @@ fn r3_006_an_unsupported_rename_mode_leaves_no_durable_trace() {
         assert_eq!(refused.kind, ErrorKind::UnsupportedCapability);
     });
 }
+
+/// **R3-001.** A record that cannot be decoded stops the run too, and its
+/// bytes are left where they are.
+///
+/// The failure model's CORRUPTED row is "preserve remaining bytes; refuse
+/// automatic repair". A run whose journal can no longer be read must not go on
+/// accepting mutations that would add more records to it.
+#[test]
+fn r3_001_a_corrupt_record_stops_the_run_and_keeps_its_bytes() {
+    let run_id = fresh_run();
+    let context = RequestContext {
+        run_id,
+        operation_id: OperationId(Uuid::new_v4()),
+        idempotency_key: IdempotencyKey("corrupt".into()),
+        writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+    };
+    let request = create_file(context, b"whatever.txt");
+
+    // A record file that is not JSON at all.
+    let mut fake = seed_released_run(run_id, Some(0));
+    let retries = walk(
+        &mut fake,
+        run_id,
+        &[layout::PRIVATE_DIR, layout::RETRIES_DIR],
+    );
+    let hex: String = "corrupt"
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    fake.insert_file(
+        &retries,
+        format!("key-{hex}").as_bytes(),
+        b"{ this is not a record".to_vec(),
+    );
+    let mut storage = over(fake);
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let corrupt = storage
+        .execute(&request)
+        .expect_err("a record that does not decode is refused");
+    assert_eq!(corrupt.kind, ErrorKind::CorruptJournal);
+
+    // The run is stopped: a different, valid, fresh mutation is refused.
+    let refused = storage
+        .execute(&create_file(
+            RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("after-corrupt".into()),
+                writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+            },
+            b"should-not-exist.txt",
+        ))
+        .expect_err("a run whose journal cannot be read must not accept new mutations");
+    assert_eq!(refused.kind, ErrorKind::InvalidState);
+    assert!(
+        refused.context.contains("this run is stopped"),
+        "the refusal must name the state: {}",
+        refused.context
+    );
+
+    // The corrupt bytes are still on the server.
+    let records = retry_records(storage.transport().expect("transport"), run_id);
+    assert!(
+        records.iter().any(|n| n == &format!("key-{hex}")),
+        "the corrupt record is preserved, saw {records:?}"
+    );
+
+    // And no clean release follows.
+    let lease = storage.admission().expect("admitted").lease();
+    storage
+        .release_writer(&lease)
+        .expect_err("a release over an unreadable journal must not be reported clean");
+}
+
+/// **R3-001.** A legacy intent with no evidence stops the run as well, not just
+/// the one request that met it.
+#[test]
+fn r3_001_a_legacy_intent_stops_the_run() {
+    let run_id = fresh_run();
+    let context = RequestContext {
+        run_id,
+        operation_id: OperationId(Uuid::new_v4()),
+        idempotency_key: IdempotencyKey("legacy".into()),
+        writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+    };
+    let request = create_file(context, b"legacy.txt");
+
+    // An intent with no `pre-` sidecar: the shape an older provider leaves.
+    let mut fake = seed_released_run(run_id, Some(0));
+    let retries = walk(
+        &mut fake,
+        run_id,
+        &[layout::PRIVATE_DIR, layout::RETRIES_DIR],
+    );
+    let hex: String = "legacy"
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let intent: (
+        StorageRequest,
+        Option<umbra_core::Result<umbra_core::StorageResponse>>,
+    ) = (request.clone(), None);
+    fake.insert_file(
+        &retries,
+        format!("key-{hex}").as_bytes(),
+        serde_json::to_vec(&intent).expect("intent encodes"),
+    );
+    let mut storage = over(fake);
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let stopped = storage
+        .execute(&request)
+        .expect_err("a legacy intent with no evidence is not guessed");
+    assert!(
+        umbra_storage_nfs_userspace::journal::is_blocked(&stopped),
+        "the stop is blocked-recoverable: {}",
+        stopped.context
+    );
+
+    let refused = storage
+        .execute(&create_file(
+            RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("after-legacy".into()),
+                writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+            },
+            b"should-not-exist.txt",
+        ))
+        .expect_err("the run is stopped, not just that one request");
+    assert!(
+        refused.context.contains("this run is stopped"),
+        "{}",
+        refused.context
+    );
+}

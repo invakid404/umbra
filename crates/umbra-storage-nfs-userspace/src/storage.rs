@@ -800,7 +800,13 @@ impl NfsUserspaceStorage {
         // unsettled work so the release that follows cannot be reported clean.
         // An interrupted intent that could not be settled is precisely "uncertain
         // old I/O" — handing the run on over it is what the failure model forbids.
-        if crate::journal::is_blocked(error) && self.recovery_blocked.is_none() {
+        // A corrupt record is the failure model's CORRUPTED row — "preserve
+        // remaining bytes; refuse automatic repair" — and it stops the run for the
+        // same reason a contradictory one does: what the journal says about this
+        // run can no longer be read, so nothing further may be built on it.
+        let stops_the_run =
+            crate::journal::is_blocked(error) || error.kind == ErrorKind::CorruptJournal;
+        if stops_the_run && self.recovery_blocked.is_none() {
             self.recovery_blocked = Some(error.clone());
             self.unsettled.push(format!(
                 "{operation}: unsettled recovery: {}",
