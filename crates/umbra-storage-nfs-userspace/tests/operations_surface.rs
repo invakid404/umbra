@@ -52,6 +52,7 @@ use umbra_storage_nfs_userspace::fake::{FakeReplayLog, FakeTransport, ScriptedFa
 use umbra_storage_nfs_userspace::handle::{FileHandle, ObjectIdentity};
 use umbra_storage_nfs_userspace::identity::PinnedObject;
 use umbra_storage_nfs_userspace::integration::{identity_for, Backend, StateSession};
+use umbra_storage_nfs_userspace::namespace::dispatch::TransportDispatcher;
 use umbra_storage_nfs_userspace::namespace::{
     NamespaceDispatcher, NamespaceEffect, NamespaceMutation, NamespaceOutcome,
 };
@@ -283,13 +284,17 @@ fn the_surface_runs_over_a_real_client_incarnation_and_is_never_mistaken_for_liv
         .incarnation()
         .expect("an incarnation was adopted")
         .open_owners();
+    // R1-007: an `EXCLUSIVE4` create applies the requested mode with a follow-up
+    // SETATTR, which goes through the namespace seam, so an exclusive create needs
+    // a dispatcher bound exactly as a directory create does.
+    let mut dispatcher = TransportDispatcher::new();
     let mut ops = OpsContext {
         transport,
         replay: &mut replay,
         mutations: Some(MutationContext {
             owners,
             create_verifier: Some(verifier),
-            namespace: None,
+            namespace: Some(&mut dispatcher),
         }),
         deadline: deadline(),
     };

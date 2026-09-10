@@ -477,3 +477,195 @@ fn r1_003_unsupported_run_policies_are_refused_before_the_run_exists() {
         );
     }
 }
+
+// --- R1-006: no-replace rename is refused, not emulated ----------------------
+
+/// **R1-006.** `RenameMode::NoReplace` is refused before any effect.
+///
+/// Pre-fix the provider probed the destination and refused only when the probe
+/// returned `Ok`. Two holes followed: another client creating the destination
+/// between the probe and the RENAME had it silently overwritten, and a probe that
+/// failed with anything but NOENT — EIO, ACCESS, STALE — fell straight through to
+/// an ordinary replacing RENAME. Neither the capability table nor the preflight
+/// rejected the mode.
+#[test]
+fn r1_006_no_replace_rename_is_refused_before_any_effect() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "src"),
+            b"source.txt",
+        ))
+        .expect("create the source");
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "dst"),
+            b"dest.txt",
+        ))
+        .expect("create the destination");
+
+    let refused = storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "no-replace"),
+            operation: StorageOperation::Rename {
+                source: path(b"source.txt"),
+                destination: path(b"dest.txt"),
+                mode: umbra_core::RenameMode::NoReplace,
+            },
+        })
+        .expect_err("atomic no-replace is not available over NFSv4.0");
+    assert_eq!(refused.kind, ErrorKind::UnsupportedCapability);
+    assert!(
+        refused.context.contains("not atomic"),
+        "the refusal must say why, not just that: {}",
+        refused.context
+    );
+
+    // Nothing moved and nothing was overwritten.
+    for name in [b"source.txt".as_slice(), b"dest.txt".as_slice()] {
+        storage
+            .execute(&StorageRequest {
+                context: RequestContext {
+                    run_id,
+                    operation_id: OperationId(Uuid::new_v4()),
+                    idempotency_key: IdempotencyKey(format!(
+                        "probe-{}",
+                        String::from_utf8_lossy(name)
+                    )),
+                    writer_epoch: None,
+                },
+                operation: StorageOperation::Stat { path: path(name) },
+            })
+            .unwrap_or_else(|error| panic!("{:?} must survive: {error:?}", name));
+    }
+
+    // The ordinary replacing rename is unaffected.
+    storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "replace"),
+            operation: StorageOperation::Rename {
+                source: path(b"source.txt"),
+                destination: path(b"dest.txt"),
+                mode: umbra_core::RenameMode::Replace,
+            },
+        })
+        .expect("a replacing rename is supported");
+}
+
+// --- R1-007: the requested create mode is applied ----------------------------
+
+/// **R1-007.** A file created with a non-default mode has that mode afterwards.
+///
+/// Pre-fix, `request()` supplied a create verifier for every keyed operation, so
+/// the create always chose `CreateExclusive` rather than `CreateNew { mode }`.
+/// `EXCLUSIVE4` carries the verifier in the field that would have carried the
+/// attributes, and no SETATTR followed, so creating an executable with mode 0755
+/// succeeded without the execute bits.
+#[test]
+fn r1_007_a_created_file_has_the_mode_that_was_requested() {
+    for mode in [0o755u32, 0o600, 0o444] {
+        let mut storage = provider();
+        let run_id = fresh_run();
+        storage.open_run(&create_run(run_id)).expect("open_run");
+
+        let name = format!("mode-{mode:o}.bin");
+        let created = storage
+            .execute(&StorageRequest {
+                context: authorised(&storage, run_id, &name),
+                operation: StorageOperation::Create {
+                    path: path(name.as_bytes()),
+                    options: CreateOptions {
+                        kind: CreateKind::File,
+                        mode,
+                    },
+                },
+            })
+            .unwrap_or_else(|error| panic!("create {mode:o}: {error:?}"));
+        let umbra_core::StorageResponse::Created(result) = created else {
+            panic!("a create answers with an object result");
+        };
+        assert_eq!(
+            result.stat.mode & 0o7777,
+            mode,
+            "the create result must report the mode that was asked for"
+        );
+
+        // And the server agrees on a fresh read, so this is the object's mode and
+        // not a value the create path invented for its own reply.
+        let stat = storage
+            .execute(&StorageRequest {
+                context: RequestContext {
+                    run_id,
+                    operation_id: OperationId(Uuid::new_v4()),
+                    idempotency_key: IdempotencyKey(format!("stat-{mode:o}")),
+                    writer_epoch: None,
+                },
+                operation: StorageOperation::Stat {
+                    path: path(name.as_bytes()),
+                },
+            })
+            .expect("stat the created file");
+        let umbra_core::StorageResponse::Stat(stat) = stat else {
+            panic!("a stat answers with a blob stat");
+        };
+        assert_eq!(
+            stat.mode & 0o7777,
+            mode,
+            "a fresh read must see the requested mode"
+        );
+    }
+}
+
+/// **R1-007.** Retrying the identical create — the lost-reply case the exclusive
+/// verifier exists for — still ends with the requested mode.
+#[test]
+fn r1_007_an_exclusive_create_retry_keeps_the_requested_mode() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    // One idempotency key, presented twice: the second call is the retry a lost
+    // reply produces.
+    let context = authorised(&storage, run_id, "retry-create");
+    let request = StorageRequest {
+        context: context.clone(),
+        operation: StorageOperation::Create {
+            path: path(b"retry.bin"),
+            options: CreateOptions {
+                kind: CreateKind::File,
+                mode: 0o750,
+            },
+        },
+    };
+    storage.execute(&request).expect("the first create");
+    let retried = storage.execute(&request);
+
+    // Whether the retry is answered from the recorded outcome or re-runs the
+    // exclusive create, the mode must be the requested one either way.
+    if let Ok(umbra_core::StorageResponse::Created(result)) = &retried {
+        assert_eq!(result.stat.mode & 0o7777, 0o750);
+    }
+    let stat = storage
+        .execute(&StorageRequest {
+            context: RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("retry-stat".into()),
+                writer_epoch: None,
+            },
+            operation: StorageOperation::Stat {
+                path: path(b"retry.bin"),
+            },
+        })
+        .expect("stat the retried create");
+    let umbra_core::StorageResponse::Stat(stat) = stat else {
+        panic!("a stat answers with a blob stat");
+    };
+    assert_eq!(
+        stat.mode & 0o7777,
+        0o750,
+        "a retried exclusive create must not leave the default mode behind"
+    );
+}

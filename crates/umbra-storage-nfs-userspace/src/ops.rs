@@ -24,10 +24,10 @@
 //! [`AuthorityError::NoWriterEpoch`](crate::error::AuthorityError::NoWriterEpoch).
 
 use umbra_core::{
-    BlobStat, CreateKind, DirectoryPage, Durability, ErrorKind, Fencing, ListCursor, ObjectResult,
-    OpenRunRequest, RenameMode, Result, RunBinding, RunId, StorageAnchor, StorageCapabilities,
-    StorageOperation, StoragePath, StoragePolicy, StorageRequest, StorageResponse, UmbraError,
-    MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
+    BlobStat, CreateKind, DirectoryPage, Durability, ErrorKind, Fencing, ListCursor,
+    MetadataUpdate, ObjectResult, OpenRunRequest, RenameMode, Result, RunBinding, RunId,
+    StorageAnchor, StorageCapabilities, StorageOperation, StoragePath, StoragePolicy,
+    StorageRequest, StorageResponse, UmbraError, MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
 };
 
 use crate::anchor::{Anchor, HandleMint, RunAnchors, Target};
@@ -527,7 +527,7 @@ impl Operations {
     ) -> Result<StorageResponse> {
         MutationIdentity::from_context(&request.context).map_err(|e| e.to_umbra(operation))?;
         let (parent, name) = self.parent_and_name(context, path, operation)?;
-        let (open, created) = {
+        let (open, created, was_exclusive) = {
             let deadline = context.deadline;
             let transport = &mut context.transport;
             let (owners, create_verifier) = require_owners(&mut context.mutations, operation)?;
@@ -540,6 +540,7 @@ impl Operations {
                 Some(verifier) => CreateDisposition::CreateExclusive { verifier },
                 None => CreateDisposition::CreateNew { mode },
             };
+            let was_exclusive = create_verifier.is_some();
             let open = OpenObject::open(
                 owners,
                 &mut **transport,
@@ -552,8 +553,46 @@ impl Operations {
             .map_err(|error| error.to_umbra(operation))?;
             let created = PinnedObject::pin(&mut **transport, open.handle().clone(), deadline)
                 .map_err(|error| error.to_umbra(operation))?;
-            (open, created)
+            (open, created, was_exclusive)
         };
+
+        // R1-007: `EXCLUSIVE4` carries a verifier in the field `GUARDED4` uses for
+        // the initial attributes, so the requested mode was never sent — creating
+        // an executable with mode 0755 quietly produced the server's default.
+        // RFC 7530 §18.16.3 and `docs/design/managed-lifecycle-spike.md:33` both
+        // say the attributes are applied afterwards, with SETATTR.
+        //
+        // The provider supplies a create verifier for every keyed operation, so
+        // this is the ordinary path, not a corner case.
+        if was_exclusive {
+            let requested = MetadataUpdate {
+                mode: Some(mode),
+                uid: None,
+                gid: None,
+                accessed_nanos: None,
+                modified_nanos: None,
+            };
+            let applied = dispatch_namespace(
+                context,
+                operation,
+                &NamespaceMutation::SetAttributes {
+                    object: created.handle().clone(),
+                    target: created.identity(),
+                    update: requested,
+                },
+            );
+            if let Err(error) = applied {
+                // The file exists and the mode is the server's default. There is
+                // no rollback to invent — an EXCLUSIVE4 create is not undone by
+                // removing the name, which could destroy a concurrent writer's
+                // work — so the partial effect is reported rather than hidden.
+                let _ = release(open, context.transport, context.deadline, operation);
+                return Err(error);
+            }
+        }
+
+        // Read the result after the attributes are applied, so a caller is told
+        // the mode the object actually has.
         let result = self.object_result(context, &created)?;
         release(open, context.transport, context.deadline, operation)?;
         Ok(StorageResponse::Created(result))
@@ -677,6 +716,28 @@ impl Operations {
                 ErrorKind::InvalidPath,
                 operation,
                 "a cross-anchor rename is rejected",
+            ));
+        }
+        if mode == RenameMode::NoReplace {
+            // R1-006: NFSv4.0 RENAME always replaces, and there is no v4.0
+            // operation that makes "rename only if the destination is absent"
+            // atomic. The previous emulation probed the destination and then
+            // renamed: another client can create the destination between the two
+            // round trips, and a probe that failed for any reason other than
+            // NOENT — EIO, ACCESS, STALE — fell through to an ordinary replacing
+            // RENAME. `docs/design/syscall-matrix.md` prohibits exactly that
+            // check-then-rename, and `managed-lifecycle-spike.md` requires the
+            // unsupported atomic no-replace to be refused unless it is proven.
+            //
+            // Refusing before any effect is the honest answer. Ordinary
+            // `RenameMode::Replace` is unaffected.
+            return Err(UmbraError::new(
+                ErrorKind::UnsupportedCapability,
+                operation,
+                "atomic no-replace rename is not available over NFSv4.0: RENAME always \
+                 replaces, and emulating the guarantee with a destination probe is not \
+                 atomic. Use RenameMode::Replace, or check the destination yourself and \
+                 accept the race.",
             ));
         }
         let (source_parent, source_name) = self.parent_and_name(context, source, operation)?;
