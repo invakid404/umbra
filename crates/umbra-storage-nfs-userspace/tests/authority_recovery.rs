@@ -1123,15 +1123,26 @@ fn eio_latches_the_original_failure_and_refuses_a_clean_release() {
     );
 
     // Three further recovery attempts, each returning something less specific.
+    // `BlockedRecoverable` is terminal (F06), so each of these is refused before
+    // it can move anything: the stop is what it was, the attempt is not counted,
+    // and the latched status is untouched. Before F06 these ran `decide` again
+    // and only the latch stopped the later status winning.
     for later in [
         FacadeError::protocol(Nfs4Status::SERVERFAULT, OpCode::Write, 1),
         FacadeError::Replay(ReplayError::Indeterminate),
         FacadeError::protocol(Nfs4Status::DELAY, OpCode::Write, 1),
     ] {
-        run.machine
-            .enter(CrashWindow::ServerEio, &evidence().with_error(later));
+        assert_eq!(
+            run.machine
+                .enter(CrashWindow::ServerEio, &evidence().with_error(later)),
+            RecoveryState::BlockedRecoverable
+        );
     }
-    assert_eq!(run.machine.attempts(), 4);
+    assert_eq!(
+        run.machine.attempts(),
+        1,
+        "a stopped machine counts no further attempts"
+    );
     assert_eq!(
         run.machine.status().map(|s| s.0),
         Some(5),
@@ -1270,10 +1281,17 @@ fn sigstop_resume_stays_blocked_until_queued_effects_are_excluded() {
         "queued remote effects that cannot be excluded keep the run blocked"
     );
 
+    // The remaining two evidence combinations each get their own machine.
+    // `BlockedRecoverable` is terminal (F06), so a machine that has already
+    // stopped answers with its stop rather than re-deciding — which is the whole
+    // point of the state, and means a per-combination assertion has to start from
+    // a run that has not stopped.
+    let fresh = || OutageMachine::running(OutageBudget::DESIGN_DEFAULTS, false);
+
     // Even with the queue proven empty, a suspend longer than the outage budget
     // means the authority this session held may have lapsed while it could not
     // check. It is poisoned, not resumed.
-    let long_gap = run.machine.enter(
+    let long_gap = fresh().enter(
         CrashWindow::UmbraSigstopResume,
         &evidence()
             .with_admission(AdmissionStanding::Held(admitted.epoch()))
@@ -1283,7 +1301,7 @@ fn sigstop_resume_stays_blocked_until_queued_effects_are_excluded() {
     assert_eq!(long_gap, RecoveryState::BlockedRecoverable);
 
     // A short suspend with the queue proven empty may revalidate.
-    let short_gap = run.machine.enter(
+    let short_gap = fresh().enter(
         CrashWindow::UmbraSigstopResume,
         &evidence()
             .with_admission(AdmissionStanding::Held(admitted.epoch()))
@@ -1291,6 +1309,9 @@ fn sigstop_resume_stays_blocked_until_queued_effects_are_excluded() {
             .io_excluded(true),
     );
     assert_eq!(short_gap, RecoveryState::Recovering);
+
+    // And the stopped run stays stopped through both of them.
+    assert_eq!(run.machine.state(), RecoveryState::BlockedRecoverable);
 
     assert_eq!(
         run.machine.retained().expect("latched").error(),

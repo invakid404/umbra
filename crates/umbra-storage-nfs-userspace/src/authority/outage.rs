@@ -484,7 +484,28 @@ impl OutageMachine {
     }
 
     /// Drive one crash window and return the state it settled in.
+    ///
+    /// **F06.** A terminal state is terminal. `decide` answers each window on the
+    /// window's own evidence, with no memory of where the run already stopped, so
+    /// driving a fresh window into a stopped machine used to overwrite the stop:
+    /// a run put into [`RecoveryState::Corrupted`] by a proven durable loss went
+    /// back to [`RecoveryState::Running`] on a later
+    /// [`CrashWindow::StaleFilehandle`] whose identity happened to prove, and
+    /// [`RecoveryState::admits_mutation`] then said yes. That is the opposite of
+    /// what [`RecoveryState::is_terminal`] promises, and it is the failure model's
+    /// "no automatic repair or relaunch" read backwards.
+    ///
+    /// The stop is returned before anything can move: the attempt is not counted,
+    /// no later error displaces the latched one, and no window's deferral is
+    /// recorded against a run that is no longer being driven. Everything a stopped
+    /// machine already holds — diagnosis, marker retention, counters — is exactly
+    /// what it held when it stopped. Nothing here reopens a terminal state; only
+    /// building a new machine does, which is the operator intervention the state
+    /// is for.
     pub fn enter(&mut self, window: CrashWindow, evidence: &Evidence) -> RecoveryState {
+        if self.state.is_terminal() {
+            return self.state;
+        }
         self.attempts = self.attempts.saturating_add(1);
         if let Some(error) = &evidence.error {
             self.latch(evidence.operation, &evidence.key, error.clone());
@@ -706,18 +727,32 @@ mod tests {
 
     #[test]
     fn the_first_error_is_latched_and_later_attempts_never_replace_it() {
+        // Driven through a *non-terminal* window on purpose. A terminal state
+        // stops the machine outright (F06), so repeating a window that stops it
+        // would prove the latch survives only because nothing ran at all. A
+        // bounded transient partition keeps returning `Recovering`, so every one
+        // of these really is another attempt against a live machine.
         let mut machine = machine();
         let original = FacadeError::protocol(Nfs4Status::NOSPC, OpCode::Write, 1);
-        machine.enter(
-            CrashWindow::ServerEnospc,
-            &evidence().with_error(original.clone()),
+        assert_eq!(
+            machine.enter(
+                CrashWindow::TransientPartition,
+                &evidence().with_error(original.clone()),
+            ),
+            RecoveryState::Recovering
         );
         for generic in [
             FacadeError::Transport(TransportError::Connect("later attempt".into())),
             FacadeError::Replay(ReplayError::Indeterminate),
             FacadeError::protocol(Nfs4Status::SERVERFAULT, OpCode::Write, 1),
         ] {
-            machine.enter(CrashWindow::ServerEnospc, &evidence().with_error(generic));
+            assert_eq!(
+                machine.enter(
+                    CrashWindow::TransientPartition,
+                    &evidence().with_error(generic)
+                ),
+                RecoveryState::Recovering
+            );
         }
         assert_eq!(machine.attempts(), 4);
         assert_eq!(
@@ -726,6 +761,106 @@ mod tests {
             "the original NFS4ERR_NOSPC must survive every later attempt"
         );
         assert_eq!(machine.retained().expect("latched").error(), &original);
+    }
+
+    /// **F06.** Every terminal state stays terminal, whatever window arrives next.
+    ///
+    /// `decide` answers each window on that window's own evidence, with no memory
+    /// of where the run already stopped. So a machine that had stopped went back
+    /// to `Running` on the next window whose evidence happened to be good — a
+    /// proven durable loss became `Corrupted`, and one `StaleFilehandle` with a
+    /// proven identity reopened it for mutations.
+    #[test]
+    fn f06_a_terminal_state_never_returns_to_running() {
+        // Each of the three actual terminal variants, reached the way the failure
+        // model reaches it, then driven with the window that used to reopen it.
+        for (window, expected) in [
+            (CrashWindow::ServerEio, RecoveryState::Corrupted),
+            (CrashWindow::ServerEnospc, RecoveryState::BlockedRecoverable),
+            (CrashWindow::TraceeCrash, RecoveryState::FailedTracee),
+        ] {
+            let mut machine = machine();
+            // Only the EIO window needs proven loss to reach its stop; the other
+            // two stop on the window alone, and the extra evidence is inert.
+            machine.enter(window, &evidence().proven_loss());
+            assert_eq!(machine.state(), expected);
+            assert!(machine.state().is_terminal());
+            let attempts = machine.attempts();
+            let retained = machine.retained().cloned();
+
+            // The window whose `decide` arm answers `Running` outright.
+            assert_eq!(
+                machine.enter(CrashWindow::StaleFilehandle, &evidence().identity(true),),
+                expected,
+                "a proven identity must not reopen a {expected:?} run"
+            );
+            // And the other one, which needs a full reclaim.
+            assert_eq!(
+                machine.enter(
+                    CrashWindow::GaneshaGracefulRestart,
+                    &evidence().reclaim(true, 90),
+                ),
+                expected,
+                "a complete reclaim must not reopen a {expected:?} run either"
+            );
+            assert!(
+                !machine.state().admits_mutation(),
+                "a stopped run admits no mutation"
+            );
+
+            // Everything the stop retained is exactly what it retained.
+            assert_eq!(
+                machine.attempts(),
+                attempts,
+                "a stopped machine counts no further attempts"
+            );
+            assert_eq!(machine.retained().cloned(), retained);
+            assert!(machine.marker_retained());
+        }
+    }
+
+    /// **F06.** A later window's deferral is not recorded against a run that has
+    /// already stopped, and a later error does not displace the latched one.
+    #[test]
+    fn f06_a_stopped_run_records_no_later_deferral_or_error() {
+        let mut machine = machine();
+        let original = FacadeError::protocol(Nfs4Status::IO, OpCode::Write, 1);
+        machine.enter(
+            CrashWindow::ServerEio,
+            &evidence().proven_loss().with_error(original.clone()),
+        );
+        assert_eq!(machine.state(), RecoveryState::Corrupted);
+        assert_eq!(machine.deferral(), None);
+
+        // SplitBrain defers to M3 and would latch its own error.
+        machine.enter(
+            CrashWindow::SplitBrain,
+            &evidence().with_error(FacadeError::Replay(ReplayError::Indeterminate)),
+        );
+        assert_eq!(machine.state(), RecoveryState::Corrupted);
+        assert_eq!(
+            machine.deferral(),
+            None,
+            "a stopped run is not being driven, so no window's deferral applies to it"
+        );
+        assert_eq!(machine.retained().expect("latched").error(), &original);
+    }
+
+    /// **F06.** A non-terminal state is still driven normally: the guard stops
+    /// stopped runs, not recovery.
+    #[test]
+    fn f06_a_recovering_run_is_still_driven() {
+        let mut machine = machine();
+        assert_eq!(
+            machine.enter(CrashWindow::TransientPartition, &evidence()),
+            RecoveryState::Recovering
+        );
+        assert_eq!(
+            machine.enter(CrashWindow::StaleFilehandle, &evidence().identity(true),),
+            RecoveryState::Running,
+            "recovery may still conclude the run is healthy"
+        );
+        assert_eq!(machine.attempts(), 2);
     }
 
     #[test]
