@@ -343,3 +343,253 @@ fn f11_a_deadline_needs_recovery_and_a_full_queue_is_still_retriable() {
     });
     assert_eq!(queue_full.class(), ErrorClass::Retriable);
 }
+
+// --- F15: a REMOVE that cannot prove what it unlinked stops the run ----------
+
+/// A transport that replaces the doomed name between the probe and the REMOVE.
+///
+/// The replacement travels over the wire — a real `REMOVE` then a creating
+/// `OPEN` — so the parent's `FATTR4_CHANGE` moves exactly as it would on a
+/// server, which is the evidence the fix reads. Seeding the fake's maps directly
+/// would not move it and would prove nothing.
+struct ReplaceBeforeRemove {
+    inner: FakeTransport,
+    fired: bool,
+    parent: umbra_storage_nfs_userspace::handle::FileHandle,
+    victim: Vec<u8>,
+}
+
+impl RawTransport for ReplaceBeforeRemove {
+    fn wire_profile(&self) -> umbra_storage_nfs_userspace::transport::WireProfile {
+        self.inner.wire_profile()
+    }
+    fn limits(&self) -> umbra_storage_nfs_userspace::transport::TransportLimits {
+        self.inner.limits()
+    }
+    fn connection(&self) -> umbra_storage_nfs_userspace::transport::ConnectionState {
+        self.inner.connection()
+    }
+    fn submit(
+        &mut self,
+        call: umbra_storage_nfs_userspace::transport::Compound,
+        call_deadline: Deadline,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::CompoundReply,
+    > {
+        use umbra_storage_nfs_userspace::transport::Nfs4Op;
+        let removes = call
+            .ops
+            .iter()
+            .any(|op| matches!(op, Nfs4Op::Remove { name } if name.as_bytes() == self.victim));
+        if removes && !self.fired {
+            self.fired = true;
+            // Another client unlinks the name and creates a different object
+            // under it, in the window between our probe and our REMOVE.
+            let parent = self.parent.clone();
+            let victim = name(&self.victim);
+            self.inner
+                .submit(
+                    umbra_storage_nfs_userspace::transport::Compound::new(
+                        *b"race",
+                        vec![
+                            Nfs4Op::PutFh(parent.clone()),
+                            Nfs4Op::Remove {
+                                name: victim.clone(),
+                            },
+                        ],
+                    ),
+                    call_deadline,
+                )
+                .expect("the racing unlink lands");
+            let owner = umbra_storage_nfs_userspace::handle::Session::establish(
+                umbra_storage_nfs_userspace::handle::SessionId(9),
+                umbra_storage_nfs_userspace::handle::ClientId(9),
+                umbra_storage_nfs_userspace::transport::ConnectionEpoch(1),
+            )
+            .open_owner(b"racer".to_vec())
+            .expect("a fresh session mints owners");
+            self.inner
+                .open(
+                    &parent,
+                    umbra_storage_nfs_userspace::transport::OpenArgs {
+                        seqid: 0,
+                        share_access: umbra_storage_nfs_userspace::transport::ShareAccess::BOTH,
+                        share_deny: umbra_storage_nfs_userspace::transport::ShareDeny::NONE,
+                        owner,
+                        how: umbra_storage_nfs_userspace::transport::OpenHow::Guarded {
+                            mode: 0o600,
+                        },
+                        claim: umbra_storage_nfs_userspace::transport::OpenClaim::Null {
+                            name: victim,
+                        },
+                    },
+                    call_deadline,
+                )
+                .expect("the racing create lands");
+        }
+        self.inner.submit(call, call_deadline)
+    }
+    fn cancel(
+        &mut self,
+        token: umbra_storage_nfs_userspace::transport::CallToken,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::Retirement,
+    > {
+        self.inner.cancel(token)
+    }
+    fn reconnect(
+        &mut self,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::ConnectionEpoch,
+    > {
+        self.inner.reconnect()
+    }
+    fn install_faults(&mut self, plan: Box<dyn umbra_storage_nfs_userspace::transport::FaultPlan>) {
+        self.inner.install_faults(plan)
+    }
+}
+
+/// **F15.** A racing replacement between the probe and the REMOVE is not reported
+/// as the caller's own removal, and the run does not release cleanly afterwards.
+///
+/// At the reviewed candidate the dispatcher proved the pinned identity, discarded
+/// the REMOVE's `ChangeInfo`, and answered `Removed` regardless — so the unlink of
+/// somebody else's object was reported as the caller's. REMOVE is a pathname
+/// operation and a name is not an object; no COMPOUND can make it one, because
+/// [RFC 7530 §14.2](https://www.rfc-editor.org/rfc/rfc7530.html#section-14.2)
+/// guarantees order but not atomicity. What the server *can* answer is whether
+/// its directory moved, and that is what the fix reads.
+#[test]
+fn f15_a_replacement_between_the_probe_and_the_remove_is_not_a_pinned_removal() {
+    let run_id = fresh_run();
+    let mut fake = seed_released_run(run_id, Some(0));
+    let root = walk(&mut fake, run_id, &[b"root"]);
+    fake.insert_file(&root, b"doomed.txt", b"mine".to_vec());
+
+    let mut storage = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(ReplaceBeforeRemove {
+            inner: fake,
+            fired: false,
+            parent: root,
+            victim: b"doomed.txt".to_vec(),
+        }),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("provider");
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let epoch = storage
+        .admission()
+        .expect("a run is open")
+        .admitted()
+        .epoch();
+    let refused = storage
+        .execute(&umbra_core::StorageRequest {
+            context: umbra_core::RequestContext {
+                run_id,
+                operation_id: umbra_core::OperationId(Uuid::new_v4()),
+                idempotency_key: umbra_core::IdempotencyKey("raced-unlink".into()),
+                writer_epoch: Some(epoch),
+            },
+            operation: umbra_core::StorageOperation::Unlink {
+                path: path(b"doomed.txt"),
+            },
+        })
+        .expect_err("a removal whose target cannot be proven is not a success");
+    assert!(
+        refused
+            .context
+            .contains("cannot be shown to be the object the caller pinned"),
+        "the diagnosis must say what could not be proven: {}",
+        refused.context
+    );
+
+    // The run stopped: a fresh, entirely unrelated mutation is refused with the
+    // original diagnosis carried forward.
+    let stopped = storage
+        .execute(&umbra_core::StorageRequest {
+            context: umbra_core::RequestContext {
+                run_id,
+                operation_id: umbra_core::OperationId(Uuid::new_v4()),
+                idempotency_key: umbra_core::IdempotencyKey("after-raced-unlink".into()),
+                writer_epoch: Some(epoch),
+            },
+            operation: umbra_core::StorageOperation::Create {
+                path: path(b"unrelated.txt"),
+                options: umbra_core::CreateOptions {
+                    kind: umbra_core::CreateKind::File,
+                    mode: 0o644,
+                },
+            },
+        })
+        .expect_err("a run holding an unprovable removal admits no new mutation");
+    assert_eq!(stopped.kind, ErrorKind::InvalidState);
+    assert!(
+        stopped.context.contains("this run is stopped"),
+        "the refusal must name the state: {}",
+        stopped.context
+    );
+
+    // And no clean release follows: the marker stays held.
+    let lease = storage.admission().expect("admitted").lease();
+    let release = storage
+        .release_writer(&lease)
+        .expect_err("a release over an unprovable removal is not clean");
+    assert_eq!(release.kind, ErrorKind::LeaseLost);
+    assert!(
+        storage.admission().is_some(),
+        "a refused release retains admission"
+    );
+}
+
+/// **F15.** An undisturbed unlink still succeeds. The evidence check is a proof
+/// obligation, not a new refusal of ordinary pathname removal.
+#[test]
+fn f15_an_undisturbed_unlink_is_still_a_clean_removal() {
+    let run_id = fresh_run();
+    let mut fake = seed_released_run(run_id, Some(0));
+    let root = walk(&mut fake, run_id, &[b"root"]);
+    fake.insert_file(&root, b"quiet.txt", b"mine".to_vec());
+    let mut storage = over(fake);
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let epoch = storage
+        .admission()
+        .expect("a run is open")
+        .admitted()
+        .epoch();
+    let removed = storage
+        .execute(&umbra_core::StorageRequest {
+            context: umbra_core::RequestContext {
+                run_id,
+                operation_id: umbra_core::OperationId(Uuid::new_v4()),
+                idempotency_key: umbra_core::IdempotencyKey("quiet-unlink".into()),
+                writer_epoch: Some(epoch),
+            },
+            operation: umbra_core::StorageOperation::Unlink {
+                path: path(b"quiet.txt"),
+            },
+        })
+        .expect("an undisturbed unlink removes the name it proved");
+    assert!(matches!(removed, umbra_core::StorageResponse::Unlinked));
+
+    // And the run carries on.
+    storage
+        .execute(&umbra_core::StorageRequest {
+            context: umbra_core::RequestContext {
+                run_id,
+                operation_id: umbra_core::OperationId(Uuid::new_v4()),
+                idempotency_key: umbra_core::IdempotencyKey("after-quiet".into()),
+                writer_epoch: Some(epoch),
+            },
+            operation: umbra_core::StorageOperation::Create {
+                path: path(b"next.txt"),
+                options: umbra_core::CreateOptions {
+                    kind: umbra_core::CreateKind::File,
+                    mode: 0o644,
+                },
+            },
+        })
+        .expect("nothing about a proven removal stops the run");
+}

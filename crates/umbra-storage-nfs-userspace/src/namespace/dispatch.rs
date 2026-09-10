@@ -21,8 +21,8 @@ use umbra_core::{MetadataUpdate, RenameMode};
 use crate::error::{AuthorityError, FacadeError, FacadeResult, Nfs4Status};
 use crate::handle::{FileHandle, ObjectIdentity, Stateid};
 use crate::transport::{
-    AttrMask, AttrValues, ComponentName, Compound, CreateType, Deadline, Nfs4Op, Nfs4Time,
-    Nfs4Type, OpCode, OpReply, RawTransport,
+    AttrMask, AttrValues, ChangeInfo, ComponentName, Compound, CreateType, Deadline, Nfs4Op,
+    Nfs4Time, Nfs4Type, OpCode, OpReply, RawTransport,
 };
 
 use super::{
@@ -89,6 +89,25 @@ impl NamespaceDispatcher for TransportDispatcher {
                 target,
                 kind,
             } => {
+                // **F15.** The directory's change attribute *before* anything is
+                // probed. REMOVE is a pathname operation, and a name is not an
+                // object: between the probe below and the REMOVE that follows it,
+                // another client can unlink this name and create a different
+                // object under it. The candidate proved the identity, discarded
+                // the REMOVE's `ChangeInfo`, and reported the pinned removal
+                // regardless — so a racing replacement was reported as the
+                // caller's own.
+                //
+                // This is the reading the protocol supports. RFC 7530 §14.2
+                // preserves operation *order* within a COMPOUND and guarantees no
+                // atomicity across one, so a VERIFY/NVERIFY guard would be an
+                // atomicity claim v4.0 cannot make; it is deliberately not used.
+                // What the server can be asked is whether its directory moved,
+                // which is what `cinfo` reports.
+                let before = transport
+                    .getattr(parent, AttrMask::CHANGE, deadline)?
+                    .change;
+
                 // Prove what the name resolves to before unlinking it: the caller
                 // pinned an identity and asked for a specific kind, and a name
                 // that has been replaced since is a different object.
@@ -109,7 +128,24 @@ impl NamespaceDispatcher for TransportDispatcher {
                     (RemoveKind::Directory, _) => {
                         return Err(status(Nfs4Status::NOTDIR, OpCode::Remove));
                     }
-                    (RemoveKind::File, _) => {}
+                    // **F13.** A known non-directory. `RemoveKind::File` covers a
+                    // regular file *and* a logical-symlink name — see
+                    // [`RemoveKind`](super::RemoveKind) — so this deliberately
+                    // does not narrow to `Nfs4Type::Regular`; that would refuse
+                    // removals the contract supports.
+                    (RemoveKind::File, Some(_)) => {}
+                    // **F13.** No `FATTR4_TYPE` at all. The probe exists to prove
+                    // what the name resolves to, and a reply with no type proves
+                    // nothing: accepting it dispatched an unlink against an object
+                    // whose kind was never established, which is exactly what the
+                    // directory arm above already refuses.
+                    (RemoveKind::File, None) => {
+                        return Err(unproven(format!(
+                            "the server answered without FATTR4_TYPE for {}, so it cannot be \
+                             shown to be a kind this unlink may remove",
+                            String::from_utf8_lossy(name.as_bytes())
+                        )));
+                    }
                 }
 
                 let reply = transport
@@ -124,10 +160,12 @@ impl NamespaceDispatcher for TransportDispatcher {
                         deadline,
                     )
                     .map_err(FacadeError::Transport)?;
-                match reply.expect(1)? {
-                    OpReply::Remove(_) => Ok(NamespaceOutcome::Removed),
-                    other => Err(shape(OpCode::Remove, other.opcode())),
-                }
+                let info = match reply.expect(1)? {
+                    OpReply::Remove(info) => *info,
+                    other => return Err(shape(OpCode::Remove, other.opcode())),
+                };
+                remove_evidence(name, before, info)?;
+                Ok(NamespaceOutcome::Removed)
             }
 
             NamespaceMutation::Rename {
@@ -230,7 +268,10 @@ impl NamespaceDispatcher for TransportDispatcher {
                 target,
                 update,
             } => {
-                let values = attr_values(update);
+                // F14: an unrepresentable timestamp stops the update here,
+                // before any SETATTR is dispatched, so a mixed update can never
+                // apply half of what it named.
+                let values = attr_values(update)?;
                 if values.is_empty() {
                     // An update that names nothing would report a metadata change
                     // that never happened.
@@ -337,35 +378,109 @@ impl TransportDispatcher {
     }
 }
 
+/// Whether a REMOVE's own change info proves it unlinked the name that was
+/// probed (**F15**).
+///
+/// `captured` is the directory's `FATTR4_CHANGE` read before the probe. When the
+/// server reports that same value as the change it saw immediately *before* the
+/// REMOVE, nothing happened in that directory across the whole probe → REMOVE
+/// window, so the object proven under the name is the object the name still held
+/// when it was unlinked.
+///
+/// Everything else is uncertain, and uncertain is reported as uncertain. The
+/// answer is deliberately not a success and deliberately not a retriable failure:
+/// the REMOVE returned `NFS4ERR_OK`, so a name really is gone, and re-running it
+/// would unlink whatever occupies the name next. There is nothing to roll back
+/// either, for the same reason.
+///
+/// The refusal carries [`journal::BLOCKED_RECOVERABLE`](crate::journal::BLOCKED_RECOVERABLE),
+/// which is the failure model's state for "evidence matching neither deterministic
+/// outcome": `NfsUserspaceStorage` latches it, refuses later mutations with this
+/// diagnosis carried forward verbatim, and cannot report a clean release. The
+/// evidence and the server state are both left exactly as they are.
+///
+/// A server that never reports `cinfo.atomic` therefore makes every pinned unlink
+/// uncertain. That is the conservative direction and it is the intended one: a
+/// false pinned removal reports that the caller's object is gone when another
+/// client's object is what was destroyed.
+fn remove_evidence(
+    name: &ComponentName,
+    captured: Option<u64>,
+    info: ChangeInfo,
+) -> FacadeResult<()> {
+    let name = String::from_utf8_lossy(name.as_bytes()).into_owned();
+    let why = match captured {
+        Some(captured) if info.atomic && info.before == captured => return Ok(()),
+        Some(captured) if info.atomic => format!(
+            "the directory holding {name} changed from {captured} to {} between the probe and \
+             the REMOVE",
+            info.before
+        ),
+        Some(_) => format!(
+            "the server did not report atomic change info for the REMOVE of {name}, so its \
+             before-state cannot rule out a replacement between the probe and the unlink"
+        ),
+        None => format!(
+            "the server answered without FATTR4_CHANGE for the directory holding {name}, so \
+             there is no before-state to compare the REMOVE against"
+        ),
+    };
+    Err(unproven(format!(
+        "{} the REMOVE of {name} succeeded, but {why}; the name that was unlinked cannot be \
+         shown to be the object the caller pinned. Re-running it would unlink whatever holds \
+         the name next, so the run stops with the evidence retained rather than reporting a \
+         removal it cannot prove.",
+        crate::journal::BLOCKED_RECOVERABLE
+    )))
+}
+
 /// Translate the contract's [`MetadataUpdate`] into settable NFSv4 attributes.
 ///
 /// `uid` and `gid` become `FATTR4_OWNER` / `FATTR4_OWNER_GROUP`, which NFSv4
 /// carries as name strings. Under AUTH_SYS with no idmapper the numeric form is
 /// the identity string a server accepts, so the number is rendered verbatim
 /// rather than mapped to a name this provider cannot verify.
-fn attr_values(update: &MetadataUpdate) -> AttrValues {
-    AttrValues {
+///
+/// **F14.** Fallible, because a time that cannot be represented must stop the
+/// update rather than shrink it. See [`nfs_time`].
+fn attr_values(update: &MetadataUpdate) -> FacadeResult<AttrValues> {
+    Ok(AttrValues {
         size: None,
         mode: update.mode,
         owner: update.uid.map(|uid| uid.to_string().into_bytes()),
         owner_group: update.gid.map(|gid| gid.to_string().into_bytes()),
-        time_access: update.accessed_nanos.and_then(nfs_time),
-        time_modify: update.modified_nanos.and_then(nfs_time),
-    }
+        time_access: update.accessed_nanos.map(nfs_time).transpose()?,
+        time_modify: update.modified_nanos.map(nfs_time).transpose()?,
+    })
 }
 
 /// Split nanoseconds since the epoch into `nfstime4`.
 ///
-/// Returns `None` when the value cannot be represented, so an out-of-range time
-/// is dropped rather than wrapped into a plausible wrong one. The caller's
-/// `attrset` check then reports the attribute as unset.
-fn nfs_time(nanos: i128) -> Option<Nfs4Time> {
+/// **F14.** An unrepresentable value is refused, not dropped. It used to return
+/// `None`, on the stated reasoning that "the caller's `attrset` check then
+/// reports the attribute as unset" — which was not true of any caller. The mask
+/// the SETATTR is checked against is computed from the values that survived this
+/// conversion, so a dropped attribute was never in the requested set and nothing
+/// noticed it was missing. A `SetMetadata` naming mode *and* an out-of-range
+/// mtime therefore applied the mode, left the time alone, and answered
+/// `AttributesSet`: a partial effect reported as a whole one. A time-only update
+/// was refused only because the resulting value set was empty.
+///
+/// Refusing before the SETATTR is dispatched is what keeps it from being partial.
+///
+/// The Euclidean division is deliberate: `nfstime4.nseconds` is unsigned, so a
+/// pre-epoch time must floor the seconds and carry a positive remainder rather
+/// than truncate toward zero.
+fn nfs_time(nanos: i128) -> FacadeResult<Nfs4Time> {
     let seconds = nanos.div_euclid(1_000_000_000);
     let remainder = nanos.rem_euclid(1_000_000_000);
-    Some(Nfs4Time {
-        seconds: i64::try_from(seconds).ok()?,
-        nanoseconds: u32::try_from(remainder).ok()?,
-    })
+    match (i64::try_from(seconds), u32::try_from(remainder)) {
+        (Ok(seconds), Ok(nanoseconds)) => Ok(Nfs4Time {
+            seconds,
+            nanoseconds,
+        }),
+        _ => Err(status(Nfs4Status::INVAL, OpCode::SetAttr)),
+    }
 }
 
 /// Object identity from a reply, or a refusal naming what was missing.
@@ -435,6 +550,285 @@ mod tests {
         transport
             .lookup(parent, &name(component), AttrMask::IDENTITY, deadline)
             .is_ok()
+    }
+
+    /// **F13.** A name whose type the server did not report is not unlinked.
+    ///
+    /// The probe exists to prove what the name resolves to; the module comment
+    /// says so. The candidate's wildcard `(RemoveKind::File, _)` arm accepted
+    /// `None` — no `FATTR4_TYPE` in the reply — and dispatched the REMOVE anyway,
+    /// against an object whose kind was never established. The directory arm had
+    /// always refused the same absence.
+    ///
+    /// The refusal is not narrowed to `Nfs4Type::Regular`: `RemoveKind::File`
+    /// covers a logical-symlink name too, and refusing those would break unlinks
+    /// the contract supports.
+    #[test]
+    fn f13_a_remove_without_a_reported_type_is_refused_before_any_unlink() {
+        struct NoType(FakeTransport);
+        impl RawTransport for NoType {
+            fn wire_profile(&self) -> crate::transport::WireProfile {
+                self.0.wire_profile()
+            }
+            fn limits(&self) -> TransportLimits {
+                self.0.limits()
+            }
+            fn connection(&self) -> crate::transport::ConnectionState {
+                self.0.connection()
+            }
+            fn submit(
+                &mut self,
+                call: Compound,
+                deadline: Deadline,
+            ) -> crate::transport::TransportResult<crate::transport::CompoundReply> {
+                let mut reply = self.0.submit(call, deadline)?;
+                // A server that answers the GETATTR without FATTR4_TYPE.
+                for result in &mut reply.results {
+                    if let crate::transport::OpReply::GetAttr(attributes) = result {
+                        attributes.file_type = None;
+                    }
+                }
+                Ok(reply)
+            }
+            fn cancel(
+                &mut self,
+                token: crate::transport::CallToken,
+            ) -> crate::transport::TransportResult<crate::transport::Retirement> {
+                self.0.cancel(token)
+            }
+            fn reconnect(
+                &mut self,
+            ) -> crate::transport::TransportResult<crate::transport::ConnectionEpoch> {
+                self.0.reconnect()
+            }
+            fn install_faults(&mut self, plan: Box<dyn crate::transport::FaultPlan>) {
+                self.0.install_faults(plan)
+            }
+        }
+
+        let mut fake = FakeTransport::new();
+        let root = fake.root();
+        fake.insert_file(&root, b"untyped", b"bytes".to_vec());
+        let (_, target) = resolve(&mut fake, &root, b"untyped");
+        let mut transport = NoType(fake);
+
+        let mut dispatcher = TransportDispatcher::new();
+        let refused = dispatcher
+            .dispatch(
+                &mut transport,
+                &NamespaceMutation::Remove {
+                    parent: root.clone(),
+                    name: name(b"untyped"),
+                    target,
+                    kind: RemoveKind::File,
+                },
+            )
+            .expect_err("an unknown type is not a kind this unlink may remove");
+        assert!(
+            matches!(
+                refused,
+                FacadeError::Authority(AuthorityError::IdentityUnproven(_))
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            exists(&mut transport.0, &root, b"untyped"),
+            "the refusal must land before anything is unlinked"
+        );
+    }
+
+    /// **F13.** A known non-directory is still removed. The refusal above is
+    /// about absent evidence, not about narrowing the supported kinds.
+    #[test]
+    fn f13_a_known_non_directory_is_still_unlinked() {
+        let mut fake = FakeTransport::new();
+        let root = fake.root();
+        fake.insert_file(&root, b"ordinary", b"bytes".to_vec());
+        let (_, target) = resolve(&mut fake, &root, b"ordinary");
+
+        let mut dispatcher = TransportDispatcher::new();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &mut fake,
+                    &NamespaceMutation::Remove {
+                        parent: root.clone(),
+                        name: name(b"ordinary"),
+                        target,
+                        kind: RemoveKind::File,
+                    },
+                )
+                .expect("a typed regular file unlinks"),
+            NamespaceOutcome::Removed
+        );
+        assert!(!exists(&mut fake, &root, b"ordinary"));
+    }
+
+    /// **F14.** A mixed mode-and-time update whose time cannot be represented is
+    /// refused before any SETATTR reaches the wire.
+    ///
+    /// `nfs_time` returned `None` for an out-of-range value and `attr_values`
+    /// dropped it, on the stated reasoning that "the caller's `attrset` check
+    /// then reports the attribute as unset". No caller did that: the requested
+    /// mask is computed from the values that survived the conversion, so the
+    /// dropped attribute was never in the requested set and nothing noticed. The
+    /// update applied the mode, left the time alone, and answered `AttributesSet`
+    /// — a partial effect reported as a whole one.
+    #[test]
+    fn f14_an_unrepresentable_time_refuses_the_whole_metadata_update() {
+        let mut fake = FakeTransport::new();
+        let root = fake.root();
+        fake.insert_file(&root, b"stamped", b"bytes".to_vec());
+        let (handle, target) = resolve(&mut fake, &root, b"stamped");
+        let before = fake
+            .getattr(&handle, AttrMask::STAT, deadline(&fake))
+            .expect("attributes");
+
+        let mut dispatcher = TransportDispatcher::new();
+        for update in [
+            // Mixed: a mode that is perfectly settable beside a time that is not.
+            MetadataUpdate {
+                mode: Some(0o700),
+                uid: None,
+                gid: None,
+                accessed_nanos: None,
+                modified_nanos: Some(i128::MAX),
+            },
+            // The other timestamp field, and the negative extreme.
+            MetadataUpdate {
+                mode: Some(0o700),
+                uid: None,
+                gid: None,
+                accessed_nanos: Some(i128::MIN),
+                modified_nanos: None,
+            },
+        ] {
+            let refused = dispatcher
+                .dispatch(
+                    &mut fake,
+                    &NamespaceMutation::SetAttributes {
+                        object: handle.clone(),
+                        target,
+                        update,
+                    },
+                )
+                .expect_err("an unrepresentable time refuses the update");
+            assert_eq!(
+                refused.status(),
+                Some(Nfs4Status::INVAL),
+                "the refusal names the invalid argument: {refused:?}"
+            );
+        }
+
+        let after = fake
+            .getattr(&handle, AttrMask::STAT, deadline(&fake))
+            .expect("attributes");
+        assert_eq!(
+            after.mode, before.mode,
+            "nothing may be applied by an update that was refused"
+        );
+        assert_eq!(after.time_modify, before.time_modify);
+    }
+
+    /// **F14.** Representable times still work, negative ones included, and the
+    /// Euclidean split keeps `nseconds` unsigned.
+    #[test]
+    fn f14_representable_times_are_still_applied_including_pre_epoch() {
+        assert_eq!(
+            nfs_time(0).expect("the epoch is representable"),
+            Nfs4Time {
+                seconds: 0,
+                nanoseconds: 0
+            }
+        );
+        assert_eq!(
+            nfs_time(-1).expect("one nanosecond before the epoch"),
+            Nfs4Time {
+                seconds: -1,
+                nanoseconds: 999_999_999
+            },
+            "a pre-epoch time floors the seconds and carries a positive remainder"
+        );
+        let max = i128::from(i64::MAX) * 1_000_000_000 + 999_999_999;
+        assert_eq!(
+            nfs_time(max).expect("the representable ceiling"),
+            Nfs4Time {
+                seconds: i64::MAX,
+                nanoseconds: 999_999_999
+            }
+        );
+        assert!(
+            nfs_time(max + 1).is_err(),
+            "one past the ceiling is refused"
+        );
+        let min = i128::from(i64::MIN) * 1_000_000_000;
+        assert_eq!(
+            nfs_time(min).expect("the representable floor").seconds,
+            i64::MIN
+        );
+        assert!(nfs_time(min - 1).is_err(), "one past the floor is refused");
+    }
+
+    /// **F15.** A REMOVE whose change info cannot rule out a replacement is not
+    /// reported as the pinned removal.
+    #[test]
+    fn f15_remove_evidence_accepts_only_an_unmoved_atomic_before() {
+        let doomed = name(b"doomed");
+        assert!(remove_evidence(
+            &doomed,
+            Some(7),
+            ChangeInfo {
+                atomic: true,
+                before: 7,
+                after: 8
+            }
+        )
+        .is_ok());
+
+        for (captured, info, why) in [
+            (
+                Some(7),
+                ChangeInfo {
+                    atomic: true,
+                    before: 9,
+                    after: 10,
+                },
+                "the directory moved between the probe and the unlink",
+            ),
+            (
+                Some(7),
+                ChangeInfo {
+                    atomic: false,
+                    before: 7,
+                    after: 8,
+                },
+                "a non-atomic before-state cannot rule out the race",
+            ),
+            (
+                None,
+                ChangeInfo {
+                    atomic: true,
+                    before: 7,
+                    after: 8,
+                },
+                "no captured before-state to compare against",
+            ),
+        ] {
+            let refused = remove_evidence(&doomed, captured, info)
+                .expect_err(why)
+                .to_umbra("execute.unlink");
+            assert!(
+                crate::journal::is_blocked(&refused),
+                "{why}: the run must stop with the evidence retained, got {refused:?}"
+            );
+            assert!(
+                refused
+                    .context
+                    .contains("cannot be shown to be the object the caller pinned"),
+                "{why}: the diagnosis must say what could not be proven: {}",
+                refused.context
+            );
+        }
     }
 
     #[test]

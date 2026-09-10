@@ -456,9 +456,15 @@ fn blocked(operation: &str, detail: &str) -> UmbraError {
 }
 
 /// Whether an error is one of this module's blocked-recoverable stops.
+///
+/// `contains` rather than `starts_with` (**F15**): a stop can also be raised by a
+/// facade below this module, and `FacadeError::to_umbra` renders its own domain
+/// prefix ahead of the detail. The token is not prose a message would carry by
+/// accident — it exists to be matched on, and writing it into a diagnostic is how
+/// a caller declares the state deliberately.
 #[must_use]
 pub fn is_blocked(error: &UmbraError) -> bool {
-    error.context.starts_with(BLOCKED_RECOVERABLE)
+    error.context.contains(BLOCKED_RECOVERABLE)
 }
 
 /// Decide, from evidence, whether an interrupted mutation took effect.
