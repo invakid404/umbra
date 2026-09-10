@@ -32,6 +32,7 @@
 use std::sync::{Arc, Mutex};
 
 use umbra_core::{IdempotencyKey, OperationId};
+use umbra_storage_nfs_userspace::error::ReplayError;
 use umbra_storage_nfs_userspace::error::{AuthorityError, FacadeError, Nfs4Status, TransportError};
 use umbra_storage_nfs_userspace::fake::{FakeReplayLog, FakeTransport};
 use umbra_storage_nfs_userspace::handle::{OpenFile, Stateid};
@@ -42,7 +43,7 @@ use umbra_storage_nfs_userspace::state::open_owner::{
     close, confirm_open, downgrade_with, CloseOutcome, OpenOutcome, OpenRequest,
 };
 use umbra_storage_nfs_userspace::state::reclaim::{ReclaimPlan, SurrenderCause};
-use umbra_storage_nfs_userspace::state::retained_errors::RetainedErrorLedger;
+use umbra_storage_nfs_userspace::state::retained_errors::{is_settled, RetainedErrorLedger};
 use umbra_storage_nfs_userspace::state::verifier::{check_commit, note_write, WriteRecord};
 use umbra_storage_nfs_userspace::state::{Incarnation, ProtocolState};
 use umbra_storage_nfs_userspace::transport::{
@@ -527,18 +528,43 @@ fn row_retained_error(
         return Ok(());
     };
     let status = error.status();
+    let settled = is_settled(&error);
+
+    // **F19.** A fake transport observation is not persistence evidence, so the
+    // record is volatile. This row used to pass `true` for every cell, which is
+    // how an `NFS4ERR_DELAY` — a condition the server explicitly asks the client
+    // to retry — became a durably settled answer that every later retry of the
+    // key read back as final.
     ledger
         .retain(
             OperationId(uuid::Uuid::from_u128(7)),
             &retained_key,
-            error,
-            true,
+            error.clone(),
+            false,
         )
         .map_err(|error| format!("retaining a fresh key failed: {error}"))?;
     if ledger.status(&retained_key) != status {
         return Err("the retained error lost its original NFS4ERR code".into());
     }
-    Ok(())
+    if ledger.is_durably_settled(&retained_key) {
+        return Err("a volatile record must not report itself durably settled".into());
+    }
+
+    // And the durable path answers according to what the failure actually is.
+    let durable = ledger.retain(
+        OperationId(uuid::Uuid::from_u128(8)),
+        &key("matrix-retained-durable"),
+        error,
+        true,
+    );
+    match (settled, durable) {
+        (true, Ok(_)) | (false, Err(ReplayError::Indeterminate)) => Ok(()),
+        (true, Err(error)) => Err(format!("a settled failure must retain durably: {error}")),
+        (false, Ok(_)) => {
+            Err("a transient failure must not be retained as a durable answer".into())
+        }
+        (false, Err(error)) => Err(format!("expected Indeterminate, got {error}")),
+    }
 }
 
 // --- Matrix ------------------------------------------------------------------
