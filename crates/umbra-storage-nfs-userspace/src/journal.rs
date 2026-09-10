@@ -484,28 +484,54 @@ fn recover(
     recorded: &Preconditions,
     observed: &Preconditions,
 ) -> Recovery {
-    // The parent must still be the same directory in every case. If it is not,
-    // the mutation's addressing is no longer meaningful.
-    if let (Some(before), Some(now)) = (recorded.parent, observed.parent) {
-        if before.identity != now.identity {
-            return Recovery::Ambiguous(format!(
-                "the parent directory was {:?} before dispatch and is {:?} now",
-                before.identity, now.identity
-            ));
-        }
-    } else if recorded.parent.is_some() != observed.parent.is_some() {
-        return Recovery::Ambiguous(
-            "the parent directory was resolvable before dispatch and is not now, or the \
-             reverse"
-                .to_owned(),
-        );
+    // The parent must still be the same directory in every case: if it is not,
+    // the mutation's addressing is no longer meaningful, whatever else holds.
+    if let Err(why) = parent_identity("the parent directory", recorded.parent, observed.parent) {
+        return Recovery::Ambiguous(why);
     }
 
     match operation {
-        // --- creations: absent before, present after -----------------------
+        // --- creations: the create verifier is the proof, not the name -----
+        //
+        // **R4-002.** This arm used to read "the name was absent, the name is
+        // present, therefore our create landed" and settle a `Created` response
+        // built from whatever object it found. Two things break that.
+        //
+        // A supported create is two steps: `EXCLUSIVE4` OPEN, then the SETATTR
+        // that applies the requested mode (R1-007). An interruption between them
+        // leaves a file with the server's default mode, and declaring the
+        // operation Applied stored a success for an operation that had not
+        // finished. And the name may hold somebody else's object entirely — a
+        // directory, even — which our file-create could never have produced.
+        //
+        // Presence is not proof, but the protocol already carries one.
+        // `EXCLUSIVE4` exists precisely so a replayed create can be recognised:
+        // the verifier is derived deterministically from the operation id
+        // (`state::verifier::create_verifier_for`), which the durable record
+        // holds, so a redispatch presents the *same* verifier the first attempt
+        // used. The server answers success if that verifier is the one it stored
+        // for the object — our create, replayed — and `NFS4ERR_EXIST` if it is
+        // not. Redispatching also re-runs the SETATTR, which is what completes a
+        // partial create rather than papering over it.
+        //
+        // So recovery never settles a create from observation. It hands the
+        // decision to the server, which is the only party that can make it.
         StorageOperation::Create { .. } => match (recorded.target, observed.target) {
+            // R4-003: concluding "redispatch" means asserting the namespace is
+            // still the one this create was addressed against. A parent whose
+            // change attribute moved is a directory something happened in, and
+            // this decision cannot attribute that to the interrupted operation.
+            (None, None) | (None, Some(_))
+                if parent_unchanged("the parent directory", recorded.parent, observed.parent)
+                    .is_err() =>
+            {
+                Recovery::Ambiguous(
+                    parent_unchanged("the parent directory", recorded.parent, observed.parent)
+                        .unwrap_err(),
+                )
+            }
             (None, None) => Recovery::NotApplied,
-            (None, Some(_)) => Recovery::Applied,
+            (None, Some(_)) => Recovery::NotApplied,
             // It already existed before dispatch, unchanged: the request would
             // have failed the same way again, and re-running reproduces that
             // answer without repeating an effect.
@@ -539,12 +565,27 @@ fn recover(
                     }
                     _ => Recovery::Applied,
                 },
-                (Some(before), Some(now)) if now.unchanged_from(&before) => Recovery::NotApplied,
+                // R4-003: "nothing was removed" asserts the directory is
+                // untouched, so the directory's own change attribute is part of
+                // the proof. (The *Applied* arm above is the documented
+                // exception: a parent whose change attribute moved is the
+                // signature a removal leaves, not a contradiction of it.)
+                (Some(before), Some(now)) if now.unchanged_from(&before) => {
+                    match parent_unchanged("the parent directory", recorded.parent, observed.parent)
+                    {
+                        Ok(()) => Recovery::NotApplied,
+                        Err(why) => Recovery::Ambiguous(why),
+                    }
+                }
                 (None, None) => {
                     // It was already gone before dispatch, so the request would
                     // have failed NOENT either way; re-running reproduces that
                     // answer without repeating an effect.
-                    Recovery::NotApplied
+                    match parent_unchanged("the parent directory", recorded.parent, observed.parent)
+                    {
+                        Ok(()) => Recovery::NotApplied,
+                        Err(why) => Recovery::Ambiguous(why),
+                    }
                 }
                 (before, now) => Recovery::Ambiguous(format!(
                     "the removal target was {:?} before dispatch and is {:?} now",
@@ -560,16 +601,12 @@ fn recover(
         // ordinary replacing RENAME over a destination that changed under the
         // interruption destroys whatever replaced it.
         StorageOperation::Rename { .. } => {
-            if let (Some(before), Some(now)) =
-                (recorded.destination_parent, observed.destination_parent)
-            {
-                if before.identity != now.identity {
-                    return Recovery::Ambiguous(format!(
-                        "the rename destination's parent was {:?} before dispatch and is {:?} \
-                         now",
-                        before.identity, now.identity
-                    ));
-                }
+            if let Err(why) = parent_identity(
+                "the rename destination's parent",
+                recorded.destination_parent,
+                observed.destination_parent,
+            ) {
+                return Recovery::Ambiguous(why);
             }
             let moved = recorded.target.map(|e| e.identity);
             let source_now = observed.target;
@@ -596,6 +633,31 @@ fn recover(
                 _ => false,
             };
             if source_still_there && destination_untouched {
+                // **R4-003.** Both endpoint names looking untouched is not enough
+                // to conclude that nothing happened. A rename mutates *two*
+                // directories, so their change attributes are part of this
+                // operation's before-state; round 3 recorded them and then
+                // compared only identities. An interrupted rename that applied,
+                // followed by external namespace activity that restored the
+                // observed names, presents exactly the endpoint state this branch
+                // reads as "not applied" — and re-dispatching it would move the
+                // object a second time.
+                for (label, before, now) in [
+                    (
+                        "the rename source's parent",
+                        recorded.parent,
+                        observed.parent,
+                    ),
+                    (
+                        "the rename destination's parent",
+                        recorded.destination_parent,
+                        observed.destination_parent,
+                    ),
+                ] {
+                    if let Err(why) = parent_unchanged(label, before, now) {
+                        return Recovery::Ambiguous(why);
+                    }
+                }
                 return Recovery::NotApplied;
             }
             Recovery::Ambiguous(format!(
@@ -652,7 +714,69 @@ fn recover(
     }
 }
 
-/// Build the response a recovered effect settles to.
+/// The parent must be the same object. Nothing else is asserted here.
+fn parent_identity(
+    label: &str,
+    recorded: Option<ObjectEvidence>,
+    observed: Option<ObjectEvidence>,
+) -> std::result::Result<(), String> {
+    match (recorded, observed) {
+        (None, None) => Ok(()),
+        (Some(before), Some(now)) if before.identity == now.identity => Ok(()),
+        (Some(before), Some(now)) => Err(format!(
+            "{label} was {:?} before dispatch and is {:?} now",
+            before.identity, now.identity
+        )),
+        _ => Err(format!(
+            "{label} was resolvable before dispatch and is not now, or the reverse"
+        )),
+    }
+}
+
+/// The parent must be the same object *in the same state*.
+///
+/// **R4-003.** Round 3 recorded `FATTR4_CHANGE`, size and mtime for both parents
+/// and then compared only their identities, so a namespace edit that moved a
+/// directory's change attribute was invisible to the decision.
+///
+/// This guards the *redispatch* conclusion specifically, which is the dangerous
+/// one: saying "nothing happened, run it again" asserts the namespace is still
+/// the one the operation was addressed against. A directory's change attribute
+/// moves on any mutation within it, so this cannot distinguish the interrupted
+/// operation's own effect from a sibling edit — and the failure model forbids
+/// reading an absent conflict signal as proof of no conflict, so an unexplained
+/// signal is a safe give-up.
+///
+/// Two conclusions deliberately do *not* consult it, each for a stated reason:
+///
+/// * a removal or rename settled as **Applied**, where a moved parent change
+///   attribute is the signature the operation leaves rather than a contradiction;
+/// * an **in-place** mutation, whose postcondition is entirely within one object.
+///   A write, truncate or attribute set does not touch its parent directory, so
+///   the object's own change attribute is a complete before/after proof and a
+///   sibling's edit in the same directory is genuinely irrelevant to it.
+fn parent_unchanged(
+    label: &str,
+    recorded: Option<ObjectEvidence>,
+    observed: Option<ObjectEvidence>,
+) -> std::result::Result<(), String> {
+    parent_identity(label, recorded, observed)?;
+    match (recorded, observed) {
+        (None, None) => Ok(()),
+        (Some(before), Some(now)) if now.unchanged_from(&before) => Ok(()),
+        (Some(before), Some(now)) => Err(format!(
+            "{label} is the same directory but its state moved (change {:?} -> {:?}); something \
+             was mutated in it since dispatch, and this decision cannot attribute that to the \
+             interrupted operation",
+            before.change, now.change
+        )),
+        _ => Err(format!(
+            "{label} was resolvable before dispatch and is not now, or the reverse"
+        )),
+    }
+}
+
+/// Build the response a recovered effect settles to./// Build the response a recovered effect settles to.
 ///
 /// **R3-001.** This used to block for creates and renames, because the journal
 /// holds no operations surface and could not rebuild an `ObjectResult` from
@@ -667,18 +791,17 @@ fn recovered_response(
     match operation {
         StorageOperation::Unlink { .. } => Ok(StorageResponse::Unlinked),
         StorageOperation::RemoveDirectory { .. } => Ok(StorageResponse::DirectoryRemoved),
-        StorageOperation::Create { .. } | StorageOperation::CreateParents { .. } => observed
-            .target_result
-            .clone()
-            .map(StorageResponse::Created)
-            .ok_or_else(|| {
-                blocked(
-                    label,
-                    "the interrupted create took effect but the created object could not be \
-                     read back, so no result can be reported for it; the record is retained \
-                     and the run is blocked rather than answered with a fabricated result",
-                )
-            }),
+        // R4-002: a create is never settled as Applied — the exclusive verifier
+        // decides it on redispatch — so reaching here means the decision table
+        // and this builder have drifted apart. Blocking is the safe answer to
+        // that, and it is never a fabricated success.
+        StorageOperation::Create { .. } | StorageOperation::CreateParents { .. } => Err(blocked(
+            label,
+            "a create is settled by replaying its exclusive-create verifier, never by \
+             observing that its name exists; reaching this point means the recovery \
+             decision and the response builder disagree, so the run is blocked rather \
+             than answered",
+        )),
         // A rename's effect is at the destination, which is where the object now
         // is.
         StorageOperation::Rename { .. } => observed

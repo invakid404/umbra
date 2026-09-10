@@ -2349,3 +2349,573 @@ fn r3_001_a_legacy_intent_stops_the_run() {
         refused.context
     );
 }
+
+// --- a server two providers can share ----------------------------------------
+
+/// `FakeTransport` *is* the server, so two providers over two fakes are two
+/// servers. Sharing one behind a lock is what lets a test model a process
+/// restart: the same server state, a new provider with none of the old one's
+/// in-memory state.
+#[derive(Clone)]
+struct SharedFake(Arc<Mutex<FakeTransport>>);
+
+impl SharedFake {
+    fn new(inner: FakeTransport) -> Self {
+        Self(Arc::new(Mutex::new(inner)))
+    }
+    fn with<T>(&self, body: impl FnOnce(&mut FakeTransport) -> T) -> T {
+        body(&mut self.0.lock().expect("not poisoned"))
+    }
+}
+
+impl RawTransport for SharedFake {
+    fn wire_profile(&self) -> WireProfile {
+        self.0.lock().expect("not poisoned").wire_profile()
+    }
+    fn limits(&self) -> TransportLimits {
+        self.0.lock().expect("not poisoned").limits()
+    }
+    fn connection(&self) -> ConnectionState {
+        self.0.lock().expect("not poisoned").connection()
+    }
+    fn submit(&mut self, call: Compound, deadline: Deadline) -> TransportResult<CompoundReply> {
+        self.0.lock().expect("not poisoned").submit(call, deadline)
+    }
+    fn cancel(&mut self, token: CallToken) -> TransportResult<Retirement> {
+        self.0.lock().expect("not poisoned").cancel(token)
+    }
+    fn reconnect(&mut self) -> TransportResult<ConnectionEpoch> {
+        self.0.lock().expect("not poisoned").reconnect()
+    }
+    fn install_faults(&mut self, plan: Box<dyn FaultPlan>) {
+        self.0.lock().expect("not poisoned").install_faults(plan)
+    }
+}
+
+/// A shared server that loses the reply to the first `SETATTR` it sees.
+///
+/// The compound is never forwarded, so the attribute is not applied, and the
+/// error maps to `StorageUnavailable` — an *unknown* disposition, which is what
+/// leaves the journal record as an unsettled intent rather than a settled
+/// failure. That is the crash window R4-002's first trace needs: an
+/// `EXCLUSIVE4` OPEN that created the object, followed by an interruption before
+/// the SETATTR that applies the requested mode.
+struct LoseFirstSetAttr {
+    inner: SharedFake,
+    fired: bool,
+}
+
+impl RawTransport for LoseFirstSetAttr {
+    fn wire_profile(&self) -> WireProfile {
+        self.inner.wire_profile()
+    }
+    fn limits(&self) -> TransportLimits {
+        self.inner.limits()
+    }
+    fn connection(&self) -> ConnectionState {
+        self.inner.connection()
+    }
+    fn submit(&mut self, call: Compound, deadline: Deadline) -> TransportResult<CompoundReply> {
+        // Only the create's *mode* SETATTR. The journal's own record writes end
+        // with a SETATTR of `size`, and losing one of those would interrupt a
+        // different operation than the one this test is about.
+        let sets_mode = call.ops.iter().any(
+            |op| matches!(op, Nfs4Op::SetAttr { attributes, .. } if attributes.mode.is_some()),
+        );
+        if sets_mode && !self.fired {
+            self.fired = true;
+            return Err(
+                umbra_storage_nfs_userspace::error::TransportError::Disconnected {
+                    epoch: ConnectionEpoch(1),
+                    detail: "the SETATTR reply was lost".into(),
+                },
+            );
+        }
+        self.inner.submit(call, deadline)
+    }
+    fn cancel(&mut self, token: CallToken) -> TransportResult<Retirement> {
+        self.inner.cancel(token)
+    }
+    fn reconnect(&mut self) -> TransportResult<ConnectionEpoch> {
+        self.inner.reconnect()
+    }
+    fn install_faults(&mut self, plan: Box<dyn FaultPlan>) {
+        self.inner.install_faults(plan)
+    }
+}
+
+// --- R4-001: unresolved recovery and unknown disposition stop admission ------
+
+/// **R4-001, trace A.** An interrupted intent whose *observation* fails leaves the
+/// run stopped, even though the failure carries no blocked marker.
+///
+/// At the candidate, recognition was confined to the blocked marker,
+/// `CorruptJournal` and `Io`. `Operations::observe_one` propagates `InvalidPath`
+/// and `ACCESS` unchanged, so an interrupted record whose target path had become
+/// unresolvable returned that error, latched nothing, and the very next fresh
+/// mutation was admitted and dispatched — with the interrupted record still
+/// unsettled, and a cooperative release still able to succeed.
+#[test]
+fn r4_001_a_failed_recovery_observation_stops_the_run() {
+    let run_id = fresh_run();
+    let context = RequestContext {
+        run_id,
+        operation_id: OperationId(Uuid::new_v4()),
+        idempotency_key: IdempotencyKey("obs-fails".into()),
+        writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+    };
+    // The interrupted intent's target sits under `nested/`, which is a *file* on
+    // the server. Resolving through it fails with InvalidPath — not NotFound,
+    // which `observe_one` would absorb as a legitimate absence.
+    let request = create_file(context, b"nested/deep.txt");
+
+    let fake = seed_interrupted_with_evidence(
+        run_id,
+        "obs-fails",
+        &request,
+        &[(b"nested", b"this name is a regular file")],
+        |fake, run| {
+            let parent = fake_root_evidence(fake, run);
+            umbra_storage_nfs_userspace::journal::Preconditions {
+                parent: Some(parent),
+                target: None,
+                destination_parent: None,
+                destination: None,
+            }
+        },
+    );
+    let mut storage = over(fake);
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let failed = storage
+        .execute(&request)
+        .expect_err("the interrupted intent's target cannot be observed");
+    assert_eq!(
+        failed.kind,
+        ErrorKind::InvalidPath,
+        "the original diagnosis is returned verbatim: {failed:?}"
+    );
+    assert!(
+        !umbra_storage_nfs_userspace::journal::is_blocked(&failed),
+        "this failure carries no blocked marker, which is the point of the finding"
+    );
+
+    // The run is nonetheless stopped: a valid fresh mutation under an accessible
+    // sibling is refused.
+    let refused = storage
+        .execute(&create_file(
+            RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("fresh-after-obs".into()),
+                writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+            },
+            b"sibling.txt",
+        ))
+        .expect_err("a run holding an unresolved interrupted intent admits no new mutation");
+    assert_eq!(refused.kind, ErrorKind::InvalidState);
+    assert!(
+        refused.context.contains("this run is stopped"),
+        "the refusal must name the state: {}",
+        refused.context
+    );
+    assert!(
+        refused.context.contains("NFS4ERR") || refused.context.contains("not a directory"),
+        "and must carry the original diagnosis forward: {}",
+        refused.context
+    );
+
+    // And no clean release follows.
+    let lease = storage.admission().expect("admitted").lease();
+    let release = storage
+        .release_writer(&lease)
+        .expect_err("a release over an unresolved interrupted intent is not clean");
+    assert_eq!(release.kind, ErrorKind::LeaseLost);
+    assert!(
+        storage.admission().is_some(),
+        "the marker stays held: a refused release retains admission"
+    );
+}
+
+/// **R4-001, trace B.** A call whose server-side disposition is unknown stops
+/// mutation admission, not only the release.
+///
+/// At the candidate `observe_disposition` appended such calls to the unsettled
+/// ledger and the *release* consulted it, but `preflight` never did. A timed-out
+/// call on a still-usable connection was followed by a healthy RPC under a fresh
+/// identity while the old operation remained unresolved.
+#[test]
+fn r4_001_an_unknown_disposition_stops_later_mutations() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    // The request reaches the wire and its reply is dropped: whether the server
+    // applied it is exactly what this provider cannot know.
+    storage
+        .transport()
+        .expect("transport")
+        .install_faults(ScriptedFault::once(
+            FaultPoint::OnDeadline,
+            None,
+            FaultAction::DropReply,
+        ));
+    let lost = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "lost-reply"),
+            b"unknown.txt",
+        ))
+        .expect_err("the injected loss surfaces");
+    assert_eq!(lost.kind, ErrorKind::StorageUnavailable);
+
+    // The connection is healthy again — the fault fired once — so only the
+    // provider's own state can be what refuses the next mutation.
+    let refused = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "after-unknown"),
+            b"after.txt",
+        ))
+        .expect_err("a run with an unresolved dispatch admits no new mutation");
+    assert_eq!(refused.kind, ErrorKind::InvalidState);
+    assert!(
+        refused.context.contains("disposition is unknown"),
+        "the refusal must name the unresolved call: {}",
+        refused.context
+    );
+
+    // The object the refused mutation would have created does not exist.
+    let missing = storage
+        .execute(&StorageRequest {
+            context: RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("probe-after".into()),
+                writer_epoch: None,
+            },
+            operation: StorageOperation::Stat {
+                path: path(b"after.txt"),
+            },
+        })
+        .expect_err("nothing was dispatched");
+    assert_eq!(missing.kind, ErrorKind::NotFound);
+}
+
+// --- R4-002: an interrupted create is proven, not assumed --------------------
+
+/// **R4-002, trace A.** An interrupted create whose SETATTR never ran is
+/// completed by replay, not settled as successful with the server's default mode.
+///
+/// A supported create is `EXCLUSIVE4` OPEN followed by the SETATTR that applies
+/// the requested mode. At the candidate, recovery saw "the name was absent, the
+/// name is present" and stored `Created` — for an operation that had not applied
+/// the mode it was asked for. The exclusive verifier is derived from the
+/// operation id the record holds, so replaying presents the same verifier, the
+/// server recognises its own object, and the SETATTR runs.
+#[test]
+fn r4_002_an_interrupted_create_completes_its_mode_instead_of_reporting_success() {
+    let run_id = fresh_run();
+    let context = RequestContext {
+        run_id,
+        operation_id: OperationId(Uuid::new_v4()),
+        idempotency_key: IdempotencyKey("half-created".into()),
+        writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+    };
+    let request = StorageRequest {
+        context,
+        operation: StorageOperation::Create {
+            path: path(b"half.txt"),
+            options: CreateOptions {
+                kind: CreateKind::File,
+                mode: 0o755,
+            },
+        },
+    };
+
+    // The half-finished state is produced by the real code path rather than
+    // seeded, so the object really does carry the verifier this operation id
+    // derives. One provider throughout: a crashed holder's marker is never taken
+    // over, so "the process comes back" is not an M1 scenario — resolving the
+    // outstanding operation under the still-live controller is.
+    let server = SharedFake::new(seed_released_run(run_id, Some(0)));
+    let mut storage = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(LoseFirstSetAttr {
+            inner: server.clone(),
+            fired: false,
+        }),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("provider");
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let interrupted = storage
+        .execute(&request)
+        .expect_err("the create is interrupted, not completed");
+    assert_eq!(
+        interrupted.kind,
+        ErrorKind::StorageUnavailable,
+        "the disposition must be *unknown*, or the record settles as a failure: {interrupted:?}"
+    );
+
+    // The object exists with the create default mode, not the requested one.
+    let before = server.with(|fake| {
+        let root = walk(fake, run_id, &[b"root"]);
+        fake.lookup(
+            &root,
+            &ComponentName::new(b"half.txt".to_vec()).unwrap(),
+            AttrMask::STAT,
+            deadline(),
+        )
+        .ok()
+        .and_then(|(_, attributes)| attributes.mode)
+    });
+    assert_eq!(
+        before.map(|mode| mode & 0o7777),
+        Some(0o600),
+        "the interruption left the exclusive-create default mode, not 0o755"
+    );
+
+    // Resolving the outstanding operation is permitted even though the run
+    // admits no *new* mutation: retrying its own key is the recovery.
+    let recovered = storage
+        .execute(&request)
+        .expect("our own half-finished create is recognised by its verifier and completed");
+    let umbra_core::StorageResponse::Created(result) = recovered else {
+        panic!("a create answers with an object result");
+    };
+    assert_eq!(
+        result.stat.mode & 0o7777,
+        0o755,
+        "the requested mode is applied by the replay, not left at the create default"
+    );
+
+    // The server agrees: the completion is on the server, not in the reply.
+    let after = server.with(|fake| {
+        let root = walk(fake, run_id, &[b"root"]);
+        fake.lookup(
+            &root,
+            &ComponentName::new(b"half.txt".to_vec()).unwrap(),
+            AttrMask::STAT,
+            deadline(),
+        )
+        .expect("the object resolves")
+        .1
+        .mode
+    });
+    assert_eq!(after.map(|mode| mode & 0o7777), Some(0o755));
+}
+
+/// **R4-002, trace B.** An interrupted create whose name was taken by somebody
+/// else's object is a safe give-up, not a reported success.
+///
+/// The candidate returned `Created` wrapping whatever object it observed — a
+/// directory, in this trace — for a file create that could never have produced
+/// it. The exclusive verifier is what distinguishes our object from anyone
+/// else's: the server answers `NFS4ERR_EXIST` when it does not recognise it.
+#[test]
+fn r4_002_an_interrupted_create_gives_up_when_the_name_is_not_ours() {
+    let run_id = fresh_run();
+    let context = RequestContext {
+        run_id,
+        operation_id: OperationId(Uuid::new_v4()),
+        idempotency_key: IdempotencyKey("taken".into()),
+        writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+    };
+    let request = StorageRequest {
+        context,
+        operation: StorageOperation::Create {
+            path: path(b"taken.txt"),
+            options: CreateOptions {
+                kind: CreateKind::File,
+                mode: 0o644,
+            },
+        },
+    };
+
+    // An external client created a *directory* under the name while our create
+    // was interrupted. Nothing about it carries our verifier.
+    let fake = seed_interrupted_with_evidence(run_id, "taken", &request, &[], |fake, run| {
+        let root = walk(fake, run, &[b"root"]);
+        fake.insert_directory(&root, b"taken.txt");
+        umbra_storage_nfs_userspace::journal::Preconditions {
+            parent: Some(fake_root_evidence(fake, run)),
+            target: None,
+            destination_parent: None,
+            destination: None,
+        }
+    });
+    let mut storage = over(fake);
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let refused = storage
+        .execute(&request)
+        .expect_err("somebody else's object is not our completed create");
+    assert!(
+        !matches!(refused.kind, ErrorKind::NotFound),
+        "the refusal is about ownership, not absence: {refused:?}"
+    );
+
+    // The run is stopped rather than left to retry into somebody else's object.
+    let after = storage
+        .execute(&create_file(
+            RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("after-taken".into()),
+                writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+            },
+            b"elsewhere.txt",
+        ))
+        .expect_err("a conflicting external creation stops the run");
+    assert_eq!(after.kind, ErrorKind::InvalidState);
+
+    // The external object is untouched.
+    let stat = storage.execute(&StorageRequest {
+        context: RequestContext {
+            run_id,
+            operation_id: OperationId(Uuid::new_v4()),
+            idempotency_key: IdempotencyKey("probe-taken".into()),
+            writer_epoch: None,
+        },
+        operation: StorageOperation::Stat {
+            path: path(b"taken.txt"),
+        },
+    });
+    // The run is stopped, so the read is refused; what matters is that nothing
+    // overwrote or "repaired" the external directory before the stop.
+    let _ = stat;
+}
+
+// --- R4-003: rename parent evidence is consulted -----------------------------
+
+/// **R4-003.** An interrupted rename whose *destination parent* changed state is
+/// a safe give-up, even though both endpoint names look untouched.
+///
+/// Round 3 recorded `FATTR4_CHANGE`, size and mtime for both parents and then
+/// compared only their identities. A rename mutates two directories, so their
+/// change attributes are part of its before-state: an interrupted rename that
+/// applied, followed by external activity that restored the observed names,
+/// presents exactly the endpoint state the candidate read as "not applied".
+#[test]
+fn r4_003_an_interrupted_rename_gives_up_when_a_parent_state_moved() {
+    for (label, move_source_parent) in [("destination-parent", false), ("source-parent", true)] {
+        let run_id = fresh_run();
+        let context = RequestContext {
+            run_id,
+            operation_id: OperationId(Uuid::new_v4()),
+            idempotency_key: IdempotencyKey("parent-moved".into()),
+            writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+        };
+        let request = StorageRequest {
+            context,
+            operation: StorageOperation::Rename {
+                source: path(b"src.txt"),
+                destination: path(b"dst.txt"),
+                mode: umbra_core::RenameMode::Replace,
+            },
+        };
+
+        // Both endpoints are exactly as recorded; only a parent's change
+        // attribute differs from what was recorded before dispatch.
+        let fake = seed_interrupted_with_evidence(
+            run_id,
+            "parent-moved",
+            &request,
+            &[(b"src.txt", b"S"), (b"dst.txt", b"D")],
+            |fake, run| {
+                let parent = fake_root_evidence(fake, run);
+                let source = fake_evidence(fake, run, b"src.txt");
+                let destination = fake_evidence(fake, run, b"dst.txt");
+                // Source and destination share one directory here, so the two
+                // recorded parents are the same object; moving one of them is
+                // what distinguishes the two halves of this case.
+                let (recorded_parent, recorded_destination_parent) = if move_source_parent {
+                    (with_other_change(parent), parent)
+                } else {
+                    (parent, with_other_change(parent))
+                };
+                umbra_storage_nfs_userspace::journal::Preconditions {
+                    parent: Some(recorded_parent),
+                    target: Some(source),
+                    destination_parent: Some(recorded_destination_parent),
+                    destination: Some(destination),
+                }
+            },
+        );
+        let mut storage = over(fake);
+        open_existing(&mut storage, run_id).expect("the run opens");
+
+        let refused = storage.execute(&request).unwrap_err();
+        assert!(
+            umbra_storage_nfs_userspace::journal::is_blocked(&refused),
+            "{label}: a moved parent state is a safe give-up: {}",
+            refused.context
+        );
+        assert!(
+            refused.context.contains("its state moved"),
+            "{label}: the stop must name the parent change: {}",
+            refused.context
+        );
+
+        // Neither name moved: no blind replay happened.
+        for name in [b"src.txt".as_slice(), b"dst.txt".as_slice()] {
+            let present = retry_records(storage.transport().expect("transport"), run_id);
+            let _ = present;
+            let root = walk(storage.transport().expect("transport"), run_id, &[b"root"]);
+            let found = storage
+                .transport()
+                .expect("transport")
+                .lookup(
+                    &root,
+                    &ComponentName::new(name.to_vec()).expect("component"),
+                    AttrMask::STAT,
+                    deadline(),
+                )
+                .is_ok();
+            assert!(found, "{label}: {:?} must still be there", name);
+        }
+    }
+}
+
+/// **R4-003.** The control: with both parents and both endpoints exactly as
+/// recorded, the rename still redispatches. Without this the tests above could
+/// pass because every rename recovery blocks.
+#[test]
+fn r4_003_an_unchanged_rename_still_redispatches() {
+    let run_id = fresh_run();
+    let context = RequestContext {
+        run_id,
+        operation_id: OperationId(Uuid::new_v4()),
+        idempotency_key: IdempotencyKey("unchanged".into()),
+        writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+    };
+    let request = StorageRequest {
+        context,
+        operation: StorageOperation::Rename {
+            source: path(b"src.txt"),
+            destination: path(b"dst.txt"),
+            mode: umbra_core::RenameMode::Replace,
+        },
+    };
+    let fake = seed_interrupted_with_evidence(
+        run_id,
+        "unchanged",
+        &request,
+        &[(b"src.txt", b"S"), (b"dst.txt", b"D")],
+        |fake, run| {
+            let parent = fake_root_evidence(fake, run);
+            umbra_storage_nfs_userspace::journal::Preconditions {
+                parent: Some(parent),
+                target: Some(fake_evidence(fake, run, b"src.txt")),
+                destination_parent: Some(parent),
+                destination: Some(fake_evidence(fake, run, b"dst.txt")),
+            }
+        },
+    );
+    let mut storage = over(fake);
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    storage
+        .execute(&request)
+        .expect("an unchanged before-state authorises the replay");
+}

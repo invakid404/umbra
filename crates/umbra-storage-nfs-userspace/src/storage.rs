@@ -787,6 +787,23 @@ impl NfsUserspaceStorage {
         }
     }
 
+    /// Put the run into the terminal blocked state, retaining `error` verbatim.
+    ///
+    /// **R4-001.** Called from the paths that *are* unresolved recovery, rather
+    /// than from a predicate over the error's kind or prose. An observation that
+    /// failed with `InvalidPath` carries no blocked marker and is not
+    /// `CorruptJournal`, but the run is in exactly the same state as if it had:
+    /// an interrupted intent whose disposition could not be established.
+    fn block_recovery(&mut self, operation: &str, error: &UmbraError) {
+        if self.recovery_blocked.is_none() {
+            self.recovery_blocked = Some(error.clone());
+        }
+        self.unsettled.push(format!(
+            "{operation}: unresolved recovery: {}",
+            error.context
+        ));
+    }
+
     /// Note a failed request: its disposition, and the write latch it may trip.
     ///
     /// **R2-003.** Called at every stage a mutation can fail — observing the
@@ -1228,6 +1245,11 @@ impl Storage for NfsUserspaceStorage {
         // Reads are not journalled: they have no effect to reconcile, and
         // recording one would consume durable space per lookup.
         let journalled = request.operation.is_mutation();
+        // Whether this call is replaying an interrupted intent. A redispatch that
+        // then fails on pre-existence is the exclusive verifier refusing to
+        // recognise the object as ours, which is a safe give-up rather than an
+        // ordinary settled failure (R4-002).
+        let mut recovering = false;
         if journalled {
             // R3-003: the record is consulted *before* anything about the
             // request's target is observed. A settled key's answer is its record;
@@ -1249,6 +1271,34 @@ impl Storage for NfsUserspaceStorage {
                 // Settled: answered from the record, target untouched.
                 crate::journal::Lookup::Recorded(result) => return result,
                 crate::journal::Lookup::Fresh => {
+                    // R4-001: a call whose server-side disposition this provider
+                    // could not establish leaves the run in the failure model's
+                    // RECOVERING posture — "stop new mutations and quiesce;
+                    // resolve bounded outstanding operations". Round 3 recorded
+                    // those calls and let the *release* refuse over them, but
+                    // mutation admission went on accepting fresh work: a timed-out
+                    // call on a still-usable connection was followed by a healthy
+                    // RPC under a new identity, with the old operation unresolved.
+                    //
+                    // The gate belongs here, not in `preflight`, because the two
+                    // halves of that sentence pull in opposite directions.
+                    // *Resolving* an outstanding operation means retrying its own
+                    // key, and a gate that refused every mutation would make the
+                    // recovery it demands unreachable. A key with no record is new
+                    // work; a key with one is the resolution.
+                    if let Some(first) = self.unsettled.first() {
+                        let refusal = UmbraError::new(
+                            ErrorKind::InvalidState,
+                            operation,
+                            format!(
+                                "this run has {} call(s) whose server-side disposition is \
+                                 unknown and admits no new mutation until they are resolved; \
+                                 the first was: {first}",
+                                self.unsettled.len()
+                            ),
+                        );
+                        return Err(refusal);
+                    }
                     // R2-003: the state this mutation is about to act on is
                     // observed before anything is written, and recorded beside
                     // the intent as the precondition evidence a record must carry.
@@ -1267,9 +1317,20 @@ impl Storage for NfsUserspaceStorage {
                     }
                 }
                 crate::journal::Lookup::Interrupted(recorded) => {
+                    // R4-001: from here the run holds an unresolved interrupted
+                    // intent. Whether it becomes resolved depends on the next two
+                    // steps, and *any* failure in either leaves it unresolved —
+                    // not just one whose error happens to carry a blocked marker
+                    // or a particular `ErrorKind`. Recognising the state by the
+                    // path taken rather than by the prose of the error is the
+                    // whole point: an observation that fails with `InvalidPath`
+                    // or `ACCESS` leaves exactly the same unresolved record as a
+                    // contradictory one.
+                    recovering = true;
                     let observed = match self.observe_now(operation, request) {
                         Ok(observed) => observed,
                         Err(error) => {
+                            self.block_recovery(operation, &error);
                             self.note_failure(operation, request, &error);
                             return Err(error);
                         }
@@ -1281,6 +1342,7 @@ impl Storage for NfsUserspaceStorage {
                         // never landed, so dispatch proceeds under the same key.
                         Ok(_) => {}
                         Err(error) => {
+                            self.block_recovery(operation, &error);
                             self.note_failure(operation, request, &error);
                             return Err(error);
                         }
@@ -1301,6 +1363,16 @@ impl Storage for NfsUserspaceStorage {
         // provider cannot rule out. `close_run` reads this ledger rather than
         // asserting `Excluded` from the shape of the dispatch loop.
         if let Err(error) = &outcome {
+            // R4-002: a replayed exclusive create that comes back
+            // `NFS4ERR_EXIST` means the server did not recognise the verifier as
+            // the one it stored for that name — the object is somebody else's.
+            // The failure model puts a conflicting external creation during an
+            // interrupted operation outside deterministic reconciliation, so this
+            // is a safe give-up with the original status retained, not an
+            // ordinary settled failure a later retry would treat as final.
+            if recovering && error.kind == ErrorKind::AlreadyExists {
+                self.block_recovery(operation, error);
+            }
             self.note_failure(operation, request, error);
         }
         if journalled {

@@ -31,7 +31,7 @@ use umbra_storage_nfs_userspace::integration::Backend;
 use umbra_storage_nfs_userspace::storage::{
     NfsUserspaceConfig, NfsUserspaceStorage, FORMAT_VERSION,
 };
-use umbra_storage_nfs_userspace::transport::{Deadline, RawTransport};
+use umbra_storage_nfs_userspace::transport::{Deadline, FaultAction, FaultPoint, RawTransport};
 
 /// Export component below the server's pseudo-root, and the run parent under it.
 const EXPORT: &[u8] = b"umbra";
@@ -640,4 +640,108 @@ fn a_live_backend_actually_ran_when_one_was_configured() {
         assert!(!live);
         eprintln!("live backend not exercised: UMBRA_NFS_RAW_FIXTURE unset or transport-raw off");
     }
+}
+
+/// **R4-001, live counterpart.** A call whose server-side disposition is unknown
+/// stops new mutations, driven against whichever backends this run has.
+///
+/// The fake half proves the state machine; the live half proves the same thing
+/// happens when a real server is on the other end of the lost reply, which is
+/// where the reviewer's trace B lives. `review_round_2.rs` carries the
+/// deterministic version of this case; this one is the acceptance.
+#[test]
+fn r4_001_an_unknown_disposition_stops_new_mutations_on_every_backend() {
+    for (backend, transport) in backends() {
+        let mut storage = provider(transport);
+        let run_id = fresh_run();
+        storage.open_run(&create_run(run_id)).expect("open_run");
+
+        // A supported mutation whose reply is lost after the request is on the
+        // wire. Whether the server applied it is exactly what cannot be known.
+        // The two backends take a dropped reply at different points: the fake
+        // consults `OnDeadline` on every submit, while the raw transport sets
+        // `discard_reply` at `AfterDispatch` and only reaches `OnDeadline` once a
+        // call has actually timed out. One shot at whichever comes first covers
+        // both without pretending they are the same machine.
+        #[derive(Default)]
+        struct LoseOneReply(bool);
+        impl umbra_storage_nfs_userspace::transport::FaultPlan for LoseOneReply {
+            fn decide(
+                &mut self,
+                point: FaultPoint,
+                _context: umbra_storage_nfs_userspace::transport::FaultContext,
+            ) -> FaultAction {
+                if self.0 || !matches!(point, FaultPoint::AfterDispatch | FaultPoint::OnDeadline) {
+                    return FaultAction::Proceed;
+                }
+                self.0 = true;
+                FaultAction::DropReply
+            }
+        }
+        storage
+            .transport()
+            .expect("transport")
+            .install_faults(Box::new(LoseOneReply::default()));
+        let lost = run_expecting_error(
+            &mut storage,
+            "lost-reply",
+            StorageOperation::Create {
+                path: path("unknown.txt"),
+                options: CreateOptions {
+                    kind: CreateKind::File,
+                    mode: 0o644,
+                },
+            },
+        );
+        assert_eq!(
+            lost.kind,
+            ErrorKind::StorageUnavailable,
+            "{backend:?}: the lost reply surfaces as an unknown disposition: {lost:?}"
+        );
+
+        // The fault fired once, so the transport is healthy again: only the
+        // provider's own state can refuse the next mutation.
+        let refused = run_expecting_error(
+            &mut storage,
+            "after-unknown",
+            StorageOperation::Create {
+                path: path("after.txt"),
+                options: CreateOptions {
+                    kind: CreateKind::File,
+                    mode: 0o644,
+                },
+            },
+        );
+        assert_eq!(
+            refused.kind,
+            ErrorKind::InvalidState,
+            "{backend:?}: a run with an unresolved dispatch admits no new mutation: {refused:?}"
+        );
+        assert!(
+            refused.context.contains("disposition is unknown"),
+            "{backend:?}: the refusal names the unresolved call: {}",
+            refused.context
+        );
+
+        // And the release over it is not clean.
+        let closed = storage
+            .close_run()
+            .expect_err("a release over an unresolved dispatch is not reported clean");
+        assert_eq!(closed.kind, ErrorKind::LeaseLost, "{backend:?}");
+    }
+}
+
+/// Execute an operation that is expected to fail, and return its error.
+fn run_expecting_error(
+    storage: &mut NfsUserspaceStorage,
+    key: &str,
+    operation: StorageOperation,
+) -> umbra_core::UmbraError {
+    let request = StorageRequest {
+        context: context(storage, key),
+        operation,
+    };
+    storage
+        .execute(&request)
+        .expect_err("this operation was expected to fail")
 }
