@@ -1345,13 +1345,21 @@ fn r1_004_a_recorded_failure_is_replayed_as_that_failure() {
     assert_eq!(first.context, again.context, "verbatim, from the record");
 }
 
-/// **R1-004.** An intent recorded by a previous attempt that never settled makes
-/// the retry stop for reconciliation rather than repeat the effect.
+/// **R1-004 / R2-003.** A *legacy* intent — one recorded without the precondition
+/// evidence this provider now writes — stops the run rather than being guessed.
 ///
-/// This is the "after intent, before result" interruption: the record proves the
-/// request was dispatched and says nothing about what it did.
+/// This test used to assert the opposite of what the design requires. It named
+/// itself `..._forces_reconciliation` and checked for the words "requires
+/// reconciliation", which `docs/design/failure-model.md:53` explicitly forbids as
+/// a substitute for implemented recovery in a supported crash window. Round 2
+/// recorded that as R2-003, so the case now asserts what the failure model
+/// actually says about this narrower situation: a legacy ambiguous intent with
+/// insufficient evidence stops as BLOCKED_RECOVERABLE, with the record retained.
+///
+/// Recovery of intents that *do* carry evidence is covered by the `r2_003_*`
+/// cases in `review_round_2.rs`.
 #[test]
-fn r1_004_an_unsettled_intent_forces_reconciliation() {
+fn r1_004_a_legacy_intent_without_evidence_blocks_rather_than_guessing() {
     let run_id = fresh_run();
     let context = RequestContext {
         run_id,
@@ -1369,7 +1377,8 @@ fn r1_004_an_unsettled_intent_forces_reconciliation() {
             },
         },
     };
-    // The record a crash between intent and result leaves behind.
+    // A record with no `pre-` sidecar beside it: the shape an older provider, or
+    // the mounted adapter, leaves behind.
     let intent: (
         StorageRequest,
         Option<umbra_core::Result<umbra_core::StorageResponse>>,
@@ -1384,16 +1393,25 @@ fn r1_004_an_unsettled_intent_forces_reconciliation() {
 
     let refused = storage
         .execute(&request)
-        .expect_err("an unsettled intent must not be re-dispatched");
-    assert_eq!(refused.kind, ErrorKind::StorageUnavailable);
+        .expect_err("an intent with no evidence must not be re-dispatched");
+    assert_eq!(
+        refused.kind,
+        ErrorKind::InvalidState,
+        "a blocked-recoverable stop, not a transport failure: {refused:?}"
+    );
     assert!(
-        refused.context.contains("requires"),
-        "the refusal must ask for reconciliation, not a retry: {}",
+        refused.context.contains("no recorded preconditions"),
+        "the stop must name the missing evidence: {}",
         refused.context
     );
     assert!(
-        refused.context.contains("indeterminate"),
-        "and must name the state: {}",
+        !refused.context.contains("requires reconciliation"),
+        "the phrasing the failure model forbids must not reappear: {}",
+        refused.context
+    );
+    assert!(
+        refused.context.contains("retained"),
+        "and must say the record is kept: {}",
         refused.context
     );
 }

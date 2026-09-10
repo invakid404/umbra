@@ -33,6 +33,7 @@ use umbra_core::{
 use crate::anchor::{Anchor, HandleMint, RunAnchors, Target};
 use crate::capability::{operation_name, storage_support, Support};
 use crate::crud::{read_anonymous, CreateDisposition, MutationIdentity, OpenObject, WriteAt};
+use crate::handle::ObjectIdentity;
 use crate::identity::PinnedObject;
 use crate::namespace::{
     apply as apply_namespace, NamespaceDispatcher, NamespaceMutation, NamespaceOutcome, RemoveKind,
@@ -288,6 +289,72 @@ impl Operations {
             return refused.map(|_| ());
         }
         Ok(())
+    }
+
+    /// Observe the state a mutation is about to be dispatched against.
+    ///
+    /// **R2-003.** This is the "object/parent identities and preconditions"
+    /// evidence the failure model requires a record to carry. Absence is an
+    /// answer, not a failure: a create's target is expected to be missing, and
+    /// recording that is exactly what lets a recovery tell "the create landed"
+    /// from "the create never ran".
+    ///
+    /// Resolution failures other than absence are propagated, because observing
+    /// nothing is not the same as observing an absence.
+    pub fn observe(
+        &self,
+        context: &mut OpsContext<'_>,
+        request: &StorageRequest,
+    ) -> Result<crate::journal::Preconditions> {
+        let operation = operation_name(&request.operation);
+        let primary = primary_path(&request.operation);
+        let (parent, target) = match primary {
+            None => (None, None),
+            Some(path) => self.observe_one(context, path, operation)?,
+        };
+        let (destination_parent, destination) = match &request.operation {
+            StorageOperation::Rename { destination, .. } => {
+                self.observe_one(context, destination, operation)?
+            }
+            _ => (None, None),
+        };
+        Ok(crate::journal::Preconditions {
+            parent,
+            target,
+            destination_parent,
+            destination,
+        })
+    }
+
+    /// The parent's identity and the final component's, if it exists.
+    fn observe_one(
+        &self,
+        context: &mut OpsContext<'_>,
+        path: &StoragePath,
+        operation: &str,
+    ) -> Result<(Option<ObjectIdentity>, Option<ObjectIdentity>)> {
+        match self
+            .anchors
+            .resolve_parent(context.transport, path, context.deadline)
+        {
+            Ok(Target::Anchor(pin)) => Ok((None, Some(pin.identity()))),
+            Ok(Target::Named { parent, name }) => {
+                let parent_identity = parent.identity();
+                match self.child(context, &parent, &name, operation) {
+                    Ok(pinned) => Ok((Some(parent_identity), Some(pinned.identity()))),
+                    // Absent is the observation, not a failure.
+                    Err(error) if error.kind == ErrorKind::NotFound => {
+                        Ok((Some(parent_identity), None))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            // The parent itself does not resolve. That is a real failure for a
+            // mutation, and the preflight or the dispatch will report it; there
+            // is simply nothing to record.
+            Err(error) if error.kind == ErrorKind::NotFound => Ok((None, None)),
+            Err(error) => Err(error),
+        }
     }
 
     /// Execute one contract primitive.
@@ -560,8 +627,8 @@ impl Operations {
             },
             deadline,
         );
-        let count = match written {
-            Ok(ticket) => ticket.count(),
+        let ticket = match written {
+            Ok(ticket) => ticket,
             Err(error) => {
                 // The write failed; the open still has to go, but its own failure
                 // must not replace the one the caller needs to see.
@@ -569,6 +636,24 @@ impl Operations {
                 return Err(error.to_umbra(operation));
             }
         };
+        let count = ticket.count();
+
+        // R2-003: the write is committed and its verifier compared before the
+        // open is released. Previously the ticket's count was taken and the
+        // ticket dropped, so nothing on the public path ever observed whether the
+        // server kept the bytes: an `UNSTABLE` write is durable only once a
+        // `COMMIT` returns the verifier the `WRITE` did, and a changed verifier
+        // means the server lost them and they must be rewritten from the retained
+        // payload — which the durable journal now holds.
+        //
+        // This is not a durability claim. `Durability::None` and the `flush` gate
+        // are unchanged: committing observes what the *server* did with the bytes,
+        // it does not qualify a persistence boundary underneath it.
+        let committed = open.commit(&mut **transport, &**replay, &ticket, deadline);
+        if let Err(error) = committed {
+            let _ = open.close(&mut **transport, deadline);
+            return Err(error.to_umbra(operation));
+        }
         release(open, &mut **transport, deadline, operation)?;
         Ok(StorageResponse::WriteAt(count))
     }
@@ -999,6 +1084,21 @@ fn release(
         CloseOutcome::Rejected { error, .. } | CloseOutcome::Abandoned { error } => {
             Err(error.to_umbra(operation))
         }
+    }
+}
+
+/// The path a mutation's primary effect lands on, when it has one.
+fn primary_path(operation: &StorageOperation) -> Option<&StoragePath> {
+    match operation {
+        StorageOperation::Create { path, .. }
+        | StorageOperation::CreateParents { path, .. }
+        | StorageOperation::Unlink { path }
+        | StorageOperation::RemoveDirectory { path }
+        | StorageOperation::SetMetadata { path, .. }
+        | StorageOperation::Truncate { path, .. }
+        | StorageOperation::WriteAt { path, .. } => Some(path),
+        StorageOperation::Rename { source, .. } => Some(source),
+        _ => None,
     }
 }
 

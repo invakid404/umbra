@@ -595,13 +595,17 @@ fn r2_002_the_effect_observer_is_not_vacuous() {
     let after = retry_records(storage.transport().expect("transport"), run_id);
     assert_eq!(
         after.len(),
-        2,
-        "an accepted mutation writes exactly its op- index and key- record, saw {after:?}"
+        3,
+        "an accepted mutation writes its pre- evidence, its op- index and its key- record,          saw {after:?}"
     );
     assert!(after
         .iter()
         .any(|n| n.starts_with(layout::RETRY_KEY_PREFIX)));
     assert!(after.iter().any(|n| n.starts_with(layout::RETRY_OP_PREFIX)));
+    assert!(
+        after.iter().any(|n| n.starts_with("pre-")),
+        "R2-003: the precondition sidecar is part of an accepted mutation's evidence"
+    );
     assert!(
         wire.lock().expect("not poisoned").modifying > modifying_before,
         "an accepted mutation sends modifying operations"
@@ -1091,4 +1095,545 @@ fn r2_004_a_present_epoch_file_still_admits() {
             "{label}: admission must land one above the recorded epoch"
         );
     }
+}
+
+// --- R2-003: interrupted operations are recovered, not stalled ---------------
+
+/// Seed a run holding an interrupted intent *and* its precondition evidence,
+/// exactly as a crash between the intent write and the result write leaves it.
+///
+/// `target_before` is the identity the sidecar records for the target; `None`
+/// records that it was absent.
+#[allow(clippy::too_many_arguments)]
+fn seed_interrupted(
+    run_id: RunId,
+    key: &str,
+    request: &StorageRequest,
+    preconditions: &umbra_storage_nfs_userspace::journal::Preconditions,
+    seed_target: Option<(&[u8], &[u8])>,
+) -> FakeTransport {
+    let mut fake = FakeTransport::new();
+    let mut current = fake.root();
+    for part in EXPORT.split(|byte| *byte == b'/') {
+        current = fake.insert_directory(&current, part);
+    }
+    let run_parent = fake.insert_directory(&current, RUN_PARENT);
+    let run = fake.insert_directory(&run_parent, run_id.0.hyphenated().to_string().as_bytes());
+    let root_anchor = fake.insert_directory(&run, b"root");
+    fake.insert_directory(&run, b"control");
+    let private = fake.insert_directory(&run, layout::PRIVATE_DIR);
+    fake.insert_file(
+        &private,
+        layout::MANIFEST_FILE,
+        serde_json::to_vec(&(run_id, &base(), FORMAT_VERSION)).expect("manifest encodes"),
+    );
+    fake.insert_file(&private, layout::EPOCH_FILE, 0u64.to_le_bytes().to_vec());
+    let retries = fake.insert_directory(&private, layout::RETRIES_DIR);
+
+    if let Some((name, contents)) = seed_target {
+        fake.insert_file(&root_anchor, name, contents.to_vec());
+    }
+
+    let intent: (
+        StorageRequest,
+        Option<umbra_core::Result<umbra_core::StorageResponse>>,
+    ) = (request.clone(), None);
+    let hex: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    fake.insert_file(
+        &retries,
+        format!("key-{hex}").as_bytes(),
+        serde_json::to_vec(&intent).expect("intent encodes"),
+    );
+    fake.insert_file(
+        &retries,
+        format!("pre-{hex}").as_bytes(),
+        serde_json::to_vec(preconditions).expect("preconditions encode"),
+    );
+    fake
+}
+
+/// The identity the fake reports for a name under the run's root anchor.
+fn identity_of(
+    storage: &mut NfsUserspaceStorage,
+    run_id: RunId,
+    name: &[u8],
+) -> umbra_storage_nfs_userspace::handle::ObjectIdentity {
+    let transport = storage.transport().expect("transport");
+    let root = walk(transport, run_id, &[b"root"]);
+    let (_, attributes) = transport
+        .lookup(
+            &root,
+            &ComponentName::new(name.to_vec()).expect("component"),
+            AttrMask::STAT,
+            deadline(),
+        )
+        .expect("the object resolves");
+    umbra_storage_nfs_userspace::handle::ObjectIdentity {
+        fsid: attributes.fsid.expect("fsid"),
+        fileid: attributes.fileid.expect("fileid"),
+    }
+}
+
+fn root_identity(
+    storage: &mut NfsUserspaceStorage,
+    run_id: RunId,
+) -> umbra_storage_nfs_userspace::handle::ObjectIdentity {
+    let transport = storage.transport().expect("transport");
+    let root = walk(transport, run_id, &[b"root"]);
+    let attributes = transport
+        .getattr(&root, AttrMask::STAT, deadline())
+        .expect("the root anchor resolves");
+    umbra_storage_nfs_userspace::handle::ObjectIdentity {
+        fsid: attributes.fsid.expect("fsid"),
+        fileid: attributes.fileid.expect("fileid"),
+    }
+}
+
+/// **R2-003.** Interrupted *after* the intent and *before* the effect: the
+/// operation is re-dispatched and completes.
+///
+/// At the candidate every unsettled intent returned StorageUnavailable with
+/// "requires reconciliation", which `docs/design/failure-model.md:53` explicitly
+/// forbids as a substitute for implemented recovery in a supported crash window.
+/// Nothing consumed the record, and no before/after evidence existed to consume.
+#[test]
+fn r2_003_an_intent_interrupted_before_its_effect_is_recovered_by_redispatch() {
+    let run_id = fresh_run();
+    let context = RequestContext {
+        run_id,
+        operation_id: OperationId(Uuid::new_v4()),
+        idempotency_key: IdempotencyKey("interrupted-create".into()),
+        writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+    };
+    let request = create_file(context, b"recovered.txt");
+
+    // Evidence recorded before dispatch: the target did not exist.
+    let mut probe = over(seed_released_run(run_id, Some(0)));
+    open_existing(&mut probe, run_id).expect("probe opens the run");
+    let parent = root_identity(&mut probe, run_id);
+
+    let preconditions = umbra_storage_nfs_userspace::journal::Preconditions {
+        parent: Some(parent),
+        target: None,
+        destination_parent: None,
+        destination: None,
+    };
+    let mut storage = over(seed_interrupted(
+        run_id,
+        "interrupted-create",
+        &request,
+        &preconditions,
+        None,
+    ));
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    // The effect never landed, so recovery re-dispatches and the create succeeds.
+    let recovered = storage
+        .execute(&request)
+        .expect("an intent whose effect never landed is recovered, not stalled");
+    match recovered {
+        umbra_core::StorageResponse::Created(_) => {}
+        other => panic!("expected a create result, got {other:?}"),
+    }
+
+    // And the object is really there.
+    storage
+        .execute(&StorageRequest {
+            context: RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("probe-recovered".into()),
+                writer_epoch: None,
+            },
+            operation: StorageOperation::Stat {
+                path: path(b"recovered.txt"),
+            },
+        })
+        .expect("the recovered create actually created the object");
+}
+
+/// **R2-003.** Interrupted *after* the effect and before the result: the recovery
+/// settles the record from the observed state rather than repeating the effect.
+///
+/// This is the window that matters most for a non-idempotent primitive. The
+/// removal already happened; re-dispatching would answer NOENT for an operation
+/// that actually succeeded, which is the same class of wrong answer R1-004
+/// recorded for rename.
+#[test]
+fn r2_003_an_intent_interrupted_after_its_effect_is_settled_from_evidence() {
+    let run_id = fresh_run();
+    let context = RequestContext {
+        run_id,
+        operation_id: OperationId(Uuid::new_v4()),
+        idempotency_key: IdempotencyKey("interrupted-unlink".into()),
+        writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+    };
+    let request = StorageRequest {
+        context,
+        operation: StorageOperation::Unlink {
+            path: path(b"gone.txt"),
+        },
+    };
+
+    // The sidecar records an object that existed before dispatch; the server no
+    // longer has it, because the unlink landed before the crash.
+    let mut probe = over(seed_released_run(run_id, Some(0)));
+    open_existing(&mut probe, run_id).expect("probe opens the run");
+    let parent = root_identity(&mut probe, run_id);
+    let preconditions = umbra_storage_nfs_userspace::journal::Preconditions {
+        parent: Some(parent),
+        target: Some(umbra_storage_nfs_userspace::handle::ObjectIdentity {
+            fsid: parent.fsid,
+            fileid: parent.fileid + 4242,
+        }),
+        destination_parent: None,
+        destination: None,
+    };
+
+    let mut storage = over(seed_interrupted(
+        run_id,
+        "interrupted-unlink",
+        &request,
+        &preconditions,
+        None,
+    ));
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let recovered = storage
+        .execute(&request)
+        .expect("an interrupted unlink whose effect landed is settled, not re-run");
+    assert!(
+        matches!(recovered, umbra_core::StorageResponse::Unlinked),
+        "the recovery answers the operation's own result, got {recovered:?}"
+    );
+
+    // The record is settled now, so an ordinary retry is answered from it.
+    let again = storage
+        .execute(&request)
+        .expect("the settled record answers a later retry");
+    assert!(matches!(again, umbra_core::StorageResponse::Unlinked));
+}
+
+/// **R2-003.** Evidence that matches neither the recorded before nor the expected
+/// after is a blocked-recoverable stop, with the record retained.
+///
+/// An external writer replaced the object under the interrupted operation. There
+/// is no deterministic answer, and the failure model says so: "conflicting
+/// external writes during an interrupted operation are outside deterministic
+/// automatic reconciliation".
+#[test]
+fn r2_003_contradictory_evidence_blocks_with_the_record_retained() {
+    let run_id = fresh_run();
+    let context = RequestContext {
+        run_id,
+        operation_id: OperationId(Uuid::new_v4()),
+        idempotency_key: IdempotencyKey("interrupted-replaced".into()),
+        writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+    };
+    let request = StorageRequest {
+        context,
+        operation: StorageOperation::Unlink {
+            path: path(b"replaced.txt"),
+        },
+    };
+
+    let mut probe = over(seed_released_run(run_id, Some(0)));
+    open_existing(&mut probe, run_id).expect("probe opens the run");
+    let parent = root_identity(&mut probe, run_id);
+    // Recorded: some object. Present now: a *different* object under that name.
+    let preconditions = umbra_storage_nfs_userspace::journal::Preconditions {
+        parent: Some(parent),
+        target: Some(umbra_storage_nfs_userspace::handle::ObjectIdentity {
+            fsid: parent.fsid,
+            fileid: parent.fileid + 9999,
+        }),
+        destination_parent: None,
+        destination: None,
+    };
+    let mut storage = over(seed_interrupted(
+        run_id,
+        "interrupted-replaced",
+        &request,
+        &preconditions,
+        Some((b"replaced.txt", b"a different object")),
+    ));
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let blocked = storage
+        .execute(&request)
+        .expect_err("contradictory evidence has no deterministic answer");
+    assert_eq!(
+        blocked.kind,
+        ErrorKind::InvalidState,
+        "a blocked-recoverable stop: {blocked:?}"
+    );
+    assert!(
+        blocked.context.contains("blocked rather than guessed"),
+        "the stop must say it refused to guess: {}",
+        blocked.context
+    );
+    assert!(
+        !blocked.context.contains("requires reconciliation"),
+        "the phrasing the failure model forbids must not reappear: {}",
+        blocked.context
+    );
+
+    // The record and the object are both still there.
+    let records = retry_records(storage.transport().expect("transport"), run_id);
+    assert!(
+        records.iter().any(|n| n.starts_with("key-")),
+        "the interrupted record is retained, saw {records:?}"
+    );
+    assert!(
+        records.iter().any(|n| n.starts_with("pre-")),
+        "and so is its evidence, saw {records:?}"
+    );
+}
+
+/// **R2-003.** An interrupted absolute write is re-dispatched when its target is
+/// provably the same object, and blocked when it is not.
+#[test]
+fn r2_003_an_interrupted_write_recovers_only_onto_the_same_object() {
+    for (label, same_object, expect_ok) in [("same", true, true), ("replaced", false, false)] {
+        let run_id = fresh_run();
+        let context = RequestContext {
+            run_id,
+            operation_id: OperationId(Uuid::new_v4()),
+            idempotency_key: IdempotencyKey("interrupted-write".into()),
+            writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+        };
+        let request = StorageRequest {
+            context,
+            operation: StorageOperation::WriteAt {
+                path: path(b"target.bin"),
+                offset: 0,
+                bytes: b"exact bytes".to_vec(),
+            },
+        };
+
+        // Seed the run with the target present, then read back its identity.
+        let mut probe = over(seed_interrupted(
+            run_id,
+            "probe-only",
+            &request,
+            &umbra_storage_nfs_userspace::journal::Preconditions {
+                parent: None,
+                target: None,
+                destination_parent: None,
+                destination: None,
+            },
+            Some((b"target.bin", b"before")),
+        ));
+        open_existing(&mut probe, run_id).expect("probe opens the run");
+        let parent = root_identity(&mut probe, run_id);
+        let actual = identity_of(&mut probe, run_id, b"target.bin");
+
+        let recorded_target = if same_object {
+            actual
+        } else {
+            umbra_storage_nfs_userspace::handle::ObjectIdentity {
+                fsid: actual.fsid,
+                fileid: actual.fileid + 1234,
+            }
+        };
+        let preconditions = umbra_storage_nfs_userspace::journal::Preconditions {
+            parent: Some(parent),
+            target: Some(recorded_target),
+            destination_parent: None,
+            destination: None,
+        };
+        let mut storage = over(seed_interrupted(
+            run_id,
+            "interrupted-write",
+            &request,
+            &preconditions,
+            Some((b"target.bin", b"before")),
+        ));
+        open_existing(&mut storage, run_id).expect("the run opens");
+
+        let outcome = storage.execute(&request);
+        if expect_ok {
+            let response = outcome.unwrap_or_else(|error| {
+                panic!("{label}: an absolute write onto the same object recovers: {error:?}")
+            });
+            match response {
+                umbra_core::StorageResponse::WriteAt(count) => {
+                    assert_eq!(count as usize, b"exact bytes".len())
+                }
+                other => panic!("{label}: expected a write result, got {other:?}"),
+            }
+        } else {
+            let error = outcome.expect_err("{label}: a replaced target has no safe replay");
+            assert_eq!(error.kind, ErrorKind::InvalidState, "{label}: {error:?}");
+            assert!(
+                error.context.contains("different object"),
+                "{label}: the stop must name the risk: {}",
+                error.context
+            );
+        }
+    }
+}
+
+/// **R2-003.** A public write commits and compares verifiers, and a verifier the
+/// server changed under it is a typed failure rather than a silent success.
+///
+/// At the candidate `write_at` took `ticket.count()` and dropped the ticket, so
+/// nothing on the public path ever observed whether the server kept the bytes.
+#[test]
+fn r2_003_a_public_write_commits_and_notices_a_changed_verifier() {
+    // Healthy: the write commits and the verifier matches.
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "seed"),
+            b"committed.bin",
+        ))
+        .expect("create the target");
+    storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "good-write"),
+            operation: StorageOperation::WriteAt {
+                path: path(b"committed.bin"),
+                offset: 0,
+                bytes: b"kept bytes".to_vec(),
+            },
+        })
+        .expect("an ordinary write commits cleanly");
+
+    // Now rotate the server's verifier on every reply, so whatever verifier the
+    // WRITE reports, the COMMIT reports a different one. That is precisely what a
+    // server which lost unstable data does, and the only thing that can detect it
+    // is a COMMIT whose verifier is compared against the WRITE's.
+    #[derive(Default)]
+    struct RotateEveryReply(u8);
+    impl FaultPlan for RotateEveryReply {
+        fn decide(
+            &mut self,
+            point: FaultPoint,
+            _context: umbra_storage_nfs_userspace::transport::FaultContext,
+        ) -> FaultAction {
+            if point != FaultPoint::BeforeReturn {
+                return FaultAction::Proceed;
+            }
+            self.0 = self.0.wrapping_add(1);
+            FaultAction::RotateVerifier(umbra_storage_nfs_userspace::transport::WriteVerifier(
+                [self.0; 8],
+            ))
+        }
+    }
+    storage
+        .transport()
+        .expect("transport")
+        .install_faults(Box::new(RotateEveryReply::default()));
+
+    let outcome = storage.execute(&StorageRequest {
+        context: authorised(&storage, run_id, "rotated-write"),
+        operation: StorageOperation::WriteAt {
+            path: path(b"committed.bin"),
+            offset: 0,
+            bytes: b"lost bytes".to_vec(),
+        },
+    });
+    let error =
+        outcome.expect_err("a verifier that changed under the write must not surface as a success");
+    assert!(
+        format!("{error:?}").contains("verifier") || error.kind == ErrorKind::Io,
+        "the failure must name what could not be established: {error:?}"
+    );
+}
+
+/// **R2-003.** A failed write is latched: later mutations stop, the original
+/// status survives, and the release that follows is not reported clean.
+///
+/// `docs/design/failure-model.md`'s "Server EIO / failed stable write" row
+/// requires exactly this. At the candidate the provider's failure accounting only
+/// marked `StorageUnavailable` as unsettled, so an `NFS4ERR_IO` write left the
+/// run mutating happily and closing cleanly afterwards.
+#[test]
+fn r2_003_a_failed_write_latches_and_stops_later_mutations() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "seed"),
+            b"latched.bin",
+        ))
+        .expect("create the target");
+
+    // Fail the write itself with the server's own I/O status.
+    struct FailWrites;
+    impl FaultPlan for FailWrites {
+        fn decide(
+            &mut self,
+            point: FaultPoint,
+            context: umbra_storage_nfs_userspace::transport::FaultContext,
+        ) -> FaultAction {
+            if point == FaultPoint::AfterDispatch && context.op == OpCode::PutFh {
+                // The compound's first op identifies it; a write compound is
+                // PUTFH; WRITE, so substituting here fails the write.
+                return FaultAction::Substitute(Nfs4Status::IO);
+            }
+            FaultAction::Proceed
+        }
+    }
+    storage
+        .transport()
+        .expect("transport")
+        .install_faults(Box::new(FailWrites));
+
+    let failed = storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "failing-write"),
+            operation: StorageOperation::WriteAt {
+                path: path(b"latched.bin"),
+                offset: 0,
+                bytes: b"never lands".to_vec(),
+            },
+        })
+        .expect_err("the injected NFS4ERR_IO surfaces");
+    assert_eq!(failed.kind, ErrorKind::Io);
+
+    // Clear the fault: the latch, not the fault, must be what stops the next one.
+    storage
+        .transport()
+        .expect("transport")
+        .install_faults(ScriptedFault::once(
+            FaultPoint::BeforeDispatch,
+            Some(OpCode::Renew),
+            FaultAction::Proceed,
+        ));
+
+    let refused = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "after-latch"),
+            b"after.txt",
+        ))
+        .expect_err("a run that latched a write failure must not keep mutating");
+    assert_eq!(refused.kind, ErrorKind::Io);
+    assert!(
+        refused.context.contains("latched a failed write"),
+        "the refusal must name the latch: {}",
+        refused.context
+    );
+    assert!(
+        refused.context.contains("NFS4ERR 5"),
+        "and must carry the original status forward: {}",
+        refused.context
+    );
+
+    // And the close is not clean: a failed stable write owes no clean release.
+    let closed = storage
+        .close_run()
+        .expect_err("a release over a latched write failure must not be reported clean");
+    assert_eq!(closed.kind, ErrorKind::LeaseLost);
+    assert!(
+        closed
+            .context
+            .contains("outstanding I/O could not be excluded"),
+        "the refusal must name the unsettled work: {}",
+        closed.context
+    );
 }
