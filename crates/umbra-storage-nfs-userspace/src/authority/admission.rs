@@ -397,6 +397,50 @@ impl<S: MarkerStore> AdmissionControl<S> {
                 admitted: Box::new(admitted),
             };
         }
+        // R2-001: the marker is re-read before it is overwritten. A release is a
+        // *total* rewrite of the record, so writing one without first confirming
+        // the record still describes this session destroys whatever replaced it —
+        // a successor's `Held`, or an externally changed record the failure model
+        // requires be preserved and refused rather than stamped over.
+        //
+        // Only "this session, this epoch, still Held" earns the write. Everything
+        // else is `Uncertain`: the proof is consumed, the bytes on the server are
+        // left exactly as found, and reconciliation is an operator action.
+        match self.inspect() {
+            Ok(Some(current))
+                if current.token() == admitted.token
+                    && current.epoch() == admitted.epoch
+                    && current.phase() == AdmissionPhase::Held => {}
+            Ok(Some(current)) => {
+                return ReleaseOutcome::Uncertain {
+                    error: FacadeError::Authority(AuthorityError::IdentityUnproven(format!(
+                        "the marker now records epoch {} in phase {:?}, not this session's held \
+                         epoch {}; the record is preserved rather than overwritten with a \
+                         release this session cannot prove it is entitled to publish",
+                        current.epoch().0,
+                        current.phase(),
+                        admitted.epoch.0,
+                    ))),
+                }
+            }
+            Ok(None) => {
+                return ReleaseOutcome::Uncertain {
+                    error: FacadeError::Authority(AuthorityError::IdentityUnproven(
+                        "the admission marker is gone; this session cannot publish a release \
+                         for a run whose ownership evidence no longer exists"
+                            .into(),
+                    )),
+                }
+            }
+            Err(error) => {
+                // The evidence could not be read, so it cannot be confirmed. A
+                // blind overwrite here is the destructive case.
+                return ReleaseOutcome::Retained {
+                    admitted: Box::new(admitted),
+                    error,
+                };
+            }
+        }
         let released = AdmissionMarker::new(
             admitted.token,
             admitted.writer.clone(),

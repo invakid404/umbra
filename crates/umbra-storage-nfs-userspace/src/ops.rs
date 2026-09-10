@@ -236,14 +236,21 @@ impl Operations {
         }
     }
 
-    /// Execute one contract primitive.
-    pub fn execute(
-        &self,
-        context: &mut OpsContext<'_>,
-        request: &StorageRequest,
-    ) -> Result<StorageResponse> {
+    /// Everything that must hold before a request may have *any* effect.
+    ///
+    /// **R2-002.** These checks used to live at the top of [`Self::execute`],
+    /// which the provider reaches only *after* the durable retry journal has
+    /// created and written its index and intent records. A request naming another
+    /// run, a mutation on a read-only run, an unsupported operation and an
+    /// oversized request therefore all left private records behind before being
+    /// refused. Splitting them out lets the provider run them first, against the
+    /// same surface, without duplicating the rules.
+    ///
+    /// Ordering inside is deliberate: bounds and the writer-epoch requirement,
+    /// then "this run takes no mutations at all", then run identity, then
+    /// capability support.
+    pub fn preflight(&self, request: &StorageRequest) -> Result<()> {
         let operation = operation_name(&request.operation);
-        let support = storage_support(&request.operation);
         // The same preflight direct callers and helper callers get: I/O bounds,
         // page limits and the writer-epoch requirement for mutations.
         umbra_storage::validate_request(&self.capabilities(), request)?;
@@ -275,9 +282,27 @@ impl Operations {
         // Anything this provider will never offer stops here, before any effect.
         // A deferred operation falls through to its handler, which reports the
         // contracts gap by name when no dispatcher is bound.
+        let support = storage_support(&request.operation);
         if matches!(support, Support::Unsupported { .. }) {
-            return support.refuse(operation);
+            let refused: Result<StorageResponse> = support.refuse(operation);
+            return refused.map(|_| ());
         }
+        Ok(())
+    }
+
+    /// Execute one contract primitive.
+    pub fn execute(
+        &self,
+        context: &mut OpsContext<'_>,
+        request: &StorageRequest,
+    ) -> Result<StorageResponse> {
+        let operation = operation_name(&request.operation);
+        // Re-run even though `NfsUserspaceStorage::execute` already ran it before
+        // touching the journal (R2-002). This is the seam a direct caller reaches
+        // without a provider, so it validates for itself rather than trusting that
+        // somebody upstream did.
+        self.preflight(request)?;
+        let support = storage_support(&request.operation);
         match &request.operation {
             StorageOperation::Lookup { path } => {
                 let object = self.resolve(context, path)?;
