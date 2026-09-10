@@ -801,6 +801,36 @@ impl Storage for NfsUserspaceStorage {
             )?;
         }
 
+        // R1-005: an existing run's own durable evidence is read and validated
+        // before admission. `OpenExisting` used to check the caller's format
+        // version and nothing else, so a run whose manifest named another base,
+        // another run or another format was admitted, and a missing or malformed
+        // manifest was indistinguishable from a healthy one.
+        //
+        // The epoch floor comes from the same read. A run the mounted adapter
+        // released cleanly has no marker but may have reached epoch 7; creating a
+        // fresh marker at epoch 1 there would regress the run's authority epoch.
+        let epoch_floor = if request.intent == umbra_core::OpenRunIntent::CreateNew {
+            umbra_core::LeaseEpoch(0)
+        } else {
+            let private = operations.anchors().private().ok_or_else(|| {
+                UmbraError::new(
+                    ErrorKind::InvalidState,
+                    "open_run",
+                    "the run has no .provider directory, so its recorded identity cannot be                      read; opening without one would be an unverified session",
+                )
+            })?;
+            crate::anchor::read_persisted_state(
+                transport,
+                private,
+                request.run_id,
+                &request.immutable_base,
+                FORMAT_VERSION,
+                deadline,
+            )?
+            .epoch
+        };
+
         // Product admission, before the binding exists. A denial returns here and
         // leaves `self.operations` untouched, so the caller has nothing to use.
         let writer = self.writer_id.clone();
@@ -811,6 +841,7 @@ impl Storage for NfsUserspaceStorage {
             request.run_id,
             writer.clone(),
             writer_token(request.run_id, &writer),
+            epoch_floor,
             deadline,
         )?;
 

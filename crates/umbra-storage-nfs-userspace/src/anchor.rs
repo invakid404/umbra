@@ -33,8 +33,8 @@
 //! no path can leave the anchor through one.
 
 use umbra_core::{
-    BytePath, ErrorKind, OpenRunIntent, Result, RunId, RuntimeDirectoryBinding, StorageAnchor,
-    StorageHandle, StoragePath, UmbraError,
+    BytePath, ErrorKind, LeaseEpoch, OpenRunIntent, Result, RunId, RuntimeDirectoryBinding,
+    StorageAnchor, StorageHandle, StoragePath, UmbraError,
 };
 
 use crate::handle::FileHandle;
@@ -508,6 +508,167 @@ pub fn provision_private_state(
         &manifest,
         deadline,
     )
+}
+
+/// What a run's persisted `.provider` state says about its identity (**R1-005**).
+///
+/// Read before admission, because a run whose manifest names a different run, a
+/// different immutable base or a different format version is not the run the
+/// caller asked to open, and admitting it would bind a session to state it cannot
+/// account for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedRunState {
+    /// Run identity the manifest records.
+    pub run_id: RunId,
+    /// Immutable base the manifest records.
+    pub immutable_base: umbra_core::ImmutableBaseContract,
+    /// Format version the manifest records.
+    pub format_version: u32,
+    /// Writer epoch `.provider/epoch` records, zero when the run never had one.
+    ///
+    /// The mounted adapter increments this on acquisition, so a cleanly released
+    /// legacy run carries the highest epoch it ever reached even though its lock
+    /// is gone.
+    pub epoch: LeaseEpoch,
+}
+
+/// Read and validate a run's persisted identity before admitting a session.
+///
+/// **R1-005.** `OpenExisting` used to validate only the caller's `format_version`
+/// and read nothing at all from the run it was opening. A run whose manifest
+/// carried another base fingerprint, another run id or another format version was
+/// admitted anyway, and a missing or malformed manifest was indistinguishable
+/// from a healthy one.
+///
+/// Every failure here is a refusal, never an inference: `docs/design/failure-model.md`
+/// requires malformed or changed evidence to be preserved and refused, and a
+/// missing file is never read as a release.
+pub fn read_persisted_state(
+    transport: &mut dyn RawTransport,
+    private: &Anchor,
+    expected_run: RunId,
+    expected_base: &umbra_core::ImmutableBaseContract,
+    expected_format: u32,
+    deadline: Deadline,
+) -> Result<PersistedRunState> {
+    let manifest_bytes = read_private_file(
+        transport,
+        private,
+        &component(layout::MANIFEST_FILE)?,
+        deadline,
+    )?
+    .ok_or_else(|| {
+        UmbraError::new(
+            ErrorKind::CorruptJournal,
+            "open_run",
+            "the run has no .provider/manifest, so its identity cannot be proven; an \
+             existing run without one is refused rather than adopted",
+        )
+    })?;
+
+    let (run_id, immutable_base, format_version): (RunId, umbra_core::ImmutableBaseContract, u32) =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            UmbraError::new(
+                ErrorKind::CorruptJournal,
+                "open_run",
+                format!(
+                    "the run manifest does not decode ({error}); the bytes are retained on the \
+                 server for inspection and the run is refused"
+                ),
+            )
+        })?;
+
+    if run_id != expected_run {
+        return Err(UmbraError::new(
+            ErrorKind::InvalidState,
+            "open_run",
+            format!(
+                "the run directory's manifest records run {}, not the requested {}",
+                run_id.0, expected_run.0
+            ),
+        ));
+    }
+    if format_version != expected_format {
+        return Err(UmbraError::new(
+            ErrorKind::ProtocolMismatch,
+            "open_run",
+            format!(
+                "the run on the server was written at format version {format_version}, not \
+                 the {expected_format} this request declares"
+            ),
+        ));
+    }
+    if immutable_base != *expected_base {
+        return Err(UmbraError::new(
+            ErrorKind::InvalidState,
+            "open_run",
+            format!(
+                "the run was created over immutable base {:?}, not the {:?} this request \
+                 declares; the run is refused rather than rebound to a different base",
+                immutable_base.identity, expected_base.identity
+            ),
+        ));
+    }
+
+    // `.provider/epoch` is the mounted adapter's little-endian u64. Absent is a
+    // legitimate state for a run this provider created before the file existed;
+    // present-but-unreadable is not.
+    let epoch = match read_private_file(
+        transport,
+        private,
+        &component(layout::EPOCH_FILE)?,
+        deadline,
+    )? {
+        None => LeaseEpoch(0),
+        Some(bytes) => {
+            let raw: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+                UmbraError::new(
+                    ErrorKind::CorruptJournal,
+                    "open_run",
+                    format!(
+                        "the run's .provider/epoch is {} bytes, not the 8 a little-endian u64 \
+                         occupies; the recorded writer epoch cannot be read and the run is \
+                         refused rather than restarted at epoch 1",
+                        bytes.len()
+                    ),
+                )
+            })?;
+            LeaseEpoch(u64::from_le_bytes(raw))
+        }
+    };
+
+    Ok(PersistedRunState {
+        run_id,
+        immutable_base,
+        format_version,
+        epoch,
+    })
+}
+
+/// Read one whole file from `.provider`, or `None` when the name is absent.
+///
+/// Absence is `NFS4ERR_NOENT` and nothing else: a lookup or read that *failed* is
+/// propagated, because reporting it as absence is the R1-011 defect in another
+/// place.
+fn read_private_file(
+    transport: &mut dyn RawTransport,
+    private: &Anchor,
+    name: &ComponentName,
+    deadline: Deadline,
+) -> Result<Option<Vec<u8>>> {
+    /// Bound on the private files this reads. Both are small and fixed-shape; a
+    /// larger file is refused rather than streamed.
+    const MAX_PRIVATE_FILE_BYTES: u32 = 64 * 1024;
+
+    let pinned = match descend_any(transport, private.pin(), name, deadline) {
+        Ok(pinned) => pinned,
+        Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let reply =
+        crate::crud::read_anonymous(transport, &pinned, 0, MAX_PRIVATE_FILE_BYTES, deadline)
+            .map_err(|error| error.to_umbra("open_run"))?;
+    Ok(Some(reply.data))
 }
 
 /// `GUARDED4` create one file and write its whole contents.

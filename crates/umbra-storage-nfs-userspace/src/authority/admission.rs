@@ -194,10 +194,25 @@ pub struct AdmissionControl<S: MarkerStore> {
 impl<S: MarkerStore> AdmissionControl<S> {
     /// Admission control for `run` over `store`.
     pub fn new(run: RunId, store: S) -> Self {
+        Self::with_epoch_floor(run, store, LeaseEpoch(0))
+    }
+
+    /// Admission control that already knows a run reached `floor`.
+    ///
+    /// **R1-005.** A run written by the mounted adapter records its writer epoch
+    /// in `.provider/epoch` and deletes only the lock on a cooperative release, so
+    /// a cleanly released legacy run has no marker but may have reached epoch 7.
+    /// Creating a fresh marker at epoch 1 there regresses the run's authority
+    /// epoch — a later reader cannot tell the new epoch 3 from the legacy one.
+    ///
+    /// Seeding the floor makes the first marker this provider writes land above
+    /// everything the run has already used, and makes a marker that reads *below*
+    /// the floor the epoch regression it is.
+    pub fn with_epoch_floor(run: RunId, store: S, floor: LeaseEpoch) -> Self {
         Self {
             store,
             run,
-            highest_epoch_seen: LeaseEpoch(0),
+            highest_epoch_seen: floor,
         }
     }
 
@@ -236,10 +251,20 @@ impl<S: MarkerStore> AdmissionControl<S> {
             return AdmissionOutcome::Refused(refusal);
         }
 
+        // R1-005: the first epoch is one past anything the run is already known to
+        // have used, which is `LeaseEpoch(1)` for a run with no history.
+        let Some(first) = self.highest_epoch_seen.0.checked_add(1) else {
+            return AdmissionOutcome::Refused(FacadeError::Authority(
+                AuthorityError::IdentityUnproven(
+                    "admission epoch would overflow; refusing rather than wrapping".into(),
+                ),
+            ));
+        };
+        let first = LeaseEpoch(first);
         let fresh = AdmissionMarker::new(
             request.token,
             request.writer.clone(),
-            LeaseEpoch(1),
+            first,
             AdmissionPhase::Held,
         );
         let encoded = match fresh.encode() {
@@ -249,12 +274,12 @@ impl<S: MarkerStore> AdmissionControl<S> {
         match self.store.create_exclusive(&encoded) {
             Err(error) => return AdmissionOutcome::Refused(error),
             Ok(ExclusiveCreate::Created) => {
-                self.highest_epoch_seen = LeaseEpoch(1);
+                self.highest_epoch_seen = first;
                 return AdmissionOutcome::Admitted(Admitted {
                     run: self.run,
                     writer: request.writer.clone(),
                     token: request.token,
-                    epoch: LeaseEpoch(1),
+                    epoch: first,
                 });
             }
             Ok(ExclusiveCreate::Exists) => {}

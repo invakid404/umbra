@@ -986,3 +986,235 @@ fn r1_011_an_invalidated_cursor_keeps_the_original_status() {
         error.context
     );
 }
+
+// --- R1-005: an existing run's own evidence is validated ---------------------
+
+/// Seed a run directory the way a *previous* provider left it: the layout, a
+/// manifest, an `.provider/epoch`, and no `writer.lock`.
+///
+/// This is a userspace-seeded legacy run. No mounted adapter and no live server
+/// is involved; the bytes are the ones the mounted adapter writes.
+fn seed_existing_run(
+    manifest: Option<Vec<u8>>,
+    epoch: Option<u64>,
+    run_id: RunId,
+) -> (FakeTransport, RunId) {
+    let mut fake = FakeTransport::new();
+    let mut current = fake.root();
+    for part in EXPORT.split(|byte| *byte == b'/') {
+        current = fake.insert_directory(&current, part);
+    }
+    let run_parent = fake.insert_directory(&current, RUN_PARENT);
+    let run = fake.insert_directory(&run_parent, run_id.0.hyphenated().to_string().as_bytes());
+    fake.insert_directory(&run, b"root");
+    fake.insert_directory(&run, b"control");
+    let private = fake.insert_directory(&run, b".provider");
+    fake.insert_directory(&private, b"retries");
+    if let Some(bytes) = manifest {
+        fake.insert_file(&private, b"manifest", bytes);
+    }
+    if let Some(epoch) = epoch {
+        fake.insert_file(&private, b"epoch", epoch.to_le_bytes().to_vec());
+    }
+    (fake, run_id)
+}
+
+fn manifest_bytes(run_id: RunId, base: &ImmutableBaseContract, format: u32) -> Vec<u8> {
+    serde_json::to_vec(&(run_id, base, format)).expect("the manifest encodes")
+}
+
+fn open_existing(storage: &mut NfsUserspaceStorage, run_id: RunId) -> umbra_core::Result<()> {
+    storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::OpenExisting,
+            immutable_base: base(),
+            policy: policy(),
+        })
+        .map(|_| ())
+}
+
+fn over(fake: FakeTransport) -> NfsUserspaceStorage {
+    NfsUserspaceStorage::with_facades(config(), Box::new(fake), Box::new(FakeReplayLog::default()))
+        .expect("provider")
+}
+
+/// **R1-005.** A legacy run that reached epoch 7 and released cleanly is admitted
+/// at epoch 8, not epoch 1.
+///
+/// Pre-fix a missing `writer.lock` always initialised epoch 1, so opening a
+/// cleanly released run regressed its authority epoch — a later reader could not
+/// tell this session's epoch 3 from the legacy run's own epoch 3.
+#[test]
+fn r1_005_a_released_legacy_run_does_not_restart_the_epoch_ladder() {
+    let run_id = fresh_run();
+    let (fake, run_id) = seed_existing_run(
+        Some(manifest_bytes(run_id, &base(), FORMAT_VERSION)),
+        Some(7),
+        run_id,
+    );
+    let mut storage = over(fake);
+    open_existing(&mut storage, run_id).expect("a cleanly released legacy run opens");
+
+    let epoch = storage.admission().expect("admitted").admitted().epoch();
+    assert_eq!(
+        epoch.0, 8,
+        "admission must land above every epoch the run already used, not at 1"
+    );
+}
+
+/// **R1-005.** A run whose manifest was never written is refused, not adopted.
+#[test]
+fn r1_005_a_run_without_a_manifest_is_refused() {
+    let run_id = fresh_run();
+    let (fake, run_id) = seed_existing_run(None, Some(0), run_id);
+    let mut storage = over(fake);
+    let refused = open_existing(&mut storage, run_id).expect_err("no manifest, no identity");
+    assert_eq!(refused.kind, ErrorKind::CorruptJournal);
+    assert!(
+        refused.context.contains("no .provider/manifest"),
+        "{}",
+        refused.context
+    );
+    assert!(storage.admission().is_none(), "no admission is published");
+}
+
+/// **R1-005.** A manifest that does not decode is refused and its bytes are left
+/// where they are.
+#[test]
+fn r1_005_a_malformed_manifest_is_refused_and_retained() {
+    let run_id = fresh_run();
+    let (fake, run_id) = seed_existing_run(Some(b"{not json".to_vec()), Some(3), run_id);
+    let mut storage = over(fake);
+    let refused = open_existing(&mut storage, run_id).expect_err("a malformed manifest is refused");
+    assert_eq!(refused.kind, ErrorKind::CorruptJournal);
+    assert!(
+        refused.context.contains("does not decode"),
+        "{}",
+        refused.context
+    );
+}
+
+/// **R1-005.** A manifest naming a different run, base or format version is
+/// refused. Each is a distinct way the run on the server is not the run asked for.
+#[test]
+fn r1_005_a_manifest_that_names_other_state_is_refused() {
+    let requested = fresh_run();
+
+    // Another run id.
+    let (fake, run_id) = seed_existing_run(
+        Some(manifest_bytes(
+            RunId(Uuid::new_v4()),
+            &base(),
+            FORMAT_VERSION,
+        )),
+        Some(1),
+        requested,
+    );
+    let mut storage = over(fake);
+    let refused = open_existing(&mut storage, run_id).expect_err("wrong run id");
+    assert_eq!(refused.kind, ErrorKind::InvalidState);
+    assert!(
+        refused.context.contains("records run"),
+        "{}",
+        refused.context
+    );
+
+    // Another immutable base.
+    let other_base = ImmutableBaseContract {
+        identity: "some-other-base".into(),
+        fingerprint: vec![0x01, 0x02],
+    };
+    let (fake, run_id) = seed_existing_run(
+        Some(manifest_bytes(requested, &other_base, FORMAT_VERSION)),
+        Some(1),
+        requested,
+    );
+    let mut storage = over(fake);
+    let refused = open_existing(&mut storage, run_id).expect_err("wrong immutable base");
+    assert_eq!(refused.kind, ErrorKind::InvalidState);
+    assert!(
+        refused.context.contains("immutable base"),
+        "{}",
+        refused.context
+    );
+
+    // Another format version.
+    let (fake, run_id) = seed_existing_run(
+        Some(manifest_bytes(requested, &base(), FORMAT_VERSION + 1)),
+        Some(1),
+        requested,
+    );
+    let mut storage = over(fake);
+    let refused = open_existing(&mut storage, run_id).expect_err("wrong format version");
+    assert_eq!(refused.kind, ErrorKind::ProtocolMismatch);
+}
+
+/// **R1-005.** An `.provider/epoch` that cannot be read is refused rather than
+/// treated as zero. A corrupt file is not an inference that the run never ran.
+#[test]
+fn r1_005_an_unreadable_epoch_file_is_refused_not_read_as_zero() {
+    let run_id = fresh_run();
+    let (mut fake, run_id) = seed_existing_run(
+        Some(manifest_bytes(run_id, &base(), FORMAT_VERSION)),
+        None,
+        run_id,
+    );
+    // Three bytes where a little-endian u64 belongs.
+    let mut current = fake.root();
+    for part in EXPORT.split(|byte| *byte == b'/') {
+        current = fake
+            .lookup(
+                &current,
+                &umbra_storage_nfs_userspace::transport::ComponentName::new(part.to_vec()).unwrap(),
+                umbra_storage_nfs_userspace::transport::AttrMask::STAT,
+                Deadline { millis: 5_000 },
+            )
+            .expect("walk")
+            .0;
+    }
+    let (run_parent, _) = fake
+        .lookup(
+            &current,
+            &umbra_storage_nfs_userspace::transport::ComponentName::new(RUN_PARENT.to_vec())
+                .unwrap(),
+            umbra_storage_nfs_userspace::transport::AttrMask::STAT,
+            Deadline { millis: 5_000 },
+        )
+        .expect("run parent");
+    let (run, _) = fake
+        .lookup(
+            &run_parent,
+            &umbra_storage_nfs_userspace::transport::ComponentName::new(
+                run_id.0.hyphenated().to_string().into_bytes(),
+            )
+            .unwrap(),
+            umbra_storage_nfs_userspace::transport::AttrMask::STAT,
+            Deadline { millis: 5_000 },
+        )
+        .expect("run");
+    let (private, _) = fake
+        .lookup(
+            &run,
+            &umbra_storage_nfs_userspace::transport::ComponentName::new(b".provider".to_vec())
+                .unwrap(),
+            umbra_storage_nfs_userspace::transport::AttrMask::STAT,
+            Deadline { millis: 5_000 },
+        )
+        .expect("private");
+    fake.insert_file(&private, b"epoch", vec![0xAA, 0xBB, 0xCC]);
+
+    let mut storage = over(fake);
+    let refused = open_existing(&mut storage, run_id).expect_err("a truncated epoch is refused");
+    assert_eq!(refused.kind, ErrorKind::CorruptJournal);
+    assert!(
+        refused.context.contains("not the 8"),
+        "the refusal must name the shape problem: {}",
+        refused.context
+    );
+    assert!(
+        refused.context.contains("rather than restarted at epoch 1"),
+        "and must say what it refused to infer: {}",
+        refused.context
+    );
+}

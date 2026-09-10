@@ -60,6 +60,7 @@ impl Session {
         run: RunId,
         writer: WriterId,
         token: WriterToken,
+        epoch_floor: LeaseEpoch,
         deadline: Deadline,
     ) -> Result<Self> {
         let private = anchors.private().ok_or_else(|| {
@@ -84,7 +85,10 @@ impl Session {
             .open_owners();
 
         let store = ServerMarkerStore::new(transport, owners, parent, name, deadline);
-        let mut control = AdmissionControl::new(run, store);
+        // R1-005: the floor is the highest epoch the run's durable evidence says
+        // it already reached, so a first marker written here lands above it and a
+        // marker reading below it is the regression it is.
+        let mut control = AdmissionControl::with_epoch_floor(run, store, epoch_floor);
         match control.acquire(&AdmissionRequest::cooperative(writer, token)) {
             AdmissionOutcome::Admitted(admitted) => Ok(Self { admitted }),
             AdmissionOutcome::Denied {
