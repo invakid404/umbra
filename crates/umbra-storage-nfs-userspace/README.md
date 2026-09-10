@@ -1,0 +1,878 @@
+# umbra-storage-nfs-userspace
+
+**Current state: a working userspace NFSv4.0 storage provider — the Umbra-owned
+protocol state machine, a raw-RPC transport behind an off-by-default feature, the
+storage operations surface, and product admission acquired before any run
+binding is published.** This crate holds the private facade contracts for
+Umbra's userspace NFSv4.0 backend, the client state machine in `src/state/`, the
+operations surface in `src/ops.rs` and the modules beside it, the admission,
+journal and outage machine in `src/authority/`, the admission binding in
+`src/session.rs`, and a `Storage` implementation that creates and opens runs,
+resolves paths, stats, enumerates, reads, writes, creates, renames, removes,
+sets metadata and truncates. Semantics this provider will not offer answer
+`UnsupportedCapability`; `flush` answers `NotImplemented`, because a durability
+receipt would assert a persistence boundary nothing here has qualified.
+
+`open_run` acquires admission before it returns a binding, so a denied session
+receives an error and nothing to use. Admission is granted only by a release the
+previous holder recorded — never by elapsed time — and every takeover policy
+other than `Refuse` is refused before the marker is touched.
+
+A default build needs no native toolchain, and its tests contact no server:
+they run against the in-memory fake in `src/fake.rs`. Building with
+`--features transport-raw` adds `transport::raw::LibnfsRawTransport`, which
+speaks NFSv4.0 to a real server; `tests/m1_conformance.rs` and
+`tests/golden_compat.rs` then drive the same provider against an isolated
+NFS-Ganesha container when `UMBRA_NFS_RAW_FIXTURE=<host>:<port>` names one. No
+suite in this crate mounts anything.
+
+**Ownership boundary.** This README owns `crates/umbra-storage-nfs-userspace/`:
+`src/`, `tests/`, `Cargo.toml`, `build.rs`, `libnfs.pin` and `provider.json`. The
+mounted adapter is a separate boundary at
+[umbra-storage-nfs](../umbra-storage-nfs/README.md); the contract this crate
+implements is [umbra-storage](../umbra-storage/README.md).
+
+## Why a second NFS provider
+
+[umbra-storage-nfs](../umbra-storage-nfs/README.md) needs an NFSv4 mount that
+already exists in the OS namespace. This provider speaks NFSv4.0 from user space,
+so a host does not need a mount. The mounted adapter stays the qualified fallback
+where a mount is already present.
+
+The two are sequential, not concurrent: a run created by one can later be opened
+by the other, and one-session-one-Umbra admission remains product-wide.
+
+## Scope
+
+- **Wire profile:** NFSv4.0 over TCP with AUTH_SYS. Nothing else. The NFSv4.1
+  session model — `EXCHANGE_ID`, `CREATE_SESSION`, `SEQUENCE`, `RECLAIM_COMPLETE`
+  — is out of scope and has no variant in `transport::OpCode`, so it is
+  unrepresentable rather than merely discouraged.
+- **Umbra owns protocol state:** client ids, open and lock owners, stateids,
+  seqids, renewal, reconnect, grace, NFSv4.0 `CLAIM_PREVIOUS` reclaim, replay
+  buffers and verifier accounting. A transport supplies raw RPC/XDR and task
+  primitives only. `LibnfsRawTransport` holds none of that state: stateids and
+  open-owner bytes pass through it as opaque owned values inside `Nfs4Op`.
+- **Protocol ownership is not writer authority.** A successful `RENEW` proves the
+  NFS lease is alive. It never authorises taking over an abandoned session.
+  `error::AuthorityError` is a separate domain for exactly that reason.
+- **Locking:** the M2 syscall contract (design snapshot `docs/design/syscall-matrix.md`,
+  not tracked in this repository) defers `flock` to an M2 gate and admits only
+  `fcntl` record locks meanwhile, so the only locks in scope are NFSv4.0
+  **advisory** byte-range record locks. `LOCK` and `LOCKU` are frozen in the
+  transport facade so the M2 gate does not reopen the seam; no consumer path in
+  this crate calls them.
+
+## The five facades
+
+| Facade | File | What it fixes in place |
+| --- | --- | --- |
+| Transport | `src/transport.rs` | COMPOUND submission, the v4.0 operation set, deadlines, bounded queues, connection epochs, fault-injection points |
+| Handle | `src/handle.rs` | Byte-owned filehandles, stable object identity, open-owner sequencing |
+| Error | `src/error.rs` | Four disjoint failure domains and retained-error tracking |
+| Replay | `src/replay.rs` | Durable intent identity, verifier accounting, bounded buffer, backpressure |
+| Fake | `src/fake.rs` | In-memory transport and replay log behind the same traits |
+
+`src/transport/raw/` implements the transport facade against libnfs and is
+compiled only under `transport-raw`; see [Raw transport](#raw-transport) below.
+
+`src/storage.rs` holds the provider configuration and the `Storage`
+implementation; `src/lib.rs` exports the provider id and the run-layout
+constants. `src/state/` and the operations modules consume the facades rather
+than adding to them.
+
+## Protocol state
+
+`src/state/` is the client state machine: everything that makes raw RPC an NFSv4.0
+*client*. It binds no transport of its own.
+
+| Module | Owns |
+| --- | --- |
+| `state::seqid` | Owner seqids for the window before an `OpenFile` exists |
+| `state::client_id` | `SETCLIENTID` then `SETCLIENTID_CONFIRM`, and the retained client verifier |
+| `state::open_owner` | Owner allocation, `OPEN`, `OPEN_CONFIRM`, `CLOSE`, `OPEN_DOWNGRADE` |
+| `state::lease` | `RENEW` while idle, and the connection-epoch rule |
+| `state::reclaim` | `CLAIM_PREVIOUS` reclaim within a bounded grace |
+| `state::verifier` | `EXCLUSIVE4` create verifiers, and WRITE/COMMIT matching |
+| `state::retained_errors` | Which failures are settled, and for how long |
+
+`state::retained_errors` means one thing by *settled*: `ErrorClass::Permanent`,
+a failure that retrying the identical request cannot change. Only a settled
+failure may be retained durably; a transient one — a server asking for a retry,
+a lost connection, a changed write verifier, a safe stop whose whole meaning is
+that the outcome is unknown — is retained volatile or not at all, and asking for
+a durable record of one is refused before anything is written. A deadline is in
+that group: `Retirement` proves this pump withdrew the call and says nothing
+about whether the server acted on it, so `DeadlineExpired` classifies
+`NeedsRecovery`, unlike the pre-dispatch `QueueFull` refusal beside it.
+
+Three rules shape it.
+
+1. **Illegal transitions do not compile.** A `ConfirmedClient` is reachable only
+   through a `SETCLIENTID_CONFIRM` the server accepted; an `OwnerLease` is consumed
+   by its OPEN attempt; `close` consumes the `OpenFile`; an unconfirmed open's
+   `stateid()` keeps refusing. None of these is a runtime guard. Seqid authority
+   is not duplicable either: `OwnerSequence`, `OwnerLease` and `LockOwnerLease`
+   implement neither `Clone` nor `Copy`, because a copy is a second claim on one
+   owner's counter — two copies would issue the same seqid, and poisoning one
+   would leave the other usable.
+2. **Nothing advances further than the server proved.** A server answer resolves
+   the seqid by the RFC 7530 section 9.1.7 rule and leaves the owner reusable. An
+   answer that never arrived poisons the owner instead, because the seqid the
+   server observed cannot be inferred from silence. The cost is one retired owner
+   name per lost reply.
+3. **Renewal is not authority.** `LeaseClock::takeover_by_timeout` always returns
+   `AuthorityError::TakeoverRefused`. An expired lease means this client's own
+   state may be gone; it is never evidence that another session terminated.
+
+An OPEN that the server committed is released rather than dropped, on both paths
+that can decide it is unusable: an identity lookup that fails after the OPEN, and
+a `CLAIM_PREVIOUS` reclaim that comes back naming a different object. Dropping an
+`OpenFile` sends nothing — CLOSE is a wire operation `state::open_owner::close`
+dispatches — and a client that goes on renewing its lease is the reason that
+state would otherwise survive. `OPEN_CONFIRM` runs first where the server asked
+for it, because its reply carries the stateid the CLOSE must present. Neither
+cleanup changes the answer: an unproven identity is still abandoned with the
+owner burned, and a reclaim mismatch is still surrendered as `IdentityChanged`
+with any cleanup failure retained beside it.
+
+`OPEN_DOWNGRADE` is a partial seam. `state::open_owner::downgrade_with` owns the
+seqid and the share-bit narrowing and takes the wire step as a closure, because
+`transport::Nfs4Op` has no `OpenDowngrade` variant to submit. The state transition
+is implemented and tested; the operation cannot yet be put on the wire.
+
+### Safe-wrapper invariants
+
+The crate denies `unsafe_code`. `src/transport/raw/` is the single module that
+lifts the lint, under a `#![allow(unsafe_code)]` carrying the reason, so the FFI
+stays visible in review rather than diffused through the crate.
+
+Two hazards are closed by types rather than by convention:
+
+1. **Nothing borrows across the seam.** A `FileHandle` owns its bytes and a
+   `CompoundReply` owns its result bytes, so no reply can alias a caller's freed
+   buffer. Ordering that a borrow lifetime would have expressed is carried by
+   ownership instead: an `OpenFile` holds an `Arc<SessionCore>`, so a session core
+   cannot be dropped while open state derived from it is alive. Closing a session
+   makes surviving handles report `IdentityUnproven`, not undefined behaviour.
+2. **A deadline cannot be reported without a cancellation.**
+   `TransportError::DeadlineExpired` holds a `Retirement`, whose constructor is
+   crate-private and reachable only through `RawTransport::cancel`. An
+   implementation cannot report a timeout for a call it did not first withdraw
+   from the pump. Calls are registered under an integer `CallToken` resolved
+   through a pump-owned registry, so a completion for a retired call finds nothing
+   instead of dereferencing freed memory.
+
+`OpenFile::sequence` returns a `SequencedOp` guard holding the open-owner's lock,
+which makes two concurrent sequenced operations for one owner impossible. The
+guard must be resolved: `commit` advances the seqid, `abort` applies the RFC 7530
+section 9.1.7 rule about which failures hold it, and both an explicit `abandon`
+and an unresolved drop poison the sequence so the next caller is told to recover
+rather than silently desynchronising. `OpenFile::next_seqid` reads the same
+counter without creating a guard, so inspecting an owner cannot poison it.
+
+## Operations
+
+`src/ops.rs` is the operations surface: one typed `Storage` primitive in, one
+typed response out. Every request ends in the typed response, a refusal naming a
+capability this provider will not offer, or a refusal naming the node that owes
+the wiring — never a success it did not perform.
+
+| Module | Owns |
+| --- | --- |
+| `anchor` | The `run`, `root`, `control` and `.provider` anchors, containment-checked path resolution, and the session-bound `StorageHandle` mint |
+| `identity` | `(fsid, fileid)` as stable object identity, its mapping to `ObjectId`, and the `PinnedObject` every operation addresses |
+| `pages` | Bounded `READDIR` paging, cookie-verifier continuity, and the noise filter |
+| `crud` | `OPEN` dispositions, reads, writes, and the WRITE/COMMIT verifier flow |
+| `namespace` | The typed seam for `REMOVE`, `RENAME`, `CREATE` and `SETATTR` |
+| `capability` | The capability matrix, and the error each verdict produces |
+
+Four rules shape it.
+
+1. **An anchor is a handle, never a path.** A userspace client has no mount root
+   and no host path, so every `RuntimeDirectoryBinding::physical_path` is `None`.
+   A fabricated one would name a path no `open` could use.
+2. **Identity is the `(fsid, fileid)` pair, never the name and never the
+   filehandle bytes.** An `OpenObject` records the name it was opened under for
+   diagnostics and never re-resolves it. A rename therefore cannot retarget it, a
+   pathname replacement leaves it on the original object while a fresh lookup
+   finds the replacement, and an object whose last name is gone stays readable
+   through the open until `CLOSE`.
+3. **Escaping an anchor is unrepresentable, not merely checked.** `StoragePath`
+   refuses empty, `.` and `..` components; `ComponentName` refuses those again
+   along with `/` and NUL; and every intermediate component must resolve to a
+   directory, so a server-side symlink stops the walk instead of being followed.
+   Path bytes are not containment on their own: the walk also pins the server
+   filesystem. `RunAnchors::open` records the `fsid` of the resolved export — the
+   pseudo-root to configured-export transition is the one deliberate crossing —
+   and every descent below it, including the final component of a resolved path,
+   must report that same `fsid`. A `LOOKUP` into a nested exported filesystem
+   returns an ordinary directory that no byte check and no symlink check can see,
+   so it is refused on its own terms.
+4. **A page is bounded at every level.** One `List` issues at most
+   `pages::MAX_SERVER_PAGES` `READDIR` operations, each capped by `max_count`,
+   and returns at most the requested limit; nothing accumulates a whole
+   directory. The *allocation* is bounded independently of the caller's limit: a
+   limit is a request, not a measurement of the directory, so reserving for it
+   made a three-entry listing cost whatever number was asked for. The initial
+   reservation is the smallest of the limit, what those server pages could
+   physically carry, and a fixed ceiling; the vector still grows if more arrives. A changed `cookieverf` invalidates outstanding cursors explicitly
+   rather than restarting silently or answering from a cached snapshot. The
+   invalidation keeps the server's own diagnosis: a `NFS4ERR_BAD_COOKIE` is
+   reported as an invalidated cursor *and* carries the original status number and
+   failing operation, so a caller can tell why enumeration restarted. Absence and
+   failure stay distinct throughout — a `.provider` lookup answered `NFS4ERR_IO`
+   is that failure, not a run without a private directory.
+
+Creating a file applies the mode that was requested. The provider supplies a
+create verifier for every keyed operation, so a create is `EXCLUSIVE4`, which
+carries that verifier in the field `GUARDED4` uses for initial attributes. The
+attributes therefore follow in a `SETATTR`, whose returned attrset is checked
+before the create reports success; a `SETATTR` failure is surfaced with its
+partial effect rather than undone by removing a name another writer may own.
+
+The verifier is derived from the operation id by mixing both halves of it through
+MurmurHash3's `fmix64`, with fixed published constants rather than a hasher whose
+algorithm may change between compiler releases. It is deterministic, which is
+what lets a replayed create be recognised without consulting storage, and it is
+**not** unique: 2^128 identities cannot map injectively onto 2^64 verifiers, so
+what the module states is a collision probability of about 2^-64 for two random
+ids. The earlier fold XORed paired bytes of the two halves together, which made
+whole families of ids collide by construction — operation ids `1` and `1 << 64`
+derived the same verifier, and an `EXCLUSIVE4` replay treats an equal verifier as
+the same create. `CreateVerifierLedger` retains a key's verifier once it has been
+used and `authority_recovery` persists that ledger, so a create whose verifier
+reached durable storage replays exactly; one interrupted before that presents the
+new derivation, is answered `NFS4ERR_EXIST`, and stops as a safe give-up rather
+than adopting an object.
+
+A `WriteAt` records a durable intent through the replay facade before dispatch,
+reports the count and stability the server actually reached rather than the ones
+requested, and writes `UNSTABLE`. An unstable write is durable only once a
+`COMMIT` returns the verifier the `WRITE` did; a changed verifier is
+`ReplayError::VerifierChanged`, meaning the bytes must be rewritten from the
+retained payload. No receipt is issued here, so nothing claims persistence.
+
+### Capabilities
+
+`capability::CONTRACT_SURFACE` is the single source of truth for what each
+`Storage` operation does, and `capability::OUT_OF_SURFACE` records a verdict for
+the syscall-matrix entries no contract operation maps to. Three verdicts:
+
+- **Supported**, implemented here and exercised by this crate's tests: `Lookup`,
+  `Stat`, `List`, `ReadAt`, `WriteAt`, `Create` of a file or a directory,
+  `CreateParents`, `Unlink`, `RemoveDirectory`, `Rename`, `SetMetadata` and
+  `Truncate`.
+- **Unsupported**, answered with `ErrorKind::UnsupportedCapability`: hard links;
+  logical symlinks and `ReadLink`, which are overlay-owned; extended attributes;
+  whiteouts; `AtomicSwap`; and `RenameMode::NoReplace`, because NFSv4.0 `RENAME`
+  always replaces and no v4.0 operation makes "only if the destination is absent"
+  atomic. Probing the destination first and renaming second is the
+  check-then-rename the syscall matrix prohibits: another client can create the
+  destination between the two round trips, and a probe that fails for any reason
+  other than `NFS4ERR_NOENT` says nothing about what is there. It is refused in
+  preflight, with the other unsupported operations, so it leaves no journal
+  record behind; the capability table classifies by operation and cannot express
+  an unsupported submode on its own. `RenameMode::Replace` is supported and
+  unaffected. `OUT_OF_SURFACE` adds file-backed `mmap`, ACLs,
+  `flock`, and — out of scope by the syscall matrix's notifications decision —
+  `kqueue`/`kevent` with `EVFILT_VNODE` and FSEvents. Nothing in this crate
+  registers, delivers or emulates a file-change notification.
+- **Deferred**, answered with `ErrorKind::NotImplemented` naming the owner:
+  `CopyUp`, which needs a base-materialisation seam that lives above storage, and
+  `flush`, whose receipt would assert a persistence boundary nothing here has
+  qualified.
+
+Namespace mutation — `Unlink`, `RemoveDirectory`, `Rename`, `Create` of a
+directory, `CreateParents`, `SetMetadata`, `Truncate` — was deferred while the
+frozen `transport::Nfs4Op` carried no argument variant for `REMOVE`, `RENAME`,
+`CREATE` or `SETATTR`, even though `transport::OpCode` enumerated all four. The
+authorised contracts hotfix at `m1_integrate` added those variants plus the
+`SAVEFH` a RENAME needs to name its source directory, and
+`namespace::dispatch::TransportDispatcher` binds them. A request that carries no
+dispatcher — because it holds no writer authority — still receives
+`NotImplemented` naming the missing binding, never a fabricated success.
+
+`namespace::apply` enforces one rule whoever dispatches: a rename moves a name,
+not an object, so an outcome reporting an identity other than the one the caller
+pinned is refused rather than believed. `TransportDispatcher` takes the transport
+per call rather than owning one, so a mutation provably travels on the session's
+own connection instead of a second one whose epoch authorised nothing.
+
+Three things the dispatcher refuses rather than absorbs:
+
+- **An unlink whose target type the server did not report.** The probe exists to
+  prove what a name resolves to, and a reply with no `FATTR4_TYPE` proves
+  nothing. `RemoveKind::File` still covers a regular file *and* a logical-symlink
+  name, so the refusal is about absent evidence and not about narrowing the kinds
+  the contract supports.
+- **A removal it cannot show removed the object the caller pinned.** REMOVE is a
+  pathname operation and a name is not an object: another client can replace the
+  name between the probe and the unlink. No COMPOUND can close that window —
+  [RFC 7530 §14.2](https://www.rfc-editor.org/rfc/rfc7530.html#section-14.2)
+  guarantees order but not atomicity, so a VERIFY guard would be an atomicity
+  claim v4.0 cannot make — but the server can say whether its directory moved.
+  The parent's `FATTR4_CHANGE` is captured before the probe and compared against
+  the REMOVE's own atomic `cinfo.before`; equal means nothing happened in that
+  directory across the window. Anything else stops the run
+  `BLOCKED_RECOVERABLE`, because the REMOVE *succeeded* — a name really is gone,
+  re-running would unlink whatever holds it next, and there is nothing to roll
+  back. A server that never reports atomic change info therefore makes every
+  pinned unlink uncertain, which is the conservative direction.
+- **A metadata update whose timestamp cannot be represented.** An out-of-range
+  time used to be dropped, which left a mixed mode-and-time update applying the
+  mode and reporting `AttributesSet`: a partial effect reported as a whole one.
+  The conversion is fallible and refuses before any SETATTR reaches the wire.
+  Pre-epoch times still floor their seconds and carry a positive remainder,
+  because `nfstime4.nseconds` is unsigned.
+
+## Raw transport
+
+`transport::raw::LibnfsRawTransport` implements `RawTransport` over
+[libnfs](https://github.com/sahlberg/libnfs), pinned in `libnfs.pin`. It is
+transport only: it holds no client id, seqid, lease or reclaim state.
+
+`build.rs` does three things, all of them scope enforcement rather than
+convenience, and it does nothing at all unless the feature is enabled:
+
+1. **Pins the dependency.** The libnfs checkout is rejected unless it is at the
+   commit `libnfs.pin` names, so the generated ABI cannot drift silently. The
+   checkout is expected at `third_party/libnfs`, or wherever `UMBRA_LIBNFS_SRC`
+   points.
+2. **Allowlists the ABI.** Only the public raw RPC, XDR and task primitives are
+   generated. `libnfs.h` is parsed because `libnfs-raw.h` needs its `rpc_cb`
+   typedef, but no managed-lifecycle symbol is emitted.
+3. **Proves the allowlist held.** The generated file is scanned afterwards and
+   the build fails if any `nfs_*` entry point or `nfs_context` reached it. An
+   allowlist passed to a generator is a statement of intent; the scan is a
+   statement about the artefact.
+
+Two hazards the audited spike carried are closed by construction:
+
+- **libnfs never receives the address of a Rust value.** `private_data` is a
+  `u64` call id resolved against a registry, so a late or duplicated completion
+  for a retired call finds no entry instead of dereferencing freed memory.
+- **Argument memory is heap-owned for the whole dispatch.** `rpc_nfs4_write_task`
+  references the WRITE payload from the PDU's iovector rather than copying it, so
+  a `CallArena` owns every buffer C can reach until the call completes or is
+  proven withdrawn. `rpc_cancel_pdu` dereferences the PDU it is given before
+  checking that libnfs still owns it, so the pointer is reachable exactly once,
+  through `Dispatch::take_for_cancel`.
+- **A connection failure frees every outstanding PDU, not just one.** Reachable
+  once is not enough on its own: when `rpc_service` returns a negative value,
+  `rpc_reconnect_requeue` has already errored every outstanding call and freed
+  each PDU, so every pointer the wrapper holds is dangling at once. `pdu`
+  counts those connection-wide disposals, each `CallSlot` records the generation
+  it was queued in, and retirement makes a stale slot's pointer unreachable
+  instead of cancelling it. The rule lives in `src/pdu.rs` rather than behind the
+  `transport-raw` feature so it is compiled and tested in a default build.
+- **Every service return is reconciled before any cancellation.** The same
+  requeue path calls each outstanding completion on its way out, so a connection
+  failure can carry a settled answer. The pump consults the completion registry
+  on every return, including the failure paths, rather than reporting
+  `Disconnected` over a completion that had already arrived.
+- **The lifetime rule is asserted, not just stated.** `CallArena` counts its live
+  instances, so a harness can observe the *ordering* of C-side disposal against
+  Rust-side release — the ordering a use-after-free inverts. The `r3_004_*` tests
+  in `src/transport/raw/mod.rs` queue a real specialized READ against a live
+  server and drive it through a local poll failure and a real `rpc_disconnect`,
+  asserting the arena is still alive when C is told to dispose, that retirement
+  never cancels the freed PDU, that no stale registration remains, and that the
+  arena is released exactly once afterwards. A third case pins that an ordinary
+  completed call does release its arena, so the others cannot pass by arenas
+  never dropping. ASan was not used: the workspace pins stable Rust and
+  `-Zsanitizer=address` is nightly-only.
+- **Retirement happens on every return path.** A reply that fails to decode
+  retires its registration, slot and arena before the error propagates. Leaving
+  them in flight would accumulate retained slots until `max_inflight` was spent
+  and every later submission was refused `QueueFull`.
+
+Replies are copied out of libnfs's buffers inside the completion callback, so no
+reply borrows C memory. They are copied with `read_unaligned`: libnfs decodes
+into a ZDR bump allocator with four-byte granularity, while `nfs_resop4` and
+`entry4` contain `uint64_t` fields, and a misaligned reference is undefined
+behaviour in Rust even where C tolerates the same address.
+
+## Joining the two
+
+`integration::StateSession` is the seam where the protocol state machine and a
+wire transport meet. It owns one `Box<dyn RawTransport>` and one `ProtocolState`
+driven over it, and it is constructed either way:
+
+- `StateSession::over_fake` — the in-memory shape fake, no I/O.
+- `StateSession::over_libnfs` — the live libnfs transport, behind the
+  `transport-raw` feature.
+
+The state machine already consumed `&mut dyn RawTransport`, so joining the two
+implementations changed no state-machine code and moved no public surface; the
+session only makes the choice explicit and reports which backend answered through
+`StateSession::backend`. `split` hands out both halves at once because the driver
+methods need `&mut ProtocolState` and `&mut dyn RawTransport` in one call, and
+`observe` expresses the epoch comparison that needs both by shared reference.
+
+**No live transport is constructed for `Storage` here.** `NfsUserspaceStorage`
+runs its operations over whatever `with_facades` was given, which is the fake in
+every test in this crate. Constructing a `LibnfsRawTransport` for the provider,
+and the acceptance that goes with it, is deferred.
+
+## Authority and recovery
+
+`src/authority/` owns the two questions the protocol state machine deliberately
+refuses: whether this session may mutate at all, and what happens when it is
+interrupted. `state::lease::LeaseClock::takeover_by_timeout` and
+`state::ProtocolState::takeover` both answer `TakeoverRefused` rather than
+owning the question; this is where it is owned.
+
+| Module | Owns |
+| --- | --- |
+| `authority::marker` | The durable ownership record, its fixed-width codec, and the `MarkerStore` seam |
+| `authority::server_marker` | That store on the server, over the frozen transport facade |
+| `authority::admission` | Acquire, deny, cooperatively release; the epoch ladder |
+| `authority::journal` | Durable intent, payload and committed result over the frozen `ReplayLog` |
+| `authority::outage` | The finite state machine over the failure model's five states |
+
+Four rules shape it.
+
+1. **A held marker denies every acquirer.** Not until a lease elapses, and not
+   unless the token matches — denies. No code path leads from elapsed time to
+   admission, and a restarted process presenting its predecessor's token has
+   proven only that it can read a file, not that the predecessor is dead. A
+   crashed owner's own restart is therefore denied exactly like a stranger's and
+   the run stops as `BLOCKED_RECOVERABLE` with the marker, the replay data and
+   the diagnostic all retained. Every `TakeoverPolicy` other than `Refuse` is
+   answered with `TakeoverRefused` before the store is touched.
+2. **Release is recorded, never deleted.** The store has no `remove`, so no
+   recovery path can reach for one under pressure. A graceful shutdown writes
+   `AdmissionPhase::Released` in place, which is the evidence a follow-on process
+   reads before acquiring at exactly one higher epoch. A release is withheld
+   entirely while outstanding I/O cannot be excluded: `ReleaseOutcome::Retained`
+   hands the proof back rather than publishing a handover the session cannot
+   stand behind. `OutstandingIo` is derived from the calls the provider actually
+   observed — a lost connection or an elapsed deadline leaves a request that may
+   already have been applied — not asserted from the shape of the dispatch loop.
+
+   A release whose write fails is reconciled against the marker rather than
+   assumed not to have landed. If the marker reads `Released` at this session's
+   epoch the write did land and only its reply was lost; if it still reads `Held`
+   by this session the release provably did not happen and the proof is handed
+   back; anything else is `ReleaseOutcome::Uncertain`, which consumes the proof.
+   Reviving authority over evidence the session cannot account for is how one
+   failed round trip becomes two live owners.
+3. **Succession is decided by the server, not by a read.** Reading a released
+   marker and overwriting it is two round trips, so two contenders can both read
+   the release and both write themselves in. `MarkerStore::claim_succession`
+   serialises it: a `GUARDED4` create of the epoch's claim name means the loser is
+   told `NFS4ERR_EXIST` by the server rather than by a local guess. Claims are
+   durable evidence of which contender took which epoch and are never deleted, so
+   a run that has been succeeded carries one `writer.lock.claim.<epoch>` per
+   handover alongside the untouched predecessor evidence.
+4. **Nothing dispatches before its intent is durable.** `DispatchTicket` has no
+   public constructor; the only way to get one is `MutationJournal::begin`
+   returning `Acknowledged::Dispatch`, which happens after the intent, the
+   payload and the authorising epoch have reached the log. Backpressure is
+   applied before that admit, so an exhausted buffer refuses the mutation instead
+   of letting it reach the wire with nowhere to record its outcome.
+5. **A stop is terminal, and the first error is latched.** `OutageMachine`
+   answers with its existing state as soon as that state `is_terminal` —
+   `BlockedRecoverable`, `Corrupted` or `FailedTracee` — before a later window
+   can decide anything. Each window is decided on its own evidence with no memory
+   of where the run stopped, so without that guard a `Corrupted` run went back to
+   `Running` on the next `StaleFilehandle` whose identity happened to prove. A
+   stopped machine counts no further attempts and records no later window's
+   deferral; only building a new machine reopens it, which is the operator
+   intervention the state is for. Within a window that is still live, the failure
+   that opened it is kept in a frozen `RetainedError` and later attempts are
+   counted without replacing it, so an `NFS4ERR_NOSPC` is still 28 after three
+   reconnects. A
+   digest-only payload is `PayloadMissing` rather than reconstructed bytes, and a
+   namespace intent whose reply was lost is `Indeterminate` rather than a guess:
+   its record carries a name, not the before/after proof the failure model
+   requires.
+
+`AdmissionMarker` decodes two encodings and produces one. The 16-byte legacy
+lock the mounted adapter writes — the one `tests/goldens/writer-lock.bin` pins —
+reads as *held* by an unnamed writer, never as released, because absence of a
+phase is not evidence of a release. Records this provider writes are a
+fixed-width extended encoding, so every overwrite is total: a shorter record
+written over a longer one would leave the old tail readable and the next reader
+would decode a chimera. `SETATTR` exists on the wire now, so truncation is
+available in principle, but a fixed width needs no truncation to be correct and
+narrowing the record would reopen a case that is currently unrepresentable.
+
+`ServerMarkerStore` is the one place an operation is expressed here rather than
+left to the operations node, because the failure model requires *server-atomic*
+admission and that atomicity is an authority requirement. It uses `OPEN` with
+`GUARDED4`, not `EXCLUSIVE4`: an exclusive create is designed to let a replay
+with the same verifier succeed again, which is right for a retried create and
+wrong for admission, where the second session must be told the name exists. It
+is four calls on two names and nothing else — the marker, and the per-epoch
+succession claim that serialises a cooperative handover — with no path
+resolution, no anchoring and no capability. `session::Session` binds it into
+`Storage`.
+
+**Split brain and hard partition are not implemented here.** Two hosts holding
+conflicting valid ownership evidence needs a fence receipt and a cutoff before a
+winner may be selected. `CrashWindow::SplitBrain` and `CrashWindow::HardPartition`
+stop *both* sides and record `Deferral::M3Fencing`; `CrashWindow::ServerPowerLoss`
+records `Deferral::M3Qualification`. An increasing epoch is not a fence and
+nothing here pretends otherwise.
+
+## Configuration and registration
+
+`NfsUserspaceConfig` carries the server host and port, a server-relative `export`
+and `run_parent`, the two anchor components, and a per-COMPOUND deadline. Export
+and run parent are validated with the storage contract's own path rule, so neither
+can be absolute or contain `.` or `..`. There is no mount root and no host path.
+
+Options are the JSON encoding of that struct, carried as descriptor option bytes.
+`provider.json` is an installation template; `tests/provider_template.rs` checks it
+decodes as a storage descriptor for id `nfs-userspace` and that its options
+validate. A userspace client has no kernel-visible run root, so this provider
+supplies opaque session-bound handles and no `physical_path`, and `umbra run`
+cannot select it.
+
+`open_run` establishes a client incarnation, resolves or creates the run's
+anchors over the bound transport, acquires product admission, and only then
+publishes a binding whose advertised `max_io_bytes` and `max_directory_entries`
+come from that transport's own limits. `Durability::None` and `Fencing::ReadOnly`
+stay: no persistence boundary is qualified and no independent termination
+verifier exists. `OpenRunIntent::CreateNew` writes the run directory, both
+contract anchors, `.provider/`, `.provider/retries/`, `.provider/epoch` and
+`.provider/manifest` with the mounted adapter's names, modes and encodings. It
+does not create the export or run-parent directories: those are deployment
+configuration, and creating a missing one would silently relocate every run.
+
+The `StoragePolicy` is enforced rather than recorded. `require_kernel_shadow` and
+`require_strict_remote_persistence` are refused before the run is touched, since
+this provider offers neither; a read-only run cannot be created, because creation
+is itself a mutation, and an opened read-only run refuses mutations while still
+serving reads.
+
+`OpenRunIntent::OpenExisting` reads the run's own evidence before admission.
+`.provider/manifest` must decode and must name the requested run, immutable base
+and format version; a manifest that is absent or malformed is refused with its
+bytes left on the server, never adopted and never read as a release.
+`.provider/epoch` supplies an epoch floor, so a run the mounted adapter released
+cleanly at epoch 7 is admitted at 8 rather than restarting the ladder at 1. An
+epoch file that is not eight bytes is refused rather than treated as zero, and so
+is one that is absent: every run either adapter creates writes that file, so its
+absence in an existing run is missing recovery evidence rather than a run that
+never had a writer.
+
+Every request is checked against the admission it claims: a mutation naming a
+different run than the open one, or presenting a writer epoch other than the
+admitted one, is refused before dispatch. Neither check exists upstream —
+`umbra_storage::validate_request` deliberately leaves bound-run and lease checks
+to the backend and only requires that some epoch is present.
+
+All of it — the authority latch, the run binding, the read-only policy, the
+capability verdict, the input bounds and the epoch — runs as one gate *before the
+journal is touched*, so a request that will be refused consumes no operation id
+and leaves no record behind. `Operations::preflight` holds the rules and
+`Operations::execute` re-runs them, because a direct caller reaches that seam
+without a provider in front of it.
+
+## Golden fixtures
+
+`tests/goldens/` pins the on-server bytes an existing run has, so the mounted and
+userspace adapters cannot drift apart silently:
+
+| Fixture | Purpose |
+| --- | --- |
+| `run-layout.txt` | Names, kinds and modes under a run directory |
+| `manifest.json` | `.provider/manifest`: `[run_id, immutable_base, format_version]` |
+| `epoch.bin` | `.provider/epoch`: a little-endian `u64`, created as zero |
+| `writer-lock.bin` | `.provider/writer.lock`: the 16 raw UUID bytes of a writer token |
+| `retry-intent.json` | A retry record before dispatch: `[request, null]` |
+| `retry-result-ok.json` | A settled success: `[request, {"Ok": …}]` |
+| `retry-result-err.json` | A settled failure, the permanent answer for its key |
+| `retry-file-names.txt` | `key-<hex idempotency key>` and the `op-<uuid>` index |
+
+`tests/goldens.rs` rebuilds each from the same `umbra-core` DTOs the mounted
+adapter serialises and compares bytes, so an encoding drift fails a test instead of
+surfacing on a live run. Regenerate deliberately with `UMBRA_GOLDEN_UPDATE=1` and
+review the diff.
+
+## Tests
+
+`cargo test -p umbra-storage-nfs-userspace` runs the unit tests, the golden and
+provider-template suites, `tests/fake_fault_matrix.rs`,
+`tests/operations_surface.rs`, `tests/authority_recovery.rs`,
+`tests/review_round_1.rs`, `tests/review_round_2.rs`,
+`tests/coderabbit_round_1.rs`, and the fake half of `tests/m1_conformance.rs` and
+`tests/golden_compat.rs`. Each review suite names the findings it closes in its
+test names, so a regression points at the finding it reopens. There is no network, mount, service, fixture directory
+or environment gate: the two harnesses that can use a server compare against the
+fake when none is configured.
+
+`tests/review_round_1.rs` covers the findings of the first independent review,
+one case per finding id, each stating in its own doc comment what the pre-fix
+code did and asserting the corrected behaviour: latched authority loss and
+outstanding-I/O derivation, bound-run and writer-epoch validation, run-policy
+refusal, persisted-manifest and epoch-floor validation, durable replay through
+the retry journal, the no-replace refusal, the applied create mode, preserved
+NFS statuses, and the filesystem-boundary check. Two of them install a transport
+decorator rather than a fault plan, because a nested export and a changed `fsid`
+are answers a server gives rather than faults it injects.
+
+The fake transport is a shape fake: it answers the operations M1 needs and models
+OPEN_CONFIRM, exclusive-create verifier reuse, short writes, write/commit
+verifiers, grace and reclaim, and cookie invalidation. Everything else answers
+`NFS4ERR_NOTSUPP` rather than pretending.
+
+Its directory change attribute is faithful in both directions, which matters
+because the interrupted-create recovery decides on that attribute. A create —
+through `CREATE` or through a creating `OPEN` — advances the parent's
+`FATTR4_CHANGE`, as [RFC 7530 §5.8.1.4][rfc-change] requires of a server whose
+directory has changed, and the operation's `cinfo` reports that same transition
+rather than a canned pair. An `OPEN` that creates nothing leaves it alone.
+A fake that suppressed the create-through-`OPEN` bump would let a recovery accept
+evidence no conforming server can produce.
+
+[rfc-change]: https://www.rfc-editor.org/rfc/rfc7530.html#section-5.8.1.4
+
+`tests/fake_fault_matrix.rs` drives ten state transitions against all five
+`FaultPoint` values and all five `FaultAction` values, and asserts each
+transition's invariant rather than one expected outcome — a fault may
+legitimately produce success, a server rejection or an unknown result, and what
+must hold in all three is that no state advanced beyond what the transport
+proved. The fake acts on a given action only where it means something (`Fail` at
+`BeforeDispatch` and `BeforeReturn`, `Substitute` at `AfterDispatch`,
+`DropReply` at `OnDeadline`, `RotateVerifier` at `BeforeReturn`); `OnConnection`
+is never consulted and short writes are driven by `FakeTransport::set_write_cap`.
+Cells where the action is inert at that point still run and still assert the
+invariant, so no cell claims coverage the fake does not provide.
+
+`tests/operations_surface.rs` drives the operations surface over
+`integration::StateSession` carrying a real client incarnation — SETCLIENTID,
+SETCLIENTID_CONFIRM, open-owner minting, OPEN_CONFIRM sequencing and CLOSE all
+happen as they would on the wire, with only the transport faked. It asserts
+`Backend::is_live` is false, so no result there can be read as a live-server
+one. It covers identity across a rename, in-place edit visibility through an
+open handle, a pathname replacement leaving open handles on the original object,
+retention until `CLOSE`, bounded paging with explicit cursor invalidation,
+`UNSTABLE` to `COMMIT` verifier matching and its typed failure, and the refusal
+of every unsupported and deferred operation.
+
+`tests/authority_recovery.rs` is one test per crash window in
+`authority::outage::CrashWindow::ALL` — the failure model's taxonomy, with its
+umbra-crash row split into the before, mid and after-write windows — driven
+through a `StateSession::over_fake` under fault injection. Each asserts the
+state-machine transition and, wherever the window produced a failure, that the
+original `NFS4ERR_*` is still readable verbatim afterwards; the tracee-crash and
+in-grace-reclaim windows produce none and assert no status. Every crash-window
+test then reads the durable marker back and asserts who holds it, at which epoch,
+and that no timeout moved either. The competing-session test runs two genuinely
+separate sessions, with separate client ids and separate open owners, over one
+shared fake server: the first is admitted at epoch 1 and the second is denied,
+repeatedly, naming the actual holder.
+
+Because `FakeReplayLog` is in memory, every `RetainedError` it carries reports
+`is_durable() == false`, and the suite asserts that. Consequently those tests
+assert the *recovery plan* a durable journal would license rather than performing
+a replay: under the fake no evidence survives a process to replay from, and a
+test that pretended otherwise would be passing on volatile evidence.
+
+The suites that use a server — `tests/raw_smoke.rs`, `tests/fault_matrix.rs`,
+`tests/live_state.rs`, `tests/m1_conformance.rs` and `tests/golden_compat.rs` —
+need `--features transport-raw` and use one only when
+`UMBRA_NFS_RAW_FIXTURE=<host>:<port>` names it. They speak NFSv4.0 from user
+space and mount nothing.
+
+`tests/m1_conformance.rs` drives the provider through the public `Storage`
+contract over both backends, asserting which one answered. It covers admission
+before any binding is published, a second session denied by name, denial that
+repeats because no clock is consulted, release-then-admit at the next epoch, the
+whole namespace surface end to end, and that an open run claims no durability, no
+fencing, no kernel shadow and no physical path.
+
+`tests/golden_compat.rs` is the sequential existing-run compatibility half:
+it creates a run through the provider, reads the result back over NFSv4.0, and
+compares the layout, `.provider/manifest` and `.provider/epoch` byte for byte
+against `tests/goldens/`. The layout comparison is taken on the run as
+`CreateNew` left it; a cooperative succession additionally leaves a
+`writer.lock.claim.<epoch>`, which is this provider's own state rather than part
+of the layout the mounted adapter writes, so it is asserted separately. It also asserts the one-way `writer.lock` limit rather
+than leaving it to prose. `fault_matrix.rs` drives every `FaultPoint` against
+every `FaultAction` — `assert_eq!(cells.len(), 30, "5 fault points x 6 fault
+actions")` — asserting for each cell both that the transport consulted that fault
+point and that the outcome matched, so an action that carries no meaning at a
+point is asserted to be ignored rather than left untested. It also carries the
+retirement case: a one-byte reply budget makes a real `GETATTR` overflow inside
+`decode`, and with one concurrent call allowed, a registration that survived the
+failure would refuse the next submission `QueueFull`. Ten consecutive over-budget
+calls each reporting the decode failure, followed by ordinary calls that succeed,
+is what "retirement happens on every return path" means in practice rather than
+in prose.
+
+`tests/live_state.rs` is the same idea one layer up: the protocol state machine
+driven over the **live** transport. It runs the six transitions this layer can
+fault meaningfully (SETCLIENTID, SETCLIENTID_CONFIRM, OPEN, OPEN_CONFIRM, CLOSE,
+`OP_RENEW`) against all five fault points and five fault actions —
+`assert_eq!(cells, 150, "6 transitions x 5 fault points x 5 fault actions")` —
+asserting the one-directional invariant the fake matrix settled on: the client
+may never claim more than the transport proved. It matters alongside the fake
+matrix because the fake never consults `OnConnection` and honours each action at
+a single point, while `LibnfsRawTransport` consults all five, so cells that are
+inert against the fake are real here. The same file carries the acceptance
+scenarios — anchored OPEN with the OPEN_CONFIRM the server actually demands,
+bounded READDIR paging with cookie-verifier continuity, WRITE UNSTABLE to COMMIT
+with verifier matching and a typed retained error when a restart changes the
+verifier, an idle longer than the lease held open by `OP_RENEW`, and v4.0
+`CLAIM_PREVIOUS` reclaim in grace with a safe surrender outside it.
+
+Tests that restart the server additionally need
+`UMBRA_NFS_FIXTURE_CONTAINER=<name>` and skip without it rather than proving
+less. **Run the live suite with `-- --test-threads=1`**: several tests restart
+the shared fixture. A server that has just restarted answers `NFS4ERR_GRACE` to
+any open that is not a reclaim, which is correct behaviour, so the harness waits
+that window out under a bounded budget instead of reading it as a failure.
+
+## Deferred
+
+`authority::AdmissionControl` is bound: `open_run` acquires admission and
+`close_run` releases it.
+
+Durable replay is bound too. Every supported mutation `execute` dispatches goes
+through [`journal`](src/journal.rs) first: the exact request is recorded in
+`.provider/retries/key-<hex>` before the operation reaches the wire, and the
+exact settled result is written back afterwards, in the byte encoding the mounted
+adapter uses and `tests/goldens/retry-*.json` pins. An exact-key retry is
+answered from its record and never re-dispatched; an outcome whose server-side
+disposition is unknown is left unsettled rather than recorded as a failure a
+later retry would trust. Reads are not journalled.
+
+An **interrupted** intent is recovered rather than stalled. Beside each record,
+`.provider/retries/pre-<hex>` holds the object and parent identities the mutation
+was dispatched against — the preconditions the failure model requires, kept in a
+sidecar so `key-<hex>` stays byte-identical to what the mounted adapter writes.
+Recovery compares that before-state against the server now: proven-not-applied
+re-dispatches under the same key, proven-applied settles the record from the
+observed state without repeating the effect, and evidence matching neither is a
+blocked-recoverable stop with the record and the server state both retained.
+A create is never settled from observation at all — the `EXCLUSIVE4` verifier is
+the only thing that can say whose object is behind the name, so the decision goes
+back to the server. Which is why the parent directory's change attribute does not
+gate a create whose name is now present: a successful create moves that attribute
+itself, so requiring it to stand still would require evidence success rules out.
+Where the name is still absent, a moved parent is somebody else's work and the
+run stops rather than guessing. A
+record with no sidecar is a legacy one, and an ambiguous legacy intent stops for
+the same reason. Nothing answers "requires reconciliation": the failure model
+forbids that standing in for recovery in a window this provider supports.
+
+**A stop is a state, not a return value.** A blocked-recoverable refusal, a record
+that cannot be decoded, and any failure while resolving an interrupted intent —
+including one whose own error says nothing about recovery, such as a target path
+that no longer resolves — put the run into `BLOCKED_RECOVERABLE`: later mutations
+are refused with the original diagnosis carried forward, the evidence is left
+exactly where it is, and a cooperative release cannot succeed. It clears only by
+reopening the run, which is the operator intervention the state is for.
+
+Separately, a call whose server-side disposition could not be established stops
+the run admitting *new* work. The failure model asks for both halves — "stop new
+mutations and quiesce; resolve bounded outstanding operations" — and resolving an
+outstanding operation means retrying its own key, so a request under an unrelated
+key is refused while the outstanding key's own retry is the recovery.
+
+**The ledger is an obligation per call, not a list of error strings.** Each entry
+carries the mutation's *idempotency key* — the identity `.provider/retries` is
+keyed on, and the one a caller keeps when it mints a fresh operation id for a
+retry — and the dispatch phase the call was interrupted in. That is what makes
+the second half reachable. A reply lost on the journal lookup or the precondition
+observation is lost on a strictly read-only round trip, before any intent exists;
+when that key's next attempt reads the journal cleanly and finds no record, the
+absence proves the obligation discharged, because nothing that mutates was ever
+submitted under it. The gate then admits the retry as its own operation.
+
+The discharge is deliberately narrow. A reply lost on the intent write itself, or
+on the mutation, leaves a create or an effect that may still land, so absence
+alone proves nothing about it: only that key's own settled record discharges it —
+recovery reconstructing the outcome, or a redispatch that settles. Obligations
+under other keys are untouched by either, and a blocked recovery and a latched
+write failure are terminal states rather than obligations, so neither is ever
+discharged. A run whose obligations are all discharged mutates and releases
+normally again; one still holding any of them does neither.
+
+Records are read in bounded chunks to end of file and written in as many round
+trips as the server needs, because a short `READ` or `WRITE` is a legal answer
+rather than a frame boundary, and the raw transport caps a reply well below the
+size a `WriteAt` record reaches.
+
+Every small whole-file reader in the crate works the same way, through
+`crud::read_whole`: `.provider/manifest` and `.provider/epoch` on the run-open
+path, and the admission marker. [RFC 7530 §16.25.4](https://www.rfc-editor.org/rfc/rfc7530.html#section-16.25.4)
+lets a server answer with fewer bytes than requested and leave `eof` clear, so a
+reader that decoded the first reply as the whole object turned a healthy run into
+a corrupt-file refusal or a healthy marker into a malformed one. The loop
+advances by what arrived and asks only for the capacity that remains; a reply
+with no bytes *and* no end of file is refused rather than looped on, and reaching
+the bound before end of file is reported to the caller, which decides what its
+own format makes of it.
+
+How much it asks for is derived from `TransportLimits::max_read_payload`, not
+from `max_reply_bytes`. A reply's budget is not all payload: `RawTransport::read`
+sends the four-byte `READ_TAG`, the server echoes it, and the raw decoder charges
+the echoed tag and the READ data against the same figure. Asking for the whole
+budget therefore asks for a reply that cannot fit inside it — under a 128-byte
+budget a full reply costs 132 and is refused as malformed, so a healthy file
+failed to read. A budget with no room for the tag *and* a byte of progress is
+refused before anything is dispatched, because there is no chunk size that would
+work and rounding back up to one byte would reissue the over-budget request. The
+retry journal's own record reader derives its chunk the same way, and the
+`max_io_bytes` a binding advertises is the read payload rather than the whole
+budget, so a `ReadAt` of exactly the advertised size is one the provider can
+actually answer.
+
+A write commits and compares verifiers before its open is released: an `UNSTABLE`
+write is durable only once a `COMMIT` returns the verifier the `WRITE` did. A
+journalled mutation that fails with an I/O status is latched — later mutations
+stop with the original status carried forward, and the release that follows is
+not reported clean. That covers a failed `FILE_SYNC4` journal write for a rename
+or a create, not only a failed `WriteAt`.
+
+`flush` still reports its gate rather than issuing a receipt, and the provider
+still advertises `Durability::None`. Writing a record `FILE_SYNC4` asks the
+server for stability; it does not qualify a persistence boundary, and no
+remote-durability claim is made from it. `authority::MutationJournal` remains the
+typed lower-layer model over the `ReplayLog` facade and is not itself on the
+`Storage` path.
+
+Held-object coherence is demonstrated against a real server.
+`tests/live_state.rs`'s `r2_006_*` case runs two NFSv4 clients — separate client
+ids, separate open owners — and holds client A's open while client B edits in
+place, truncates, renames, replaces the name with a different object and finally
+removes the object's last name. A's handle keeps its `fsid`/`fileid` throughout,
+sees B's edit and truncation, still reads after the replacement and after the
+unlink, while a fresh open and a `READDIR` see the replacement instead. B is an
+external editor, not a second admitted Umbra session.
+
+A second live case, `r3_005_*`, covers the branch the first one does not: B stages
+a distinct object under a temporary name and atomically `RENAME`s it over a name
+that is *still occupied* by the object A holds open. A's `fsid`/`fileid` and its
+exact bytes are unchanged; a fresh open, stat and `READDIR` all see the
+replacement; the staging name is gone; and A's open is the only remaining
+reference to the now-unnamed original. Renaming the old object away first and
+creating into the vacated name is name reuse, not atomic replacement, and the two
+are asserted separately.
+
+`tests/operations_surface.rs` still covers the same shape against the fake, whose
+object table is permanent by construction; that case is a shape check, and the
+live ones are the acceptance.
+
+`OPEN_DOWNGRADE` remains unavailable: `transport::Nfs4Op` has no variant for it,
+and the hotfix that added the four namespace mutations deliberately did not widen
+further. `LOCK`/`LOCKU` are allocated and sequenced but never dispatched.
+`CopyUp` needs an immutable-base materialisation seam that lives above storage.
+
+`writer.lock` compatibility is one-way. This provider reads the mounted adapter's
+16-byte legacy token, but writes the 256-byte extended record that also carries
+epoch and phase, so a run this provider has admitted is not one the mounted
+adapter can parse as a bare token. `tests/golden_compat.rs` pins that rather than
+leaving a reader to assume byte equality.
+
+Overlay and session recovery, fencing, and remote-storage power-loss
+qualification are later milestones; split-brain resolution is explicitly deferred
+to M3 fencing authority. **Nothing in this crate qualifies remote durability.**
+Running against a live server proves the protocol works; it proves nothing about
+persistence after power loss, and the advertised capabilities say so.
