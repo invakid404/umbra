@@ -90,9 +90,21 @@ impl OperationLimits {
     /// will actually carry, so an advertised limit is one the provider can meet
     /// rather than one it hopes to.
     pub fn from_transport(transport: &dyn RawTransport) -> Self {
-        let reply_bytes = u32::try_from(transport.limits().max_reply_bytes).unwrap_or(u32::MAX);
+        let limits = transport.limits();
+        let reply_bytes = u32::try_from(limits.max_reply_bytes).unwrap_or(u32::MAX);
+        // **R2-02, adjacent.** `max_io_bytes` is advertised as a size a `ReadAt`
+        // may ask for, and `ReadAt` hands it straight to a READ whose reply also
+        // carries the echoed COMPOUND tag. Advertising the whole reply budget
+        // therefore promised a read this provider would then refuse as malformed,
+        // which is the opposite of what the sentence above claims for it. The
+        // payload figure is the one it can actually meet.
+        let read_bytes = u32::try_from(limits.max_read_payload()).unwrap_or(u32::MAX);
         Self {
-            max_io_bytes: reply_bytes.min(u32::try_from(MAX_IO_BYTES).unwrap_or(u32::MAX)),
+            max_io_bytes: read_bytes.min(u32::try_from(MAX_IO_BYTES).unwrap_or(u32::MAX)),
+            // Left on the full budget deliberately: READDIR's `maxcount` bounds
+            // the reply structure the *server* assembles rather than a payload
+            // this side sizes, and this figure is a per-entry division with its
+            // own clamp rather than a byte count put on the wire.
             max_directory_entries: (reply_bytes / crate::pages::BYTES_PER_ENTRY)
                 .clamp(1, MAX_DIRECTORY_ENTRIES),
         }

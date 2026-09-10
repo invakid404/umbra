@@ -1155,6 +1155,16 @@ impl Deadline {
     }
 }
 
+/// The COMPOUND tag [`RawTransport::read`] sends, and the server echoes back.
+///
+/// **R2-02.** Exported because sizing a READ correctly needs it. A reply's budget
+/// is not all payload: `transport::raw::decode` charges the echoed tag *and* the
+/// READ data to the same [`TransportLimits::max_reply_bytes`], so a caller that
+/// asks for the whole budget asks for a reply that cannot fit inside it. Keeping
+/// the value here rather than at each call site is what stops the two figures
+/// drifting apart.
+pub const READ_TAG: [u8; 4] = *b"read";
+
 /// Bounds an implementation must advertise and enforce.
 ///
 /// One event pump per context, bounded queues and explicit deadlines are owner
@@ -1169,6 +1179,26 @@ pub struct TransportLimits {
     pub max_reply_bytes: usize,
     /// Deadline applied when a caller does not supply one.
     pub default_deadline: Deadline,
+}
+
+impl TransportLimits {
+    /// The largest READ payload one reply can carry under [`Self::max_reply_bytes`].
+    ///
+    /// **R2-02.** The budget is spent on the echoed [`READ_TAG`] as well as the
+    /// data, so this is the figure a `count` must be derived from — not
+    /// `max_reply_bytes` itself. Under a 128-byte budget a full 128-byte reply
+    /// costs 132 and the decoder refuses it, so a valid read of a healthy file
+    /// failed for asking too politely for too much.
+    ///
+    /// **Zero is a real answer.** A budget at or below the tag length can carry
+    /// no payload at all, and there is no chunk size that would make progress.
+    /// Callers must refuse before dispatch rather than rounding it back up to
+    /// one: that would issue exactly the over-budget request this exists to
+    /// prevent, and a zero-byte request would loop forever making no progress.
+    #[must_use]
+    pub fn max_read_payload(&self) -> usize {
+        self.max_reply_bytes.saturating_sub(READ_TAG.len())
+    }
 }
 
 /// A point at which an implementation must consult its fault plan.
@@ -1397,7 +1427,7 @@ pub trait RawTransport: Send {
         let reply = self
             .submit(
                 Compound::new(
-                    *b"read",
+                    READ_TAG,
                     vec![
                         Nfs4Op::PutFh(handle.clone()),
                         Nfs4Op::Read {
@@ -1711,6 +1741,27 @@ fn shape(operation: &str, expected: OpCode, observed: OpCode) -> FacadeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **R2-02.** The reply budget is shared between the echoed tag and the READ
+    /// payload, so the payload figure is the budget minus the tag — and it is
+    /// allowed to be zero rather than being rounded up to a request that cannot
+    /// fit.
+    #[test]
+    fn r2_02_the_read_payload_budget_reserves_the_tag() {
+        let limits = |max_reply_bytes| TransportLimits {
+            max_inflight: 1,
+            max_queue_depth: 8,
+            max_reply_bytes,
+            default_deadline: Deadline { millis: 5_000 },
+        };
+        assert_eq!(READ_TAG.len(), 4);
+        assert_eq!(limits(128).max_read_payload(), 124);
+        assert_eq!(limits(1024 * 1024).max_read_payload(), 1024 * 1024 - 4);
+        // The lower edge saturates instead of wrapping, and stays zero.
+        assert_eq!(limits(5).max_read_payload(), 1);
+        assert_eq!(limits(4).max_read_payload(), 0);
+        assert_eq!(limits(0).max_read_payload(), 0);
+    }
 
     #[test]
     fn only_the_authorised_profile_passes() {
