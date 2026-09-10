@@ -1000,3 +1000,95 @@ fn r2_007_a_write_to_a_foreign_final_target_is_refused() {
         refused.context
     );
 }
+
+// --- R2-004: missing epoch evidence is refused, not read as zero -------------
+
+/// Seed an existing run whose `.provider` holds a valid manifest and, optionally,
+/// an epoch file. No marker, as a cooperatively released run has none.
+fn seed_released_run(run_id: RunId, epoch: Option<u64>) -> FakeTransport {
+    let mut fake = FakeTransport::new();
+    let mut current = fake.root();
+    for part in EXPORT.split(|byte| *byte == b'/') {
+        current = fake.insert_directory(&current, part);
+    }
+    let run_parent = fake.insert_directory(&current, RUN_PARENT);
+    let run = fake.insert_directory(&run_parent, run_id.0.hyphenated().to_string().as_bytes());
+    fake.insert_directory(&run, b"root");
+    fake.insert_directory(&run, b"control");
+    let private = fake.insert_directory(&run, layout::PRIVATE_DIR);
+    fake.insert_directory(&private, layout::RETRIES_DIR);
+    fake.insert_file(
+        &private,
+        layout::MANIFEST_FILE,
+        serde_json::to_vec(&(run_id, &base(), FORMAT_VERSION)).expect("manifest encodes"),
+    );
+    if let Some(epoch) = epoch {
+        fake.insert_file(&private, layout::EPOCH_FILE, epoch.to_le_bytes().to_vec());
+    }
+    fake
+}
+
+fn over(fake: FakeTransport) -> NfsUserspaceStorage {
+    NfsUserspaceStorage::with_facades(config(), Box::new(fake), Box::new(FakeReplayLog::default()))
+        .expect("provider")
+}
+
+fn open_existing(storage: &mut NfsUserspaceStorage, run_id: RunId) -> umbra_core::Result<()> {
+    storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::OpenExisting,
+            immutable_base: base(),
+            policy: policy(),
+        })
+        .map(|_| ())
+}
+
+/// **R2-004.** An existing run whose `.provider/epoch` is gone is refused, not
+/// admitted at epoch 1.
+///
+/// At the candidate, absence returned `LeaseEpoch(0)` on the strength of a comment
+/// about older runs written before the file existed — a case nothing establishes.
+/// A run released cleanly at epoch 7 whose epoch file was then deleted would be
+/// re-admitted at 1, silently below the ladder it had already reached, and a later
+/// reader could not tell this session's epoch 3 from the run's own earlier 3.
+#[test]
+fn r2_004_a_missing_epoch_file_is_refused_not_read_as_zero() {
+    let run_id = fresh_run();
+    let mut storage = over(seed_released_run(run_id, None));
+    let refused = open_existing(&mut storage, run_id)
+        .expect_err("missing recovery evidence must not be read as a run that never had a writer");
+    assert_eq!(refused.kind, ErrorKind::CorruptJournal);
+    assert!(
+        refused.context.contains("no .provider/epoch"),
+        "the refusal must name the missing evidence: {}",
+        refused.context
+    );
+    assert!(
+        refused.context.contains("regress"),
+        "and must say what it refused to risk: {}",
+        refused.context
+    );
+    assert!(
+        storage.admission().is_none(),
+        "a refused open publishes no admission"
+    );
+}
+
+/// **R2-004.** A present epoch file still works, at zero and at a legacy value.
+///
+/// This is the control: the refusal above must be about absence, not about
+/// reading the file at all.
+#[test]
+fn r2_004_a_present_epoch_file_still_admits() {
+    for (label, epoch, expected) in [("fresh", 0u64, 1u64), ("legacy", 7, 8)] {
+        let run_id = fresh_run();
+        let mut storage = over(seed_released_run(run_id, Some(epoch)));
+        open_existing(&mut storage, run_id).unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        assert_eq!(
+            storage.admission().expect("admitted").admitted().epoch().0,
+            expected,
+            "{label}: admission must land one above the recorded epoch"
+        );
+    }
+}

@@ -610,16 +610,38 @@ pub fn read_persisted_state(
         ));
     }
 
-    // `.provider/epoch` is the mounted adapter's little-endian u64. Absent is a
-    // legitimate state for a run this provider created before the file existed;
-    // present-but-unreadable is not.
+    // `.provider/epoch` is the mounted adapter's little-endian u64.
+    //
+    // **R2-004.** Absence used to mean `LeaseEpoch(0)`, justified by a comment
+    // about older runs written before the file existed. Nothing establishes that
+    // case: this provider's own `CreateNew` always writes the file, the mounted
+    // adapter's `open_run` does too, and the pinned run layout lists it. So an
+    // existing format-1 run without one is missing required recovery evidence,
+    // and reading that as "this run never had a writer" is the same class of
+    // inference the failure model forbids for a missing marker — it would let a
+    // run whose epoch file was deleted after a cooperative release be re-admitted
+    // at epoch 1, silently below the ladder it had already reached.
+    //
+    // Refusing is the answer. The bytes that remain are preserved for an operator.
     let epoch = match read_private_file(
         transport,
         private,
         &component(layout::EPOCH_FILE)?,
         deadline,
     )? {
-        None => LeaseEpoch(0),
+        None => {
+            return Err(UmbraError::new(
+                ErrorKind::CorruptJournal,
+                "open_run",
+                format!(
+                    "this run has a valid format-{expected_format} manifest but no \
+                     .provider/epoch; every run this provider or the mounted adapter creates \
+                     writes that file, so its absence is missing recovery evidence rather than \
+                     a run that never had a writer. The run is refused rather than admitted at \
+                     epoch 1, which could regress an epoch ladder it already reached."
+                ),
+            ))
+        }
         Some(bytes) => {
             let raw: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
                 UmbraError::new(
