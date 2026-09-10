@@ -805,7 +805,7 @@ fn within(pin: PinnedObject, filesystem: Fsid, name: &ComponentName) -> Result<P
     within_labelled(
         pin,
         filesystem,
-        &String::from_utf8_lossy(name.as_bytes()).into_owned(),
+        &String::from_utf8_lossy(name.as_bytes()),
         "resolve",
     )
 }
