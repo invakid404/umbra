@@ -53,10 +53,10 @@ unchanged.
 ## How to invalidate for policy changes
 
 Invalidation requests a semantic review even when source files have not changed.
-Any session may invalidate when documentation guidance has shifted; prefer the
-narrowest scope that fits so unrelated reviews are not forced. Routine drift
-from ordinary code changes flows through the review procedure instead of
-invalidation.
+Invalidation is initiated on an authorized review request when documentation
+guidance has shifted; prefer the narrowest scope that fits so unrelated reviews
+are not forced. Routine drift from ordinary code changes flows through the
+review procedure instead of invalidation.
 
 For a writing-rule change requiring repository-wide review, use
 `memoria invalidate all --reason "..."`. For a narrower audit, use
