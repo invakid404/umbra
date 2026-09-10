@@ -348,7 +348,10 @@ impl RawTransport for LibnfsRawTransport {
         let outcome = self.pump.service_until(id, deadline_millis, discard_reply);
 
         // Whatever happened, the PDU is no longer owed a cancellation once a
-        // completion has been seen.
+        // completion has been seen. R1-009: `service_until` now reconciles the
+        // registry on every return, including the connection-failure paths, so a
+        // completion delivered by `rpc_reconnect_requeue` on its way out reaches
+        // this arm as `Completed` rather than being lost behind `Disconnected`.
         if matches!(
             outcome,
             ServiceOutcome::Completed | ServiceOutcome::Discarded
@@ -363,12 +366,31 @@ impl RawTransport for LibnfsRawTransport {
                 let completion = pump::take_completion(id);
                 let mut reply = match completion {
                     Some(Completion::Reply(decoded)) => {
-                        let decoded = (*decoded)?;
-                        // A zero-copy READ is completed from the arena before
-                        // the slot is retired, because retiring drops it.
-                        let reply = self.complete_zero_copy_read(id, decoded)?;
-                        self.retire(token);
-                        reply
+                        // R1-010: `?` here used to return before `retire`, so a
+                        // malformed or over-budget reply left its registration,
+                        // slot and arena in `inflight` forever. With the loopback
+                        // default of 16 concurrent calls, repeated decode failures
+                        // accumulated retained slots until every later submission
+                        // was refused `QueueFull`. The transport facade's
+                        // all-path retirement invariant admits no exception for a
+                        // reply that failed to decode.
+                        //
+                        // The zero-copy READ is completed from the arena first,
+                        // because retiring drops the arena it reads from.
+                        let outcome = (*decoded)
+                            .and_then(|decoded| self.complete_zero_copy_read(id, decoded));
+                        match outcome {
+                            Ok(reply) => {
+                                self.retire(token);
+                                reply
+                            }
+                            Err(error) => {
+                                // Retire first, then report the original error
+                                // unchanged.
+                                self.retire(token);
+                                return Err(error);
+                            }
+                        }
                     }
                     Some(Completion::Failed(detail)) => {
                         self.retire(token);

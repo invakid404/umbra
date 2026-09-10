@@ -62,6 +62,7 @@ pub mod integration;
 pub mod namespace;
 pub mod ops;
 pub mod pages;
+pub mod pdu;
 pub mod replay;
 pub mod session;
 pub mod state;
