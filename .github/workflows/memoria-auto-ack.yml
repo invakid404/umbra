@@ -1,0 +1,150 @@
+name: Memoria Auto-Ack on Renovate
+
+on:
+  push:
+    branches:
+      - "renovate/**"
+
+concurrency:
+  group: memoria-auto-ack-${{ github.ref }}
+  # A github-actions[bot] auto-ack push must NOT cancel the run that
+  # produced it — that older run is finishing post-job cleanup. Real
+  # Renovate dep-bump/rebase pushes (authored by renovate[bot]) still
+  # cancel any older in-flight auto-ack runs on the same ref.
+  cancel-in-progress: ${{ github.event.head_commit.author.name != 'github-actions[bot]' }}
+
+jobs:
+  auto-ack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    # Loop protection: this workflow authors its own pushes, and we don't
+    # want them to retrigger the workflow itself.
+    if: github.event.head_commit.author.name != 'github-actions[bot]'
+
+    steps:
+      - name: Checkout Renovate branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          # PAT (not GITHUB_TOKEN): a GITHUB_TOKEN-authored push is
+          # suppressed from re-triggering downstream workflows, so the
+          # memoria gate in ci.yml would never re-run against the acked
+          # head. A fine-grained PAT with Contents:Read+Write on this
+          # repo re-triggers CI as expected. actions/checkout writes a
+          # URL-scoped Basic extraheader (`x-access-token:<PAT>`) into
+          # the runner's git config and removes it during post-job
+          # cleanup.
+          token: ${{ secrets.MEMORIA_AUTO_ACK_TOKEN }}
+
+      - name: Verify PAT push auth
+        # Preflight: fail here with a clear error if the PAT lost its
+        # Contents:write scope or has otherwise been revoked, instead
+        # of after producing an auto-ack commit that has nowhere to go.
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: git push --dry-run origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install memoria CLI
+        # Same source-install invocation as .github/workflows/ci.yml's
+        # `Install memoria CLI` step; keep the two in sync when the
+        # memoria tag bumps. Follow-up issue #32 tracks pinning `--rev`
+        # instead of `--tag` for both call sites.
+        run: cargo install --locked --git https://github.com/viktordanov/rs-memoria --tag v0.3.0 rs-memoria
+
+      - name: Attempt auto-ack
+        run: ./scripts/memoria-auto-ack.sh
+
+      - name: Validate diff allowlist, commit, and push
+        run: |
+          # The auto-ack script (or an unrelated bug) must NOT produce
+          # any file change outside memoria.lock. If anything else is
+          # dirty (tracked or untracked), refuse to commit so a human
+          # inspects the drift instead of silently pushing.
+          #
+          # NUL-delimited path streams: `git status --porcelain` collapses
+          # whitespace and quotes special names, so `awk`-on-status would
+          # mis-parse a path like `weird name/x`. Pair `git diff -z HEAD`
+          # (tracked changes incl. deletes) with
+          # `git ls-files --others --exclude-standard -z` (untracked) for
+          # a clean NUL-terminated stream of one literal path each.
+          validate_outbound_allowlist() {
+            local violators
+            violators=$(
+              {
+                git diff --name-only -z HEAD
+                git ls-files --others --exclude-standard -z
+              } | while IFS= read -r -d '' path; do
+                  case "$path" in
+                    (memoria.lock) ;;
+                    ("") ;;
+                    (*) printf '%s\n' "$path" ;;
+                  esac
+                done
+            )
+            if [ -n "$violators" ]; then
+              echo "ERROR: auto-ack produced changes outside the outbound allowlist:"
+              echo "$violators"
+              echo
+              echo "Full git status:"
+              git status --porcelain --untracked-files=all
+              exit 1
+            fi
+          }
+
+          commit_msg() {
+            printf '%s\n\n%s\n' \
+              'chore(memoria): auto-ack safe dep bump' \
+              'Renovate bumped only dependency version literals; the root README ack was refreshed automatically by .github/workflows/memoria-auto-ack.yml.'
+          }
+
+          git_push() {
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          }
+
+          validate_outbound_allowlist
+
+          if [ -z "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "No memoria.lock change; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add memoria.lock
+          if git diff --cached --quiet; then
+            echo "Nothing staged after allowlisted add; treating as no-op."
+            exit 0
+          fi
+          git commit -m "$(commit_msg)"
+
+          if git_push; then
+            exit 0
+          fi
+
+          # Single retry on non-fast-forward — Renovate may have force-
+          # pushed a rebase mid-run. Reset, rerun, revalidate, retry once.
+          echo "Initial push rejected; attempting one rebase/retry."
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+          ./scripts/memoria-auto-ack.sh
+          validate_outbound_allowlist
+          if [ -z "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "Auto-ack is a no-op on top of the rebased tip; nothing to push."
+            exit 0
+          fi
+          git add memoria.lock
+          if git diff --cached --quiet; then
+            echo "Nothing staged after retry; nothing to push."
+            exit 0
+          fi
+          git commit -m "$(commit_msg)"
+          if ! git_push; then
+            echo "ERROR: push still rejected after one retry; aborting."
+            exit 1
+          fi
