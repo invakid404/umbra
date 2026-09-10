@@ -181,9 +181,25 @@ impl MarkerStore for ServerMarkerStore<'_> {
             OpenHow::NoCreate,
             ShareAccess::READ,
             |transport, handle, stateid, deadline| {
-                let reply =
-                    transport.read(handle, stateid, 0, EXTENDED_MARKER_BYTES as u32, deadline)?;
-                Ok(reply.data.clone())
+                // F07: a single READ is not the whole marker. NFSv4.0 permits a
+                // short reply with no end-of-file marker, and decoding one as
+                // the entire record splits an extended marker mid-field — which
+                // `AdmissionMarker::decode` then reports as a malformed marker,
+                // denying admission to a run whose marker is perfectly healthy.
+                //
+                // The bound stays `EXTENDED_MARKER_BYTES`: a longer file is not
+                // a marker this provider wrote. `complete` is deliberately not
+                // consulted here, because a marker file that runs past the bound
+                // still decodes from its first `EXTENDED_MARKER_BYTES` if it is
+                // one of ours, and `decode` owns that judgement.
+                let whole = crate::crud::read_whole(
+                    transport,
+                    handle,
+                    stateid,
+                    EXTENDED_MARKER_BYTES as u32,
+                    deadline,
+                )?;
+                Ok(whole.data)
             },
         );
         match outcome {

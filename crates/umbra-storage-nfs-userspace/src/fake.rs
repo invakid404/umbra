@@ -76,6 +76,9 @@ pub struct FakeTransport {
     in_grace: bool,
     /// Byte cap applied to every WRITE, so short writes can be exercised.
     write_cap: Option<u32>,
+    /// Cap on every READ reply, producing legal short reads. See
+    /// [`FakeTransport::set_read_cap`].
+    read_cap: Option<u32>,
 }
 
 impl std::fmt::Debug for FakeTransport {
@@ -138,6 +141,7 @@ impl FakeTransport {
             next_stateid: 1,
             in_grace: false,
             write_cap: None,
+            read_cap: None,
         }
     }
 
@@ -164,6 +168,21 @@ impl FakeTransport {
     /// Cap every WRITE at `cap` bytes, producing short writes.
     pub fn set_write_cap(&mut self, cap: Option<u32>) {
         self.write_cap = cap;
+    }
+
+    /// Cap every READ at `cap` bytes, producing short reads.
+    ///
+    /// A short READ is a *legal* NFSv4.0 reply, not a fault:
+    /// [RFC 7530 §16.25.4](https://www.rfc-editor.org/rfc/rfc7530.html#section-16.25.4)
+    /// lets a server return fewer bytes than requested and leave `eof` clear.
+    /// `eof` stays truthful — it is set only when the capped slice really does
+    /// reach the end of the object — so a reader that follows the offset finishes
+    /// the file and one that decodes the first reply as the whole file does not.
+    ///
+    /// `Some(0)` models a server that returns nothing and does not report end of
+    /// file, which is the reply a bounded reader must refuse rather than spin on.
+    pub fn set_read_cap(&mut self, cap: Option<u32>) {
+        self.read_cap = cap;
     }
 
     /// Rotate the write/commit verifier, as a server restart would.
@@ -397,11 +416,12 @@ impl FakeTransport {
                 if self.objects[target].kind == Nfs4Type::Directory {
                     return Err(fail(Nfs4Status::ISDIR));
                 }
+                let want = self.read_cap.map_or(*count, |cap| cap.min(*count));
                 let data = &self.objects[target].data;
                 let start = usize::try_from(*offset)
                     .unwrap_or(usize::MAX)
                     .min(data.len());
-                let end = data.len().min(start.saturating_add(*count as usize));
+                let end = data.len().min(start.saturating_add(want as usize));
                 Ok(OpReply::Read(ReadReply {
                     data: data[start..end].to_vec(),
                     eof: end == data.len(),

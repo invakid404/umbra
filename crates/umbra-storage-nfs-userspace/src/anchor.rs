@@ -687,10 +687,35 @@ fn read_private_file(
         Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let reply =
-        crate::crud::read_anonymous(transport, &pinned, 0, MAX_PRIVATE_FILE_BYTES, deadline)
-            .map_err(|error| error.to_umbra("open_run"))?;
-    Ok(Some(reply.data))
+    // F04: one READ is not a whole file. A server may legally answer a
+    // 64 KiB request with eight bytes and no end-of-file marker, and this
+    // reader used to hand those eight bytes to a caller that requires the
+    // whole manifest or exactly eight epoch bytes — turning a healthy run into
+    // a `CorruptJournal` refusal that no operator could explain.
+    let whole = crate::crud::read_whole(
+        transport,
+        pinned.handle(),
+        crate::handle::Stateid::ANONYMOUS,
+        MAX_PRIVATE_FILE_BYTES,
+        deadline,
+    )
+    .map_err(|error| error.to_umbra("open_run"))?;
+    if !whole.complete {
+        // Beyond the bound with no end of file. Every file this reads is small
+        // and fixed-shape, so this is not one of them; refusing beats decoding
+        // a prefix as a whole frame.
+        return Err(UmbraError::new(
+            ErrorKind::CorruptJournal,
+            "open_run",
+            format!(
+                "the run's .provider/{} exceeds the {MAX_PRIVATE_FILE_BYTES}-byte bound this \
+                 provider writes before end of file; it is refused rather than read as a \
+                 truncated one",
+                String::from_utf8_lossy(name.as_bytes())
+            ),
+        ));
+    }
+    Ok(Some(whole.data))
 }
 
 /// `GUARDED4` create one file and write its whole contents.
