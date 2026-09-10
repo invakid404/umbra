@@ -533,6 +533,78 @@ impl NfsUserspaceStorage {
         }
     }
 
+    /// Consult the durable retry journal for `request` (**R1-004**).
+    fn journal_admit(
+        &mut self,
+        operation: &str,
+        request: &StorageRequest,
+    ) -> Result<crate::journal::Admission> {
+        let deadline = self.config.deadline;
+        let (transport, owners, private) = self.journal_scope(operation)?;
+        crate::journal::admit(transport, owners, &private, request, operation, deadline)
+    }
+
+    /// Record what a dispatched mutation actually did (**R1-004**).
+    fn journal_settle(
+        &mut self,
+        operation: &str,
+        request: &StorageRequest,
+        outcome: &Result<StorageResponse>,
+    ) -> Result<()> {
+        let deadline = self.config.deadline;
+        let (transport, owners, private) = self.journal_scope(operation)?;
+        crate::journal::settle(
+            transport, owners, &private, request, outcome, operation, deadline,
+        )
+    }
+
+    /// The three pieces the retry journal needs, borrowed together.
+    ///
+    /// The private anchor is cloned rather than borrowed because `self.operations`
+    /// and `self.transport` cannot both be borrowed out of one `&mut self`
+    /// otherwise; an `Anchor` is a pinned handle and a run identity, so the clone
+    /// names the same object the borrow would have.
+    fn journal_scope(
+        &mut self,
+        operation: &str,
+    ) -> Result<(
+        &mut dyn RawTransport,
+        &mut crate::state::open_owner::OpenOwnerRegistry,
+        crate::anchor::Anchor,
+    )> {
+        let private = self
+            .operations
+            .as_ref()
+            .and_then(|operations| operations.anchors().private())
+            .ok_or_else(|| {
+                UmbraError::new(
+                    ErrorKind::InvalidState,
+                    operation,
+                    "the run has no .provider directory, so no retry record can be written; a                      mutation without durable replay evidence is refused",
+                )
+            })?
+            .clone();
+        let transport = self.transport.as_deref_mut().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::StorageUnavailable,
+                operation,
+                "no transport facade is bound to this provider",
+            )
+        })?;
+        let owners = self
+            .state
+            .incarnation()
+            .ok_or_else(|| {
+                UmbraError::new(
+                    ErrorKind::InvalidState,
+                    operation,
+                    "a retry record needs open owners from a confirmed client incarnation",
+                )
+            })?
+            .open_owners();
+        Ok((transport, owners, private))
+    }
+
     /// Reject a mutation whose writer epoch is not the admitted one (**R1-003**).
     ///
     /// A stale epoch is a request authorised by an admission this provider no
@@ -949,6 +1021,34 @@ impl Storage for NfsUserspaceStorage {
         if request.operation.is_mutation() {
             self.check_presented_epoch(operation, &request.context)?;
         }
+        // R1-004: every supported mutation goes through the durable retry journal
+        // before it reaches the wire. A recorded key is answered from its record
+        // and never re-dispatched; a fresh key has its exact request persisted as
+        // an intent first, so a lost reply can be reconciled from evidence rather
+        // than by re-deriving the answer from the namespace as it stands now.
+        //
+        // Reads are not journalled: they have no effect to reconcile, and
+        // recording one would consume durable space per lookup.
+        let journalled = request.operation.is_mutation();
+        if journalled {
+            // The journal's own round trips can fail the same way a dispatched
+            // mutation can, so their disposition is observed too (R1-002). A
+            // record write that reached the server and lost its reply leaves the
+            // journal in a state this session cannot account for.
+            let admitted = self.journal_admit(operation, request);
+            let admitted = match admitted {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    self.observe_disposition(operation, &error);
+                    return Err(error);
+                }
+            };
+            match admitted {
+                crate::journal::Admission::Recorded(result) => return result,
+                crate::journal::Admission::Fresh => {}
+            }
+        }
+
         let outcome = {
             let (operations, mut context) = self.request(
                 operation,
@@ -962,6 +1062,33 @@ impl Storage for NfsUserspaceStorage {
         // asserting `Excluded` from the shape of the dispatch loop.
         if let Err(error) = &outcome {
             self.observe_disposition(operation, error);
+        }
+        if journalled {
+            // The outcome is recorded as it happened, a *settled* failure
+            // included: a retry of a key that failed must be told the failure
+            // rather than allowed to try again under the same identity.
+            //
+            // An outcome whose server-side disposition is unknown is deliberately
+            // NOT settled. Recording "this failed" for a request that may well
+            // have been applied would hand a later retry a wrong answer with the
+            // authority of a durable record. The intent stays unsettled instead,
+            // so the retry is told the operation is indeterminate and needs
+            // reconciliation — which is what the replay facade's
+            // `Admission::Indeterminate` means.
+            let settled = match &outcome {
+                Ok(_) => true,
+                Err(error) => unsettled_detail(operation, error).is_none(),
+            };
+            if settled {
+                // A journal write that itself fails is reported: the operation may
+                // well have taken effect, and returning the result while its
+                // record says the attempt is still in flight would leave a retry
+                // unable to tell.
+                if let Err(error) = self.journal_settle(operation, request, &outcome) {
+                    self.observe_disposition(operation, &error);
+                    return Err(error);
+                }
+            }
         }
         outcome
     }

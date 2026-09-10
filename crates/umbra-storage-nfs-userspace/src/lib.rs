@@ -59,6 +59,7 @@ mod fixture;
 pub mod handle;
 pub mod identity;
 pub mod integration;
+pub mod journal;
 pub mod namespace;
 pub mod ops;
 pub mod pages;

@@ -866,6 +866,29 @@ fn create_directory_at(
 }
 
 /// Look one name up without constraining its type.
+/// Look one name up and require it to be a directory, without a boundary check.
+///
+/// Used for `.provider` children, which are resolved from an anchor that has
+/// already been proven on the run's filesystem.
+pub fn descend_directory(
+    transport: &mut dyn RawTransport,
+    parent: &PinnedObject,
+    name: &ComponentName,
+    deadline: Deadline,
+) -> Result<PinnedObject> {
+    descend(transport, parent, name, deadline)
+}
+
+/// Look one name up and pin whatever it is.
+pub fn descend_file(
+    transport: &mut dyn RawTransport,
+    parent: &PinnedObject,
+    name: &ComponentName,
+    deadline: Deadline,
+) -> Result<PinnedObject> {
+    descend_any(transport, parent, name, deadline)
+}
+
 fn descend_any(
     transport: &mut dyn RawTransport,
     parent: &PinnedObject,

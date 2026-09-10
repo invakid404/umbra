@@ -1218,3 +1218,382 @@ fn r1_005_an_unreadable_epoch_file_is_refused_not_read_as_zero() {
         refused.context
     );
 }
+
+// --- R1-004: supported mutations go through a durable replay journal ---------
+
+/// Seed a run that already carries one retry record, as a previous provider
+/// process would have left it.
+fn seed_run_with_record(run_id: RunId, record_name: &str, record: Vec<u8>) -> FakeTransport {
+    let mut fake = FakeTransport::new();
+    let mut current = fake.root();
+    for part in EXPORT.split(|byte| *byte == b'/') {
+        current = fake.insert_directory(&current, part);
+    }
+    let run_parent = fake.insert_directory(&current, RUN_PARENT);
+    let run = fake.insert_directory(&run_parent, run_id.0.hyphenated().to_string().as_bytes());
+    fake.insert_directory(&run, b"root");
+    fake.insert_directory(&run, b"control");
+    let private = fake.insert_directory(&run, b".provider");
+    fake.insert_file(
+        &private,
+        b"manifest",
+        manifest_bytes(run_id, &base(), FORMAT_VERSION),
+    );
+    fake.insert_file(&private, b"epoch", 0u64.to_le_bytes().to_vec());
+    let retries = fake.insert_directory(&private, b"retries");
+    fake.insert_file(&retries, record_name.as_bytes(), record);
+    fake
+}
+
+fn key_file(key: &str) -> String {
+    let hex: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    format!("key-{hex}")
+}
+
+/// **R1-004.** The review's exact static trace: a successful rename, retried
+/// under the identical idempotency key, is answered from its record.
+///
+/// Pre-fix there was no record. The retry re-resolved the source, found it gone —
+/// because the first attempt had already moved it — and reported `NOENT` for an
+/// operation that had actually succeeded. The only `ReplayLog` implementation was
+/// in memory, `MutationJournal` was reached by no `Storage` method, and namespace
+/// mutations dispatched straight to the wire.
+#[test]
+fn r1_004_an_exact_key_retry_of_a_rename_is_answered_from_its_record() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    storage
+        .execute(&create_file(authorised(&storage, run_id, "seed"), b"a.txt"))
+        .expect("create the source");
+
+    let context = authorised(&storage, run_id, "rename-key");
+    let rename = StorageRequest {
+        context,
+        operation: StorageOperation::Rename {
+            source: path(b"a.txt"),
+            destination: path(b"b.txt"),
+            mode: umbra_core::RenameMode::Replace,
+        },
+    };
+    let first = storage.execute(&rename).expect("the rename succeeds");
+
+    // The identical request again. `a.txt` no longer exists, so a re-dispatch
+    // would answer NOENT.
+    let retried = storage
+        .execute(&rename)
+        .expect("an exact-key retry must be answered, not re-dispatched");
+    assert_eq!(
+        format!("{first:?}"),
+        format!("{retried:?}"),
+        "the retry must return the recorded outcome verbatim"
+    );
+
+    // And the namespace was not touched a second time.
+    storage
+        .execute(&StorageRequest {
+            context: RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("probe-b".into()),
+                writer_epoch: None,
+            },
+            operation: StorageOperation::Stat {
+                path: path(b"b.txt"),
+            },
+        })
+        .expect("the destination is still there exactly once");
+}
+
+/// **R1-004.** A settled *failure* is replayed as that failure, so a retry cannot
+/// reinterpret it by trying again.
+#[test]
+fn r1_004_a_recorded_failure_is_replayed_as_that_failure() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    // Removing a directory with Unlink is refused by the capability surface, so
+    // this failure is settled: the server's answer is known.
+    storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "mkdir"),
+            operation: StorageOperation::Create {
+                path: path(b"adir"),
+                options: CreateOptions {
+                    kind: CreateKind::Directory,
+                    mode: 0o700,
+                },
+            },
+        })
+        .expect("create a directory");
+
+    let context = authorised(&storage, run_id, "unlink-dir");
+    let bad = StorageRequest {
+        context,
+        operation: StorageOperation::Unlink {
+            path: path(b"adir"),
+        },
+    };
+    let first = storage
+        .execute(&bad)
+        .expect_err("unlinking a directory is refused");
+    let again = storage
+        .execute(&bad)
+        .expect_err("and the retry gets the same answer");
+    assert_eq!(first.kind, again.kind);
+    assert_eq!(first.context, again.context, "verbatim, from the record");
+}
+
+/// **R1-004.** An intent recorded by a previous attempt that never settled makes
+/// the retry stop for reconciliation rather than repeat the effect.
+///
+/// This is the "after intent, before result" interruption: the record proves the
+/// request was dispatched and says nothing about what it did.
+#[test]
+fn r1_004_an_unsettled_intent_forces_reconciliation() {
+    let run_id = fresh_run();
+    let context = RequestContext {
+        run_id,
+        operation_id: OperationId(Uuid::new_v4()),
+        idempotency_key: IdempotencyKey("interrupted".into()),
+        writer_epoch: umbra_core::LeaseEpoch(1).into(),
+    };
+    let request = StorageRequest {
+        context: context.clone(),
+        operation: StorageOperation::Create {
+            path: path(b"half-done.txt"),
+            options: CreateOptions {
+                kind: CreateKind::File,
+                mode: 0o644,
+            },
+        },
+    };
+    // The record a crash between intent and result leaves behind.
+    let intent: (
+        StorageRequest,
+        Option<umbra_core::Result<umbra_core::StorageResponse>>,
+    ) = (request.clone(), None);
+    let fake = seed_run_with_record(
+        run_id,
+        &key_file("interrupted"),
+        serde_json::to_vec(&intent).expect("the intent encodes"),
+    );
+    let mut storage = over(fake);
+    open_existing(&mut storage, run_id).expect("the run opens");
+
+    let refused = storage
+        .execute(&request)
+        .expect_err("an unsettled intent must not be re-dispatched");
+    assert_eq!(refused.kind, ErrorKind::StorageUnavailable);
+    assert!(
+        refused.context.contains("requires"),
+        "the refusal must ask for reconciliation, not a retry: {}",
+        refused.context
+    );
+    assert!(
+        refused.context.contains("indeterminate"),
+        "and must name the state: {}",
+        refused.context
+    );
+}
+
+/// **R1-004.** The same key naming a different request is refused; the recorded
+/// outcome belongs to the request that was actually issued.
+#[test]
+fn r1_004_a_key_reused_for_a_different_request_is_refused() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    let context = authorised(&storage, run_id, "shared-key");
+    storage
+        .execute(&create_file(context.clone(), b"first.txt"))
+        .expect("the first request");
+    let refused = storage
+        .execute(&create_file(context, b"second.txt"))
+        .expect_err("one key cannot name two requests");
+    assert_eq!(refused.kind, ErrorKind::InvalidInput);
+    assert!(
+        refused.context.contains("different request"),
+        "{}",
+        refused.context
+    );
+}
+
+/// **R1-004.** Reusing one operation id under a second idempotency key is caught.
+#[test]
+fn r1_004_an_operation_id_reused_under_another_key_is_refused() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    let first = authorised(&storage, run_id, "key-one");
+    let operation_id = first.operation_id;
+    storage
+        .execute(&create_file(first, b"one.txt"))
+        .expect("the first request");
+
+    let mut second = authorised(&storage, run_id, "key-two");
+    second.operation_id = operation_id;
+    let refused = storage
+        .execute(&create_file(second, b"two.txt"))
+        .expect_err("one operation id cannot name two keys");
+    assert_eq!(refused.kind, ErrorKind::InvalidInput);
+    assert!(
+        refused.context.contains("operation id"),
+        "{}",
+        refused.context
+    );
+}
+
+/// **R1-004.** The intent is durable *before* dispatch, and the settled record
+/// carries the exact request and the exact result.
+///
+/// Read back through the contract's own list surface, so this asserts what a
+/// recovering process would actually find on the server.
+#[test]
+fn r1_004_the_record_is_on_the_server_with_the_exact_request_and_result() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    let context = authorised(&storage, run_id, "written");
+    let request = StorageRequest {
+        context,
+        operation: StorageOperation::Create {
+            path: path(b"recorded.txt"),
+            options: CreateOptions {
+                kind: CreateKind::File,
+                mode: 0o644,
+            },
+        },
+    };
+    let outcome = storage.execute(&request).expect("the create succeeds");
+
+    // Walk to `.provider/retries` and read the record back off the server.
+    let deadline = Deadline { millis: 5_000 };
+    let transport = storage.transport().expect("transport");
+    let mut current = transport.root_filehandle(deadline).expect("root");
+    for part in EXPORT
+        .split(|byte| *byte == b'/')
+        .chain([RUN_PARENT])
+        .chain([run_id.0.hyphenated().to_string().as_bytes()])
+        .chain([b".provider".as_slice(), b"retries".as_slice()])
+    {
+        current = transport
+            .lookup(
+                &current,
+                &umbra_storage_nfs_userspace::transport::ComponentName::new(part.to_vec()).unwrap(),
+                umbra_storage_nfs_userspace::transport::AttrMask::STAT,
+                deadline,
+            )
+            .expect("walk to retries")
+            .0;
+    }
+    let (record_handle, _) = transport
+        .lookup(
+            &current,
+            &umbra_storage_nfs_userspace::transport::ComponentName::new(
+                key_file("written").into_bytes(),
+            )
+            .unwrap(),
+            umbra_storage_nfs_userspace::transport::AttrMask::STAT,
+            deadline,
+        )
+        .expect("the retry record exists on the server");
+    let bytes = transport
+        .read(
+            &record_handle,
+            umbra_storage_nfs_userspace::handle::Stateid::ANONYMOUS,
+            0,
+            64 * 1024,
+            deadline,
+        )
+        .expect("read the record")
+        .data;
+
+    let (recorded_request, recorded_outcome): (
+        StorageRequest,
+        Option<umbra_core::Result<umbra_core::StorageResponse>>,
+    ) = serde_json::from_slice(&bytes).expect("the record decodes");
+    assert_eq!(
+        recorded_request, request,
+        "the record must hold the exact request, byte for byte"
+    );
+    let recorded_outcome = recorded_outcome.expect("the record is settled");
+    assert_eq!(
+        format!("{recorded_outcome:?}"),
+        format!("{:?}", Ok::<_, umbra_core::UmbraError>(outcome)),
+        "and the exact result"
+    );
+}
+
+/// **R1-004.** A `WriteAt` record retains the payload, so a recovery can rebuild
+/// the write without the server's reply cache.
+#[test]
+fn r1_004_a_write_record_retains_its_payload() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "target"),
+            b"payload.bin",
+        ))
+        .expect("create the target");
+
+    let payload = b"exact bytes that recovery needs".to_vec();
+    let request = StorageRequest {
+        context: authorised(&storage, run_id, "the-write"),
+        operation: StorageOperation::WriteAt {
+            path: path(b"payload.bin"),
+            offset: 0,
+            bytes: payload.clone(),
+        },
+    };
+    storage.execute(&request).expect("the write succeeds");
+
+    // Retrying the identical write is answered from the record rather than
+    // written a second time.
+    let retried = storage.execute(&request).expect("the retry is answered");
+    match retried {
+        umbra_core::StorageResponse::WriteAt(count) => {
+            assert_eq!(count as usize, payload.len())
+        }
+        other => panic!("expected a write response, got {other:?}"),
+    }
+}
+
+/// **R1-004.** Reads are not journalled: they have nothing to reconcile, and
+/// recording one would consume durable space per lookup.
+#[test]
+fn r1_004_reads_are_not_recorded() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "seed"),
+            b"read-me.txt",
+        ))
+        .expect("seed");
+
+    // The same read key twice, which a journalled operation would refuse the
+    // second time only if it disagreed — and would record either way.
+    for _ in 0..2 {
+        storage
+            .execute(&StorageRequest {
+                context: RequestContext {
+                    run_id,
+                    operation_id: OperationId(Uuid::new_v4()),
+                    idempotency_key: IdempotencyKey("a-read".into()),
+                    writer_epoch: None,
+                },
+                operation: StorageOperation::Stat {
+                    path: path(b"read-me.txt"),
+                },
+            })
+            .expect("reads are unrestricted by the journal");
+    }
+}

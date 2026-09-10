@@ -512,10 +512,24 @@ that window out under a bounded budget instead of reading it as a failure.
 ## Deferred
 
 `authority::AdmissionControl` is bound: `open_run` acquires admission and
-`close_run` releases it. `authority::MutationJournal` is **not** yet on the
-`Storage` path — durable intents exist and are tested, but no contract method
-routes through them, so `flush` still reports its gate rather than issuing a
-receipt.
+`close_run` releases it.
+
+Durable replay is bound too. Every supported mutation `execute` dispatches goes
+through [`journal`](src/journal.rs) first: the exact request is recorded in
+`.provider/retries/key-<hex>` before the operation reaches the wire, and the
+exact settled result is written back afterwards, in the byte encoding the mounted
+adapter uses and `tests/goldens/retry-*.json` pins. An exact-key retry is
+answered from its record and never re-dispatched; a record whose intent never
+settled stops for reconciliation rather than repeating the effect; an outcome
+whose server-side disposition is unknown is left unsettled rather than recorded
+as a failure a later retry would trust. Reads are not journalled.
+
+`flush` still reports its gate rather than issuing a receipt, and the provider
+still advertises `Durability::None`. Writing a record `FILE_SYNC4` asks the
+server for stability; it does not qualify a persistence boundary, and no
+remote-durability claim is made from it. `authority::MutationJournal` remains the
+typed lower-layer model over the `ReplayLog` facade and is not itself on the
+`Storage` path.
 
 `OPEN_DOWNGRADE` remains unavailable: `transport::Nfs4Op` has no variant for it,
 and the hotfix that added the four namespace mutations deliberately did not widen
