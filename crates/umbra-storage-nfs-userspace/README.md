@@ -670,11 +670,20 @@ exactly where it is, and a cooperative release cannot succeed. It clears only by
 reopening the run, which is the operator intervention the state is for.
 
 Separately, a call whose server-side disposition could not be established stops
-the run admitting *new* work while leaving the resolution reachable. The failure
-model asks for both halves — "stop new mutations and quiesce; resolve bounded
-outstanding operations" — and resolving an outstanding operation means retrying
-its own key, so a key with no record is refused while a key with one is the
-recovery.
+the run admitting *new* work. The failure model asks for both halves — "stop new
+mutations and quiesce; resolve bounded outstanding operations" — and resolving an
+outstanding operation means retrying its own key, so a key with no record is
+refused while a key with one is the recovery.
+
+**That leaves the resolution reachable only once a record exists.** The intent is
+written after the preconditions are observed, and both are real round trips, so a
+reply lost before the record lands arms the ledger while `.provider/retries` stays
+empty. Every later key then looks fresh, including the outstanding one, and the
+run refuses every mutation and every release: the marker stays held and only
+reopening the run clears it. Nothing is lost and no false success is reported —
+this is a stop, not a correctness hole — but the diagnostic asks for a resolution
+that this window has no path to, and a reader should not take "resolution
+reachable" as unconditional.
 
 Records are read in bounded chunks to end of file and written in as many round
 trips as the server needs, because a short `READ` or `WRITE` is a legal answer
