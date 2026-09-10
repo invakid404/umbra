@@ -17,7 +17,13 @@ BASE_REF="${BASE_REF:-origin/master}"
 
 # ---- 1. What actually changed vs base? -------------------------------
 
-git fetch --depth=50 origin master
+# actions/checkout already fetched full history (fetch-depth: 0). Only
+# refresh the base ref itself; do NOT pass --depth here (a shallow-depth
+# fetch on a full clone creates .git/shallow and can break merge-base
+# for `git diff BASE...HEAD` when the base is older than the depth).
+# Strip the `origin/` prefix from BASE_REF so `git fetch` receives a
+# remote-side ref name.
+git fetch origin "${BASE_REF#origin/}"
 changed=$(git diff --name-only "$BASE_REF"...HEAD)
 if [ -z "$changed" ]; then
     echo "auto-ack: no changes vs $BASE_REF, nothing to do"
@@ -26,23 +32,32 @@ fi
 
 # ---- 2. Restrict changed paths to the allowlist ----------------------
 
-# Anything outside Cargo.toml / Cargo.lock means a structural change we
-# refuse to auto-ack. Note this list is intentionally NARROWER than the
-# workflow's commit-allowlist (which only permits memoria.lock outbound);
-# on the inbound side we want to reject any file we don't understand.
-non_safe=$(printf '%s\n' "$changed" | grep -vE '^(Cargo\.lock|Cargo\.toml)$' || true)
+# Anything outside Cargo.toml / Cargo.lock (root or per-crate) means a
+# structural change we refuse to auto-ack. Note this list is
+# intentionally NARROWER than the workflow's commit-allowlist (which
+# only permits memoria.lock outbound); on the inbound side we want to
+# reject any file we don't understand. Per-crate manifests are included
+# because members like crates/umbra-platform-macos and crates/umbra-storage-nfs
+# pin dependencies (e.g. libc) directly rather than through
+# [workspace.dependencies], so a Renovate bump to those deps changes the
+# member manifest.
+non_safe=$(printf '%s\n' "$changed" \
+    | grep -vE '^(Cargo\.lock|Cargo\.toml|crates/[^/]+/Cargo\.toml)$' || true)
 if [ -n "$non_safe" ]; then
     printf 'auto-ack: SKIP — Renovate touched paths outside the safe allowlist:\n%s\n' "$non_safe"
     exit 0
 fi
 
-# ---- 3. If Cargo.toml changed, verify diff is version-literals only --
+# ---- 3. For every Cargo.toml touched, verify diff is version-only ---
 
-if printf '%s\n' "$changed" | grep -q '^Cargo\.toml$'; then
-    if ! python3 scripts/check-cargo-toml-diff.py "$BASE_REF" Cargo.toml; then
-        echo "auto-ack: SKIP — Cargo.toml diff isn't pure version-literal bumps; human ack required"
-        exit 0
-    fi
+changed_manifests=$(printf '%s\n' "$changed" | grep -E '(^|/)Cargo\.toml$' || true)
+if [ -n "$changed_manifests" ]; then
+    while IFS= read -r manifest; do
+        if ! python3 scripts/check-cargo-toml-diff.py "$BASE_REF" "$manifest"; then
+            echo "auto-ack: SKIP — $manifest diff isn't pure version-literal bumps; human ack required"
+            exit 0
+        fi
+    done <<<"$changed_manifests"
 fi
 
 # ---- 4. Ack every pending README ------------------------------------

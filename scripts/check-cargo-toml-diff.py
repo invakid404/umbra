@@ -20,7 +20,8 @@ from __future__ import annotations
 import subprocess
 import sys
 import tomllib
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 DEP_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
 
