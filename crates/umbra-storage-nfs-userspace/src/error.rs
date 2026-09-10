@@ -328,9 +328,18 @@ impl FacadeError {
         match self {
             Self::Protocol(error) => protocol_class(error.status),
             Self::Transport(error) => match error {
-                TransportError::QueueFull { .. } | TransportError::DeadlineExpired { .. } => {
-                    ErrorClass::Retriable
-                }
+                // A queue that was full refused the call *before* dispatch, so
+                // nothing reached the server and the same identity may simply be
+                // offered again.
+                TransportError::QueueFull { .. } => ErrorClass::Retriable,
+                // **F11.** A deadline is not that. `Retirement` proves the call
+                // was withdrawn from *this* pump; it proves nothing about the
+                // server, which may have received and applied the request already
+                // — `raw::mod`'s completion race can even synthesise this error
+                // for a call that finished. `Retriable` says "no state was lost",
+                // and a caller that believed it would re-offer a mutation whose
+                // first attempt might still land.
+                TransportError::DeadlineExpired { .. } => ErrorClass::NeedsRecovery,
                 TransportError::Connect(_) | TransportError::Disconnected { .. } => {
                     ErrorClass::NeedsRecovery
                 }
@@ -502,6 +511,7 @@ impl std::fmt::Display for RetainedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::{CallToken, Retirement};
 
     #[test]
     fn unknown_status_is_preserved_and_never_successful() {
@@ -530,6 +540,61 @@ mod tests {
         for advanced in [Nfs4Status::OK, Nfs4Status::DENIED, Nfs4Status::ACCESS] {
             assert!(!advanced.holds_seqid());
         }
+    }
+
+    /// **F11.** A deadline needs recovery; only the pre-dispatch refusal is
+    /// directly retriable.
+    ///
+    /// The candidate grouped `DeadlineExpired` with `QueueFull`. `QueueFull` is
+    /// refused *before* dispatch, so nothing reached the server and the same
+    /// identity may simply be offered again. A deadline proves only that this
+    /// pump withdrew the registration; the server may have received and applied
+    /// the request, so `Retriable`'s "no state was lost" is a promise the
+    /// transport cannot make.
+    #[test]
+    fn f11_a_deadline_needs_recovery_rather_than_a_plain_retry() {
+        let token = CallToken::new(std::num::NonZeroU64::new(7).expect("nonzero"));
+        let expired = FacadeError::Transport(TransportError::DeadlineExpired {
+            retirement: Retirement::new(token, true),
+        });
+        assert_eq!(expired.class(), ErrorClass::NeedsRecovery);
+        assert_ne!(expired.class(), ErrorClass::Retriable);
+
+        // Classification discards nothing: the retirement, its token, the
+        // rendered detail and the absent server status are all unchanged.
+        let FacadeError::Transport(TransportError::DeadlineExpired { retirement }) = &expired
+        else {
+            unreachable!("still a deadline");
+        };
+        assert_eq!(retirement.token(), token);
+        assert!(retirement.drained());
+        assert_eq!(
+            expired.to_string(),
+            "transport: deadline elapsed for call CallToken(7)"
+        );
+        assert_eq!(expired.status(), None);
+        assert_eq!(
+            expired.to_umbra("write").kind,
+            ErrorKind::StorageUnavailable,
+            "the provider's own unknown-disposition ledger keys on this kind and is untouched"
+        );
+    }
+
+    /// **F11.** A deadline reported for a call that had already *completed*
+    /// classifies identically.
+    ///
+    /// `raw::mod` retires a slot it has already marked completed and can report
+    /// the deadline anyway, which is the sharpest case: the server definitely
+    /// acted. The caller cannot tell that apart from a call the pump really did
+    /// withdraw first, so neither may the class.
+    #[test]
+    fn f11_a_deadline_raced_against_completion_is_not_retriable_either() {
+        let token = CallToken::new(std::num::NonZeroU64::new(35).expect("nonzero"));
+        // `drained` is what the second retirement of a completed slot reports.
+        let after_completion = FacadeError::Transport(TransportError::DeadlineExpired {
+            retirement: Retirement::new(token, true),
+        });
+        assert_eq!(after_completion.class(), ErrorClass::NeedsRecovery);
     }
 
     #[test]

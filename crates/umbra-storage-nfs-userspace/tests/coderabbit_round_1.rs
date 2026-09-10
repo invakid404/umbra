@@ -274,3 +274,72 @@ fn walk(
     }
     cursor
 }
+
+// --- F11: a deadline needs recovery, it is not directly retriable ------------
+
+/// **F11.** `DeadlineExpired` classifies as `NeedsRecovery`, not `Retriable`.
+///
+/// At the reviewed candidate it was grouped with `QueueFull`, whose refusal
+/// happens *before* dispatch. A deadline is not that: `Retirement` proves the
+/// call was withdrawn from this pump and proves nothing about the server, which
+/// may have received and applied the request. `ErrorClass::Retriable` promises
+/// "no state was lost", so a caller that trusted it would re-offer a mutation
+/// whose first attempt could still land.
+///
+/// The error value itself is untouched by classification — the retirement, the
+/// token it names and the rendered detail are all still what the transport
+/// produced.
+#[test]
+fn f11_a_deadline_needs_recovery_and_a_full_queue_is_still_retriable() {
+    use umbra_storage_nfs_userspace::error::{ErrorClass, FacadeError, TransportError};
+    use umbra_storage_nfs_userspace::fake::ScriptedFault;
+    use umbra_storage_nfs_userspace::transport::{FaultAction, FaultPoint};
+
+    let mut fake = FakeTransport::new();
+    fake.install_faults(ScriptedFault::once(
+        FaultPoint::OnDeadline,
+        None,
+        FaultAction::DropReply,
+    ));
+    let deadline_error = fake
+        .root_filehandle(deadline())
+        .expect_err("the dropped reply must reach its deadline");
+    let FacadeError::Transport(TransportError::DeadlineExpired { retirement }) = &deadline_error
+    else {
+        panic!("expected a deadline, got {deadline_error:?}");
+    };
+    let token = retirement.token();
+    let rendered = deadline_error.to_string();
+
+    assert_eq!(
+        deadline_error.class(),
+        ErrorClass::NeedsRecovery,
+        "a withdrawn registration is not proof the server did nothing"
+    );
+    assert_ne!(deadline_error.class(), ErrorClass::Retriable);
+
+    // Classification discards nothing.
+    let FacadeError::Transport(TransportError::DeadlineExpired { retirement }) = &deadline_error
+    else {
+        unreachable!("still a deadline");
+    };
+    assert_eq!(retirement.token(), token, "the retirement is unchanged");
+    assert_eq!(
+        deadline_error.to_string(),
+        rendered,
+        "the detail is unchanged"
+    );
+    assert_eq!(
+        deadline_error.status(),
+        None,
+        "a deadline carries no server status, before or after classification"
+    );
+
+    // The pre-dispatch refusal keeps its own answer: nothing reached the wire,
+    // so the same identity may simply be offered again.
+    let queue_full = FacadeError::Transport(TransportError::QueueFull {
+        depth: 64,
+        capacity: 64,
+    });
+    assert_eq!(queue_full.class(), ErrorClass::Retriable);
+}
