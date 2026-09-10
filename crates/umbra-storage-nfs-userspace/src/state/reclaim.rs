@@ -36,7 +36,7 @@
 
 use crate::error::{FacadeError, Nfs4Status};
 use crate::handle::{FileHandle, ObjectIdentity, OpenFile};
-use crate::state::open_owner::{OpenOutcome, OpenOwnerRegistry};
+use crate::state::open_owner::{close, CloseOutcome, OpenOutcome, OpenOwnerRegistry};
 use crate::transport::{
     Deadline, DelegationType, OpenClaim, OpenHow, RawTransport, ShareAccess, ShareDeny,
 };
@@ -296,11 +296,29 @@ fn reclaim_one(
         );
         match outcome {
             OpenOutcome::Opened(file) => {
-                return if file.identity() == target.identity {
-                    Ok(file)
-                } else {
-                    Err((SurrenderCause::IdentityChanged, None))
+                if file.identity() == target.identity {
+                    return Ok(file);
+                }
+                // **F31.** The reclaim *succeeded*: the server minted open state
+                // for this owner and handed back a stateid. It is the wrong
+                // object, so it cannot be carried forward — but dropping the
+                // `OpenFile` does not release it. CLOSE is a wire operation this
+                // module dispatches explicitly through `open_owner::close`;
+                // `OpenFile::drop` sends nothing, so the old code left server
+                // state alive under a client that keeps renewing its lease.
+                //
+                // The cause stays `IdentityChanged`: that is why the open is
+                // being surrendered, and a CLOSE that also failed does not
+                // change it. The cleanup failure is retained as the evidence
+                // beside it, and an unknown cleanup leaves the owner poisoned by
+                // `close` itself rather than being reported as a clean release.
+                let cleanup = match close(file, transport, deadline) {
+                    CloseOutcome::Closed(_) => None,
+                    CloseOutcome::Rejected { error, .. } | CloseOutcome::Abandoned { error } => {
+                        Some(error)
+                    }
                 };
+                return Err((SurrenderCause::IdentityChanged, cleanup));
             }
             // A reclaim that opened but could not be confirmed has not been
             // proven; it is surrendered rather than carried forward unusable.

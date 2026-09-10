@@ -735,3 +735,349 @@ fn f17_ordinary_paging_is_unchanged() {
         "the cursor advanced"
     );
 }
+
+// --- F18 / F31: a committed OPEN is released, not leaked --------------------
+
+/// Records the sequenced operations that reached the wire.
+#[derive(Clone, Debug, Default)]
+struct WireOps(std::sync::Arc<std::sync::Mutex<Vec<(&'static str, u32)>>>);
+
+impl WireOps {
+    fn seen(&self) -> Vec<(&'static str, u32)> {
+        self.0.lock().expect("not poisoned").clone()
+    }
+}
+
+/// A transport that records sequenced operations and can strip identity from the
+/// `getattr` that follows an OPEN.
+struct Sequenced {
+    inner: FakeTransport,
+    ops: WireOps,
+    /// Drop FSID/FILEID from `getattr` replies, which is what makes
+    /// `object_identity` fail after a committed OPEN.
+    blind_identity: bool,
+    /// Fail the CLOSE with this status instead of letting it through.
+    refuse_close: Option<umbra_storage_nfs_userspace::error::Nfs4Status>,
+}
+
+impl RawTransport for Sequenced {
+    fn wire_profile(&self) -> umbra_storage_nfs_userspace::transport::WireProfile {
+        self.inner.wire_profile()
+    }
+    fn limits(&self) -> umbra_storage_nfs_userspace::transport::TransportLimits {
+        self.inner.limits()
+    }
+    fn connection(&self) -> umbra_storage_nfs_userspace::transport::ConnectionState {
+        self.inner.connection()
+    }
+    fn submit(
+        &mut self,
+        call: umbra_storage_nfs_userspace::transport::Compound,
+        call_deadline: Deadline,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::CompoundReply,
+    > {
+        use umbra_storage_nfs_userspace::transport::{Nfs4Op, OpReply};
+        {
+            let mut seen = self.ops.0.lock().expect("not poisoned");
+            for op in &call.ops {
+                match op {
+                    Nfs4Op::Open(args) => seen.push(("OPEN", args.seqid)),
+                    Nfs4Op::OpenConfirm { seqid, .. } => seen.push(("OPEN_CONFIRM", *seqid)),
+                    Nfs4Op::Close { seqid, .. } => seen.push(("CLOSE", *seqid)),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(status) = self.refuse_close {
+            if call.ops.iter().any(|op| matches!(op, Nfs4Op::Close { .. })) {
+                return Ok(umbra_storage_nfs_userspace::transport::CompoundReply {
+                    tag: call.tag.clone(),
+                    results: Vec::new(),
+                    failure: Some(umbra_storage_nfs_userspace::error::ProtocolError {
+                        status,
+                        op: umbra_storage_nfs_userspace::transport::OpCode::Close,
+                        index: 1,
+                    }),
+                });
+            }
+        }
+        let mut reply = self.inner.submit(call, call_deadline)?;
+        if self.blind_identity {
+            for result in &mut reply.results {
+                if let OpReply::GetAttr(attributes) = result {
+                    attributes.fsid = None;
+                    attributes.fileid = None;
+                }
+            }
+        }
+        Ok(reply)
+    }
+    fn cancel(
+        &mut self,
+        token: umbra_storage_nfs_userspace::transport::CallToken,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::Retirement,
+    > {
+        self.inner.cancel(token)
+    }
+    fn reconnect(
+        &mut self,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::ConnectionEpoch,
+    > {
+        self.inner.reconnect()
+    }
+    fn install_faults(&mut self, plan: Box<dyn umbra_storage_nfs_userspace::transport::FaultPlan>) {
+        self.inner.install_faults(plan)
+    }
+}
+
+fn registry(label: u64) -> umbra_storage_nfs_userspace::state::open_owner::OpenOwnerRegistry {
+    umbra_storage_nfs_userspace::state::open_owner::OpenOwnerRegistry::new(
+        umbra_storage_nfs_userspace::handle::Session::establish(
+            umbra_storage_nfs_userspace::handle::SessionId(label),
+            umbra_storage_nfs_userspace::handle::ClientId(label),
+            umbra_storage_nfs_userspace::transport::ConnectionEpoch(1),
+        ),
+        format!("cr-{label}").into_bytes(),
+    )
+}
+
+/// **F18.** An OPEN that committed and then could not be identified is released,
+/// not left on the server.
+///
+/// The candidate burned the owner and dropped the reply, on the reasoning that
+/// "the server releases it when the lease expires". It does not: this client goes
+/// on renewing the very lease that keeps the state alive, so the open survives as
+/// long as the session does. Both the handle and the stateid the OPEN returned
+/// are in hand, so the state is released explicitly — OPEN_CONFIRM first, because
+/// the server asked for it and an unconfirmed stateid is not one a CLOSE may
+/// carry.
+///
+/// The answer is unchanged: the identity is still unproven, so this is still
+/// `Abandoned` and the owner is still burned.
+#[test]
+fn f18_a_committed_open_whose_identity_fails_is_closed_on_the_server() {
+    use umbra_storage_nfs_userspace::state::open_owner::{OpenOutcome, OpenRequest};
+    use umbra_storage_nfs_userspace::transport::{OpenHow, ShareAccess, ShareDeny};
+
+    let mut fake = FakeTransport::new();
+    let root = fake.root();
+    fake.insert_file(&root, b"opened", b"bytes".to_vec());
+    let ops = WireOps::default();
+    let mut transport = Sequenced {
+        inner: fake,
+        ops: ops.clone(),
+        blind_identity: true,
+        refuse_close: None,
+    };
+
+    let mut owners = registry(1);
+    let lease = owners.allocate().expect("a fresh registry mints leases");
+    let outcome = owners.open(
+        lease,
+        &mut transport,
+        &OpenRequest {
+            parent: root.clone(),
+            name: name(b"opened"),
+            how: OpenHow::NoCreate,
+            share_access: ShareAccess::READ,
+            share_deny: ShareDeny::NONE,
+        },
+        deadline(),
+    );
+
+    assert!(
+        matches!(outcome, OpenOutcome::Abandoned { .. }),
+        "an unproven identity is still abandoned: {outcome:?}"
+    );
+    assert_eq!(
+        owners.burned(),
+        1,
+        "and the owner is still burned; cleanup does not resurrect authority"
+    );
+
+    // The wire says the state was released, with the seqids the owner owed.
+    // A fresh owner opens at 0, so the confirm carries 1 and the close 2.
+    assert_eq!(
+        ops.seen(),
+        vec![("OPEN", 0), ("OPEN_CONFIRM", 1), ("CLOSE", 2)],
+        "a committed OPEN must be confirmed and closed, in that order, correctly sequenced"
+    );
+}
+
+/// **F18.** A cleanup the server refuses changes nothing about the answer.
+#[test]
+fn f18_a_refused_cleanup_still_reports_the_original_identity_failure() {
+    use umbra_storage_nfs_userspace::error::Nfs4Status;
+    use umbra_storage_nfs_userspace::state::open_owner::{OpenOutcome, OpenRequest};
+    use umbra_storage_nfs_userspace::transport::{OpenHow, ShareAccess, ShareDeny};
+
+    let mut fake = FakeTransport::new();
+    let root = fake.root();
+    fake.insert_file(&root, b"opened", b"bytes".to_vec());
+    let ops = WireOps::default();
+    let mut transport = Sequenced {
+        inner: fake,
+        ops: ops.clone(),
+        blind_identity: true,
+        refuse_close: Some(Nfs4Status::SERVERFAULT),
+    };
+
+    let mut owners = registry(2);
+    let lease = owners.allocate().expect("lease");
+    let outcome = owners.open(
+        lease,
+        &mut transport,
+        &OpenRequest {
+            parent: root.clone(),
+            name: name(b"opened"),
+            how: OpenHow::NoCreate,
+            share_access: ShareAccess::READ,
+            share_deny: ShareDeny::NONE,
+        },
+        deadline(),
+    );
+
+    let OpenOutcome::Abandoned { error } = outcome else {
+        panic!("an unproven identity is still abandoned");
+    };
+    assert!(
+        error.to_string().contains("identity cannot be proven"),
+        "the original identity failure is what the caller reads, not the CLOSE's: {error}"
+    );
+    assert_eq!(owners.burned(), 1);
+    assert!(
+        ops.seen().contains(&("CLOSE", 2)),
+        "the cleanup was still attempted: {:?}",
+        ops.seen()
+    );
+}
+
+/// **F31.** A reclaim that returns a different object is closed before it is
+/// surrendered.
+///
+/// `CLAIM_PREVIOUS` succeeded — the server minted open state for this owner and
+/// handed back a stateid — but it named the wrong object, so it cannot be carried
+/// forward. The candidate dropped the `OpenFile`, and `OpenFile::drop` sends
+/// nothing: CLOSE is a wire operation this module dispatches explicitly. The
+/// state stayed alive under a client that keeps renewing its lease.
+///
+/// `IdentityChanged` stays the reported cause; the CLOSE is cleanup, not the
+/// reason.
+#[test]
+fn f31_an_identity_mismatched_reclaim_is_closed_before_it_is_surrendered() {
+    use umbra_storage_nfs_userspace::handle::ObjectIdentity;
+    use umbra_storage_nfs_userspace::state::reclaim::{ReclaimPlan, ReclaimTarget, SurrenderCause};
+    use umbra_storage_nfs_userspace::transport::Fsid;
+    use umbra_storage_nfs_userspace::transport::{AttrMask, ShareAccess, ShareDeny};
+
+    let mut fake = FakeTransport::new();
+    let root = fake.root();
+    fake.insert_file(&root, b"reclaimed", b"bytes".to_vec());
+    // CLAIM_PREVIOUS is only answered inside the server's grace window.
+    fake.set_grace(true);
+    let (handle, _) = fake
+        .lookup(&root, &name(b"reclaimed"), AttrMask::STAT, deadline())
+        .expect("resolve the target");
+
+    let ops = WireOps::default();
+    let mut transport = Sequenced {
+        inner: fake,
+        ops: ops.clone(),
+        blind_identity: false,
+        refuse_close: None,
+    };
+
+    // A target pinned to an identity the server will not answer with: the
+    // reclaim succeeds and comes back as somebody else's object.
+    let report = ReclaimPlan::from_targets(vec![ReclaimTarget {
+        handle,
+        identity: ObjectIdentity {
+            fsid: Fsid {
+                major: 0xDEAD,
+                minor: 0xBEEF,
+            },
+            fileid: 0xFFFF_FFFF,
+        },
+        share_access: ShareAccess::READ,
+        share_deny: ShareDeny::NONE,
+    }])
+    .run(&mut registry(3), &mut transport, deadline());
+
+    assert!(
+        report.recovered.is_empty(),
+        "the wrong object is not recovered"
+    );
+    assert_eq!(report.surrendered.len(), 1);
+    assert_eq!(
+        report.surrendered[0].cause,
+        SurrenderCause::IdentityChanged,
+        "the identity is why it was surrendered, whatever the CLOSE said"
+    );
+
+    let closes: Vec<_> = ops
+        .seen()
+        .into_iter()
+        .filter(|(op, _)| *op == "CLOSE")
+        .collect();
+    assert_eq!(
+        closes.len(),
+        1,
+        "exactly one CLOSE, for the open the reclaim actually minted: {:?}",
+        ops.seen()
+    );
+    assert_eq!(
+        ops.seen(),
+        vec![("OPEN", 0), ("OPEN_CONFIRM", 1), ("CLOSE", 2)],
+        "and it carries the seqid the owner owed"
+    );
+}
+
+/// **F31.** A cleanup the server refuses is retained as evidence beside the
+/// identity mismatch, never reported as a clean release.
+#[test]
+fn f31_a_failed_cleanup_is_retained_beside_the_identity_change() {
+    use umbra_storage_nfs_userspace::error::Nfs4Status;
+    use umbra_storage_nfs_userspace::handle::ObjectIdentity;
+    use umbra_storage_nfs_userspace::state::reclaim::{ReclaimPlan, ReclaimTarget, SurrenderCause};
+    use umbra_storage_nfs_userspace::transport::Fsid;
+    use umbra_storage_nfs_userspace::transport::{AttrMask, ShareAccess, ShareDeny};
+
+    let mut fake = FakeTransport::new();
+    let root = fake.root();
+    fake.insert_file(&root, b"reclaimed", b"bytes".to_vec());
+    fake.set_grace(true);
+    let (handle, _) = fake
+        .lookup(&root, &name(b"reclaimed"), AttrMask::STAT, deadline())
+        .expect("resolve the target");
+
+    let mut transport = Sequenced {
+        inner: fake,
+        ops: WireOps::default(),
+        blind_identity: false,
+        refuse_close: Some(Nfs4Status::SERVERFAULT),
+    };
+
+    let report = ReclaimPlan::from_targets(vec![ReclaimTarget {
+        handle,
+        identity: ObjectIdentity {
+            fsid: Fsid {
+                major: 0xDEAD,
+                minor: 0xBEEF,
+            },
+            fileid: 0xFFFF_FFFF,
+        },
+        share_access: ShareAccess::READ,
+        share_deny: ShareDeny::NONE,
+    }])
+    .run(&mut registry(4), &mut transport, deadline());
+
+    assert_eq!(report.surrendered[0].cause, SurrenderCause::IdentityChanged);
+    let retained = report.surrendered[0]
+        .error
+        .as_ref()
+        .expect("the cleanup failure is retained as evidence");
+    assert_eq!(retained.status(), Some(Nfs4Status::SERVERFAULT));
+}

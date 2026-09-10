@@ -287,8 +287,24 @@ impl OpenOwnerRegistry {
             Ok(identity) => identity,
             Err(error) => {
                 // The open exists on the server but its identity is unproven, so
-                // nothing may be written through it. Safe-stop: the state is
-                // dropped and the server releases it when the lease expires.
+                // nothing may be written through it.
+                //
+                // **F18.** "The server releases it when the lease expires" was
+                // the old justification for simply dropping it, and it does not
+                // hold: this client goes on renewing the very lease that keeps
+                // the state alive, so the open survives for as long as the
+                // session does. The handle and the stateid the OPEN returned are
+                // both in hand, so the state is released explicitly — confirming
+                // first where the server asked for it, because an unconfirmed
+                // stateid is not one a CLOSE may carry.
+                //
+                // Best effort, and it changes nothing about the answer: the
+                // identity is still unproven, so this is still `Abandoned` and
+                // the owner is still burned. A cleanup that fails or whose
+                // outcome is unknown leaves exactly what was there before.
+                let cleanup =
+                    release_uncommittable_open(transport, &handle, &reply, &mut sequence, deadline);
+                let _ = cleanup;
                 self.burned.insert(owner.as_bytes().to_vec());
                 return OpenOutcome::Abandoned { error };
             }
@@ -334,6 +350,76 @@ impl OpenOwnerRegistry {
                 self.burned.insert(owner.as_bytes().to_vec());
                 OpenOutcome::Abandoned { error }
             }
+        }
+    }
+}
+
+/// Release an OPEN that committed on the server but cannot be carried forward
+/// (**F18**).
+///
+/// The OPEN succeeded, so the server holds open state for this owner; only the
+/// *client* has decided it is unusable. Dropping the reply leaves that state
+/// alive for as long as the client keeps renewing its lease — which it does,
+/// because the session is still running — so the open is released explicitly
+/// instead.
+///
+/// `OPEN_CONFIRM` runs first where the server asked for it: RFC 7530 §9.1.7
+/// makes an unconfirmed stateid unusable, and its reply carries the stateid the
+/// CLOSE must present. Both operations take their seqid from the owner's own
+/// sequence through the ordinary ticket discipline, so a failure resolves the
+/// seqid exactly as it would on any other path.
+///
+/// Returns the cleanup failure, if there was one, for the caller to retain. It is
+/// never promoted over the reason the open was being released: an unproven
+/// identity is what the caller answers, whatever the server said about the CLOSE.
+fn release_uncommittable_open(
+    transport: &mut dyn RawTransport,
+    handle: &FileHandle,
+    reply: &crate::transport::OpenReply,
+    sequence: &mut OwnerSequence,
+    deadline: Deadline,
+) -> Option<FacadeError> {
+    let mut stateid = reply.stateid;
+    if reply.confirm_required {
+        let ticket = match sequence.issue() {
+            Ok(ticket) => ticket,
+            Err(error) => return Some(error),
+        };
+        let seqid = ticket.seqid();
+        match transport.open_confirm(handle, stateid, seqid, deadline) {
+            Ok(confirmed) => {
+                ticket.commit();
+                stateid = confirmed;
+            }
+            Err(error) => {
+                match error.status() {
+                    Some(status) => {
+                        ticket.abort(status);
+                    }
+                    None => ticket.abandon(),
+                }
+                return Some(error);
+            }
+        }
+    }
+    let ticket = match sequence.issue() {
+        Ok(ticket) => ticket,
+        Err(error) => return Some(error),
+    };
+    let seqid = ticket.seqid();
+    match transport.close(handle, seqid, stateid, deadline) {
+        Ok(_) => {
+            ticket.commit();
+            None
+        }
+        Err(error) => {
+            match error.status() {
+                Some(status) => {
+                    ticket.abort(status);
+                }
+                None => ticket.abandon(),
+            }
+            Some(error)
         }
     }
 }
