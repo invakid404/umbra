@@ -60,8 +60,8 @@ jobs:
         run: cargo test --workspace --doc
 
       - name: Install memoria CLI
-        run: cargo install --locked --git https://github.com/viktordanov/rs-memoria --tag v0.2.0 rs-memoria
-        # Pinned to rs-memoria's v0.2.0 tag; bump on new releases.
+        run: cargo install --locked --git https://github.com/viktordanov/rs-memoria --tag v0.3.0 rs-memoria
+        # Pinned to rs-memoria's v0.3.0 tag; bump on new releases.
 
       - name: Memoria documentation gate
         run: memoria --root . check
