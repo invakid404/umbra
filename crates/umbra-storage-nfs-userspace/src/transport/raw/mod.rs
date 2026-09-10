@@ -513,6 +513,241 @@ impl Drop for LibnfsRawTransport {
 }
 
 #[cfg(test)]
+mod c_boundary {
+    //! **R3-004.** A deterministic C-boundary lifetime harness.
+    //!
+    //! The acceptance this closes is "exercise real queued specialized READ/WRITE
+    //! buffers through local poll failure and socket-disconnect callback/free
+    //! order, proving arena lifetime and no stale registration/cancellation at the
+    //! actual C boundary".
+    //!
+    //! # Why this and not ASan
+    //!
+    //! The workspace pins stable 1.98.1 (`rust-toolchain.toml`), and
+    //! `-Zsanitizer=address` is nightly-only. The review permits "an equivalent
+    //! deterministic harness with observable allocation/disposal ordering", which
+    //! is what `args::live_arenas()` provides: the arena count is the observable,
+    //! and the assertions below pin the *ordering* of C-side disposal against
+    //! Rust-side release. A sanitizer would catch a violation after the fact;
+    //! this catches the state that would cause one, before it is reachable.
+    //!
+    //! # What is real here
+    //!
+    //! A live server, a real `rpc_context`, a real specialized READ PDU carrying
+    //! its own destination buffer, and the real `rpc_disconnect` / `rpc_service`
+    //! calls. Nothing is modelled. The tests skip when no fixture is configured.
+
+    use super::*;
+    use crate::handle::FileHandle;
+    use crate::pdu::{ownership, Ownership, ServiceFailure};
+    use crate::transport::{AttrMask, ComponentName, Nfs4Op};
+
+    fn fixture() -> Option<RawTransportConfig> {
+        let target = std::env::var("UMBRA_NFS_RAW_FIXTURE").ok()?;
+        let (host, port) = target.rsplit_once(':')?;
+        let mut config = RawTransportConfig::loopback(port.parse().ok()?);
+        config.host = host.to_owned();
+        Some(config)
+    }
+
+    /// A connected pump against the live fixture, and the export root handle.
+    fn connected(config: &RawTransportConfig) -> (pump::EventPump, FileHandle) {
+        let mut pump = pump::EventPump::new(&config.host, config.port).expect("context");
+        pump.connect(config.limits.default_deadline.millis)
+            .expect("connect to the fixture");
+        // Resolve the export root through the ordinary path, so the handle the
+        // READ below uses is a real one.
+        let mut transport =
+            LibnfsRawTransport::connect(config.clone()).expect("a second transport for lookup");
+        let root = transport
+            .root_filehandle(config.limits.default_deadline)
+            .expect("PUTROOTFH; GETFH");
+        (pump, root)
+    }
+
+    /// Build a real specialized READ arena addressed at `handle`.
+    fn read_arena(handle: &FileHandle, limits: &TransportLimits) -> args::CallArena {
+        let call = Compound::new(
+            *b"r3_read",
+            vec![
+                Nfs4Op::PutFh(handle.clone()),
+                Nfs4Op::Read {
+                    stateid: crate::handle::Stateid::ANONYMOUS,
+                    offset: 0,
+                    count: 4096,
+                },
+            ],
+        );
+        args::CallArena::build(&call, limits).expect("a READ arena builds")
+    }
+
+    /// **R3-004.** A local poll failure with a *real queued PDU*: the arena stays
+    /// alive across the disposal, C is told to dispose before anything is
+    /// released, and retirement neither cancels a freed PDU nor leaves a stale
+    /// registration.
+    ///
+    /// The round-2 tests this replaces allocated an unconnected context, used an
+    /// unregistered id and had no outstanding PDU, so they exercised the branch
+    /// without exercising the thing the branch is about.
+    #[test]
+    fn r3_004_a_queued_pdu_survives_a_local_failure_without_being_cancelled() {
+        let Some(config) = fixture() else {
+            eprintln!("skipped: UMBRA_NFS_RAW_FIXTURE is unset");
+            return;
+        };
+        let (mut pump, root) = connected(&config);
+        let baseline = args::live_arenas();
+
+        // A real specialized READ, queued with libnfs holding its buffer.
+        let arena = read_arena(&root, &config.limits);
+        let mut slot = pump
+            .dispatch(arena, config.limits.max_reply_bytes)
+            .expect("the READ is queued");
+        assert!(
+            args::live_arenas() > baseline,
+            "the arena is alive while libnfs holds the PDU"
+        );
+        assert!(
+            slot.dispatch.is_queued(),
+            "libnfs owns the PDU at this point"
+        );
+        let queued_in = slot.queued_in;
+
+        // The local failure path: `poll` failed, nothing in libnfs was called yet.
+        let outcome = pump.stopped(ServiceFailure::Local, slot.id, false);
+        assert_eq!(outcome, ServiceOutcome::Disconnected);
+
+        // Ordering assertion 1: C has been told to dispose, and the arena is
+        // *still* alive. This is the ordering a use-after-free inverts.
+        assert!(
+            args::live_arenas() > baseline,
+            "the arena must outlive the disposal call, not be released before it"
+        );
+        assert!(
+            pump.disposals > queued_in,
+            "a local failure disconnects, which is what actually frees the PDUs, \
+             and only then records the disposal"
+        );
+        assert!(
+            matches!(pump.state(), ConnectionState::Broken(_)),
+            "the connection is not left usable"
+        );
+
+        // Ordering assertion 2: the slot is now known-freed, so retirement must
+        // not hand its pointer to `rpc_cancel_pdu`.
+        assert_eq!(
+            ownership(slot.queued_in, pump.disposals, false),
+            Ownership::Freed,
+            "a PDU outstanding across a proven disposal is not cancellable"
+        );
+        let drained = pump.retire(&mut slot);
+        assert!(drained, "retirement reports the call proven idle");
+        assert!(
+            !slot.dispatch.is_queued(),
+            "the pointer is unreachable after retirement, not merely unused"
+        );
+
+        // Ordering assertion 3: only dropping the slot releases the arena, and it
+        // returns to the baseline — nothing leaked and nothing was double-freed.
+        drop(slot);
+        assert_eq!(
+            args::live_arenas(),
+            baseline,
+            "the arena is released exactly once, after C was done with it"
+        );
+    }
+
+    /// **R3-004.** A real socket disconnect with a queued PDU: libnfs's own
+    /// callback/free ordering is reconciled before retirement, and the arena is
+    /// again released only after disposal is proven.
+    ///
+    /// `rpc_disconnect` is the same call `rpc_reconnect_requeue` makes on a socket
+    /// error — it errors every outstanding PDU and frees it — so this drives the
+    /// C-side ordering the R1-009 trace described, with a real queued call.
+    #[test]
+    fn r3_004_a_queued_pdu_survives_a_real_disconnect_without_being_cancelled() {
+        let Some(config) = fixture() else {
+            eprintln!("skipped: UMBRA_NFS_RAW_FIXTURE is unset");
+            return;
+        };
+        let (mut pump, root) = connected(&config);
+        let baseline = args::live_arenas();
+
+        let arena = read_arena(&root, &config.limits);
+        let mut slot = pump
+            .dispatch(arena, config.limits.max_reply_bytes)
+            .expect("the READ is queued");
+        let queued_in = slot.queued_in;
+        assert!(args::live_arenas() > baseline);
+
+        // The connection goes down under the outstanding call. libnfs errors and
+        // frees every PDU it holds, calling their completions on the way out.
+        pump.disconnect();
+        assert!(
+            pump.disposals > queued_in,
+            "the disconnect is proven disposal and is recorded as such"
+        );
+        assert!(
+            args::live_arenas() > baseline,
+            "the arena outlives the disposal: C read from it until this moment"
+        );
+
+        // Reconciliation happens before retirement: a completion delivered by the
+        // teardown is taken rather than discarded.
+        let settled = pump.stopped(ServiceFailure::LibnfsReported, slot.id, false);
+        assert!(
+            matches!(
+                settled,
+                ServiceOutcome::Completed | ServiceOutcome::Disconnected
+            ),
+            "the call settles one way or the other, never silently: {settled:?}"
+        );
+
+        let drained = pump.retire(&mut slot);
+        assert!(drained, "no callback for this call can run again");
+        assert!(
+            !slot.dispatch.is_queued(),
+            "the freed pointer is unreachable"
+        );
+        drop(slot);
+        assert_eq!(
+            args::live_arenas(),
+            baseline,
+            "released exactly once, after the disposal"
+        );
+    }
+
+    /// **R3-004.** The healthy path is unaffected: an ordinary completed call
+    /// still releases its arena, so the assertions above are not passing because
+    /// arenas simply never drop.
+    #[test]
+    fn r3_004_an_ordinary_completed_call_releases_its_arena() {
+        let Some(config) = fixture() else {
+            eprintln!("skipped: UMBRA_NFS_RAW_FIXTURE is unset");
+            return;
+        };
+        let baseline = args::live_arenas();
+        {
+            let mut transport = LibnfsRawTransport::connect(config.clone()).expect("connect");
+            let root = transport
+                .root_filehandle(config.limits.default_deadline)
+                .expect("root");
+            let _ = transport.lookup(
+                &root,
+                &ComponentName::new(b"export".to_vec()).unwrap(),
+                AttrMask::STAT,
+                config.limits.default_deadline,
+            );
+        }
+        assert_eq!(
+            args::live_arenas(),
+            baseline,
+            "ordinary calls release their arenas, so the counter is meaningful"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::{AttrMask, ComponentName, Nfs4Op};
