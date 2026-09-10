@@ -610,16 +610,38 @@ pub fn read_persisted_state(
         ));
     }
 
-    // `.provider/epoch` is the mounted adapter's little-endian u64. Absent is a
-    // legitimate state for a run this provider created before the file existed;
-    // present-but-unreadable is not.
+    // `.provider/epoch` is the mounted adapter's little-endian u64.
+    //
+    // **R2-004.** Absence used to mean `LeaseEpoch(0)`, justified by a comment
+    // about older runs written before the file existed. Nothing establishes that
+    // case: this provider's own `CreateNew` always writes the file, the mounted
+    // adapter's `open_run` does too, and the pinned run layout lists it. So an
+    // existing format-1 run without one is missing required recovery evidence,
+    // and reading that as "this run never had a writer" is the same class of
+    // inference the failure model forbids for a missing marker — it would let a
+    // run whose epoch file was deleted after a cooperative release be re-admitted
+    // at epoch 1, silently below the ladder it had already reached.
+    //
+    // Refusing is the answer. The bytes that remain are preserved for an operator.
     let epoch = match read_private_file(
         transport,
         private,
         &component(layout::EPOCH_FILE)?,
         deadline,
     )? {
-        None => LeaseEpoch(0),
+        None => {
+            return Err(UmbraError::new(
+                ErrorKind::CorruptJournal,
+                "open_run",
+                format!(
+                    "this run has a valid format-{expected_format} manifest but no \
+                     .provider/epoch; every run this provider or the mounted adapter creates \
+                     writes that file, so its absence is missing recovery evidence rather than \
+                     a run that never had a writer. The run is refused rather than admitted at \
+                     epoch 1, which could regress an epoch ladder it already reached."
+                ),
+            ))
+        }
         Some(bytes) => {
             let raw: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
                 UmbraError::new(
@@ -780,19 +802,36 @@ fn descend_within(
 
 /// Reject a pin that is not on the run's pinned filesystem (**R1-015**).
 fn within(pin: PinnedObject, filesystem: Fsid, name: &ComponentName) -> Result<PinnedObject> {
+    within_labelled(
+        pin,
+        filesystem,
+        &String::from_utf8_lossy(name.as_bytes()).into_owned(),
+        "resolve",
+    )
+}
+
+/// Reject a pin that is not on `filesystem`, naming it however the caller wants.
+///
+/// **R2-007.** The resolver was not the only place an object gets adopted:
+/// `Operations::child` (which `create_parents` walks through) and the OPEN that
+/// `WriteAt` and `Create` finish with both produce pins that never reached
+/// `resolve`. A boundary enforced on one path is not a boundary, so this is the
+/// shared check every adoption point calls.
+pub fn within_labelled(
+    pin: PinnedObject,
+    filesystem: Fsid,
+    label: &str,
+    operation: &str,
+) -> Result<PinnedObject> {
     let observed = pin.identity().fsid;
     if observed != filesystem {
         return Err(UmbraError::new(
             ErrorKind::InvalidPath,
-            "resolve",
+            operation,
             format!(
-                "{:?} is on filesystem {}:{}, not the run's {}:{}; the walk does not cross \
+                "{label:?} is on filesystem {}:{}, not the run's {}:{}; the walk does not cross \
                  into another exported filesystem",
-                String::from_utf8_lossy(name.as_bytes()),
-                observed.major,
-                observed.minor,
-                filesystem.major,
-                filesystem.minor,
+                observed.major, observed.minor, filesystem.major, filesystem.minor,
             ),
         ));
     }

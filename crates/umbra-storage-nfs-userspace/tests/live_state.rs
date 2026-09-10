@@ -1326,3 +1326,387 @@ fn action_label(action: &FaultAction) -> &'static str {
         FaultAction::DropReply => "DropReply",
     }
 }
+
+// ---------------------------------------------------------------------------
+// R2-006 — held-object coherence against a real server, with a second client
+// ---------------------------------------------------------------------------
+
+/// Create a file under `parent` with `bytes`, through `session`, and close it.
+fn seed_file(session: &mut StateSession, parent: &FileHandle, name: &[u8], bytes: &[u8]) {
+    let request = OpenRequest {
+        parent: parent.clone(),
+        name: ComponentName::new(name.to_vec()).expect("component"),
+        how: OpenHow::Guarded { mode: 0o644 },
+        share_access: ShareAccess::BOTH,
+        share_deny: ShareDeny::NONE,
+    };
+    let file = match open_waiting_out_grace(session, &request, 150_000) {
+        OpenOutcome::Opened(file) => file,
+        other => panic!(
+            "seeding {:?} did not open: {other:?}",
+            String::from_utf8_lossy(name)
+        ),
+    };
+    let stateid = file.stateid().expect("a confirmed open yields a stateid");
+    if !bytes.is_empty() {
+        let wrote = session
+            .transport()
+            .write(
+                file.handle(),
+                stateid,
+                0,
+                Stability::FileSync,
+                bytes.to_vec(),
+                deadline(),
+            )
+            .expect("seed WRITE");
+        assert_eq!(wrote.count as usize, bytes.len(), "seed write was short");
+    }
+    let (_, transport) = session.split();
+    match umbra_storage_nfs_userspace::state::open_owner::close(file, transport, deadline()) {
+        umbra_storage_nfs_userspace::state::open_owner::CloseOutcome::Closed(_) => {}
+        other => panic!("seed CLOSE did not settle: {other:?}"),
+    }
+}
+
+/// Create a directory under `parent`.
+fn make_directory(session: &mut StateSession, parent: &FileHandle, name: &[u8]) -> FileHandle {
+    use umbra_storage_nfs_userspace::transport::{AttrValues, CreateType, Nfs4Op, OpReply};
+    let reply = session
+        .transport()
+        .submit(
+            umbra_storage_nfs_userspace::transport::Compound::new(
+                *b"mkdir__",
+                vec![
+                    Nfs4Op::PutFh(parent.clone()),
+                    Nfs4Op::Create {
+                        object_type: CreateType::Directory,
+                        name: ComponentName::new(name.to_vec()).expect("component"),
+                        attributes: AttrValues {
+                            mode: Some(0o755),
+                            ..AttrValues::default()
+                        },
+                    },
+                    Nfs4Op::GetFh,
+                ],
+            ),
+            deadline(),
+        )
+        .expect("CREATE a scratch directory");
+    match reply.expect(2).expect("GETFH") {
+        OpReply::GetFh(handle) => handle.clone(),
+        other => panic!("expected a GETFH reply, got {other:?}"),
+    }
+}
+
+/// `PUTFH; REMOVE` through `session`.
+fn remove_name(session: &mut StateSession, parent: &FileHandle, name: &[u8]) {
+    use umbra_storage_nfs_userspace::transport::Nfs4Op;
+    let reply = session
+        .transport()
+        .submit(
+            umbra_storage_nfs_userspace::transport::Compound::new(
+                *b"remove_",
+                vec![
+                    Nfs4Op::PutFh(parent.clone()),
+                    Nfs4Op::Remove {
+                        name: ComponentName::new(name.to_vec()).expect("component"),
+                    },
+                ],
+            ),
+            deadline(),
+        )
+        .expect("REMOVE");
+    if let Some(error) = reply.failure {
+        panic!("REMOVE failed: {error:?}");
+    }
+}
+
+/// `PUTFH; SAVEFH; PUTFH; RENAME` through `session`, within one directory.
+fn rename_name(session: &mut StateSession, parent: &FileHandle, from: &[u8], to: &[u8]) {
+    use umbra_storage_nfs_userspace::transport::Nfs4Op;
+    let reply = session
+        .transport()
+        .submit(
+            umbra_storage_nfs_userspace::transport::Compound::new(
+                *b"rename_",
+                vec![
+                    Nfs4Op::PutFh(parent.clone()),
+                    Nfs4Op::SaveFh,
+                    Nfs4Op::PutFh(parent.clone()),
+                    Nfs4Op::Rename {
+                        old_name: ComponentName::new(from.to_vec()).expect("component"),
+                        new_name: ComponentName::new(to.to_vec()).expect("component"),
+                    },
+                ],
+            ),
+            deadline(),
+        )
+        .expect("RENAME");
+    if let Some(error) = reply.failure {
+        panic!("RENAME failed: {error:?}");
+    }
+}
+
+/// **R2-006.** Client A holds an open while an independent client B edits,
+/// truncates, renames, unlinks and replaces the name.
+///
+/// This is the acceptance the owner's criteria call for and that no test in this
+/// crate performed: `tests/operations_surface.rs` shows the same shape against
+/// `FakeTransport`, whose object table is permanent by construction, so it cannot
+/// qualify how a real server behaves for an open whose last name is gone.
+///
+/// B is a second NFSv4 client — its own client id, its own open owners — acting
+/// as an external editor. It is **not** a second admitted Umbra session: nothing
+/// here touches `Storage` or the admission marker, so one-session-one-Umbra is
+/// not being contradicted.
+#[test]
+fn r2_006_a_held_open_survives_a_second_clients_edits_renames_and_replacement() {
+    let Some(config) = fixture() else {
+        eprintln!("skipped: UMBRA_NFS_RAW_FIXTURE is unset");
+        return;
+    };
+    let (mut a, root) = live_session(&config, "r2-006-client-a");
+    let (mut b, root_b) = live_session(&config, "r2-006-client-b");
+
+    // An isolated scratch directory, so a re-run never meets its own leftovers.
+    let export = resolve(a.transport(), &root, &[b"export"]).expect("resolve /export");
+    let scratch_name = format!("r2-006-{}", uuid::Uuid::new_v4());
+    let scratch = make_directory(&mut a, &export, scratch_name.as_bytes());
+    let scratch_b = resolve(
+        b.transport(),
+        &root_b,
+        &[b"export", scratch_name.as_bytes()],
+    )
+    .expect("client B resolves the scratch directory");
+
+    const ORIGINAL: &[u8] = b"original-contents\n";
+    seed_file(&mut a, &scratch, b"held.txt", ORIGINAL);
+
+    // --- A opens and holds -------------------------------------------------
+    let held = match open_waiting_out_grace(
+        &mut a,
+        &OpenRequest {
+            parent: scratch.clone(),
+            name: ComponentName::new(b"held.txt".to_vec()).unwrap(),
+            how: OpenHow::NoCreate,
+            share_access: ShareAccess::READ,
+            share_deny: ShareDeny::NONE,
+        },
+        150_000,
+    ) {
+        OpenOutcome::Opened(file) => file,
+        other => panic!("A's OPEN did not settle: {other:?}"),
+    };
+    let stateid = held.stateid().expect("a confirmed open yields a stateid");
+    let pinned = a
+        .transport()
+        .getattr(held.handle(), AttrMask::STAT, deadline())
+        .expect("A pins the object it opened");
+    let pinned_fileid = pinned.fileid.expect("the server reports a fileid");
+    let pinned_fsid = pinned.fsid.expect("the server reports an fsid");
+
+    let read_held = |session: &mut StateSession| -> Vec<u8> {
+        session
+            .transport()
+            .read(held.handle(), stateid, 0, 4096, deadline())
+            .expect("READ through A's held open")
+            .data
+    };
+    assert_eq!(read_held(&mut a), ORIGINAL);
+
+    // --- B edits in place --------------------------------------------------
+    const EDITED: &[u8] = b"edited-by-client-b\n";
+    let b_open = match open_waiting_out_grace(
+        &mut b,
+        &OpenRequest {
+            parent: scratch_b.clone(),
+            name: ComponentName::new(b"held.txt".to_vec()).unwrap(),
+            how: OpenHow::NoCreate,
+            share_access: ShareAccess::WRITE,
+            share_deny: ShareDeny::NONE,
+        },
+        150_000,
+    ) {
+        OpenOutcome::Opened(file) => file,
+        other => panic!("B's OPEN did not settle: {other:?}"),
+    };
+    let b_stateid = b_open.stateid().expect("B's open yields a stateid");
+    b.transport()
+        .write(
+            b_open.handle(),
+            b_stateid,
+            0,
+            Stability::FileSync,
+            EDITED.to_vec(),
+            deadline(),
+        )
+        .expect("B writes in place");
+
+    let after_edit = read_held(&mut a);
+    assert_eq!(
+        &after_edit[..EDITED.len()],
+        EDITED,
+        "A's held open must see B's in-place edit; the handle addresses the object, not a snapshot"
+    );
+
+    // --- B truncates -------------------------------------------------------
+    {
+        use umbra_storage_nfs_userspace::transport::{AttrValues, Nfs4Op};
+        let reply = b
+            .transport()
+            .submit(
+                umbra_storage_nfs_userspace::transport::Compound::new(
+                    *b"trunc__",
+                    vec![
+                        Nfs4Op::PutFh(b_open.handle().clone()),
+                        Nfs4Op::SetAttr {
+                            stateid: b_stateid,
+                            attributes: AttrValues {
+                                size: Some(4),
+                                ..AttrValues::default()
+                            },
+                        },
+                    ],
+                ),
+                deadline(),
+            )
+            .expect("B truncates");
+        if let Some(error) = reply.failure {
+            panic!("SETATTR size failed: {error:?}");
+        }
+    }
+    assert_eq!(
+        read_held(&mut a).len(),
+        4,
+        "A's held open must see B's truncation"
+    );
+
+    // --- B renames the name A opened ---------------------------------------
+    rename_name(&mut b, &scratch_b, b"held.txt", b"moved.txt");
+    let after_rename = a
+        .transport()
+        .getattr(held.handle(), AttrMask::STAT, deadline())
+        .expect("A's handle still resolves after a rename");
+    assert_eq!(
+        after_rename.fileid.expect("fileid"),
+        pinned_fileid,
+        "a rename moves a name, not an object: A's handle keeps its identity"
+    );
+    assert_eq!(after_rename.fsid.expect("fsid"), pinned_fsid);
+    assert_eq!(read_held(&mut a).len(), 4, "and still reads");
+
+    // --- B replaces the original name with a different object --------------
+    const REPLACEMENT: &[u8] = b"a-different-object\n";
+    seed_file(&mut b, &scratch_b, b"held.txt", REPLACEMENT);
+    let replacement = a
+        .transport()
+        .lookup(
+            &scratch,
+            &ComponentName::new(b"held.txt".to_vec()).unwrap(),
+            AttrMask::STAT,
+            deadline(),
+        )
+        .expect("a fresh lookup finds the replacement");
+    assert_ne!(
+        replacement.1.fileid.expect("fileid"),
+        pinned_fileid,
+        "the replacement is a different object"
+    );
+    assert_eq!(
+        read_held(&mut a).len(),
+        4,
+        "A's held open still addresses the original object, not the replacement"
+    );
+
+    // A fresh open by A sees the replacement's bytes.
+    {
+        let fresh = match open_waiting_out_grace(
+            &mut a,
+            &OpenRequest {
+                parent: scratch.clone(),
+                name: ComponentName::new(b"held.txt".to_vec()).unwrap(),
+                how: OpenHow::NoCreate,
+                share_access: ShareAccess::READ,
+                share_deny: ShareDeny::NONE,
+            },
+            150_000,
+        ) {
+            OpenOutcome::Opened(file) => file,
+            other => panic!("A's fresh OPEN did not settle: {other:?}"),
+        };
+        let fresh_stateid = fresh.stateid().expect("stateid");
+        let bytes = a
+            .transport()
+            .read(fresh.handle(), fresh_stateid, 0, 4096, deadline())
+            .expect("read the replacement")
+            .data;
+        assert_eq!(bytes, REPLACEMENT, "a fresh open reads the replacement");
+        let (_, transport) = a.split();
+        let _ = umbra_storage_nfs_userspace::state::open_owner::close(fresh, transport, deadline());
+    }
+
+    // --- B unlinks the renamed name: A's open outlives the last name --------
+    remove_name(&mut b, &scratch_b, b"moved.txt");
+    let orphaned = read_held(&mut a);
+    assert_eq!(
+        orphaned.len(),
+        4,
+        "A's open must still read after B removed the object's last name"
+    );
+    let orphan_attrs = a
+        .transport()
+        .getattr(held.handle(), AttrMask::STAT, deadline())
+        .expect("an unlinked-but-open object still answers GETATTR");
+    assert_eq!(
+        orphan_attrs.fileid.expect("fileid"),
+        pinned_fileid,
+        "and it is still the same object"
+    );
+
+    // --- listing shows the replacement, not the removed name ----------------
+    let page = a
+        .transport()
+        .readdir(
+            &scratch,
+            ReadDirRequest {
+                cookie: DirCookie(0),
+                verifier: DirVerifier([0; 8]),
+                dir_count: 4096,
+                max_count: 4096,
+                attrs: AttrMask::STAT,
+            },
+            deadline(),
+        )
+        .expect("list the scratch directory");
+    let names: Vec<Vec<u8>> = page
+        .entries
+        .iter()
+        .map(|e| e.name.as_bytes().to_vec())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == b"held.txt"),
+        "the replacement's name is listed, saw {:?}",
+        names
+            .iter()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !names.iter().any(|n| n == b"moved.txt"),
+        "the removed name is gone from the listing"
+    );
+
+    // --- CLOSE settles the retention ---------------------------------------
+    let (_, transport) = b.split();
+    let _ = umbra_storage_nfs_userspace::state::open_owner::close(b_open, transport, deadline());
+    let (_, transport) = a.split();
+    match umbra_storage_nfs_userspace::state::open_owner::close(held, transport, deadline()) {
+        umbra_storage_nfs_userspace::state::open_owner::CloseOutcome::Closed(_) => {}
+        other => panic!("A's CLOSE did not settle: {other:?}"),
+    }
+    eprintln!(
+        "r2-006: held open survived edit, truncate, rename, replacement and unlink; \
+         fileid {pinned_fileid} stable throughout"
+    );
+}

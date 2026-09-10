@@ -33,6 +33,7 @@ use umbra_core::{
 use crate::anchor::{Anchor, HandleMint, RunAnchors, Target};
 use crate::capability::{operation_name, storage_support, Support};
 use crate::crud::{read_anonymous, CreateDisposition, MutationIdentity, OpenObject, WriteAt};
+use crate::handle::ObjectIdentity;
 use crate::identity::PinnedObject;
 use crate::namespace::{
     apply as apply_namespace, NamespaceDispatcher, NamespaceMutation, NamespaceOutcome, RemoveKind,
@@ -236,14 +237,21 @@ impl Operations {
         }
     }
 
-    /// Execute one contract primitive.
-    pub fn execute(
-        &self,
-        context: &mut OpsContext<'_>,
-        request: &StorageRequest,
-    ) -> Result<StorageResponse> {
+    /// Everything that must hold before a request may have *any* effect.
+    ///
+    /// **R2-002.** These checks used to live at the top of [`Self::execute`],
+    /// which the provider reaches only *after* the durable retry journal has
+    /// created and written its index and intent records. A request naming another
+    /// run, a mutation on a read-only run, an unsupported operation and an
+    /// oversized request therefore all left private records behind before being
+    /// refused. Splitting them out lets the provider run them first, against the
+    /// same surface, without duplicating the rules.
+    ///
+    /// Ordering inside is deliberate: bounds and the writer-epoch requirement,
+    /// then "this run takes no mutations at all", then run identity, then
+    /// capability support.
+    pub fn preflight(&self, request: &StorageRequest) -> Result<()> {
         let operation = operation_name(&request.operation);
-        let support = storage_support(&request.operation);
         // The same preflight direct callers and helper callers get: I/O bounds,
         // page limits and the writer-epoch requirement for mutations.
         umbra_storage::validate_request(&self.capabilities(), request)?;
@@ -275,9 +283,93 @@ impl Operations {
         // Anything this provider will never offer stops here, before any effect.
         // A deferred operation falls through to its handler, which reports the
         // contracts gap by name when no dispatcher is bound.
+        let support = storage_support(&request.operation);
         if matches!(support, Support::Unsupported { .. }) {
-            return support.refuse(operation);
+            let refused: Result<StorageResponse> = support.refuse(operation);
+            return refused.map(|_| ());
         }
+        Ok(())
+    }
+
+    /// Observe the state a mutation is about to be dispatched against.
+    ///
+    /// **R2-003.** This is the "object/parent identities and preconditions"
+    /// evidence the failure model requires a record to carry. Absence is an
+    /// answer, not a failure: a create's target is expected to be missing, and
+    /// recording that is exactly what lets a recovery tell "the create landed"
+    /// from "the create never ran".
+    ///
+    /// Resolution failures other than absence are propagated, because observing
+    /// nothing is not the same as observing an absence.
+    pub fn observe(
+        &self,
+        context: &mut OpsContext<'_>,
+        request: &StorageRequest,
+    ) -> Result<crate::journal::Preconditions> {
+        let operation = operation_name(&request.operation);
+        let primary = primary_path(&request.operation);
+        let (parent, target) = match primary {
+            None => (None, None),
+            Some(path) => self.observe_one(context, path, operation)?,
+        };
+        let (destination_parent, destination) = match &request.operation {
+            StorageOperation::Rename { destination, .. } => {
+                self.observe_one(context, destination, operation)?
+            }
+            _ => (None, None),
+        };
+        Ok(crate::journal::Preconditions {
+            parent,
+            target,
+            destination_parent,
+            destination,
+        })
+    }
+
+    /// The parent's identity and the final component's, if it exists.
+    fn observe_one(
+        &self,
+        context: &mut OpsContext<'_>,
+        path: &StoragePath,
+        operation: &str,
+    ) -> Result<(Option<ObjectIdentity>, Option<ObjectIdentity>)> {
+        match self
+            .anchors
+            .resolve_parent(context.transport, path, context.deadline)
+        {
+            Ok(Target::Anchor(pin)) => Ok((None, Some(pin.identity()))),
+            Ok(Target::Named { parent, name }) => {
+                let parent_identity = parent.identity();
+                match self.child(context, &parent, &name, operation) {
+                    Ok(pinned) => Ok((Some(parent_identity), Some(pinned.identity()))),
+                    // Absent is the observation, not a failure.
+                    Err(error) if error.kind == ErrorKind::NotFound => {
+                        Ok((Some(parent_identity), None))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            // The parent itself does not resolve. That is a real failure for a
+            // mutation, and the preflight or the dispatch will report it; there
+            // is simply nothing to record.
+            Err(error) if error.kind == ErrorKind::NotFound => Ok((None, None)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Execute one contract primitive.
+    pub fn execute(
+        &self,
+        context: &mut OpsContext<'_>,
+        request: &StorageRequest,
+    ) -> Result<StorageResponse> {
+        let operation = operation_name(&request.operation);
+        // Re-run even though `NfsUserspaceStorage::execute` already ran it before
+        // touching the journal (R2-002). This is the seam a direct caller reaches
+        // without a provider, so it validates for itself rather than trusting that
+        // somebody upstream did.
+        self.preflight(request)?;
+        let support = storage_support(&request.operation);
         match &request.operation {
             StorageOperation::Lookup { path } => {
                 let object = self.resolve(context, path)?;
@@ -438,7 +530,24 @@ impl Operations {
             .transport
             .lookup(parent.handle(), name, AttrMask::STAT, context.deadline)
             .map_err(|error| error.to_umbra(operation))?;
-        PinnedObject::adopt(handle, &attributes).map_err(|error| error.to_umbra(operation))
+        let pinned =
+            PinnedObject::adopt(handle, &attributes).map_err(|error| error.to_umbra(operation))?;
+        // R2-007: this is the lookup `create_parents` walks through and `rename`
+        // pins its source with. Without the boundary check here, an existing
+        // directory on another exported filesystem became the next parent and
+        // CREATE ran beneath it.
+        self.within(pinned, &String::from_utf8_lossy(name.as_bytes()), operation)
+    }
+
+    /// Reject an object that is not on the run's pinned filesystem (**R2-007**).
+    ///
+    /// Every place this crate adopts a `PinnedObject` in an operation path goes
+    /// through here. `RunAnchors::resolve` enforced the boundary on its own walk,
+    /// but `create_parents` walks with [`Self::child`] and the create/write paths
+    /// finish with an OPEN, so an object on a nested exported filesystem could
+    /// still become a parent or a write target without ever passing the resolver.
+    fn within(&self, pinned: PinnedObject, label: &str, operation: &str) -> Result<PinnedObject> {
+        crate::anchor::within_labelled(pinned, self.anchors.filesystem(), label, operation)
     }
 
     fn stat(&self, context: &mut OpsContext<'_>, object: &PinnedObject) -> Result<BlobStat> {
@@ -489,6 +598,20 @@ impl Operations {
             deadline,
         )
         .map_err(|error| error.to_umbra(operation))?;
+        // R2-007: the OPEN result is the object this write lands on, and it never
+        // passed the resolver's boundary check — `parent_and_name` checks the
+        // parent, not the final component. An object on another exported
+        // filesystem must not be written through.
+        {
+            let pinned = PinnedObject::pin(&mut **transport, open.handle().clone(), deadline)
+                .map_err(|error| error.to_umbra(operation))?;
+            if let Err(error) =
+                self.within(pinned, &String::from_utf8_lossy(name.as_bytes()), operation)
+            {
+                let _ = open.close(&mut **transport, deadline);
+                return Err(error);
+            }
+        }
         // `UNSTABLE`, because a durability receipt is the only thing entitled to
         // claim persistence and this provider issues none. The verifier is
         // recorded against the idempotency key, so whichever node eventually
@@ -504,8 +627,8 @@ impl Operations {
             },
             deadline,
         );
-        let count = match written {
-            Ok(ticket) => ticket.count(),
+        let ticket = match written {
+            Ok(ticket) => ticket,
             Err(error) => {
                 // The write failed; the open still has to go, but its own failure
                 // must not replace the one the caller needs to see.
@@ -513,6 +636,24 @@ impl Operations {
                 return Err(error.to_umbra(operation));
             }
         };
+        let count = ticket.count();
+
+        // R2-003: the write is committed and its verifier compared before the
+        // open is released. Previously the ticket's count was taken and the
+        // ticket dropped, so nothing on the public path ever observed whether the
+        // server kept the bytes: an `UNSTABLE` write is durable only once a
+        // `COMMIT` returns the verifier the `WRITE` did, and a changed verifier
+        // means the server lost them and they must be rewritten from the retained
+        // payload — which the durable journal now holds.
+        //
+        // This is not a durability claim. `Durability::None` and the `flush` gate
+        // are unchanged: committing observes what the *server* did with the bytes,
+        // it does not qualify a persistence boundary underneath it.
+        let committed = open.commit(&mut **transport, &**replay, &ticket, deadline);
+        if let Err(error) = committed {
+            let _ = open.close(&mut **transport, deadline);
+            return Err(error.to_umbra(operation));
+        }
         release(open, &mut **transport, deadline, operation)?;
         Ok(StorageResponse::WriteAt(count))
     }
@@ -553,6 +694,12 @@ impl Operations {
             .map_err(|error| error.to_umbra(operation))?;
             let created = PinnedObject::pin(&mut **transport, open.handle().clone(), deadline)
                 .map_err(|error| error.to_umbra(operation))?;
+            // R2-007: the OPEN's own result, which never passed the resolver.
+            let created = self.within(
+                created,
+                &String::from_utf8_lossy(name.as_bytes()),
+                operation,
+            )?;
             (open, created, was_exclusive)
         };
 
@@ -620,6 +767,7 @@ impl Operations {
         };
         let created = PinnedObject::pin(context.transport, effect.handle, context.deadline)
             .map_err(|error| error.to_umbra(operation))?;
+        let created = self.within(created, "the created directory", operation)?;
         Ok(StorageResponse::Created(
             self.object_result(context, &created)?,
         ))
@@ -674,6 +822,7 @@ impl Operations {
                     let pinned =
                         PinnedObject::pin(context.transport, effect.handle, context.deadline)
                             .map_err(|error| error.to_umbra(operation))?;
+                    let pinned = self.within(pinned, &String::from_utf8_lossy(raw), operation)?;
                     created = Some(pinned.clone());
                     pinned
                 }
@@ -762,6 +911,7 @@ impl Operations {
         };
         let moved = PinnedObject::pin(context.transport, effect.handle, context.deadline)
             .map_err(|error| error.to_umbra(operation))?;
+        let moved = self.within(moved, "the renamed object", operation)?;
         Ok(StorageResponse::Renamed(
             self.object_result(context, &moved)?,
         ))
@@ -934,6 +1084,21 @@ fn release(
         CloseOutcome::Rejected { error, .. } | CloseOutcome::Abandoned { error } => {
             Err(error.to_umbra(operation))
         }
+    }
+}
+
+/// The path a mutation's primary effect lands on, when it has one.
+fn primary_path(operation: &StorageOperation) -> Option<&StoragePath> {
+    match operation {
+        StorageOperation::Create { path, .. }
+        | StorageOperation::CreateParents { path, .. }
+        | StorageOperation::Unlink { path }
+        | StorageOperation::RemoveDirectory { path }
+        | StorageOperation::SetMetadata { path, .. }
+        | StorageOperation::Truncate { path, .. }
+        | StorageOperation::WriteAt { path, .. } => Some(path),
+        StorageOperation::Rename { source, .. } => Some(source),
+        _ => None,
     }
 }
 

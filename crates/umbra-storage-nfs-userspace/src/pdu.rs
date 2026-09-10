@@ -64,6 +64,46 @@ impl DisposalGeneration {
     }
 }
 
+/// Why a bounded service run stopped, and whether C provably disposed of its PDUs.
+///
+/// **R2-005.** The two are not the same fact, and conflating them is a
+/// memory-safety bug in either direction. Recording a disposal that did not
+/// happen makes the wrapper drop an argument arena libnfs is still reading from;
+/// failing to record one that did happen makes it hand a freed pointer to
+/// `rpc_cancel_pdu`. Only libnfs can tell us which, so the discriminator is which
+/// call reported the failure — not how bad the failure looked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceFailure {
+    /// libnfs reported it: `rpc_service` returned a negative value.
+    ///
+    /// On that path `rpc_reconnect_requeue` has already run, and with
+    /// `auto_reconnect` off it invoked every outstanding call's completion and
+    /// then freed each PDU (`lib/init.c`). Disposal is proven.
+    LibnfsReported,
+    /// The failure is local to this process: `poll` returned an error, or the
+    /// context has no descriptor.
+    ///
+    /// Nothing about C's ownership follows. `rpc_service`, `rpc_disconnect` and
+    /// `rpc_cancel_pdu` were not called, so every PDU is still C-owned and every
+    /// argument arena is still referenced by one.
+    Local,
+}
+
+impl ServiceFailure {
+    /// Whether libnfs has provably freed every outstanding PDU.
+    ///
+    /// A caller that gets `false` must not advance the disposal generation on
+    /// this fact alone: it either cancels while the PDU is still live, or makes
+    /// disposal true by disconnecting explicitly, and records it then.
+    #[must_use]
+    pub fn disposed_pdus(self) -> bool {
+        match self {
+            Self::LibnfsReported => true,
+            Self::Local => false,
+        }
+    }
+}
+
 /// Who owns a dispatched call's PDU right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ownership {
@@ -158,6 +198,55 @@ mod tests {
         // A call dispatched after the disposal is on the new generation and is
         // cancellable again.
         assert_eq!(ownership(after, after, false), Ownership::Cancellable);
+    }
+
+    /// **R2-005.** A local failure proves nothing about C's ownership.
+    ///
+    /// The regression treated a `poll()` error exactly like a negative
+    /// `rpc_service`: it advanced the disposal generation, so `retire` declared
+    /// the PDU freed, withdrew the registration without cancelling, and let the
+    /// slot — and the argument arena libnfs was still reading from — be dropped
+    /// while C still owned the PDU.
+    #[test]
+    fn r2_005_only_a_libnfs_reported_failure_proves_disposal() {
+        assert!(
+            ServiceFailure::LibnfsReported.disposed_pdus(),
+            "rpc_service returning negative means requeue already errored and freed every PDU"
+        );
+        assert!(
+            !ServiceFailure::Local.disposed_pdus(),
+            "a poll error or a missing descriptor calls nothing in libnfs, so nothing is freed"
+        );
+    }
+
+    /// **R2-005.** A call outstanding across a *local* failure is still
+    /// cancellable, which is what keeps its arena alive until C is done.
+    #[test]
+    fn r2_005_a_local_failure_leaves_the_pdu_cancellable() {
+        let generation = DisposalGeneration::START;
+        // A local failure does not advance the generation on its own.
+        let after_local = if ServiceFailure::Local.disposed_pdus() {
+            generation.disposed()
+        } else {
+            generation
+        };
+        assert_eq!(after_local, generation);
+        assert_eq!(
+            ownership(generation, after_local, false),
+            Ownership::Cancellable,
+            "the PDU is still C-owned, so it must be cancelled rather than abandoned"
+        );
+
+        // A libnfs-reported failure does advance it, and then it must not be.
+        let after_reported = if ServiceFailure::LibnfsReported.disposed_pdus() {
+            generation.disposed()
+        } else {
+            generation
+        };
+        assert_eq!(
+            ownership(generation, after_reported, false),
+            Ownership::Freed
+        );
     }
 
     /// A second disposal does not resurrect anything.
