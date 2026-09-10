@@ -533,6 +533,36 @@ impl NfsUserspaceStorage {
         }
     }
 
+    /// Reject a mutation whose writer epoch is not the admitted one (**R1-003**).
+    ///
+    /// A stale epoch is a request authorised by an admission this provider no
+    /// longer holds; a forged one is a request authorised by an admission that
+    /// never existed. Neither may reach a dispatch path.
+    fn check_presented_epoch(&self, operation: &str, context: &RequestContext) -> Result<()> {
+        let Some(session) = self.session.as_ref() else {
+            return Err(UmbraError::new(
+                ErrorKind::LeaseLost,
+                operation,
+                "no admission is held; a mutation cannot be authorised",
+            ));
+        };
+        let current = session.admitted().epoch();
+        match context.writer_epoch {
+            Some(presented) if presented == current => Ok(()),
+            Some(presented) => Err(crate::error::FacadeError::Authority(
+                crate::error::AuthorityError::StaleEpoch {
+                    held: presented,
+                    current,
+                },
+            )
+            .to_umbra(operation)),
+            None => Err(crate::error::FacadeError::Authority(
+                crate::error::AuthorityError::NoWriterEpoch,
+            )
+            .to_umbra(operation)),
+        }
+    }
+
     /// Record a call whose server-side effect this provider cannot rule out.
     ///
     /// **R1-002.** Only failures that leave the request possibly *received* count.
@@ -701,6 +731,11 @@ impl Storage for NfsUserspaceStorage {
         let deadline = self.config.deadline;
         let serial = self.serial;
         let config = self.config.clone();
+        // A newly admitted run starts with no lost authority and nothing
+        // outstanding. `close_run` clears both as well; doing it here too means a
+        // run that is opened after a failed close cannot inherit the old verdict.
+        self.authority_loss = None;
+        self.unsettled.clear();
         let transport = self.transport.as_deref_mut().ok_or_else(|| {
             UmbraError::new(
                 ErrorKind::StorageUnavailable,
@@ -875,6 +910,14 @@ impl Storage for NfsUserspaceStorage {
 
     fn execute(&mut self, request: &StorageRequest) -> Result<StorageResponse> {
         let operation = crate::capability::operation_name(&request.operation);
+        // R1-003: the admitted epoch lives on the session, so the check that a
+        // request presents the epoch this provider actually holds belongs here.
+        // Neither `umbra_storage::validate_request` (which only asks that *some*
+        // epoch is present) nor `MutationIdentity::from_context` (which accepts
+        // whatever it is handed) compares it against the admission.
+        if request.operation.is_mutation() {
+            self.check_presented_epoch(operation, &request.context)?;
+        }
         let outcome = {
             let (operations, mut context) = self.request(
                 operation,
@@ -915,6 +958,12 @@ impl Storage for NfsUserspaceStorage {
             self.release("close_run", deadline)?;
         }
         self.operations = None;
+        // The run is gone, and with it everything that was true only of that run:
+        // the authority latch (R1-002) and the unsettled-call ledger both belong
+        // to the closed run, not to the provider. Carrying either into the next
+        // `open_run` would refuse a fresh, properly admitted run.
+        self.authority_loss = None;
+        self.unsettled.clear();
         // Every handle this session issued carries its serial, which `open_run`
         // has already advanced, so all of them are now rejected on presentation.
         // A close never implies a flush.

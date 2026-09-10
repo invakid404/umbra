@@ -26,7 +26,7 @@
 use umbra_core::{
     BlobStat, CreateKind, DirectoryPage, Durability, ErrorKind, Fencing, ListCursor, ObjectResult,
     OpenRunRequest, RenameMode, Result, RunBinding, RunId, StorageAnchor, StorageCapabilities,
-    StorageOperation, StoragePath, StorageRequest, StorageResponse, UmbraError,
+    StorageOperation, StoragePath, StoragePolicy, StorageRequest, StorageResponse, UmbraError,
     MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
 };
 
@@ -106,6 +106,12 @@ pub struct Operations {
     anchors: RunAnchors,
     mint: HandleMint,
     limits: OperationLimits,
+    /// The policy the run was opened under.
+    ///
+    /// **R1-003.** `open` used to validate `format_version` and drop the rest, so
+    /// a read-only run mutated and an unsupported durability requirement was
+    /// silently accepted. Keeping it is what lets `execute` answer for it.
+    policy: StoragePolicy,
 }
 
 impl Operations {
@@ -121,6 +127,26 @@ impl Operations {
         serial: u64,
         deadline: Deadline,
     ) -> Result<Self> {
+        // R1-003: every unsupported requirement is refused *before* the run is
+        // touched, so a caller that asked for a guarantee this provider does not
+        // offer gets a refusal rather than a run that silently ignores it. The
+        // mounted adapter refuses the same two at
+        // `crates/umbra-storage-nfs/src/lib.rs`; a userspace run that accepted
+        // them would be advertising a durability boundary it never qualified.
+        if request.policy.require_kernel_shadow {
+            return Err(UmbraError::new(
+                ErrorKind::UnsupportedCapability,
+                "open_run",
+                "this provider has no kernel-visible shadow: it speaks NFSv4 itself and                  publishes no physical path",
+            ));
+        }
+        if request.policy.require_strict_remote_persistence {
+            return Err(UmbraError::new(
+                ErrorKind::UnsupportedCapability,
+                "open_run",
+                "strict remote persistence is not qualified by this provider; it advertises                  Durability::None and must not accept a run that requires more",
+            ));
+        }
         if request.policy.format_version != crate::storage::FORMAT_VERSION {
             return Err(UmbraError::new(
                 ErrorKind::ProtocolMismatch,
@@ -132,6 +158,13 @@ impl Operations {
                 ),
             ));
         }
+        if request.policy.read_only && request.intent == umbra_core::OpenRunIntent::CreateNew {
+            return Err(UmbraError::new(
+                ErrorKind::Denied,
+                "open_run",
+                "a read-only run cannot be created: creation is itself a mutation",
+            ));
+        }
         let anchors =
             RunAnchors::open(transport, config, request.run_id, request.intent, deadline)?;
         Ok(Self {
@@ -139,7 +172,13 @@ impl Operations {
             anchors,
             mint: HandleMint::for_session(request.run_id, serial),
             limits: OperationLimits::from_transport(transport),
+            policy: request.policy.clone(),
         })
+    }
+
+    /// The policy this run was opened under.
+    pub fn policy(&self) -> &StoragePolicy {
+        &self.policy
     }
 
     /// The run identity this surface is bound to.
@@ -208,6 +247,31 @@ impl Operations {
         // The same preflight direct callers and helper callers get: I/O bounds,
         // page limits and the writer-epoch requirement for mutations.
         umbra_storage::validate_request(&self.capabilities(), request)?;
+        // R1-003: `validate_request` deliberately leaves run-policy enforcement to
+        // the backend, so a read-only run mutated freely. Refused here, before any
+        // effect and before the run identity check, because "this run does not
+        // take mutations at all" is the broader answer.
+        if self.policy.read_only && request.operation.is_mutation() {
+            return Err(UmbraError::new(
+                ErrorKind::Denied,
+                operation,
+                "this run was opened read-only; it does not accept mutations",
+            ));
+        }
+        // R1-003: the request must name the run this surface is bound to. Nothing
+        // upstream checks it: `validate_request` only requires that *some* writer
+        // epoch is present, and `MutationIdentity::from_context` accepts whatever
+        // run and epoch it is handed.
+        if request.context.run_id != self.run_id {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidInput,
+                operation,
+                format!(
+                    "the request names run {}, but this surface is bound to run {}",
+                    request.context.run_id.0, self.run_id.0
+                ),
+            ));
+        }
         // Anything this provider will never offer stops here, before any effect.
         // A deferred operation falls through to its handler, which reports the
         // contracts gap by name when no dispatcher is bound.

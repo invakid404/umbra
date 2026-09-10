@@ -126,12 +126,23 @@ fn open_existing(run_id: RunId) -> OpenRunRequest {
     }
 }
 
-fn context(key: &str) -> RequestContext {
+/// A request context naming the run and epoch the provider actually holds.
+///
+/// **R1-003.** This used to hand every operation `RunId::nil()` and a hardcoded
+/// epoch 1, and the green mutation cases were therefore evidence that a
+/// mismatched run and an unchecked epoch were *accepted*. The context is now
+/// derived from the open admission, so a case that mutates is a case that
+/// presented the run's own identity.
+fn context(storage: &NfsUserspaceStorage, key: &str) -> RequestContext {
+    let admitted = storage
+        .admission()
+        .expect("a run is open on this provider")
+        .admitted();
     RequestContext {
-        run_id: RunId(Uuid::nil()),
+        run_id: admitted.run(),
         operation_id: OperationId(Uuid::new_v4()),
         idempotency_key: IdempotencyKey(key.into()),
-        writer_epoch: Some(umbra_core::LeaseEpoch(1)),
+        writer_epoch: Some(admitted.epoch()),
     }
 }
 
@@ -144,11 +155,12 @@ fn run(
     key: &str,
     operation: StorageOperation,
 ) -> StorageResponse {
+    let request = StorageRequest {
+        context: context(storage, key),
+        operation,
+    };
     storage
-        .execute(&StorageRequest {
-            context: context(key),
-            operation,
-        })
+        .execute(&request)
         .unwrap_or_else(|error| panic!("{key}: {error:?}"))
 }
 
@@ -400,7 +412,7 @@ fn the_namespace_mutations_the_hotfix_added_run_end_to_end() {
         assert_eq!(
             storage
                 .execute(&StorageRequest {
-                    context: context("stat-gone"),
+                    context: context(&storage, "stat-gone"),
                     operation: StorageOperation::Stat {
                         path: path("before")
                     },
@@ -473,7 +485,7 @@ fn the_namespace_mutations_the_hotfix_added_run_end_to_end() {
             assert_eq!(
                 storage
                     .execute(&StorageRequest {
-                        context: context("stat-removed"),
+                        context: context(&storage, "stat-removed"),
                         operation: StorageOperation::Stat { path: path(gone) },
                     })
                     .unwrap_err()
@@ -522,7 +534,7 @@ fn unlinking_a_directory_and_rmdir_of_a_file_are_both_refused() {
         assert!(
             storage
                 .execute(&StorageRequest {
-                    context: context("unlink-dir"),
+                    context: context(&storage, "unlink-dir"),
                     operation: StorageOperation::Unlink { path: path("d") },
                 })
                 .is_err(),
@@ -530,7 +542,7 @@ fn unlinking_a_directory_and_rmdir_of_a_file_are_both_refused() {
         );
         assert!(storage
             .execute(&StorageRequest {
-                context: context("rmdir-file"),
+                context: context(&storage, "rmdir-file"),
                 operation: StorageOperation::RemoveDirectory { path: path("f") },
             })
             .is_err());
@@ -587,7 +599,7 @@ fn an_open_run_claims_no_durability_no_fencing_and_no_physical_path() {
         assert_eq!(
             storage
                 .flush(&umbra_core::FlushRequest {
-                    context: context("flush"),
+                    context: context(&storage, "flush"),
                     scope: umbra_core::FlushScope::Data {
                         objects: Vec::new()
                     },

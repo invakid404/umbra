@@ -291,3 +291,189 @@ fn r1_002_an_unsettled_call_blocks_a_clean_release() {
         "a refused release retains admission"
     );
 }
+
+// --- R1-003: request authority and run policy are validated ------------------
+
+/// **R1-003.** A mutation naming a different run than the one this surface is
+/// bound to is refused before any effect.
+///
+/// Pre-fix nothing compared `RequestContext::run_id` to the open run:
+/// `umbra_storage::validate_request` explicitly leaves bound-run checks to the
+/// backend, and `MutationIdentity::from_context` accepted whatever run it was
+/// handed. The shipped conformance suite passed `RunId::nil()` for every
+/// operation and every mutation still succeeded.
+#[test]
+fn r1_003_a_mutation_naming_another_run_is_refused() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    let mut wrong = authorised(&storage, run_id, "wrong-run");
+    wrong.run_id = RunId(Uuid::nil());
+    let refused = storage
+        .execute(&create_file(wrong, b"wrong-run.txt"))
+        .expect_err("a request naming another run must not mutate this one");
+    assert_eq!(refused.kind, ErrorKind::InvalidInput);
+    assert!(
+        refused.context.contains("bound to run"),
+        "the refusal must name the binding: {}",
+        refused.context
+    );
+
+    // Nothing was created: the refusal came before any effect.
+    let missing = storage
+        .execute(&StorageRequest {
+            context: RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("probe".into()),
+                writer_epoch: None,
+            },
+            operation: StorageOperation::Stat {
+                path: path(b"wrong-run.txt"),
+            },
+        })
+        .expect_err("the refused create left nothing behind");
+    assert_eq!(missing.kind, ErrorKind::NotFound);
+}
+
+/// **R1-003.** A mutation presenting an epoch this provider does not hold is
+/// refused, whether the epoch is stale or invented.
+#[test]
+fn r1_003_a_stale_or_forged_writer_epoch_is_refused() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    let held = storage.admission().expect("admitted").admitted().epoch();
+    assert_eq!(held.0, 1, "a created run is admitted at epoch 1");
+
+    for (label, epoch) in [("stale", 0u64), ("forged", 99u64)] {
+        let mut context = authorised(&storage, run_id, label);
+        context.writer_epoch = Some(umbra_core::LeaseEpoch(epoch));
+        let refused = storage
+            .execute(&create_file(context, format!("{label}.txt").as_bytes()))
+            .unwrap_err();
+        assert_eq!(
+            refused.kind,
+            ErrorKind::LeaseLost,
+            "{label} epoch {epoch} must be refused"
+        );
+        assert!(
+            refused.context.contains("stale writer epoch"),
+            "{label}: the refusal must name the epoch mismatch: {}",
+            refused.context
+        );
+    }
+}
+
+/// **R1-003.** A run opened read-only refuses mutations.
+///
+/// Pre-fix `Operations::open` checked only `format_version` and dropped the rest
+/// of the policy, so an opened read-only run mutated exactly like a writable one.
+#[test]
+fn r1_003_a_read_only_run_refuses_mutations() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    // Create it writable first, then reopen the same run read-only.
+    storage.open_run(&create_run(run_id)).expect("create");
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "seed"),
+            b"seed.txt",
+        ))
+        .expect("the writable run mutates");
+    storage.close_run().expect("release");
+
+    storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::OpenExisting,
+            immutable_base: base(),
+            policy: StoragePolicy {
+                read_only: true,
+                ..policy()
+            },
+        })
+        .expect("reopen read-only");
+
+    let refused = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "readonly"),
+            b"nope.txt",
+        ))
+        .expect_err("a read-only run must not accept a create");
+    assert_eq!(refused.kind, ErrorKind::Denied);
+    assert!(
+        refused.context.contains("read-only"),
+        "the refusal must name the policy: {}",
+        refused.context
+    );
+
+    // Reads still work: read-only is a restriction on mutation, not on access.
+    storage
+        .execute(&StorageRequest {
+            context: RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("ro-stat".into()),
+                writer_epoch: None,
+            },
+            operation: StorageOperation::Stat {
+                path: path(b"seed.txt"),
+            },
+        })
+        .expect("a read-only run still reads");
+}
+
+/// **R1-003.** `CreateNew` under a read-only policy is refused, and so is any
+/// policy requiring a guarantee this provider does not offer.
+///
+/// Pre-fix all three were accepted: `open` validated `format_version` alone, so a
+/// read-only run could be *created*, and a caller demanding strict remote
+/// persistence or a kernel shadow got a run that quietly provided neither.
+#[test]
+fn r1_003_unsupported_run_policies_are_refused_before_the_run_exists() {
+    let cases: [(&str, StoragePolicy, ErrorKind); 3] = [
+        (
+            "read-only create",
+            StoragePolicy {
+                read_only: true,
+                ..policy()
+            },
+            ErrorKind::Denied,
+        ),
+        (
+            "strict remote persistence",
+            StoragePolicy {
+                require_strict_remote_persistence: true,
+                ..policy()
+            },
+            ErrorKind::UnsupportedCapability,
+        ),
+        (
+            "kernel shadow",
+            StoragePolicy {
+                require_kernel_shadow: true,
+                ..policy()
+            },
+            ErrorKind::UnsupportedCapability,
+        ),
+    ];
+    for (label, policy, expected) in cases {
+        let mut storage = provider();
+        let run_id = fresh_run();
+        let refused = storage
+            .open_run(&OpenRunRequest {
+                run_id,
+                intent: OpenRunIntent::CreateNew,
+                immutable_base: base(),
+                policy,
+            })
+            .expect_err(label);
+        assert_eq!(refused.kind, expected, "{label}: {refused:?}");
+        assert!(
+            storage.admission().is_none(),
+            "{label}: a refused open must publish no admission"
+        );
+    }
+}
