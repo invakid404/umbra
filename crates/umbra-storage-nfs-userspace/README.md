@@ -226,8 +226,11 @@ the syscall-matrix entries no contract operation maps to. Three verdicts:
   atomic. Probing the destination first and renaming second is the
   check-then-rename the syscall matrix prohibits: another client can create the
   destination between the two round trips, and a probe that fails for any reason
-  other than `NFS4ERR_NOENT` says nothing about what is there. `RenameMode::Replace`
-  is supported and unaffected. `OUT_OF_SURFACE` adds file-backed `mmap`, ACLs,
+  other than `NFS4ERR_NOENT` says nothing about what is there. It is refused in
+  preflight, with the other unsupported operations, so it leaves no journal
+  record behind; the capability table classifies by operation and cannot express
+  an unsupported submode on its own. `RenameMode::Replace` is supported and
+  unaffected. `OUT_OF_SURFACE` adds file-backed `mmap`, ACLs,
   `flock`, and — out of scope by the syscall matrix's notifications decision —
   `kqueue`/`kevent` with `EVFILT_VNODE` and FSEvents. Nothing in this crate
   registers, delivers or emulates a file-change notification.
@@ -297,6 +300,17 @@ Two hazards the audited spike carried are closed by construction:
   failure can carry a settled answer. The pump consults the completion registry
   on every return, including the failure paths, rather than reporting
   `Disconnected` over a completion that had already arrived.
+- **The lifetime rule is asserted, not just stated.** `CallArena` counts its live
+  instances, so a harness can observe the *ordering* of C-side disposal against
+  Rust-side release — the ordering a use-after-free inverts. The `r3_004_*` tests
+  in `src/transport/raw/mod.rs` queue a real specialized READ against a live
+  server and drive it through a local poll failure and a real `rpc_disconnect`,
+  asserting the arena is still alive when C is told to dispose, that retirement
+  never cancels the freed PDU, that no stale registration remains, and that the
+  arena is released exactly once afterwards. A third case pins that an ordinary
+  completed call does release its arena, so the others cannot pass by arenas
+  never dropping. ASan was not used: the workspace pins stable Rust and
+  `-Zsanitizer=address` is nightly-only.
 - **Retirement happens on every return path.** A reply that fails to decode
   retires its registration, slot and arena before the error propagates. Leaving
   them in flight would accumulate retained slots until `max_inflight` was spent
@@ -654,9 +668,10 @@ size a `WriteAt` record reaches.
 
 A write commits and compares verifiers before its open is released: an `UNSTABLE`
 write is durable only once a `COMMIT` returns the verifier the `WRITE` did. A
-write that fails with an I/O status is latched — later mutations stop with the
-original status carried forward, and the release that follows is not reported
-clean.
+journalled mutation that fails with an I/O status is latched — later mutations
+stop with the original status carried forward, and the release that follows is
+not reported clean. That covers a failed `FILE_SYNC4` journal write for a rename
+or a create, not only a failed `WriteAt`.
 
 `flush` still reports its gate rather than issuing a receipt, and the provider
 still advertises `Durability::None`. Writing a record `FILE_SYNC4` asks the
@@ -674,9 +689,18 @@ sees B's edit and truncation, still reads after the replacement and after the
 unlink, while a fresh open and a `READDIR` see the replacement instead. B is an
 external editor, not a second admitted Umbra session.
 
+A second live case, `r3_005_*`, covers the branch the first one does not: B stages
+a distinct object under a temporary name and atomically `RENAME`s it over a name
+that is *still occupied* by the object A holds open. A's `fsid`/`fileid` and its
+exact bytes are unchanged; a fresh open, stat and `READDIR` all see the
+replacement; the staging name is gone; and A's open is the only remaining
+reference to the now-unnamed original. Renaming the old object away first and
+creating into the vacated name is name reuse, not atomic replacement, and the two
+are asserted separately.
+
 `tests/operations_surface.rs` still covers the same shape against the fake, whose
 object table is permanent by construction; that case is a shape check, and the
-live one is the acceptance.
+live ones are the acceptance.
 
 `OPEN_DOWNGRADE` remains unavailable: `transport::Nfs4Op` has no variant for it,
 and the hotfix that added the four namespace mutations deliberately did not widen
