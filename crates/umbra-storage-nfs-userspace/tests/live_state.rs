@@ -1577,9 +1577,9 @@ fn r2_006_a_held_open_survives_a_second_clients_edits_renames_and_replacement() 
         }
     }
     assert_eq!(
-        read_held(&mut a).len(),
-        4,
-        "A's held open must see B's truncation"
+        read_held(&mut a),
+        &EDITED[..4],
+        "A's held open must see B's truncation, byte for byte"
     );
 
     // --- B renames the name A opened ---------------------------------------
@@ -1594,7 +1594,11 @@ fn r2_006_a_held_open_survives_a_second_clients_edits_renames_and_replacement() 
         "a rename moves a name, not an object: A's handle keeps its identity"
     );
     assert_eq!(after_rename.fsid.expect("fsid"), pinned_fsid);
-    assert_eq!(read_held(&mut a).len(), 4, "and still reads");
+    assert_eq!(
+        read_held(&mut a),
+        &EDITED[..4],
+        "and still reads the same bytes"
+    );
 
     // --- B replaces the original name with a different object --------------
     const REPLACEMENT: &[u8] = b"a-different-object\n";
@@ -1614,8 +1618,8 @@ fn r2_006_a_held_open_survives_a_second_clients_edits_renames_and_replacement() 
         "the replacement is a different object"
     );
     assert_eq!(
-        read_held(&mut a).len(),
-        4,
+        read_held(&mut a),
+        &EDITED[..4],
         "A's held open still addresses the original object, not the replacement"
     );
 
@@ -1648,11 +1652,10 @@ fn r2_006_a_held_open_survives_a_second_clients_edits_renames_and_replacement() 
 
     // --- B unlinks the renamed name: A's open outlives the last name --------
     remove_name(&mut b, &scratch_b, b"moved.txt");
-    let orphaned = read_held(&mut a);
     assert_eq!(
-        orphaned.len(),
-        4,
-        "A's open must still read after B removed the object's last name"
+        read_held(&mut a),
+        &EDITED[..4],
+        "A's open must still read the same bytes after B removed the object's last name"
     );
     let orphan_attrs = a
         .transport()
@@ -1708,5 +1711,207 @@ fn r2_006_a_held_open_survives_a_second_clients_edits_renames_and_replacement() 
     eprintln!(
         "r2-006: held open survived edit, truncate, rename, replacement and unlink; \
          fileid {pinned_fileid} stable throughout"
+    );
+}
+
+/// **R3-005.** A second client atomically replaces the *occupied* pathname of an
+/// object client A holds open.
+///
+/// `r2_006_*` covers edit, truncate, rename and unlink, but its replacement step
+/// renames the old object away first and then creates into the vacated name. That
+/// is name reuse after a rename, not an atomic replacing RENAME over a name that
+/// is still taken — the branch `docs/design/syscall-matrix.md:29,88` calls for and
+/// the recorded acceptance criteria name as "renamed/unlinked/replaced handle
+/// identity".
+///
+/// Here B builds its replacement under a temporary name and RENAMEs it over
+/// `occupied.txt` while A still holds that object open. The server must move the
+/// name without disturbing the object behind A's handle.
+#[test]
+fn r3_005_a_second_client_atomically_replaces_an_occupied_open_name() {
+    let Some(config) = fixture() else {
+        eprintln!("skipped: UMBRA_NFS_RAW_FIXTURE is unset");
+        return;
+    };
+    let (mut a, root) = live_session(&config, "r3-005-client-a");
+    let (mut b, root_b) = live_session(&config, "r3-005-client-b");
+
+    let export = resolve(a.transport(), &root, &[b"export"]).expect("resolve /export");
+    let scratch_name = format!("r3-005-{}", uuid::Uuid::new_v4());
+    let scratch = make_directory(&mut a, &export, scratch_name.as_bytes());
+    let scratch_b = resolve(
+        b.transport(),
+        &root_b,
+        &[b"export", scratch_name.as_bytes()],
+    )
+    .expect("client B resolves the scratch directory");
+
+    const ORIGINAL: &[u8] = b"the-object-A-holds\n";
+    const REPLACEMENT: &[u8] = b"the-object-B-moves-over-it\n";
+    seed_file(&mut a, &scratch, b"occupied.txt", ORIGINAL);
+
+    // --- A opens and holds the object that is about to be replaced ----------
+    let held = match open_waiting_out_grace(
+        &mut a,
+        &OpenRequest {
+            parent: scratch.clone(),
+            name: ComponentName::new(b"occupied.txt".to_vec()).unwrap(),
+            how: OpenHow::NoCreate,
+            share_access: ShareAccess::READ,
+            share_deny: ShareDeny::NONE,
+        },
+        150_000,
+    ) {
+        OpenOutcome::Opened(file) => file,
+        other => panic!("A's OPEN did not settle: {other:?}"),
+    };
+    let stateid = held.stateid().expect("a confirmed open yields a stateid");
+    let pinned = a
+        .transport()
+        .getattr(held.handle(), AttrMask::STAT, deadline())
+        .expect("A pins the object it opened");
+    let pinned_fileid = pinned.fileid.expect("fileid");
+    let pinned_fsid = pinned.fsid.expect("fsid");
+
+    let read_held = |session: &mut StateSession| -> Vec<u8> {
+        session
+            .transport()
+            .read(held.handle(), stateid, 0, 4096, deadline())
+            .expect("READ through A's held open")
+            .data
+    };
+    assert_eq!(read_held(&mut a), ORIGINAL);
+
+    // --- B stages its replacement under a temporary name --------------------
+    seed_file(&mut b, &scratch_b, b"incoming.tmp", REPLACEMENT);
+    let (_, incoming_attrs) = b
+        .transport()
+        .lookup(
+            &scratch_b,
+            &ComponentName::new(b"incoming.tmp".to_vec()).unwrap(),
+            AttrMask::STAT,
+            deadline(),
+        )
+        .expect("the staged object resolves");
+    let incoming_fileid = incoming_attrs.fileid.expect("fileid");
+    assert_ne!(
+        incoming_fileid, pinned_fileid,
+        "the staged replacement must be a distinct object"
+    );
+
+    // --- the atomic replacement: RENAME over a name that is still taken -----
+    //
+    // `occupied.txt` exists and A holds it open. NFSv4 RENAME replaces the
+    // destination in one operation; nothing unlinks it first.
+    rename_name(&mut b, &scratch_b, b"incoming.tmp", b"occupied.txt");
+
+    // --- A's handle still names the original object -------------------------
+    let after = a
+        .transport()
+        .getattr(held.handle(), AttrMask::STAT, deadline())
+        .expect("A's handle still resolves after its name was replaced");
+    assert_eq!(
+        after.fileid.expect("fileid"),
+        pinned_fileid,
+        "an atomic replacement moves a name, not the object behind an open handle"
+    );
+    assert_eq!(after.fsid.expect("fsid"), pinned_fsid);
+    assert_eq!(
+        read_held(&mut a),
+        ORIGINAL,
+        "A's held open still reads the original bytes, not the replacement's"
+    );
+
+    // --- a fresh open, stat and listing all see the replacement -------------
+    let fresh = match open_waiting_out_grace(
+        &mut a,
+        &OpenRequest {
+            parent: scratch.clone(),
+            name: ComponentName::new(b"occupied.txt".to_vec()).unwrap(),
+            how: OpenHow::NoCreate,
+            share_access: ShareAccess::READ,
+            share_deny: ShareDeny::NONE,
+        },
+        150_000,
+    ) {
+        OpenOutcome::Opened(file) => file,
+        other => panic!("A's fresh OPEN did not settle: {other:?}"),
+    };
+    let fresh_stateid = fresh.stateid().expect("stateid");
+    assert_eq!(
+        a.transport()
+            .read(fresh.handle(), fresh_stateid, 0, 4096, deadline())
+            .expect("read the replacement")
+            .data,
+        REPLACEMENT,
+        "a fresh open of the same name reads the replacement"
+    );
+    let (_, fresh_attrs) = a
+        .transport()
+        .lookup(
+            &scratch,
+            &ComponentName::new(b"occupied.txt".to_vec()).unwrap(),
+            AttrMask::STAT,
+            deadline(),
+        )
+        .expect("stat the name");
+    assert_eq!(
+        fresh_attrs.fileid.expect("fileid"),
+        incoming_fileid,
+        "the name now stats as the staged object"
+    );
+
+    let page = a
+        .transport()
+        .readdir(
+            &scratch,
+            ReadDirRequest {
+                cookie: DirCookie(0),
+                verifier: DirVerifier([0; 8]),
+                dir_count: 4096,
+                max_count: 4096,
+                attrs: AttrMask::STAT,
+            },
+            deadline(),
+        )
+        .expect("list the scratch directory");
+    let names: Vec<Vec<u8>> = page
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_bytes().to_vec())
+        .collect();
+    assert!(
+        names.iter().any(|name| name == b"occupied.txt"),
+        "the replaced name is listed once, saw {:?}",
+        names
+            .iter()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !names.iter().any(|name| name == b"incoming.tmp"),
+        "the staging name is gone: RENAME moved it rather than copying it"
+    );
+
+    // --- A supplies the only remaining reference ----------------------------
+    //
+    // The original object now has no name at all. A's open is what keeps it
+    // reachable, which is the retention property CLOSE settles.
+    let (_, transport) = a.split();
+    let _ = umbra_storage_nfs_userspace::state::open_owner::close(fresh, transport, deadline());
+    assert_eq!(
+        read_held(&mut a),
+        ORIGINAL,
+        "the unnamed original is still readable through A's open alone"
+    );
+
+    let (_, transport) = a.split();
+    match umbra_storage_nfs_userspace::state::open_owner::close(held, transport, deadline()) {
+        umbra_storage_nfs_userspace::state::open_owner::CloseOutcome::Closed(_) => {}
+        other => panic!("A's CLOSE did not settle: {other:?}"),
+    }
+    eprintln!(
+        "r3-005: atomic RENAME over an occupied open name; A kept fileid {pinned_fileid}, \
+         the name now resolves to {incoming_fileid}"
     );
 }

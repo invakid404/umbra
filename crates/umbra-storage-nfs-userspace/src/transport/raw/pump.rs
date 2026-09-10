@@ -248,7 +248,7 @@ pub(super) struct EventPump {
     epoch: ConnectionEpoch,
     state: ConnectionState,
     /// How many times libnfs has disposed of every outstanding PDU (**R1-009**).
-    disposals: DisposalGeneration,
+    pub(super) disposals: DisposalGeneration,
 }
 
 // SAFETY: `rpc` and `auth` are owned exclusively by this value and are only
@@ -574,7 +574,12 @@ impl EventPump {
     /// cancelling while the PDU is live — is what an ordinary deadline already
     /// does; this path is aborting the connection, so disconnecting is both
     /// simpler and stronger.
-    fn stopped(&mut self, failure: ServiceFailure, id: u64, discard: bool) -> ServiceOutcome {
+    pub(super) fn stopped(
+        &mut self,
+        failure: ServiceFailure,
+        id: u64,
+        discard: bool,
+    ) -> ServiceOutcome {
         if let Some(settled) = self.take_settled(id, discard) {
             // A completion is already in hand. The connection is not touched: for
             // a local failure it may well still be usable, and for a reported one

@@ -40,6 +40,28 @@ pub(super) enum DispatchKind {
     Write,
 }
 
+/// How many `CallArena`s are alive right now.
+///
+/// **R3-004.** The lifetime rule this module exists to keep — argument memory
+/// stays owned for as long as libnfs can read it — is not observable from
+/// outside, so it cannot be asserted. This counter makes it observable: a harness
+/// can watch the ordering of "C is told to dispose" against "the arena is
+/// released", which is exactly the ordering a use-after-free violates.
+///
+/// It is a plain relaxed counter, not a diagnostic surface: nothing branches on
+/// it, and it costs one atomic per dispatch and one per drop.
+static LIVE_ARENAS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Arenas currently alive. See [`LIVE_ARENAS`].
+///
+/// The accessor is test-only; the counter is not. Keeping the increment and
+/// decrement in the ordinary path is what makes the harness measure the real
+/// code rather than a test-only variant of it.
+#[cfg(test)]
+pub(super) fn live_arenas() -> usize {
+    LIVE_ARENAS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One dispatch's arguments, owned for the whole call.
 pub(super) struct CallArena {
     /// Tag bytes referenced by `compound.tag`.
@@ -71,11 +93,22 @@ pub(super) struct CallArena {
 // the arena between threads moves exclusive ownership of the whole graph.
 unsafe impl Send for CallArena {}
 
+// SAFETY-adjacent bookkeeping only: dropping an arena is what releases every
+// buffer libnfs was reading from, so it is the moment the lifetime rule is
+// either kept or broken. Counting it is what makes the ordering observable
+// (**R3-004**).
+impl Drop for CallArena {
+    fn drop(&mut self) {
+        LIVE_ARENAS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl CallArena {
     /// Marshal a COMPOUND, or refuse it before anything is registered.
     pub(super) fn build(call: &Compound, limits: &TransportLimits) -> TransportResult<Self> {
         let kind = classify(call)?;
 
+        LIVE_ARENAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut arena = Self {
             _tag: own(call.tag.clone()),
             ops: Vec::with_capacity(call.ops.len()),
