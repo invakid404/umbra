@@ -607,3 +607,152 @@ fn r2_002_the_effect_observer_is_not_vacuous() {
         "an accepted mutation sends modifying operations"
     );
 }
+
+// --- R2-010: a record is read whole, not assumed to fit one reply ------------
+
+/// A transport that truncates every READ reply and reports "not end of file".
+///
+/// This is a legal server: NFSv4 permits a short `READ` that is not at EOF. The
+/// journal used to treat the first reply as the whole record.
+struct ShortReads {
+    inner: FakeTransport,
+    /// Bytes any one READ may return.
+    cap: usize,
+}
+
+impl RawTransport for ShortReads {
+    fn wire_profile(&self) -> WireProfile {
+        self.inner.wire_profile()
+    }
+    fn limits(&self) -> TransportLimits {
+        self.inner.limits()
+    }
+    fn connection(&self) -> ConnectionState {
+        self.inner.connection()
+    }
+    fn submit(&mut self, call: Compound, deadline: Deadline) -> TransportResult<CompoundReply> {
+        let mut reply = self.inner.submit(call, deadline)?;
+        for result in reply.results.iter_mut() {
+            if let umbra_storage_nfs_userspace::transport::OpReply::Read(read) = result {
+                if read.data.len() > self.cap {
+                    read.data.truncate(self.cap);
+                    // Truncated, so this reply is no longer the end of the file.
+                    read.eof = false;
+                }
+            }
+        }
+        Ok(reply)
+    }
+    fn cancel(&mut self, token: CallToken) -> TransportResult<Retirement> {
+        self.inner.cancel(token)
+    }
+    fn reconnect(&mut self) -> TransportResult<ConnectionEpoch> {
+        self.inner.reconnect()
+    }
+    fn install_faults(&mut self, plan: Box<dyn FaultPlan>) {
+        self.inner.install_faults(plan)
+    }
+}
+
+/// **R2-010.** A record delivered in short, non-EOF replies is still read whole.
+///
+/// At the candidate, `read_record` issued one `READ` for `MAX_RECORD_BYTES` and
+/// deserialized whatever came back. A server returning a legal short read made
+/// the provider report `CorruptJournal` for a record it had written itself.
+#[test]
+fn r2_010_a_record_delivered_in_short_reads_is_still_read_whole() {
+    let mut storage = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(ShortReads {
+            inner: fake_server(),
+            cap: 16,
+        }),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("provider");
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    let request = create_file(authorised(&storage, run_id, "short-reads"), b"short.txt");
+    let first = storage
+        .execute(&request)
+        .expect("the first attempt succeeds");
+
+    // The retry has to read the settled record back, 16 bytes at a time.
+    let retried = storage
+        .execute(&request)
+        .expect("an exact-key retry must be answered, not called corrupt");
+    assert_eq!(
+        format!("{first:?}"),
+        format!("{retried:?}"),
+        "the record read back in pieces must be the record that was written"
+    );
+}
+
+/// **R2-010.** A valid record larger than one transport reply round-trips.
+///
+/// The provider advertises writes up to `max_io_bytes`, and a `WriteAt` record
+/// embeds that payload as a JSON byte array, which is several times larger than
+/// the bytes themselves. With a single `READ` capped at `max_reply_bytes`, a
+/// record the provider wrote itself could not be read back.
+#[test]
+fn r2_010_a_record_larger_than_one_reply_round_trips() {
+    // The raw transport caps every READ reply at `limits().max_reply_bytes`
+    // (`raw/args.rs`); `FakeTransport` does not, so a fake-only run would return
+    // even a multi-megabyte record in one reply and prove nothing. Capping here
+    // models the real transport, which is where the defect lives.
+    let reply_cap = fake_server().limits().max_reply_bytes;
+    let mut storage = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(ShortReads {
+            inner: fake_server(),
+            cap: reply_cap,
+        }),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("provider");
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "big-target"),
+            b"big.bin",
+        ))
+        .expect("create the target");
+
+    // Every byte encodes as at least two JSON characters, so this payload's
+    // record is comfortably past one reply while staying inside max_io_bytes.
+    let advertised = storage
+        .operations()
+        .expect("a run is open")
+        .capabilities()
+        .max_io_bytes as usize;
+    let payload_len = advertised.min(reply_cap);
+    let payload = vec![0xFFu8; payload_len];
+
+    let request = StorageRequest {
+        context: authorised(&storage, run_id, "big-write"),
+        operation: StorageOperation::WriteAt {
+            path: path(b"big.bin"),
+            offset: 0,
+            bytes: payload.clone(),
+        },
+    };
+    let first = storage.execute(&request).expect("the large write succeeds");
+
+    // The record's JSON is larger than one reply; the retry must still find it.
+    let retried = storage
+        .execute(&request)
+        .expect("an exact-key retry of a large record must be answered");
+    assert_eq!(
+        format!("{first:?}"),
+        format!("{retried:?}"),
+        "a record spanning several replies must round-trip exactly"
+    );
+    match retried {
+        umbra_core::StorageResponse::WriteAt(count) => {
+            assert_eq!(count as usize, payload.len())
+        }
+        other => panic!("expected a write response, got {other:?}"),
+    }
+}

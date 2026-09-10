@@ -167,6 +167,11 @@ pub fn admit(
         ));
     }
 
+    // R2-010: encode before anything is created, so an over-large record is
+    // refused with the journal untouched rather than after its index exists.
+    let intent: Record = (request.clone(), None);
+    let encoded = encode(&intent, operation)?;
+
     // Index first, then the intent. Both are `GUARDED4`, so a racing contender is
     // refused by the server rather than by a local read.
     write_new_record(
@@ -178,8 +183,6 @@ pub fn admit(
         operation,
         deadline,
     )?;
-    let intent: Record = (request.clone(), None);
-    let encoded = encode(&intent, operation)?;
     write_new_record(
         transport,
         owners,
@@ -221,14 +224,32 @@ pub fn settle(
     )
 }
 
+/// Encode a record, refusing one too large to be written and read back whole.
+///
+/// **R2-010.** Checked *before* any index or intent reaches the server, so a
+/// request whose record cannot round-trip is refused while the journal is still
+/// untouched rather than after half of it exists.
 fn encode(record: &Record, operation: &str) -> Result<Vec<u8>> {
-    serde_json::to_vec(record).map_err(|error| {
+    let bytes = serde_json::to_vec(record).map_err(|error| {
         UmbraError::new(
             ErrorKind::InvalidState,
             operation,
             format!("a retry record could not be encoded: {error}"),
         )
-    })
+    })?;
+    if bytes.len() > MAX_RECORD_BYTES as usize {
+        return Err(UmbraError::new(
+            ErrorKind::InvalidInput,
+            operation,
+            format!(
+                "this request encodes to a {}-byte retry record, past the {MAX_RECORD_BYTES}-byte \
+                 bound this journal can write and read back whole; it is refused before any \
+                 record is created",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Read one record whole, or `None` when the name is absent.
@@ -236,6 +257,19 @@ fn encode(record: &Record, operation: &str) -> Result<Vec<u8>> {
 /// Absence is `NFS4ERR_NOENT` and nothing else. A lookup or read that *failed* is
 /// propagated: reporting it as absence would make a fresh intent out of a record
 /// that may well exist, which is the whole failure this journal prevents.
+///
+/// **R2-010.** This used to issue one `READ` for `MAX_RECORD_BYTES` and hand back
+/// whatever came out, which is wrong twice over. NFSv4 `READ` may return fewer
+/// bytes than asked for without being at end of file, and the raw transport caps
+/// every reply at `limits().max_reply_bytes` — 1 MiB on the loopback profile —
+/// while the provider advertises writes up to 1 MiB, whose JSON byte-array
+/// encoding is several times larger. A perfectly valid record could therefore
+/// come back as a prefix, and `serde_json` would call the prefix corrupt: the
+/// provider would report `CorruptJournal` for a record it wrote itself.
+///
+/// So the record is read in bounded chunks until the server reports EOF, with the
+/// total capped. A short reply is a normal step, not a frame; only a complete
+/// frame that fails to decode is corruption.
 fn read_record(
     transport: &mut dyn RawTransport,
     retries: &PinnedObject,
@@ -247,9 +281,53 @@ fn read_record(
         Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let reply = read_anonymous(transport, &pinned, 0, MAX_RECORD_BYTES, deadline)
-        .map_err(|error| error.to_umbra("retry"))?;
-    Ok(Some(reply.data))
+
+    // One chunk never exceeds what the transport will decode, so a chunk is never
+    // refused for being too large to reply to.
+    let chunk = u32::try_from(transport.limits().max_reply_bytes)
+        .unwrap_or(u32::MAX)
+        .clamp(1, MAX_RECORD_BYTES);
+
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        let remaining = MAX_RECORD_BYTES.saturating_sub(bytes.len() as u32);
+        if remaining == 0 {
+            // The record on the server is larger than any record this provider
+            // writes. Refusing beats decoding a truncation as a whole frame.
+            return Err(UmbraError::new(
+                ErrorKind::CorruptJournal,
+                "retry",
+                format!(
+                    "the retry record exceeds the {MAX_RECORD_BYTES}-byte bound before end of \
+                     file; it is not a record this provider wrote and is refused rather than \
+                     read as a truncated one"
+                ),
+            ));
+        }
+        let want = chunk.min(remaining);
+        let reply = read_anonymous(transport, &pinned, bytes.len() as u64, want, deadline)
+            .map_err(|error| error.to_umbra("retry"))?;
+        let progressed = !reply.data.is_empty();
+        bytes.extend_from_slice(&reply.data);
+        if reply.eof {
+            break;
+        }
+        if !progressed {
+            // Not at end of file and no bytes: the server is not advancing, and
+            // looping forever is not an answer. This is an incomplete transport
+            // result, deliberately distinct from a corrupt frame.
+            return Err(UmbraError::new(
+                ErrorKind::StorageUnavailable,
+                "retry",
+                format!(
+                    "the server returned no bytes and no end-of-file at offset {} of the retry \
+                     record; the record could not be read whole and its state is unknown",
+                    bytes.len()
+                ),
+            ));
+        }
+    }
+    Ok(Some(bytes))
 }
 
 /// `GUARDED4` create and write one record whole.
@@ -321,28 +399,35 @@ fn write_whole(
     // FILE_SYNC4: the record is the evidence a recovery reads, so it is on stable
     // storage before this call returns or it is not evidence.
     let result = (|transport: &mut dyn RawTransport| -> Result<()> {
-        let reply = transport
-            .write(
-                &handle,
-                stateid,
-                0,
-                Stability::FileSync,
-                bytes.to_vec(),
-                deadline,
-            )
-            .map_err(|error| error.to_umbra(operation))?;
-        if reply.count as usize != bytes.len() {
-            // A short write leaves a truncated record, which decodes as nothing
-            // and would read as a fresh key on the next attempt.
-            return Err(UmbraError::new(
-                ErrorKind::Io,
-                operation,
-                format!(
-                    "a retry record was written short: {} of {} bytes",
-                    reply.count,
-                    bytes.len()
-                ),
-            ));
+        // R2-010: a short WRITE is a real answer, not a failure, so the record is
+        // written in as many round trips as the server needs. Previously a single
+        // short write was reported as an error, leaving a truncated record that
+        // decodes as nothing and reads as a fresh key on the next attempt.
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let reply = transport
+                .write(
+                    &handle,
+                    stateid,
+                    written as u64,
+                    Stability::FileSync,
+                    bytes[written..].to_vec(),
+                    deadline,
+                )
+                .map_err(|error| error.to_umbra(operation))?;
+            if reply.count == 0 {
+                // No progress and no error: looping forever is not an answer.
+                return Err(UmbraError::new(
+                    ErrorKind::Io,
+                    operation,
+                    format!(
+                        "the server accepted no bytes at offset {written} of a {}-byte retry \
+                         record; the record is incomplete on the server",
+                        bytes.len()
+                    ),
+                ));
+            }
+            written += reply.count as usize;
         }
         let truncate = AttrValues {
             size: Some(bytes.len() as u64),
