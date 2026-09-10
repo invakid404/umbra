@@ -460,13 +460,23 @@ and format version; a manifest that is absent or malformed is refused with its
 bytes left on the server, never adopted and never read as a release.
 `.provider/epoch` supplies an epoch floor, so a run the mounted adapter released
 cleanly at epoch 7 is admitted at 8 rather than restarting the ladder at 1. An
-epoch file that is not eight bytes is refused rather than treated as zero.
+epoch file that is not eight bytes is refused rather than treated as zero, and so
+is one that is absent: every run either adapter creates writes that file, so its
+absence in an existing run is missing recovery evidence rather than a run that
+never had a writer.
 
 Every request is checked against the admission it claims: a mutation naming a
 different run than the open one, or presenting a writer epoch other than the
 admitted one, is refused before dispatch. Neither check exists upstream —
 `umbra_storage::validate_request` deliberately leaves bound-run and lease checks
 to the backend and only requires that some epoch is present.
+
+All of it — the authority latch, the run binding, the read-only policy, the
+capability verdict, the input bounds and the epoch — runs as one gate *before the
+journal is touched*, so a request that will be refused consumes no operation id
+and leaves no record behind. `Operations::preflight` holds the rules and
+`Operations::execute` re-runs them, because a direct caller reaches that seam
+without a provider in front of it.
 
 ## Golden fixtures
 
@@ -621,10 +631,32 @@ through [`journal`](src/journal.rs) first: the exact request is recorded in
 `.provider/retries/key-<hex>` before the operation reaches the wire, and the
 exact settled result is written back afterwards, in the byte encoding the mounted
 adapter uses and `tests/goldens/retry-*.json` pins. An exact-key retry is
-answered from its record and never re-dispatched; a record whose intent never
-settled stops for reconciliation rather than repeating the effect; an outcome
-whose server-side disposition is unknown is left unsettled rather than recorded
-as a failure a later retry would trust. Reads are not journalled.
+answered from its record and never re-dispatched; an outcome whose server-side
+disposition is unknown is left unsettled rather than recorded as a failure a
+later retry would trust. Reads are not journalled.
+
+An **interrupted** intent is recovered rather than stalled. Beside each record,
+`.provider/retries/pre-<hex>` holds the object and parent identities the mutation
+was dispatched against — the preconditions the failure model requires, kept in a
+sidecar so `key-<hex>` stays byte-identical to what the mounted adapter writes.
+Recovery compares that before-state against the server now: proven-not-applied
+re-dispatches under the same key, proven-applied settles the record from the
+observed state without repeating the effect, and evidence matching neither is a
+blocked-recoverable stop with the record and the server state both retained. A
+record with no sidecar is a legacy one, and an ambiguous legacy intent stops for
+the same reason. Nothing answers "requires reconciliation": the failure model
+forbids that standing in for recovery in a window this provider supports.
+
+Records are read in bounded chunks to end of file and written in as many round
+trips as the server needs, because a short `READ` or `WRITE` is a legal answer
+rather than a frame boundary, and the raw transport caps a reply well below the
+size a `WriteAt` record reaches.
+
+A write commits and compares verifiers before its open is released: an `UNSTABLE`
+write is durable only once a `COMMIT` returns the verifier the `WRITE` did. A
+write that fails with an I/O status is latched — later mutations stop with the
+original status carried forward, and the release that follows is not reported
+clean.
 
 `flush` still reports its gate rather than issuing a receipt, and the provider
 still advertises `Durability::None`. Writing a record `FILE_SYNC4` asks the
@@ -633,14 +665,18 @@ remote-durability claim is made from it. `authority::MutationJournal` remains th
 typed lower-layer model over the `ReplayLog` facade and is not itself on the
 `Storage` path.
 
-**Held-object coherence is proven against the fake, not against a server.**
-`tests/operations_surface.rs` shows an open handle surviving an in-place edit, a
-rename and a pathname replacement, but its backend is the fake, whose object
-table is permanent by construction. That cannot qualify how a real server behaves
-for an open whose last name is gone, and no live case yet holds one client's open
-while an independent second client edits, truncates, renames, unlinks and
-replaces the name. Until one runs, treat the retention property as modelled
-rather than demonstrated.
+Held-object coherence is demonstrated against a real server.
+`tests/live_state.rs`'s `r2_006_*` case runs two NFSv4 clients — separate client
+ids, separate open owners — and holds client A's open while client B edits in
+place, truncates, renames, replaces the name with a different object and finally
+removes the object's last name. A's handle keeps its `fsid`/`fileid` throughout,
+sees B's edit and truncation, still reads after the replacement and after the
+unlink, while a fresh open and a `READDIR` see the replacement instead. B is an
+external editor, not a second admitted Umbra session.
+
+`tests/operations_surface.rs` still covers the same shape against the fake, whose
+object table is permanent by construction; that case is a shape check, and the
+live one is the acceptance.
 
 `OPEN_DOWNGRADE` remains unavailable: `transport::Nfs4Op` has no variant for it,
 and the hotfix that added the four namespace mutations deliberately did not widen
