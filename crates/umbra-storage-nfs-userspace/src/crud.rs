@@ -28,7 +28,7 @@
 
 use umbra_core::{IdempotencyKey, LeaseEpoch, OperationId, RequestContext, RunId};
 
-use crate::error::{AuthorityError, FacadeError, FacadeResult, RetainedError};
+use crate::error::{AuthorityError, FacadeError, FacadeResult, RetainedError, TransportError};
 use crate::handle::{FileHandle, ObjectIdentity, OpenFile, Stateid};
 use crate::identity::PinnedObject;
 use crate::replay::{
@@ -444,6 +444,91 @@ pub fn read_anonymous(
     deadline: Deadline,
 ) -> FacadeResult<ReadReply> {
     transport.read(object.handle(), Stateid::ANONYMOUS, offset, count, deadline)
+}
+
+/// What [`read_whole`] recovered, and whether that is the whole object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WholeRead {
+    /// Bytes accumulated, never more than the caller's `limit`.
+    pub data: Vec<u8>,
+    /// Whether end of file was reached inside `limit`.
+    ///
+    /// `false` means the object has more bytes than the caller allowed. It is a
+    /// *bound* answer, not a failure: callers whose format has a fixed maximum
+    /// treat it as "this is not a file I wrote" and refuse with their own
+    /// diagnosis, which keeps the refusal prose where the format lives.
+    pub complete: bool,
+}
+
+/// Read one whole small object into memory, following short replies to EOF.
+///
+/// **F04 / F07.** A single `READ` is not a whole file.
+/// [RFC 7530 §16.25.4](https://www.rfc-editor.org/rfc/rfc7530.html#section-16.25.4)
+/// lets a server return fewer bytes than requested *without* setting `eof` — it
+/// is a legal reply, not a fault — so a reader that decodes the first reply as
+/// the entire object turns a healthy file into a corrupt-file refusal. Two
+/// readers in this crate made exactly that mistake against two different files
+/// that gate a run opening at all: `.provider/epoch` and the admission marker.
+///
+/// The loop advances the offset by what actually arrived and asks only for the
+/// capacity that remains, so it can neither overrun `limit` nor re-read bytes it
+/// already holds. A reply that carries no bytes *and* no end of file is refused
+/// rather than looped on: the server is not advancing, and a reader that spun
+/// there would hang a run open on a file it cannot finish.
+///
+/// `stateid` is the caller's: an anonymous read for a path that holds no open
+/// state, and a real open stateid where one is held.
+pub fn read_whole(
+    transport: &mut dyn RawTransport,
+    handle: &FileHandle,
+    stateid: Stateid,
+    limit: u32,
+    deadline: Deadline,
+) -> FacadeResult<WholeRead> {
+    // One chunk never exceeds what the transport will decode, so a chunk is
+    // never refused for being too large to reply to.
+    let chunk = u32::try_from(transport.limits().max_reply_bytes)
+        .unwrap_or(u32::MAX)
+        .clamp(1, limit.max(1));
+
+    let mut data: Vec<u8> = Vec::new();
+    loop {
+        let read = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        let remaining = limit.saturating_sub(read);
+        if remaining == 0 {
+            // At the bound with no end of file yet. Whether that is acceptable
+            // is the caller's format question, not this loop's.
+            return Ok(WholeRead {
+                data,
+                complete: false,
+            });
+        }
+        let want = chunk.min(remaining);
+        let reply = transport.read(handle, stateid, u64::from(read), want, deadline)?;
+        let progressed = !reply.data.is_empty();
+        // A server that answers with more than it was asked for is not one this
+        // reader can account for: taking the excess would silently exceed the
+        // bound the caller set.
+        if reply.data.len() > want as usize {
+            return Err(FacadeError::Transport(TransportError::Malformed(format!(
+                "READ returned {} bytes for a {want}-byte request at offset {read}",
+                reply.data.len()
+            ))));
+        }
+        data.extend_from_slice(&reply.data);
+        if reply.eof {
+            return Ok(WholeRead {
+                data,
+                complete: true,
+            });
+        }
+        if !progressed {
+            return Err(FacadeError::Transport(TransportError::Malformed(format!(
+                "READ returned no bytes and no end of file at offset {read}; the object \
+                 could not be read whole"
+            ))));
+        }
+    }
 }
 
 #[cfg(test)]

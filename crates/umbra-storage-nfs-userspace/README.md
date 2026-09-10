@@ -96,12 +96,26 @@ than adding to them.
 | `state::verifier` | `EXCLUSIVE4` create verifiers, and WRITE/COMMIT matching |
 | `state::retained_errors` | Which failures are settled, and for how long |
 
+`state::retained_errors` means one thing by *settled*: `ErrorClass::Permanent`,
+a failure that retrying the identical request cannot change. Only a settled
+failure may be retained durably; a transient one — a server asking for a retry,
+a lost connection, a changed write verifier, a safe stop whose whole meaning is
+that the outcome is unknown — is retained volatile or not at all, and asking for
+a durable record of one is refused before anything is written. A deadline is in
+that group: `Retirement` proves this pump withdrew the call and says nothing
+about whether the server acted on it, so `DeadlineExpired` classifies
+`NeedsRecovery`, unlike the pre-dispatch `QueueFull` refusal beside it.
+
 Three rules shape it.
 
 1. **Illegal transitions do not compile.** A `ConfirmedClient` is reachable only
    through a `SETCLIENTID_CONFIRM` the server accepted; an `OwnerLease` is consumed
    by its OPEN attempt; `close` consumes the `OpenFile`; an unconfirmed open's
-   `stateid()` keeps refusing. None of these is a runtime guard.
+   `stateid()` keeps refusing. None of these is a runtime guard. Seqid authority
+   is not duplicable either: `OwnerSequence`, `OwnerLease` and `LockOwnerLease`
+   implement neither `Clone` nor `Copy`, because a copy is a second claim on one
+   owner's counter — two copies would issue the same seqid, and poisoning one
+   would leave the other usable.
 2. **Nothing advances further than the server proved.** A server answer resolves
    the seqid by the RFC 7530 section 9.1.7 rule and leaves the owner reusable. An
    answer that never arrived poisons the owner instead, because the seqid the
@@ -110,6 +124,17 @@ Three rules shape it.
 3. **Renewal is not authority.** `LeaseClock::takeover_by_timeout` always returns
    `AuthorityError::TakeoverRefused`. An expired lease means this client's own
    state may be gone; it is never evidence that another session terminated.
+
+An OPEN that the server committed is released rather than dropped, on both paths
+that can decide it is unusable: an identity lookup that fails after the OPEN, and
+a `CLAIM_PREVIOUS` reclaim that comes back naming a different object. Dropping an
+`OpenFile` sends nothing — CLOSE is a wire operation `state::open_owner::close`
+dispatches — and a client that goes on renewing its lease is the reason that
+state would otherwise survive. `OPEN_CONFIRM` runs first where the server asked
+for it, because its reply carries the stateid the CLOSE must present. Neither
+cleanup changes the answer: an unproven identity is still abandoned with the
+owner burned, and a reclaim mismatch is still surrendered as `IdentityChanged`
+with any cleanup failure retained beside it.
 
 `OPEN_DOWNGRADE` is a partial seam. `state::open_owner::downgrade_with` owns the
 seqid and the share-bit narrowing and takes the wire step as a closure, because
@@ -187,7 +212,11 @@ Four rules shape it.
 4. **A page is bounded at every level.** One `List` issues at most
    `pages::MAX_SERVER_PAGES` `READDIR` operations, each capped by `max_count`,
    and returns at most the requested limit; nothing accumulates a whole
-   directory. A changed `cookieverf` invalidates outstanding cursors explicitly
+   directory. The *allocation* is bounded independently of the caller's limit: a
+   limit is a request, not a measurement of the directory, so reserving for it
+   made a three-entry listing cost whatever number was asked for. The initial
+   reservation is the smallest of the limit, what those server pages could
+   physically carry, and a fixed ceiling; the vector still grows if more arrives. A changed `cookieverf` invalidates outstanding cursors explicitly
    rather than restarting silently or answering from a cached snapshot. The
    invalidation keeps the server's own diagnosis: a `NFS4ERR_BAD_COOKIE` is
    reported as an invalidated cursor *and* carries the original status number and
@@ -201,6 +230,21 @@ carries that verifier in the field `GUARDED4` uses for initial attributes. The
 attributes therefore follow in a `SETATTR`, whose returned attrset is checked
 before the create reports success; a `SETATTR` failure is surfaced with its
 partial effect rather than undone by removing a name another writer may own.
+
+The verifier is derived from the operation id by mixing both halves of it through
+MurmurHash3's `fmix64`, with fixed published constants rather than a hasher whose
+algorithm may change between compiler releases. It is deterministic, which is
+what lets a replayed create be recognised without consulting storage, and it is
+**not** unique: 2^128 identities cannot map injectively onto 2^64 verifiers, so
+what the module states is a collision probability of about 2^-64 for two random
+ids. The earlier fold XORed paired bytes of the two halves together, which made
+whole families of ids collide by construction — operation ids `1` and `1 << 64`
+derived the same verifier, and an `EXCLUSIVE4` replay treats an equal verifier as
+the same create. `CreateVerifierLedger` retains a key's verifier once it has been
+used and `authority_recovery` persists that ledger, so a create whose verifier
+reached durable storage replays exactly; one interrupted before that presents the
+new derivation, is answered `NFS4ERR_EXIST`, and stops as a safe give-up rather
+than adopting an object.
 
 A `WriteAt` records a durable intent through the replay facade before dispatch,
 reports the count and stability the server actually reached rather than the ones
@@ -254,6 +298,33 @@ not an object, so an outcome reporting an identity other than the one the caller
 pinned is refused rather than believed. `TransportDispatcher` takes the transport
 per call rather than owning one, so a mutation provably travels on the session's
 own connection instead of a second one whose epoch authorised nothing.
+
+Three things the dispatcher refuses rather than absorbs:
+
+- **An unlink whose target type the server did not report.** The probe exists to
+  prove what a name resolves to, and a reply with no `FATTR4_TYPE` proves
+  nothing. `RemoveKind::File` still covers a regular file *and* a logical-symlink
+  name, so the refusal is about absent evidence and not about narrowing the kinds
+  the contract supports.
+- **A removal it cannot show removed the object the caller pinned.** REMOVE is a
+  pathname operation and a name is not an object: another client can replace the
+  name between the probe and the unlink. No COMPOUND can close that window —
+  [RFC 7530 §14.2](https://www.rfc-editor.org/rfc/rfc7530.html#section-14.2)
+  guarantees order but not atomicity, so a VERIFY guard would be an atomicity
+  claim v4.0 cannot make — but the server can say whether its directory moved.
+  The parent's `FATTR4_CHANGE` is captured before the probe and compared against
+  the REMOVE's own atomic `cinfo.before`; equal means nothing happened in that
+  directory across the window. Anything else stops the run
+  `BLOCKED_RECOVERABLE`, because the REMOVE *succeeded* — a name really is gone,
+  re-running would unlink whatever holds it next, and there is nothing to roll
+  back. A server that never reports atomic change info therefore makes every
+  pinned unlink uncertain, which is the conservative direction.
+- **A metadata update whose timestamp cannot be represented.** An out-of-range
+  time used to be dropped, which left a mixed mode-and-time update applying the
+  mode and reporting `AttributesSet`: a partial effect reported as a whole one.
+  The conversion is fallible and refuses before any SETATTR reaches the wire.
+  Pre-epoch times still floor their seconds and carry a positive remainder,
+  because `nfstime4.nseconds` is unsigned.
 
 ## Raw transport
 
@@ -401,9 +472,18 @@ Four rules shape it.
    payload and the authorising epoch have reached the log. Backpressure is
    applied before that admit, so an exhausted buffer refuses the mutation instead
    of letting it reach the wire with nowhere to record its outcome.
-5. **The first error is latched.** `OutageMachine` keeps the failure that opened
-   a window in a frozen `RetainedError` and counts later attempts without
-   replacing it, so an `NFS4ERR_NOSPC` is still 28 after three reconnects. A
+5. **A stop is terminal, and the first error is latched.** `OutageMachine`
+   answers with its existing state as soon as that state `is_terminal` —
+   `BlockedRecoverable`, `Corrupted` or `FailedTracee` — before a later window
+   can decide anything. Each window is decided on its own evidence with no memory
+   of where the run stopped, so without that guard a `Corrupted` run went back to
+   `Running` on the next `StaleFilehandle` whose identity happened to prove. A
+   stopped machine counts no further attempts and records no later window's
+   deferral; only building a new machine reopens it, which is the operator
+   intervention the state is for. Within a window that is still live, the failure
+   that opened it is kept in a frozen `RetainedError` and later attempts are
+   counted without replacing it, so an `NFS4ERR_NOSPC` is still 28 after three
+   reconnects. A
    digest-only payload is `PayloadMissing` rather than reconstructed bytes, and a
    namespace intent whose reply was lost is `Indeterminate` rather than a guess:
    its record carries a name, not the before/after proof the failure model
@@ -518,8 +598,10 @@ review the diff.
 `cargo test -p umbra-storage-nfs-userspace` runs the unit tests, the golden and
 provider-template suites, `tests/fake_fault_matrix.rs`,
 `tests/operations_surface.rs`, `tests/authority_recovery.rs`,
-`tests/review_round_1.rs`, and the fake half of `tests/m1_conformance.rs` and
-`tests/golden_compat.rs`. There is no network, mount, service, fixture directory
+`tests/review_round_1.rs`, `tests/review_round_2.rs`,
+`tests/coderabbit_round_1.rs`, and the fake half of `tests/m1_conformance.rs` and
+`tests/golden_compat.rs`. Each review suite names the findings it closes in its
+test names, so a regression points at the finding it reopens. There is no network, mount, service, fixture directory
 or environment gate: the two harnesses that can use a server compare against the
 fake when none is configured.
 
@@ -716,6 +798,17 @@ Records are read in bounded chunks to end of file and written in as many round
 trips as the server needs, because a short `READ` or `WRITE` is a legal answer
 rather than a frame boundary, and the raw transport caps a reply well below the
 size a `WriteAt` record reaches.
+
+Every small whole-file reader in the crate works the same way, through
+`crud::read_whole`: `.provider/manifest` and `.provider/epoch` on the run-open
+path, and the admission marker. [RFC 7530 §16.25.4](https://www.rfc-editor.org/rfc/rfc7530.html#section-16.25.4)
+lets a server answer with fewer bytes than requested and leave `eof` clear, so a
+reader that decoded the first reply as the whole object turned a healthy run into
+a corrupt-file refusal or a healthy marker into a malformed one. The loop
+advances by what arrived and asks only for the capacity that remains; a reply
+with no bytes *and* no end of file is refused rather than looped on, and reaching
+the bound before end of file is reported to the caller, which decides what its
+own format makes of it.
 
 A write commits and compares verifiers before its open is released: an `UNSTABLE`
 write is durable only once a `COMMIT` returns the verifier the `WRITE` did. A

@@ -63,6 +63,19 @@ impl RetainedErrorLedger {
     /// stands for the key and this is not a byte-identical restatement of it. A
     /// volatile record may be replaced, including by a durable record for the
     /// same failure, which is how a write-through to a durable log is reflected.
+    ///
+    /// **F19.** Refuses with [`ReplayError::Indeterminate`] when a *durable*
+    /// record is asked for a failure that is not settled. This module's own
+    /// definition of settled is [`is_settled`] — only [`ErrorClass::Permanent`] —
+    /// and nothing enforced it: `durable: true` wrote a permanent answer for an
+    /// `NFS4ERR_DELAY`, a lost connection or a safe stop, and every later retry of
+    /// that key read back a failure the server never made final. A transient
+    /// condition may still be retained; it is retained *volatile*, which is what
+    /// it is.
+    ///
+    /// The refusal happens before insertion, so a rejected durable retain leaves
+    /// the ledger exactly as it was — it does not downgrade to volatile behind the
+    /// caller's back, and it does not overwrite a record that already stands.
     pub fn retain(
         &mut self,
         operation: OperationId,
@@ -70,6 +83,9 @@ impl RetainedErrorLedger {
         error: FacadeError,
         durable: bool,
     ) -> Result<&RetainedError, ReplayError> {
+        if durable && !is_settled(&error) {
+            return Err(ReplayError::Indeterminate);
+        }
         if let Some(existing) = self.entries.get(key) {
             if existing.is_durable() && (existing.error() != &error || !durable) {
                 return Err(ReplayError::KeyConflict);
@@ -97,9 +113,19 @@ impl RetainedErrorLedger {
         self.entries.get(key).and_then(|e| e.error().status())
     }
 
-    /// Whether a durable answer stands for `key`.
+    /// Whether a durable *settled* answer stands for `key`.
+    ///
+    /// **F19.** Both halves are asked. The durability bit says the record reached
+    /// a persistence boundary; it says nothing about whether the failure it holds
+    /// is final, and reading it alone reported "this key is settled durably" for
+    /// any transient condition that had been written durably. `retain` now refuses
+    /// to create such a record, and this asks the second question anyway, so a
+    /// record predating the check — or reconstructed from a log written by an
+    /// older build — cannot be read as settled either.
     pub fn is_durably_settled(&self, key: &IdempotencyKey) -> bool {
-        self.entries.get(key).is_some_and(RetainedError::is_durable)
+        self.entries
+            .get(key)
+            .is_some_and(|entry| entry.is_durable() && is_settled(entry.error()))
     }
 
     /// Release a key whose record has been retired from the replay log.
@@ -211,6 +237,88 @@ mod tests {
                 false
             )
             .is_err());
+    }
+
+    /// **F19.** A durable record is refused for a failure that is not settled.
+    ///
+    /// `is_settled` was this module's own definition of the word and nothing
+    /// enforced it: `durable: true` wrote a permanent answer for an
+    /// `NFS4ERR_DELAY` — a condition the server explicitly asks the client to
+    /// retry — for a lost connection, or for a safe stop, and every later retry
+    /// of that key read back a failure the server never made final.
+    #[test]
+    fn f19_a_transient_failure_is_never_retained_as_a_durable_answer() {
+        for transient in [
+            // Retriable: the server asked for a retry.
+            FacadeError::protocol(Nfs4Status::DELAY, OpCode::Write, 1),
+            FacadeError::protocol(Nfs4Status::GRACE, OpCode::Open, 0),
+            // NeedsRecovery: answerable again once state is re-established.
+            FacadeError::Transport(TransportError::Connect("lost".into())),
+            FacadeError::Replay(ReplayError::VerifierChanged {
+                recorded: [1; 8],
+                observed: [2; 8],
+            }),
+            // SafeStop: the answer is unknown, which is exactly what must not be
+            // frozen into a key as though it were known.
+            FacadeError::Authority(AuthorityError::TakeoverRefused),
+            FacadeError::Replay(ReplayError::Indeterminate),
+        ] {
+            let mut ledger = RetainedErrorLedger::new();
+            assert_eq!(
+                ledger.retain(operation(1), &key("t"), transient.clone(), true),
+                Err(ReplayError::Indeterminate),
+                "{transient:?} is not settled and must not become a durable answer"
+            );
+            assert!(
+                ledger.get(&key("t")).is_none(),
+                "a refused durable retain leaves the ledger untouched: {transient:?}"
+            );
+
+            // Volatile is what it is, and that is still allowed.
+            ledger
+                .retain(operation(1), &key("t"), transient.clone(), false)
+                .expect("a transient failure may be retained volatile");
+            assert!(
+                !ledger.is_durably_settled(&key("t")),
+                "and never reports itself durably settled: {transient:?}"
+            );
+            assert_eq!(ledger.status(&key("t")), transient.status());
+        }
+    }
+
+    /// **F19.** A key whose volatile record is transient can still settle later,
+    /// and the F10 invariant is untouched: a settled record is never overwritten.
+    #[test]
+    fn f19_a_transient_key_can_still_settle_afterwards() {
+        let mut ledger = RetainedErrorLedger::new();
+        let transient = FacadeError::protocol(Nfs4Status::DELAY, OpCode::Write, 1);
+        ledger
+            .retain(operation(1), &key("k"), transient, false)
+            .expect("volatile");
+        assert!(!ledger.is_durably_settled(&key("k")));
+
+        let settled = FacadeError::protocol(Nfs4Status::NOSPC, OpCode::Write, 1);
+        ledger
+            .retain(operation(2), &key("k"), settled.clone(), true)
+            .expect("a genuinely settled answer may replace a volatile one");
+        assert!(ledger.is_durably_settled(&key("k")));
+        assert_eq!(ledger.status(&key("k")), Some(Nfs4Status::NOSPC));
+
+        // And it is final: neither a different answer nor a demotion is taken.
+        assert_eq!(
+            ledger.retain(
+                operation(3),
+                &key("k"),
+                FacadeError::protocol(Nfs4Status::EXIST, OpCode::Write, 1),
+                true
+            ),
+            Err(ReplayError::KeyConflict)
+        );
+        assert_eq!(
+            ledger.retain(operation(3), &key("k"), settled, false),
+            Err(ReplayError::KeyConflict)
+        );
+        assert_eq!(ledger.status(&key("k")), Some(Nfs4Status::NOSPC));
     }
 
     #[test]

@@ -80,7 +80,21 @@ pub(super) struct CallArena {
     #[allow(clippy::vec_box)]
     _bitmaps: Vec<Box<[u32; 2]>>,
     /// READ destination or WRITE source, when the COMPOUND has one.
+    ///
+    /// The allocation is never zero-sized — see [`own`] — so its length is
+    /// storage, not the length the operation declares. Those are tracked apart
+    /// by [`Arena::io_len`] (**F22**).
     io: Option<Box<[u8]>>,
+    /// The I/O length this COMPOUND actually declares, which for an empty
+    /// buffer is *not* the allocation's length.
+    ///
+    /// **F22.** `own` pads an empty buffer to one byte so the pointer C receives
+    /// is never dangling, and `io_buffer` returned that padded length as the
+    /// operation's. A zero-length WRITE therefore encoded `data_len: 0` in the
+    /// XDR arguments while handing libnfs a one-byte iovector, so the argument
+    /// and the vector disagreed about the request; a zero-count READ likewise
+    /// exposed a destination larger than the count it asked for.
+    io_len: usize,
     /// The root argument struct handed to libnfs.
     compound: Box<sys::COMPOUND4args>,
     /// Task primitive this COMPOUND needs.
@@ -115,6 +129,7 @@ impl CallArena {
             _owned: Vec::new(),
             _bitmaps: Vec::new(),
             io: None,
+            io_len: 0,
             compound: Box::new(unsafe { core::mem::zeroed() }),
             kind,
         };
@@ -150,18 +165,28 @@ impl CallArena {
     /// Bytes libnfs decoded into the READ destination, bounded by `count`.
     ///
     /// Returns `None` when this arena has no destination buffer, and refuses a
-    /// count larger than the buffer that was actually allocated rather than
-    /// reading past it.
+    /// count larger than the READ actually asked for rather than reading past it.
+    ///
+    /// **F22.** Bounded by the *declared* length, not by the allocation. The two
+    /// differ for a zero-count READ, where the allocation is padded to one byte:
+    /// bounding by storage would have let a server that answered with more bytes
+    /// than were requested have one of them read back.
     pub(super) fn read_bytes(&self, count: usize) -> Option<&[u8]> {
+        if count > self.io_len {
+            return None;
+        }
         let buffer = self.io.as_deref()?;
         buffer.get(..count)
     }
 
     /// READ destination or WRITE source, if this COMPOUND has one.
+    ///
+    /// **F22.** The length is what the operation declares, so the iovector agrees
+    /// with the XDR argument beside it. The pointer is still the padded
+    /// allocation's, which is what keeps it non-dangling for a zero-length call.
     pub(super) fn io_buffer(&mut self) -> Option<(*mut u8, usize)> {
-        self.io
-            .as_mut()
-            .map(|buffer| (buffer.as_mut_ptr(), buffer.len()))
+        let length = self.io_len;
+        self.io.as_mut().map(|buffer| (buffer.as_mut_ptr(), length))
     }
 
     /// Take ownership of one variable-length argument buffer and return the
@@ -266,8 +291,11 @@ impl CallArena {
                 count,
             } => {
                 let capped = (*count as usize).min(limits.max_reply_bytes);
-                // Destination for the zero-copy decode libnfs performs.
-                self.io = Some(own(vec![0u8; capped.max(1)]));
+                // Destination for the zero-copy decode libnfs performs. The
+                // allocation is padded to a byte so its pointer is valid; the
+                // length the request declares is `capped` (F22).
+                self.io = Some(own(vec![0u8; capped]));
+                self.io_len = capped;
                 out.nfs_argop4_u.opread = sys::READ4args {
                     stateid: to_stateid(stateid),
                     offset: *offset,
@@ -287,6 +315,8 @@ impl CallArena {
                 let pointer = buffer.as_mut_ptr().cast::<c_char>();
                 let length = data.len() as u32;
                 self.io = Some(buffer);
+                // F22: what the WRITE declares, not what was allocated for it.
+                self.io_len = data.len();
                 out.nfs_argop4_u.opwrite = sys::WRITE4args {
                     stateid: to_stateid(stateid),
                     offset: *offset,
@@ -727,3 +757,145 @@ const READ_LT: sys::nfs_lock_type4 = 1;
 const WRITE_LT: sys::nfs_lock_type4 = 2;
 const READW_LT: sys::nfs_lock_type4 = 3;
 const WRITEW_LT: sys::nfs_lock_type4 = 4;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handle::{FileHandle, Stateid};
+    use crate::transport::{Compound, Nfs4Op, Stability};
+
+    fn limits() -> TransportLimits {
+        TransportLimits {
+            max_inflight: 1,
+            max_queue_depth: 8,
+            max_reply_bytes: 1024 * 1024,
+            default_deadline: crate::transport::Deadline { millis: 5_000 },
+        }
+    }
+
+    fn handle() -> FileHandle {
+        FileHandle::from_wire(vec![0u8; 8]).expect("eight bytes is a valid filehandle")
+    }
+
+    /// **F22.** A zero-length WRITE declares zero bytes and hands libnfs a
+    /// zero-length iovector, not the one-byte allocation that keeps its pointer
+    /// valid.
+    ///
+    /// `own` pads an empty buffer to a byte because a zero-length `Box<[u8]>`
+    /// has a dangling pointer and libnfs passes argument pointers to `writev`.
+    /// `io_buffer` returned that padded length as the operation's, so the XDR
+    /// argument said `data_len: 0` while the vector said one byte: the request
+    /// and the vector describing it disagreed.
+    #[test]
+    fn f22_a_zero_length_write_declares_zero_bytes() {
+        let mut arena = CallArena::build(
+            &Compound::new(
+                *b"wr00",
+                vec![
+                    Nfs4Op::PutFh(handle()),
+                    Nfs4Op::Write {
+                        stateid: Stateid::ANONYMOUS,
+                        offset: 0,
+                        stability: Stability::FileSync,
+                        data: Vec::new(),
+                    },
+                ],
+            ),
+            &limits(),
+        )
+        .expect("a zero-length write is a legal COMPOUND");
+
+        let (pointer, length) = arena.io_buffer().expect("a WRITE arena has a buffer");
+        assert!(
+            !pointer.is_null(),
+            "the pointer stays valid, which is why own pads"
+        );
+        assert_eq!(
+            length, 0,
+            "and the declared length is the one the WRITE carries"
+        );
+    }
+
+    /// **F22.** A non-empty WRITE is unaffected: declared length is the data's.
+    #[test]
+    fn f22_a_nonempty_write_declares_its_own_length() {
+        let mut arena = CallArena::build(
+            &Compound::new(
+                *b"wr04",
+                vec![
+                    Nfs4Op::PutFh(handle()),
+                    Nfs4Op::Write {
+                        stateid: Stateid::ANONYMOUS,
+                        offset: 0,
+                        stability: Stability::FileSync,
+                        data: b"abcd".to_vec(),
+                    },
+                ],
+            ),
+            &limits(),
+        )
+        .expect("build");
+        assert_eq!(arena.io_buffer().expect("buffer").1, 4);
+    }
+
+    /// **F22.** A zero-count READ exposes a zero-length destination, and cannot
+    /// have a byte read back out of its padding.
+    #[test]
+    fn f22_a_zero_count_read_exposes_no_destination_bytes() {
+        let mut arena = CallArena::build(
+            &Compound::new(
+                *b"rd00",
+                vec![
+                    Nfs4Op::PutFh(handle()),
+                    Nfs4Op::Read {
+                        stateid: Stateid::ANONYMOUS,
+                        offset: 0,
+                        count: 0,
+                    },
+                ],
+            ),
+            &limits(),
+        )
+        .expect("a zero-count read is a legal COMPOUND");
+
+        let (pointer, length) = arena.io_buffer().expect("a READ arena has a buffer");
+        assert!(!pointer.is_null());
+        assert_eq!(
+            length, 0,
+            "the destination the server is told about is empty"
+        );
+        assert_eq!(
+            arena.read_bytes(0).map(<[u8]>::len),
+            Some(0),
+            "zero bytes read back is the whole of a zero-count READ"
+        );
+        assert_eq!(
+            arena.read_bytes(1),
+            None,
+            "a server answering more than it was asked for must not be read out of the padding"
+        );
+    }
+
+    /// **F22.** A non-zero READ still bounds `read_bytes` by what it asked for.
+    #[test]
+    fn f22_a_read_bounds_its_destination_by_the_declared_count() {
+        let mut arena = CallArena::build(
+            &Compound::new(
+                *b"rd08",
+                vec![
+                    Nfs4Op::PutFh(handle()),
+                    Nfs4Op::Read {
+                        stateid: Stateid::ANONYMOUS,
+                        offset: 0,
+                        count: 8,
+                    },
+                ],
+            ),
+            &limits(),
+        )
+        .expect("build");
+        assert_eq!(arena.io_buffer().expect("buffer").1, 8);
+        assert_eq!(arena.read_bytes(8).map(<[u8]>::len), Some(8));
+        assert_eq!(arena.read_bytes(9), None);
+    }
+}

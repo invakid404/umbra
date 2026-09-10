@@ -1123,15 +1123,26 @@ fn eio_latches_the_original_failure_and_refuses_a_clean_release() {
     );
 
     // Three further recovery attempts, each returning something less specific.
+    // `BlockedRecoverable` is terminal (F06), so each of these is refused before
+    // it can move anything: the stop is what it was, the attempt is not counted,
+    // and the latched status is untouched. Before F06 these ran `decide` again
+    // and only the latch stopped the later status winning.
     for later in [
         FacadeError::protocol(Nfs4Status::SERVERFAULT, OpCode::Write, 1),
         FacadeError::Replay(ReplayError::Indeterminate),
         FacadeError::protocol(Nfs4Status::DELAY, OpCode::Write, 1),
     ] {
-        run.machine
-            .enter(CrashWindow::ServerEio, &evidence().with_error(later));
+        assert_eq!(
+            run.machine
+                .enter(CrashWindow::ServerEio, &evidence().with_error(later)),
+            RecoveryState::BlockedRecoverable
+        );
     }
-    assert_eq!(run.machine.attempts(), 4);
+    assert_eq!(
+        run.machine.attempts(),
+        1,
+        "a stopped machine counts no further attempts"
+    );
     assert_eq!(
         run.machine.status().map(|s| s.0),
         Some(5),
@@ -1270,10 +1281,17 @@ fn sigstop_resume_stays_blocked_until_queued_effects_are_excluded() {
         "queued remote effects that cannot be excluded keep the run blocked"
     );
 
+    // The remaining two evidence combinations each get their own machine.
+    // `BlockedRecoverable` is terminal (F06), so a machine that has already
+    // stopped answers with its stop rather than re-deciding — which is the whole
+    // point of the state, and means a per-combination assertion has to start from
+    // a run that has not stopped.
+    let fresh = || OutageMachine::running(OutageBudget::DESIGN_DEFAULTS, false);
+
     // Even with the queue proven empty, a suspend longer than the outage budget
     // means the authority this session held may have lapsed while it could not
     // check. It is poisoned, not resumed.
-    let long_gap = run.machine.enter(
+    let long_gap = fresh().enter(
         CrashWindow::UmbraSigstopResume,
         &evidence()
             .with_admission(AdmissionStanding::Held(admitted.epoch()))
@@ -1283,7 +1301,7 @@ fn sigstop_resume_stays_blocked_until_queued_effects_are_excluded() {
     assert_eq!(long_gap, RecoveryState::BlockedRecoverable);
 
     // A short suspend with the queue proven empty may revalidate.
-    let short_gap = run.machine.enter(
+    let short_gap = fresh().enter(
         CrashWindow::UmbraSigstopResume,
         &evidence()
             .with_admission(AdmissionStanding::Held(admitted.epoch()))
@@ -1291,6 +1309,9 @@ fn sigstop_resume_stays_blocked_until_queued_effects_are_excluded() {
             .io_excluded(true),
     );
     assert_eq!(short_gap, RecoveryState::Recovering);
+
+    // And the stopped run stays stopped through both of them.
+    assert_eq!(run.machine.state(), RecoveryState::BlockedRecoverable);
 
     assert_eq!(
         run.machine.retained().expect("latched").error(),
@@ -1569,3 +1590,159 @@ fn no_window_and_no_policy_produces_a_takeover() {
 
 /// The in-memory store, aliased so the takeover assertion above needs no server.
 type MemoryStore = umbra_storage_nfs_userspace::authority::marker::MemoryMarkerStore;
+
+// --- F07: the marker reader follows short READ replies -----------------------
+
+/// **F07.** The admission marker is read whole, across as many short replies as
+/// the server chooses to send.
+///
+/// At the reviewed candidate `ServerMarkerStore::read` decoded exactly one
+/// `READ` reply regardless of `eof`. A short reply is legal —
+/// [RFC 7530 §16.25.4](https://www.rfc-editor.org/rfc/rfc7530.html#section-16.25.4)
+/// permits fewer bytes than requested with `eof` clear — so a server that capped
+/// its replies handed `AdmissionMarker::decode` a fragment of the 256-byte
+/// extended record. `decode` accepts exactly 16 or exactly 256 bytes, so the
+/// fragment became a malformed-marker refusal: a healthy held run would deny its
+/// own holder, and a released run would deny its successor.
+///
+/// This is the same protocol mistake as F04 but a different reader on a
+/// different call path; fixing `anchor.rs` alone does not fix it.
+#[test]
+fn f07_a_short_read_reply_does_not_split_the_extended_marker() {
+    for cap in [1_u32, 3, 255] {
+        let mut fake = FakeTransport::new();
+        let export_root = fake.root();
+        let provider = fake.insert_directory(&export_root, layout::PRIVATE_DIR);
+        // Every READ on this server is short, from the very first call.
+        fake.set_read_cap(Some(cap));
+        let shared = SharedFake::new(fake);
+
+        let mut session = StateSession::new(
+            Backend::Fake,
+            Box::new(shared.clone()),
+            identity_for("f07-holder", Verifier([0x5A; 8])),
+        );
+        let root = session.root(DEADLINE).expect("export root");
+        session
+            .establish_and_adopt(&root, 0, DEADLINE)
+            .expect("establish");
+
+        let admitted = {
+            let (state, transport) = session.split();
+            let owners = state.incarnation().expect("adopted").open_owners();
+            let mut store = ServerMarkerStore::new(
+                transport,
+                owners,
+                provider.clone(),
+                marker_name(),
+                DEADLINE,
+            );
+            AdmissionControl::new(run_id(), &mut store).acquire(&AdmissionRequest::cooperative(
+                WriterId("f07-holder".to_owned()),
+                WriterToken([9; 16]),
+            ))
+        };
+        assert!(
+            matches!(admitted, AdmissionOutcome::Admitted(_)),
+            "cap {cap}: the first session must be admitted, got {admitted:?}"
+        );
+
+        // The record reads back whole and decodes, which a truncated read could
+        // not do: `decode` accepts only 16 or 256 bytes.
+        let (state, transport) = session.split();
+        let owners = state.incarnation().expect("adopted").open_owners();
+        let mut store =
+            ServerMarkerStore::new(transport, owners, provider.clone(), marker_name(), DEADLINE);
+        let bytes = store.read().expect("read").expect("marker present");
+        assert_eq!(
+            bytes.len(),
+            umbra_storage_nfs_userspace::authority::marker::EXTENDED_MARKER_BYTES,
+            "cap {cap}: the whole extended record must be recovered"
+        );
+        assert_marker(
+            Some(AdmissionMarker::decode(&bytes).expect("decode")),
+            "f07-holder",
+            AdmissionPhase::Held,
+            LeaseEpoch(1),
+        );
+    }
+}
+
+/// **F07.** A 16-byte legacy lock survives short replies too, and is still
+/// recognised as the legacy record rather than as a fragment.
+#[test]
+fn f07_b_a_legacy_marker_survives_short_reads() {
+    let mut fake = FakeTransport::new();
+    let export_root = fake.root();
+    let provider = fake.insert_directory(&export_root, layout::PRIVATE_DIR);
+    fake.insert_file(&provider, layout::WRITER_LOCK_FILE, vec![0xAB; 16]);
+    fake.set_read_cap(Some(5));
+    let shared = SharedFake::new(fake);
+
+    let mut session = StateSession::new(
+        Backend::Fake,
+        Box::new(shared.clone()),
+        identity_for("f07-legacy", Verifier([0x5A; 8])),
+    );
+    let root = session.root(DEADLINE).expect("export root");
+    session
+        .establish_and_adopt(&root, 0, DEADLINE)
+        .expect("establish");
+
+    let (state, transport) = session.split();
+    let owners = state.incarnation().expect("adopted").open_owners();
+    let mut store =
+        ServerMarkerStore::new(transport, owners, provider.clone(), marker_name(), DEADLINE);
+    let bytes = store.read().expect("read").expect("marker present");
+    assert_eq!(
+        bytes.len(),
+        16,
+        "the legacy record is 16 bytes, not a prefix"
+    );
+    let marker = AdmissionMarker::decode(&bytes).expect("a legacy lock decodes");
+    assert_eq!(
+        marker.phase(),
+        AdmissionPhase::Held,
+        "a legacy lock is a held marker: {marker:?}"
+    );
+}
+
+/// **F07.** A server that returns no bytes and no end of file is refused rather
+/// than looped on, and the refusal is a reply-shape failure.
+#[test]
+fn f07_c_a_stalled_marker_read_is_refused() {
+    let mut fake = FakeTransport::new();
+    let export_root = fake.root();
+    let provider = fake.insert_directory(&export_root, layout::PRIVATE_DIR);
+    fake.insert_file(&provider, layout::WRITER_LOCK_FILE, vec![0xAB; 16]);
+    fake.set_read_cap(Some(0));
+    let shared = SharedFake::new(fake);
+
+    let mut session = StateSession::new(
+        Backend::Fake,
+        Box::new(shared.clone()),
+        identity_for("f07-stall", Verifier([0x5A; 8])),
+    );
+    let root = session.root(DEADLINE).expect("export root");
+    session
+        .establish_and_adopt(&root, 0, DEADLINE)
+        .expect("establish");
+
+    let (state, transport) = session.split();
+    let owners = state.incarnation().expect("adopted").open_owners();
+    let mut store =
+        ServerMarkerStore::new(transport, owners, provider.clone(), marker_name(), DEADLINE);
+    let failed = store
+        .read()
+        .expect_err("a server that never advances cannot produce a whole marker");
+    assert!(
+        matches!(
+            failed,
+            FacadeError::Transport(
+                umbra_storage_nfs_userspace::error::TransportError::Malformed(_)
+            )
+        ),
+        "a stalled read is a reply-shape failure, not an absent marker: {failed:?}"
+    );
+    assert_eq!(failed.class(), ErrorClass::SafeStop);
+}
