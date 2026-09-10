@@ -1081,3 +1081,311 @@ fn f31_a_failed_cleanup_is_retained_beside_the_identity_change() {
         .expect("the cleanup failure is retained as evidence");
     assert_eq!(retained.status(), Some(Nfs4Status::SERVERFAULT));
 }
+
+// --- F12: partial journal preparation does not conflict with its own retry ---
+
+/// Fails the first `GUARDED4` OPEN that creates a `.provider/retries` record
+/// whose name starts with `prefix`.
+///
+/// `definite` chooses between the two failure shapes that matter: a server status
+/// (the operation provably did not happen) and a lost connection (its disposition
+/// is unknown). The whole point of F12's accepted scope is that only the first
+/// may be resumed.
+struct FailRecordCreate {
+    inner: FakeTransport,
+    prefix: &'static str,
+    definite: bool,
+    fired: bool,
+}
+
+impl RawTransport for FailRecordCreate {
+    fn wire_profile(&self) -> umbra_storage_nfs_userspace::transport::WireProfile {
+        self.inner.wire_profile()
+    }
+    fn limits(&self) -> umbra_storage_nfs_userspace::transport::TransportLimits {
+        self.inner.limits()
+    }
+    fn connection(&self) -> umbra_storage_nfs_userspace::transport::ConnectionState {
+        self.inner.connection()
+    }
+    fn submit(
+        &mut self,
+        call: umbra_storage_nfs_userspace::transport::Compound,
+        call_deadline: Deadline,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::CompoundReply,
+    > {
+        use umbra_storage_nfs_userspace::transport::{Nfs4Op, OpenClaim, OpenHow};
+        let creates = call.ops.iter().any(|op| match op {
+            Nfs4Op::Open(args) => {
+                let named = match &args.claim {
+                    OpenClaim::Null { name } => {
+                        String::from_utf8_lossy(name.as_bytes()).starts_with(self.prefix)
+                    }
+                    OpenClaim::Previous { .. } => false,
+                };
+                named && matches!(args.how, OpenHow::Guarded { .. })
+            }
+            _ => false,
+        });
+        if creates && !self.fired {
+            self.fired = true;
+            if self.definite {
+                return Ok(umbra_storage_nfs_userspace::transport::CompoundReply {
+                    tag: call.tag.clone(),
+                    results: Vec::new(),
+                    failure: Some(umbra_storage_nfs_userspace::error::ProtocolError {
+                        status: umbra_storage_nfs_userspace::error::Nfs4Status::ACCESS,
+                        op: umbra_storage_nfs_userspace::transport::OpCode::Open,
+                        index: 1,
+                    }),
+                });
+            }
+            return Err(
+                umbra_storage_nfs_userspace::error::TransportError::Disconnected {
+                    epoch: umbra_storage_nfs_userspace::transport::ConnectionEpoch(1),
+                    detail: "the record create's reply was lost".into(),
+                },
+            );
+        }
+        self.inner.submit(call, call_deadline)
+    }
+    fn cancel(
+        &mut self,
+        token: umbra_storage_nfs_userspace::transport::CallToken,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::Retirement,
+    > {
+        self.inner.cancel(token)
+    }
+    fn reconnect(
+        &mut self,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::ConnectionEpoch,
+    > {
+        self.inner.reconnect()
+    }
+    fn install_faults(&mut self, plan: Box<dyn umbra_storage_nfs_userspace::transport::FaultPlan>) {
+        self.inner.install_faults(plan)
+    }
+}
+
+fn create_request(
+    run_id: RunId,
+    epoch: umbra_core::LeaseEpoch,
+    key: &str,
+    file: &[u8],
+) -> umbra_core::StorageRequest {
+    umbra_core::StorageRequest {
+        context: umbra_core::RequestContext {
+            run_id,
+            operation_id: umbra_core::OperationId(Uuid::new_v4()),
+            idempotency_key: umbra_core::IdempotencyKey(key.into()),
+            writer_epoch: Some(epoch),
+        },
+        operation: umbra_core::StorageOperation::Create {
+            path: path(file),
+            options: umbra_core::CreateOptions {
+                kind: umbra_core::CreateKind::File,
+                mode: 0o644,
+            },
+        },
+    }
+}
+
+fn retry_names(storage: &mut NfsUserspaceStorage, run_id: RunId) -> Vec<String> {
+    let transport = storage.transport().expect("transport");
+    let retries = walk(
+        transport,
+        run_id,
+        &[layout::PRIVATE_DIR, layout::RETRIES_DIR],
+    );
+    let mut out = Vec::new();
+    let mut cursor = umbra_storage_nfs_userspace::transport::DirCookie(0);
+    let mut verifier = umbra_storage_nfs_userspace::transport::DirVerifier([0; 8]);
+    loop {
+        let page = transport
+            .readdir(
+                &retries,
+                umbra_storage_nfs_userspace::transport::ReadDirRequest {
+                    cookie: cursor,
+                    verifier,
+                    dir_count: 4096,
+                    max_count: 4096,
+                    attrs: umbra_storage_nfs_userspace::transport::AttrMask::STAT,
+                },
+                deadline(),
+            )
+            .expect("readdir the retries directory");
+        verifier = page.verifier;
+        for entry in &page.entries {
+            out.push(String::from_utf8_lossy(entry.name.as_bytes()).into_owned());
+            cursor = entry.cookie;
+        }
+        if page.eof || page.entries.is_empty() {
+            break;
+        }
+    }
+    out.sort();
+    out
+}
+
+/// **F12.** A definite failure part way through preparation does not make the
+/// identical request permanently unadmittable.
+///
+/// Preparation is three `GUARDED4` creates — sidecar, index, intent — and a
+/// server status part way through — here `NFS4ERR_ACCESS`, chosen because it is
+/// definite without also latching the run the way an I/O failure does — leaves
+/// the earlier ones standing with nothing dispatched. The candidate then refused
+/// the identical retry with its own work:
+/// the index it wrote was read back as another key's claim, and the sidecar it
+/// wrote was answered `NFS4ERR_EXIST`. Neither is a conflict.
+///
+/// Only *definite* failures are resumed. The lost-reply control below is the half
+/// that must stay blocked.
+#[test]
+fn f12_a_definite_failure_after_the_sidecar_does_not_block_the_identical_retry() {
+    for prefix in [layout::RETRY_OP_PREFIX, layout::RETRY_KEY_PREFIX] {
+        let run_id = fresh_run();
+        let mut storage = NfsUserspaceStorage::with_facades(
+            config(),
+            Box::new(FailRecordCreate {
+                inner: seed_released_run(run_id, Some(0)),
+                prefix,
+                definite: true,
+                fired: false,
+            }),
+            Box::new(FakeReplayLog::default()),
+        )
+        .expect("provider");
+        open_existing(&mut storage, run_id).expect("the run opens");
+        let epoch = storage
+            .admission()
+            .expect("a run is open")
+            .admitted()
+            .epoch();
+
+        let request = create_request(run_id, epoch, "half-prepared", b"half-prepared.txt");
+        let refused = storage
+            .execute(&request)
+            .expect_err("the injected NFS4ERR_ACCESS surfaces");
+        assert_eq!(
+            refused.kind,
+            ErrorKind::Denied,
+            "{prefix}: a definite server status, not an unknown disposition: {refused:?}"
+        );
+
+        // Nothing was dispatched against the target: only preparation ran.
+        let held = retry_names(&mut storage, run_id);
+        assert!(
+            held.iter().any(|name| name.starts_with("pre-")),
+            "{prefix}: the sidecar landed before the failure: {held:?}"
+        );
+        assert!(
+            !held.iter().any(|name| name.starts_with(prefix)),
+            "{prefix}: the record the failure hit did not land: {held:?}"
+        );
+        let probe = storage.execute(&umbra_core::StorageRequest {
+            context: umbra_core::RequestContext {
+                run_id,
+                operation_id: umbra_core::OperationId(Uuid::new_v4()),
+                idempotency_key: umbra_core::IdempotencyKey(format!("probe-{prefix}")),
+                writer_epoch: None,
+            },
+            operation: umbra_core::StorageOperation::Stat {
+                path: path(b"half-prepared.txt"),
+            },
+        });
+        assert_eq!(
+            probe
+                .expect_err("nothing was dispatched against the target")
+                .kind,
+            ErrorKind::NotFound,
+            "{prefix}: preparation must not have touched the namespace"
+        );
+
+        // The fault was one-shot, so the identical request may now be admitted.
+        let created = storage.execute(&request).unwrap_or_else(|error| {
+            panic!("{prefix}: the identical retry must be admitted: {error:?}")
+        });
+        assert!(matches!(created, umbra_core::StorageResponse::Created(_)));
+        let after = retry_names(&mut storage, run_id);
+        assert!(
+            after
+                .iter()
+                .any(|name| name.starts_with(layout::RETRY_KEY_PREFIX)),
+            "{prefix}: preparation completed on the retry: {after:?}"
+        );
+    }
+}
+
+/// **F12, negative control.** A *lost* reply during preparation stays blocked.
+///
+/// This is the half the bot's broader remedy would have broken. When the record
+/// create's disposition is unknown, a `GUARDED4` create may still land after the
+/// absence was observed, so matching preparation is not evidence that nothing is
+/// outstanding. The provider's unresolved-call ledger holds an `IntentWrite`
+/// obligation for the key, and only that key's own settled record discharges it —
+/// never absence alone.
+#[test]
+fn f12_a_lost_reply_during_preparation_is_still_blocked() {
+    let run_id = fresh_run();
+    let mut storage = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(FailRecordCreate {
+            inner: seed_released_run(run_id, Some(0)),
+            prefix: layout::RETRY_KEY_PREFIX,
+            definite: false,
+            fired: false,
+        }),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("provider");
+    open_existing(&mut storage, run_id).expect("the run opens");
+    let epoch = storage
+        .admission()
+        .expect("a run is open")
+        .admitted()
+        .epoch();
+
+    let request = create_request(run_id, epoch, "lost-intent", b"lost-intent.txt");
+    let lost = storage
+        .execute(&request)
+        .expect_err("the lost reply surfaces");
+    assert_eq!(
+        lost.kind,
+        ErrorKind::StorageUnavailable,
+        "the disposition must be unknown, or this is not the control it claims to be"
+    );
+
+    // The identical request is refused: absence of the intent record does not
+    // exclude a create that may still land.
+    let blocked = storage
+        .execute(&request)
+        .expect_err("an unknown intent write is not resumable by matching preparation");
+    assert_eq!(blocked.kind, ErrorKind::InvalidState);
+    assert!(
+        blocked.context.contains("disposition is unknown"),
+        "the refusal must be the unresolved-call gate: {}",
+        blocked.context
+    );
+
+    // And so is unrelated work, and the release.
+    let unrelated = storage
+        .execute(&create_request(
+            run_id,
+            epoch,
+            "unrelated",
+            b"unrelated.txt",
+        ))
+        .expect_err("the run admits no new mutation either");
+    assert_eq!(unrelated.kind, ErrorKind::InvalidState);
+    let lease = storage.admission().expect("admitted").lease();
+    assert_eq!(
+        storage
+            .release_writer(&lease)
+            .expect_err("no clean release over an unknown intent write")
+            .kind,
+        ErrorKind::LeaseLost
+    );
+}

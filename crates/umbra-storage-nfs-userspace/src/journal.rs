@@ -373,14 +373,33 @@ pub fn admit_fresh(
 
     // The operation id must be fresh too, or two different keys would be
     // claiming one operation identity.
+    //
+    // **F12.** "Fresh" used to mean "absent", which put this function's own
+    // partial results in conflict with its retry. Preparation is three `GUARDED4`
+    // creates — sidecar, then index, then intent — and a *definite* failure part
+    // way through leaves the earlier ones standing with nothing dispatched. The
+    // identical request could then never be admitted: the index it wrote itself
+    // was read back as another key's claim, and the sidecar it wrote itself was
+    // refused `NFS4ERR_EXIST`. Neither is a conflict; both are this key's own
+    // completed work.
+    //
+    // An index whose bytes name *this* key is exactly that, so it is reused. One
+    // naming a different key is the collision the check exists for and still
+    // refuses. Absence still takes the `GUARDED4` path below, so a racing
+    // contender is still refused by the server rather than by a local read.
     let operation_component = component(operation_name(request.context.operation_id).into_bytes())?;
-    if read_record(transport, &retries, &operation_component, deadline)?.is_some() {
-        return Err(UmbraError::new(
-            ErrorKind::InvalidInput,
-            operation,
-            "this operation id was already used under a different idempotency key",
-        ));
-    }
+    let recorded_index = read_record(transport, &retries, &operation_component, deadline)?;
+    let index_is_ours = match &recorded_index {
+        None => false,
+        Some(bytes) if bytes == key.as_bytes() => true,
+        Some(_) => {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidInput,
+                operation,
+                "this operation id was already used under a different idempotency key",
+            ))
+        }
+    };
 
     // R2-010: encode before anything is created, so an over-large record is
     // refused with the journal untouched rather than after its index exists.
@@ -398,27 +417,52 @@ pub fn admit_fresh(
             format!("the preconditions could not be encoded: {error}"),
         )
     })?;
-    write_new_record(
+    // **F12.** A sidecar this key already wrote, whose decoded preconditions are
+    // the ones being recorded now, is this attempt's own completed work: reuse
+    // it. One that decodes to *different* preconditions is a genuine conflict —
+    // the same key was prepared against a different before-state — and one that
+    // does not decode at all is corruption, which `read_preconditions` already
+    // reports as `CorruptJournal`. Neither is written over.
+    match read_preconditions(
         transport,
-        owners,
         &retries,
-        &precondition_component,
-        &precondition_bytes,
+        &request.context.idempotency_key,
         operation,
         deadline,
-    )?;
+    )? {
+        None => write_new_record(
+            transport,
+            owners,
+            &retries,
+            &precondition_component,
+            &precondition_bytes,
+            operation,
+            deadline,
+        )?,
+        Some(recorded) if recorded == *preconditions => {}
+        Some(_) => {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidInput,
+                operation,
+                "this idempotency key already recorded preconditions describing a different \
+                 before-state; the earlier evidence is retained rather than overwritten",
+            ))
+        }
+    }
 
     // Index next, then the intent. Both are `GUARDED4`, so a racing contender is
     // refused by the server rather than by a local read.
-    write_new_record(
-        transport,
-        owners,
-        &retries,
-        &operation_component,
-        key.as_bytes(),
-        operation,
-        deadline,
-    )?;
+    if !index_is_ours {
+        write_new_record(
+            transport,
+            owners,
+            &retries,
+            &operation_component,
+            key.as_bytes(),
+            operation,
+            deadline,
+        )?;
+    }
     write_new_record(
         transport,
         owners,
