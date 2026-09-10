@@ -910,10 +910,12 @@ impl Storage for NfsUserspaceStorage {
             transport,
             &mut self.state,
             operations.anchors(),
-            request.run_id,
-            writer.clone(),
-            writer_token(request.run_id, &writer),
-            epoch_floor,
+            crate::session::Claim {
+                run: request.run_id,
+                token: writer_token(request.run_id, &writer),
+                writer,
+                epoch_floor,
+            },
             deadline,
         )?;
 

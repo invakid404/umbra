@@ -35,7 +35,9 @@ opening duplicate role sessions in CLI assembly.
 Storage-nfs-userspace speaks NFSv4.0/TCP/AUTH_SYS from user space, so it needs no mount.
 It opens and creates runs, resolves paths, stats, enumerates, reads, writes, creates,
 renames, removes and sets metadata, and acquires product admission (one-session-one-Umbra)
-before it publishes a run binding. It advertises `durability: None` and `fencing: ReadOnly`:
+before it publishes a run binding. Rename is replacing only: NFSv4.0 has no atomic
+no-replace rename, so `RenameMode::NoReplace` is refused with `UnsupportedCapability`
+rather than emulated with a check-then-rename. It advertises `durability: None` and `fencing: ReadOnly`:
 no persistence boundary and no termination verifier is qualified, and `flush` reports the
 gate rather than issuing a receipt. It exposes opaque handles and no physical path, so
 `umbra run` cannot select it. Its live transport is behind the off-by-default `transport-raw`

@@ -598,3 +598,77 @@ fn cancelling_an_unknown_token_is_not_an_error_and_reports_drained() {
         .expect_err("a missing name is NFS4ERR_NOENT");
     assert_eq!(error.status(), Some(Nfs4Status::NOENT));
 }
+
+/// **R1-010**, the reviewer's acceptance case, executed against a real server.
+///
+/// Added at `collect_fix` rather than by the fixer: the fix landed but its test
+/// could not be written there, because `src/transport/raw/` does not compile
+/// without the pinned libnfs checkout that worktree lacked.
+///
+/// The review asks for "a malformed or over-budget reply followed by a valid
+/// request, asserting zero live registrations and no stale backpressure". An
+/// over-budget reply is the reachable half against a well-behaved server: a
+/// one-byte reply budget makes a real `GETATTR` overflow inside `decode`, on the
+/// exact `?` path that used to return before `retire`.
+///
+/// `max_inflight: 1` is what turns a leak into a visible failure rather than a
+/// silent one. Before the fix, the first over-budget call kept its registration,
+/// so the *second* submission was refused `QueueFull` and every later one too.
+/// Asserting "the tenth over-budget call still reports a decode failure, and a
+/// normal call afterwards still succeeds" therefore fails loudly on a regression
+/// instead of needing an accessor into private state.
+#[test]
+fn r1_010_an_over_budget_reply_retires_its_registration_on_a_real_server() {
+    let Some(fixture) = fixture() else {
+        eprintln!("skipped: UMBRA_NFS_RAW_FIXTURE is unset");
+        return;
+    };
+
+    let mut starved = fixture.config.clone();
+    // One byte of reply budget: every reply carrying attributes overflows it.
+    starved.limits.max_reply_bytes = 1;
+    // One concurrent call: a single retained registration is enough to jam this.
+    starved.limits.max_inflight = 1;
+    let deadline = Deadline { millis: 5_000 };
+
+    let mut transport =
+        LibnfsRawTransport::connect(starved).expect("connect to the m1-integrator fixture");
+
+    for attempt in 0..10 {
+        let error = transport
+            .lookup(&fixture.directory, &fixture.name, AttrMask::STAT, deadline)
+            .expect_err("a one-byte reply budget cannot decode a GETATTR reply");
+        // The original error survives retirement: it is the budget refusal, not
+        // a `QueueFull` produced by this transport's own leaked slot.
+        // The budget refusal is a `Malformed`, raised by `ReplyBudget::charge`.
+        match &error {
+            FacadeError::Transport(TransportError::Malformed(detail)) => {
+                assert!(
+                    detail.contains("max_reply_bytes"),
+                    "attempt {attempt}: expected the reply-budget refusal, got {detail}"
+                );
+            }
+            other => panic!("attempt {attempt}: expected a decode failure, got {other:?}"),
+        }
+        assert!(
+            !matches!(
+                &error,
+                FacadeError::Transport(TransportError::QueueFull { .. })
+            ),
+            "attempt {attempt}: a retained registration jammed the queue, which is \
+             exactly the leak R1-010 reports"
+        );
+    }
+
+    // No stale backpressure: a normal request on the same transport still works
+    // once the budget is adequate.
+    let mut healthy = fixture.config.clone();
+    healthy.limits.max_inflight = 1;
+    let mut transport =
+        LibnfsRawTransport::connect(healthy).expect("reconnect with an adequate budget");
+    for _ in 0..3 {
+        transport
+            .lookup(&fixture.directory, &fixture.name, AttrMask::STAT, deadline)
+            .expect("a valid request after decode failures must still succeed");
+    }
+}

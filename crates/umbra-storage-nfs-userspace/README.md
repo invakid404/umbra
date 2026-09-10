@@ -580,7 +580,13 @@ than leaving it to prose. `fault_matrix.rs` drives every `FaultPoint` against
 every `FaultAction` — `assert_eq!(cells.len(), 30, "5 fault points x 6 fault
 actions")` — asserting for each cell both that the transport consulted that fault
 point and that the outcome matched, so an action that carries no meaning at a
-point is asserted to be ignored rather than left untested.
+point is asserted to be ignored rather than left untested. It also carries the
+retirement case: a one-byte reply budget makes a real `GETATTR` overflow inside
+`decode`, and with one concurrent call allowed, a registration that survived the
+failure would refuse the next submission `QueueFull`. Ten consecutive over-budget
+calls each reporting the decode failure, followed by ordinary calls that succeed,
+is what "retirement happens on every return path" means in practice rather than
+in prose.
 
 `tests/live_state.rs` is the same idea one layer up: the protocol state machine
 driven over the **live** transport. It runs the six transitions this layer can

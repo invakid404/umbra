@@ -319,11 +319,6 @@ impl EventPump {
         self.epoch
     }
 
-    /// The current PDU disposal generation.
-    pub(super) fn disposals(&self) -> DisposalGeneration {
-        self.disposals
-    }
-
     /// Record that libnfs has errored and freed every outstanding PDU.
     ///
     /// **R1-009.** Called on every path where `rpc_reconnect_requeue` can have
