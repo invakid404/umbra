@@ -1776,40 +1776,6 @@ fn fake_root_evidence(
     evidence_from(&attributes)
 }
 
-/// Seed an existing run holding two named files.
-fn seed_two_files(
-    run_id: RunId,
-    first: &[u8],
-    first_bytes: &[u8],
-    second: &[u8],
-    second_bytes: &[u8],
-) -> FakeTransport {
-    let mut fake = seed_released_run(run_id, Some(0));
-    let root = walk_fake_root(&mut fake, run_id);
-    fake.insert_file(&root, first, first_bytes.to_vec());
-    fake.insert_file(&root, second, second_bytes.to_vec());
-    fake
-}
-
-/// Seed an interrupted record with two named files present.
-#[allow(clippy::too_many_arguments)]
-fn seed_interrupted_two(
-    run_id: RunId,
-    key: &str,
-    request: &StorageRequest,
-    preconditions: &umbra_storage_nfs_userspace::journal::Preconditions,
-    first: &[u8],
-    first_bytes: &[u8],
-    second: &[u8],
-    second_bytes: &[u8],
-) -> FakeTransport {
-    let mut fake = seed_interrupted(run_id, key, request, preconditions, None);
-    let root = walk_fake_root(&mut fake, run_id);
-    fake.insert_file(&root, first, first_bytes.to_vec());
-    fake.insert_file(&root, second, second_bytes.to_vec());
-    fake
-}
-
 /// The run's root anchor handle, resolved directly on the fake.
 fn walk_fake_root(fake: &mut FakeTransport, run_id: RunId) -> FileHandle {
     walk(fake, run_id, &[b"root"])
