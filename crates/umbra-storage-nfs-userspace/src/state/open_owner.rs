@@ -41,8 +41,10 @@ use crate::transport::{
 ///
 /// Carries its own seqid counter. `open` takes it by value, so one lease drives
 /// at most one OPEN attempt and a burned owner cannot be resurrected.
+/// **F20.** Not `Clone`: the lease *is* the owner's seqid authority until an
+/// `OpenFile` takes it over, so a copy is a second claim on one counter.
 #[must_use = "an allocated open owner must be spent on an OPEN or explicitly released"]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct OwnerLease {
     owner: OpenOwner,
     sequence: OwnerSequence,
@@ -581,8 +583,9 @@ where
 /// them; the M2 locking gate owns that decision. Allocation and sequencing live
 /// here so the gate finds a seam rather than an empty file, and so a lock owner
 /// is scoped to a client id by construction like every other owner.
+/// **F20.** Not `Clone`, for the same reason [`OwnerLease`] is not.
 #[must_use = "an allocated lock owner must be spent or explicitly released"]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct LockOwnerLease {
     client_id: ClientId,
     owner: Vec<u8>,

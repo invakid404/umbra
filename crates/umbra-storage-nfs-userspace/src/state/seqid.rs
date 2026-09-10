@@ -55,7 +55,17 @@ enum SequenceState {
 /// the authority for exactly one owner and hands it over — by value — to the
 /// [`OpenFile`](crate::handle::OpenFile) that a successful OPEN mints, so the two
 /// can never both believe they own the same counter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// **F20.** Deliberately neither `Clone` nor `Copy`. The whole ownership story
+/// above is "hands it over by value, so the two can never both believe they own
+/// the same counter" — and a derived `Copy` handed it over while keeping it.
+/// Two copies issued the same seqid for two different operations, which the
+/// server answers `NFS4ERR_BAD_SEQID` to at best and silently misapplies at
+/// worst; poisoning one copy left the other cheerfully usable, so the honest
+/// answer to a lost reply was discardable by making a copy first. `issue`
+/// borrowing mutably bounds *concurrent* operations on one value; it can say
+/// nothing about a second value that was never supposed to exist.
+#[derive(Debug, PartialEq, Eq)]
 pub struct OwnerSequence {
     state: SequenceState,
 }
@@ -181,6 +191,87 @@ impl Drop for SeqidTicket<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Type-level probe: does `T` implement `Clone`?
+    ///
+    /// Autoref specialisation. The inherent method on `Probe<T>` exists only when
+    /// `T: Clone`, and method resolution prefers an inherent method over a trait
+    /// one, so the answer is decided at compile time by whether the bound holds.
+    /// This is the "meaningful API check" a compile-fail harness would give,
+    /// without adding a dependency to get it.
+    struct Probe<T>(std::marker::PhantomData<T>);
+
+    trait NotCloneable {
+        fn cloneable(&self) -> bool {
+            false
+        }
+    }
+
+    impl<T> NotCloneable for Probe<T> {}
+
+    impl<T: Clone> Probe<T> {
+        fn cloneable(&self) -> bool {
+            true
+        }
+    }
+
+    /// **F20.** Seqid authority is not duplicable.
+    ///
+    /// `OwnerSequence` derived `Clone` and `Copy`, and `OwnerLease` derived
+    /// `Clone`, against this module's own contract: the counter is handed over
+    /// *by value* so two holders can never both believe they own it. A copy made
+    /// them both believe it. Two copies issued the same seqid for two different
+    /// operations — `NFS4ERR_BAD_SEQID` at best, a misapplied operation at worst
+    /// — and poisoning one left the other usable, so the honest answer to a lost
+    /// reply was discardable by copying first.
+    ///
+    /// `issue` borrowing mutably bounds *concurrent* operations on one value. It
+    /// can say nothing about a second value that was never supposed to exist,
+    /// which is why the derive had to go rather than the guard being tightened.
+    #[test]
+    fn f20_seqid_authority_cannot_be_duplicated() {
+        use std::marker::PhantomData;
+        // Each call is monomorphic on purpose: the inherent method can only be
+        // selected where the concrete type is known, so a generic helper would
+        // always resolve to the trait's default and answer `false` for
+        // everything — including the positive controls below.
+        assert!(
+            !Probe::<OwnerSequence>(PhantomData).cloneable(),
+            "OwnerSequence must not be Clone or Copy: a copy is a second claim on one counter"
+        );
+        assert!(
+            !Probe::<crate::state::open_owner::OwnerLease>(PhantomData).cloneable(),
+            "an unspent open-owner lease holds that counter and must not be duplicable either"
+        );
+        assert!(
+            !Probe::<crate::state::open_owner::LockOwnerLease>(PhantomData).cloneable(),
+            "nor a lock-owner lease"
+        );
+        // The probe is meaningful only if it can say yes.
+        assert!(
+            Probe::<Nfs4Status>(PhantomData).cloneable(),
+            "the probe detects Clone"
+        );
+        assert!(Probe::<PoisonReason>(PhantomData).cloneable());
+    }
+
+    /// **F20.** A poisoned owner stays poisoned: there is no second value to
+    /// carry on with.
+    #[test]
+    fn f20_poisoning_an_owner_leaves_nothing_usable_behind() {
+        let mut sequence = OwnerSequence::fresh();
+        sequence.issue().unwrap().commit();
+        assert_eq!(sequence.next_seqid(), Some(1));
+
+        // A lost reply: the seqid the server observed cannot be inferred.
+        sequence.issue().unwrap().abandon();
+        assert_eq!(sequence.poison(), Some(PoisonReason::OutcomeUnknown));
+        assert_eq!(sequence.next_seqid(), None);
+        assert!(
+            sequence.issue().is_err(),
+            "and no further operation may be issued for that owner"
+        );
+    }
 
     #[test]
     fn a_fresh_owner_starts_at_zero_and_advances_on_success() {
