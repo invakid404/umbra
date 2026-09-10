@@ -33,7 +33,6 @@ use umbra_core::{
 use crate::anchor::{Anchor, HandleMint, RunAnchors, Target};
 use crate::capability::{operation_name, storage_support, Support};
 use crate::crud::{read_anonymous, CreateDisposition, MutationIdentity, OpenObject, WriteAt};
-use crate::handle::ObjectIdentity;
 use crate::identity::PinnedObject;
 use crate::namespace::{
     apply as apply_namespace, NamespaceDispatcher, NamespaceMutation, NamespaceOutcome, RemoveKind,
@@ -288,6 +287,26 @@ impl Operations {
             let refused: Result<StorageResponse> = support.refuse(operation);
             return refused.map(|_| ());
         }
+        // R3-006: `storage_support` classifies by operation, and every `Rename`
+        // maps to the same Supported row whatever its mode. `NoReplace` was
+        // therefore refused only inside `Operations::rename`, which the provider
+        // reaches *after* observing state and writing the precondition sidecar,
+        // the operation index and the intent — so an unsupported request left a
+        // full set of durable records behind and then persisted its own
+        // rejection. An unsupported *sub*mode has to be refused here, with the
+        // rest of them.
+        //
+        // The refusal itself is R1-006's and is unchanged: NFSv4.0 RENAME always
+        // replaces, and emulating the guarantee with a destination probe is not
+        // atomic. `ops::rename` still repeats it, because that seam is reachable
+        // without a provider in front of it.
+        if let StorageOperation::Rename {
+            mode: RenameMode::NoReplace,
+            ..
+        } = &request.operation
+        {
+            return Err(no_replace_unsupported(operation));
+        }
         Ok(())
     }
 
@@ -305,46 +324,67 @@ impl Operations {
         &self,
         context: &mut OpsContext<'_>,
         request: &StorageRequest,
-    ) -> Result<crate::journal::Preconditions> {
+    ) -> Result<Observation> {
         let operation = operation_name(&request.operation);
         let primary = primary_path(&request.operation);
-        let (parent, target) = match primary {
-            None => (None, None),
+        let (parent, target, target_result) = match primary {
+            None => (None, None, None),
             Some(path) => self.observe_one(context, path, operation)?,
         };
-        let (destination_parent, destination) = match &request.operation {
+        let (destination_parent, destination, destination_result) = match &request.operation {
             StorageOperation::Rename { destination, .. } => {
                 self.observe_one(context, destination, operation)?
             }
-            _ => (None, None),
+            _ => (None, None, None),
         };
-        Ok(crate::journal::Preconditions {
-            parent,
-            target,
-            destination_parent,
-            destination,
+        Ok(Observation {
+            evidence: crate::journal::Preconditions {
+                parent,
+                target,
+                destination_parent,
+                destination,
+            },
+            target_result,
+            destination_result,
         })
     }
 
-    /// The parent's identity and the final component's, if it exists.
+    /// The parent's evidence, the final component's, and its current result.
+    ///
+    /// The `ObjectResult` is observed but never serialised: it is what lets a
+    /// recovery that proves an effect *landed* answer with the object's real stat
+    /// rather than blocking for want of a reply it could not rebuild (**R3-001**).
+    #[allow(clippy::type_complexity)]
     fn observe_one(
         &self,
         context: &mut OpsContext<'_>,
         path: &StoragePath,
         operation: &str,
-    ) -> Result<(Option<ObjectIdentity>, Option<ObjectIdentity>)> {
+    ) -> Result<(
+        Option<crate::journal::ObjectEvidence>,
+        Option<crate::journal::ObjectEvidence>,
+        Option<ObjectResult>,
+    )> {
         match self
             .anchors
             .resolve_parent(context.transport, path, context.deadline)
         {
-            Ok(Target::Anchor(pin)) => Ok((None, Some(pin.identity()))),
+            Ok(Target::Anchor(pin)) => {
+                let evidence = self.evidence_for(context, &pin)?;
+                let result = self.object_result(context, &pin)?;
+                Ok((None, Some(evidence), Some(result)))
+            }
             Ok(Target::Named { parent, name }) => {
-                let parent_identity = parent.identity();
+                let parent_evidence = self.evidence_for(context, &parent)?;
                 match self.child(context, &parent, &name, operation) {
-                    Ok(pinned) => Ok((Some(parent_identity), Some(pinned.identity()))),
+                    Ok(pinned) => {
+                        let evidence = self.evidence_for(context, &pinned)?;
+                        let result = self.object_result(context, &pinned)?;
+                        Ok((Some(parent_evidence), Some(evidence), Some(result)))
+                    }
                     // Absent is the observation, not a failure.
                     Err(error) if error.kind == ErrorKind::NotFound => {
-                        Ok((Some(parent_identity), None))
+                        Ok((Some(parent_evidence), None, None))
                     }
                     Err(error) => Err(error),
                 }
@@ -352,9 +392,28 @@ impl Operations {
             // The parent itself does not resolve. That is a real failure for a
             // mutation, and the preflight or the dispatch will report it; there
             // is simply nothing to record.
-            Err(error) if error.kind == ErrorKind::NotFound => Ok((None, None)),
+            Err(error) if error.kind == ErrorKind::NotFound => Ok((None, None, None)),
             Err(error) => Err(error),
         }
+    }
+
+    /// Identity plus the content state that says whether anything changed.
+    fn evidence_for(
+        &self,
+        context: &mut OpsContext<'_>,
+        pinned: &PinnedObject,
+    ) -> Result<crate::journal::ObjectEvidence> {
+        let attributes = pinned
+            .revalidate(context.transport, context.deadline)
+            .map_err(|error| error.to_umbra("observe"))?;
+        Ok(crate::journal::ObjectEvidence {
+            identity: pinned.identity(),
+            change: attributes.change,
+            size: attributes.size,
+            modified_nanos: attributes.time_modify.map(|time| {
+                i128::from(time.seconds) * 1_000_000_000 + i128::from(time.nanoseconds)
+            }),
+        })
     }
 
     /// Execute one contract primitive.
@@ -880,14 +939,7 @@ impl Operations {
             //
             // Refusing before any effect is the honest answer. Ordinary
             // `RenameMode::Replace` is unaffected.
-            return Err(UmbraError::new(
-                ErrorKind::UnsupportedCapability,
-                operation,
-                "atomic no-replace rename is not available over NFSv4.0: RENAME always \
-                 replaces, and emulating the guarantee with a destination probe is not \
-                 atomic. Use RenameMode::Replace, or check the destination yourself and \
-                 accept the race.",
-            ));
+            return Err(no_replace_unsupported(operation));
         }
         let (source_parent, source_name) = self.parent_and_name(context, source, operation)?;
         let (target_parent, target_name) = self.parent_and_name(context, destination, operation)?;
@@ -1085,6 +1137,35 @@ fn release(
             Err(error.to_umbra(operation))
         }
     }
+}
+
+/// What observing a mutation's target found.
+///
+/// The `evidence` half is persisted as the record's preconditions; the two
+/// `ObjectResult`s are not. They exist so a recovery that proves an effect landed
+/// can answer with the object's real stat instead of blocking for want of a reply
+/// it could not rebuild (**R3-001**).
+#[derive(Clone, Debug)]
+pub struct Observation {
+    /// The persisted evidence.
+    pub evidence: crate::journal::Preconditions,
+    /// The primary target's current result, when it exists.
+    pub target_result: Option<ObjectResult>,
+    /// A rename destination's current result, when it exists.
+    pub destination_result: Option<ObjectResult>,
+}
+
+/// The refusal an atomic no-replace rename gets (**R1-006**, hoisted by R3-006).
+///
+/// One text, two call sites: `Operations::preflight`, which runs before anything
+/// durable happens, and `Operations::rename`, which is the seam a direct caller
+/// reaches without a provider.
+fn no_replace_unsupported(operation: &str) -> UmbraError {
+    UmbraError::new(
+        ErrorKind::UnsupportedCapability,
+        operation,
+        "atomic no-replace rename is not available over NFSv4.0: RENAME always replaces, and          emulating the guarantee with a destination probe is not atomic. Use          RenameMode::Replace, or check the destination yourself and accept the race.",
+    )
 }
 
 /// The path a mutation's primary effect lands on, when it has one.

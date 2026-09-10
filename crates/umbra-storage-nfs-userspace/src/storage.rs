@@ -175,6 +175,14 @@ pub struct NfsUserspaceStorage {
     /// successor may already be live, and none of them may be retried into
     /// authority by the next call that happens to find `session` populated.
     authority_loss: Option<AuthorityLoss>,
+    /// The recovery that could not be settled, once one has been refused.
+    ///
+    /// **R3-001.** `docs/design/failure-model.md`'s BLOCKED_RECOVERABLE is a
+    /// *state*, not an error return: "stop new mutations and quiesce", retain the
+    /// marker, the replay data and the diagnostic, and resume only after the
+    /// recovery conditions change. Returning a blocked error and then accepting
+    /// the next mutation — or publishing a clean release — is none of that.
+    recovery_blocked: Option<UmbraError>,
     /// The original failure of a write or barrier that did not complete.
     ///
     /// **R2-003.** `docs/design/failure-model.md`'s "Server EIO / failed stable
@@ -267,6 +275,7 @@ impl NfsUserspaceStorage {
             session: None,
             serial: 0,
             authority_loss: None,
+            recovery_blocked: None,
             stable_write_failure: None,
             unsettled: Vec::new(),
         })
@@ -300,6 +309,7 @@ impl NfsUserspaceStorage {
             session: None,
             serial: 0,
             authority_loss: None,
+            recovery_blocked: None,
             stable_write_failure: None,
             unsettled: Vec::new(),
         })
@@ -555,24 +565,63 @@ impl NfsUserspaceStorage {
     }
 
     /// Consult the durable retry journal for `request` (**R1-004**).
-    fn journal_admit(
+    /// Consult the journal for this key, observing nothing (**R3-003**).
+    fn journal_lookup(
+        &mut self,
+        operation: &str,
+        request: &StorageRequest,
+    ) -> Result<crate::journal::Lookup> {
+        let deadline = self.config.deadline;
+        let (transport, _, private) = self.journal_scope(operation)?;
+        crate::journal::lookup(transport, &private, request, operation, deadline)
+    }
+
+    /// Observe the state a fresh or interrupted mutation acts on.
+    fn observe_now(
+        &mut self,
+        operation: &str,
+        request: &StorageRequest,
+    ) -> Result<crate::ops::Observation> {
+        let (operations, mut context) = self.request(
+            operation,
+            Some(&request.context.idempotency_key),
+            request.context.operation_id,
+        )?;
+        operations.observe(&mut context, request)
+    }
+
+    /// Record a fresh intent with its preconditions (**R2-003**).
+    fn journal_admit_fresh(
         &mut self,
         operation: &str,
         request: &StorageRequest,
         preconditions: &crate::journal::Preconditions,
-        observed: &crate::journal::Preconditions,
-    ) -> Result<crate::journal::Admission> {
+    ) -> Result<()> {
         let deadline = self.config.deadline;
         let (transport, owners, private) = self.journal_scope(operation)?;
-        crate::journal::admit(
+        crate::journal::admit_fresh(
             transport,
             owners,
             &private,
             request,
             preconditions,
-            observed,
             operation,
             deadline,
+        )
+    }
+
+    /// Settle an interrupted intent against the state observed now (**R2-003**).
+    fn journal_recover(
+        &mut self,
+        operation: &str,
+        request: &StorageRequest,
+        recorded: &crate::journal::Preconditions,
+        observed: &crate::ops::Observation,
+    ) -> Result<crate::journal::Admission> {
+        let deadline = self.config.deadline;
+        let (transport, owners, private) = self.journal_scope(operation)?;
+        crate::journal::recover_interrupted(
+            transport, owners, &private, request, recorded, observed, operation, deadline,
         )
     }
 
@@ -655,6 +704,23 @@ impl NfsUserspaceStorage {
         if let Some(loss) = &self.authority_loss {
             return Err(loss.refuse(operation));
         }
+        // R3-001: a blocked recovery is terminal for this run. The original
+        // diagnostic is reported verbatim, because the failure model requires the
+        // evidence and the diagnosis to be retained, and a fresh generic error
+        // would lose the reason the run stopped.
+        if request.operation.is_mutation() {
+            if let Some(retained) = &self.recovery_blocked {
+                return Err(UmbraError::new(
+                    ErrorKind::InvalidState,
+                    operation,
+                    format!(
+                        "this run is stopped: an interrupted operation could not be settled \
+                         from evidence, and it stays stopped until an operator resolves it. \
+                         The original diagnosis was: {retained}"
+                    ),
+                ));
+            }
+        }
         // R2-003: a latched write failure stops further mutations. The original
         // error is reported rather than a fresh one, because the failure model
         // requires the first failure to survive: "a later successful flush cannot
@@ -730,7 +796,22 @@ impl NfsUserspaceStorage {
     /// row whichever call reported it.
     fn note_failure(&mut self, operation: &str, request: &StorageRequest, error: &UmbraError) {
         self.observe_disposition(operation, error);
-        if matches!(request.operation, StorageOperation::WriteAt { .. })
+        // R3-001: a blocked recovery becomes a provider state, and it counts as
+        // unsettled work so the release that follows cannot be reported clean.
+        // An interrupted intent that could not be settled is precisely "uncertain
+        // old I/O" — handing the run on over it is what the failure model forbids.
+        if crate::journal::is_blocked(error) && self.recovery_blocked.is_none() {
+            self.recovery_blocked = Some(error.clone());
+            self.unsettled.push(format!(
+                "{operation}: unsettled recovery: {}",
+                error.context
+            ));
+        }
+        // R2-003, widened by R3-001: any journalled mutation whose I/O failed —
+        // not only a `WriteAt` — latches. A FILE_SYNC journal write for a Rename
+        // or Create that fails leaves exactly the same unresolved record, and the
+        // old request-kind filter let those through.
+        if request.operation.is_mutation()
             && error.kind == ErrorKind::Io
             && self.stable_write_failure.is_none()
         {
@@ -914,6 +995,7 @@ impl Storage for NfsUserspaceStorage {
         // outstanding. `close_run` clears both as well; doing it here too means a
         // run that is opened after a failed close cannot inherit the old verdict.
         self.authority_loss = None;
+        self.recovery_blocked = None;
         self.stable_write_failure = None;
         self.unsettled.clear();
         let transport = self.transport.as_deref_mut().ok_or_else(|| {
@@ -1141,42 +1223,63 @@ impl Storage for NfsUserspaceStorage {
         // recording one would consume durable space per lookup.
         let journalled = request.operation.is_mutation();
         if journalled {
-            // The journal's own round trips can fail the same way a dispatched
-            // mutation can, so their disposition is observed too (R1-002). A
-            // record write that reached the server and lost its reply leaves the
-            // journal in a state this session cannot account for.
-            // R2-003: the state this mutation is about to act on is observed
-            // before anything is written, and recorded beside the intent. It is
-            // both the precondition evidence a record must carry and, on a
-            // recovery, the "now" half of the before/after pair.
-            let observed = {
-                let (operations, mut context) = self.request(
-                    operation,
-                    Some(&request.context.idempotency_key),
-                    request.context.operation_id,
-                )?;
-                operations.observe(&mut context, request)
-            };
-            let observed = match observed {
-                Ok(observed) => observed,
+            // R3-003: the record is consulted *before* anything about the
+            // request's target is observed. A settled key's answer is its record;
+            // making it depend on resolving the target again meant a completed
+            // operation could stop being answerable because an external editor
+            // later replaced a path component with a symlink, or made the lookup
+            // fail with ACCESS. The journal itself stays readable in both cases.
+            //
+            // The journal's own round trips can still fail the way a dispatched
+            // mutation can, so their disposition is observed too (R1-002).
+            let found = match self.journal_lookup(operation, request) {
+                Ok(found) => found,
                 Err(error) => {
                     self.note_failure(operation, request, &error);
                     return Err(error);
                 }
             };
-            let admitted = self.journal_admit(operation, request, &observed, &observed);
-            let admitted = match admitted {
-                Ok(admitted) => admitted,
-                Err(error) => {
-                    self.note_failure(operation, request, &error);
-                    return Err(error);
+            match found {
+                // Settled: answered from the record, target untouched.
+                crate::journal::Lookup::Recorded(result) => return result,
+                crate::journal::Lookup::Fresh => {
+                    // R2-003: the state this mutation is about to act on is
+                    // observed before anything is written, and recorded beside
+                    // the intent as the precondition evidence a record must carry.
+                    let observed = match self.observe_now(operation, request) {
+                        Ok(observed) => observed,
+                        Err(error) => {
+                            self.note_failure(operation, request, &error);
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) =
+                        self.journal_admit_fresh(operation, request, &observed.evidence)
+                    {
+                        self.note_failure(operation, request, &error);
+                        return Err(error);
+                    }
                 }
-            };
-            match admitted {
-                crate::journal::Admission::Recorded(result) => return result,
-                // The recorded evidence proves the interrupted attempt never
-                // landed, so dispatch proceeds under the same key.
-                crate::journal::Admission::Fresh | crate::journal::Admission::Redispatch => {}
+                crate::journal::Lookup::Interrupted(recorded) => {
+                    let observed = match self.observe_now(operation, request) {
+                        Ok(observed) => observed,
+                        Err(error) => {
+                            self.note_failure(operation, request, &error);
+                            return Err(error);
+                        }
+                    };
+                    let settled = self.journal_recover(operation, request, &recorded, &observed);
+                    match settled {
+                        Ok(crate::journal::Admission::Recorded(result)) => return result,
+                        // The recorded evidence proves the interrupted attempt
+                        // never landed, so dispatch proceeds under the same key.
+                        Ok(_) => {}
+                        Err(error) => {
+                            self.note_failure(operation, request, &error);
+                            return Err(error);
+                        }
+                    }
+                }
             }
         }
 
@@ -1265,6 +1368,7 @@ impl Storage for NfsUserspaceStorage {
         // to the closed run, not to the provider. Carrying either into the next
         // `open_run` would refuse a fresh, properly admitted run.
         self.authority_loss = None;
+        self.recovery_blocked = None;
         self.stable_write_failure = None;
         self.unsettled.clear();
         // Every handle this session issued carries its serial, which `open_run`

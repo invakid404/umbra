@@ -62,6 +62,55 @@ const RECORD_MODE: u32 = 0o600;
 /// as nothing and would look like a fresh key.
 const MAX_RECORD_BYTES: u32 = 8 * 1024 * 1024;
 
+/// One object's identity *and* its content state, as evidence.
+///
+/// **R3-002.** Identity alone proves which object is behind a name; it proves
+/// nothing about whether an intervening write changed it. `FATTR4_CHANGE` is the
+/// attribute NFSv4 defines for exactly that question — it must differ whenever
+/// the object's data or metadata changed — so a recovery that compares it can
+/// tell "nothing has happened here" from "something did, and I cannot tell
+/// whether it was me".
+///
+/// `size` and `time_modify` are carried alongside as corroboration rather than as
+/// the decision: a server whose change attribute is a coarse timestamp can report
+/// an unchanged `change` across two writes inside its resolution, and a differing
+/// size or mtime catches that.
+///
+/// The write verifier is deliberately *not* here. It is a field of a WRITE or
+/// COMMIT reply, not an attribute a pre-dispatch GETATTR can obtain, so recording
+/// it before the mutation is not possible; what it would prove — that the server
+/// restarted and may have dropped unstable data — is proven instead by the
+/// WRITE/COMMIT comparison on the ordinary path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectEvidence {
+    /// Server identity: which object this is.
+    pub identity: ObjectIdentity,
+    /// `FATTR4_CHANGE`: whether anything about it has changed.
+    pub change: Option<u64>,
+    /// `FATTR4_SIZE`.
+    pub size: Option<u64>,
+    /// `FATTR4_TIME_MODIFY`, as nanoseconds.
+    pub modified_nanos: Option<i128>,
+}
+
+impl ObjectEvidence {
+    /// Whether this is the same object, in the same content state, as `other`.
+    ///
+    /// A missing `change` on either side is not treated as agreement: unknown is
+    /// not equal, because the whole point is to refuse to guess.
+    #[must_use]
+    pub fn unchanged_from(&self, other: &Self) -> bool {
+        if self.identity != other.identity {
+            return false;
+        }
+        match (self.change, other.change) {
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
+        self.size == other.size && self.modified_nanos == other.modified_nanos
+    }
+}
+
 /// The state a mutation was dispatched against.
 ///
 /// **R2-003.** `docs/design/failure-model.md` lists "object/parent identities and
@@ -78,14 +127,14 @@ const MAX_RECORD_BYTES: u32 = 8 * 1024 * 1024;
 /// intent stops rather than being guessed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preconditions {
-    /// Identity of the directory the mutation was addressed to.
-    pub parent: Option<ObjectIdentity>,
-    /// Identity of the target before dispatch. `None` means it did not exist.
-    pub target: Option<ObjectIdentity>,
+    /// The directory the mutation was addressed to.
+    pub parent: Option<ObjectEvidence>,
+    /// The target before dispatch. `None` means it did not exist.
+    pub target: Option<ObjectEvidence>,
     /// For a rename, the destination's parent.
-    pub destination_parent: Option<ObjectIdentity>,
-    /// For a rename, the destination's identity before dispatch.
-    pub destination: Option<ObjectIdentity>,
+    pub destination_parent: Option<ObjectEvidence>,
+    /// For a rename, the destination before dispatch. `None` means it was free.
+    pub destination: Option<ObjectEvidence>,
 }
 
 /// What a recovery decided about an interrupted operation.
@@ -178,103 +227,152 @@ type Record = (StorageRequest, Option<Result<StorageResponse>>);
 /// settled, and refuses rather than dispatching when a record exists whose
 /// request differs, when the operation id was already used under another key, or
 /// when a previous attempt recorded an intent that never settled.
+/// What consulting the journal found, before any state is observed.
+///
+/// **R3-003.** Splitting the lookup from the admission is the whole point.
+/// `Storage::execute` used to observe the request's current target namespace for
+/// *every* mutation and only then consult the record, so a completed key whose
+/// target path had since been replaced by a symlink — or had become unreadable —
+/// failed during observation and never reached its own recorded success. A
+/// settled key's answer is the record; the namespace has nothing to say about it.
+#[derive(Debug)]
+pub enum Lookup {
+    /// This key already settled. Return the recorded outcome; observe nothing.
+    Recorded(Result<StorageResponse>),
+    /// No record exists. A fresh intent must be written, which needs the
+    /// preconditions observed first.
+    Fresh,
+    /// An interrupted intent, with the evidence recorded beside it. Recovery
+    /// needs the current state to compare against.
+    Interrupted(Box<Preconditions>),
+}
+
+/// Consult the journal for this request's key, without touching its target.
+pub fn lookup(
+    transport: &mut dyn RawTransport,
+    private: &Anchor,
+    request: &StorageRequest,
+    operation: &str,
+    deadline: Deadline,
+) -> Result<Lookup> {
+    let retries = retries_directory(transport, private, deadline)?;
+    let key_component = component(key_name(&request.context.idempotency_key).into_bytes())?;
+
+    let Some(bytes) = read_record(transport, &retries, &key_component, deadline)? else {
+        return Ok(Lookup::Fresh);
+    };
+    let (previous, outcome): Record = serde_json::from_slice(&bytes).map_err(|error| {
+        UmbraError::new(
+            ErrorKind::CorruptJournal,
+            operation,
+            format!(
+                "the retry record for this idempotency key does not decode ({error}); it is \
+                 retained on the server and the request is refused rather than re-dispatched"
+            ),
+        )
+    })?;
+    if previous != *request {
+        // The same key naming a different request is the caller's error, and
+        // answering it with the recorded outcome would report the result of an
+        // operation it never asked for.
+        return Err(UmbraError::new(
+            ErrorKind::InvalidInput,
+            operation,
+            "this idempotency key was already used for a different request",
+        ));
+    }
+    if let Some(result) = outcome {
+        return Ok(Lookup::Recorded(result));
+    }
+
+    // An intent with no result is an interrupted attempt. The failure model
+    // forbids answering that with "requires reconciliation" when the window is
+    // one this provider supports, so the recorded preconditions and the server's
+    // current state decide it instead.
+    let recorded = read_preconditions(
+        transport,
+        &retries,
+        &request.context.idempotency_key,
+        operation,
+        deadline,
+    )?;
+    let Some(recorded) = recorded else {
+        // A legacy record: written before this provider recorded preconditions,
+        // or by an adapter that does not. There is no before-state to compare, so
+        // the failure model's rule for a legacy ambiguous intent applies — stop,
+        // retaining the evidence.
+        return Err(blocked(
+            operation,
+            "this run holds an interrupted intent for the key with no recorded \
+             preconditions, so whether it took effect cannot be established from \
+             evidence. The record is retained and the run is blocked rather than \
+             guessed or replayed.",
+        ));
+    };
+    Ok(Lookup::Interrupted(Box::new(recorded)))
+}
+
+/// Settle an interrupted intent against the state observed now.
 #[allow(clippy::too_many_arguments)]
-pub fn admit(
+pub fn recover_interrupted(
+    transport: &mut dyn RawTransport,
+    owners: &mut OpenOwnerRegistry,
+    private: &Anchor,
+    request: &StorageRequest,
+    recorded: &Preconditions,
+    observed: &crate::ops::Observation,
+    operation: &str,
+    deadline: Deadline,
+) -> Result<Admission> {
+    let retries = retries_directory(transport, private, deadline)?;
+    let key_component = component(key_name(&request.context.idempotency_key).into_bytes())?;
+    match recover(&request.operation, recorded, &observed.evidence) {
+        Recovery::NotApplied => Ok(Admission::Redispatch),
+        Recovery::Applied => {
+            // The effect is on the server. Settling from the observed state is
+            // the recovery: the key stops being indeterminate, and later retries
+            // are answered from the record like any settled one.
+            let response = recovered_response(&request.operation, observed, operation)?;
+            let record: Record = (request.clone(), Some(Ok(response.clone())));
+            let encoded = encode(&record, operation)?;
+            replace_record(
+                transport,
+                owners,
+                &retries,
+                &key_component,
+                &encoded,
+                operation,
+                deadline,
+            )?;
+            Ok(Admission::Recorded(Ok(response)))
+        }
+        Recovery::Ambiguous(why) => Err(blocked(
+            operation,
+            &format!(
+                "an interrupted intent for this key cannot be settled from evidence: {why}. \
+                 The record and the server state are both retained and the run is blocked \
+                 rather than guessed."
+            ),
+        )),
+    }
+}
+
+/// Record a fresh intent, with its preconditions, before anything is dispatched.
+pub fn admit_fresh(
     transport: &mut dyn RawTransport,
     owners: &mut OpenOwnerRegistry,
     private: &Anchor,
     request: &StorageRequest,
     preconditions: &Preconditions,
-    observed: &Preconditions,
     operation: &str,
     deadline: Deadline,
-) -> Result<Admission> {
+) -> Result<()> {
     let retries = retries_directory(transport, private, deadline)?;
     let key = key_name(&request.context.idempotency_key);
     let key_component = component(key.clone().into_bytes())?;
 
-    if let Some(bytes) = read_record(transport, &retries, &key_component, deadline)? {
-        let (previous, outcome): Record = serde_json::from_slice(&bytes).map_err(|error| {
-            UmbraError::new(
-                ErrorKind::CorruptJournal,
-                operation,
-                format!(
-                    "the retry record for this idempotency key does not decode ({error}); it is \
-                     retained on the server and the request is refused rather than re-dispatched"
-                ),
-            )
-        })?;
-        if previous != *request {
-            // The same key naming a different request is the caller's error, and
-            // answering it with the recorded outcome would report the result of an
-            // operation it never asked for.
-            return Err(UmbraError::new(
-                ErrorKind::InvalidInput,
-                operation,
-                "this idempotency key was already used for a different request",
-            ));
-        }
-        if let Some(result) = outcome {
-            return Ok(Admission::Recorded(result));
-        }
-
-        // R2-003: an intent with no result is an interrupted attempt. The
-        // failure model forbids answering that with "requires reconciliation"
-        // when the window is one this provider supports, so the recorded
-        // preconditions and the server's current state decide it instead.
-        let recorded = read_preconditions(
-            transport,
-            &retries,
-            &request.context.idempotency_key,
-            operation,
-            deadline,
-        )?;
-        let Some(recorded) = recorded else {
-            // A legacy record: written before this provider recorded
-            // preconditions, or by an adapter that does not. There is no
-            // before-state to compare, so the failure model's rule for a legacy
-            // ambiguous intent applies — stop, retaining the evidence.
-            return Err(blocked(
-                operation,
-                "this run holds an interrupted intent for the key with no recorded \
-                 preconditions, so whether it took effect cannot be established from \
-                 evidence. The record is retained and the run is blocked rather than \
-                 guessed or replayed.",
-            ));
-        };
-        return match recover(&request.operation, &recorded, observed) {
-            Recovery::NotApplied => Ok(Admission::Redispatch),
-            Recovery::Applied => {
-                // The effect is on the server. Settling from the observed state
-                // is the recovery: the key stops being indeterminate, and later
-                // retries are answered from the record like any settled one.
-                let response = recovered_response(&request.operation, observed, operation)?;
-                let record: Record = (request.clone(), Some(Ok(response.clone())));
-                let encoded = encode(&record, operation)?;
-                replace_record(
-                    transport,
-                    owners,
-                    &retries,
-                    &key_component,
-                    &encoded,
-                    operation,
-                    deadline,
-                )?;
-                Ok(Admission::Recorded(Ok(response)))
-            }
-            Recovery::Ambiguous(why) => Err(blocked(
-                operation,
-                &format!(
-                    "an interrupted intent for this key cannot be settled from evidence: \
-                     {why}. The record and the server state are both retained and the run \
-                     is blocked rather than guessed."
-                ),
-            )),
-        };
-    }
-
-    // A fresh key. The operation id must be fresh too, or two different keys
-    // would be claiming one operation identity.
+    // The operation id must be fresh too, or two different keys would be
+    // claiming one operation identity.
     let operation_component = component(operation_name(request.context.operation_id).into_bytes())?;
     if read_record(transport, &retries, &operation_component, deadline)?.is_some() {
         return Err(UmbraError::new(
@@ -329,9 +427,15 @@ pub fn admit(
         &encoded,
         operation,
         deadline,
-    )?;
-    Ok(Admission::Fresh)
+    )
 }
+
+/// Marker every blocked-recoverable stop carries in its context.
+///
+/// **R3-001.** The provider has to recognise these to enter its own stopped
+/// state, and matching on prose would be a guess. This is the recognisable token;
+/// it reads as a state name to a human too, which is the point.
+pub const BLOCKED_RECOVERABLE: &str = "BLOCKED_RECOVERABLE:";
 
 /// A safe stop with the evidence retained (`BLOCKED_RECOVERABLE`).
 ///
@@ -339,22 +443,42 @@ pub fn admit(
 /// for recovery the failure model requires be *implemented*. This is the answer
 /// for the cases the model does put in BLOCKED_RECOVERABLE — a legacy intent with
 /// no evidence, or evidence that contradicts every deterministic outcome.
+///
+/// **R3-001.** Returning this error is not, by itself, the state the failure model
+/// describes. `NfsUserspaceStorage` latches it: see `AuthorityLoss`'s sibling
+/// `recovery_blocked`, which stops later mutations and denies a clean release.
 fn blocked(operation: &str, detail: &str) -> UmbraError {
-    UmbraError::new(ErrorKind::InvalidState, operation, detail.to_owned())
+    UmbraError::new(
+        ErrorKind::InvalidState,
+        operation,
+        format!("{BLOCKED_RECOVERABLE} {detail}"),
+    )
+}
+
+/// Whether an error is one of this module's blocked-recoverable stops.
+#[must_use]
+pub fn is_blocked(error: &UmbraError) -> bool {
+    error.context.starts_with(BLOCKED_RECOVERABLE)
 }
 
 /// Decide, from evidence, whether an interrupted mutation took effect.
 ///
 /// `recorded` is what the state was before dispatch; `observed` is what it is
-/// now. Neither is a guess: both come from the server's own identities, so an
-/// external replacement is visible as a changed identity rather than hidden
-/// behind an unchanged pathname.
+/// now. Neither is a guess: both come from the server's own identities and change
+/// attributes, so an external replacement *or an external edit* is visible rather
+/// than hidden behind an unchanged pathname.
 ///
-/// The operations split into two classes. A *detectable* mutation changes
-/// presence or identity in a way the before/after pair settles. An *idempotent*
-/// one — an absolute write, an absolute attribute set, `mkdir -p` — produces the
-/// same state whether it ran once or twice, so proving the target is still the
-/// same object is enough to re-dispatch safely.
+/// **R3-002.** The previous version decided from identity alone, which is not
+/// enough in two ways it got wrong. The rename arm ignored the recorded
+/// destination entirely, so an interrupted `Rename(A, B)` whose destination `B`
+/// had since been replaced by an external client was re-dispatched, and the
+/// ordinary replacing RENAME destroyed the replacement. The in-place arms treated
+/// an unchanged `fsid`/`fileid` as proof that nothing had happened, so an
+/// interrupted `WriteAt` was replayed over an external writer's edit to the same
+/// object. Identity says *which object exists*, never *whether it changed*.
+///
+/// Every arm now either proves its answer from before/after evidence or gives up
+/// safely. "I cannot tell" is an outcome, not a reason to pick the convenient one.
 fn recover(
     operation: &StorageOperation,
     recorded: &Preconditions,
@@ -362,11 +486,19 @@ fn recover(
 ) -> Recovery {
     // The parent must still be the same directory in every case. If it is not,
     // the mutation's addressing is no longer meaningful.
-    if recorded.parent.is_some() && recorded.parent != observed.parent {
-        return Recovery::Ambiguous(format!(
-            "the parent directory was {:?} before dispatch and is {:?} now",
-            recorded.parent, observed.parent
-        ));
+    if let (Some(before), Some(now)) = (recorded.parent, observed.parent) {
+        if before.identity != now.identity {
+            return Recovery::Ambiguous(format!(
+                "the parent directory was {:?} before dispatch and is {:?} now",
+                before.identity, now.identity
+            ));
+        }
+    } else if recorded.parent.is_some() != observed.parent.is_some() {
+        return Recovery::Ambiguous(
+            "the parent directory was resolvable before dispatch and is not now, or the \
+             reverse"
+                .to_owned(),
+        );
     }
 
     match operation {
@@ -374,17 +506,40 @@ fn recover(
         StorageOperation::Create { .. } => match (recorded.target, observed.target) {
             (None, None) => Recovery::NotApplied,
             (None, Some(_)) => Recovery::Applied,
-            (Some(before), Some(now)) if before == now => Recovery::NotApplied,
+            // It already existed before dispatch, unchanged: the request would
+            // have failed the same way again, and re-running reproduces that
+            // answer without repeating an effect.
+            (Some(before), Some(now)) if now.unchanged_from(&before) => Recovery::NotApplied,
             (before, now) => Recovery::Ambiguous(format!(
-                "the create target was {before:?} before dispatch and is {now:?} now"
+                "the create target was {:?} before dispatch and is {:?} now",
+                before.map(|e| e.identity),
+                now.map(|e| e.identity)
             )),
         },
 
         // --- removals: present before, absent after ------------------------
+        //
+        // R3-002: absence alone is not the answer. The reviewer's point is that
+        // it does not establish that *this* request is what removed it. What the
+        // evidence can establish is the contradictory case: a target that
+        // vanished while its parent directory's change attribute stood still is
+        // not a state any removal produced, so it is refused rather than read as
+        // success. Where the parent did change, the postcondition this request
+        // asked for holds, and `Unlinked` asserts that the name is gone — not who
+        // removed it.
         StorageOperation::Unlink { .. } | StorageOperation::RemoveDirectory { .. } => {
             match (recorded.target, observed.target) {
-                (Some(_), None) => Recovery::Applied,
-                (Some(before), Some(now)) if before == now => Recovery::NotApplied,
+                (Some(_), None) => match (recorded.parent, observed.parent) {
+                    (Some(before), Some(now)) if before.change == now.change => {
+                        Recovery::Ambiguous(
+                            "the removal target is gone but its parent directory's change \
+                             attribute did not move, which no removal produces"
+                                .to_owned(),
+                        )
+                    }
+                    _ => Recovery::Applied,
+                },
+                (Some(before), Some(now)) if now.unchanged_from(&before) => Recovery::NotApplied,
                 (None, None) => {
                     // It was already gone before dispatch, so the request would
                     // have failed NOENT either way; re-running reproduces that
@@ -392,45 +547,100 @@ fn recover(
                     Recovery::NotApplied
                 }
                 (before, now) => Recovery::Ambiguous(format!(
-                    "the removal target was {before:?} before dispatch and is {now:?} now"
+                    "the removal target was {:?} before dispatch and is {:?} now",
+                    before.map(|e| e.identity),
+                    now.map(|e| e.identity)
                 )),
             }
         }
 
         // --- rename: the source's identity moves to the destination --------
+        //
+        // R3-002: the recorded destination is consulted. Re-dispatching an
+        // ordinary replacing RENAME over a destination that changed under the
+        // interruption destroys whatever replaced it.
         StorageOperation::Rename { .. } => {
-            let moved = recorded.target;
-            match (observed.target, observed.destination) {
-                // The source is gone and the destination now holds the object
-                // that was at the source: the rename landed.
-                (None, destination) if destination.is_some() && destination == moved => {
-                    Recovery::Applied
+            if let (Some(before), Some(now)) =
+                (recorded.destination_parent, observed.destination_parent)
+            {
+                if before.identity != now.identity {
+                    return Recovery::Ambiguous(format!(
+                        "the rename destination's parent was {:?} before dispatch and is {:?} \
+                         now",
+                        before.identity, now.identity
+                    ));
                 }
-                // The source still holds the same object: nothing moved.
-                (Some(now), _) if Some(now) == moved => Recovery::NotApplied,
-                (source, destination) => Recovery::Ambiguous(format!(
-                    "the rename source was {moved:?} before dispatch; the source is {source:?} \
-                     and the destination {destination:?} now"
-                )),
             }
+            let moved = recorded.target.map(|e| e.identity);
+            let source_now = observed.target;
+            let destination_now = observed.destination;
+
+            // The source is gone and the destination holds the object that was at
+            // the source: the rename landed.
+            if source_now.is_none()
+                && destination_now.map(|e| e.identity) == moved
+                && moved.is_some()
+            {
+                return Recovery::Applied;
+            }
+
+            // Nothing moved: the source is still the same object in the same
+            // state, *and* the destination is still exactly what was recorded.
+            let source_still_there = match (recorded.target, source_now) {
+                (Some(before), Some(now)) => now.unchanged_from(&before),
+                _ => false,
+            };
+            let destination_untouched = match (recorded.destination, destination_now) {
+                (None, None) => true,
+                (Some(before), Some(now)) => now.unchanged_from(&before),
+                _ => false,
+            };
+            if source_still_there && destination_untouched {
+                return Recovery::NotApplied;
+            }
+            Recovery::Ambiguous(format!(
+                "the rename cannot be settled: source was {:?} and is {:?}; destination was \
+                 {:?} and is {:?}",
+                recorded.target.map(|e| e.identity),
+                source_now.map(|e| e.identity),
+                recorded.destination.map(|e| e.identity),
+                destination_now.map(|e| e.identity)
+            ))
         }
 
-        // --- idempotent given a stable target ------------------------------
+        // --- in-place mutations: absolute, but only over an unchanged object -
         //
-        // An absolute write of the same bytes at the same offset, an absolute
-        // attribute set, an absolute truncation and `mkdir -p` all converge:
-        // running them a second time produces the state the first run aimed at.
-        // What must be proven is only that the object is still the same one.
+        // R3-002: an absolute write of the same bytes at the same offset, an
+        // absolute attribute set and an absolute truncation all converge *if
+        // nothing else touched the object*. Replaying one over an external
+        // writer's edit does not converge, it overwrites. Proving the object is
+        // byte-for-byte in the state it was dispatched against is what makes the
+        // replay safe; anything else is a safe give-up.
         StorageOperation::WriteAt { .. }
         | StorageOperation::SetMetadata { .. }
         | StorageOperation::Truncate { .. } => match (recorded.target, observed.target) {
-            (Some(before), Some(now)) if before == now => Recovery::NotApplied,
+            (Some(before), Some(now)) if now.unchanged_from(&before) => Recovery::NotApplied,
+            (Some(before), Some(now)) if before.identity == now.identity => {
+                Recovery::Ambiguous(format!(
+                    "the target is the same object but its state moved (change {:?} -> {:?}, \
+                     size {:?} -> {:?}); replaying an absolute mutation would overwrite \
+                     whatever changed it, and whether this request is what changed it cannot \
+                     be established",
+                    before.change, now.change, before.size, now.size
+                ))
+            }
             (None, None) => Recovery::NotApplied,
             (before, now) => Recovery::Ambiguous(format!(
-                "the target was {before:?} before dispatch and is {now:?} now, so repeating an \
-                 absolute mutation could act on a different object"
+                "the target was {:?} before dispatch and is {:?} now, so repeating an absolute \
+                 mutation could act on a different object",
+                before.map(|e| e.identity),
+                now.map(|e| e.identity)
             )),
         },
+
+        // `mkdir -p` converges: every component it would create is a directory
+        // whose presence is the whole postcondition. The parent identity check
+        // above is what keeps it addressed to the same place.
         StorageOperation::CreateParents { .. } => Recovery::NotApplied,
 
         // Everything else is refused by the capability surface long before a
@@ -444,29 +654,56 @@ fn recover(
 
 /// Build the response a recovered effect settles to.
 ///
-/// Only the operations whose effect is *detectable* reach here, and each of them
-/// has an answer that can be read from the state rather than reconstructed: a
-/// create answers with the object that now exists, a removal with its typed unit
-/// response, a rename with the object now at the destination.
+/// **R3-001.** This used to block for creates and renames, because the journal
+/// holds no operations surface and could not rebuild an `ObjectResult` from
+/// identities. It does not have to: the observation that proved the effect landed
+/// already read the object, so the result travels with it. A recovery that can
+/// answer, answers; only a genuinely unanswerable case blocks.
 fn recovered_response(
     operation: &StorageOperation,
-    observed: &Preconditions,
+    observed: &crate::ops::Observation,
     label: &str,
 ) -> Result<StorageResponse> {
     match operation {
         StorageOperation::Unlink { .. } => Ok(StorageResponse::Unlinked),
         StorageOperation::RemoveDirectory { .. } => Ok(StorageResponse::DirectoryRemoved),
-        // A create or rename answers with an object result, which needs the
-        // object's current stat. The provider supplies it, because the journal
-        // holds no operations surface; it is passed back through `observed`.
+        StorageOperation::Create { .. } | StorageOperation::CreateParents { .. } => observed
+            .target_result
+            .clone()
+            .map(StorageResponse::Created)
+            .ok_or_else(|| {
+                blocked(
+                    label,
+                    "the interrupted create took effect but the created object could not be \
+                     read back, so no result can be reported for it; the record is retained \
+                     and the run is blocked rather than answered with a fabricated result",
+                )
+            }),
+        // A rename's effect is at the destination, which is where the object now
+        // is.
+        StorageOperation::Rename { .. } => observed
+            .destination_result
+            .clone()
+            .map(StorageResponse::Renamed)
+            .ok_or_else(|| {
+                blocked(
+                    label,
+                    "the interrupted rename took effect but the moved object could not be read \
+                     back at its destination, so no result can be reported for it; the record \
+                     is retained and the run is blocked rather than answered with a \
+                     fabricated result",
+                )
+            }),
+        StorageOperation::WriteAt { .. }
+        | StorageOperation::SetMetadata { .. }
+        | StorageOperation::Truncate { .. } => Err(blocked(
+            label,
+            "an interrupted in-place mutation is never settled as applied; it is either \
+             replayed over a provably unchanged object or refused",
+        )),
         _ => Err(blocked(
             label,
-            &format!(
-                "the interrupted operation took effect, but this journal cannot rebuild its \
-                 reply from identities alone (target {:?}); the effect is recorded and the \
-                 run is blocked rather than answered with a fabricated result",
-                observed.target
-            ),
+            "the recorded operation is not one this provider journals",
         )),
     }
 }
