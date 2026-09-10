@@ -107,7 +107,7 @@ jobs:
         with:
           # Include the memoria tag in the shared key so different
           # tag pins get different caches.
-          shared-key: memoria-cli-v0.3.0
+          shared-key: memoria-cli-v0.4.0
           cache-directories: |
             ~/.cargo/bin
 
@@ -116,7 +116,7 @@ jobs:
         # `Install memoria CLI` step; keep the two in sync when the
         # memoria tag bumps. Follow-up issue #32 tracks pinning `--rev`
         # instead of `--tag` for both call sites.
-        run: cargo install --locked --git https://github.com/viktordanov/rs-memoria --tag v0.3.0 rs-memoria
+        run: cargo install --locked --git https://github.com/viktordanov/rs-memoria --tag v0.4.0 rs-memoria
 
       - name: Create PR head worktree (isolated data checkout)
         env:
