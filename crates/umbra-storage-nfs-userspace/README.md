@@ -661,6 +661,21 @@ record with no sidecar is a legacy one, and an ambiguous legacy intent stops for
 the same reason. Nothing answers "requires reconciliation": the failure model
 forbids that standing in for recovery in a window this provider supports.
 
+**A stop is a state, not a return value.** A blocked-recoverable refusal, a record
+that cannot be decoded, and any failure while resolving an interrupted intent —
+including one whose own error says nothing about recovery, such as a target path
+that no longer resolves — put the run into `BLOCKED_RECOVERABLE`: later mutations
+are refused with the original diagnosis carried forward, the evidence is left
+exactly where it is, and a cooperative release cannot succeed. It clears only by
+reopening the run, which is the operator intervention the state is for.
+
+Separately, a call whose server-side disposition could not be established stops
+the run admitting *new* work while leaving the resolution reachable. The failure
+model asks for both halves — "stop new mutations and quiesce; resolve bounded
+outstanding operations" — and resolving an outstanding operation means retrying
+its own key, so a key with no record is refused while a key with one is the
+recovery.
+
 Records are read in bounded chunks to end of file and written in as many round
 trips as the server needs, because a short `READ` or `WRITE` is a legal answer
 rather than a frame boundary, and the raw transport caps a reply well below the
