@@ -33,15 +33,15 @@
 //! no path can leave the anchor through one.
 
 use umbra_core::{
-    BytePath, ErrorKind, OpenRunIntent, Result, RunId, RuntimeDirectoryBinding, StorageAnchor,
-    StorageHandle, StoragePath, UmbraError,
+    BytePath, ErrorKind, LeaseEpoch, OpenRunIntent, Result, RunId, RuntimeDirectoryBinding,
+    StorageAnchor, StorageHandle, StoragePath, UmbraError,
 };
 
 use crate::handle::FileHandle;
 use crate::identity::PinnedObject;
 use crate::layout;
 use crate::storage::NfsUserspaceConfig;
-use crate::transport::{ComponentName, Deadline, Nfs4Type, RawTransport};
+use crate::transport::{ComponentName, Deadline, Fsid, Nfs4Type, RawTransport};
 
 /// Which anchor a handle belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -180,6 +180,14 @@ pub struct RunAnchors {
     root: Anchor,
     control: Anchor,
     private: Option<Anchor>,
+    /// The one server filesystem every object in this run must live on.
+    ///
+    /// **R1-015.** Byte-path validation and symlink refusal do not establish
+    /// filesystem containment: a `LOOKUP` into a nested export answers with a
+    /// perfectly ordinary directory that happens to carry a different `fsid`.
+    /// `docs/design/managed-lifecycle-spike.md:30` requires that crossing to be
+    /// rejected on its own terms.
+    filesystem: Fsid,
 }
 
 impl RunAnchors {
@@ -209,10 +217,19 @@ impl RunAnchors {
             .map_err(|error| error.to_umbra("open_run"))?;
         let mut current = PinnedObject::pin(transport, export_root, deadline)
             .map_err(|error| error.to_umbra("open_run"))?;
-        for relative in [&config.export, &config.run_parent] {
-            for component in components(relative)? {
-                current = descend(transport, &current, &component, deadline)?;
-            }
+        // R1-015: walking the *configured export* is the one transition that is
+        // expected to change filesystem — the server's pseudo-root is its own
+        // filesystem and the export is another. That crossing is deliberate and
+        // configured, so it is allowed here and nowhere else.
+        for component in components(&config.export)? {
+            current = descend(transport, &current, &component, deadline)?;
+        }
+        // From the resolved export down, the filesystem is pinned. Everything
+        // below — the run parent, the run, its anchors, and every path a caller
+        // later resolves inside them — has to be on it.
+        let filesystem = current.identity().fsid;
+        for component in components(&config.run_parent)? {
+            current = descend_within(transport, &current, &component, filesystem, deadline)?;
         }
         let run_name = component(run_id.0.hyphenated().to_string().into_bytes())?;
         let run = if creating {
@@ -226,15 +243,20 @@ impl RunAnchors {
                     format!("run {run_id:?} already exists under the configured run parent"),
                 ));
             }
-            create_directory(transport, &current, &run_name, deadline)?
+            within(
+                create_directory(transport, &current, &run_name, deadline)?,
+                filesystem,
+                &run_name,
+            )?
         } else {
-            descend(transport, &current, &run_name, deadline)?
+            descend_within(transport, &current, &run_name, filesystem, deadline)?
         };
         let root = anchor_child(
             transport,
             &run,
             &component(config.root_anchor.as_bytes())?,
             creating,
+            filesystem,
             deadline,
         )?;
         let control = anchor_child(
@@ -242,16 +264,31 @@ impl RunAnchors {
             &run,
             &component(config.control_anchor.as_bytes())?,
             creating,
+            filesystem,
             deadline,
         )?;
         let private_name = component(layout::PRIVATE_DIR)?;
         let private = if creating {
-            Some(create_directory(transport, &run, &private_name, deadline)?)
+            Some(within(
+                create_directory(transport, &run, &private_name, deadline)?,
+                filesystem,
+                &private_name,
+            )?)
         } else {
             // A run written by the mounted adapter always has `.provider`, but a
             // run that lost it is a real state and reporting it as present would
             // be a claim about state this provider never observed.
-            descend(transport, &run, &private_name, deadline).ok()
+            //
+            // R1-011: only NOENT is that state. The old code was `.ok()`, which
+            // turned EIO, ACCESS and STALE into "this run has no `.provider`" and
+            // left the caller reading `session.rs`'s generic no-private-directory
+            // message instead of the server's actual failure. A lookup that failed
+            // is not an answer about what is there.
+            match descend_within(transport, &run, &private_name, filesystem, deadline) {
+                Ok(pin) => Some(pin),
+                Err(error) if error.kind == ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            }
         }
         .map(|pin| Anchor {
             kind: AnchorKind::Private,
@@ -271,6 +308,7 @@ impl RunAnchors {
                 pin: control,
             },
             private,
+            filesystem,
         })
     }
 
@@ -315,8 +353,20 @@ impl RunAnchors {
     ) -> Result<PinnedObject> {
         match self.resolve_parent(transport, path, deadline)? {
             Target::Anchor(pin) => Ok(pin),
-            Target::Named { parent, name } => descend_any(transport, &parent, &name, deadline),
+            // R1-015: the final component is checked too. It is the one a caller
+            // then reads, writes or mutates through, so letting it be the object
+            // that crosses the boundary would defeat the whole walk.
+            Target::Named { parent, name } => within(
+                descend_any(transport, &parent, &name, deadline)?,
+                self.filesystem,
+                &name,
+            ),
         }
+    }
+
+    /// The server filesystem every object in this run must live on (**R1-015**).
+    pub fn filesystem(&self) -> Fsid {
+        self.filesystem
     }
 
     /// Resolve everything but the final component of a contract path.
@@ -343,7 +393,7 @@ impl RunAnchors {
         });
         let mut parent = anchor.pin.clone();
         for part in parts {
-            parent = descend(transport, &parent, &part, deadline)?;
+            parent = descend_within(transport, &parent, &part, self.filesystem, deadline)?;
         }
         Ok(Target::Named { parent, name })
     }
@@ -460,6 +510,167 @@ pub fn provision_private_state(
     )
 }
 
+/// What a run's persisted `.provider` state says about its identity (**R1-005**).
+///
+/// Read before admission, because a run whose manifest names a different run, a
+/// different immutable base or a different format version is not the run the
+/// caller asked to open, and admitting it would bind a session to state it cannot
+/// account for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedRunState {
+    /// Run identity the manifest records.
+    pub run_id: RunId,
+    /// Immutable base the manifest records.
+    pub immutable_base: umbra_core::ImmutableBaseContract,
+    /// Format version the manifest records.
+    pub format_version: u32,
+    /// Writer epoch `.provider/epoch` records, zero when the run never had one.
+    ///
+    /// The mounted adapter increments this on acquisition, so a cleanly released
+    /// legacy run carries the highest epoch it ever reached even though its lock
+    /// is gone.
+    pub epoch: LeaseEpoch,
+}
+
+/// Read and validate a run's persisted identity before admitting a session.
+///
+/// **R1-005.** `OpenExisting` used to validate only the caller's `format_version`
+/// and read nothing at all from the run it was opening. A run whose manifest
+/// carried another base fingerprint, another run id or another format version was
+/// admitted anyway, and a missing or malformed manifest was indistinguishable
+/// from a healthy one.
+///
+/// Every failure here is a refusal, never an inference: `docs/design/failure-model.md`
+/// requires malformed or changed evidence to be preserved and refused, and a
+/// missing file is never read as a release.
+pub fn read_persisted_state(
+    transport: &mut dyn RawTransport,
+    private: &Anchor,
+    expected_run: RunId,
+    expected_base: &umbra_core::ImmutableBaseContract,
+    expected_format: u32,
+    deadline: Deadline,
+) -> Result<PersistedRunState> {
+    let manifest_bytes = read_private_file(
+        transport,
+        private,
+        &component(layout::MANIFEST_FILE)?,
+        deadline,
+    )?
+    .ok_or_else(|| {
+        UmbraError::new(
+            ErrorKind::CorruptJournal,
+            "open_run",
+            "the run has no .provider/manifest, so its identity cannot be proven; an \
+             existing run without one is refused rather than adopted",
+        )
+    })?;
+
+    let (run_id, immutable_base, format_version): (RunId, umbra_core::ImmutableBaseContract, u32) =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            UmbraError::new(
+                ErrorKind::CorruptJournal,
+                "open_run",
+                format!(
+                    "the run manifest does not decode ({error}); the bytes are retained on the \
+                 server for inspection and the run is refused"
+                ),
+            )
+        })?;
+
+    if run_id != expected_run {
+        return Err(UmbraError::new(
+            ErrorKind::InvalidState,
+            "open_run",
+            format!(
+                "the run directory's manifest records run {}, not the requested {}",
+                run_id.0, expected_run.0
+            ),
+        ));
+    }
+    if format_version != expected_format {
+        return Err(UmbraError::new(
+            ErrorKind::ProtocolMismatch,
+            "open_run",
+            format!(
+                "the run on the server was written at format version {format_version}, not \
+                 the {expected_format} this request declares"
+            ),
+        ));
+    }
+    if immutable_base != *expected_base {
+        return Err(UmbraError::new(
+            ErrorKind::InvalidState,
+            "open_run",
+            format!(
+                "the run was created over immutable base {:?}, not the {:?} this request \
+                 declares; the run is refused rather than rebound to a different base",
+                immutable_base.identity, expected_base.identity
+            ),
+        ));
+    }
+
+    // `.provider/epoch` is the mounted adapter's little-endian u64. Absent is a
+    // legitimate state for a run this provider created before the file existed;
+    // present-but-unreadable is not.
+    let epoch = match read_private_file(
+        transport,
+        private,
+        &component(layout::EPOCH_FILE)?,
+        deadline,
+    )? {
+        None => LeaseEpoch(0),
+        Some(bytes) => {
+            let raw: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+                UmbraError::new(
+                    ErrorKind::CorruptJournal,
+                    "open_run",
+                    format!(
+                        "the run's .provider/epoch is {} bytes, not the 8 a little-endian u64 \
+                         occupies; the recorded writer epoch cannot be read and the run is \
+                         refused rather than restarted at epoch 1",
+                        bytes.len()
+                    ),
+                )
+            })?;
+            LeaseEpoch(u64::from_le_bytes(raw))
+        }
+    };
+
+    Ok(PersistedRunState {
+        run_id,
+        immutable_base,
+        format_version,
+        epoch,
+    })
+}
+
+/// Read one whole file from `.provider`, or `None` when the name is absent.
+///
+/// Absence is `NFS4ERR_NOENT` and nothing else: a lookup or read that *failed* is
+/// propagated, because reporting it as absence is the R1-011 defect in another
+/// place.
+fn read_private_file(
+    transport: &mut dyn RawTransport,
+    private: &Anchor,
+    name: &ComponentName,
+    deadline: Deadline,
+) -> Result<Option<Vec<u8>>> {
+    /// Bound on the private files this reads. Both are small and fixed-shape; a
+    /// larger file is refused rather than streamed.
+    const MAX_PRIVATE_FILE_BYTES: u32 = 64 * 1024;
+
+    let pinned = match descend_any(transport, private.pin(), name, deadline) {
+        Ok(pinned) => pinned,
+        Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let reply =
+        crate::crud::read_anonymous(transport, &pinned, 0, MAX_PRIVATE_FILE_BYTES, deadline)
+            .map_err(|error| error.to_umbra("open_run"))?;
+    Ok(Some(reply.data))
+}
+
 /// `GUARDED4` create one file and write its whole contents.
 fn create_file(
     transport: &mut dyn RawTransport,
@@ -533,13 +744,59 @@ fn anchor_child(
     run: &PinnedObject,
     name: &ComponentName,
     creating: bool,
+    filesystem: Fsid,
     deadline: Deadline,
 ) -> Result<PinnedObject> {
     if creating {
-        create_directory(transport, run, name, deadline)
+        within(
+            create_directory(transport, run, name, deadline)?,
+            filesystem,
+            name,
+        )
     } else {
-        descend(transport, run, name, deadline)
+        descend_within(transport, run, name, filesystem, deadline)
     }
+}
+
+/// Look one name up, require a directory, and require it to be on `filesystem`.
+///
+/// **R1-015.** The fsid comparison is what makes containment a property of the
+/// walk rather than of the path bytes. A `LOOKUP` that resolves into a nested
+/// exported filesystem returns an ordinary directory; without this check it was
+/// adopted and used for further reads and mutations.
+fn descend_within(
+    transport: &mut dyn RawTransport,
+    parent: &PinnedObject,
+    name: &ComponentName,
+    filesystem: Fsid,
+    deadline: Deadline,
+) -> Result<PinnedObject> {
+    within(
+        descend(transport, parent, name, deadline)?,
+        filesystem,
+        name,
+    )
+}
+
+/// Reject a pin that is not on the run's pinned filesystem (**R1-015**).
+fn within(pin: PinnedObject, filesystem: Fsid, name: &ComponentName) -> Result<PinnedObject> {
+    let observed = pin.identity().fsid;
+    if observed != filesystem {
+        return Err(UmbraError::new(
+            ErrorKind::InvalidPath,
+            "resolve",
+            format!(
+                "{:?} is on filesystem {}:{}, not the run's {}:{}; the walk does not cross \
+                 into another exported filesystem",
+                String::from_utf8_lossy(name.as_bytes()),
+                observed.major,
+                observed.minor,
+                filesystem.major,
+                filesystem.minor,
+            ),
+        ));
+    }
+    Ok(pin)
 }
 
 /// `PUTFH; CREATE NF4DIR; GETFH; GETATTR`: make one directory and pin it.
@@ -609,6 +866,29 @@ fn create_directory_at(
 }
 
 /// Look one name up without constraining its type.
+/// Look one name up and require it to be a directory, without a boundary check.
+///
+/// Used for `.provider` children, which are resolved from an anchor that has
+/// already been proven on the run's filesystem.
+pub fn descend_directory(
+    transport: &mut dyn RawTransport,
+    parent: &PinnedObject,
+    name: &ComponentName,
+    deadline: Deadline,
+) -> Result<PinnedObject> {
+    descend(transport, parent, name, deadline)
+}
+
+/// Look one name up and pin whatever it is.
+pub fn descend_file(
+    transport: &mut dyn RawTransport,
+    parent: &PinnedObject,
+    name: &ComponentName,
+    deadline: Deadline,
+) -> Result<PinnedObject> {
+    descend_any(transport, parent, name, deadline)
+}
+
 fn descend_any(
     transport: &mut dyn RawTransport,
     parent: &PinnedObject,

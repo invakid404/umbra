@@ -168,6 +168,63 @@ pub struct NfsUserspaceStorage {
     /// [`StorageHandle`](umbra_core::StorageHandle) so a token from a closed run
     /// cannot be replayed against the next one.
     serial: u64,
+    /// Why this provider may no longer act on the open run, once that is settled.
+    ///
+    /// **R1-002.** Losing writer authority is sticky. A failed renewal, a release
+    /// whose effect could not be established, or a completed handover all mean a
+    /// successor may already be live, and none of them may be retried into
+    /// authority by the next call that happens to find `session` populated.
+    authority_loss: Option<AuthorityLoss>,
+    /// Calls this provider issued whose server-side effect is not settled.
+    ///
+    /// **R1-002.** `close_run` used to assert [`OutstandingIo::Excluded`] purely
+    /// because `submit` had returned. Withdrawing a local registration does not
+    /// prove the server never received the request, so the evidence is collected
+    /// here as it happens and the release reports what it actually knows.
+    unsettled: Vec<String>,
+}
+
+/// Why a provider stopped being able to act on its open run.
+///
+/// Every variant is terminal for the run: the only way out is `close_run`.
+#[derive(Clone, Debug)]
+pub enum AuthorityLoss {
+    /// Renewal found the marker no longer records this session.
+    RenewalFailed(UmbraError),
+    /// A release neither provably happened nor provably did not.
+    UncertainRelease(UmbraError),
+    /// Admission was cooperatively released. The run is no longer this session's.
+    Handed,
+}
+
+impl AuthorityLoss {
+    /// The error a call made after this loss must report.
+    fn refuse(&self, operation: &str) -> UmbraError {
+        match self {
+            Self::RenewalFailed(error) => UmbraError::new(
+                ErrorKind::LeaseLost,
+                operation,
+                format!(
+                    "this provider lost writer authority and will not act on the run again \
+                     until it is reopened: {error}"
+                ),
+            ),
+            Self::UncertainRelease(error) => UmbraError::new(
+                ErrorKind::LeaseLost,
+                operation,
+                format!(
+                    "this provider's admission release could not be proven either way, so a \
+                     successor may already hold the run: {error}"
+                ),
+            ),
+            Self::Handed => UmbraError::new(
+                ErrorKind::LeaseLost,
+                operation,
+                "this provider released admission for the run; it holds no authority to act \
+                 on it, for reads or for mutations",
+            ),
+        }
+    }
 }
 
 impl std::fmt::Debug for NfsUserspaceStorage {
@@ -202,6 +259,8 @@ impl NfsUserspaceStorage {
             writer_id: writer_id(&config_for_writer, instance),
             session: None,
             serial: 0,
+            authority_loss: None,
+            unsettled: Vec::new(),
         })
     }
 
@@ -232,6 +291,8 @@ impl NfsUserspaceStorage {
             writer_id: writer_id(&config_for_writer, instance),
             session: None,
             serial: 0,
+            authority_loss: None,
+            unsettled: Vec::new(),
         })
     }
 
@@ -305,6 +366,11 @@ impl NfsUserspaceStorage {
         key: Option<&umbra_core::IdempotencyKey>,
         operation_id: umbra_core::OperationId,
     ) -> Result<(&Operations, OpsContext<'_>)> {
+        // R1-002: a latched authority loss is checked before anything is
+        // borrowed, so no call after the loss can reach a dispatch path.
+        if let Some(loss) = &self.authority_loss {
+            return Err(loss.refuse(operation));
+        }
         let deadline = self.config.deadline;
         let operations = self.operations.as_ref().ok_or_else(|| {
             UmbraError::new(
@@ -371,6 +437,9 @@ impl NfsUserspaceStorage {
         &mut dyn RawTransport,
         &mut ProtocolState,
     )> {
+        if let Some(loss) = &self.authority_loss {
+            return Err(loss.refuse(operation));
+        }
         let session = self.session.as_ref().ok_or_else(|| {
             UmbraError::new(
                 ErrorKind::InvalidState,
@@ -423,25 +492,179 @@ impl NfsUserspaceStorage {
                 "no transport facade is bound to this provider",
             ));
         };
-        // This provider issues one COMPOUND per call and awaits each reply before
-        // returning, so nothing it dispatched is still in flight here. That is
-        // what `Excluded` asserts, and it is asserted because it is true of this
-        // dispatch model, not assumed.
+        // R1-002: the disposition is derived from what this provider actually
+        // observed, not from the fact that `submit` returned. One COMPOUND per
+        // call and one awaited reply rules out *pending* work, but a call whose
+        // retirement was never proven drained, or that died with the connection,
+        // may still have been received and acted on by the server.
+        let outstanding = match self.unsettled.first() {
+            None => OutstandingIo::Excluded,
+            Some(first) => OutstandingIo::Unknown {
+                detail: format!(
+                    "{} call(s) issued by this session have unproven server-side disposition;                      first: {first}",
+                    self.unsettled.len()
+                ),
+            },
+        };
         match session.release(
             transport,
             &mut self.state,
             operations.anchors(),
-            OutstandingIo::Excluded,
+            outstanding,
             operation,
             deadline,
         ) {
-            Ok(_) => Ok(()),
-            Err(retained) => {
-                let (session, error) = *retained;
+            crate::session::SessionRelease::Released(_) => {
+                // Admission is gone. The run surface stays addressable only so
+                // `close_run` can tear it down; every contract call is refused.
+                self.authority_loss = Some(AuthorityLoss::Handed);
+                Ok(())
+            }
+            crate::session::SessionRelease::Retained { session, error } => {
                 self.session = Some(session);
                 Err(error)
             }
+            // The proof was consumed on purpose. Putting a session back here is
+            // exactly the revival R1-002 records as unsafe.
+            crate::session::SessionRelease::Uncertain(error) => {
+                self.authority_loss = Some(AuthorityLoss::UncertainRelease(error.clone()));
+                Err(error)
+            }
         }
+    }
+
+    /// Consult the durable retry journal for `request` (**R1-004**).
+    fn journal_admit(
+        &mut self,
+        operation: &str,
+        request: &StorageRequest,
+    ) -> Result<crate::journal::Admission> {
+        let deadline = self.config.deadline;
+        let (transport, owners, private) = self.journal_scope(operation)?;
+        crate::journal::admit(transport, owners, &private, request, operation, deadline)
+    }
+
+    /// Record what a dispatched mutation actually did (**R1-004**).
+    fn journal_settle(
+        &mut self,
+        operation: &str,
+        request: &StorageRequest,
+        outcome: &Result<StorageResponse>,
+    ) -> Result<()> {
+        let deadline = self.config.deadline;
+        let (transport, owners, private) = self.journal_scope(operation)?;
+        crate::journal::settle(
+            transport, owners, &private, request, outcome, operation, deadline,
+        )
+    }
+
+    /// The three pieces the retry journal needs, borrowed together.
+    ///
+    /// The private anchor is cloned rather than borrowed because `self.operations`
+    /// and `self.transport` cannot both be borrowed out of one `&mut self`
+    /// otherwise; an `Anchor` is a pinned handle and a run identity, so the clone
+    /// names the same object the borrow would have.
+    fn journal_scope(
+        &mut self,
+        operation: &str,
+    ) -> Result<(
+        &mut dyn RawTransport,
+        &mut crate::state::open_owner::OpenOwnerRegistry,
+        crate::anchor::Anchor,
+    )> {
+        let private = self
+            .operations
+            .as_ref()
+            .and_then(|operations| operations.anchors().private())
+            .ok_or_else(|| {
+                UmbraError::new(
+                    ErrorKind::InvalidState,
+                    operation,
+                    "the run has no .provider directory, so no retry record can be written; a                      mutation without durable replay evidence is refused",
+                )
+            })?
+            .clone();
+        let transport = self.transport.as_deref_mut().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::StorageUnavailable,
+                operation,
+                "no transport facade is bound to this provider",
+            )
+        })?;
+        let owners = self
+            .state
+            .incarnation()
+            .ok_or_else(|| {
+                UmbraError::new(
+                    ErrorKind::InvalidState,
+                    operation,
+                    "a retry record needs open owners from a confirmed client incarnation",
+                )
+            })?
+            .open_owners();
+        Ok((transport, owners, private))
+    }
+
+    /// Reject a mutation whose writer epoch is not the admitted one (**R1-003**).
+    ///
+    /// A stale epoch is a request authorised by an admission this provider no
+    /// longer holds; a forged one is a request authorised by an admission that
+    /// never existed. Neither may reach a dispatch path.
+    fn check_presented_epoch(&self, operation: &str, context: &RequestContext) -> Result<()> {
+        let Some(session) = self.session.as_ref() else {
+            return Err(UmbraError::new(
+                ErrorKind::LeaseLost,
+                operation,
+                "no admission is held; a mutation cannot be authorised",
+            ));
+        };
+        let current = session.admitted().epoch();
+        match context.writer_epoch {
+            Some(presented) if presented == current => Ok(()),
+            Some(presented) => Err(crate::error::FacadeError::Authority(
+                crate::error::AuthorityError::StaleEpoch {
+                    held: presented,
+                    current,
+                },
+            )
+            .to_umbra(operation)),
+            None => Err(crate::error::FacadeError::Authority(
+                crate::error::AuthorityError::NoWriterEpoch,
+            )
+            .to_umbra(operation)),
+        }
+    }
+
+    /// Record a call whose server-side effect this provider cannot rule out.
+    ///
+    /// **R1-002.** Only failures that leave the request possibly *received* count.
+    /// A refusal before dispatch (`QueueFull`), a malformed reply, or a deadline
+    /// whose retirement was proven drained leave nothing outstanding.
+    fn observe_disposition(&mut self, operation: &str, error: &UmbraError) {
+        let Some(detail) = unsettled_detail(operation, error) else {
+            return;
+        };
+        self.unsettled.push(detail);
+    }
+}
+
+/// Whether an error leaves a dispatched request's server-side effect unknown.
+///
+/// Every transport failure in this crate surfaces as
+/// [`ErrorKind::StorageUnavailable`] (`FacadeError::to_umbra`), which covers a
+/// lost connection, an elapsed deadline and a cancelled call — each of which can
+/// leave a request already received and applied by the server.
+///
+/// A failure that carries an NFS status is *not* outstanding: the server answered,
+/// so the outcome is known even though it is an error. A refusal before dispatch
+/// is not outstanding either, but it arrives as `StorageUnavailable` too, so it is
+/// counted here. That direction is deliberate: over-reporting keeps the marker
+/// held and only costs a cooperative handover, while under-reporting is the
+/// two-live-owners failure R1-002 describes.
+fn unsettled_detail(operation: &str, error: &UmbraError) -> Option<String> {
+    match error.kind {
+        ErrorKind::StorageUnavailable => Some(format!("{operation}: {}", error.context)),
+        _ => None,
     }
 }
 
@@ -580,6 +803,11 @@ impl Storage for NfsUserspaceStorage {
         let deadline = self.config.deadline;
         let serial = self.serial;
         let config = self.config.clone();
+        // A newly admitted run starts with no lost authority and nothing
+        // outstanding. `close_run` clears both as well; doing it here too means a
+        // run that is opened after a failed close cannot inherit the old verdict.
+        self.authority_loss = None;
+        self.unsettled.clear();
         let transport = self.transport.as_deref_mut().ok_or_else(|| {
             UmbraError::new(
                 ErrorKind::StorageUnavailable,
@@ -645,6 +873,36 @@ impl Storage for NfsUserspaceStorage {
             )?;
         }
 
+        // R1-005: an existing run's own durable evidence is read and validated
+        // before admission. `OpenExisting` used to check the caller's format
+        // version and nothing else, so a run whose manifest named another base,
+        // another run or another format was admitted, and a missing or malformed
+        // manifest was indistinguishable from a healthy one.
+        //
+        // The epoch floor comes from the same read. A run the mounted adapter
+        // released cleanly has no marker but may have reached epoch 7; creating a
+        // fresh marker at epoch 1 there would regress the run's authority epoch.
+        let epoch_floor = if request.intent == umbra_core::OpenRunIntent::CreateNew {
+            umbra_core::LeaseEpoch(0)
+        } else {
+            let private = operations.anchors().private().ok_or_else(|| {
+                UmbraError::new(
+                    ErrorKind::InvalidState,
+                    "open_run",
+                    "the run has no .provider directory, so its recorded identity cannot be                      read; opening without one would be an unverified session",
+                )
+            })?;
+            crate::anchor::read_persisted_state(
+                transport,
+                private,
+                request.run_id,
+                &request.immutable_base,
+                FORMAT_VERSION,
+                deadline,
+            )?
+            .epoch
+        };
+
         // Product admission, before the binding exists. A denial returns here and
         // leaves `self.operations` untouched, so the caller has nothing to use.
         let writer = self.writer_id.clone();
@@ -655,6 +913,7 @@ impl Storage for NfsUserspaceStorage {
             request.run_id,
             writer.clone(),
             writer_token(request.run_id, &writer),
+            epoch_floor,
             deadline,
         )?;
 
@@ -707,8 +966,34 @@ impl Storage for NfsUserspaceStorage {
 
     fn renew_writer(&mut self, lease: &WriterLease) -> Result<WriterLease> {
         let deadline = self.config.deadline;
-        let (session, operations, transport, state) = self.authority("renew_writer")?;
-        session.renew(transport, state, operations.anchors(), lease, deadline)
+        // A lease this session never issued is a rejected argument, not a lost
+        // admission: nothing about the durable marker has been observed yet. Only
+        // the marker re-proof below can latch authority loss (R1-002).
+        {
+            let (session, ..) = self.authority("renew_writer")?;
+            if !session.owns_lease(lease) {
+                return Err(UmbraError::new(
+                    ErrorKind::LeaseLost,
+                    "renew_writer",
+                    "the presented lease is not the one this session holds",
+                ));
+            }
+        }
+        let renewed = {
+            let (session, operations, transport, state) = self.authority("renew_writer")?;
+            session.renew(transport, state, operations.anchors(), lease, deadline)
+        };
+        match renewed {
+            Ok(lease) => Ok(lease),
+            // R1-002: a renewal that could not re-prove this session's ownership
+            // is terminal. Returning the error and leaving the session installed
+            // let the very next mutation build a context and dispatch anyway.
+            Err(error) => {
+                self.observe_disposition("renew_writer", &error);
+                self.authority_loss = Some(AuthorityLoss::RenewalFailed(error.clone()));
+                Err(error)
+            }
+        }
     }
 
     fn release_writer(&mut self, lease: &WriterLease) -> Result<()> {
@@ -728,12 +1013,84 @@ impl Storage for NfsUserspaceStorage {
 
     fn execute(&mut self, request: &StorageRequest) -> Result<StorageResponse> {
         let operation = crate::capability::operation_name(&request.operation);
-        let (operations, mut context) = self.request(
-            operation,
-            Some(&request.context.idempotency_key),
-            request.context.operation_id,
-        )?;
-        operations.execute(&mut context, request)
+        // R1-003: the admitted epoch lives on the session, so the check that a
+        // request presents the epoch this provider actually holds belongs here.
+        // Neither `umbra_storage::validate_request` (which only asks that *some*
+        // epoch is present) nor `MutationIdentity::from_context` (which accepts
+        // whatever it is handed) compares it against the admission.
+        if request.operation.is_mutation() {
+            self.check_presented_epoch(operation, &request.context)?;
+        }
+        // R1-004: every supported mutation goes through the durable retry journal
+        // before it reaches the wire. A recorded key is answered from its record
+        // and never re-dispatched; a fresh key has its exact request persisted as
+        // an intent first, so a lost reply can be reconciled from evidence rather
+        // than by re-deriving the answer from the namespace as it stands now.
+        //
+        // Reads are not journalled: they have no effect to reconcile, and
+        // recording one would consume durable space per lookup.
+        let journalled = request.operation.is_mutation();
+        if journalled {
+            // The journal's own round trips can fail the same way a dispatched
+            // mutation can, so their disposition is observed too (R1-002). A
+            // record write that reached the server and lost its reply leaves the
+            // journal in a state this session cannot account for.
+            let admitted = self.journal_admit(operation, request);
+            let admitted = match admitted {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    self.observe_disposition(operation, &error);
+                    return Err(error);
+                }
+            };
+            match admitted {
+                crate::journal::Admission::Recorded(result) => return result,
+                crate::journal::Admission::Fresh => {}
+            }
+        }
+
+        let outcome = {
+            let (operations, mut context) = self.request(
+                operation,
+                Some(&request.context.idempotency_key),
+                request.context.operation_id,
+            )?;
+            operations.execute(&mut context, request)
+        };
+        // R1-002: record, as it happens, any call whose server-side effect this
+        // provider cannot rule out. `close_run` reads this ledger rather than
+        // asserting `Excluded` from the shape of the dispatch loop.
+        if let Err(error) = &outcome {
+            self.observe_disposition(operation, error);
+        }
+        if journalled {
+            // The outcome is recorded as it happened, a *settled* failure
+            // included: a retry of a key that failed must be told the failure
+            // rather than allowed to try again under the same identity.
+            //
+            // An outcome whose server-side disposition is unknown is deliberately
+            // NOT settled. Recording "this failed" for a request that may well
+            // have been applied would hand a later retry a wrong answer with the
+            // authority of a durable record. The intent stays unsettled instead,
+            // so the retry is told the operation is indeterminate and needs
+            // reconciliation — which is what the replay facade's
+            // `Admission::Indeterminate` means.
+            let settled = match &outcome {
+                Ok(_) => true,
+                Err(error) => unsettled_detail(operation, error).is_none(),
+            };
+            if settled {
+                // A journal write that itself fails is reported: the operation may
+                // well have taken effect, and returning the result while its
+                // record says the attempt is still in flight would leave a retry
+                // unable to tell.
+                if let Err(error) = self.journal_settle(operation, request, &outcome) {
+                    self.observe_disposition(operation, &error);
+                    return Err(error);
+                }
+            }
+        }
+        outcome
     }
 
     fn flush(&mut self, _request: &FlushRequest) -> Result<DurabilityReceipt> {
@@ -759,6 +1116,12 @@ impl Storage for NfsUserspaceStorage {
             self.release("close_run", deadline)?;
         }
         self.operations = None;
+        // The run is gone, and with it everything that was true only of that run:
+        // the authority latch (R1-002) and the unsettled-call ledger both belong
+        // to the closed run, not to the provider. Carrying either into the next
+        // `open_run` would refuse a fresh, properly admitted run.
+        self.authority_loss = None;
+        self.unsettled.clear();
         // Every handle this session issued carries its serial, which `open_run`
         // has already advanced, so all of them are now rejected on presentation.
         // A close never implies a flush.

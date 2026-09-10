@@ -138,12 +138,17 @@ impl NamespaceDispatcher for TransportDispatcher {
                 source,
                 mode,
             } => {
-                if *mode == RenameMode::NoReplace
-                    && Self::probe(transport, target_parent, target_name, deadline).is_ok()
-                {
-                    // NFSv4.0 RENAME always replaces; the contract's NoReplace is
-                    // enforced here, before anything is sent.
-                    return Err(status(Nfs4Status::EXIST, OpCode::Rename));
+                if *mode == RenameMode::NoReplace {
+                    // R1-006: this used to probe the destination and, if the probe
+                    // did not return Ok, fall through to an ordinary replacing
+                    // RENAME. That is check-then-rename: a destination created
+                    // between the probe and the RENAME was silently overwritten,
+                    // and so was one whose probe failed with EIO, ACCESS or STALE.
+                    // NFSv4.0 has no atomic no-replace rename, so the dispatcher
+                    // refuses rather than emulating one. `ops::rename` refuses the
+                    // same request earlier; this is the seam's own guard, so no
+                    // future caller can reach the wire with it.
+                    return Err(unsupported_no_replace());
                 }
 
                 // SAVEFH names the source directory; PUTFH names the target.
@@ -383,6 +388,15 @@ fn status(status: Nfs4Status, op: OpCode) -> FacadeError {
     FacadeError::protocol(status, op, 0)
 }
 
+/// The refusal an atomic no-replace rename gets (**R1-006**).
+///
+/// `NFS4ERR_NOTSUPP` is the honest wire answer: the guarantee is not one this
+/// version of the protocol offers, as opposed to a destination that happens to
+/// exist right now, which is what the old `NFS4ERR_EXIST` claimed.
+fn unsupported_no_replace() -> FacadeError {
+    FacadeError::protocol(Nfs4Status::NOTSUPP, OpCode::Rename, 0)
+}
+
 fn shape(expected: OpCode, actual: OpCode) -> FacadeError {
     FacadeError::Transport(crate::error::TransportError::Malformed(format!(
         "expected a {expected:?} reply, got {actual:?}"
@@ -549,17 +563,70 @@ mod tests {
         assert!(exists(&mut fake, &target_dir, b"after"));
     }
 
+    /// **R1-006.** No-replace rename is refused as unsupported, whether or not the
+    /// destination happens to exist.
+    ///
+    /// The previous implementation probed the destination and refused only when
+    /// the probe returned `Ok`. That is check-then-rename, which
+    /// `docs/design/syscall-matrix.md:29` explicitly prohibits as an atomic
+    /// no-replace: a destination created between the probe and the RENAME was
+    /// silently overwritten, and so was one whose probe failed for any reason
+    /// other than NOENT. The absent-destination case below is the one that used to
+    /// *succeed*, and it is the one the race actually exploits.
     #[test]
-    fn a_no_replace_rename_onto_an_existing_name_is_refused_before_dispatch() {
+    fn r1_006_no_replace_rename_is_refused_whether_or_not_the_destination_exists() {
+        for (label, seed_destination) in [("occupied", true), ("absent", false)] {
+            let mut fake = FakeTransport::new();
+            let root = fake.root();
+            fake.insert_file(&root, b"before", b"a".to_vec());
+            if seed_destination {
+                fake.insert_file(&root, b"after", b"b".to_vec());
+            }
+            let (_, source) = resolve(&mut fake, &root, b"before");
+
+            let mut dispatcher = TransportDispatcher::new();
+            let error = dispatcher
+                .dispatch(
+                    &mut fake,
+                    &NamespaceMutation::Rename {
+                        source_parent: root.clone(),
+                        source_name: name(b"before"),
+                        target_parent: root.clone(),
+                        target_name: name(b"after"),
+                        source,
+                        mode: RenameMode::NoReplace,
+                    },
+                )
+                .unwrap_err();
+
+            // NOTSUPP, not EXIST: the guarantee is unavailable in this protocol
+            // version, which is a different fact from "the destination is taken".
+            assert!(
+                matches!(&error, FacadeError::Protocol(p) if p.status == Nfs4Status::NOTSUPP),
+                "{label}: {error:?}"
+            );
+            // Nothing was sent, so the source is still where it was and any
+            // occupant survived.
+            assert!(exists(&mut fake, &root, b"before"), "{label}");
+            assert_eq!(
+                exists(&mut fake, &root, b"after"),
+                seed_destination,
+                "{label}: the destination must be untouched"
+            );
+        }
+    }
+
+    /// **R1-006.** Ordinary replacing rename is unaffected by the refusal above.
+    #[test]
+    fn r1_006_ordinary_replace_rename_still_replaces() {
         let mut fake = FakeTransport::new();
         let root = fake.root();
         fake.insert_file(&root, b"before", b"a".to_vec());
         fake.insert_file(&root, b"after", b"b".to_vec());
         let (_, source) = resolve(&mut fake, &root, b"before");
-        let (_, occupant) = resolve(&mut fake, &root, b"after");
 
         let mut dispatcher = TransportDispatcher::new();
-        let error = dispatcher
+        let outcome = dispatcher
             .dispatch(
                 &mut fake,
                 &NamespaceMutation::Rename {
@@ -568,17 +635,16 @@ mod tests {
                     target_parent: root.clone(),
                     target_name: name(b"after"),
                     source,
-                    mode: RenameMode::NoReplace,
+                    mode: RenameMode::Replace,
                 },
             )
-            .unwrap_err();
-
-        assert!(matches!(&error, FacadeError::Protocol(p) if p.status == Nfs4Status::EXIST));
-        // NFSv4.0 RENAME always replaces, so the refusal has to happen before the
-        // COMPOUND is sent; proving the occupant survived proves it did.
-        let (_, still_there) = resolve(&mut fake, &root, b"after");
-        assert_eq!(still_there, occupant);
-        assert!(exists(&mut fake, &root, b"before"));
+            .expect("a replacing rename is supported");
+        match outcome {
+            NamespaceOutcome::Renamed(effect) => assert_eq!(effect.identity, source),
+            other => panic!("expected a rename outcome, got {other:?}"),
+        }
+        assert!(!exists(&mut fake, &root, b"before"));
+        assert!(exists(&mut fake, &root, b"after"));
     }
 
     #[test]

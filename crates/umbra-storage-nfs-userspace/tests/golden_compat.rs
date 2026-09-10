@@ -339,18 +339,84 @@ fn a_created_run_lays_out_exactly_what_the_mounted_adapter_golden_pins() {
         // session rather than a concurrent reader of a held run.
         storage.close_run().expect("release");
 
+        // The golden pins what `CreateNew` *produced*. Reopening the run here
+        // would make the observation include a cooperative succession's durable
+        // claim (R1-001), which is this provider's own state and not part of the
+        // layout the mounted adapter writes. Succession is asserted separately by
+        // `a_cooperative_succession_records_one_durable_claim_per_epoch`.
         let mut inspector = handover(label, storage);
-        inspector
-            .open_run(&open_existing(run_id))
-            .expect("reopen the created run");
         let observed = render_layout(inspector.transport().expect("transport"), run_id);
-        inspector.close_run().expect("release");
 
         let expected = String::from_utf8(golden("run-layout.txt")).expect("utf-8 golden");
         assert_eq!(
             observed, expected,
             "{label}: the created run must match the mounted-adapter layout byte for byte"
         );
+    }
+}
+
+/// **R1-001.** Cooperative succession is decided by a server-atomic per-epoch
+/// claim, and that claim is durable evidence: it names the epoch a successor took
+/// and it is never deleted.
+///
+/// This pins the artifact so the divergence from the mounted adapter's layout is
+/// asserted rather than discovered. The claim is additive: every name the mounted
+/// adapter reads is still exactly where it was, which is why
+/// `a_second_sequential_session_opens_the_run_the_first_one_created` still passes.
+#[test]
+fn a_cooperative_succession_records_one_durable_claim_per_epoch() {
+    for (label, transport) in transports() {
+        let mut storage = provider(transport);
+        let run_id = RunId(Uuid::new_v4());
+        storage
+            .open_run(&create_run(run_id))
+            .expect("create the run");
+        storage.close_run().expect("release");
+
+        let mut successor = handover(label, storage);
+        successor
+            .open_run(&open_existing(run_id))
+            .expect("succeed to the released run");
+        let epoch = successor
+            .admission()
+            .expect("the successor is admitted")
+            .admitted()
+            .epoch();
+        assert_eq!(epoch.0, 2, "{label}: succession advances the epoch by one");
+
+        let run = run_directory(successor.transport().expect("transport"), run_id);
+        let private = resolve(
+            successor.transport().expect("transport"),
+            &run,
+            layout::PRIVATE_DIR,
+        );
+        let names: Vec<Vec<u8>> = listing(successor.transport().expect("transport"), &private)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == b"writer.lock.claim.2"),
+            "{label}: succession to epoch 2 must leave its durable claim; saw {:?}",
+            names
+                .iter()
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+                .collect::<Vec<_>>()
+        );
+        // The predecessor's evidence is untouched: the marker is still the one
+        // name admission arbitrates over, and every golden name is still present.
+        for pinned in [
+            layout::WRITER_LOCK_FILE,
+            layout::MANIFEST_FILE,
+            layout::EPOCH_FILE,
+            layout::RETRIES_DIR,
+        ] {
+            assert!(
+                names.iter().any(|name| name.as_slice() == pinned),
+                "{label}: {:?} must survive a succession",
+                String::from_utf8_lossy(pinned)
+            );
+        }
+        successor.close_run().expect("release");
     }
 }
 

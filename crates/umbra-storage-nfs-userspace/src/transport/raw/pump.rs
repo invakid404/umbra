@@ -23,6 +23,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::error::TransportError;
+use crate::pdu::{ownership, DisposalGeneration, Ownership};
 use crate::transport::{ConnectionEpoch, ConnectionState, TransportResult};
 
 use super::decode::{self, ReplyBudget};
@@ -131,12 +132,23 @@ impl Dispatch {
     pub(super) fn mark_completed(&mut self) {
         *self = Dispatch::Completed;
     }
+
+    /// Whether libnfs may still be holding this PDU.
+    pub(super) fn is_queued(&self) -> bool {
+        matches!(self, Dispatch::Queued(_))
+    }
 }
 
 /// One in-flight call: its id, its PDU, and the arguments C is reading.
 pub(super) struct CallSlot {
     /// Registry id, also the value behind the public `CallToken`.
     pub(super) id: u64,
+    /// Disposal generation this call was queued in.
+    ///
+    /// **R1-009.** A connection-wide disposal frees every outstanding PDU at
+    /// once, so "may this pointer still be cancelled" is a question about the
+    /// context's history and not only about this call. See [`crate::pdu`].
+    pub(super) queued_in: DisposalGeneration,
     /// PDU ownership state.
     pub(super) dispatch: Dispatch,
     /// Argument memory, owned until the call completes or is withdrawn.
@@ -235,6 +247,8 @@ pub(super) struct EventPump {
     port: u16,
     epoch: ConnectionEpoch,
     state: ConnectionState,
+    /// How many times libnfs has disposed of every outstanding PDU (**R1-009**).
+    disposals: DisposalGeneration,
 }
 
 // SAFETY: `rpc` and `auth` are owned exclusively by this value and are only
@@ -293,6 +307,7 @@ impl EventPump {
             port,
             epoch: ConnectionEpoch(0),
             state: ConnectionState::Idle,
+            disposals: DisposalGeneration::START,
         })
     }
 
@@ -302,6 +317,21 @@ impl EventPump {
 
     pub(super) fn epoch(&self) -> ConnectionEpoch {
         self.epoch
+    }
+
+    /// The current PDU disposal generation.
+    pub(super) fn disposals(&self) -> DisposalGeneration {
+        self.disposals
+    }
+
+    /// Record that libnfs has errored and freed every outstanding PDU.
+    ///
+    /// **R1-009.** Called on every path where `rpc_reconnect_requeue` can have
+    /// run: a negative `rpc_service`, a lost file descriptor, a poll failure, and
+    /// the deliberate `rpc_disconnect`. After this, no PDU pointer queued before
+    /// the call may be handed to `rpc_cancel_pdu`.
+    fn note_disposal(&mut self) {
+        self.disposals = self.disposals.disposed();
     }
 
     /// Number of PDUs libnfs currently holds, used for backpressure.
@@ -382,6 +412,9 @@ impl EventPump {
         let reason = CString::new("umbra: transport reconnect").expect("literal has no NUL");
         // SAFETY: `self.rpc` is live; `reason` outlives the call.
         unsafe { sys::rpc_disconnect(self.rpc, reason.as_ptr()) };
+        // rpc_disconnect errors and frees every outstanding PDU, exactly as a
+        // socket failure does.
+        self.note_disposal();
         self.state = ConnectionState::Broken(self.epoch);
     }
 
@@ -443,6 +476,7 @@ impl EventPump {
 
         Ok(CallSlot {
             id,
+            queued_in: self.disposals,
             dispatch: Dispatch::Queued(pdu),
             arena,
             drop_reply: false,
@@ -481,7 +515,11 @@ impl EventPump {
             // SAFETY: `self.rpc` is live for the lifetime of this value.
             let fd = unsafe { sys::rpc_get_fd(self.rpc) };
             if fd < 0 {
-                return ServiceOutcome::Disconnected;
+                // R1-009: a context with no descriptor has already torn its
+                // queue down. Reconcile before reporting, so a completion that
+                // was delivered on the way out is not left behind for a
+                // cancellation to trip over.
+                return self.disconnected(id, discard);
             }
             // SAFETY: as above.
             let events = unsafe { sys::rpc_which_events(self.rpc) };
@@ -499,7 +537,7 @@ impl EventPump {
                 if errno.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                return ServiceOutcome::Disconnected;
+                return self.disconnected(id, discard);
             }
             if ready == 0 {
                 continue;
@@ -509,9 +547,40 @@ impl EventPump {
             // Completion callbacks run inside this call.
             if unsafe { sys::rpc_service(self.rpc, c_int::from(descriptor.revents)) } < 0 {
                 self.state = ConnectionState::Broken(self.epoch);
-                return ServiceOutcome::Disconnected;
+                return self.disconnected(id, discard);
             }
         }
+    }
+
+    /// Settle a connection failure: reconcile this call's completion, then record
+    /// that libnfs disposed of every outstanding PDU.
+    ///
+    /// **R1-009.** Both halves matter and the order matters. `rpc_service`
+    /// returning a negative value means `rpc_reconnect_requeue` has already run:
+    /// with `auto_reconnect` off it invoked *every* outstanding call's completion
+    /// and then freed each PDU (`lib/init.c`). So a completion for this call may
+    /// well be sitting in the registry — reporting `Disconnected` without looking
+    /// discards a settled answer — and every PDU pointer the wrapper holds is
+    /// now dangling, which is what [`Self::note_disposal`] records.
+    ///
+    /// Previously this returned `Disconnected` immediately, the caller left the
+    /// slot in `Dispatch::Queued`, and retirement handed the freed pointer to
+    /// `rpc_cancel_pdu`, which dereferences it before looking it up.
+    fn disconnected(&mut self, id: u64, discard: bool) -> ServiceOutcome {
+        let outcome = if has_completion(id) {
+            if discard {
+                let _ = take(id);
+                ServiceOutcome::Discarded
+            } else {
+                ServiceOutcome::Completed
+            }
+        } else {
+            ServiceOutcome::Disconnected
+        };
+        // Recorded whichever way the completion went: the disposal is a property
+        // of the connection, not of this one call.
+        self.note_disposal();
+        outcome
     }
 
     /// Withdraw a call from libnfs and report whether the pump is proven idle.
@@ -520,13 +589,30 @@ impl EventPump {
     /// the case when `rpc_cancel_pdu` removed the PDU (libnfs frees it without
     /// invoking the callback) or when a completion had already been observed.
     pub(super) fn retire(&mut self, slot: &mut CallSlot) -> bool {
+        // R1-009: decide ownership *before* reaching for the pointer. A call that
+        // has a completion waiting, or that was outstanding across a
+        // connection-wide disposal, is one libnfs has already freed; asking for
+        // its pointer at all would be the use-after-free.
+        if slot.dispatch.is_queued()
+            && ownership(slot.queued_in, self.disposals, has_completion(slot.id))
+                == Ownership::Freed
+        {
+            // Make the pointer unreachable rather than merely unused.
+            slot.dispatch.mark_completed();
+            withdraw(slot.id);
+            // libnfs is provably done with this call: no callback for it can run
+            // again, which is exactly what `drained` reports.
+            return true;
+        }
         let drained = match slot.dispatch.take_for_cancel() {
             // No PDU is owed a cancellation: libnfs already finished with it.
             None => true,
             Some(pdu) => {
                 // SAFETY: `Dispatch::Queued` is only ever set from a live PDU
                 // pointer, and `take_for_cancel` consumes it, so libnfs still
-                // owned this PDU and no second cancellation can occur.
+                // owned this PDU and no second cancellation can occur. The
+                // ownership check above has additionally ruled out both ways
+                // libnfs can have freed it first (R1-009).
                 let removed = unsafe { sys::rpc_cancel_pdu(self.rpc, pdu) };
                 // 0 means the PDU was found and freed without a callback.
                 // -ENOENT means it had already been serviced, in which case any
@@ -608,6 +694,53 @@ mod tests {
         let mut dispatch = Dispatch::Queued(0x1234 as *mut sys::rpc_pdu);
         dispatch.mark_completed();
         assert!(dispatch.take_for_cancel().is_none());
+    }
+
+    /// **R1-009.** A slot queued before a connection-wide disposal is never
+    /// cancelled, because libnfs has already freed its PDU.
+    ///
+    /// This is the pointer-level half of the rule; the decision itself is
+    /// `crate::pdu::ownership`, which is tested in the default build. Together
+    /// they cover the review's trace: queued PDU -> socket error -> callback
+    /// records Failed -> libnfs frees the PDU -> `rpc_service` returns -1 ->
+    /// (previously) the slot stayed `Queued` and retirement dereferenced the
+    /// freed pointer.
+    #[test]
+    fn r1_009_a_slot_outstanding_across_a_disposal_is_not_cancellable() {
+        let queued_in = DisposalGeneration::START;
+        let after = queued_in.disposed();
+
+        // The pointer is deliberately bogus: the point of the assertion is that
+        // nothing ever reaches for it. If the rule regressed, this test would
+        // hand `0xDEAD` to `rpc_cancel_pdu`.
+        let mut slot_dispatch = Dispatch::Queued(0xDEAD as *mut sys::rpc_pdu);
+        assert!(slot_dispatch.is_queued());
+        assert_eq!(
+            ownership(queued_in, after, false),
+            Ownership::Freed,
+            "a disposal after dispatch means libnfs freed this PDU"
+        );
+
+        // What `retire` does with that verdict: make the pointer unreachable.
+        slot_dispatch.mark_completed();
+        assert!(!slot_dispatch.is_queued());
+        assert!(
+            slot_dispatch.take_for_cancel().is_none(),
+            "a freed PDU's pointer must be unreachable, not merely unused"
+        );
+    }
+
+    /// **R1-009.** Without a disposal, an outstanding call is still cancellable —
+    /// the deadline path must keep working.
+    #[test]
+    fn r1_009_an_ordinary_deadline_still_cancels_its_pdu() {
+        let generation = DisposalGeneration::START;
+        assert_eq!(
+            ownership(generation, generation, false),
+            Ownership::Cancellable
+        );
+        let mut dispatch = Dispatch::Queued(0x1234 as *mut sys::rpc_pdu);
+        assert!(dispatch.take_for_cancel().is_some());
     }
 
     #[test]

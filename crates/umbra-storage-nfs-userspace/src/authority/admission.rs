@@ -163,6 +163,20 @@ pub enum ReleaseOutcome {
         /// The verbatim reason.
         error: FacadeError,
     },
+    /// The release neither provably happened nor provably did not.
+    ///
+    /// **R1-002.** A failed release write is not the same as a release that did
+    /// not take effect: the WRITE may have reached the server and only its reply
+    /// been lost. Handing the [`Admitted`] proof back in that case revives an
+    /// authority a successor may already have taken over — two live owners from
+    /// one failed round trip. So this variant consumes the proof exactly as
+    /// [`Self::Released`] does, and the session it came from must stop rather
+    /// than mutate.
+    Uncertain {
+        /// What the marker was found to say afterwards, or why it could not be
+        /// read. Recorded verbatim; this is the operator's reconciliation input.
+        error: FacadeError,
+    },
 }
 
 /// Admission control over one run's durable marker.
@@ -180,10 +194,25 @@ pub struct AdmissionControl<S: MarkerStore> {
 impl<S: MarkerStore> AdmissionControl<S> {
     /// Admission control for `run` over `store`.
     pub fn new(run: RunId, store: S) -> Self {
+        Self::with_epoch_floor(run, store, LeaseEpoch(0))
+    }
+
+    /// Admission control that already knows a run reached `floor`.
+    ///
+    /// **R1-005.** A run written by the mounted adapter records its writer epoch
+    /// in `.provider/epoch` and deletes only the lock on a cooperative release, so
+    /// a cleanly released legacy run has no marker but may have reached epoch 7.
+    /// Creating a fresh marker at epoch 1 there regresses the run's authority
+    /// epoch — a later reader cannot tell the new epoch 3 from the legacy one.
+    ///
+    /// Seeding the floor makes the first marker this provider writes land above
+    /// everything the run has already used, and makes a marker that reads *below*
+    /// the floor the epoch regression it is.
+    pub fn with_epoch_floor(run: RunId, store: S, floor: LeaseEpoch) -> Self {
         Self {
             store,
             run,
-            highest_epoch_seen: LeaseEpoch(0),
+            highest_epoch_seen: floor,
         }
     }
 
@@ -222,10 +251,20 @@ impl<S: MarkerStore> AdmissionControl<S> {
             return AdmissionOutcome::Refused(refusal);
         }
 
+        // R1-005: the first epoch is one past anything the run is already known to
+        // have used, which is `LeaseEpoch(1)` for a run with no history.
+        let Some(first) = self.highest_epoch_seen.0.checked_add(1) else {
+            return AdmissionOutcome::Refused(FacadeError::Authority(
+                AuthorityError::IdentityUnproven(
+                    "admission epoch would overflow; refusing rather than wrapping".into(),
+                ),
+            ));
+        };
+        let first = LeaseEpoch(first);
         let fresh = AdmissionMarker::new(
             request.token,
             request.writer.clone(),
-            LeaseEpoch(1),
+            first,
             AdmissionPhase::Held,
         );
         let encoded = match fresh.encode() {
@@ -235,12 +274,12 @@ impl<S: MarkerStore> AdmissionControl<S> {
         match self.store.create_exclusive(&encoded) {
             Err(error) => return AdmissionOutcome::Refused(error),
             Ok(ExclusiveCreate::Created) => {
-                self.highest_epoch_seen = LeaseEpoch(1);
+                self.highest_epoch_seen = first;
                 return AdmissionOutcome::Admitted(Admitted {
                     run: self.run,
                     writer: request.writer.clone(),
                     token: request.token,
-                    epoch: LeaseEpoch(1),
+                    epoch: first,
                 });
             }
             Ok(ExclusiveCreate::Exists) => {}
@@ -294,6 +333,33 @@ impl<S: MarkerStore> AdmissionControl<S> {
                     ));
                 };
                 let epoch = LeaseEpoch(next);
+
+                // R1-001: reading `Released` and overwriting it is two round
+                // trips, and two contenders can interleave them so that both
+                // write themselves in as `Held` and both believe they were
+                // admitted. The claim below is the server-atomic serialisation
+                // point that makes exactly one of them the successor: whoever
+                // creates the epoch's claim name wins, and every other contender
+                // is refused by the *server*, not by a local guess.
+                //
+                // The refusal is deliberately not a `Denied`: `Denied` reports a
+                // holder read from the marker, and a contender that lost this
+                // race has not read the winner's marker yet. Refusing is the safe
+                // stop, and a caller that wants the winner's identity re-reads.
+                match self.store.claim_succession(epoch) {
+                    Err(error) => return AdmissionOutcome::Refused(error),
+                    Ok(ExclusiveCreate::Exists) => {
+                        return AdmissionOutcome::Refused(FacadeError::Authority(
+                            AuthorityError::AdmissionRefused(format!(
+                                "another session already claimed succession to epoch {} of run \
+                                 {}; cooperative succession admits exactly one contender",
+                                epoch.0, self.run.0,
+                            )),
+                        ))
+                    }
+                    Ok(ExclusiveCreate::Created) => {}
+                }
+
                 let claimed = AdmissionMarker::new(
                     request.token,
                     request.writer.clone(),
@@ -350,9 +416,71 @@ impl<S: MarkerStore> AdmissionControl<S> {
             Ok(()) => ReleaseOutcome::Released {
                 epoch: admitted.epoch,
             },
-            Err(error) => ReleaseOutcome::Retained {
-                admitted: Box::new(admitted),
+            // R1-002: a failed overwrite is ambiguous. Re-read the marker and let
+            // the durable evidence decide, rather than assuming the write did not
+            // land and reinstating authority over it.
+            Err(error) => self.reconcile_failed_release(&admitted, error),
+        }
+    }
+
+    /// Decide what a failed release write actually left behind (**R1-002**).
+    ///
+    /// Three answers, and only one of them may return the proof:
+    ///
+    /// * the marker reads `Released` at this session's epoch and token — the
+    ///   write landed and only the reply was lost, so the release is complete;
+    /// * the marker still reads `Held` by this session — the write provably did
+    ///   not land, so retaining authority is correct and safe;
+    /// * anything else, including an unreadable marker or one now held by another
+    ///   writer — the disposition is unknown, so the proof is consumed and the
+    ///   session stops.
+    fn reconcile_failed_release(
+        &mut self,
+        admitted: &Admitted,
+        error: FacadeError,
+    ) -> ReleaseOutcome {
+        let observed = match self.inspect() {
+            Ok(Some(marker)) => marker,
+            Ok(None) => {
+                return ReleaseOutcome::Uncertain {
+                    error: FacadeError::Authority(AuthorityError::IdentityUnproven(format!(
+                        "the release write failed ({error}) and the marker is now absent; \
+                         whether the release took effect cannot be established"
+                    ))),
+                }
+            }
+            Err(read_error) => {
+                return ReleaseOutcome::Uncertain {
+                    error: FacadeError::Authority(AuthorityError::IdentityUnproven(format!(
+                        "the release write failed ({error}) and the marker could not be re-read \
+                         ({read_error}); whether the release took effect cannot be established"
+                    ))),
+                }
+            }
+        };
+        let ours = observed.token() == admitted.token && observed.epoch() == admitted.epoch;
+        match (ours, observed.phase()) {
+            // The write landed; only the acknowledgement was lost.
+            (true, AdmissionPhase::Released) => ReleaseOutcome::Released {
+                epoch: admitted.epoch,
+            },
+            // The marker still records this session as the holder, so the release
+            // provably did not take effect and authority was never handed over.
+            (true, AdmissionPhase::Held) => ReleaseOutcome::Retained {
+                admitted: Box::new(admitted.clone()),
                 error,
+            },
+            // Someone else's record, at any phase. Reviving this session's proof
+            // over it is exactly the two-live-owners defect.
+            _ => ReleaseOutcome::Uncertain {
+                error: FacadeError::Authority(AuthorityError::IdentityUnproven(format!(
+                    "the release write failed ({error}) and the marker now records epoch {} in \
+                     phase {:?}, which is not this session's epoch {}; authority is not revived \
+                     over evidence this session cannot account for",
+                    observed.epoch().0,
+                    observed.phase(),
+                    admitted.epoch.0,
+                ))),
             },
         }
     }

@@ -24,10 +24,10 @@
 //! [`AuthorityError::NoWriterEpoch`](crate::error::AuthorityError::NoWriterEpoch).
 
 use umbra_core::{
-    BlobStat, CreateKind, DirectoryPage, Durability, ErrorKind, Fencing, ListCursor, ObjectResult,
-    OpenRunRequest, RenameMode, Result, RunBinding, RunId, StorageAnchor, StorageCapabilities,
-    StorageOperation, StoragePath, StorageRequest, StorageResponse, UmbraError,
-    MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
+    BlobStat, CreateKind, DirectoryPage, Durability, ErrorKind, Fencing, ListCursor,
+    MetadataUpdate, ObjectResult, OpenRunRequest, RenameMode, Result, RunBinding, RunId,
+    StorageAnchor, StorageCapabilities, StorageOperation, StoragePath, StoragePolicy,
+    StorageRequest, StorageResponse, UmbraError, MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
 };
 
 use crate::anchor::{Anchor, HandleMint, RunAnchors, Target};
@@ -106,6 +106,12 @@ pub struct Operations {
     anchors: RunAnchors,
     mint: HandleMint,
     limits: OperationLimits,
+    /// The policy the run was opened under.
+    ///
+    /// **R1-003.** `open` used to validate `format_version` and drop the rest, so
+    /// a read-only run mutated and an unsupported durability requirement was
+    /// silently accepted. Keeping it is what lets `execute` answer for it.
+    policy: StoragePolicy,
 }
 
 impl Operations {
@@ -121,6 +127,26 @@ impl Operations {
         serial: u64,
         deadline: Deadline,
     ) -> Result<Self> {
+        // R1-003: every unsupported requirement is refused *before* the run is
+        // touched, so a caller that asked for a guarantee this provider does not
+        // offer gets a refusal rather than a run that silently ignores it. The
+        // mounted adapter refuses the same two at
+        // `crates/umbra-storage-nfs/src/lib.rs`; a userspace run that accepted
+        // them would be advertising a durability boundary it never qualified.
+        if request.policy.require_kernel_shadow {
+            return Err(UmbraError::new(
+                ErrorKind::UnsupportedCapability,
+                "open_run",
+                "this provider has no kernel-visible shadow: it speaks NFSv4 itself and                  publishes no physical path",
+            ));
+        }
+        if request.policy.require_strict_remote_persistence {
+            return Err(UmbraError::new(
+                ErrorKind::UnsupportedCapability,
+                "open_run",
+                "strict remote persistence is not qualified by this provider; it advertises                  Durability::None and must not accept a run that requires more",
+            ));
+        }
         if request.policy.format_version != crate::storage::FORMAT_VERSION {
             return Err(UmbraError::new(
                 ErrorKind::ProtocolMismatch,
@@ -132,6 +158,13 @@ impl Operations {
                 ),
             ));
         }
+        if request.policy.read_only && request.intent == umbra_core::OpenRunIntent::CreateNew {
+            return Err(UmbraError::new(
+                ErrorKind::Denied,
+                "open_run",
+                "a read-only run cannot be created: creation is itself a mutation",
+            ));
+        }
         let anchors =
             RunAnchors::open(transport, config, request.run_id, request.intent, deadline)?;
         Ok(Self {
@@ -139,7 +172,13 @@ impl Operations {
             anchors,
             mint: HandleMint::for_session(request.run_id, serial),
             limits: OperationLimits::from_transport(transport),
+            policy: request.policy.clone(),
         })
+    }
+
+    /// The policy this run was opened under.
+    pub fn policy(&self) -> &StoragePolicy {
+        &self.policy
     }
 
     /// The run identity this surface is bound to.
@@ -208,6 +247,31 @@ impl Operations {
         // The same preflight direct callers and helper callers get: I/O bounds,
         // page limits and the writer-epoch requirement for mutations.
         umbra_storage::validate_request(&self.capabilities(), request)?;
+        // R1-003: `validate_request` deliberately leaves run-policy enforcement to
+        // the backend, so a read-only run mutated freely. Refused here, before any
+        // effect and before the run identity check, because "this run does not
+        // take mutations at all" is the broader answer.
+        if self.policy.read_only && request.operation.is_mutation() {
+            return Err(UmbraError::new(
+                ErrorKind::Denied,
+                operation,
+                "this run was opened read-only; it does not accept mutations",
+            ));
+        }
+        // R1-003: the request must name the run this surface is bound to. Nothing
+        // upstream checks it: `validate_request` only requires that *some* writer
+        // epoch is present, and `MutationIdentity::from_context` accepts whatever
+        // run and epoch it is handed.
+        if request.context.run_id != self.run_id {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidInput,
+                operation,
+                format!(
+                    "the request names run {}, but this surface is bound to run {}",
+                    request.context.run_id.0, self.run_id.0
+                ),
+            ));
+        }
         // Anything this provider will never offer stops here, before any effect.
         // A deferred operation falls through to its handler, which reports the
         // contracts gap by name when no dispatcher is bound.
@@ -463,7 +527,7 @@ impl Operations {
     ) -> Result<StorageResponse> {
         MutationIdentity::from_context(&request.context).map_err(|e| e.to_umbra(operation))?;
         let (parent, name) = self.parent_and_name(context, path, operation)?;
-        let (open, created) = {
+        let (open, created, was_exclusive) = {
             let deadline = context.deadline;
             let transport = &mut context.transport;
             let (owners, create_verifier) = require_owners(&mut context.mutations, operation)?;
@@ -476,6 +540,7 @@ impl Operations {
                 Some(verifier) => CreateDisposition::CreateExclusive { verifier },
                 None => CreateDisposition::CreateNew { mode },
             };
+            let was_exclusive = create_verifier.is_some();
             let open = OpenObject::open(
                 owners,
                 &mut **transport,
@@ -488,8 +553,46 @@ impl Operations {
             .map_err(|error| error.to_umbra(operation))?;
             let created = PinnedObject::pin(&mut **transport, open.handle().clone(), deadline)
                 .map_err(|error| error.to_umbra(operation))?;
-            (open, created)
+            (open, created, was_exclusive)
         };
+
+        // R1-007: `EXCLUSIVE4` carries a verifier in the field `GUARDED4` uses for
+        // the initial attributes, so the requested mode was never sent — creating
+        // an executable with mode 0755 quietly produced the server's default.
+        // RFC 7530 §18.16.3 and `docs/design/managed-lifecycle-spike.md:33` both
+        // say the attributes are applied afterwards, with SETATTR.
+        //
+        // The provider supplies a create verifier for every keyed operation, so
+        // this is the ordinary path, not a corner case.
+        if was_exclusive {
+            let requested = MetadataUpdate {
+                mode: Some(mode),
+                uid: None,
+                gid: None,
+                accessed_nanos: None,
+                modified_nanos: None,
+            };
+            let applied = dispatch_namespace(
+                context,
+                operation,
+                &NamespaceMutation::SetAttributes {
+                    object: created.handle().clone(),
+                    target: created.identity(),
+                    update: requested,
+                },
+            );
+            if let Err(error) = applied {
+                // The file exists and the mode is the server's default. There is
+                // no rollback to invent — an EXCLUSIVE4 create is not undone by
+                // removing the name, which could destroy a concurrent writer's
+                // work — so the partial effect is reported rather than hidden.
+                let _ = release(open, context.transport, context.deadline, operation);
+                return Err(error);
+            }
+        }
+
+        // Read the result after the attributes are applied, so a caller is told
+        // the mode the object actually has.
         let result = self.object_result(context, &created)?;
         release(open, context.transport, context.deadline, operation)?;
         Ok(StorageResponse::Created(result))
@@ -613,6 +716,28 @@ impl Operations {
                 ErrorKind::InvalidPath,
                 operation,
                 "a cross-anchor rename is rejected",
+            ));
+        }
+        if mode == RenameMode::NoReplace {
+            // R1-006: NFSv4.0 RENAME always replaces, and there is no v4.0
+            // operation that makes "rename only if the destination is absent"
+            // atomic. The previous emulation probed the destination and then
+            // renamed: another client can create the destination between the two
+            // round trips, and a probe that failed for any reason other than
+            // NOENT — EIO, ACCESS, STALE — fell through to an ordinary replacing
+            // RENAME. `docs/design/syscall-matrix.md` prohibits exactly that
+            // check-then-rename, and `managed-lifecycle-spike.md` requires the
+            // unsupported atomic no-replace to be refused unless it is proven.
+            //
+            // Refusing before any effect is the honest answer. Ordinary
+            // `RenameMode::Replace` is unaffected.
+            return Err(UmbraError::new(
+                ErrorKind::UnsupportedCapability,
+                operation,
+                "atomic no-replace rename is not available over NFSv4.0: RENAME always \
+                 replaces, and emulating the guarantee with a destination probe is not \
+                 atomic. Use RenameMode::Replace, or check the destination yourself and \
+                 accept the race.",
             ));
         }
         let (source_parent, source_name) = self.parent_and_name(context, source, operation)?;
