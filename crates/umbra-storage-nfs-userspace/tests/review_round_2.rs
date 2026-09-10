@@ -2919,3 +2919,99 @@ fn r4_003_an_unchanged_rename_still_redispatches() {
         .execute(&request)
         .expect("an unchanged before-state authorises the replay");
 }
+
+/// **Integrator finding I4-001.** `#[ignore]`d because it currently FAILS, and
+/// the failure is the finding rather than a broken test. Round 5 owns the call.
+///
+/// Added at `collect_fix` round 4, not by the fixer. Their report records that
+/// their first R4-001 implementation put the gate in `preflight`, refusing every
+/// mutation, which made the failure model's "resolve bounded outstanding
+/// operations" unsatisfiable; they moved it to the fresh-key branch so that "a
+/// key with no record is new work; a key with one is the resolution".
+///
+/// That correction only reaches the resolution branch when a record exists. When
+/// the lost reply lands on an RPC *before* the intent record is durably written —
+/// the observation or the intent write itself, both real round trips — the ledger
+/// is armed with an unknown disposition and `.provider/retries` stays empty. Every
+/// later key, including the outstanding one, then looks `Fresh` and is refused,
+/// so the operation the error says must be "resolved" has no path to resolution.
+/// The release is refused too and the marker stays `Held`, so no future session
+/// can acquire the run either.
+///
+/// This is a **safe stop, not a correctness hole**: nothing is lost and no false
+/// success is reported. Two readings are open and this node does not choose
+/// between them — it is either the failure model's BLOCKED_RECOVERABLE state
+/// working as intended, in which case the diagnostic promising resolution is
+/// misleading, or the unreachable-resolution defect the fixer set out to avoid.
+#[test]
+#[ignore = "integrator finding I4-001: no resolution path exists in the no-record \
+            window; see /tmp/nfs-scope/m1/integration-4.md. Run with --ignored."]
+fn r4_001_the_unknown_disposition_gate_still_admits_the_resolving_retry() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+
+    // Same setup as the refusal case: one dropped reply leaves a call whose
+    // server-side disposition this provider cannot establish.
+    storage
+        .transport()
+        .expect("transport")
+        .install_faults(ScriptedFault::once(
+            FaultPoint::OnDeadline,
+            None,
+            FaultAction::DropReply,
+        ));
+    let lost = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "resolving-key"),
+            b"resolving.txt",
+        ))
+        .expect_err("the injected loss surfaces");
+    assert_eq!(lost.kind, ErrorKind::StorageUnavailable);
+
+    // The mechanism: the dropped reply landed on an RPC *before* the intent
+    // record was durably written, so `.provider/retries` is empty and
+    // `journal::lookup` will answer `Fresh` for this key forever.
+    let held = retry_records(storage.transport().expect("transport"), run_id);
+    assert!(
+        held.is_empty(),
+        "this trace is the no-record window; with a record the resolution branch \
+         is reached and this test would not be characterising anything: {held:?}"
+    );
+
+    // A *different* key is new work and is refused — this is the gate being
+    // armed, so the retry below is genuinely exercising the resolution branch
+    // rather than a run where the gate never fired.
+    let refused = storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "unrelated-key"),
+            b"unrelated.txt",
+        ))
+        .expect_err("the gate is armed");
+    assert_eq!(refused.kind, ErrorKind::InvalidState);
+
+    // The same key is the resolution, and must be admitted. Whatever it settles
+    // to — the recorded effect, a completed replay, or a typed safe give-up —
+    // it must not be the fresh-work refusal, because that answer would leave the
+    // outstanding operation permanently unresolvable.
+    let resolved = storage.execute(&create_file(
+        authorised(&storage, run_id, "resolving-key"),
+        b"resolving.txt",
+    ));
+    match &resolved {
+        Ok(_) => {}
+        Err(error) => {
+            assert_ne!(
+                error.kind,
+                ErrorKind::InvalidState,
+                "the resolving retry was refused as new work: {}",
+                error.context
+            );
+            assert!(
+                !error.context.contains("disposition is unknown"),
+                "the resolving retry hit the fresh-work gate: {}",
+                error.context
+            );
+        }
+    }
+}
