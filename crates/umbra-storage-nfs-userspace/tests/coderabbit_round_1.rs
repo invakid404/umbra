@@ -24,6 +24,34 @@ use umbra_storage_nfs_userspace::storage::{
 };
 use umbra_storage_nfs_userspace::transport::{ComponentName, Deadline, RawTransport};
 
+/// Records the largest single allocation this test binary makes.
+///
+/// **F17** needs evidence about an *eager reservation*, and a reservation is one
+/// allocation: a `Vec::with_capacity(n)` asks the allocator for `n * size_of::<T>()`
+/// bytes in a single call, whether or not a single entry is ever written. Peak
+/// resident memory would be noisy across parallel tests; the largest single
+/// request is not, because nothing else in this binary asks for anything close.
+struct LargestAllocation;
+
+static LARGEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe impl std::alloc::GlobalAlloc for LargestAllocation {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        LARGEST.fetch_max(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        LARGEST.fetch_max(new_size, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: LargestAllocation = LargestAllocation;
+
 const EXPORT: &[u8] = b"umbra";
 const RUN_PARENT: &[u8] = b"runs";
 
@@ -592,4 +620,118 @@ fn f15_an_undisturbed_unlink_is_still_a_clean_removal() {
             },
         })
         .expect("nothing about a proven removal stops the run");
+}
+
+// --- F17: a caller's page limit does not size an eager allocation ------------
+
+/// **F17.** A page limit is a request, not a measurement of the directory.
+///
+/// `page` reserved `limit` `DirectoryEntry` slots before issuing a single
+/// READDIR, so a caller asking for a large page against a three-entry directory
+/// paid for the request rather than for the answer — and `u32::MAX` asks for
+/// billions of slots, tens of gigabytes, on an empty directory.
+///
+/// The wire request was already bounded by `max_reply_bytes`, so no page can
+/// return more than `MAX_SERVER_PAGES` replies' worth of entries however large
+/// the limit is. The reservation is now bounded by what can actually arrive, and
+/// the vector still grows on demand if it does.
+#[test]
+fn f17_a_huge_page_limit_does_not_reserve_a_huge_allocation() {
+    use std::sync::atomic::Ordering;
+    use umbra_storage_nfs_userspace::identity::PinnedObject;
+    use umbra_storage_nfs_userspace::pages::NoiseFilter;
+
+    let mut fake = FakeTransport::new();
+    let root = fake.root();
+    let listed = fake.insert_directory(&root, b"small");
+    for entry in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
+        fake.insert_file(&listed, entry, b"x".to_vec());
+    }
+    let pinned = PinnedObject::pin(&mut fake, listed, deadline()).expect("pin the directory");
+
+    // Two million entries is well past anything this directory holds, and past
+    // anything the transport's 1 MiB reply bound could carry across four server
+    // pages. It is chosen to be large enough to dominate every other allocation
+    // in this binary and small enough that the pre-fix reservation is *recorded*
+    // rather than aborting the process, which a `u32::MAX` reservation would.
+    let limit = 2_000_000_u32;
+    let entry_bytes = std::mem::size_of::<umbra_core::DirectoryEntry>();
+
+    LARGEST.store(0, Ordering::Relaxed);
+    let page = umbra_storage_nfs_userspace::pages::page(
+        &mut fake,
+        &pinned,
+        None,
+        limit,
+        &NoiseFilter::default(),
+        deadline(),
+    )
+    .expect("a huge limit is a legal request");
+    let largest = LARGEST.load(Ordering::Relaxed);
+
+    // The answer is still correct and complete.
+    let names: Vec<Vec<u8>> = page
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_bytes().to_vec())
+        .collect();
+    assert_eq!(
+        names,
+        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+        "every entry the directory holds is returned, in order"
+    );
+    assert!(page.next.is_none(), "a three-entry directory is exhausted");
+
+    // And it did not cost the request. The pre-fix reservation alone would be
+    // `limit * size_of::<DirectoryEntry>()`, hundreds of megabytes.
+    let refused_bound = 16 * 1024 * 1024;
+    assert!(
+        largest < refused_bound,
+        "the largest single allocation was {largest} bytes; a reservation sized by the \
+         caller's limit would be about {} bytes",
+        limit as usize * entry_bytes
+    );
+}
+
+/// **F17.** An ordinary limit still reserves for an ordinary page, and paging
+/// across server pages still works.
+#[test]
+fn f17_ordinary_paging_is_unchanged() {
+    use umbra_storage_nfs_userspace::identity::PinnedObject;
+    use umbra_storage_nfs_userspace::pages::NoiseFilter;
+
+    let mut fake = FakeTransport::new();
+    let root = fake.root();
+    let listed = fake.insert_directory(&root, b"many");
+    for index in 0..10u32 {
+        fake.insert_file(&listed, format!("f{index:02}").as_bytes(), b"x".to_vec());
+    }
+    let pinned = PinnedObject::pin(&mut fake, listed, deadline()).expect("pin the directory");
+
+    let first = umbra_storage_nfs_userspace::pages::page(
+        &mut fake,
+        &pinned,
+        None,
+        4,
+        &NoiseFilter::default(),
+        deadline(),
+    )
+    .expect("a small page");
+    assert_eq!(first.entries.len(), 4, "the caller's limit still bounds it");
+    let cursor = first.next.expect("more entries remain");
+
+    let second = umbra_storage_nfs_userspace::pages::page(
+        &mut fake,
+        &pinned,
+        Some(&cursor),
+        4,
+        &NoiseFilter::default(),
+        deadline(),
+    )
+    .expect("the continuation");
+    assert_eq!(second.entries.len(), 4);
+    assert_ne!(
+        first.entries[0].name, second.entries[0].name,
+        "the cursor advanced"
+    );
 }

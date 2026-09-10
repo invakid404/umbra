@@ -54,6 +54,26 @@ pub const MAX_SERVER_PAGES: u32 = 4;
 /// as the ordinary case rather than as an error.
 pub const BYTES_PER_ENTRY: u32 = 512;
 
+/// Ceiling on the entry vector's *initial* reservation (**F17**).
+///
+/// A page can only ever hold what [`MAX_SERVER_PAGES`] replies actually carry,
+/// and each reply is bounded by the transport's `max_reply_bytes`. Reserving past
+/// that is reserving for entries no server can send. The vector still grows on
+/// demand, so this bounds the eager allocation and nothing else.
+const MAX_INITIAL_ENTRIES: u32 = 4096;
+
+/// How many entry slots to reserve up front.
+///
+/// The smallest of: what the caller asked for, what the wire could physically
+/// return across every server page this call will make, and a fixed ceiling. At
+/// least one, so a reservation is never zero for a request that will return
+/// something.
+fn initial_reserve(limit: u32, max_count: u32) -> u32 {
+    let per_page = max_count / BYTES_PER_ENTRY;
+    let reachable = per_page.saturating_mul(MAX_SERVER_PAGES);
+    limit.clamp(1, reachable.clamp(1, MAX_INITIAL_ENTRIES))
+}
+
 /// Names removed from an enumeration before it reaches a consumer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NoiseFilter {
@@ -218,7 +238,16 @@ pub fn page(
     let bound = transport.limits().max_reply_bytes;
     let max_count = max_count.min(u32::try_from(bound).unwrap_or(u32::MAX));
 
-    let mut entries = Vec::with_capacity(limit as usize);
+    // **F17.** The reservation is bounded independently of `limit`. `limit` is a
+    // caller's *request*, not a measurement of the directory: `u32::MAX` asks for
+    // billions of `DirectoryEntry` slots — tens of gigabytes — before a single
+    // READDIR has been issued, and an empty directory costs exactly as much as a
+    // full one. The wire request above is already bounded by `max_reply_bytes`,
+    // so no page can return more than `MAX_SERVER_PAGES` replies' worth of
+    // entries however large `limit` is; reserving for what can actually arrive is
+    // both sufficient and self-limiting. The vector still grows if the server
+    // sends more than the reserve, which is the ordinary case a `Vec` handles.
+    let mut entries = Vec::with_capacity(initial_reserve(limit, max_count) as usize);
     let mut exhausted = false;
     for _ in 0..MAX_SERVER_PAGES {
         let request = ReadDirRequest {
