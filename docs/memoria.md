@@ -47,8 +47,17 @@ errors too. Passing the gate validates recorded reviews, not proof of prose accu
 The job pins the CLI to a release tag. Bump that pin and your local install
 together so CI diagnostics match what you see locally. From 0.3.0 the human output
 groups repeated diagnostics under a counted header, wraps to the terminal width,
-and ends with a `Next action:` block. The JSON output and the exit codes are
-unchanged.
+and ends with a `Next action:` block. From 0.4.0 the human `review` and `explain`
+output starts with changes and evidence; pass `--full` to restore the previous
+detailed layout. Existing `review` and `explain` JSON contracts and exit codes
+remain compatible across both releases; the new `packet view` command carries
+its own versioned JSON view separate from those contracts.
+
+To read one section of a saved packet without preparing a new review, run
+`memoria packet view <PACKET> --section <SECTION>` (0.4.0+). `--file <FILE>`
+selects one exact saved input instead of a named section. The command
+validates the packet's canonical JSON v2 envelope and prints the requested
+piece; it does not record a review and does not consult the working tree.
 
 ## How to invalidate for policy changes
 
