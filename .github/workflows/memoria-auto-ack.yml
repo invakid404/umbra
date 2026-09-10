@@ -95,7 +95,7 @@ jobs:
         run: git push --dry-run origin "refs/remotes/pr-head:refs/heads/${PR_HEAD_REF}"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       # Cache the cargo registry/git/bin so the memoria CLI is not
       # rebuilt from source on every Renovate PR. Key against the
