@@ -132,7 +132,56 @@ jobs:
           git worktree add "$PR_HEAD_WORKTREE" refs/remotes/pr-head
           echo "PR_HEAD_WORKTREE=$PR_HEAD_WORKTREE" >> "$GITHUB_ENV"
 
+      - name: Rebase PR head onto current master (fingerprint anchor)
+        env:
+          BASE_REF: origin/${{ github.event.pull_request.base.ref }}
+        working-directory: ${{ env.PR_HEAD_WORKTREE }}
+        run: |
+          # `memoria ack` records the input_manifest for EVERY tracked
+          # README input at the current tree state, not just the diff.
+          # If master advances between this workflow run and the PR
+          # merge, the recorded fingerprint goes stale and `memoria
+          # check` fails on master post-merge (see incident recorded
+          # in the "hotfix(memoria): re-ack root README on master
+          # after stale auto-ack" commit).
+          #
+          # Rebase pr-head onto current master so the fingerprint
+          # captured below reflects the effective merged tree. If
+          # rebase conflicts (unusual for a Renovate-only bump), abort
+          # and skip auto-ack — Renovate will rebase on its own cycle
+          # and this workflow will re-run on the next push.
+          # actions/checkout ran minutes ago; master may have advanced
+          # while the toolchain + memoria CLI installed. Refresh the
+          # base ref right before the ancestry check so the rebase
+          # anchor reflects the CURRENT master. Without this refresh,
+          # a merged PR that landed during install would leave the
+          # ancestry check thinking pr-head is up to date (or would
+          # rebase against a stale master), reproducing the exact
+          # fingerprint staleness this workflow is meant to prevent.
+          base_branch="${BASE_REF#origin/}"
+          git fetch origin \
+            "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge-base --is-ancestor "$BASE_REF" HEAD; then
+            echo "auto-ack: pr-head already contains $BASE_REF; no rebase needed"
+            echo "REBASED=false" >> "$GITHUB_ENV"
+          elif git rebase "$BASE_REF"; then
+            echo "auto-ack: pr-head rebased onto $BASE_REF for fingerprint freshness"
+            echo "REBASED=true" >> "$GITHUB_ENV"
+          else
+            echo "auto-ack: SKIP — rebase onto $BASE_REF failed (conflicts). Renovate will rebase; workflow will re-run on that push."
+            git rebase --abort
+            # `exit 0` alone leaves the rest of the job running against
+            # an un-rebased pr-head (rebase --abort restores it), which
+            # would defeat the fingerprint-freshness anchor entirely.
+            # Set a skip flag and gate every subsequent step on it.
+            echo "SKIP_AUTO_ACK=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
       - name: Attempt auto-ack (trusted script, PR head worktree cwd)
+        if: env.SKIP_AUTO_ACK != 'true'
         env:
           BASE_REF: origin/${{ github.event.pull_request.base.ref }}
           # Absolute path to master's scripts dir — the auto-ack script
@@ -143,6 +192,7 @@ jobs:
         run: "${{ github.workspace }}/scripts/memoria-auto-ack.sh"
 
       - name: Validate diff allowlist, commit, and push
+        if: env.SKIP_AUTO_ACK != 'true'
         env:
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         working-directory: ${{ env.PR_HEAD_WORKTREE }}
@@ -189,7 +239,28 @@ jobs:
           }
 
           git_push() {
-            git push origin "HEAD:refs/heads/${PR_HEAD_REF}"
+            # If we rebased pr-head onto master above, we've rewritten
+            # history and must force-with-lease.
+            #
+            # `--force-with-lease` without an explicit value compares
+            # against `refs/remotes/origin/<branch>`, which
+            # `actions/checkout` did not populate (we fetched only the
+            # base ref, not every branch), so the default lease
+            # reference is stale/empty and the push may reject even
+            # when `refs/remotes/pr-head` (the tip we actually
+            # fetched) is still the current remote tip. Pass the
+            # fetched PR-head sha explicitly so the lease compares
+            # against a known, freshly-fetched value.
+            if [ "${REBASED:-false}" = "true" ]; then
+              local expected_head
+              expected_head=$(git rev-parse refs/remotes/pr-head)
+              git push \
+                --force-with-lease="refs/heads/${PR_HEAD_REF}:${expected_head}" \
+                origin \
+                "HEAD:refs/heads/${PR_HEAD_REF}"
+            else
+              git push origin "HEAD:refs/heads/${PR_HEAD_REF}"
+            fi
           }
 
           validate_outbound_allowlist
@@ -213,12 +284,31 @@ jobs:
           fi
 
           # Single retry on non-fast-forward — Renovate may have force-
-          # pushed a rebase mid-run. Reset the worktree to the freshly
-          # fetched head, rerun the trusted script, revalidate, retry once.
+          # pushed a rebase mid-run, or another workflow may have
+          # advanced pr-head. Reset to the freshly fetched head, redo
+          # the rebase-onto-master and auto-ack sequence, and retry.
           echo "Initial push rejected; attempting one rebase/retry."
-          git fetch origin "+refs/heads/${PR_HEAD_REF}:refs/remotes/pr-head"
+          git fetch origin \
+            "+refs/heads/${PR_HEAD_REF}:refs/remotes/pr-head" \
+            "${{ github.event.pull_request.base.ref }}"
           git reset --hard refs/remotes/pr-head
-          BASE_REF="origin/${{ github.event.pull_request.base.ref }}" \
+          # Re-anchor the fingerprint to current master: same rebase
+          # semantics as the initial pass. If the retry rebase conflicts
+          # (e.g., Renovate's own new rebase collided with unrelated
+          # master churn), abort cleanly so the workflow re-fires on
+          # Renovate's next push.
+          RETRY_BASE="origin/${{ github.event.pull_request.base.ref }}"
+          if git merge-base --is-ancestor "$RETRY_BASE" HEAD; then
+            REBASED=false
+          elif git rebase "$RETRY_BASE"; then
+            REBASED=true
+          else
+            echo "auto-ack: retry SKIP — rebase onto $RETRY_BASE failed. Renovate will rebase; workflow will re-run."
+            git rebase --abort
+            exit 0
+          fi
+          export REBASED
+          BASE_REF="$RETRY_BASE" \
             SCRIPTS_ROOT="${{ github.workspace }}/scripts" \
             "${{ github.workspace }}/scripts/memoria-auto-ack.sh"
           validate_outbound_allowlist
