@@ -22,7 +22,9 @@ use umbra_storage_nfs_userspace::fake::{FakeReplayLog, FakeTransport, ScriptedFa
 use umbra_storage_nfs_userspace::storage::{
     NfsUserspaceConfig, NfsUserspaceStorage, FORMAT_VERSION,
 };
-use umbra_storage_nfs_userspace::transport::{Deadline, FaultAction, FaultPoint};
+use umbra_storage_nfs_userspace::transport::{
+    Compound, CompoundReply, Deadline, FaultAction, FaultPoint, RawTransport,
+};
 
 const EXPORT: &[u8] = b"umbra";
 const RUN_PARENT: &[u8] = b"runs";
@@ -667,5 +669,320 @@ fn r1_007_an_exclusive_create_retry_keeps_the_requested_mode() {
         stat.mode & 0o7777,
         0o750,
         "a retried exclusive create must not leave the default mode behind"
+    );
+}
+
+// --- R1-015: the anchor walk does not cross into another filesystem ----------
+
+/// A transport that reports a different `fsid` for one named directory.
+///
+/// This is what a nested export looks like on the wire: an ordinary directory,
+/// resolvable, not a symlink, whose `FATTR4_FSID` differs from its parent's.
+/// Byte-path validation cannot see it and symlink refusal does not apply, which
+/// is exactly why R1-015 needs its own check.
+struct NestedExport {
+    inner: FakeTransport,
+    /// Component whose replies get the foreign filesystem id.
+    boundary: Vec<u8>,
+    /// Fileids observed to belong to that component, so later GETATTRs on the
+    /// same object stay consistent.
+    foreign: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+}
+
+impl NestedExport {
+    fn new(inner: FakeTransport, boundary: &[u8]) -> Self {
+        Self {
+            inner,
+            boundary: boundary.to_vec(),
+            foreign: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+        }
+    }
+
+    /// Rewrite the fsid of any attribute set belonging to the boundary object.
+    fn rewrite(&self, call: &Compound, reply: &mut CompoundReply) {
+        use umbra_storage_nfs_userspace::transport::{Fsid, Nfs4Op, OpReply};
+        const FOREIGN: Fsid = Fsid {
+            major: 0xFEED,
+            minor: 0xFACE,
+        };
+
+        // A LOOKUP of the boundary name marks its fileid as foreign from then on.
+        let looked_up = call.ops.iter().any(
+            |op| matches!(op, Nfs4Op::Lookup(name) if name.as_bytes() == self.boundary.as_slice()),
+        );
+        for result in reply.results.iter_mut() {
+            if let OpReply::GetAttr(attributes) = result {
+                let Some(fileid) = attributes.fileid else {
+                    continue;
+                };
+                if looked_up {
+                    self.foreign.borrow_mut().insert(fileid);
+                }
+                if self.foreign.borrow().contains(&fileid) {
+                    attributes.fsid = Some(FOREIGN);
+                }
+            }
+        }
+    }
+}
+
+impl RawTransport for NestedExport {
+    fn wire_profile(&self) -> umbra_storage_nfs_userspace::transport::WireProfile {
+        self.inner.wire_profile()
+    }
+    fn limits(&self) -> umbra_storage_nfs_userspace::transport::TransportLimits {
+        self.inner.limits()
+    }
+    fn connection(&self) -> umbra_storage_nfs_userspace::transport::ConnectionState {
+        self.inner.connection()
+    }
+    fn submit(
+        &mut self,
+        call: Compound,
+        deadline: Deadline,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<CompoundReply> {
+        let mut reply = self.inner.submit(call.clone(), deadline)?;
+        self.rewrite(&call, &mut reply);
+        Ok(reply)
+    }
+    fn cancel(
+        &mut self,
+        token: umbra_storage_nfs_userspace::transport::CallToken,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::Retirement,
+    > {
+        self.inner.cancel(token)
+    }
+    fn reconnect(
+        &mut self,
+    ) -> umbra_storage_nfs_userspace::transport::TransportResult<
+        umbra_storage_nfs_userspace::transport::ConnectionEpoch,
+    > {
+        self.inner.reconnect()
+    }
+    fn install_faults(&mut self, plan: Box<dyn umbra_storage_nfs_userspace::transport::FaultPlan>) {
+        self.inner.install_faults(plan)
+    }
+}
+
+/// **R1-015.** A directory component whose `fsid` differs from the run's is
+/// rejected, and nothing is dispatched beneath it.
+///
+/// Pre-fix `PinnedObject::adopt` recorded whatever fsid the server returned and
+/// nothing compared it to the anchor's, so a LOOKUP into a nested exported
+/// filesystem was adopted and used for further reads and mutations. Component
+/// bytes were validated and physical symlinks refused, but neither of those sees
+/// a filesystem crossing.
+#[test]
+fn r1_015_a_component_on_another_filesystem_is_refused() {
+    let mut storage = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(NestedExport::new(fake_server(), b"nested")),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("provider");
+    let run_id = fresh_run();
+    storage
+        .open_run(&create_run(run_id))
+        .expect("create the run");
+
+    // An ordinary directory, created through the contract. The transport reports
+    // a foreign filesystem for it the moment a walk *resolves* it by name, which
+    // is what a nested export looks like: nothing about the create says so.
+    storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "nested-dir"),
+            operation: StorageOperation::Create {
+                path: path(b"nested"),
+                options: CreateOptions {
+                    kind: CreateKind::Directory,
+                    mode: 0o700,
+                },
+            },
+        })
+        .expect("creating the directory itself is an ordinary create");
+
+    // Resolving it is refused, so it can never be adopted as a pin.
+    let stat = storage
+        .execute(&StorageRequest {
+            context: RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("stat-nested".into()),
+                writer_epoch: None,
+            },
+            operation: StorageOperation::Stat {
+                path: path(b"nested"),
+            },
+        })
+        .expect_err("an object reported on another filesystem must not be adopted");
+    assert_eq!(stat.kind, ErrorKind::InvalidPath);
+    assert!(
+        stat.context.contains("another exported filesystem"),
+        "the refusal must name the crossing: {}",
+        stat.context
+    );
+
+    // And nothing is dispatched *beneath* the crossing: the walk stops at the
+    // boundary component rather than continuing through it.
+    let refused = storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run_id, "below-nested"),
+            operation: StorageOperation::Create {
+                path: path(b"nested/inside.txt"),
+                options: CreateOptions {
+                    kind: CreateKind::File,
+                    mode: 0o644,
+                },
+            },
+        })
+        .expect_err("nothing may be created beneath a filesystem crossing");
+    assert_eq!(refused.kind, ErrorKind::InvalidPath);
+    assert!(
+        refused.context.contains("another exported filesystem"),
+        "the refusal must name the crossing: {}",
+        refused.context
+    );
+
+    // A sibling on the run's own filesystem is unaffected.
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "sibling"),
+            b"sibling.txt",
+        ))
+        .expect("the rest of the run is untouched by the boundary check");
+}
+
+/// **R1-015.** The deliberate pseudo-root to configured-export transition is
+/// still allowed: pinning the boundary must not break ordinary operation.
+#[test]
+fn r1_015_the_configured_export_transition_is_still_allowed() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage
+        .open_run(&create_run(run_id))
+        .expect("the export walk crosses from the pseudo-root as it always did");
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "ordinary"),
+            b"ordinary.txt",
+        ))
+        .expect("ordinary paths inside the run still work");
+    storage.close_run().expect("close");
+}
+
+// --- R1-011: original NFS errors survive the public surface ------------------
+
+/// **R1-011.** A `.provider` lookup that *failed* is not reported as a `.provider`
+/// that is *absent*.
+///
+/// Pre-fix the lookup was `.ok()`, so EIO, ACCESS and STALE all became `None`,
+/// and the caller then saw `session.rs`'s generic "the run has no `.provider`
+/// directory" message. A missing private directory and an unreachable one need
+/// different answers: the first is a run state, the second is a server failure.
+#[test]
+fn r1_011_a_failed_private_directory_lookup_is_not_reported_as_absence() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage
+        .open_run(&create_run(run_id))
+        .expect("create the run");
+    storage.close_run().expect("release");
+
+    // Reopen, with the `.provider` lookup answered NFS4ERR_IO. The run exists and
+    // its private directory exists; the lookup is what failed.
+    //
+    // The fault fires on the first compound of the reopen walk, which is enough
+    // to prove the distinction: the error that comes back carries the server's
+    // status rather than the absence message.
+    storage
+        .transport()
+        .expect("transport")
+        .install_faults(ScriptedFault::once(
+            FaultPoint::AfterDispatch,
+            None,
+            FaultAction::Substitute(Nfs4Status::IO),
+        ));
+    let error = storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::OpenExisting,
+            immutable_base: base(),
+            policy: policy(),
+        })
+        .expect_err("a failed lookup during the walk is reported, not absorbed");
+
+    assert_ne!(
+        error.kind,
+        ErrorKind::InvalidState,
+        "a failed lookup must not be reported as the run having no .provider directory"
+    );
+    assert!(
+        !error.context.contains("has no .provider directory"),
+        "the absence message must be reserved for actual absence: {}",
+        error.context
+    );
+    assert!(
+        error.context.contains("NFS4ERR 5") || error.kind == ErrorKind::Io,
+        "the original NFS status must survive: {error:?}"
+    );
+}
+
+/// **R1-011.** A `BAD_COOKIE` still reports an invalidated cursor, but keeps the
+/// server's own status and operation in the message.
+///
+/// Pre-fix the arm replaced the facade error with a freshly constructed
+/// `StaleHandle` whose entire context was "the server invalidated this cursor",
+/// discarding the numeric status, the failing operation and its COMPOUND index.
+#[test]
+fn r1_011_an_invalidated_cursor_keeps_the_original_status() {
+    let mut storage = provider();
+    let run_id = fresh_run();
+    storage.open_run(&create_run(run_id)).expect("open_run");
+    storage
+        .execute(&create_file(
+            authorised(&storage, run_id, "entry"),
+            b"entry.txt",
+        ))
+        .expect("seed one entry");
+
+    storage
+        .transport()
+        .expect("transport")
+        .install_faults(ScriptedFault::once(
+            FaultPoint::AfterDispatch,
+            None,
+            FaultAction::Substitute(Nfs4Status::BAD_COOKIE),
+        ));
+    let error = storage
+        .execute(&StorageRequest {
+            context: RequestContext {
+                run_id,
+                operation_id: OperationId(Uuid::new_v4()),
+                idempotency_key: IdempotencyKey("list".into()),
+                writer_epoch: None,
+            },
+            operation: StorageOperation::List {
+                path: path(b""),
+                cursor: None,
+                limit: 16,
+            },
+        })
+        .expect_err("BAD_COOKIE invalidates the cursor");
+
+    assert_eq!(
+        error.kind,
+        ErrorKind::StaleHandle,
+        "the caller still learns the cursor is void, so it does not retry forever"
+    );
+    assert!(
+        error.context.contains("invalidated this cursor"),
+        "the cursor diagnosis is kept: {}",
+        error.context
+    );
+    assert!(
+        error.context.contains("10003"),
+        "the original NFS status number must survive alongside it: {}",
+        error.context
     );
 }

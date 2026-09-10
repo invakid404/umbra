@@ -41,7 +41,7 @@ use crate::handle::FileHandle;
 use crate::identity::PinnedObject;
 use crate::layout;
 use crate::storage::NfsUserspaceConfig;
-use crate::transport::{ComponentName, Deadline, Nfs4Type, RawTransport};
+use crate::transport::{ComponentName, Deadline, Fsid, Nfs4Type, RawTransport};
 
 /// Which anchor a handle belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -180,6 +180,14 @@ pub struct RunAnchors {
     root: Anchor,
     control: Anchor,
     private: Option<Anchor>,
+    /// The one server filesystem every object in this run must live on.
+    ///
+    /// **R1-015.** Byte-path validation and symlink refusal do not establish
+    /// filesystem containment: a `LOOKUP` into a nested export answers with a
+    /// perfectly ordinary directory that happens to carry a different `fsid`.
+    /// `docs/design/managed-lifecycle-spike.md:30` requires that crossing to be
+    /// rejected on its own terms.
+    filesystem: Fsid,
 }
 
 impl RunAnchors {
@@ -209,10 +217,19 @@ impl RunAnchors {
             .map_err(|error| error.to_umbra("open_run"))?;
         let mut current = PinnedObject::pin(transport, export_root, deadline)
             .map_err(|error| error.to_umbra("open_run"))?;
-        for relative in [&config.export, &config.run_parent] {
-            for component in components(relative)? {
-                current = descend(transport, &current, &component, deadline)?;
-            }
+        // R1-015: walking the *configured export* is the one transition that is
+        // expected to change filesystem — the server's pseudo-root is its own
+        // filesystem and the export is another. That crossing is deliberate and
+        // configured, so it is allowed here and nowhere else.
+        for component in components(&config.export)? {
+            current = descend(transport, &current, &component, deadline)?;
+        }
+        // From the resolved export down, the filesystem is pinned. Everything
+        // below — the run parent, the run, its anchors, and every path a caller
+        // later resolves inside them — has to be on it.
+        let filesystem = current.identity().fsid;
+        for component in components(&config.run_parent)? {
+            current = descend_within(transport, &current, &component, filesystem, deadline)?;
         }
         let run_name = component(run_id.0.hyphenated().to_string().into_bytes())?;
         let run = if creating {
@@ -226,15 +243,20 @@ impl RunAnchors {
                     format!("run {run_id:?} already exists under the configured run parent"),
                 ));
             }
-            create_directory(transport, &current, &run_name, deadline)?
+            within(
+                create_directory(transport, &current, &run_name, deadline)?,
+                filesystem,
+                &run_name,
+            )?
         } else {
-            descend(transport, &current, &run_name, deadline)?
+            descend_within(transport, &current, &run_name, filesystem, deadline)?
         };
         let root = anchor_child(
             transport,
             &run,
             &component(config.root_anchor.as_bytes())?,
             creating,
+            filesystem,
             deadline,
         )?;
         let control = anchor_child(
@@ -242,16 +264,31 @@ impl RunAnchors {
             &run,
             &component(config.control_anchor.as_bytes())?,
             creating,
+            filesystem,
             deadline,
         )?;
         let private_name = component(layout::PRIVATE_DIR)?;
         let private = if creating {
-            Some(create_directory(transport, &run, &private_name, deadline)?)
+            Some(within(
+                create_directory(transport, &run, &private_name, deadline)?,
+                filesystem,
+                &private_name,
+            )?)
         } else {
             // A run written by the mounted adapter always has `.provider`, but a
             // run that lost it is a real state and reporting it as present would
             // be a claim about state this provider never observed.
-            descend(transport, &run, &private_name, deadline).ok()
+            //
+            // R1-011: only NOENT is that state. The old code was `.ok()`, which
+            // turned EIO, ACCESS and STALE into "this run has no `.provider`" and
+            // left the caller reading `session.rs`'s generic no-private-directory
+            // message instead of the server's actual failure. A lookup that failed
+            // is not an answer about what is there.
+            match descend_within(transport, &run, &private_name, filesystem, deadline) {
+                Ok(pin) => Some(pin),
+                Err(error) if error.kind == ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            }
         }
         .map(|pin| Anchor {
             kind: AnchorKind::Private,
@@ -271,6 +308,7 @@ impl RunAnchors {
                 pin: control,
             },
             private,
+            filesystem,
         })
     }
 
@@ -315,8 +353,20 @@ impl RunAnchors {
     ) -> Result<PinnedObject> {
         match self.resolve_parent(transport, path, deadline)? {
             Target::Anchor(pin) => Ok(pin),
-            Target::Named { parent, name } => descend_any(transport, &parent, &name, deadline),
+            // R1-015: the final component is checked too. It is the one a caller
+            // then reads, writes or mutates through, so letting it be the object
+            // that crosses the boundary would defeat the whole walk.
+            Target::Named { parent, name } => within(
+                descend_any(transport, &parent, &name, deadline)?,
+                self.filesystem,
+                &name,
+            ),
         }
+    }
+
+    /// The server filesystem every object in this run must live on (**R1-015**).
+    pub fn filesystem(&self) -> Fsid {
+        self.filesystem
     }
 
     /// Resolve everything but the final component of a contract path.
@@ -343,7 +393,7 @@ impl RunAnchors {
         });
         let mut parent = anchor.pin.clone();
         for part in parts {
-            parent = descend(transport, &parent, &part, deadline)?;
+            parent = descend_within(transport, &parent, &part, self.filesystem, deadline)?;
         }
         Ok(Target::Named { parent, name })
     }
@@ -533,13 +583,59 @@ fn anchor_child(
     run: &PinnedObject,
     name: &ComponentName,
     creating: bool,
+    filesystem: Fsid,
     deadline: Deadline,
 ) -> Result<PinnedObject> {
     if creating {
-        create_directory(transport, run, name, deadline)
+        within(
+            create_directory(transport, run, name, deadline)?,
+            filesystem,
+            name,
+        )
     } else {
-        descend(transport, run, name, deadline)
+        descend_within(transport, run, name, filesystem, deadline)
     }
+}
+
+/// Look one name up, require a directory, and require it to be on `filesystem`.
+///
+/// **R1-015.** The fsid comparison is what makes containment a property of the
+/// walk rather than of the path bytes. A `LOOKUP` that resolves into a nested
+/// exported filesystem returns an ordinary directory; without this check it was
+/// adopted and used for further reads and mutations.
+fn descend_within(
+    transport: &mut dyn RawTransport,
+    parent: &PinnedObject,
+    name: &ComponentName,
+    filesystem: Fsid,
+    deadline: Deadline,
+) -> Result<PinnedObject> {
+    within(
+        descend(transport, parent, name, deadline)?,
+        filesystem,
+        name,
+    )
+}
+
+/// Reject a pin that is not on the run's pinned filesystem (**R1-015**).
+fn within(pin: PinnedObject, filesystem: Fsid, name: &ComponentName) -> Result<PinnedObject> {
+    let observed = pin.identity().fsid;
+    if observed != filesystem {
+        return Err(UmbraError::new(
+            ErrorKind::InvalidPath,
+            "resolve",
+            format!(
+                "{:?} is on filesystem {}:{}, not the run's {}:{}; the walk does not cross \
+                 into another exported filesystem",
+                String::from_utf8_lossy(name.as_bytes()),
+                observed.major,
+                observed.minor,
+                filesystem.major,
+                filesystem.minor,
+            ),
+        ));
+    }
+    Ok(pin)
 }
 
 /// `PUTFH; CREATE NF4DIR; GETFH; GETATTR`: make one directory and pin it.

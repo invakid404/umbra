@@ -234,8 +234,18 @@ pub fn page(
                 // The server invalidated the cookie itself. Reporting it as
                 // anything but an invalidated cursor would invite a caller to
                 // retry the same cookie forever.
+                //
+                // R1-011: the original facade error is carried through rather
+                // than replaced. The old code built a fresh `StaleHandle` whose
+                // whole context was "the server invalidated this cursor", so the
+                // numeric status, the failing operation and its COMPOUND index
+                // were all lost — a caller diagnosing why enumeration keeps
+                // restarting had nothing left to read.
                 Some(status) if status == crate::error::Nfs4Status::BAD_COOKIE => {
-                    invalidated("the server invalidated this cursor")
+                    invalidated(&format!(
+                        "the server invalidated this cursor ({})",
+                        error.to_umbra("list").context
+                    ))
                 }
                 _ => error.to_umbra("list"),
             })?;
