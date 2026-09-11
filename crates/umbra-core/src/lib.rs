@@ -289,6 +289,42 @@ pub struct Prot {
     pub execute: bool,
 }
 
+/// Normalized access-check intent, decoded from native mode bits by the platform
+/// ABI. All-false is a bare existence probe, the native `F_OK`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessMode {
+    /// Read.
+    pub read: bool,
+    /// Write.
+    pub write: bool,
+    /// Execute.
+    pub execute: bool,
+}
+
+/// Normalized access-check flag intent, decoded from native `*at` flags by the
+/// platform ABI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessFlags {
+    /// Check against the effective identity rather than the real one.
+    ///
+    /// No namespace reads this today, and that is deliberate rather than an
+    /// oversight: a rewrite replaces only the path operand, so the native flag
+    /// survives in its own register and the kernel honours it against the
+    /// rewritten path. A namespace that starts answering an access probe
+    /// without the kernel has to begin honouring this itself.
+    pub effective_ids: bool,
+    /// Follow.
+    pub follow: bool,
+}
+
+/// Normalized ownership-change flag intent, decoded from native `*at` flags by
+/// the platform ABI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChownFlags {
+    /// Follow.
+    pub follow: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Map flags.
 pub enum MapFlags {
@@ -321,6 +357,17 @@ pub enum FsOp {
         path: BytePath,
         /// Follow.
         follow: bool,
+    },
+    /// Access.
+    Access {
+        /// Dir.
+        dir: DirRef,
+        /// Path interpreted according to the enclosing operation and path type.
+        path: BytePath,
+        /// Mode.
+        mode: AccessMode,
+        /// Flags.
+        flags: AccessFlags,
     },
     /// Rename.
     Rename {
@@ -480,6 +527,19 @@ pub enum FsOp {
         fd: TracedFd,
         /// Mode.
         mode: u32,
+    },
+    /// Fchownat.
+    Fchownat {
+        /// Dir.
+        dir: DirRef,
+        /// Path interpreted according to the enclosing operation and path type.
+        path: BytePath,
+        /// Uid. `None` is the native `-1` unchanged-ID sentinel.
+        uid: Option<u32>,
+        /// Gid. `None` is the native `-1` unchanged-ID sentinel.
+        gid: Option<u32>,
+        /// Flags.
+        flags: ChownFlags,
     },
     /// Sync.
     Sync {

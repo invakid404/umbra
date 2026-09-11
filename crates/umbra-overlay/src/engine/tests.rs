@@ -1510,3 +1510,510 @@ fn renewal_failure_latches_and_a_poisoned_session_cannot_renew() {
         ErrorKind::InvalidState
     );
 }
+
+fn access(path: &[u8], mode: AccessMode, follow: bool) -> FsOp {
+    FsOp::Access {
+        dir: DirRef::Cwd,
+        path: bytes(path),
+        mode,
+        flags: AccessFlags {
+            effective_ids: false,
+            follow,
+        },
+    }
+}
+fn chown(path: &[u8], uid: Option<u32>, gid: Option<u32>, follow: bool) -> FsOp {
+    FsOp::Fchownat {
+        dir: DirRef::Cwd,
+        path: bytes(path),
+        uid,
+        gid,
+        flags: ChownFlags { follow },
+    }
+}
+const READ: AccessMode = AccessMode {
+    read: true,
+    write: false,
+    execute: false,
+};
+
+#[test]
+fn access_probes_the_namespace_without_materialising_or_journaling() {
+    let mut f = Fixture::new(&[(b"nested/file", b"base bytes")]);
+    // A base-only object is probed against the immutable base's own physical
+    // path: read-through, not copy-up.
+    let ResolvedAction::Rewrite(plan) = f
+        .overlay
+        .resolve(&f.process, &access(b"nested/file", READ, true))
+        .unwrap()
+    else {
+        panic!("access rewrite")
+    };
+    assert_eq!(
+        native(&plan.paths[0].path.0),
+        f.base_root.join("nested/file")
+    );
+    let prepared = f.prepare(&access(b"nested/file", READ, true));
+    assert!(!f.shadow_root.join("nested/file").exists());
+    f.complete(prepared);
+    // A probe is not a mutation, so nothing reached the journal at all.
+    assert!(f.log.lock().unwrap().records.is_empty());
+    // W_OK is still a probe. Asking whether the object could be written must
+    // not copy it up on the strength of the question.
+    let write_probe = access(
+        b"nested/file",
+        AccessMode {
+            read: false,
+            write: true,
+            execute: false,
+        },
+        true,
+    );
+    let prepared = f.prepare(&write_probe);
+    f.complete(prepared);
+    assert!(!f.shadow_root.join("nested/file").exists());
+    assert!(f.log.lock().unwrap().records.is_empty());
+    // Once the object is in the shadow the probe follows it there.
+    f.run(&open(
+        b"nested/file",
+        OpenFlags {
+            read: true,
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    let ResolvedAction::Rewrite(plan) = f
+        .overlay
+        .resolve(&f.process, &access(b"nested/file", READ, true))
+        .unwrap()
+    else {
+        panic!("access rewrite")
+    };
+    assert_eq!(
+        native(&plan.paths[0].path.0),
+        f.shadow_root.join("nested/file")
+    );
+    // An absent target, and one hidden by a whiteout, are both ENOENT *from the
+    // resolver*. This is the namespace's answer at the resolve boundary, not
+    // what a tracee observes: the supervisor turns NotFound on a non-mutating
+    // operation into a plain resume, so the tracee's own unrewritten faccessat
+    // still runs against the host and can see a whiteouted base file. That gap
+    // is the supervisor's, it predates this operation and it applies equally to
+    // Stat/Read/ReadLink, so nothing here should be read as an end-to-end
+    // guarantee; issue #49 tracks closing it.
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &access(b"nested/missing", READ, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+    f.run(&unlink(b"nested/file"));
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &access(b"nested/file", READ, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+    // A bare existence probe (F_OK, all-false) of a directory still resolves.
+    assert!(matches!(
+        f.overlay
+            .resolve(&f.process, &access(b"nested", AccessMode::default(), true))
+            .unwrap(),
+        ResolvedAction::Rewrite(_)
+    ));
+}
+
+#[test]
+fn access_follows_a_logical_symlink_and_never_probes_its_placeholder() {
+    let mut f = Fixture::new(&[(b"b/file", b"base")]);
+    f.run(&symlink(b"a/link", b"/b/file"));
+    // Following resolves to the target's physical path, not the link's.
+    let ResolvedAction::Rewrite(plan) = f
+        .overlay
+        .resolve(&f.process, &access(b"a/link", READ, true))
+        .unwrap()
+    else {
+        panic!("access rewrite")
+    };
+    assert_eq!(native(&plan.paths[0].path.0), f.base_root.join("b/file"));
+    // Not following must not reach the placeholder: it is a regular file whose
+    // own mode is not the 0o777 the overlay reports for every logical symlink.
+    let placeholder = f.shadow_root.join("a/link");
+    assert!(fs::symlink_metadata(&placeholder).unwrap().is_file());
+    for mode in [
+        AccessMode::default(),
+        READ,
+        AccessMode {
+            read: true,
+            write: true,
+            execute: true,
+        },
+    ] {
+        assert_eq!(
+            f.overlay
+                .resolve(&f.process, &access(b"a/link", mode, false))
+                .unwrap(),
+            ResolvedAction::Emulate(EmulatedResult {
+                outcome: OperationOutcome::Success { return_value: 0 },
+                memory_writes: vec![],
+            }),
+            "mode {mode:?}"
+        );
+    }
+    // A dangling logical symlink still answers ENOENT when followed.
+    f.run(&symlink(b"a/dangling", b"/b/absent"));
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &access(b"a/dangling", READ, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn fchownat_follows_a_logical_symlink_to_the_object_it_owns() {
+    // `follow_final`'s `_ => false` default is nofollow, which is wrong for
+    // fchownat: POSIX follows unless AT_SYMLINK_NOFOLLOW is set. Losing the
+    // arm that says so would silently chown the link placeholder instead of its
+    // target, so pin the resolved path rather than trusting the comment.
+    let mut f = Fixture::new(&[(b"b/file", b"base")]);
+    f.run(&symlink(b"a/link", b"/b/file"));
+    let ResolvedAction::Rewrite(plan) = f
+        .overlay
+        .resolve(&f.process, &chown(b"a/link", Some(501), Some(20), true))
+        .unwrap()
+    else {
+        panic!("fchownat rewrite")
+    };
+    // The target's path, not the link's. Both are under the shadow root because
+    // a mutation always rewrites there, so the file name is what discriminates.
+    assert_eq!(native(&plan.paths[0].path.0), f.shadow_root.join("b/file"));
+    // lchown acts on the link itself, which is the placeholder.
+    let ResolvedAction::Rewrite(plan) = f
+        .overlay
+        .resolve(&f.process, &chown(b"a/link", Some(501), Some(20), false))
+        .unwrap()
+    else {
+        panic!("fchownat rewrite")
+    };
+    assert_eq!(native(&plan.paths[0].path.0), f.shadow_root.join("a/link"));
+}
+
+#[test]
+fn fchownat_journals_a_chown_intent_against_a_copied_up_object() {
+    let mut f = Fixture::new(&[(b"nested/file", b"base bytes")]);
+    // The journaled object is the one the namespace already knows about, so
+    // read its identity before the transaction opens.
+    let object = f
+        .overlay
+        .stat(&root(b"nested/file").unwrap(), true)
+        .unwrap();
+    // Ownership is applied by the kernel against the rewritten path, so the
+    // rewrite must name the shadow even though the object is base-only.
+    let action = f
+        .overlay
+        .resolve(
+            &f.process,
+            &chown(b"nested/file", Some(501), Some(20), true),
+        )
+        .unwrap();
+    let ResolvedAction::Rewrite(plan) = &action else {
+        panic!("fchownat rewrite")
+    };
+    assert_eq!(
+        native(&plan.paths[0].path.0),
+        f.shadow_root.join("nested/file")
+    );
+    assert!(!f.shadow_root.join("nested/file").exists());
+    let id = OperationId(Uuid::new_v4());
+    let prepared = f.overlay.prepare(id, &action).unwrap();
+    // Copy-up ran before the kernel could touch the immutable base.
+    assert_eq!(
+        fs::read(f.shadow_root.join("nested/file")).unwrap(),
+        b"base bytes"
+    );
+    f.complete(prepared);
+    assert_eq!(
+        fs::read(f.base_root.join("nested/file")).unwrap(),
+        b"base bytes"
+    );
+    let log = f.log.lock().unwrap().records.clone();
+    assert_eq!(log.len(), 3);
+    // `object` is the pre-copy-up identity, so on its own the record would name
+    // something the kernel never touched. The path locates the shadow object
+    // that was actually chowned, and copy_up records that the materialisation
+    // happened at all, so a reader can tell a pre-copy-up crash from a later one.
+    let shadow_id = f
+        .overlay
+        .stat(&root(b"nested/file").unwrap(), true)
+        .unwrap()
+        .object_id;
+    assert_ne!(
+        shadow_id, object.object_id,
+        "copy-up must give the shadow object its own identity, or this test proves nothing"
+    );
+    assert!(matches!(&log[0].payload,
+        JournalPayload::Prepare { intent: JournalIntent::Chown { object: o, path, uid, gid, copy_up } }
+        if *o == object.object_id
+            && path.as_bytes() == b"/nested/file"
+            && *uid == Some(501)
+            && *gid == Some(20)
+            && *copy_up));
+    assert!(matches!(
+        log[1].payload,
+        JournalPayload::ObservedResult { .. }
+    ));
+    assert!(matches!(log[2].payload, JournalPayload::Commit));
+}
+
+#[test]
+fn fchownat_carries_the_unchanged_id_sentinel_and_link_identity_into_the_journal() {
+    let mut f = Fixture::new(&[]);
+    f.run(&symlink(b"link", b"/target"));
+    // lchown acts on the link itself. The placeholder carries the logical
+    // symlink's own uid/gid, so the shadow already holds a chownable object
+    // and copy-up is a no-op rather than a second placeholder.
+    let object = f.overlay.stat(&root(b"link").unwrap(), false).unwrap();
+    assert_eq!(object.kind, ObjectKind::LogicalSymlink);
+    let prepared = f.prepare(&chown(b"link", None, None, false));
+    let ResolvedAction::Rewrite(plan) = &prepared.action else {
+        panic!("fchownat rewrite")
+    };
+    assert_eq!(native(&plan.paths[0].path.0), f.shadow_root.join("link"));
+    f.complete(prepared);
+    assert_eq!(
+        f.overlay.read_link(&root(b"link").unwrap()).unwrap(),
+        bytes(b"/target")
+    );
+    // The sentinel survives as `None`: a no-op request is journaled as a no-op,
+    // never as a change to ID 4294967295.
+    let log = f.log.lock().unwrap().records.clone();
+    assert!(matches!(&log[3].payload,
+        JournalPayload::Prepare {
+            intent: JournalIntent::Chown { object: o, path, uid: None, gid: None, copy_up: false }
+        }
+        if *o == object.object_id && path.as_bytes() == b"/link"));
+    drop(log);
+    // An absent target is ENOENT before anything is journaled or copied up.
+    let before = f.log.lock().unwrap().records.len();
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &chown(b"absent", Some(0), None, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+    assert_eq!(f.log.lock().unwrap().records.len(), before);
+}
+
+#[test]
+fn a_base_only_directory_chown_is_refused_before_anything_is_journaled() {
+    // prepare appends and flushes the Chown intent before the copy-up that
+    // would fail here, so refusing at resolve is what keeps the journal free of
+    // an ownership change that never happened. `chown -R` over a base tree
+    // reaches this on its first directory.
+    //
+    // What this pins is the *session*, not the run. Fchownat is Materialise, so
+    // the supervisor has no non-mutating NotFound resume to fall back on: the
+    // refusal below propagates and ends the run rather than reaching the tracee
+    // as an errno. The session staying usable is what keeps the journal
+    // reconcilable, not what keeps the tracee running.
+    let mut f = Fixture::new(&[(b"dir/file", b"base")]);
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &chown(b"dir", Some(0), Some(0), true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsupportedCapability
+    );
+    // Nothing durable, and nothing to reconcile: no intent, no Commit, no Abort.
+    assert!(f.log.lock().unwrap().records.is_empty());
+    assert!(!f.shadow_root.join("dir").exists());
+    // The overlay session is usable afterwards rather than poisoned, which is
+    // the whole point of refusing before prepare. The run still ends; see above.
+    assert!(!f.overlay.poisoned);
+    assert!(matches!(
+        f.overlay.resolve(&f.process, &stat(b"dir/file")).unwrap(),
+        ResolvedAction::Rewrite(_)
+    ));
+    // A directory already in the shadow needs no copy-up, so it still chowns.
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"made"),
+        mode: 0o750,
+    });
+    let prepared = f.prepare(&chown(b"made", Some(501), Some(20), true));
+    assert!(matches!(prepared.action, ResolvedAction::Rewrite(_)));
+    f.complete(prepared);
+    // Assert on the chown's own record. Taking the first Prepare here would pick
+    // up the mkdir's Create and pass whether or not the chown journaled anything.
+    let intents: Vec<_> = f
+        .log
+        .lock()
+        .unwrap()
+        .records
+        .iter()
+        .filter_map(|r| match &r.payload {
+            JournalPayload::Prepare { intent } => Some(intent.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(intents.len(), 2, "one Create for the mkdir, one Chown");
+    assert!(matches!(
+        &intents[0],
+        JournalIntent::Create {
+            directory: true,
+            ..
+        }
+    ));
+    assert!(matches!(&intents[1],
+        JournalIntent::Chown { path, uid: Some(501), gid: Some(20), copy_up: false, .. }
+        if path.as_bytes() == b"/made"));
+}
+
+#[test]
+fn an_unchanged_id_chown_of_a_base_object_is_refused_rather_than_silently_re_owning_it() {
+    // copy_up recreates a base object through CreateOptions, which carries mode
+    // but no uid/gid, so the shadow belongs to whoever runs umbra. The kernel then
+    // sets only the IDs the tracee supplied. Were this allowed, a POSIX no-op
+    // chown(-1, -1) would silently move the object to our identity, which is the
+    // opposite of what the sentinel asks for.
+    let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+    for (uid, gid) in [(None, None), (Some(501), None), (None, Some(20))] {
+        assert_eq!(
+            f.overlay
+                .resolve(&f.process, &chown(b"file", uid, gid, true))
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsupportedCapability,
+            "uid {uid:?} gid {gid:?}"
+        );
+    }
+    // Refused before anything durable or material happened.
+    assert!(f.log.lock().unwrap().records.is_empty());
+    assert!(!f.shadow_root.join("file").exists());
+    assert!(!f.overlay.poisoned);
+    // Setting both IDs inherits nothing from the copy, so it is still allowed.
+    let prepared = f.prepare(&chown(b"file", Some(501), Some(20), true));
+    f.complete(prepared);
+    assert!(f.shadow_root.join("file").is_file());
+    // And once the object is in the shadow, copy_up is a no-op, so the sentinel
+    // is safe again: the ID left alone is the shadow object's own.
+    let prepared = f.prepare(&chown(b"file", None, None, true));
+    assert!(matches!(prepared.action, ResolvedAction::Rewrite(_)));
+    f.complete(prepared);
+}
+
+#[test]
+fn chowning_a_base_only_logical_symlink_copies_it_up_and_keeps_its_identity() {
+    // copy_up's LogicalSymlink branch runs only for a base-only object, and it
+    // re-creates the placeholder through create_symlink(.., stat.object_id),
+    // deliberately preserving the base identity. So copy_up: true with an
+    // *unchanged* object id is reachable — the one case where the journal
+    // record's object still names the object the kernel chowns.
+    let mut base = Fixture::new(&[]);
+    base.run(&open(
+        b"file",
+        OpenFlags {
+            create: true,
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    fs::write(base.shadow_root.join("file"), b"base bytes").unwrap();
+    base.run(&symlink(b"link", b"file"));
+    let id = base
+        .overlay
+        .stat(&root(b"link").unwrap(), false)
+        .unwrap()
+        .object_id;
+    let config = base.overlay.config().unwrap().clone();
+    let (storage, _) = base.overlay.into_backends();
+    let mut reader = config.context;
+    reader.writer_epoch = None;
+    let mut f = Fixture::new(&[]);
+    f.overlay.base = Some(Box::new(
+        StorageBase::new(storage, config.binding, reader).unwrap(),
+    ));
+    // The link exists only in the base, so nothing is in the shadow yet.
+    assert!(!f.shadow_root.join("link").exists());
+    assert_eq!(
+        f.overlay
+            .stat(&root(b"link").unwrap(), false)
+            .unwrap()
+            .object_id,
+        id
+    );
+    // lchown with both IDs set: allowed, and it enters the symlink copy-up.
+    let prepared = f.prepare(&chown(b"link", Some(501), Some(20), false));
+    assert!(fs::symlink_metadata(f.shadow_root.join("link"))
+        .unwrap()
+        .is_file());
+    f.complete(prepared);
+    // Identity and target both survive the materialisation.
+    assert_eq!(
+        f.overlay
+            .stat(&root(b"link").unwrap(), false)
+            .unwrap()
+            .object_id,
+        id
+    );
+    assert_eq!(
+        f.overlay.read_link(&root(b"link").unwrap()).unwrap(),
+        bytes(b"file")
+    );
+    let log = f.log.lock().unwrap().records.clone();
+    assert!(matches!(&log[0].payload,
+        JournalPayload::Prepare {
+            intent: JournalIntent::Chown { object: o, path, copy_up: true, .. }
+        }
+        if *o == id && path.as_bytes() == b"/link"));
+}
+
+#[test]
+fn a_kernel_rejected_chown_aborts_into_a_session_that_requires_reconciliation() {
+    // EPERM is the ordinary answer when an unprivileged tracee chowns to
+    // another uid. Because Fchownat is a Materialise operation, that routine
+    // failure takes the mutation abort path: the Abort is journaled, the
+    // session is poisoned and abort itself errors, which ends the run rather
+    // than handing the tracee its errno. Pinned here so the limitation is a
+    // recorded property rather than something discovered in a live run.
+    let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+    let prepared = f.prepare(&chown(b"file", Some(0), Some(0), true));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(Errno(1)))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::Cancelled)
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState
+    );
+    assert!(f.overlay.poisoned);
+    let payloads = f.log.lock().unwrap().records.clone();
+    assert!(matches!(
+        &payloads[0].payload,
+        JournalPayload::Prepare {
+            intent: JournalIntent::Chown { .. }
+        }
+    ));
+    assert!(matches!(
+        payloads[1].payload,
+        JournalPayload::ObservedResult { .. }
+    ));
+    assert!(matches!(payloads[2].payload, JournalPayload::Abort { .. }));
+    assert!(
+        !payloads
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Commit)),
+        "a failed chown must not commit"
+    );
+    // The copy-up is not rolled back, and abort does not claim it was: the
+    // shadow object stays, byte-identical to the base it came from.
+    assert_eq!(fs::read(f.shadow_root.join("file")).unwrap(), b"base bytes");
+    assert_eq!(fs::read(f.base_root.join("file")).unwrap(), b"base bytes");
+}

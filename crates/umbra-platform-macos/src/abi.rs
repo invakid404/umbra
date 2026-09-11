@@ -54,6 +54,8 @@ pub fn read_path(memory: &mut dyn TraceMemory, pointer: u64) -> Result<BytePath>
 }
 /// SDK `sys/fcntl.h:172-184`. `AT_FDCWD` is a signed sentinel, not a descriptor.
 pub const AT_FDCWD: i32 = -2;
+/// Check against the effective user and group IDs rather than the real ones.
+pub const AT_EACCESS: u32 = 0x0010;
 /// Act on the link itself rather than its target.
 pub const AT_SYMLINK_NOFOLLOW: u32 = 0x0020;
 /// Act on the target of a link.
@@ -98,8 +100,11 @@ pub fn path_operands(number: u64) -> Result<&'static [(PathOperand, usize)]> {
         // symlink: x0 holds literal target bytes, x1 the link name.
         57 => &[(PathOperand::Path, 1)],
         // openat, openat_nocancel, posix_spawn: path in x1. unlinkat,
-        // mkdirat, fchmodat, fstatat, fstatat64, readlinkat: dirfd x0, path x1.
-        463 | 464 | 244 | 467 | 469 | 470 | 472 | 473 | 475 => &[(PathOperand::Path, 1)],
+        // mkdirat, faccessat, fchmodat, fchownat, fstatat, fstatat64,
+        // readlinkat: dirfd x0, path x1.
+        463 | 464 | 244 | 466 | 467 | 468 | 469 | 470 | 472 | 473 | 475 => {
+            &[(PathOperand::Path, 1)]
+        }
         // renameat, renameatx_np, linkat: source dirfd x0, source x1,
         // destination dirfd x2, destination x3.
         465 | 471 | 488 => &[(PathOperand::Source, 1), (PathOperand::Destination, 3)],
@@ -383,13 +388,48 @@ impl SyscallAbi for DarwinArm64Abi {
                 dir: dir_ref(get(regs, 0)?),
                 path: read_path(memory, get(regs, 1)?)?,
             },
-            // faccessat and fchownat are intercepted but have no typed core
-            // operation: there is no access-mode/effective-id operation and no
-            // owner/group one. Refusing here keeps a host metadata mutation or
-            // a host existence probe from running behind the namespace's back;
-            // decoding either as some neighbouring operation would be worse.
-            466 => return Err(unsupported("faccessat has no typed access operation")),
-            468 => return Err(unsupported("fchownat has no typed owner operation")),
+            // faccessat: x2 carries the R_OK|W_OK|X_OK mask, or F_OK (0) for a
+            // bare existence probe. A bit outside that mask is a check this
+            // decode does not represent, so it is refused rather than dropped.
+            466 => {
+                let flags = at_flags(get(regs, 3)?, AT_EACCESS | AT_SYMLINK_NOFOLLOW)?;
+                let mode = get(regs, 2)? as u32;
+                if mode & !7 != 0 {
+                    return Err(unsupported(format!("faccessat mode {mode:#x}")));
+                }
+                FsOp::Access {
+                    dir: dir_ref(get(regs, 0)?),
+                    path: read_path(memory, get(regs, 1)?)?,
+                    mode: AccessMode {
+                        read: mode & 4 != 0,
+                        write: mode & 2 != 0,
+                        execute: mode & 1 != 0,
+                    },
+                    flags: AccessFlags {
+                        effective_ids: flags & AT_EACCESS != 0,
+                        follow: flags & AT_SYMLINK_NOFOLLOW == 0,
+                    },
+                }
+            }
+            // fchownat: uid/gid are unsigned, and the caller spells "leave this
+            // one alone" as -1, which arrives as 0xffffffff. Decoding that as a
+            // literal ID 4294967295 would be an ownership change, not a no-op.
+            468 => {
+                let flags = at_flags(get(regs, 4)?, AT_SYMLINK_NOFOLLOW)?;
+                let id = |raw: u64| match raw as u32 {
+                    u32::MAX => None,
+                    value => Some(value),
+                };
+                FsOp::Fchownat {
+                    dir: dir_ref(get(regs, 0)?),
+                    path: read_path(memory, get(regs, 1)?)?,
+                    uid: id(get(regs, 2)?),
+                    gid: id(get(regs, 3)?),
+                    flags: ChownFlags {
+                        follow: flags & AT_SYMLINK_NOFOLLOW == 0,
+                    },
+                }
+            }
             // Positively classified process-control calls handled by the backend.
             1 | 2 | 7 | 20 | 59 | 244 | 400 => return Ok(None),
             _ => return Err(unsupported(format!("unclassified Darwin syscall {number}"))),
@@ -516,6 +556,7 @@ mod tests {
         // Pin the SDK values themselves: sys/fcntl.h:172-180. Deriving the
         // test inputs from these constants would make any edit self-consistent.
         assert_eq!(AT_FDCWD, -2);
+        assert_eq!(AT_EACCESS, 0x0010);
         assert_eq!(AT_SYMLINK_NOFOLLOW, 0x0020);
         assert_eq!(AT_SYMLINK_FOLLOW, 0x0040);
         assert_eq!(AT_REMOVEDIR, 0x0080);
@@ -654,9 +695,149 @@ mod tests {
                 .unwrap(),
             FsOp::ReadLink {
                 dir: DirRef::Cwd,
-                path: rel,
+                path: rel.clone(),
             }
         );
+        // faccessat: x2 is the R_OK|W_OK|X_OK mask, x3 the flags. R_OK is 4,
+        // W_OK 2 and X_OK 1, so each mode bit is pinned separately against a
+        // transposed read/execute pair.
+        for (mode, expected) in [
+            (
+                0u64,
+                AccessMode {
+                    read: false,
+                    write: false,
+                    execute: false,
+                },
+            ),
+            (
+                1,
+                AccessMode {
+                    read: false,
+                    write: false,
+                    execute: true,
+                },
+            ),
+            (
+                2,
+                AccessMode {
+                    read: false,
+                    write: true,
+                    execute: false,
+                },
+            ),
+            (
+                4,
+                AccessMode {
+                    read: true,
+                    write: false,
+                    execute: false,
+                },
+            ),
+            (
+                7,
+                AccessMode {
+                    read: true,
+                    write: true,
+                    execute: true,
+                },
+            ),
+        ] {
+            assert_eq!(
+                DarwinArm64Abi
+                    .decode_entry(&entry(466, [5, ABS, mode, 0, 0]), &mut memory)
+                    .unwrap()
+                    .unwrap(),
+                FsOp::Access {
+                    dir: DirRef::Fd(TracedFd(5)),
+                    path: abs.clone(),
+                    mode: expected,
+                    flags: AccessFlags {
+                        effective_ids: false,
+                        follow: true,
+                    },
+                },
+                "faccessat mode {mode:#x}"
+            );
+        }
+        // AT_EACCESS and AT_SYMLINK_NOFOLLOW are independent, and `follow` is
+        // the inverse of the nofollow bit rather than a flag of its own.
+        assert_eq!(
+            DarwinArm64Abi
+                .decode_entry(&entry(466, [CWD, REL, 4, 0x0010 | 0x0020, 0]), &mut memory)
+                .unwrap()
+                .unwrap(),
+            FsOp::Access {
+                dir: DirRef::Cwd,
+                path: rel.clone(),
+                mode: AccessMode {
+                    read: true,
+                    write: false,
+                    execute: false,
+                },
+                flags: AccessFlags {
+                    effective_ids: true,
+                    follow: false,
+                },
+            }
+        );
+        // fchownat: x2 uid, x3 gid, x4 flags. Both IDs are ordinary values here.
+        assert_eq!(
+            DarwinArm64Abi
+                .decode_entry(&entry(468, [6, ABS, 501, 20, 0]), &mut memory)
+                .unwrap()
+                .unwrap(),
+            FsOp::Fchownat {
+                dir: DirRef::Fd(TracedFd(6)),
+                path: abs.clone(),
+                uid: Some(501),
+                gid: Some(20),
+                flags: ChownFlags { follow: true },
+            }
+        );
+        // The unchanged-ID sentinel is -1 in an unsigned field. Each operand
+        // carries it independently, and it is a no-op rather than ID 4294967295.
+        // The upper half of the register is not the callee's value, so a
+        // sign-extended -1 must decode the same way as a bare 0xffffffff.
+        for (uid_raw, gid_raw, uid, gid) in [
+            (0xffff_ffffu64, 0xffff_ffffu64, None, None),
+            (u64::MAX, 0, None, Some(0)),
+            (0, u64::MAX, Some(0), None),
+            (0xffff_ffff_ffff_fffe, 7, Some(u32::MAX - 1), Some(7)),
+        ] {
+            assert_eq!(
+                DarwinArm64Abi
+                    .decode_entry(
+                        &entry(468, [CWD, REL, uid_raw, gid_raw, 0x0020]),
+                        &mut memory
+                    )
+                    .unwrap()
+                    .unwrap(),
+                FsOp::Fchownat {
+                    dir: DirRef::Cwd,
+                    path: rel.clone(),
+                    uid,
+                    gid,
+                    flags: ChownFlags { follow: false },
+                },
+                "fchownat uid {uid_raw:#x} gid {gid_raw:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn faccessat_and_fchownat_physicalize_their_dirfd_relative_path() {
+        // prepare_paths refuses a syscall path_operands does not list, so an
+        // omission here makes every resolved rewrite fail at rewrite time
+        // rather than at decode.
+        for number in [466u64, 468] {
+            assert_eq!(
+                path_operands(number).unwrap(),
+                &[(PathOperand::Path, 1)],
+                "syscall {number}"
+            );
+            assert_eq!(path_slot(number).unwrap(), 1, "syscall {number}");
+        }
     }
 
     #[test]
@@ -698,16 +879,56 @@ mod tests {
                 "syscall {number}"
             );
         }
-        // faccessat and fchownat have no typed core operation. They are
-        // refused rather than decoded as a neighbouring one, so no host
-        // metadata mutation or existence probe runs behind the namespace.
-        for number in [466, 468] {
+        // faccessat models AT_EACCESS and AT_SYMLINK_NOFOLLOW only, and
+        // fchownat only the latter: AT_EACCESS is not a fchownat flag.
+        for (number, args) in [
+            (466u64, [1, REL, 0, 0x0040, 0]),
+            (466, [1, REL, 0, 0x0080, 0]),
+            (468, [1, REL, 0, 0, 0x0010]),
+            (468, [1, REL, 0, 0, 0x0040]),
+        ] {
             let err = DarwinArm64Abi
-                .decode_entry(&entry(number, [1, REL, 0, 0, 0]), &mut memory)
+                .decode_entry(&entry(number, args), &mut memory)
                 .unwrap_err();
-            assert_eq!(err.kind, ErrorKind::UnsupportedCapability);
-            assert!(!err.context.contains("unclassified"), "syscall {number}");
+            assert_eq!(
+                err.kind,
+                ErrorKind::UnsupportedCapability,
+                "syscall {number} x3 {:#x} x4 {:#x}",
+                args[3],
+                args[4]
+            );
+            // decode_entry's `_` fallback returns this same kind, so the kind
+            // alone cannot tell "we modelled this flag and rejected it" from
+            // "we never modelled this syscall". Without this the test stays
+            // green even if the whole 466 or 468 arm is deleted.
+            assert!(
+                !err.context.contains("unclassified"),
+                "syscall {number} reached the unclassified fallback"
+            );
         }
+        // An access mode outside R_OK|W_OK|X_OK is a check this decode does not
+        // represent. Refusing beats silently narrowing it to the low three bits.
+        for mode in [8u64, 0x10, 0xf] {
+            let err = DarwinArm64Abi
+                .decode_entry(&entry(466, [1, REL, mode, 0, 0]), &mut memory)
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::UnsupportedCapability, "mode {mode:#x}");
+            assert!(
+                !err.context.contains("unclassified"),
+                "mode {mode:#x} reached the unclassified fallback"
+            );
+        }
+        // Only the low word is the callee's, so upper-half garbage in either
+        // the mode or the flag register is not a refusal.
+        assert!(DarwinArm64Abi
+            .decode_entry(
+                &entry(
+                    466,
+                    [1, REL, 0xffff_ffff_0000_0007, 0xffff_ffff_0000_0000, 0]
+                ),
+                &mut memory
+            )
+            .is_ok());
     }
 
     #[test]
