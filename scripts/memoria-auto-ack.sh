@@ -39,23 +39,34 @@ fi
 
 # ---- 2. Restrict changed paths to the allowlist ----------------------
 
-# Anything outside Cargo.toml / Cargo.lock (root or per-crate) means a
-# structural change we refuse to auto-ack. Note this list is
-# intentionally NARROWER than the workflow's commit-allowlist (which
-# only permits memoria.lock outbound); on the inbound side we want to
-# reject any file we don't understand. Per-crate manifests are included
-# because members like crates/umbra-platform-macos and crates/umbra-storage-nfs
-# pin dependencies (e.g. libc) directly rather than through
-# [workspace.dependencies], so a Renovate bump to those deps changes the
-# member manifest.
+# Anything outside the following two families is a structural change we
+# refuse to auto-ack. Note this inbound list is intentionally NARROWER
+# than the workflow's outbound commit-allowlist (which only permits
+# memoria.lock); on the inbound side we want to reject any file we
+# don't understand.
+#
+#   1. Cargo.toml + Cargo.lock (root and per-crate). Per-crate manifests
+#      are included because members like `crates/umbra-platform-macos`
+#      and `crates/umbra-storage-nfs` pin dependencies (e.g. libc)
+#      directly rather than through `[workspace.dependencies]`, so a
+#      Renovate bump to those deps changes the member manifest.
+#   2. `.github/workflows/*.yml|*.yaml`. Renovate publishes action-pin
+#      bumps by updating `uses: <owner>/<repo>@<sha>` lines inside the
+#      workflow files themselves. Every such changed file is then
+#      structure-checked by `check-workflow-yaml-diff.py` below so we
+#      only auto-ack diffs whose ONLY changes are `uses:` values;
+#      anything else in a workflow file (a new step, a permission edit,
+#      a `run:` block change, ...) fails that check and falls back to
+#      human ack.
 non_safe=$(printf '%s\n' "$changed" \
-    | grep -vE '^(Cargo\.lock|Cargo\.toml|crates/[^/]+/Cargo\.toml)$' || true)
+    | grep -vE '^(Cargo\.lock|Cargo\.toml|crates/[^/]+/Cargo\.toml|\.github/workflows/[^/]+\.ya?ml)$' \
+    || true)
 if [ -n "$non_safe" ]; then
     printf 'auto-ack: SKIP — Renovate touched paths outside the safe allowlist:\n%s\n' "$non_safe"
     exit 0
 fi
 
-# ---- 3. For every Cargo.toml touched, verify diff is version-only ---
+# ---- 3a. For every Cargo.toml touched, verify diff is version-only --
 
 changed_manifests=$(printf '%s\n' "$changed" | grep -E '(^|/)Cargo\.toml$' || true)
 if [ -n "$changed_manifests" ]; then
@@ -65,6 +76,19 @@ if [ -n "$changed_manifests" ]; then
             exit 0
         fi
     done <<<"$changed_manifests"
+fi
+
+# ---- 3b. For every workflow YAML touched, verify diff is uses-pin only
+
+changed_workflows=$(printf '%s\n' "$changed" \
+    | grep -E '^\.github/workflows/[^/]+\.ya?ml$' || true)
+if [ -n "$changed_workflows" ]; then
+    while IFS= read -r workflow; do
+        if ! python3 "$SCRIPTS_ROOT/check-workflow-yaml-diff.py" "$BASE_REF" "$workflow"; then
+            echo "auto-ack: SKIP — $workflow diff isn't pure action-pin (uses:) bumps; human ack required"
+            exit 0
+        fi
+    done <<<"$changed_workflows"
 fi
 
 # ---- 4. Ack every pending README ------------------------------------
