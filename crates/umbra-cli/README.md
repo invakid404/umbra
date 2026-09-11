@@ -42,9 +42,12 @@ are checked before any provider is started, and the provider handshake then
 rejects a connection whose backend does not actually advertise the name.
 `--strict-remote` is a deterministic `UnsupportedCapability` error: no storage
 provider qualifies strict remote durability. A registry that configures a
-`namespace` role is refused the same way: that descriptor must declare
-`namespace-run-lifecycle-v1`, and no namespace provider advertises it yet, so an
-alternative namespace provider still cannot own a run.
+`namespace` role is refused the same way, whatever that descriptor declares: the
+supervisor does not yet route a run to a configured namespace provider, so
+`umbra run` cannot use one. `namespace-run-lifecycle-v1` names the capability such
+a provider will have to advertise; adding it to a descriptor changes the error
+message, not the outcome. Capabilities in a registry are operator-written claims,
+qualified by the provider handshake only for roles the run actually connects.
 
 Omitting `--agent` runs the trailing `--` arguments as a command; the executable
 argument must be absolute, because PATH is never searched. Under the required

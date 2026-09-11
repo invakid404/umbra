@@ -192,9 +192,11 @@ marker checks; actual raw-name filesystem I/O is conditional on native support.
 provider that does not implement them cannot be handed a run. Each has a provider
 IPC request/response pair, so `Proxy` forwards them instead of inheriting the
 refusal, and `serve_provider` dispatches them to the backend. `serve_provider`
-still advertises an empty capability set, so no provider yet satisfies
-`umbra_core::capabilities::NAMESPACE_RUN_LIFECYCLE_V1`; the supervisor refuses a
-namespace-role registry that does not declare it, before anything is opened:
+still advertises an empty capability set, so nothing in this repo offers
+`umbra_core::capabilities::NAMESPACE_RUN_LIFECYCLE_V1`. That name is the
+forward-looking gate, not today's guard: the supervisor refuses every
+namespace-role registry before anything is opened, because it still binds this
+crate's `standard_namespace` and never opens a namespace descriptor.
 
 - `renew_writer` renews the injected lease through this session's own storage. A
   refused or epoch-advanced renewal is `LeaseLost`: authority is gone or unproven,

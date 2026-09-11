@@ -290,12 +290,15 @@ fn validate(spec: &RunSpec) -> Result<()> {
             ))
         }
     }
-    // A namespace-role registry is still refused here, before anything is opened:
-    // no provider advertises this capability, and the namespace `serve_provider`
-    // advertises an empty set, so nothing can satisfy it. What changed is the
-    // reason. The refusal is now derived from the declared capability that the
-    // handshake also enforces, rather than from a hardcoded claim that the
-    // protocol lacks the lifecycle calls, which it no longer does.
+    // Every registry that configures a namespace role is refused here, before
+    // anything is opened. The protocol now carries the lifecycle calls, but this
+    // supervisor still builds its own `standard_namespace` over the storage and
+    // journal roles and never opens a namespace descriptor, so admitting one
+    // would silently discard it. The capability check runs first so an
+    // unqualified descriptor is named as such; it is the forward-looking gate
+    // rather than the thing keeping the run out. A descriptor's `capabilities` are
+    // operator-written registry JSON, so declaring the name is a claim, not
+    // evidence, and it does not admit the run.
     if let Some(namespace) = spec.registry.providers.get("namespace") {
         require_capability(
             namespace,
@@ -303,6 +306,18 @@ fn validate(spec: &RunSpec) -> Result<()> {
             "owning the run lifecycle (renew, finish and fail) for an alternative \
              namespace provider",
         )?;
+        return Err(error(
+            ErrorKind::UnsupportedCapability,
+            "run.capabilities",
+            format!(
+                "provider '{}' declares '{}', but this supervisor does not yet route a \
+                 run to a configured namespace provider: it always binds its own overlay \
+                 over the storage and journal roles. Remove the namespace role and \
+                 configure storage and journal directly",
+                namespace.id,
+                caps::NAMESPACE_RUN_LIFECYCLE_V1
+            ),
+        ));
     }
     let storage = spec.registry.get("storage")?;
     let mode = match spec.persistence {
@@ -820,10 +835,10 @@ mod validate_tests {
     use std::collections::BTreeMap;
     use umbra_core::provider::PROTOCOL_VERSION;
 
-    fn namespace_descriptor(capabilities: &[&str]) -> ProviderDescriptor {
+    fn descriptor(id: &str, role: &str, capabilities: &[&str]) -> ProviderDescriptor {
         ProviderDescriptor {
-            id: "alt-namespace".into(),
-            role: "namespace".into(),
+            id: id.into(),
+            role: role.into(),
             protocol_version: PROTOCOL_VERSION,
             executable: BytePath::new(b"/usr/bin/true".to_vec()).unwrap(),
             capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
@@ -831,11 +846,42 @@ mod validate_tests {
         }
     }
 
-    /// The smallest spec that reaches the namespace check: everything decided
-    /// before it must pass, and no other role is configured.
-    fn spec_with_namespace(capabilities: &[&str]) -> RunSpec {
+    /// Every role a local-development run needs, each declaring exactly the
+    /// capabilities its own check requires. Without a namespace role this spec
+    /// validates, which is what makes the namespace refusal below meaningful
+    /// rather than an artefact of an incomplete registry.
+    fn qualified_providers() -> BTreeMap<String, ProviderDescriptor> {
         let mut providers = BTreeMap::new();
-        providers.insert("namespace".to_owned(), namespace_descriptor(capabilities));
+        providers.insert(
+            "storage".to_owned(),
+            descriptor(
+                "storage-local",
+                "storage",
+                &[
+                    caps::STORAGE_LOCAL_DEVELOPMENT_V1,
+                    caps::STORAGE_OPEN_REWRITE_V1,
+                ],
+            ),
+        );
+        providers.insert(
+            "journal".to_owned(),
+            descriptor("journal-file", "journal", &[]),
+        );
+        providers.insert(
+            "platform".to_owned(),
+            descriptor(
+                "platform-host",
+                "platform",
+                &[
+                    caps::PLATFORM_SANDBOXED_LAUNCH_V1,
+                    caps::PLATFORM_SYSCALL_REWRITE_V1,
+                ],
+            ),
+        );
+        providers
+    }
+
+    fn spec_with(providers: BTreeMap<String, ProviderDescriptor>) -> RunSpec {
         RunSpec {
             registry: ProviderRegistry {
                 providers,
@@ -854,38 +900,71 @@ mod validate_tests {
         }
     }
 
+    fn with_namespace(capabilities: &[&str]) -> RunSpec {
+        let mut providers = qualified_providers();
+        providers.insert(
+            "namespace".to_owned(),
+            descriptor("alt-namespace", "namespace", capabilities),
+        );
+        spec_with(providers)
+    }
+
+    /// The control for the refusal below: this configuration is otherwise
+    /// complete and accepted, so a failure there can only come from the
+    /// namespace role.
     #[test]
-    fn a_namespace_role_is_refused_for_the_missing_run_lifecycle_capability() {
-        let error = validate(&spec_with_namespace(&[])).unwrap_err();
-        assert_eq!(error.kind, ErrorKind::UnsupportedCapability);
-        // The refusal is now a capability check, not a hardcoded protocol claim.
-        assert_eq!(error.operation, "run.capabilities");
+    fn a_qualified_registry_without_a_namespace_role_validates() {
+        validate(&spec_with(qualified_providers())).expect("qualified registry validates");
+    }
+
+    /// The guard's whole job: no namespace-role registry may be admitted, whatever
+    /// the descriptor declares about itself.
+    #[test]
+    fn every_namespace_role_registry_is_refused_whatever_it_declares() {
+        // Undeclared. The capability gate answers first and names what is missing.
+        let missing = validate(&with_namespace(&[])).unwrap_err();
+        assert_eq!(missing.kind, ErrorKind::UnsupportedCapability);
+        assert_eq!(missing.operation, "run.capabilities");
         assert!(
-            error.context.contains(caps::NAMESPACE_RUN_LIFECYCLE_V1),
-            "{error}"
+            missing.context.contains(caps::NAMESPACE_RUN_LIFECYCLE_V1),
+            "{missing}"
         );
         assert!(
-            error
+            missing
                 .context
                 .contains("owning the run lifecycle (renew, finish and fail)"),
-            "{error}"
+            "{missing}"
         );
+        assert!(missing.context.contains("alt-namespace"), "{missing}");
+        // The old hardcoded protocol-gap wording is gone.
         assert!(
-            !error.context.contains("are not in its protocol"),
-            "{error}"
+            !missing.context.contains("are not in its protocol"),
+            "{missing}"
         );
-        assert!(error.context.contains("alt-namespace"), "{error}");
 
-        // No namespace provider advertises the capability, so the guard still
-        // refuses every real configuration. A descriptor that merely declares it
-        // gets past this check only to meet the remaining role requirements, and
-        // the provider handshake rejects a backend that does not advertise it.
-        let declared = validate(&spec_with_namespace(&[caps::NAMESPACE_RUN_LIFECYCLE_V1]))
-            .expect_err("a namespace-only registry is still incomplete");
-        assert_eq!(declared.kind, ErrorKind::ProtocolMismatch);
+        // Declared. `capabilities` is operator-written registry JSON, so the
+        // descriptor's claim about itself is not admission: `unix::run` always
+        // binds `standard_namespace`, and an admitted descriptor would be
+        // silently discarded while the operator believed otherwise.
+        let declared = validate(&with_namespace(&[caps::NAMESPACE_RUN_LIFECYCLE_V1])).unwrap_err();
+        assert_eq!(declared.kind, ErrorKind::UnsupportedCapability);
+        assert_eq!(declared.operation, "run.capabilities");
         assert!(
-            declared.context.contains("missing provider role"),
+            declared
+                .context
+                .contains("does not yet route a run to a configured namespace provider"),
             "{declared}"
         );
+        assert!(declared.context.contains("alt-namespace"), "{declared}");
+
+        // Declaring more than asked for is not a way around it either.
+        let over_declared = validate(&with_namespace(&[
+            caps::NAMESPACE_RUN_LIFECYCLE_V1,
+            caps::STORAGE_LOCAL_DEVELOPMENT_V1,
+            caps::PLATFORM_SANDBOXED_LAUNCH_V1,
+        ]))
+        .unwrap_err();
+        assert_eq!(over_declared.kind, ErrorKind::UnsupportedCapability);
+        assert_eq!(over_declared.operation, "run.capabilities");
     }
 }

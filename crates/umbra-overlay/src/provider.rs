@@ -380,6 +380,16 @@ mod tests {
             processes_exited: 3,
         }
     }
+    /// The root-never-launched state the field's own doc comment names. `None` is
+    /// where an asymmetric serde attribute would break the round-trip, so it gets
+    /// its own fixture rather than riding on the `Some` one.
+    fn finish_request_without_root() -> FinishRunRequest {
+        FinishRunRequest {
+            run_id: run_id(),
+            root_status: None,
+            processes_exited: 0,
+        }
+    }
     fn finish_receipt() -> FinishRunReceipt {
         FinishRunReceipt {
             run_id: run_id(),
@@ -539,6 +549,20 @@ mod tests {
             finish
         );
 
+        let unlaunched = wire::encode(&Request::FinishRun {
+            request: finish_request_without_root(),
+        })
+        .unwrap();
+        let Request::FinishRun { request } = wire::decode::<Request>(&unlaunched).unwrap() else {
+            panic!("FinishRun decoded as another request");
+        };
+        assert_eq!(request.root_status, None);
+        assert_eq!(request.processes_exited, 0);
+        assert_eq!(
+            wire::encode(&Request::FinishRun { request }).unwrap(),
+            unlaunched
+        );
+
         let fail = wire::encode(&Request::FailRun {
             request: fail_request(),
         })
@@ -571,10 +595,10 @@ mod tests {
         assert_eq!(wire::encode(&Response::FinishRun(value)).unwrap(), receipt);
 
         let failed = wire::encode(&Response::FailRun(())).unwrap();
-        let Response::FailRun(()) = wire::decode::<Response>(&failed).unwrap() else {
+        let Response::FailRun(value) = wire::decode::<Response>(&failed).unwrap() else {
             panic!("FailRun decoded as another response");
         };
-        assert_eq!(wire::encode(&Response::FailRun(())).unwrap(), failed);
+        assert_eq!(wire::encode(&Response::FailRun(value)).unwrap(), failed);
     }
 
     #[test]
@@ -628,11 +652,13 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_response_variant_for_renew_writer_is_refused() {
+    fn a_wrong_response_variant_is_refused_for_every_lifecycle_call() {
         let (client_side, server_side) = UnixStream::pair().expect("socketpair");
         let timeout = Duration::from_secs(5);
-        // A well-formed server that answers the right request with the wrong
+        // A well-formed server that answers each right request with a wrong
         // response variant: exactly what the proxy's match arms exist to catch.
+        // Every answer is a *valid* response of another method, not a malformed
+        // frame, so nothing but the variant check can reject it.
         let worker = std::thread::spawn(move || {
             wire::serve(
                 Connection::new(server_side, timeout),
@@ -641,6 +667,10 @@ mod tests {
                         operation_id: OperationId(Uuid::from_u128(9)),
                         sequence: Sequence(1),
                     })),
+                    // `FailRun` and `Abort` are both `(())`, so this is the
+                    // copy-paste a reader cannot see and the compiler accepts.
+                    Request::FinishRun { .. } => Ok(Response::Abort(())),
+                    Request::FailRun { .. } => Ok(Response::RenewWriter(lease())),
                     _ => Err(protocol_error("unexpected request")),
                 },
             )
@@ -652,13 +682,24 @@ mod tests {
             )),
         };
 
-        let error = proxy.renew_writer().unwrap_err();
-        assert_eq!(
-            error,
-            protocol_error("namespace.renew_writer response mismatch")
-        );
-        assert_eq!(error.kind, ErrorKind::ProtocolMismatch);
-        assert_eq!(error.context, "namespace.renew_writer response mismatch");
+        for (error, expected) in [
+            (
+                proxy.renew_writer().unwrap_err(),
+                "namespace.renew_writer response mismatch",
+            ),
+            (
+                proxy.finish_run(&finish_request()).unwrap_err(),
+                "namespace.finish_run response mismatch",
+            ),
+            (
+                proxy.fail_run(&fail_request()).unwrap_err(),
+                "namespace.fail_run response mismatch",
+            ),
+        ] {
+            assert_eq!(error, protocol_error(expected));
+            assert_eq!(error.kind, ErrorKind::ProtocolMismatch);
+            assert_eq!(error.context, expected);
+        }
         shut_down(proxy, worker);
     }
 }

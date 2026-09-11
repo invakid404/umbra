@@ -21,9 +21,12 @@ The staged order is fixed, and each stage's failure decides what may be released
 
 1. Validate the request and the registry's declared capabilities. Nothing is
    opened until this passes, so an unqualified configuration fails first. A
-   registry that configures a `namespace` role must declare
-   `namespace-run-lifecycle-v1`; no namespace provider advertises it, so such a
-   registry is still refused here rather than handed a run.
+   registry that configures a `namespace` role is refused outright at this stage,
+   whatever its descriptor declares: stage 5 always binds the built-in overlay
+   (`standard_namespace`) and never opens a namespace descriptor, so admitting one
+   would silently discard it. `namespace-run-lifecycle-v1` names the capability
+   such a provider will have to advertise, and an unqualified descriptor is told
+   so first, but declaring it does not admit the run.
 2. Inventory the approved workspace and derive the run's `ImmutableBaseContract`.
 3. Connect storage, `open_run(CreateNew)`, then `acquire_writer` with
    `TakeoverPolicy::Refuse`. There is no stale-writer takeover.
