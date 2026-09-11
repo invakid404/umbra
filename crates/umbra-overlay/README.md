@@ -58,6 +58,18 @@ new resolutions are blocked while a transaction is pending.
   umask, owner/group, timestamps, ACLs and xattrs needs richer backend support.
 - Unlink removes an existing shadow file through Storage and prepares a base
   whiteout, including for base-only files. Recreation clears its exact whiteout.
+- `FsOp::Access` is a read-through probe of the merged namespace: it rewrites to
+  the shadow object when one exists and to the base otherwise, and it never
+  copies up, not even for a `W_OK` probe. An absent or whiteouted target is
+  `NotFound`. Nothing is journaled, because a probe reports current permissions
+  rather than authorizing a later mutation.
+- `FsOp::Fchownat` copies the target up after a flushed `JournalIntent::Chown`
+  Prepare, then rewrites to the shadow so the kernel applies the ownership there
+  and never to the immutable base. The `-1` unchanged-ID sentinel arrives as
+  `None` and is journaled as `None`. A base-only directory still returns
+  `UnsupportedCapability`, because recursive directory copy-up is deferred.
+  `FsOp::Chmod`, `FsOp::Fchmod` and `FsOp::Link` remain unimplemented at
+  `resolve`; ownership is the only metadata mutation wired through today.
 - Rename materializes a regular-file or logical-symlink source, creates shadow destination parents,
   and returns source/destination kernel rewrites for one native shadow rename.
   On observed success the source whiteout is set and destination whiteout cleared.
@@ -120,7 +132,9 @@ emulated through injected Storage after a flushed `JournalIntent::Symlink` Prepa
 ObservedResult and Commit follow the existing transaction protocol. Shadow entries
 are empty regular files requested with mode `0444`. They contain no physical
 symlink, so unchecked kernel traversal cannot follow their target or descend
-through them. Readlink and no-follow stat never expose the placeholder as a file.
+through them. Readlink, no-follow stat and a no-follow `FsOp::Access` never
+expose the placeholder as a file: the probe is answered from the `0o777` the
+overlay reports for every logical symlink, not from the placeholder's `0444`.
 
 Control metadata lives outside tracee listings:
 

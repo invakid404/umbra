@@ -82,14 +82,14 @@ The M1 mechanisms named in the tracker spec are all present:
 | `unlinkat` | 472 | `__unlinkat`, `unlinkat` | x0 dirfd, x1 path, x2 flags | `FsOp::Unlink` |
 | `symlinkat` | 474 | `symlinkat` | x0 target, x1 dirfd, x2 name | `FsOp::Symlink` |
 | `mkdirat` | 475 | `mkdirat` | x0 dirfd, x1 path, x2 mode | `FsOp::Mkdir` |
+| `faccessat` | 466 | `faccessat` | x0 dirfd, x1 path, x2 mode, x3 flags | `FsOp::Access` |
 | `fchmodat` | 467 | `fchmodat` | x0 dirfd, x1 path, x2 mode, x3 flags | `FsOp::Chmod` |
+| `fchownat` | 468 | `fchownat` | x0 dirfd, x1 path, x2 uid, x3 gid, x4 flags | `FsOp::Fchownat` |
 | `fstatat` | 469 | `__fstatat` | x0 dirfd, x1 path, x2 buffer, x3 flags | `FsOp::Stat` |
 | `fstatat64` | 470 | `fstatat` | same layout | `FsOp::Stat` |
 | `readlinkat` | 473 | `readlinkat` | x0 dirfd, x1 path, x2 buffer, x3 length | `FsOp::ReadLink` |
 | `symlink` | 57 | `symlink` | x0 target, x1 link name | `FsOp::Symlink` |
 | `readlink` | 58 | `readlink` | x0 path, x1 buffer, x2 length | `FsOp::ReadLink` |
-| `faccessat` | 466 | `faccessat` | x0 dirfd, x1 path, x2 mode, x3 flags | refused, see below |
-| `fchownat` | 468 | `fchownat` | x0 dirfd, x1 path, x2 uid, x3 gid, x4 flags | refused, see below |
 
 Stub names are the ones that actually carry the `svc`, checked per host rather
 than assumed. Several have no `__`-prefixed form; `unlinkat`'s public wrapper
@@ -113,16 +113,24 @@ installed. `fstatat` and `fstatat64` are **one symbol reaching 470**, while
 - **`symlink`/`symlinkat` x0 is not a pathname operand.** It holds the literal
   target bytes the tracee reads back, so it is never physicalized. `symlink`
   has no dirfd, so its link name anchors at the process cwd.
-- **`faccessat` and `fchownat` are intercepted and refused.** Core has no
-  access-mode/effective-id operation and no owner/group operation, and the
-  overlay MVP has no metadata mutation semantics. They return
-  `UnsupportedCapability` at decode, so neither a host metadata mutation nor a
-  host existence probe runs behind the namespace's back. Decoding them as a
-  neighbouring operation would be worse than refusing.
+- **`faccessat` and `fchownat` decode into typed operations.** `faccessat`
+  becomes `FsOp::Access`: `AccessMode` carries the `R_OK`/`W_OK`/`X_OK` intent,
+  all-false being the bare `F_OK` existence probe, and `AccessFlags` carries
+  `AT_EACCESS` alongside the usual `follow`. A mode bit outside
+  `R_OK|W_OK|X_OK` is refused rather than narrowed to the ones it models.
+  `fchownat` becomes `FsOp::Fchownat`. Its `uid`/`gid` operands are unsigned,
+  so the caller spells "leave this one alone" as -1 and it arrives as
+  `0xffffffff`; each decodes independently to `None`, never to a literal ID
+  4294967295. Both reach the kernel against a path the namespace rewrote, so
+  the probe and the ownership change act on the overlay's own object rather
+  than on the tracee's host path.
 - **`linkat` and `fchmodat` decode but do not execute.** The overlay MVP
   answers `FsOp::Link` and `FsOp::Chmod` with
   `operation requires descriptor or metadata support beyond MVP`; hard links
-  and metadata need copy-up, identity and mode semantics that are not built.
+  and mode changes need copy-up, identity and mode semantics that are not
+  built. `fchownat` is the neighbouring row that does execute: ownership is
+  the one metadata mutation the overlay carries through today, so the two
+  rows do not behave alike.
 
 `abi::path_operands` gives each syscall's operand-to-slot map, and
 `abi::prepare_paths` (with `MacosTraceBackend::prepare_physical`) allocates one

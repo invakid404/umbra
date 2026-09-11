@@ -951,6 +951,8 @@ impl NamespaceResolver for Overlay {
                 dir, path, flags, ..
             } => (*dir, path, flags.create),
             FsOp::Stat { dir, path, .. }
+            | FsOp::Access { dir, path, .. }
+            | FsOp::Fchownat { dir, path, .. }
             | FsOp::Unlink { dir, path, .. }
             | FsOp::ReadLink { dir, path } => (*dir, path, false),
             FsOp::Symlink {
@@ -974,6 +976,10 @@ impl NamespaceResolver for Overlay {
         let follow_final = match operation {
             FsOp::Open { flags, .. } => !(flags.no_follow || flags.create && flags.exclusive),
             FsOp::Stat { follow, .. } => *follow,
+            // Following is the POSIX default for both; the decoded flag says so
+            // explicitly, so neither may inherit the nofollow default below.
+            FsOp::Access { flags, .. } => flags.follow,
+            FsOp::Fchownat { flags, .. } => flags.follow,
             _ => false,
         };
         let path = self.resolve_path_follow(context, dir, name, create_parents, follow_final)?;
@@ -1113,6 +1119,18 @@ impl NamespaceResolver for Overlay {
                 ResolvedAction::Emulate(encoded)
             }
             FsOp::Rename { .. } if destination.as_ref() == Some(&path) => success(),
+            // A logical symlink is a placeholder regular file in the shadow, so
+            // a non-following probe must never reach it: the kernel would answer
+            // from the placeholder's own mode instead of the 0o777 the overlay
+            // reports for every logical symlink. At that mode every requested
+            // mode bit is granted, whichever identity the check uses.
+            FsOp::Access { .. }
+                if existing
+                    .as_ref()
+                    .is_some_and(|(s, _)| s.kind == ObjectKind::LogicalSymlink) =>
+            {
+                success()
+            }
             _ => self.rewrite(
                 operation,
                 &path,
@@ -1345,6 +1363,12 @@ impl NamespaceSession for Overlay {
                         .unwrap()
                         .whiteouts
                         .push((plan.path.clone(), true));
+                }
+                // Ownership is changed by the kernel against the rewritten
+                // shadow path, so the object has to be in the shadow first;
+                // otherwise the immutable base would be mutated in place.
+                FsOp::Fchownat { .. } => {
+                    self.copy_up(&plan.path)?;
                 }
                 FsOp::Rename { .. } => {
                     let destination = plan.destination.as_ref().unwrap();
@@ -1775,6 +1799,11 @@ impl Overlay {
                 object,
                 from: path,
                 to: logical(plan.destination.as_ref().unwrap())?,
+            },
+            FsOp::Fchownat { uid, gid, .. } => JournalIntent::Chown {
+                object,
+                uid: *uid,
+                gid: *gid,
             },
             _ => return Err(unsupported("journal intent for this operation")),
         })

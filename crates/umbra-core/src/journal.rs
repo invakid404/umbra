@@ -184,6 +184,15 @@ pub enum JournalIntent {
         /// Mode.
         mode: u32,
     },
+    /// Chown.
+    Chown {
+        /// Object.
+        object: ObjectId,
+        /// Uid. `None` leaves the owner unchanged.
+        uid: Option<u32>,
+        /// Gid. `None` leaves the group unchanged.
+        gid: Option<u32>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -388,10 +388,12 @@ fn operands(op: &FsOp) -> Vec<(DirRef, &BytePath)> {
     match op {
         FsOp::Open { dir, path, .. }
         | FsOp::Stat { dir, path, .. }
+        | FsOp::Access { dir, path, .. }
         | FsOp::Unlink { dir, path, .. }
         | FsOp::ReadLink { dir, path }
         | FsOp::Mkdir { dir, path, .. }
-        | FsOp::Chmod { dir, path, .. } => vec![(*dir, path)],
+        | FsOp::Chmod { dir, path, .. }
+        | FsOp::Fchownat { dir, path, .. } => vec![(*dir, path)],
         FsOp::Rename {
             from_dir,
             from,
