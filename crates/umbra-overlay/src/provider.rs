@@ -264,11 +264,23 @@ impl NamespaceSession for Proxy {
             _ => Err(protocol_error("namespace.renew_writer response mismatch")),
         }
     }
+    /// A receipt is durability evidence, so it is only evidence for the run it
+    /// names. Both identities are checked: the receipt's own, and the one inside
+    /// the storage flush receipt it carries. A provider that answers with a
+    /// well-formed receipt for another run is refused rather than believed.
     fn finish_run(&mut self, request: &FinishRunRequest) -> Result<FinishRunReceipt> {
         match self.call(&Request::FinishRun {
             request: request.clone(),
         })? {
-            Response::FinishRun(receipt) => Ok(receipt),
+            Response::FinishRun(receipt)
+                if receipt.run_id == request.run_id
+                    && receipt.durability.run_id == request.run_id =>
+            {
+                Ok(receipt)
+            }
+            Response::FinishRun(_) => Err(protocol_error(
+                "namespace.finish_run receipt is for a different run",
+            )),
             _ => Err(protocol_error("namespace.finish_run response mismatch")),
         }
     }
@@ -738,6 +750,61 @@ mod tests {
             assert_eq!(error.kind, ErrorKind::ProtocolMismatch);
             assert_eq!(error.context, expected);
         }
+        shut_down(proxy, worker);
+    }
+
+    /// A receipt is durability evidence, and evidence for another run is not
+    /// evidence for this one. Two identities have to agree, so the two refusals
+    /// below fail different halves of the conjunction: drop either check and one
+    /// of them stops being refused. The third call is the control — the guard
+    /// must still accept the receipt that does match.
+    #[test]
+    fn a_finish_run_receipt_for_another_run_is_refused() {
+        let other_run = RunId(Uuid::from_u128(0x6060));
+        let mut wrong_receipt = finish_receipt();
+        wrong_receipt.run_id = other_run;
+        let mut wrong_durability = finish_receipt();
+        wrong_durability.durability.run_id = other_run;
+
+        let (client_side, server_side) = UnixStream::pair().expect("socketpair");
+        let timeout = Duration::from_secs(5);
+        let scripted = Arc::new(Mutex::new(vec![
+            wrong_receipt,
+            wrong_durability,
+            finish_receipt(),
+        ]));
+        let replies = scripted.clone();
+        let worker = std::thread::spawn(move || {
+            wire::serve(
+                Connection::new(server_side, timeout),
+                move |request: Request| match request {
+                    Request::FinishRun { .. } => Ok(Response::FinishRun(
+                        replies.lock().expect("scripted replies").remove(0),
+                    )),
+                    _ => Err(protocol_error("unexpected request")),
+                },
+            )
+        });
+        let mut proxy = Proxy {
+            client: Mutex::new(Client::from_connection(
+                Connection::new(client_side, timeout),
+                welcome(),
+            )),
+        };
+
+        let mismatch = protocol_error("namespace.finish_run receipt is for a different run");
+        // The receipt names another run.
+        assert_eq!(proxy.finish_run(&finish_request()).unwrap_err(), mismatch);
+        // The receipt names this run, but the storage flush receipt inside it
+        // names another -- the half a single top-level check would miss.
+        assert_eq!(proxy.finish_run(&finish_request()).unwrap_err(), mismatch);
+        // Control: the matching receipt is still accepted.
+        let accepted = proxy
+            .finish_run(&finish_request())
+            .expect("matching receipt");
+        assert_eq!(accepted.run_id, finish_request().run_id);
+        assert_eq!(accepted.durability.run_id, finish_request().run_id);
+        assert!(scripted.lock().unwrap().is_empty(), "all replies consumed");
         shut_down(proxy, worker);
     }
 }

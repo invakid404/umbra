@@ -191,7 +191,11 @@ marker checks; actual raw-name filesystem I/O is conditional on native support.
 `NamespaceSession` adds three lifecycle methods, each defaulting to a refusal so a
 provider that does not implement them cannot be handed a run. Each has a provider
 IPC request/response pair, so `Proxy` forwards them instead of inheriting the
-refusal, and `serve_provider` dispatches them to the backend. `serve_provider`
+refusal, and `serve_provider` dispatches them to the backend. A forwarded
+`finish_run` is checked before it is believed: the receipt and the storage flush
+receipt inside it must both name the run that was asked about, or the proxy
+returns a protocol error rather than accepting another run's durability evidence.
+`serve_provider`
 still advertises an empty capability set, so nothing in this repo offers
 `umbra_core::capabilities::NAMESPACE_RUN_LIFECYCLE_V1`. That name is the
 forward-looking gate, not today's guard: the supervisor refuses every
