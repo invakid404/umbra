@@ -1,9 +1,23 @@
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
-# Pinned versions so a rebuild is reproducible even when the Debian
-# archive rolls forward under this SHA. The versions were captured
-# against the pinned image; bump this list in the same commit that
-# tests the resulting fixture works end to end.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Pinning the base image's digest freezes what's already installed, but
+# not what `apt-get install` resolves next — a rebuild would still pull
+# whatever's current in the live archive. Point APT at a dated
+# snapshot.debian.org archive (the day the pinned base image was built)
+# so the entire dependency closure resolves the same way on every build.
+# `check-valid-until=no` is required because snapshot archives are past
+# their advertised expiry. Plain HTTP is fine here: `bookworm-slim`
+# ships no CA bundle, and every .deb is signed and verified by apt's
+# own trusted keys under `/etc/apt/trusted.gpg.d/` regardless of
+# transport.
+ARG DEBIAN_SNAPSHOT=20260824T000000Z
+RUN set -eu; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s/ bookworm main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list
+# Top-level pins keep the explicit-intent hash in review-visible history;
+# under the snapshot archive above they are also the exact versions
+# apt-get resolves for the whole dependency closure.
+RUN apt-get -o Acquire::Retries=5 update \
+    && apt-get install -y --no-install-recommends \
       nfs-ganesha=4.3-2 \
       nfs-ganesha-vfs=4.3-2 \
       rpcbind=1.2.6-6+b1 \
