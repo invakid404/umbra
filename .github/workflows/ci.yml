@@ -87,11 +87,13 @@ jobs:
         # rustup honors the repository's rust-toolchain.toml.
         run: rustup component add rustfmt clippy
 
-      - name: Install libnfs build dependencies
-        # cmake drives the libnfs build; libclang-dev is bindgen's requirement.
+      - name: Install libnfs build dependencies and tcpdump
+        # cmake drives the libnfs build; libclang-dev is bindgen's
+        # requirement. tcpdump is for the wire capture below, kept in the
+        # same apt call to save one package-cache update.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake libclang-dev
+          sudo apt-get install -y --no-install-recommends cmake libclang-dev tcpdump
 
       - name: Cache Cargo registry and git dependencies
         uses: actions/cache@v6.1.0
@@ -133,6 +135,19 @@ jobs:
             up -d --build --wait --wait-timeout 120
           docker ps --filter name=$UMBRA_NFS_FIXTURE_CONTAINER
 
+      - name: Start wire capture on loopback
+        # `-U` flushes each packet so a kill-signalled process still leaves a
+        # usable file. The filter matches the published port (12105 on host
+        # loopback) and the container's own port (2049) so both sides of the
+        # docker-proxy relay are recorded.
+        run: |
+          sudo tcpdump -i any -w /tmp/nfs.pcap -U -s 0 \
+              'port 12105 or port 2049' \
+              > /tmp/tcpdump.stdout 2> /tmp/tcpdump.stderr &
+          echo $! | sudo tee /tmp/tcpdump.pid > /dev/null
+          # Let libpcap open its BPF filter before tests start dispatching.
+          sleep 2
+
       - name: Run transport-raw suite
         # `--tests` runs unit tests inside the crate and every integration
         # target under `tests/`. `--test-threads=1` is required by the live
@@ -160,12 +175,44 @@ jobs:
               -- --test-threads=1 --nocapture \
               --skip the_namespace_mutations_the_hotfix_added_run_end_to_end
 
-      - name: Print Ganesha logs on failure
+      - name: Stop wire capture
+        if: always()
+        run: |
+          if [ -f /tmp/tcpdump.pid ]; then
+            sudo kill -INT "$(cat /tmp/tcpdump.pid)" 2>/dev/null || true
+            # Give tcpdump a moment to finish flushing.
+            sleep 1
+          fi
+          sudo chown "$USER" /tmp/nfs.pcap 2>/dev/null || true
+          ls -l /tmp/nfs.pcap 2>&1 || true
+
+      - name: Capture diagnostics on failure
         if: failure()
         run: |
-          docker logs "$UMBRA_NFS_FIXTURE_CONTAINER" 2>&1 | tail -200
+          docker logs "$UMBRA_NFS_FIXTURE_CONTAINER" \
+            > /tmp/ganesha.log 2>&1 || true
           docker inspect "$UMBRA_NFS_FIXTURE_CONTAINER" \
-            --format '{{json .State.Health}}' 2>&1 || true
+            --format '{{json .State.Health}}' \
+            > /tmp/ganesha-health.json 2>&1 || true
+          echo '--- Ganesha log (last 200 lines) ---'
+          tail -200 /tmp/ganesha.log
+          echo '--- Health state ---'
+          cat /tmp/ganesha-health.json
+          echo
+
+      - name: Upload raw-transport diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: raw-transport-diagnostics
+          path: |
+            /tmp/nfs.pcap
+            /tmp/ganesha.log
+            /tmp/ganesha-health.json
+            /tmp/tcpdump.stdout
+            /tmp/tcpdump.stderr
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Tear down the fixture
         if: always()

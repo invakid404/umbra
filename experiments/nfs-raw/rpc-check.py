@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Probe NFS over TCP directly: v4 NULL succeeds and v3 is rejected."""
+"""Probe NFS directly over TCP/2049: v4 NULL succeeds and v3 is rejected."""
 import socket
 import struct
 import sys
 
 
-def call(host, port, version):
+def call(host, version):
     xid = 0x554D4200 + version
     request = struct.pack("!10I", xid, 0, 2, 100003, version, 0, 0, 0, 0, 0)
-    with socket.create_connection((host, port), timeout=2) as sock:
+    with socket.create_connection((host, 2049), timeout=2) as sock:
         sock.sendall(struct.pack("!I", 0x80000000 | len(request)) + request)
 
         def read(size):
@@ -39,13 +39,12 @@ def call(host, port, version):
 if __name__ == "__main__":
     try:
         host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-        port = int(sys.argv[2]) if len(sys.argv) > 2 else 2049
-        if call(host, port, 4) != 0:
+        if call(host, 4) != 0:
             raise RuntimeError("NFSv4 NULL failed")
         # PROG_UNAVAIL or PROG_MISMATCH; no NFSv3 operation is performed.
-        if call(host, port, 3) not in (1, 2):
+        if call(host, 3) not in (1, 2):
             raise RuntimeError("NFSv3 was not rejected")
-        print(f"PASS NFSv4 RPC ready; NFSv3 rejected on TCP/{port}")
+        print("PASS NFSv4 RPC ready; NFSv3 rejected on TCP/2049")
     except (OSError, RuntimeError, struct.error) as exc:
         print(f"FAIL RPC readiness: {exc}", file=sys.stderr)
         sys.exit(1)

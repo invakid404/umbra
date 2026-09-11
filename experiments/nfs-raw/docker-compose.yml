@@ -8,30 +8,19 @@ services:
     image: umbra-nfs-ganesha-raw:local
     hostname: umbra-m1-transport-raw
     container_name: umbra-m1-transport-raw-ganesha
-    # `restart: no` matters for the SIGKILL-restart cases: an auto-restart
-    # policy races the test's own `docker start`, and its
-    # `wait_until_serving` probe can then see an already-live server
-    # before the restart lifecycle has actually re-entered its startup
-    # state. With `no`, the test owns that lifecycle.
-    restart: "no"
+    restart: unless-stopped
     cap_add:
       - DAC_READ_SEARCH
-    # Host networking avoids Docker's port-publish path (iptables DNAT
-    # plus a docker-proxy userspace relay). On the GitHub Actions Ubuntu
-    # runner that path reaps the lease-idle test's loopback TCP flow at
-    # ~30s. With host networking the client and Ganesha share the host's
-    # own loopback, so idle NFS TCP survives as long as the OS keeps it.
-    # On macOS Docker Desktop this mode is emulated (the container joins
-    # the Docker Desktop VM's network) and localhost still reaches
-    # Ganesha through Desktop's port forwarder.
-    network_mode: host
+    # Loopback only. Port 12105 (not 2049) so this coexists with any real
+    # NFS server on the host without collision.
+    ports:
+      - "127.0.0.1:12105:2049/tcp"
     volumes:
       - export-data:/export
       - umbra-data:/umbra
       - recovery-data:/var/lib/nfs/ganesha
     healthcheck:
-      # Ganesha binds NFS_Port = 12105 directly on the host.
-      test: ["CMD", "python3", "/usr/local/bin/rpc-check.py", "127.0.0.1", "12105"]
+      test: ["CMD", "python3", "/usr/local/bin/rpc-check.py", "127.0.0.1"]
       interval: 2s
       timeout: 4s
       retries: 30
