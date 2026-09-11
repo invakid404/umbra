@@ -24,4 +24,4 @@ uuid.workspace = true
 # Not optional: a build script cannot be conditionally compiled on a feature,
 # so bindgen is always available and `build.rs` returns early when the
 # `transport-raw` feature is off.
-bindgen = "=0.70.1"
+bindgen = "=0.73.2"
