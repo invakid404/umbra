@@ -185,13 +185,26 @@ pub enum JournalIntent {
         mode: u32,
     },
     /// Chown.
+    ///
+    /// Unlike [`JournalIntent::Chmod`], this carries a path. Chmod and the other
+    /// object-keyed intents run against an object already in the shadow, so their
+    /// identity is stable; a chown may materialise its target as part of itself,
+    /// which gives the shadow object a different identity from the `object`
+    /// recorded here. The path is what stays resolvable across that change, the
+    /// same reason [`JournalIntent::CopyUp`] carries one.
     Chown {
-        /// Object.
+        /// Object. The pre-materialisation identity when `copy_up` is set.
         object: ObjectId,
+        /// Path interpreted according to the enclosing operation and path type.
+        path: BytePath,
         /// Uid. `None` leaves the owner unchanged.
         uid: Option<u32>,
         /// Gid. `None` leaves the group unchanged.
         gid: Option<u32>,
+        /// This operation copied the object up from the immutable base before
+        /// changing its ownership, so a reader must expect a shadow object at
+        /// `path` whose identity differs from `object`.
+        copy_up: bool,
     },
 }
 

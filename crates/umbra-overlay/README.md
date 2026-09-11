@@ -79,19 +79,37 @@ new resolutions are blocked while a transaction is pending.
     case.
 - `FsOp::Fchownat` copies the target up after a flushed `JournalIntent::Chown`
   Prepare, then rewrites to the shadow so the kernel applies the ownership there
-  and never to the immutable base. The `-1` unchanged-ID sentinel arrives as
-  `None` and is journaled as `None`. A base-only directory is refused at
-  `resolve` with `UnsupportedCapability`, before any journal record exists,
-  because recursive directory copy-up is deferred; a directory already in the
-  shadow needs no copy-up and chowns normally. A chown the **kernel** rejects
-  takes the mutation abort path: the `Abort` is journaled, the session is
-  poisoned, and `abort` returns `InvalidState`, which ends the run rather than
-  handing the tracee its errno. That is the shared `Materialise` contract, not
-  something specific to ownership, but `fchownat` is the first operation to
-  route a routinely-failing syscall into it — an unprivileged tracee chowning to
-  another uid gets `EPERM`, which most programs would otherwise shrug off.
-  `FsOp::Chmod`, `FsOp::Fchmod` and `FsOp::Link` remain unimplemented at
-  `resolve`; ownership is the only metadata mutation wired through today.
+  and never to the immutable base. Two shapes are refused at `resolve`, before
+  any journal record exists, rather than half-performed:
+  - A **base-only** target with an unchanged-ID sentinel in either position.
+    Copy-up recreates the object through `CreateOptions`, which carries `mode`
+    but not uid/gid, so the shadow belongs to whoever runs umbra; the kernel then
+    sets only the IDs the tracee supplied, and the ID it asked to leave alone
+    would silently become ours. The sentinel means "unchanged", and this path
+    cannot honour it. Setting **both** IDs is allowed, because the copy
+    contributes nothing to the result, and so is a sentinel against an object
+    already in the shadow, where copy-up is a no-op. Lifting the restriction
+    needs ownership-preserving copy-up, which needs `SetMetadata` in the storage
+    backend and, for a base object owned by another user, privilege umbra does
+    not have.
+  - A **base-only directory**, because recursive directory copy-up is deferred.
+    A directory already in the shadow needs no copy-up and chowns normally.
+
+  The journaled `JournalIntent::Chown` carries the logical path and a `copy_up`
+  flag, not just an object id: `object` is read before copy-up, so for a base-only
+  target it names the base object while the kernel chowns a shadow object with a
+  different identity. The path stays resolvable across that change, for the same
+  reason `CopyUp` carries one.
+
+  A chown the **kernel** rejects takes the mutation abort path: the `Abort` is
+  journaled, the session is poisoned, and `abort` returns `InvalidState`, which
+  ends the run rather than handing the tracee its errno. That is the shared
+  `Materialise` contract, not something specific to ownership, but `fchownat` is
+  the first operation to route a routinely-failing syscall into it — an
+  unprivileged tracee chowning to another uid gets `EPERM`, which most programs
+  would otherwise shrug off. `FsOp::Chmod`, `FsOp::Fchmod` and `FsOp::Link`
+  remain unimplemented at `resolve`; ownership is the only metadata mutation
+  wired through today.
 - Rename materializes a regular-file or logical-symlink source, creates shadow destination parents,
   and returns source/destination kernel rewrites for one native shadow rename.
   On observed success the source whiteout is set and destination whiteout cleared.
@@ -157,6 +175,12 @@ symlink, so unchecked kernel traversal cannot follow their target or descend
 through them. Readlink, no-follow stat and a no-follow `FsOp::Access` never
 expose the placeholder as a file: the probe is answered from the `0o777` the
 overlay reports for every logical symlink, not from the placeholder's `0444`.
+That is a resolver-layer property. Each of those answers is a
+`ResolvedAction::Emulate`, and a caller that cannot execute emulated results —
+the macOS supervisor among them — ends the run instead of answering, so it is
+not yet an end-to-end behaviour. For the no-follow `FsOp::Access` case this is
+no worse than before the operation was typed, when the same call was refused at
+decode.
 
 Control metadata lives outside tracee listings:
 

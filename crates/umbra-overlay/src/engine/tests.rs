@@ -1713,9 +1713,26 @@ fn fchownat_journals_a_chown_intent_against_a_copied_up_object() {
     );
     let log = f.log.lock().unwrap().records.clone();
     assert_eq!(log.len(), 3);
+    // `object` is the pre-copy-up identity, so on its own the record would name
+    // something the kernel never touched. The path locates the shadow object
+    // that was actually chowned, and copy_up records that the materialisation
+    // happened at all, so a reader can tell a pre-copy-up crash from a later one.
+    let shadow_id = f
+        .overlay
+        .stat(&root(b"nested/file").unwrap(), true)
+        .unwrap()
+        .object_id;
+    assert_ne!(
+        shadow_id, object.object_id,
+        "copy-up must give the shadow object its own identity, or this test proves nothing"
+    );
     assert!(matches!(&log[0].payload,
-        JournalPayload::Prepare { intent: JournalIntent::Chown { object: o, uid, gid } }
-        if *o == object.object_id && *uid == Some(501) && *gid == Some(20)));
+        JournalPayload::Prepare { intent: JournalIntent::Chown { object: o, path, uid, gid, copy_up } }
+        if *o == object.object_id
+            && path.as_bytes() == b"/nested/file"
+            && *uid == Some(501)
+            && *gid == Some(20)
+            && *copy_up));
     assert!(matches!(
         log[1].payload,
         JournalPayload::ObservedResult { .. }
@@ -1746,8 +1763,10 @@ fn fchownat_carries_the_unchanged_id_sentinel_and_link_identity_into_the_journal
     // never as a change to ID 4294967295.
     let log = f.log.lock().unwrap().records.clone();
     assert!(matches!(&log[3].payload,
-        JournalPayload::Prepare { intent: JournalIntent::Chown { object: o, uid: None, gid: None } }
-        if *o == object.object_id));
+        JournalPayload::Prepare {
+            intent: JournalIntent::Chown { object: o, path, uid: None, gid: None, copy_up: false }
+        }
+        if *o == object.object_id && path.as_bytes() == b"/link"));
     drop(log);
     // An absent target is ENOENT before anything is journaled or copied up.
     let before = f.log.lock().unwrap().records.len();
@@ -1794,21 +1813,63 @@ fn a_base_only_directory_chown_is_refused_before_anything_is_journaled() {
     let prepared = f.prepare(&chown(b"made", Some(501), Some(20), true));
     assert!(matches!(prepared.action, ResolvedAction::Rewrite(_)));
     f.complete(prepared);
+    // Assert on the chown's own record. Taking the first Prepare here would pick
+    // up the mkdir's Create and pass whether or not the chown journaled anything.
+    let intents: Vec<_> = f
+        .log
+        .lock()
+        .unwrap()
+        .records
+        .iter()
+        .filter_map(|r| match &r.payload {
+            JournalPayload::Prepare { intent } => Some(intent.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(intents.len(), 2, "one Create for the mkdir, one Chown");
     assert!(matches!(
-        f.log
-            .lock()
-            .unwrap()
-            .records
-            .iter()
-            .find_map(|r| match &r.payload {
-                JournalPayload::Prepare { intent } => Some(intent.clone()),
-                _ => None,
-            }),
-        Some(JournalIntent::Create {
+        &intents[0],
+        JournalIntent::Create {
             directory: true,
             ..
-        })
+        }
     ));
+    assert!(matches!(&intents[1],
+        JournalIntent::Chown { path, uid: Some(501), gid: Some(20), copy_up: false, .. }
+        if path.as_bytes() == b"/made"));
+}
+
+#[test]
+fn an_unchanged_id_chown_of_a_base_object_is_refused_rather_than_silently_re_owning_it() {
+    // copy_up recreates a base object through CreateOptions, which carries mode
+    // but no uid/gid, so the shadow belongs to whoever runs umbra. The kernel then
+    // sets only the IDs the tracee supplied. Were this allowed, a POSIX no-op
+    // chown(-1, -1) would silently move the object to our identity, which is the
+    // opposite of what the sentinel asks for.
+    let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+    for (uid, gid) in [(None, None), (Some(501), None), (None, Some(20))] {
+        assert_eq!(
+            f.overlay
+                .resolve(&f.process, &chown(b"file", uid, gid, true))
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsupportedCapability,
+            "uid {uid:?} gid {gid:?}"
+        );
+    }
+    // Refused before anything durable or material happened.
+    assert!(f.log.lock().unwrap().records.is_empty());
+    assert!(!f.shadow_root.join("file").exists());
+    assert!(!f.overlay.poisoned);
+    // Setting both IDs inherits nothing from the copy, so it is still allowed.
+    let prepared = f.prepare(&chown(b"file", Some(501), Some(20), true));
+    f.complete(prepared);
+    assert!(f.shadow_root.join("file").is_file());
+    // And once the object is in the shadow, copy_up is a no-op, so the sentinel
+    // is safe again: the ID left alone is the shadow object's own.
+    let prepared = f.prepare(&chown(b"file", None, None, true));
+    assert!(matches!(prepared.action, ResolvedAction::Rewrite(_)));
+    f.complete(prepared);
 }
 
 #[test]

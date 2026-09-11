@@ -1054,12 +1054,28 @@ impl NamespaceResolver for Overlay {
             // copy_up returns early for anything already materialised. The
             // condition mirrors `copy_up`'s own; prepare keeps its call as the
             // backstop.
-            FsOp::Fchownat { .. } => {
+            FsOp::Fchownat { uid, gid, .. } => {
                 let (stat, shadow) = existing
                     .as_ref()
                     .ok_or_else(|| error(ErrorKind::NotFound, "chown target absent"))?;
-                if !shadow && !matches!(stat.kind, ObjectKind::File | ObjectKind::LogicalSymlink) {
-                    return Err(unsupported("directory chown requires recursive copy-up"));
+                if !shadow {
+                    if !matches!(stat.kind, ObjectKind::File | ObjectKind::LogicalSymlink) {
+                        return Err(unsupported("directory chown requires recursive copy-up"));
+                    }
+                    // Copy-up recreates the object through `CreateOptions`, which
+                    // carries mode but no uid/gid, so the shadow object belongs to
+                    // whoever runs umbra. The kernel then sets only the IDs the
+                    // tracee supplied, which would make every ID it asked to leave
+                    // alone silently become ours. The sentinel means "unchanged",
+                    // and this path cannot honour that, so refuse rather than
+                    // quietly re-own the object. Once the object is in the shadow
+                    // copy-up is a no-op and the sentinel is safe, and a chown that
+                    // sets both IDs explicitly inherits nothing from the copy.
+                    if uid.is_none() || gid.is_none() {
+                        return Err(unsupported(
+                            "unchanged-ID chown of a base object awaits ownership-preserving copy-up",
+                        ));
+                    }
                 }
             }
             FsOp::Rename { to_dir, to, .. } => {
@@ -1821,10 +1837,18 @@ impl Overlay {
                 from: path,
                 to: logical(plan.destination.as_ref().unwrap())?,
             },
+            // `object` is read before `prepare` copies up, so for a base-only
+            // target it is the base identity and the kernel chowns a shadow
+            // object with a different one. `path` is what stays resolvable across
+            // that change, and `copy_up` records that the materialisation
+            // happened at all — `Fchownat` is the only operation that both
+            // materialises and reports something other than `CopyUp`.
             FsOp::Fchownat { uid, gid, .. } => JournalIntent::Chown {
                 object,
+                path,
                 uid: *uid,
                 gid: *gid,
+                copy_up: matches!(existing, Some((_, false))),
             },
             _ => return Err(unsupported("journal intent for this operation")),
         })
