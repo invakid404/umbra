@@ -90,7 +90,8 @@ diagnostic path, connecting platform, storage and journal, optionally connecting
 an agent when the registry declares one, and delegating
 standard namespace construction to `umbra-overlay`. A configured `namespace`
 provider replaces the standard engine there; `run` refuses one, because the
-namespace protocol has no run lifecycle.
+supervisor does not yet route a run to a configured namespace provider — see
+[Selecting a run](#selecting-a-run).
 
 `umbra providers --registry PATH [--role ROLE]` validates installed provider
 connections and starts trusted provider processes but no tracees. See

@@ -225,6 +225,7 @@ backend may bind an operation ID to the single idempotency key it was first used
 with, refusing a second, different request under it. Derivation is deterministic,
 so requests stay attributable to the operation the journal recorded.
 
-`umbra_supervisor` is the in-process owner that supplies all of the above; the
-namespace provider protocol carries no lifecycle calls, so an alternative
+`umbra_supervisor` is the in-process owner that supplies all of the above. The
+protocol now carries the lifecycle calls, but `umbra_supervisor` still binds
+`standard_namespace` and refuses a namespace-role registry, so an alternative
 namespace provider cannot yet own a run.
