@@ -23,7 +23,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Verify Apple Silicon runner
         if: runner.os == 'macOS'
@@ -34,7 +34,7 @@ jobs:
         run: rustup component add rustfmt clippy
 
       - name: Cache Cargo registry and git dependencies
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -81,7 +81,7 @@ jobs:
       UMBRA_NFS_FIXTURE_CONTAINER: umbra-m1-transport-raw-ganesha
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pinned Rust toolchain components
         # rustup honors the repository's rust-toolchain.toml.
@@ -96,7 +96,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends cmake libclang-dev tcpdump
 
       - name: Cache Cargo registry and git dependencies
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -107,7 +107,7 @@ jobs:
 
       - name: Cache pinned libnfs checkout
         id: libnfs-cache
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: third_party/libnfs
           # The pin is the entire cache identity; a bump invalidates cleanly.
@@ -208,7 +208,7 @@ jobs:
 
       - name: Upload raw-transport diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: raw-transport-diagnostics
           path: |
@@ -245,7 +245,7 @@ jobs:
       # it lands the skip can be removed.
       UMBRA_TEST_SKIP_NFS_MATRIX: "1"
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Build providers and fixture
