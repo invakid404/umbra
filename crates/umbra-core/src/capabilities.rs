@@ -28,3 +28,9 @@ pub const PLATFORM_SANDBOXED_LAUNCH_V1: &str = "sandboxed-stopped-launch-v1";
 /// scratch memory and prepared open flags, through the platform contract rather
 /// than a backend-private method.
 pub const PLATFORM_SYSCALL_REWRITE_V1: &str = "experimental-syscall-rewrite-v1";
+
+/// Namespace owns a run's whole managed lifecycle: renewing the writer lease
+/// through its own storage session, durably completing a finished run, and
+/// leaving a failed one explicitly failed. Advertise only when `renew_writer`,
+/// `finish_run` and `fail_run` are implemented, not merely routed.
+pub const NAMESPACE_RUN_LIFECYCLE_V1: &str = "namespace-run-lifecycle-v1";

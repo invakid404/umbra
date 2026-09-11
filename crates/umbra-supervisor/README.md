@@ -20,7 +20,10 @@ no stream and reads none.
 The staged order is fixed, and each stage's failure decides what may be released:
 
 1. Validate the request and the registry's declared capabilities. Nothing is
-   opened until this passes, so an unqualified configuration fails first.
+   opened until this passes, so an unqualified configuration fails first. A
+   registry that configures a `namespace` role must declare
+   `namespace-run-lifecycle-v1`; no namespace provider advertises it, so such a
+   registry is still refused here rather than handed a run.
 2. Inventory the approved workspace and derive the run's `ImmutableBaseContract`.
 3. Connect storage, `open_run(CreateNew)`, then `acquire_writer` with
    `TakeoverPolicy::Refuse`. There is no stale-writer takeover.

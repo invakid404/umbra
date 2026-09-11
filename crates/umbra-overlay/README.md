@@ -66,7 +66,8 @@ new resolutions are blocked while a transaction is pending.
   Kernel rewrites require trusted, qualified runtime bindings and caller execution.
 
 `NamespaceSession` typed reads, readlink, stat, and directory pages also have provider IPC
-request/response variants. `set_readlink_buffer` is available through IPC as well. Provider factories bind the engine and install any ABI encoder
+request/response variants. `set_readlink_buffer` is available through IPC as well, and so are
+the three run-lifecycle calls: `RenewWriter`, `FinishRun` and `FailRun`. Provider factories bind the engine and install any ABI encoder
 before entering `serve_provider`; trait objects are not serialized over IPC.
 
 ## Journal and whiteouts
@@ -188,7 +189,12 @@ marker checks; actual raw-name filesystem I/O is conditional on native support.
 ## Run lifecycle
 
 `NamespaceSession` adds three lifecycle methods, each defaulting to a refusal so a
-provider that does not implement them cannot be handed a run:
+provider that does not implement them cannot be handed a run. Each has a provider
+IPC request/response pair, so `Proxy` forwards them instead of inheriting the
+refusal, and `serve_provider` dispatches them to the backend. `serve_provider`
+still advertises an empty capability set, so no provider yet satisfies
+`umbra_core::capabilities::NAMESPACE_RUN_LIFECYCLE_V1`; the supervisor refuses a
+namespace-role registry that does not declare it, before anything is opened:
 
 - `renew_writer` renews the injected lease through this session's own storage. A
   refused or epoch-advanced renewal is `LeaseLost`: authority is gone or unproven,

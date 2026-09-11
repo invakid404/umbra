@@ -290,14 +290,19 @@ fn validate(spec: &RunSpec) -> Result<()> {
             ))
         }
     }
-    if spec.registry.providers.contains_key("namespace") {
-        return Err(error(
-            ErrorKind::UnsupportedCapability,
-            "run.validate",
-            "an alternative namespace provider cannot yet own a run lifecycle \
-             (renew/finish/fail are not in its protocol); remove the namespace role \
-             and configure storage and journal directly",
-        ));
+    // A namespace-role registry is still refused here, before anything is opened:
+    // no provider advertises this capability, and the namespace `serve_provider`
+    // advertises an empty set, so nothing can satisfy it. What changed is the
+    // reason. The refusal is now derived from the declared capability that the
+    // handshake also enforces, rather than from a hardcoded claim that the
+    // protocol lacks the lifecycle calls, which it no longer does.
+    if let Some(namespace) = spec.registry.providers.get("namespace") {
+        require_capability(
+            namespace,
+            caps::NAMESPACE_RUN_LIFECYCLE_V1,
+            "owning the run lifecycle (renew, finish and fail) for an alternative \
+             namespace provider",
+        )?;
     }
     let storage = spec.registry.get("storage")?;
     let mode = match spec.persistence {
@@ -806,5 +811,81 @@ mod abi_tests {
         );
         names.insert("darwin-arm64-abi-v2".into());
         assert!(select_abi(&names, &umbra_core::Architecture::Aarch64).is_err());
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use umbra_core::provider::PROTOCOL_VERSION;
+
+    fn namespace_descriptor(capabilities: &[&str]) -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: "alt-namespace".into(),
+            role: "namespace".into(),
+            protocol_version: PROTOCOL_VERSION,
+            executable: BytePath::new(b"/usr/bin/true".to_vec()).unwrap(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            options: Vec::new(),
+        }
+    }
+
+    /// The smallest spec that reaches the namespace check: everything decided
+    /// before it must pass, and no other role is configured.
+    fn spec_with_namespace(capabilities: &[&str]) -> RunSpec {
+        let mut providers = BTreeMap::new();
+        providers.insert("namespace".to_owned(), namespace_descriptor(capabilities));
+        RunSpec {
+            registry: ProviderRegistry {
+                providers,
+                timeout_ms: 5_000,
+            },
+            launch: RunLaunch::Command(CommandLaunch {
+                executable: BytePath::new(b"/bin/echo".to_vec()).unwrap(),
+                argv: vec![b"echo".to_vec()],
+                environment: Vec::new(),
+                cwd: BytePath::new(b"/".to_vec()).unwrap(),
+            }),
+            workspace: std::env::temp_dir(),
+            persistence: RunPersistence::LocalDevelopment,
+            experimental: true,
+            observer: None,
+        }
+    }
+
+    #[test]
+    fn a_namespace_role_is_refused_for_the_missing_run_lifecycle_capability() {
+        let error = validate(&spec_with_namespace(&[])).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::UnsupportedCapability);
+        // The refusal is now a capability check, not a hardcoded protocol claim.
+        assert_eq!(error.operation, "run.capabilities");
+        assert!(
+            error.context.contains(caps::NAMESPACE_RUN_LIFECYCLE_V1),
+            "{error}"
+        );
+        assert!(
+            error
+                .context
+                .contains("owning the run lifecycle (renew, finish and fail)"),
+            "{error}"
+        );
+        assert!(
+            !error.context.contains("are not in its protocol"),
+            "{error}"
+        );
+        assert!(error.context.contains("alt-namespace"), "{error}");
+
+        // No namespace provider advertises the capability, so the guard still
+        // refuses every real configuration. A descriptor that merely declares it
+        // gets past this check only to meet the remaining role requirements, and
+        // the provider handshake rejects a backend that does not advertise it.
+        let declared = validate(&spec_with_namespace(&[caps::NAMESPACE_RUN_LIFECYCLE_V1]))
+            .expect_err("a namespace-only registry is still incomplete");
+        assert_eq!(declared.kind, ErrorKind::ProtocolMismatch);
+        assert!(
+            declared.context.contains("missing provider role"),
+            "{declared}"
+        );
     }
 }
