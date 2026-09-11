@@ -1,6 +1,13 @@
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+# Pinned versions so a rebuild is reproducible even when the Debian
+# archive rolls forward under this SHA. The versions were captured
+# against the pinned image; bump this list in the same commit that
+# tests the resulting fixture works end to end.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      nfs-ganesha nfs-ganesha-vfs rpcbind python3 \
+      nfs-ganesha=4.3-2 \
+      nfs-ganesha-vfs=4.3-2 \
+      rpcbind=1.2.6-6+b1 \
+      python3=3.11.2-1+b1 \
     && rm -rf /var/lib/apt/lists/*
 COPY ganesha.conf /etc/ganesha/ganesha.conf
 COPY container-entrypoint.sh /usr/local/bin/umbra-entrypoint

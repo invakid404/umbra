@@ -3,8 +3,9 @@
 Loopback NFS-Ganesha instance for the `umbra-storage-nfs-userspace`
 `transport-raw` test suite.
 
-The image is the one built by [`../nfs/Dockerfile`](../nfs/Dockerfile). This
-compose file wraps it with the settings the raw-transport tests expect:
+The image is built by this directory's [`Dockerfile`](Dockerfile). The compose
+file (`build: .`) then wraps it with the settings the raw-transport tests
+expect:
 
 - container name `umbra-m1-transport-raw-ganesha`
   (`UMBRA_NFS_FIXTURE_CONTAINER` in `tests/live_state.rs`)
@@ -39,8 +40,15 @@ UMBRA_NFS_FIXTURE_CONTAINER=umbra-m1-transport-raw-ganesha \
 cargo test -p umbra-storage-nfs-userspace \
     --features transport-raw \
     --tests \
-    -- --test-threads=1 --nocapture
+    -- --test-threads=1 --nocapture \
+    --skip the_namespace_mutations_the_hotfix_added_run_end_to_end
 ```
+
+`--skip the_namespace_mutations_the_hotfix_added_run_end_to_end` matches
+what CI does: NFS-Ganesha's VFS FSAL can't report atomic REMOVE
+`change_info4` (RFC 7530 §14.2), so the test asserts `Abandoned`
+against this fixture — a fixture-capability gap, not a code gap. The
+same test runs under the mounted adapter in `crates/umbra-storage-nfs`.
 
 `UMBRA_LIBNFS_SRC` points at a libnfs checkout at the commit named in
 `crates/umbra-storage-nfs-userspace/libnfs.pin`. Without it, `build.rs`
