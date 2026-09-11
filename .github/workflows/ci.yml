@@ -140,11 +140,16 @@ jobs:
         # usable file. The filter matches the published port (12105 on host
         # loopback) and the container's own port (2049) so both sides of the
         # docker-proxy relay are recorded.
+        #
+        # The redirections have to run *inside* the elevated shell, otherwise
+        # sh opens the output files under the runner UID before executing
+        # `sudo tcpdump` (SC2024). Wrap the whole invocation in `sudo sh -c`
+        # so both the fd creation and the process itself are root.
         run: |
-          sudo tcpdump -i any -w /tmp/nfs.pcap -U -s 0 \
-              'port 12105 or port 2049' \
+          sudo sh -c 'tcpdump -i any -w /tmp/nfs.pcap -U -s 0 \
+              "port 12105 or port 2049" \
               > /tmp/tcpdump.stdout 2> /tmp/tcpdump.stderr &
-          echo $! | sudo tee /tmp/tcpdump.pid > /dev/null
+              echo $! > /tmp/tcpdump.pid'
           # Let libpcap open its BPF filter before tests start dispatching.
           sleep 2
 
@@ -154,10 +159,11 @@ jobs:
         # cases that restart the fixture (`tests/live_state.rs`); the tests
         # can otherwise clobber each other on the shared server.
         #
-        # The 10 finding-tagged tests named in issue #32 (four each in
-        # `pump.rs` and `mod.rs`, two in `tests/live_state.rs`, one in
-        # `tests/fault_matrix.rs`) all execute and pass under this fixture,
-        # alongside the rest of the raw-transport suite.
+        # The 10 finding-tagged tests named in issue #32 — four in
+        # `src/transport/raw/pump.rs`, three in `src/transport/raw/mod.rs`,
+        # two in `tests/live_state.rs`, and one in `tests/fault_matrix.rs` —
+        # all execute and pass under this fixture, alongside the rest of
+        # the raw-transport suite.
         #
         # `--skip the_namespace_mutations_the_hotfix_added_run_end_to_end`:
         # the raw transport asks REMOVE for atomic `change_info4`
