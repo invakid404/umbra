@@ -160,6 +160,13 @@ jobs:
               -- --test-threads=1 --nocapture \
               --skip the_namespace_mutations_the_hotfix_added_run_end_to_end
 
+      - name: Print Ganesha logs on failure
+        if: failure()
+        run: |
+          docker logs "$UMBRA_NFS_FIXTURE_CONTAINER" 2>&1 | tail -200
+          docker inspect "$UMBRA_NFS_FIXTURE_CONTAINER" \
+            --format '{{json .State.Health}}' 2>&1 || true
+
       - name: Tear down the fixture
         if: always()
         run: |

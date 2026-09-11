@@ -8,7 +8,12 @@ services:
     image: umbra-nfs-ganesha-raw:local
     hostname: umbra-m1-transport-raw
     container_name: umbra-m1-transport-raw-ganesha
-    restart: unless-stopped
+    # `restart: no` matters for the SIGKILL-restart cases: an auto-restart
+    # policy races the test's own `docker start`, and its
+    # `wait_until_serving` probe can then see an already-live server before
+    # the restart lifecycle has actually re-entered its startup state.
+    # With `no`, the test owns that lifecycle.
+    restart: "no"
     cap_add:
       - DAC_READ_SEARCH
     # Loopback only. Port 12105 (not 2049) so this coexists with any real
