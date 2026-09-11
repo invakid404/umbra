@@ -103,7 +103,7 @@ jobs:
       # Follow-up #32 (`--tag` → `--rev`) will make this key
       # commit-precise; until then, the tag string is sufficient.
       - name: Cache Cargo registry, git deps, and installed binaries
-        uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Include the memoria tag in the shared key so different
           # tag pins get different caches.
