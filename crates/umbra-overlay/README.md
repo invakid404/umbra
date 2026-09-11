@@ -60,14 +60,36 @@ new resolutions are blocked while a transaction is pending.
   whiteout, including for base-only files. Recreation clears its exact whiteout.
 - `FsOp::Access` is a read-through probe of the merged namespace: it rewrites to
   the shadow object when one exists and to the base otherwise, and it never
-  copies up, not even for a `W_OK` probe. An absent or whiteouted target is
-  `NotFound`. Nothing is journaled, because a probe reports current permissions
-  rather than authorizing a later mutation.
+  copies up, not even for a `W_OK` probe. Nothing is journaled, because a probe
+  reports current permissions rather than authorizing a later mutation. Two
+  limits matter, because neither is visible from the resolver's answer alone:
+  - An absent **or whiteouted** target resolves to `NotFound`. That is this
+    namespace's answer at the resolve boundary, not what the tracee observes:
+    the supervisor turns a non-mutating `NotFound` into a plain resume, so the
+    tracee's own unrewritten syscall runs against the host and a whiteouted base
+    file still answers "exists". The gap is the supervisor's, it predates this
+    operation, and `FsOp::Stat`, `FsOp::Read` and `FsOp::ReadLink` take the same
+    branch. Tracked as
+    [#49](https://github.com/invakid404/umbra/issues/49); not fixed here.
+  - `W_OK` against a base-only object is answered from the **base** file's
+    ownership, because that is the path the probe rewrites to. Copy-up carries
+    `mode` but not uid/gid, so a base file owned by another user can fail
+    `access(W_OK)` and still be writable through a later open, which copies it
+    into a shadow object this run owns. The probe and the write disagree in that
+    case.
 - `FsOp::Fchownat` copies the target up after a flushed `JournalIntent::Chown`
   Prepare, then rewrites to the shadow so the kernel applies the ownership there
   and never to the immutable base. The `-1` unchanged-ID sentinel arrives as
-  `None` and is journaled as `None`. A base-only directory still returns
-  `UnsupportedCapability`, because recursive directory copy-up is deferred.
+  `None` and is journaled as `None`. A base-only directory is refused at
+  `resolve` with `UnsupportedCapability`, before any journal record exists,
+  because recursive directory copy-up is deferred; a directory already in the
+  shadow needs no copy-up and chowns normally. A chown the **kernel** rejects
+  takes the mutation abort path: the `Abort` is journaled, the session is
+  poisoned, and `abort` returns `InvalidState`, which ends the run rather than
+  handing the tracee its errno. That is the shared `Materialise` contract, not
+  something specific to ownership, but `fchownat` is the first operation to
+  route a routinely-failing syscall into it — an unprivileged tracee chowning to
+  another uid gets `EPERM`, which most programs would otherwise shrug off.
   `FsOp::Chmod`, `FsOp::Fchmod` and `FsOp::Link` remain unimplemented at
   `resolve`; ownership is the only metadata mutation wired through today.
 - Rename materializes a regular-file or logical-symlink source, creates shadow destination parents,

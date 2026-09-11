@@ -124,6 +124,12 @@ installed. `fstatat` and `fstatat64` are **one symbol reaching 470**, while
   4294967295. Both reach the kernel against a path the namespace rewrote, so
   the probe and the ownership change act on the overlay's own object rather
   than on the tracee's host path.
+- **Only the `*at` forms are mediated.** `access` (33), `chown` (16), `lchown`
+  (364) and `fchown` (123) are absent from the breakpoint list above and from
+  `decode_entry`, so a tracee calling them runs natively against its own host
+  path, outside the namespace. On Darwin `access()` is its own syscall rather
+  than a `faccessat` wrapper, and it is the more common libc entry point, so
+  decoding 466 and 468 narrows the unmediated surface without closing it.
 - **`linkat` and `fchmodat` decode but do not execute.** The overlay MVP
   answers `FsOp::Link` and `FsOp::Chmod` with
   `operation requires descriptor or metadata support beyond MVP`; hard links

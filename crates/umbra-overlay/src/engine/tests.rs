@@ -1593,7 +1593,14 @@ fn access_probes_the_namespace_without_materialising_or_journaling() {
         native(&plan.paths[0].path.0),
         f.shadow_root.join("nested/file")
     );
-    // An absent target, and one hidden by a whiteout, are both ENOENT.
+    // An absent target, and one hidden by a whiteout, are both ENOENT *from the
+    // resolver*. This is the namespace's answer at the resolve boundary, not
+    // what a tracee observes: the supervisor turns NotFound on a non-mutating
+    // operation into a plain resume, so the tracee's own unrewritten faccessat
+    // still runs against the host and can see a whiteouted base file. That gap
+    // is the supervisor's, it predates this operation and it applies equally to
+    // Stat/Read/ReadLink, so nothing here should be read as an end-to-end
+    // guarantee; issue #49 tracks closing it.
     assert_eq!(
         f.overlay
             .resolve(&f.process, &access(b"nested/missing", READ, true))
@@ -1752,17 +1759,99 @@ fn fchownat_carries_the_unchanged_id_sentinel_and_link_identity_into_the_journal
         ErrorKind::NotFound
     );
     assert_eq!(f.log.lock().unwrap().records.len(), before);
-    // A base-only directory still needs recursive copy-up, which is deferred.
+}
+
+#[test]
+fn a_base_only_directory_chown_is_refused_before_anything_is_journaled() {
+    // prepare appends and flushes the Chown intent before the copy-up that
+    // would fail here, so refusing at resolve is what keeps the journal free of
+    // an ownership change that never happened. `chown -R` over a base tree
+    // reaches this on its first directory.
     let mut f = Fixture::new(&[(b"dir/file", b"base")]);
-    let action = f
-        .overlay
-        .resolve(&f.process, &chown(b"dir", Some(0), Some(0), true))
-        .unwrap();
     assert_eq!(
         f.overlay
-            .prepare(OperationId(Uuid::new_v4()), &action)
+            .resolve(&f.process, &chown(b"dir", Some(0), Some(0), true))
             .unwrap_err()
             .kind,
         ErrorKind::UnsupportedCapability
     );
+    // Nothing durable, and nothing to reconcile: no intent, no Commit, no Abort.
+    assert!(f.log.lock().unwrap().records.is_empty());
+    assert!(!f.shadow_root.join("dir").exists());
+    // The session is usable afterwards rather than poisoned, which is the whole
+    // point of refusing before prepare.
+    assert!(!f.overlay.poisoned);
+    assert!(matches!(
+        f.overlay.resolve(&f.process, &stat(b"dir/file")).unwrap(),
+        ResolvedAction::Rewrite(_)
+    ));
+    // A directory already in the shadow needs no copy-up, so it still chowns.
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"made"),
+        mode: 0o750,
+    });
+    let prepared = f.prepare(&chown(b"made", Some(501), Some(20), true));
+    assert!(matches!(prepared.action, ResolvedAction::Rewrite(_)));
+    f.complete(prepared);
+    assert!(matches!(
+        f.log
+            .lock()
+            .unwrap()
+            .records
+            .iter()
+            .find_map(|r| match &r.payload {
+                JournalPayload::Prepare { intent } => Some(intent.clone()),
+                _ => None,
+            }),
+        Some(JournalIntent::Create {
+            directory: true,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_kernel_rejected_chown_aborts_into_a_session_that_requires_reconciliation() {
+    // EPERM is the ordinary answer when an unprivileged tracee chowns to
+    // another uid. Because Fchownat is a Materialise operation, that routine
+    // failure takes the mutation abort path: the Abort is journaled, the
+    // session is poisoned and abort itself errors, which ends the run rather
+    // than handing the tracee its errno. Pinned here so the limitation is a
+    // recorded property rather than something discovered in a live run.
+    let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+    let prepared = f.prepare(&chown(b"file", Some(0), Some(0), true));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(Errno(1)))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::Cancelled)
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState
+    );
+    assert!(f.overlay.poisoned);
+    let payloads = f.log.lock().unwrap().records.clone();
+    assert!(matches!(
+        &payloads[0].payload,
+        JournalPayload::Prepare {
+            intent: JournalIntent::Chown { .. }
+        }
+    ));
+    assert!(matches!(
+        payloads[1].payload,
+        JournalPayload::ObservedResult { .. }
+    ));
+    assert!(matches!(payloads[2].payload, JournalPayload::Abort { .. }));
+    assert!(
+        !payloads
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Commit)),
+        "a failed chown must not commit"
+    );
+    // The copy-up is not rolled back, and abort does not claim it was: the
+    // shadow object stays, byte-identical to the base it came from.
+    assert_eq!(fs::read(f.shadow_root.join("file")).unwrap(), b"base bytes");
+    assert_eq!(fs::read(f.base_root.join("file")).unwrap(), b"base bytes");
 }

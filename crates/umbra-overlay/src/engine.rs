@@ -1046,6 +1046,22 @@ impl NamespaceResolver for Overlay {
                     ));
                 }
             }
+            // Refuse here rather than at prepare. `copy_up` rejects a base-only
+            // directory, but prepare appends and flushes the Chown intent before
+            // it runs, so reaching that failure would leave a durable record of
+            // an ownership change that never happened, with the session poisoned
+            // and neither Commit nor Abort written. A shadow directory is fine:
+            // copy_up returns early for anything already materialised. The
+            // condition mirrors `copy_up`'s own; prepare keeps its call as the
+            // backstop.
+            FsOp::Fchownat { .. } => {
+                let (stat, shadow) = existing
+                    .as_ref()
+                    .ok_or_else(|| error(ErrorKind::NotFound, "chown target absent"))?;
+                if !shadow && !matches!(stat.kind, ObjectKind::File | ObjectKind::LogicalSymlink) {
+                    return Err(unsupported("directory chown requires recursive copy-up"));
+                }
+            }
             FsOp::Rename { to_dir, to, .. } => {
                 let (stat, _) = existing
                     .as_ref()
@@ -1121,13 +1137,18 @@ impl NamespaceResolver for Overlay {
             FsOp::Rename { .. } if destination.as_ref() == Some(&path) => success(),
             // A logical symlink is a placeholder regular file in the shadow, so
             // a non-following probe must never reach it: the kernel would answer
-            // from the placeholder's own mode instead of the 0o777 the overlay
-            // reports for every logical symlink. At that mode every requested
-            // mode bit is granted, whichever identity the check uses.
-            FsOp::Access { .. }
-                if existing
-                    .as_ref()
-                    .is_some_and(|(s, _)| s.kind == ObjectKind::LogicalSymlink) =>
+            // from the placeholder's own mode instead of the 0o777 `logical_stat`
+            // substitutes for every logical symlink. At that mode every requested
+            // mode bit is granted, whichever identity the check uses, so this
+            // answer is also what a native `faccessat` on an `lrwxrwxrwx` link
+            // returns. `!flags.follow` is spelled out rather than left to the
+            // fact that a following probe resolves past the link: the guard
+            // should not depend on that invariant holding elsewhere.
+            FsOp::Access { flags, .. }
+                if !flags.follow
+                    && existing
+                        .as_ref()
+                        .is_some_and(|(s, _)| s.kind == ObjectKind::LogicalSymlink) =>
             {
                 success()
             }

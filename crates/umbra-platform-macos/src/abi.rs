@@ -893,8 +893,9 @@ mod tests {
             assert_eq!(
                 err.kind,
                 ErrorKind::UnsupportedCapability,
-                "syscall {number} flags {:#x}",
-                args[4].max(args[3])
+                "syscall {number} x3 {:#x} x4 {:#x}",
+                args[3],
+                args[4]
             );
         }
         // An access mode outside R_OK|W_OK|X_OK is a check this decode does not
