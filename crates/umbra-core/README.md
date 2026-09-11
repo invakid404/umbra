@@ -28,6 +28,7 @@ remote persistence. `StorageCapabilities::features` is the open extension point
 for narrowly qualified storage behavior, defaulting to empty so older encodings
 still decode and an absent name grants nothing. `FinishRunRequest`,
 `FinishRunReceipt` and `FailedRunRequest` describe the namespace run lifecycle,
+which `capabilities::NAMESPACE_RUN_LIFECYCLE_V1` names for the handshake,
 and `JournalLifecycle::RunCompleted` is the durable completion record for a fresh
 command run — not a checkpoint, and no authority for takeover. `OperationId::derive`
 mints distinct storage operation identities from one logical transaction, because

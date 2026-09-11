@@ -41,7 +41,13 @@ durability, requiring the storage descriptor to declare `mounted-nfsv4-v1`;
 are checked before any provider is started, and the provider handshake then
 rejects a connection whose backend does not actually advertise the name.
 `--strict-remote` is a deterministic `UnsupportedCapability` error: no storage
-provider qualifies strict remote durability.
+provider qualifies strict remote durability. A registry that configures a
+`namespace` role is refused the same way, whatever that descriptor declares: the
+supervisor does not yet route a run to a configured namespace provider, so
+`umbra run` cannot use one. `namespace-run-lifecycle-v1` names the capability such
+a provider will have to advertise; adding it to a descriptor changes the error
+message, not the outcome. Capabilities in a registry are operator-written claims,
+qualified by the provider handshake only for roles the run actually connects.
 
 Omitting `--agent` runs the trailing `--` arguments as a command; the executable
 argument must be absolute, because PATH is never searched. Under the required
@@ -84,7 +90,8 @@ diagnostic path, connecting platform, storage and journal, optionally connecting
 an agent when the registry declares one, and delegating
 standard namespace construction to `umbra-overlay`. A configured `namespace`
 provider replaces the standard engine there; `run` refuses one, because the
-namespace protocol has no run lifecycle.
+supervisor does not yet route a run to a configured namespace provider — see
+[Selecting a run](#selecting-a-run).
 
 `umbra providers --registry PATH [--role ROLE]` validates installed provider
 connections and starts trusted provider processes but no tracees. See
