@@ -897,6 +897,14 @@ mod tests {
                 args[3],
                 args[4]
             );
+            // decode_entry's `_` fallback returns this same kind, so the kind
+            // alone cannot tell "we modelled this flag and rejected it" from
+            // "we never modelled this syscall". Without this the test stays
+            // green even if the whole 466 or 468 arm is deleted.
+            assert!(
+                !err.context.contains("unclassified"),
+                "syscall {number} reached the unclassified fallback"
+            );
         }
         // An access mode outside R_OK|W_OK|X_OK is a check this decode does not
         // represent. Refusing beats silently narrowing it to the low three bits.
@@ -905,6 +913,10 @@ mod tests {
                 .decode_entry(&entry(466, [1, REL, mode, 0, 0]), &mut memory)
                 .unwrap_err();
             assert_eq!(err.kind, ErrorKind::UnsupportedCapability, "mode {mode:#x}");
+            assert!(
+                !err.context.contains("unclassified"),
+                "mode {mode:#x} reached the unclassified fallback"
+            );
         }
         // Only the low word is the callee's, so upper-half garbage in either
         // the mode or the flag register is not a refusal.

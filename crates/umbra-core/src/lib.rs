@@ -306,6 +306,12 @@ pub struct AccessMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessFlags {
     /// Check against the effective identity rather than the real one.
+    ///
+    /// No namespace reads this today, and that is deliberate rather than an
+    /// oversight: a rewrite replaces only the path operand, so the native flag
+    /// survives in its own register and the kernel honours it against the
+    /// rewritten path. A namespace that starts answering an access probe
+    /// without the kernel has to begin honouring this itself.
     pub effective_ids: bool,
     /// Follow.
     pub follow: bool,

@@ -1838,11 +1838,12 @@ impl Overlay {
                 to: logical(plan.destination.as_ref().unwrap())?,
             },
             // `object` is read before `prepare` copies up, so for a base-only
-            // target it is the base identity and the kernel chowns a shadow
-            // object with a different one. `path` is what stays resolvable across
-            // that change, and `copy_up` records that the materialisation
-            // happened at all — `Fchownat` is the only operation that both
-            // materialises and reports something other than `CopyUp`.
+            // target it is the base identity and the kernel may chown a shadow
+            // object with a different one — a copied-up file does get a new id,
+            // while a copied-up logical symlink keeps the base's. `path` is what
+            // stays resolvable either way, and `copy_up` records that the
+            // materialisation happened at all: `Fchownat` is the only operation
+            // that both materialises and reports something other than `CopyUp`.
             FsOp::Fchownat { uid, gid, .. } => JournalIntent::Chown {
                 object,
                 path,

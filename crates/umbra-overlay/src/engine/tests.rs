@@ -1674,6 +1674,35 @@ fn access_follows_a_logical_symlink_and_never_probes_its_placeholder() {
 }
 
 #[test]
+fn fchownat_follows_a_logical_symlink_to_the_object_it_owns() {
+    // `follow_final`'s `_ => false` default is nofollow, which is wrong for
+    // fchownat: POSIX follows unless AT_SYMLINK_NOFOLLOW is set. Losing the
+    // arm that says so would silently chown the link placeholder instead of its
+    // target, so pin the resolved path rather than trusting the comment.
+    let mut f = Fixture::new(&[(b"b/file", b"base")]);
+    f.run(&symlink(b"a/link", b"/b/file"));
+    let ResolvedAction::Rewrite(plan) = f
+        .overlay
+        .resolve(&f.process, &chown(b"a/link", Some(501), Some(20), true))
+        .unwrap()
+    else {
+        panic!("fchownat rewrite")
+    };
+    // The target's path, not the link's. Both are under the shadow root because
+    // a mutation always rewrites there, so the file name is what discriminates.
+    assert_eq!(native(&plan.paths[0].path.0), f.shadow_root.join("b/file"));
+    // lchown acts on the link itself, which is the placeholder.
+    let ResolvedAction::Rewrite(plan) = f
+        .overlay
+        .resolve(&f.process, &chown(b"a/link", Some(501), Some(20), false))
+        .unwrap()
+    else {
+        panic!("fchownat rewrite")
+    };
+    assert_eq!(native(&plan.paths[0].path.0), f.shadow_root.join("a/link"));
+}
+
+#[test]
 fn fchownat_journals_a_chown_intent_against_a_copied_up_object() {
     let mut f = Fixture::new(&[(b"nested/file", b"base bytes")]);
     // The journaled object is the one the namespace already knows about, so
@@ -1786,6 +1815,12 @@ fn a_base_only_directory_chown_is_refused_before_anything_is_journaled() {
     // would fail here, so refusing at resolve is what keeps the journal free of
     // an ownership change that never happened. `chown -R` over a base tree
     // reaches this on its first directory.
+    //
+    // What this pins is the *session*, not the run. Fchownat is Materialise, so
+    // the supervisor has no non-mutating NotFound resume to fall back on: the
+    // refusal below propagates and ends the run rather than reaching the tracee
+    // as an errno. The session staying usable is what keeps the journal
+    // reconcilable, not what keeps the tracee running.
     let mut f = Fixture::new(&[(b"dir/file", b"base")]);
     assert_eq!(
         f.overlay
@@ -1797,8 +1832,8 @@ fn a_base_only_directory_chown_is_refused_before_anything_is_journaled() {
     // Nothing durable, and nothing to reconcile: no intent, no Commit, no Abort.
     assert!(f.log.lock().unwrap().records.is_empty());
     assert!(!f.shadow_root.join("dir").exists());
-    // The session is usable afterwards rather than poisoned, which is the whole
-    // point of refusing before prepare.
+    // The overlay session is usable afterwards rather than poisoned, which is
+    // the whole point of refusing before prepare. The run still ends; see above.
     assert!(!f.overlay.poisoned);
     assert!(matches!(
         f.overlay.resolve(&f.process, &stat(b"dir/file")).unwrap(),
@@ -1870,6 +1905,72 @@ fn an_unchanged_id_chown_of_a_base_object_is_refused_rather_than_silently_re_own
     let prepared = f.prepare(&chown(b"file", None, None, true));
     assert!(matches!(prepared.action, ResolvedAction::Rewrite(_)));
     f.complete(prepared);
+}
+
+#[test]
+fn chowning_a_base_only_logical_symlink_copies_it_up_and_keeps_its_identity() {
+    // copy_up's LogicalSymlink branch runs only for a base-only object, and it
+    // re-creates the placeholder through create_symlink(.., stat.object_id),
+    // deliberately preserving the base identity. So copy_up: true with an
+    // *unchanged* object id is reachable — the one case where the journal
+    // record's object still names the object the kernel chowns.
+    let mut base = Fixture::new(&[]);
+    base.run(&open(
+        b"file",
+        OpenFlags {
+            create: true,
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    fs::write(base.shadow_root.join("file"), b"base bytes").unwrap();
+    base.run(&symlink(b"link", b"file"));
+    let id = base
+        .overlay
+        .stat(&root(b"link").unwrap(), false)
+        .unwrap()
+        .object_id;
+    let config = base.overlay.config().unwrap().clone();
+    let (storage, _) = base.overlay.into_backends();
+    let mut reader = config.context;
+    reader.writer_epoch = None;
+    let mut f = Fixture::new(&[]);
+    f.overlay.base = Some(Box::new(
+        StorageBase::new(storage, config.binding, reader).unwrap(),
+    ));
+    // The link exists only in the base, so nothing is in the shadow yet.
+    assert!(!f.shadow_root.join("link").exists());
+    assert_eq!(
+        f.overlay
+            .stat(&root(b"link").unwrap(), false)
+            .unwrap()
+            .object_id,
+        id
+    );
+    // lchown with both IDs set: allowed, and it enters the symlink copy-up.
+    let prepared = f.prepare(&chown(b"link", Some(501), Some(20), false));
+    assert!(fs::symlink_metadata(f.shadow_root.join("link"))
+        .unwrap()
+        .is_file());
+    f.complete(prepared);
+    // Identity and target both survive the materialisation.
+    assert_eq!(
+        f.overlay
+            .stat(&root(b"link").unwrap(), false)
+            .unwrap()
+            .object_id,
+        id
+    );
+    assert_eq!(
+        f.overlay.read_link(&root(b"link").unwrap()).unwrap(),
+        bytes(b"file")
+    );
+    let log = f.log.lock().unwrap().records.clone();
+    assert!(matches!(&log[0].payload,
+        JournalPayload::Prepare {
+            intent: JournalIntent::Chown { object: o, path, copy_up: true, .. }
+        }
+        if *o == id && path.as_bytes() == b"/link"));
 }
 
 #[test]

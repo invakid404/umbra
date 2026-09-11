@@ -77,10 +77,10 @@ new resolutions are blocked while a transaction is pending.
     `access(W_OK)` and still be writable through a later open, which copies it
     into a shadow object this run owns. The probe and the write disagree in that
     case.
-- `FsOp::Fchownat` copies the target up after a flushed `JournalIntent::Chown`
-  Prepare, then rewrites to the shadow so the kernel applies the ownership there
-  and never to the immutable base. Two shapes are refused at `resolve`, before
-  any journal record exists, rather than half-performed:
+- `FsOp::Fchownat` resolves to a shadow rewrite, then copies the target up after
+  a flushed `JournalIntent::Chown` Prepare, so the kernel applies the ownership
+  to the shadow object and never to the immutable base. Two shapes are refused at
+  `resolve`, before any journal record exists, rather than half-performed:
   - A **base-only** target with an unchanged-ID sentinel in either position.
     Copy-up recreates the object through `CreateOptions`, which carries `mode`
     but not uid/gid, so the shadow belongs to whoever runs umbra; the kernel then
@@ -95,11 +95,27 @@ new resolutions are blocked while a transaction is pending.
   - A **base-only directory**, because recursive directory copy-up is deferred.
     A directory already in the shadow needs no copy-up and chowns normally.
 
+  Refusing at `resolve` keeps the journal and the overlay session clean, but it
+  does **not** hand the tracee an errno: it ends the run. `Fchownat` is
+  `Materialise`, so `mutation` is true, and the supervisor's non-mutating
+  `NotFound` resume has no equivalent on the mutation path — every `resolve`
+  error propagates and marks the run recovery-required. That covers both
+  refusals above plus an absent target, and it is sharper than the `Access`
+  asymmetry noted above, which at least has a resume escape. The shapes ordinary
+  tooling reaches are not exotic: `chown -R` over a base tree meets the directory
+  refusal on its first directory, and `tar -x`, `cp -p`, `install -o` and `rsync`
+  routinely issue `chown(-1, gid)` or `chown(uid, -1)`, which is exactly the
+  sentinel shape. This is not a regression — before these operations were typed,
+  every `fchownat` ended the run at decode — but it is the current ceiling on how
+  useful mediated `fchownat` is, and lifting it needs ownership-preserving
+  copy-up.
+
   The journaled `JournalIntent::Chown` carries the logical path and a `copy_up`
   flag, not just an object id: `object` is read before copy-up, so for a base-only
-  target it names the base object while the kernel chowns a shadow object with a
-  different identity. The path stays resolvable across that change, for the same
-  reason `CopyUp` carries one.
+  target it names the pre-materialisation object. A copied-up file gets a new
+  identity, so `object` no longer locates what the kernel chowned; a copied-up
+  logical symlink keeps the base identity, so it still does. The path is what
+  stays resolvable in both cases, for the same reason `CopyUp` carries one.
 
   A chown the **kernel** rejects takes the mutation abort path: the `Abort` is
   journaled, the session is poisoned, and `abort` returns `InvalidState`, which
