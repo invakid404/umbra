@@ -957,7 +957,10 @@ mod validate_tests {
         );
         assert!(declared.context.contains("alt-namespace"), "{declared}");
 
-        // Declaring more than asked for is not a way around it either.
+        // Declaring more than asked for is not a way around it either. `kind` and
+        // `operation` are the same on both branches of the guard, so this case has
+        // to assert the routing message to prove it reached the second one rather
+        // than tripping the capability gate on its way past.
         let over_declared = validate(&with_namespace(&[
             caps::NAMESPACE_RUN_LIFECYCLE_V1,
             caps::STORAGE_LOCAL_DEVELOPMENT_V1,
@@ -966,5 +969,11 @@ mod validate_tests {
         .unwrap_err();
         assert_eq!(over_declared.kind, ErrorKind::UnsupportedCapability);
         assert_eq!(over_declared.operation, "run.capabilities");
+        assert!(
+            over_declared
+                .context
+                .contains("does not yet route a run to a configured namespace provider"),
+            "{over_declared}"
+        );
     }
 }

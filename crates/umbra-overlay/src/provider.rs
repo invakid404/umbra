@@ -523,9 +523,21 @@ mod tests {
 
     /// The wire codec is `umbra_core::provider::{encode, decode}` (serde_json);
     /// this repo has no second codec, so both directions are checked there.
+    ///
+    /// Both directions run through the same derived `Serialize`/`Deserialize`, so
+    /// between them they catch an *asymmetric* serde change and nothing else: a
+    /// symmetric one — renaming a field, reordering variants, retagging an enum —
+    /// stays green while breaking every out-of-tree peer. The golden literals below
+    /// are the defence against that, and they are the only bytes of this protocol
+    /// pinned anywhere in the repo. `PROTOCOL_VERSION` is not a second line of
+    /// defence here: it is frozen at 2 across this change, so a peer built against
+    /// an older crate still handshakes and then fails to decode.
+    ///
+    /// Update a literal only alongside a deliberate wire-format decision.
     #[test]
     fn lifecycle_wire_pairs_round_trip_and_re_encode_byte_identically() {
         let renew = wire::encode(&Request::RenewWriter).unwrap();
+        assert_eq!(renew, br#""RenewWriter""#);
         let Request::RenewWriter = wire::decode::<Request>(&renew).unwrap() else {
             panic!("RenewWriter decoded as another request");
         };
@@ -538,6 +550,10 @@ mod tests {
             request: finish_request(),
         })
         .unwrap();
+        assert_eq!(
+            finish,
+            br#"{"FinishRun":{"request":{"run_id":"00000000-0000-0000-0000-000000005150","root_status":{"Code":0},"processes_exited":3}}}"#
+        );
         let Request::FinishRun { request } = wire::decode::<Request>(&finish).unwrap() else {
             panic!("FinishRun decoded as another request");
         };
@@ -553,9 +569,15 @@ mod tests {
             request: finish_request_without_root(),
         })
         .unwrap();
+        // An absent root status is `null` on the wire, not an omitted key.
+        assert_eq!(
+            unlaunched,
+            br#"{"FinishRun":{"request":{"run_id":"00000000-0000-0000-0000-000000005150","root_status":null,"processes_exited":0}}}"#
+        );
         let Request::FinishRun { request } = wire::decode::<Request>(&unlaunched).unwrap() else {
             panic!("FinishRun decoded as another request");
         };
+        assert_eq!(request.run_id, finish_request_without_root().run_id);
         assert_eq!(request.root_status, None);
         assert_eq!(request.processes_exited, 0);
         assert_eq!(
@@ -567,6 +589,10 @@ mod tests {
             request: fail_request(),
         })
         .unwrap();
+        assert_eq!(
+            fail,
+            br#"{"FailRun":{"request":{"run_id":"00000000-0000-0000-0000-000000005150","reason":"tracee aborted","tree_terminated":true}}}"#
+        );
         let Request::FailRun { request } = wire::decode::<Request>(&fail).unwrap() else {
             panic!("FailRun decoded as another request");
         };
@@ -576,6 +602,10 @@ mod tests {
         assert_eq!(wire::encode(&Request::FailRun { request }).unwrap(), fail);
 
         let renewed = wire::encode(&Response::RenewWriter(lease())).unwrap();
+        assert_eq!(
+            renewed,
+            br#"{"RenewWriter":{"run_id":"00000000-0000-0000-0000-000000005150","writer_id":"writer-1","epoch":7,"renewal_token":[255,0,127],"renew_after_millis":30000}}"#
+        );
         let Response::RenewWriter(value) = wire::decode::<Response>(&renewed).unwrap() else {
             panic!("RenewWriter decoded as another response");
         };
@@ -586,6 +616,10 @@ mod tests {
         );
 
         let receipt = wire::encode(&Response::FinishRun(finish_receipt())).unwrap();
+        assert_eq!(
+            receipt,
+            br#"{"FinishRun":{"run_id":"00000000-0000-0000-0000-000000005150","durability":{"run_id":"00000000-0000-0000-0000-000000005150","writer_epoch":7,"scope":"EntireRun","durability":"Local","evidence":[99,108,105,101,110,116,45,102,115,121,110,99]},"completed_through":42}}"#
+        );
         let Response::FinishRun(value) = wire::decode::<Response>(&receipt).unwrap() else {
             panic!("FinishRun decoded as another response");
         };
@@ -595,6 +629,7 @@ mod tests {
         assert_eq!(wire::encode(&Response::FinishRun(value)).unwrap(), receipt);
 
         let failed = wire::encode(&Response::FailRun(())).unwrap();
+        assert_eq!(failed, br#"{"FailRun":null}"#);
         let Response::FailRun(value) = wire::decode::<Response>(&failed).unwrap() else {
             panic!("FailRun decoded as another response");
         };
@@ -667,10 +702,13 @@ mod tests {
                         operation_id: OperationId(Uuid::from_u128(9)),
                         sequence: Sequence(1),
                     })),
-                    // `FailRun` and `Abort` are both `(())`, so this is the
-                    // copy-paste a reader cannot see and the compiler accepts.
-                    Request::FinishRun { .. } => Ok(Response::Abort(())),
-                    Request::FailRun { .. } => Ok(Response::RenewWriter(lease())),
+                    Request::FinishRun { .. } => Ok(Response::RenewWriter(lease())),
+                    // `FailRun` is the one of the three whose payload has
+                    // `()`-carrying siblings — `Abort`, `ObserveResult`,
+                    // `SetReadLinkBuffer` — so its variant guard is the only thing
+                    // standing between a copy-paste and a wrong-method reply the
+                    // compiler accepts. Answer it with one of those siblings.
+                    Request::FailRun { .. } => Ok(Response::Abort(())),
                     _ => Err(protocol_error("unexpected request")),
                 },
             )
