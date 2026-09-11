@@ -1,0 +1,32 @@
+name: umbra-m1-transport-raw
+services:
+  # Service name is 'ganesha' so the composed container name is
+  # 'umbra-m1-transport-raw-ganesha', which the transport-raw test suite
+  # names via UMBRA_NFS_FIXTURE_CONTAINER for its restart cases.
+  ganesha:
+    build: .
+    image: umbra-nfs-ganesha-raw:local
+    hostname: umbra-m1-transport-raw
+    container_name: umbra-m1-transport-raw-ganesha
+    restart: unless-stopped
+    cap_add:
+      - DAC_READ_SEARCH
+    # Loopback only. Port 12105 (not 2049) so this coexists with any real
+    # NFS server on the host without collision.
+    ports:
+      - "127.0.0.1:12105:2049/tcp"
+    volumes:
+      - export-data:/export
+      - umbra-data:/umbra
+      - recovery-data:/var/lib/nfs/ganesha
+    healthcheck:
+      test: ["CMD", "python3", "/usr/local/bin/rpc-check.py", "127.0.0.1"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+      start_period: 5s
+    stop_grace_period: 30s
+volumes:
+  export-data:
+  umbra-data:
+  recovery-data:

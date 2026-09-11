@@ -679,6 +679,18 @@ need `--features transport-raw` and use one only when
 `UMBRA_NFS_RAW_FIXTURE=<host>:<port>` names it. They speak NFSv4.0 from user
 space and mount nothing.
 
+The [`experiments/nfs-raw/`](../../experiments/nfs-raw/) NFS-Ganesha container is
+the reference fixture for this suite. It exports two paths off the pseudo-root:
+`/export/{probe,pagedir}` (seeded with the files the fault-matrix and live-state
+cases open by name plus 120 entries for the paging case) and `/umbra/runs`
+(where the conformance and golden-compat suites create run directories). CI
+runs the whole raw-transport suite against it on `ubuntu-latest`, skipping
+`m1_conformance::the_namespace_mutations_the_hotfix_added_run_end_to_end`
+because Ganesha's VFS FSAL cannot report atomic REMOVE `change_info4`. The
+same test passes under the mounted adapter, which is why this skip is a
+fixture-capability gap and not code drift. Lifting it needs a Ganesha FSAL
+with atomic REMOVE, and is out of scope here.
+
 `tests/m1_conformance.rs` drives the provider through the public `Storage`
 contract over both backends, asserting which one answered. It covers admission
 before any binding is published, a second session denied by name, denial that

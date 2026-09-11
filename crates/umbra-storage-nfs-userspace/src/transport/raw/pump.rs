@@ -276,6 +276,35 @@ impl EventPump {
             ));
         }
 
+        // Disable libnfs's own PDU timeout. The pump enforces every
+        // per-call deadline itself in `service_until`, so libnfs's
+        // `rpc_timeout_scan` has nothing to add. What it does add,
+        // uncalibrated, is a bug: libnfs's `pdu_set_timeout` sets
+        // `pdu->major_timeout = now + rpc->timeout * rpc->retrans`, and
+        // the raw context defaults to `retrans = 0`. The result is that
+        // every PDU is created with `major_timeout` equal to the current
+        // instant, and the waitpdu scan's `t < pdu->major_timeout` check
+        // fails immediately. The scan is throttled to once per second,
+        // so rapid back-to-back calls miss it, but any call that follows
+        // more than a second of quiet trips it before the reply is read:
+        // libnfs then calls the completion callback with
+        // `RPC_STATUS_TIMEOUT` and a null message, and umbra's pump maps
+        // that to `Transport(Disconnected)` before the actual reply is
+        // observed. Passing `0` here makes `pdu_set_timeout` short-
+        // circuit to `pdu->timeout = 0`, which both scan loops in
+        // libnfs explicitly skip.
+        //
+        // `rpc_set_timeout` is exported by libnfs.a but only declared
+        // in `libnfs-private.h`, so bindgen (which reads only the public
+        // headers on purpose) does not emit it. Declare it locally with
+        // the same opaque `rpc_context` bindgen already generates.
+        // SAFETY: `rpc` is a live context this function owns; a zero
+        // timeout is documented as "never times out".
+        unsafe extern "C" {
+            fn rpc_set_timeout(rpc: *mut sys::rpc_context, timeout: c_int);
+        }
+        unsafe { rpc_set_timeout(rpc, 0) };
+
         // AUTH_SYS is the only authorised flavour. The host string is
         // informational; uid/gid come from the running process.
         let host = CString::new("umbra").expect("literal has no NUL");
