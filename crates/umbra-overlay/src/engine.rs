@@ -9,6 +9,13 @@ fn error(kind: ErrorKind, message: &str) -> UmbraError {
 fn unsupported(message: &str) -> UmbraError {
     error(ErrorKind::UnsupportedCapability, message)
 }
+/// Mode for a shadow directory with no base counterpart to inherit from: a
+/// control-anchored path, a whiteouted base ancestor, one the base does not
+/// hold, or one the base holds as something other than a directory. Shadow
+/// ancestors that *do* shadow a base directory carry its mode instead; see
+/// `Overlay::shadow_parent_mode`.
+const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
+
 fn absent<T>(result: Result<T>) -> Result<Option<T>> {
     match result {
         Ok(v) => Ok(Some(v)),
@@ -310,12 +317,16 @@ struct Pending {
     /// the run on the first write into any not-yet-shadowed base subdirectory —
     /// a large share of the ordinary `EPERM` cases
     /// [#53](https://github.com/invakid404/umbra/issues/53) exists to survive.
-    /// But materialising shadow ancestors is not free: `parents` gives them a
-    /// hardcoded `0o755` instead of the base directory's mode, so a base
-    /// directory at `0700` is reported as `0755` afterwards. That divergence
-    /// fires on the success path too — it is a fidelity defect in `parents`
-    /// ([#56](https://github.com/invakid404/umbra/issues/56)), not something this
-    /// flag is gating, and fixing it there removes the divergence on both paths.
+    /// Materialising shadow ancestors is still not nothing — they are new
+    /// objects in the shadow either way — but it is no longer *wrong*. `parents`
+    /// once gave every one of them a hardcoded `0o755` instead of the base
+    /// directory's mode, so a base directory at `0700` was answered as `0755`
+    /// afterwards, including after a syscall the tracee was told had failed. That
+    /// was a fidelity defect in `parents` rather than something this flag gated,
+    /// and it is fixed: `parents` carries the base directory's own mode onto the
+    /// shadow it materialises
+    /// ([#56](https://github.com/invakid404/umbra/issues/56)), on the success and
+    /// reconciled-abort paths alike.
     ///
     /// The predicate is shadow-shaped rather than logical; see `parents`.
     created: bool,
@@ -739,22 +750,30 @@ impl Overlay {
     /// Materialise the shadow parent directories of `path`, reporting whether any
     /// had to be created.
     ///
-    /// The answer is *shadow*-shaped, not logical: this consults `shadow_stat`
-    /// only and never the base, so an ancestor that already exists in the base but
+    /// The answer is *shadow*-shaped, not logical: `created` is decided by
+    /// `shadow_stat` alone, so an ancestor that already exists in the base but
     /// has not been copied up yet is reported as created. `Pending.created`
     /// inherits that over-approximation, which is why a refused cross-path rename
     /// onto a base-only destination parent poisons rather than reconciles — #53
-    /// under-delivers there. That is fail-closed, so it stays: narrowing the
-    /// predicate to consult the base would have to answer for the fact that the
-    /// directory created here does not carry the base directory's mode
-    /// ([#56](https://github.com/invakid404/umbra/issues/56)), and so is not
-    /// logically the same directory it shadows.
+    /// under-delivers there. That is fail-closed, so it stays — but no longer for
+    /// the reason it once did. The objection used to be that the directory
+    /// created here did not carry the base directory's mode, and so was not
+    /// logically the same directory it shadows; `shadow_parent_mode` now makes it
+    /// carry that mode ([#56](https://github.com/invakid404/umbra/issues/56)), so
+    /// that objection is spent. What still holds the predicate where it is: the
+    /// rollback a narrowed predicate would need is unimplemented
+    /// ([#55](https://github.com/invakid404/umbra/issues/55)), and until it
+    /// exists the over-approximation is the fail-closed side to be on.
+    ///
+    /// The base is consulted for the *mode* only. `created` never sees it, so the
+    /// predicate this function returns is unchanged in shape and in value.
     ///
     /// `create` discards the answer, so `copy_up` is not treated as a creation.
     /// See `Pending.created` for why, and for the asymmetry that leaves.
     fn parents(&mut self, path: &StoragePath) -> Result<bool> {
         let parts: Vec<_> = path.as_bytes().split(|b| *b == b'/').collect();
         let mut created = false;
+        let mut hidden = false;
         for n in 1..parts.len() {
             let parent = StoragePath::new(path.anchor(), parts[..n].join(&b'/'))?;
             if let Some(stat) = self.shadow_stat(&parent)? {
@@ -765,19 +784,75 @@ impl Overlay {
                     ));
                 }
             } else {
+                let mode = self.shadow_parent_mode(&parent, &mut hidden)?;
                 let context = self.context()?;
                 self.storage.create(
                     &context,
                     &parent,
                     &CreateOptions {
                         kind: CreateKind::Directory,
-                        mode: 0o755,
+                        mode,
                     },
                 )?;
                 created = true;
             }
         }
         Ok(created)
+    }
+    /// The mode to materialise one missing shadow ancestor with: the mode of the
+    /// base directory it shadows, or `DEFAULT_DIRECTORY_MODE` when there is no
+    /// base directory it can be said to shadow.
+    ///
+    /// `hidden` latches across one `parents` walk: once a prefix is whiteouted
+    /// every deeper one is too, so the marker probe stops after the first hit.
+    fn shadow_parent_mode(&mut self, parent: &StoragePath, hidden: &mut bool) -> Result<u32> {
+        // `Base` is Root-anchored only — `lookup` answers `Denied` for anything
+        // else — and `write_control` and `set_whiteout` drive this walk over
+        // Control paths for symlink blobs and whiteout markers. Those ancestors
+        // shadow nothing, so there is nothing to ask the base about.
+        if parent.anchor() != StorageAnchor::Root {
+            return Ok(DEFAULT_DIRECTORY_MODE);
+        }
+        // Ordering: `context()` goes through `config()`, and `bind` sets `config`
+        // and `base` in the same call, so reaching past this proves `base()`'s
+        // `expect("bound base")` cannot fire.
+        let context = self.context()?;
+        if !*hidden {
+            // Probe the marker directly rather than calling `whiteouted`, which
+            // latches `self.whiteout_hit` — the latch `hidden_or` consumes to turn
+            // a later NotFound into Deny(ENOENT) (#49/#54). This walk runs from
+            // `prepare` and `commit`, after resolve has returned, so a latch set
+            // here outlives the operation that set it. Today `resolve` clears the
+            // latch on entry and would mask that, but the guarantee #49 rests on
+            // is "only a real whiteout lookup latches", not the order two
+            // unrelated functions happen to run in. Keep the probe non-latching so
+            // it holds without that coincidence.
+            let marker = Self::marker(parent)?;
+            *hidden = absent(self.storage.stat(&context, &marker))?.is_some();
+        }
+        // A whiteouted base directory is logically deleted. The shadow directory
+        // materialised over its grave is a new directory, not that one, and must
+        // not wear its mode.
+        if *hidden {
+            return Ok(DEFAULT_DIRECTORY_MODE);
+        }
+        match self.base().stat(parent) {
+            // `LocalStorage` rejects `mode & !0o7777` outright, and setgid and
+            // sticky are part of the directory's identity, so mask rather than
+            // truncate to the permission bits.
+            Ok(stat) if stat.kind == ObjectKind::Directory => Ok(stat.mode & 0o7777),
+            // Never inherit a file's or a symlink's mode onto a directory.
+            Ok(_) => Ok(DEFAULT_DIRECTORY_MODE),
+            // Deliberate swallow, not an oversight. This path never touched the
+            // base at all before #56, so propagating a base error out of `parents`
+            // would turn creates that succeed today into hard failures — and
+            // `parents` runs inside `commit`, where a failure poisons the run and
+            // takes #53/#59's kernel-refusal reconciliation down with it.
+            // Swallowing costs one directory's mode fidelity; propagating costs
+            // the run. NotFound is the ordinary case here (a shadow ancestor with
+            // no base counterpart at all) and is not an error worth reporting.
+            Err(_) => Ok(DEFAULT_DIRECTORY_MODE),
+        }
     }
     fn create(&mut self, path: &StoragePath, kind: CreateKind, mode: u32) -> Result<()> {
         self.parents(path)?;

@@ -210,16 +210,28 @@ refused write open on an object the base already holds, reconciles. The content
 view is unchanged, and counting it would poison the run on the first write into
 any not-yet-shadowed base subdirectory — a large share of the ordinary `EPERM`
 cases this contract exists to survive. That is **not** a claim that copy-up is
-invisible: materialising shadow ancestors gives them a hardcoded `0o755` rather
-than the base directory's mode, so a base directory at `0700` is reported as
-`0755` afterwards, including after a syscall the tracee was told had failed. That
-divergence also fires on the success path, so it is a fidelity defect in
-`parents` rather than a property of this contract, and it is tracked in
-[#56](https://github.com/invakid404/umbra/issues/56). Note also that `created` is
-shadow-shaped: `parents` consults the shadow only, so a cross-path `rename` onto
-a destination parent that exists in the base but has not been copied up yet is
-counted as a creation and poisons. That is fail-closed and under-delivers for
-`rename`; the same issue covers it.
+invisible: it materialises shadow ancestors, and those are new objects in the
+shadow whether or not the operation that needed them was allowed to stand. What
+they are no longer is *wrong*: `parents` used to give every one of them a
+hardcoded `0o755` rather than the base directory's mode, so a base directory at
+`0700` was reported as `0755` afterwards, including after a syscall the tracee
+was told had failed. That was a fidelity defect in `parents` rather than a
+property of this contract, and it is fixed
+([#56](https://github.com/invakid404/umbra/issues/56)): a shadow ancestor now
+carries the mode of the base directory it shadows, on the success path and the
+reconciled-abort path alike. A Control-anchored ancestor — a symlink blob, a
+whiteout marker — shadows nothing and keeps the default, and so does one whose
+base counterpart is whiteouted, since a whiteouted directory is logically deleted
+and its replacement is not the same directory.
+
+Note separately that `created` is shadow-shaped: `parents` decides it from the
+shadow only, so a cross-path `rename` onto a destination parent that exists in
+the base but has not been copied up yet is counted as a creation and poisons.
+That is fail-closed and under-delivers for `rename`. #56 removed one of the two
+arguments for leaving it that way — the shadow ancestor really is the directory
+it shadows now — but not the other: narrowing the predicate needs the creation
+rollback [#55](https://github.com/invakid404/umbra/issues/55) tracks and this MVP
+does not implement, so the over-approximation stays until that lands.
 
 Commit-time effects are never applied by `abort`: `pending.whiteouts` and
 `retired_index` are consumed in `commit` alone, so a reconciled `rename` sets no
@@ -331,11 +343,15 @@ restriction. This is an executable regular-file MVP, not complete POSIX coverage
 
 Run `cargo test -p umbra-overlay`. Tests inject real `umbra-storage-local` base and
 shadow runs, with no NFS or fixture environment variables. They exercise copy-up,
-shadow/stat precedence, create parents, whiteouts and recreation, merged snapshot
-pages, native-encoder continuation, rename journal grouping, containment, non-UTF-8
+shadow/stat precedence, create parents, the mode a materialised shadow ancestor
+takes from its base counterpart, whiteouts and recreation, merged snapshot pages,
+native-encoder continuation, rename journal grouping, containment, non-UTF-8
 bytes, logical symlink creation/readlink/traversal, absolute and relative targets,
 loop bounds, symlink escape and unchecked physical-link rejection, rename identity,
 base symlink copy-up, journal failures, transaction ordering and checkpoints.
+Mode assertions are made against the mode the engine *requests*, through a
+recording `Storage` wrapper, because `mkdir(2)` applies the process umask to what
+lands on disk; the on-disk checks alongside them account for the measured umask.
 APFS configurations that reject non-UTF-8 filenames still run byte resolver and
 marker checks; actual raw-name filesystem I/O is conditional on native support.
 
