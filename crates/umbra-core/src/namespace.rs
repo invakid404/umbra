@@ -46,7 +46,10 @@ pub enum AbortReason {
     /// It is a licence to reconcile, not an instruction to. A namespace that
     /// cannot account for the transaction's effects must still refuse — an abort
     /// does not roll anything back, so a preparation that materialised an object
-    /// which did not previously exist stays fatal whatever the kernel said.
+    /// which did not previously exist stays fatal whatever the kernel said. That
+    /// is the obligation, not a predicate: a namespace may discharge it with a
+    /// conservative approximation that refuses more often than strictly needed,
+    /// and the overlay does.
     ///
     /// Every other variant means the *interception* broke down — the effects a
     /// mutating `prepare` already applied are unaccounted for — and keeps the

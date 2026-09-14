@@ -78,8 +78,8 @@ needed there, because the rewritten syscall actually executed.
 Any failure in that chain poisons the run: nothing resumes afterwards — including
 an abort the namespace refuses to reconcile, which is its verdict to give and not
 an error the supervisor may swallow. That refusal is reached today when the
-refused syscall's preparation had materialised an object that did not previously
-exist, such as a creating open, since nothing rolls that back
+refused syscall's preparation had to create a shadow object that was not there
+before — a creating open is the reachable case — since nothing rolls that back
 ([#55](https://github.com/invakid404/umbra/issues/55)). A `Deny`, reached only for
 a whiteout-hidden non-mutating path, is answered here without
 minting an operation: the supervisor asks the platform to emulate its errno, which

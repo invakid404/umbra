@@ -2070,8 +2070,11 @@ fn a_kernel_rejected_chown_reconciles_and_leaves_the_session_usable() {
         "a failed chown must not commit"
     );
     // The copy-up is not rolled back, and abort does not claim it was: the
-    // shadow object stays, byte-identical to the base it came from, so the
-    // logical view is unchanged and continuing is safe.
+    // shadow object stays, carrying the base's bytes. `file` is at the root, so
+    // `copy_up` materialised no ancestors here; under a not-yet-shadowed base
+    // directory it would also have conjured one at `0o755` (#56). Copy-up is
+    // uncounted by choice, not because it changes nothing -- see
+    // `Pending.created`.
     assert_eq!(fs::read(f.shadow_root.join("file")).unwrap(), b"base bytes");
     assert_eq!(fs::read(f.base_root.join("file")).unwrap(), b"base bytes");
     // The run continues: a reconciled session still serves reads and still
@@ -2197,9 +2200,10 @@ fn a_kernel_rejected_write_open_reconciles_and_the_session_keeps_serving_reads()
 // invisible to CI.
 #[test]
 fn a_refused_creating_open_poisons_while_a_refused_copy_up_open_reconciles() {
-    // Copy-up side. The object already existed in the base, so `prepare` only
-    // put a byte-identical duplicate in the shadow: the logical view is the same
-    // before and after, and the transaction is reconcilable.
+    // Copy-up side. The base already holds the object, so `prepare` duplicated
+    // it into the shadow instead of creating it, and the transaction is
+    // reconcilable. A root-level path, so no ancestors were materialised
+    // either; `Pending.created` records what copy-up does still change.
     let mut f = Fixture::new(&[(b"existing", b"base bytes")]);
     let prepared = f.prepare(&open(
         b"existing",

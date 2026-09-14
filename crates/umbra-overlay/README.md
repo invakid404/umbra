@@ -233,12 +233,17 @@ stands in `umbra-supervisor` today, is refused before the tracee ever reaches a
 syscall exit — a fact owned by that crate, not this one. The reachable surface
 today is a write-mode `Open` and `FsOp::Fchownat`. The behaviour is keyed on the
 dispatch class, not on a variant list, so the rest of the class inherits it as
-those paths are wired — with one exception to settle first: `Unlink`'s `prepare`
-*destroys* the shadow object outright, and `FsOp::Link` will materialise a new
-name through the `_ => {}` arm, so neither sets `created` and the gate has no
-counterpart for them. Whoever wires those paths has to revisit it rather than
-assume the inheritance; noted on
-[#57](https://github.com/invakid404/umbra/issues/57).
+those paths are wired — with two caveats to settle first. `Unlink`'s `prepare`
+*destroys* the shadow object outright and sets no `created`, so a `Whiteout`-class
+refusal reaching `abort` would reconcile after discarding shadow-only data: the
+mirror image of the creation case, and a real gap in the gate rather than a
+question of wiring. `FsOp::Link` is a different shape — `resolve` refuses it as
+beyond-MVP, so `prepare` is never entered for it and the `_ => {}` arm it would
+fall to materialises nothing; when it *is* wired it will need an arm of its own
+doing `copy_up` of the source and `parents` of the destination, exactly as
+`rename` does, and that is where setting `created` is easy to forget. Whoever
+wires either path has to revisit the gate rather than assume the inheritance;
+noted on [#57](https://github.com/invakid404/umbra/issues/57).
 
 Checkpoint flushes storage and journal, takes whiteouts from authoritative control
 markers, and publishes a logical checkpoint with `clean: false`. Only the

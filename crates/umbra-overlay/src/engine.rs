@@ -310,8 +310,8 @@ struct Pending {
     /// the run on the first write into any not-yet-shadowed base subdirectory —
     /// a large share of the ordinary `EPERM` cases
     /// [#53](https://github.com/invakid404/umbra/issues/53) exists to survive.
-    /// But materialising shadow ancestors does change one thing: `parents` gives
-    /// them a hardcoded `0o755` instead of the base directory's mode, so a base
+    /// But materialising shadow ancestors is not free: `parents` gives them a
+    /// hardcoded `0o755` instead of the base directory's mode, so a base
     /// directory at `0700` is reported as `0755` afterwards. That divergence
     /// fires on the success path too — it is a fidelity defect in `parents`
     /// ([#56](https://github.com/invakid404/umbra/issues/56)), not something this
@@ -1501,8 +1501,10 @@ impl NamespaceSession for Overlay {
                     if destination != &plan.path {
                         self.copy_up(&plan.path)?;
                         // Only parents this call had to create count: renaming
-                        // into a directory that already existed materialises
-                        // nothing and stays reconcilable.
+                        // into a directory that is already in the shadow
+                        // materialises nothing and stays reconcilable. A
+                        // base-only parent is counted as created - see
+                        // `parents`.
                         if self.parents(destination)? {
                             self.pending.as_mut().unwrap().created = true;
                         }
@@ -1639,10 +1641,11 @@ impl NamespaceSession for Overlay {
         // the poison path below. Every other reason means the interception broke
         // down and keeps the poison-and-error behaviour unchanged; the two modes
         // never merge.
-        // Reconciling does not undo what `prepare` did. Copy-up is benign - the
-        // shadow object is byte-identical to the base - but a plan that
-        // materialised something new leaves a path the tracee was told does not
-        // exist, so it stays on the poison path until rollback exists.
+        // Reconciling does not undo what `prepare` did. A plan that created a
+        // shadow object leaves a path the tracee was told does not exist, so it
+        // stays on the poison path until rollback exists. Copy-up is
+        // deliberately not counted - see `Pending.created` for why, and for what
+        // it does change.
         let kernel_refused = !pending.created
             && matches!(
                 (reason, &pending.outcome),
