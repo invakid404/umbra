@@ -308,13 +308,21 @@ of passing on timing.
 
 `dirfd-rename` and `symlink-cycle` do not use the redirect harness above. It binds a real
 `umbra-storage-local` shadow run, an approved empty immutable base and a
-recording journal, and drives every operation the case performs through the
-overlay transaction flow: `resolve` → `prepare` → apply the rewrite or the
-emulated result → `observe_result` → `commit` or `abort`. Directory opens that
-succeed are tracked into `ProcessContext.fds` with the logical path and the
-object identity the overlay reports, which is what lets a later `DirRef::Fd`
-resolve. A refused resolution is translated to an errno and emulated, because
-the case deliberately looks up a name the rename removed. dyld and library
+recording journal, and drives each operation the case performs through the
+overlay transaction flow: `resolve`, then, for an action that plans one,
+`prepare` → apply the rewrite or the emulated result → `observe_result` →
+`commit` or `abort`. Directory opens that succeed are tracked into
+`ProcessContext.fds` with the logical path and the object identity the overlay
+reports, which is what lets a later `DirRef::Fd` resolve. The case deliberately
+looks up a name the rename removed: that path is whiteouted, so the overlay
+resolves it to `Deny(ENOENT)`, which mints no operation. Like the supervisor,
+the harness emulates that errno and resumes without preparing. A resolution that
+instead fails with an error is handled by shape, mirroring the supervisor: a
+non-mutating `NotFound` is resumed unrewritten (with the host as base the kernel
+yields the same ENOENT), while a mutating `NotFound` or any other refusal is
+translated to its errno and emulated. Gating the passthrough on `!mutation`
+matters — resuming a mutating call unrewritten would touch the host.
+dyld and library
 startup reads are left pointing at the host, unrewritten — the bound base is
 empty, so the tracee could not otherwise start; that carve-out is by logical
 root and tracked descriptor, and is a property of the test harness, not of the

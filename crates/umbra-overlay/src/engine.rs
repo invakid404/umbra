@@ -317,6 +317,18 @@ pub struct Overlay {
     used_operations: BTreeSet<OperationId>,
     readlink_buffer: Option<(u64, u32)>,
     stat_encoder: Option<Box<dyn StatEncoder>>,
+    /// Set by `whiteouted()` whenever a marker hid a component during the current
+    /// `resolve`. Reset at the top of every `resolve`, read only inside that same
+    /// call, through `hidden_or`. It is the difference between "the namespace
+    /// knows nothing is here" (resuming the tracee's own syscall is equivalent)
+    /// and "the namespace deliberately hides a base object that still exists on
+    /// the host" (resuming would reveal it — #49). `lookup()` consults
+    /// `whiteouted()` only when the shadow has no object, so a set latch during a
+    /// resolve that ends NotFound-shaped means a whiteout is why. A resolve that
+    /// touches a whiteout yet still succeeds leaves it set but unread until the
+    /// next reset. Stale sets from lookups outside `resolve` are harmless: the
+    /// reset precedes every read.
+    whiteout_hit: bool,
 }
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 impl Overlay {
@@ -340,6 +352,7 @@ impl Overlay {
             used_operations: BTreeSet::new(),
             readlink_buffer: None,
             stat_encoder: None,
+            whiteout_hit: false,
         }
     }
     /// Report the injected storage capabilities without claiming qualification.
@@ -419,10 +432,30 @@ impl Overlay {
             let marker = Self::marker(&prefix)?;
             let context = self.context()?;
             if absent(self.storage.stat(&context, &marker))?.is_some() {
+                // Latch here, the one place a whiteout is ever detected, so no
+                // NotFound-shaped resolve — final component or whiteouted
+                // ancestor — can miss that a marker is the reason. See the field
+                // comment and `hidden_or`.
+                self.whiteout_hit = true;
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+    /// A `NotFound` the overlay produced *because a whiteout hides a base object*
+    /// is a decision, not a failed lookup: the base object is still on the host,
+    /// so handing the error to the supervisor makes it resume the tracee's own
+    /// unrewritten syscall and reveal the file (#49). Deny it with ENOENT instead.
+    /// A truly-absent NotFound keeps the error, whose resume is equivalent to the
+    /// answer the namespace predicts because the base *is* the host filesystem.
+    /// Mutating operations are untouched: they have no resume escape in the
+    /// supervisor and every resolve error already ends the run, so the `!mutation`
+    /// guard is what confines this to the non-mutating path.
+    fn hidden_or(&self, e: UmbraError, mutation: bool) -> Result<ResolvedAction> {
+        if !mutation && e.kind == ErrorKind::NotFound && self.whiteout_hit {
+            return Ok(ResolvedAction::Deny(Errno::ENOENT));
+        }
+        Err(e)
     }
     fn lookup(&mut self, path: &StoragePath) -> Result<(BlobStat, bool)> {
         if path.anchor() != StorageAnchor::Root {
@@ -943,6 +976,7 @@ impl NamespaceResolver for Overlay {
     fn resolve(&mut self, context: &ProcessContext, operation: &FsOp) -> Result<ResolvedAction> {
         self.idle()?;
         self.planned = None;
+        self.whiteout_hit = false;
         if let FsOp::ReadDir { fd, max_bytes } = operation {
             return self.resolve_directory(context, operation, *fd, *max_bytes);
         }
@@ -982,12 +1016,20 @@ impl NamespaceResolver for Overlay {
             FsOp::Fchownat { flags, .. } => flags.follow,
             _ => false,
         };
-        let path = self.resolve_path_follow(context, dir, name, create_parents, follow_final)?;
-        let existing = absent(self.lookup(&path))?;
+        // Hoisted above path resolution so the traversal-failure path can consult
+        // it: a whiteouted ancestor makes `resolve_path_follow` itself fail with
+        // NotFound before the final-component lookup runs. Depends only on
+        // `operation`, so this is a pure move.
         let mutation = matches!(
             super::dispatch(operation),
             super::Dispatch::Materialise | super::Dispatch::Whiteout
         );
+        let path = match self.resolve_path_follow(context, dir, name, create_parents, follow_final)
+        {
+            Ok(path) => path,
+            Err(e) => return self.hidden_or(e, mutation),
+        };
+        let existing = absent(self.lookup(&path))?;
         if mutation && path.as_bytes().is_empty() {
             return Err(error(ErrorKind::Denied, "cannot mutate namespace root"));
         }
@@ -995,7 +1037,8 @@ impl NamespaceResolver for Overlay {
         match operation {
             FsOp::Open { flags, .. } => {
                 if existing.is_none() && !flags.create {
-                    return Err(error(ErrorKind::NotFound, "open target absent"));
+                    return self
+                        .hidden_or(error(ErrorKind::NotFound, "open target absent"), mutation);
                 }
                 if existing.is_some() && flags.create && flags.exclusive {
                     return Err(error(
@@ -1103,7 +1146,7 @@ impl NamespaceResolver for Overlay {
             }
             _ => {
                 if existing.is_none() {
-                    return Err(error(ErrorKind::NotFound, "target absent"));
+                    return self.hidden_or(error(ErrorKind::NotFound, "target absent"), mutation);
                 }
             }
         }

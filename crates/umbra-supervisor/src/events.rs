@@ -13,9 +13,9 @@
 use std::time::{Duration, Instant};
 
 use umbra_core::{
-    AbortReason, ErrorKind, ExitStatus, FsOp, LaunchSpec, OperationId, OperationOutcome,
-    ProcessContext, ProcessHandle, ResolvedAction, Result, ResumeCommand, ResumeMode, TaskId,
-    TerminationPolicy, ThreadId, TraceEvent, UmbraError,
+    AbortReason, EmulatedResult, ErrorKind, ExitStatus, FsOp, LaunchSpec, OperationId,
+    OperationOutcome, ProcessContext, ProcessHandle, ResolvedAction, Result, ResumeCommand,
+    ResumeMode, TaskId, TerminationPolicy, ThreadId, TraceEvent, UmbraError,
 };
 use umbra_platform::{TraceControl, TraceMemory};
 use uuid::Uuid;
@@ -282,6 +282,29 @@ impl Supervisor {
             }
             Err(e) => return Err(e),
         };
+        // A denial executes no syscall, touches no storage and mutates nothing, so
+        // it needs no journaled preparation and no operation slot: answer the
+        // tracee here, before minting an OperationId. This is only reachable for a
+        // whiteout-hidden non-mutating path; every other NotFound still resumes the
+        // tracee's own syscall in the resolve arm above.
+        if let ResolvedAction::Deny(errno) = action {
+            let result = EmulatedResult {
+                outcome: OperationOutcome::Failure(errno),
+                memory_writes: vec![],
+            };
+            // The backend must skip the trapped syscall, not merely rewrite its
+            // return registers. On Darwin arm64 the entry stop is the `svc` itself
+            // and `emulate_result` steps PC past it; a backend that cannot do this
+            // (the Linux stub's `emulate_result` returns an error) fails closed
+            // here rather than resuming the call it was told to refuse.
+            self.platform.abi.emulate_result(&mut registers, &result)?;
+            self.service_renewal()?;
+            return self
+                .platform
+                .control
+                .set_registers(thread, &registers)
+                .and_then(|()| self.resume_thread(thread));
+        }
         let id = OperationId(Uuid::new_v4());
         self.service_renewal()?;
         let prepared = self.namespace.prepare(id, &action)?;
@@ -292,14 +315,15 @@ impl Supervisor {
                 self.resume_thread(thread)
             }
             ResolvedAction::AllowBaseRead => self.resume_thread(thread),
-            // Denial and emulation both require the platform to skip the original
-            // trap. Rewriting return registers alone would resume the very syscall
-            // the namespace refused, so this fails closed instead.
+            // Emulation still requires the platform to skip the original trap.
+            // Rewriting return registers alone would resume the very syscall the
+            // namespace refused, so this fails closed. The emulated-result paths
+            // (`ReadLink`, logical-symlink `Stat`) are a separate wiring gap, not
+            // #49; `Deny` is handled above and never reaches here.
             ResolvedAction::Deny(_) | ResolvedAction::Emulate(_) => Err(error(
                 ErrorKind::UnsupportedCapability,
                 "supervisor.syscall_entry",
-                "safe syscall emulation is not implemented; the platform contract \
-                 has no way to skip a trapped syscall without executing it",
+                "safe syscall emulation is not implemented for this action",
             )),
         }
     }
@@ -714,5 +738,257 @@ mod tests {
             memory.read(0, &mut [0]).unwrap_err().kind,
             ErrorKind::LeaseLost
         );
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    // What the platform was asked to do, in order, so a test can pin both the
+    // emulated value and that registers were installed before the thread ran.
+    enum Recorded {
+        Emulate(EmulatedResult),
+        SetRegisters(ThreadId),
+        Resume(ResumeCommand),
+    }
+    #[derive(Default)]
+    struct Recording {
+        events: Vec<Recorded>,
+    }
+    impl Recording {
+        fn order(&self) -> Vec<&'static str> {
+            self.events
+                .iter()
+                .map(|e| match e {
+                    Recorded::Emulate(_) => "emulate",
+                    Recorded::SetRegisters(_) => "set_registers",
+                    Recorded::Resume(_) => "resume",
+                })
+                .collect()
+        }
+        fn emulated(&self) -> Vec<EmulatedResult> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    Recorded::Emulate(r) => Some(r.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn set_register_threads(&self) -> Vec<ThreadId> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    Recorded::SetRegisters(t) => Some(*t),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn resumes(&self) -> Vec<ResumeCommand> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    Recorded::Resume(c) => Some(c.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    // A platform double that records what the supervisor drives it to do. Its
+    // `decode_entry` returns a fixed `FsOp`, so no real register decoding is
+    // needed; every other unused entry point is `unreachable!`.
+    struct Recorder {
+        op: FsOp,
+        log: Arc<Mutex<Recording>>,
+    }
+    impl TraceBackend for Recorder {
+        fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
+            unreachable!()
+        }
+        fn next_event(&mut self) -> Result<TraceEvent> {
+            unreachable!()
+        }
+        fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
+            unreachable!()
+        }
+        fn set_registers(&mut self, thread: ThreadId, _: &RegisterSet) -> Result<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .events
+                .push(Recorded::SetRegisters(thread));
+            Ok(())
+        }
+        fn resume(&mut self, command: ResumeCommand) -> Result<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .events
+                .push(Recorded::Resume(command));
+            Ok(())
+        }
+    }
+    impl TraceControl for Recorder {
+        fn capabilities(&self) -> PlatformCapabilities {
+            PlatformCapabilities::default()
+        }
+        fn quiesce(&mut self, _: ProcessHandle) -> Result<QuiescedTree> {
+            unreachable!()
+        }
+        fn terminate(&mut self, _: ProcessHandle, _: TerminationPolicy) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl SyscallAbi for Recorder {
+        fn decode_entry(&self, _: &RegisterSet, _: &mut dyn TraceMemory) -> Result<Option<FsOp>> {
+            Ok(Some(self.op.clone()))
+        }
+        fn apply_rewrite(&self, _: &mut RegisterSet, _: &PreparedRewrite) -> Result<()> {
+            unreachable!()
+        }
+        fn emulate_result(&self, _: &mut RegisterSet, result: &EmulatedResult) -> Result<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .events
+                .push(Recorded::Emulate(result.clone()));
+            Ok(())
+        }
+    }
+
+    // A namespace double that answers `resolve` with a scripted result. Every
+    // journaled entry point panics: a denial or a resumed passthrough must never
+    // mint an operation, so reaching one is the bug the tests guard against.
+    struct Scripted {
+        answer: Result<ResolvedAction>,
+    }
+    impl NamespaceResolver for Scripted {
+        fn resolve(&mut self, _: &ProcessContext, _: &FsOp) -> Result<ResolvedAction> {
+            self.answer.clone()
+        }
+    }
+    impl NamespaceSession for Scripted {
+        fn prepare(&mut self, _: OperationId, _: &ResolvedAction) -> Result<PreparedAction> {
+            panic!("a denial or passthrough must not reach journaled preparation")
+        }
+        fn observe_result(&mut self, _: OperationId, _: &OperationOutcome) -> Result<()> {
+            panic!("no operation was minted to observe")
+        }
+        fn commit(&mut self, _: OperationId) -> Result<CommitReceipt> {
+            panic!("no operation was minted to commit")
+        }
+        fn abort(&mut self, _: OperationId, _: &AbortReason) -> Result<()> {
+            panic!("no operation was minted to abort")
+        }
+        fn checkpoint(&mut self, _: &CheckpointRequest) -> Result<Checkpoint> {
+            unreachable!()
+        }
+        fn renew_writer(&mut self) -> Result<WriterLease> {
+            unreachable!()
+        }
+    }
+
+    fn scripted_supervisor(
+        op: FsOp,
+        answer: Result<ResolvedAction>,
+    ) -> (Supervisor, Arc<Mutex<Recording>>) {
+        let log = Arc::new(Mutex::new(Recording::default()));
+        let mut s = Supervisor::with_namespace(
+            RunId(Uuid::new_v4()),
+            PlatformSession {
+                control: Box::new(Recorder {
+                    op: op.clone(),
+                    log: log.clone(),
+                }),
+                abi: Box::new(Recorder {
+                    op,
+                    log: log.clone(),
+                }),
+            },
+            Box::new(Scripted { answer }),
+            None,
+        );
+        s.track_process(task(1), None);
+        s.state.processes.root = Some(ProcessHandle(task(1)));
+        s.live = 1;
+        s.state.lifecycle = RunLifecycle::Running;
+        (s, log)
+    }
+
+    // A non-mutating `Stat` (dispatch => ReadThrough); (a) and (b) differ only in
+    // the scripted resolve answer.
+    fn stat_entry() -> (FsOp, TraceEvent) {
+        let op = FsOp::Stat {
+            dir: DirRef::Cwd,
+            path: BytePath::new(b"/probe".to_vec()).unwrap(),
+            follow: true,
+        };
+        let event = TraceEvent::SyscallEntry {
+            task: task(1),
+            thread: ThreadId(task(1).0),
+            registers: RegisterSet::new(Architecture::Aarch64, vec![]).unwrap(),
+        };
+        (op, event)
+    }
+
+    #[test]
+    fn absent_not_found_still_resumes_the_tracees_own_syscall() {
+        let (op, event) = stat_entry();
+        let (mut s, log) = scripted_supervisor(
+            op,
+            Err(UmbraError::new(
+                ErrorKind::NotFound,
+                "overlay.resolve",
+                "target absent",
+            )),
+        );
+        assert!(s.handle_event(event).is_ok());
+        let log = log.lock().unwrap();
+        // The tracee's own unrewritten syscall is resumed byte-for-byte: nothing
+        // is emulated and no register is installed.
+        assert_eq!(log.order(), vec!["resume"]);
+        assert!(log.set_register_threads().is_empty());
+        assert_eq!(
+            log.resumes(),
+            vec![ResumeCommand {
+                thread: ThreadId(task(1).0),
+                mode: ResumeMode::Syscall,
+                signal: None,
+            }]
+        );
+        // No operation slot was minted (the Scripted panics did not fire).
+        assert!(s.operations.is_empty());
+        assert!(!s.is_poisoned());
+    }
+
+    #[test]
+    fn whiteout_hidden_path_is_denied_with_enoent_not_resumed_unrewritten() {
+        let (op, event) = stat_entry();
+        let (mut s, log) = scripted_supervisor(op, Ok(ResolvedAction::Deny(Errno::ENOENT)));
+        assert!(s.handle_event(event).is_ok());
+        let log = log.lock().unwrap();
+        // Emulate first, then install the errno-bearing registers, then resume:
+        // the registers must carry the errno before the thread runs.
+        assert_eq!(log.order(), vec!["emulate", "set_registers", "resume"]);
+        // Assert the emulated value, not just the call: a bare count would
+        // survive mutating the errno the tracee is handed.
+        assert_eq!(
+            log.emulated(),
+            vec![EmulatedResult {
+                outcome: OperationOutcome::Failure(Errno::ENOENT),
+                memory_writes: vec![],
+            }]
+        );
+        assert_eq!(log.set_register_threads(), vec![ThreadId(task(1).0)]);
+        assert_eq!(log.resumes().len(), 1);
+        // A denial mints no journaled operation, so nothing awaits an exit slot
+        // that would mis-attribute the synthesised SyscallExit.
+        assert!(s.operations.is_empty());
+        assert!(!s.is_poisoned());
     }
 }

@@ -61,16 +61,23 @@ new resolutions are blocked while a transaction is pending.
 - `FsOp::Access` is a read-through probe of the merged namespace: it rewrites to
   the shadow object when one exists and to the base otherwise, and it never
   copies up, not even for a `W_OK` probe. Nothing is journaled, because a probe
-  reports current permissions rather than authorizing a later mutation. Two
-  limits matter, because neither is visible from the resolver's answer alone:
-  - An absent **or whiteouted** target resolves to `NotFound`. That is this
-    namespace's answer at the resolve boundary, not what the tracee observes:
-    the supervisor turns a non-mutating `NotFound` into a plain resume, so the
-    tracee's own unrewritten syscall runs against the host and a whiteouted base
-    file still answers "exists". The gap is the supervisor's, it predates this
-    operation, and `FsOp::Stat`, `FsOp::Read` and `FsOp::ReadLink` take the same
-    branch. Tracked as
-    [#49](https://github.com/invakid404/umbra/issues/49); not fixed here.
+  reports current permissions rather than authorizing a later mutation. The
+  resolver now separates the two absence shapes at its own boundary, and one
+  ownership limit remains invisible from its answer alone:
+  - A **truly-absent** target resolves to `NotFound`. The supervisor turns a
+    non-mutating `NotFound` into a plain resume, so the tracee's own unrewritten
+    syscall runs against the host. This is correct because the base layer *is*
+    the host filesystem, so the kernel's own `ENOENT` equals the namespace's
+    answer. `FsOp::Stat`, a read-only `FsOp::Open` and `FsOp::ReadLink` share
+    this branch.
+  - A **whiteout-hidden** target — a base object a `.wh` marker deletes, whether
+    at the final component or at any ancestor directory — resolves to
+    `Deny(Errno::ENOENT)`. The supervisor emulates that denial: the backend steps
+    the tracee past the trapped syscall, so the tracee observes `ENOENT` and the
+    still-present base object is never revealed. This closes
+    [#49](https://github.com/invakid404/umbra/issues/49). A backend whose
+    `emulate_result` cannot skip the trap — the Linux stub — fails closed here
+    rather than resuming into a host-visible read.
   - `W_OK` against a base-only object is answered from the **base** file's
     ownership, because that is the path the probe rewrites to. Copy-up carries
     `mode` but not uid/gid, so a base file owned by another user can fail
@@ -97,11 +104,13 @@ new resolutions are blocked while a transaction is pending.
 
   Refusing at `resolve` keeps the journal and the overlay session clean, but it
   does **not** hand the tracee an errno: it ends the run. `Fchownat` is
-  `Materialise`, so `mutation` is true, and the supervisor's non-mutating
-  `NotFound` resume has no equivalent on the mutation path — every `resolve`
-  error propagates and marks the run recovery-required. That covers both
-  refusals above plus an absent target, and it is sharper than the `Access`
-  asymmetry noted above, which at least has a resume escape. The shapes ordinary
+  `Materialise`, so `mutation` is true, and the non-mutating outcomes above have
+  no equivalent on the mutation path — every `resolve` error propagates and marks
+  the run recovery-required, and the `!mutation` guard on the whiteout denial is
+  what keeps it off this path. That covers both refusals above plus an absent
+  target, and it is sharper than a non-mutating probe, which either resumes as
+  host passthrough (truly absent) or is answered with a clean `ENOENT`
+  (whiteout-hidden). The shapes ordinary
   tooling reaches are not exotic: `chown -R` over a base tree meets the directory
   refusal on its first directory, and `tar -x`, `cp -p`, `install -o` and `rsync`
   routinely issue `chown(-1, gid)` or `chown(uid, -1)`, which is exactly the
