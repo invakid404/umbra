@@ -595,6 +595,41 @@ fn overlay_fixture(
                         let action = match overlay.resolve(&process, &op) {
                             Ok(action) => action,
                             Err(refused) => {
+                                // A truly-absent, non-mutating NotFound is not a
+                                // refusal the overlay owns: with the host as base
+                                // the kernel produces the same ENOENT, so the
+                                // supervisor resumes the tracee's own unrewritten
+                                // syscall (events.rs, gated on `!mutation`) instead
+                                // of emulating. Model that gate here so the two
+                                // NotFound shapes stay distinct: a regression that
+                                // turned genuine absence into an emulated denial
+                                // would change this path rather than be masked by
+                                // the harness emulating the same errno, and a
+                                // whiteout-hidden path already arrives above as
+                                // `Deny`, not here.
+                                //
+                                // The `!mutation` gate is load-bearing: resuming a
+                                // *mutating* NotFound unrewritten would run the real
+                                // syscall against the host path — an `O_CREAT` open
+                                // could create a file under `host_root` and trip the
+                                // end-of-run "touched the host" invariant — so a
+                                // mutating NotFound, and every non-NotFound refusal,
+                                // is still emulated as a denial via `denial()`.
+                                let mutation = matches!(
+                                    umbra_overlay::dispatch(&op),
+                                    umbra_overlay::Dispatch::Materialise
+                                        | umbra_overlay::Dispatch::Whiteout
+                                );
+                                if refused.kind == ErrorKind::NotFound && !mutation {
+                                    tracer
+                                        .resume(ResumeCommand {
+                                            thread,
+                                            mode: ResumeMode::Syscall,
+                                            signal: None,
+                                        })
+                                        .unwrap();
+                                    continue;
+                                }
                                 let result = EmulatedResult {
                                     outcome: OperationOutcome::Failure(denial(&refused)),
                                     memory_writes: vec![],

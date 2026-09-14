@@ -317,7 +317,11 @@ reports, which is what lets a later `DirRef::Fd` resolve. The case deliberately
 looks up a name the rename removed: that path is whiteouted, so the overlay
 resolves it to `Deny(ENOENT)`, which mints no operation. Like the supervisor,
 the harness emulates that errno and resumes without preparing. A resolution that
-instead fails with an error is translated to its errno and emulated the same way.
+instead fails with an error is handled by shape, mirroring the supervisor: a
+non-mutating `NotFound` is resumed unrewritten (with the host as base the kernel
+yields the same ENOENT), while a mutating `NotFound` or any other refusal is
+translated to its errno and emulated. Gating the passthrough on `!mutation`
+matters — resuming a mutating call unrewritten would touch the host.
 dyld and library
 startup reads are left pointing at the host, unrewritten — the bound base is
 empty, so the tracee could not otherwise start; that carve-out is by logical
