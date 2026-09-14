@@ -33,7 +33,7 @@ Statuses are intended M2 behavior for run-backed files: **emulated** through the
 | `readlink`, `readlinkat` | emulated | P; exact logical target bytes, correct truncation/no terminating NUL semantics. |
 | `chmod`, `fchmodat` | emulated | P; supported mode/flag semantics through SETATTR; reject unsupported nofollow combinations. |
 | `fchmod` | emulated | H; permissions apply to the opened object. |
-| `chown`, `fchownat` | emulated | P; server permission/squash checks; explicit numeric/domain identity mapping, unchanged-ID sentinel handling. |
+| `chown`, `fchownat` | emulated | P; server permission/squash checks; explicit numeric/domain identity mapping, unchanged-ID sentinel handling. **Implementation note (M1):** `fchownat` decodes the sentinel and honours it by refusing the one shape that cannot preserve it; identity mapping is not built, so raw uid/gid reach the kernel against the shadow object. |
 | `fchown` | emulated | H; same identity mapping, no false ownership success. |
 | `utimensat`, `futimens` | emulated | P/H respectively; NOW/OMIT flags, precision limits documented; never silently update a replaced pathname for futimens. |
 | `access`, `faccessat` | emulated | P; correct real/effective identity and nofollow flags; ACCESS is a current probe, not authorization for a later mutation. |

@@ -197,9 +197,14 @@ pub fn dispatch(operation: &FsOp) -> Dispatch {
                 Dispatch::ReadThrough
             }
         }
-        FsOp::Stat { .. } | FsOp::ReadLink { .. } | FsOp::Read { .. } | FsOp::Fstat { .. } => {
-            Dispatch::ReadThrough
-        }
+        // Access is a probe of current permissions, never authorization for a
+        // later mutation, so it reads through whatever the namespace already
+        // shows rather than materialising the target.
+        FsOp::Stat { .. }
+        | FsOp::Access { .. }
+        | FsOp::ReadLink { .. }
+        | FsOp::Read { .. }
+        | FsOp::Fstat { .. } => Dispatch::ReadThrough,
         FsOp::Rename { .. }
         | FsOp::Link { .. }
         | FsOp::Symlink { .. }
@@ -208,6 +213,9 @@ pub fn dispatch(operation: &FsOp) -> Dispatch {
         | FsOp::Ftruncate { .. }
         | FsOp::Chmod { .. }
         | FsOp::Fchmod { .. }
+        // An unchanged-ID request still materialises: whether the ownership
+        // actually differs is not known until the object is in the shadow.
+        | FsOp::Fchownat { .. }
         | FsOp::Write { .. } => Dispatch::Materialise,
         FsOp::MmapFile {
             protection, flags, ..
@@ -268,7 +276,7 @@ pub use engine::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use umbra_core::{DirRef, OpenFlags, Prot, TracedFd};
+    use umbra_core::{AccessFlags, AccessMode, ChownFlags, DirRef, OpenFlags, Prot, TracedFd};
 
     #[test]
     fn byte_components_retain_symlink_parent_and_directory_semantics() {
@@ -337,6 +345,62 @@ mod tests {
                         Dispatch::ReadThrough
                     }
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn no_access_probe_materialises_whatever_it_asks_about() {
+        // A write probe is still a probe: asking whether the object could be
+        // written must not copy it up, or an `access(W_OK)` that never opens
+        // anything would leave a shadow object behind. Cover every normalized
+        // mode combination, the bare existence probe (all-false, F_OK)
+        // included, against both flag polarities.
+        for bits in 0..8 {
+            for flags in 0..4 {
+                let op = FsOp::Access {
+                    dir: DirRef::Cwd,
+                    path: BytePath::new(b"file".to_vec()).unwrap(),
+                    mode: AccessMode {
+                        read: bits & 1 != 0,
+                        write: bits & 2 != 0,
+                        execute: bits & 4 != 0,
+                    },
+                    flags: AccessFlags {
+                        effective_ids: flags & 1 != 0,
+                        follow: flags & 2 != 0,
+                    },
+                };
+                assert_eq!(
+                    dispatch(&op),
+                    Dispatch::ReadThrough,
+                    "mode {bits:#x} flags {flags:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_ownership_change_requires_materialisation() {
+        // Including the pair of unchanged-ID sentinels: the request reaches the
+        // overlay before anything is known about the object's current owner, so
+        // it cannot be classified as a read on the strength of its arguments.
+        for uid in [None, Some(0), Some(501)] {
+            for gid in [None, Some(0), Some(20)] {
+                for follow in [false, true] {
+                    let op = FsOp::Fchownat {
+                        dir: DirRef::Cwd,
+                        path: BytePath::new(b"file".to_vec()).unwrap(),
+                        uid,
+                        gid,
+                        flags: ChownFlags { follow },
+                    };
+                    assert_eq!(
+                        dispatch(&op),
+                        Dispatch::Materialise,
+                        "uid {uid:?} gid {gid:?} follow {follow}"
+                    );
+                }
             }
         }
     }
