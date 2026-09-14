@@ -1573,6 +1573,26 @@ impl NamespaceSession for Overlay {
         // Materialisation or emulated unlink may already have effects. We do not
         // clear a mutated session or claim those effects were rolled back.
         let mutation = pending.plan.mutation;
+        // A kernel refusal is the one abort whose effects are fully accounted
+        // for: `prepare` journaled them, `observe_result` journaled the kernel's
+        // verdict, and nothing else ran. Reconciling it and letting the tracee
+        // see its errno is the contract the supervisor's `syscall_exit` states;
+        // poisoning here would kill the run over an ordinary `EPERM`, which is
+        // the defect in [#53](https://github.com/invakid404/umbra/issues/53).
+        //
+        // `reason` is only a claim by the caller, so it is honoured only when
+        // the outcome this session itself recorded corroborates it. An abort
+        // claiming a refusal for a transaction whose kernel verdict was never
+        // observed, or whose observed errno differs from the claimed one, is an
+        // interception inconsistency, not a refused syscall: it falls through to
+        // the poison path below. Every other reason means the interception broke
+        // down and keeps the poison-and-error behaviour unchanged; the two modes
+        // never merge.
+        let kernel_refused = matches!(
+            (reason, &pending.outcome),
+            (AbortReason::KernelRefused(claimed), Some(OperationOutcome::Failure(observed)))
+                if claimed == observed
+        );
         if mutation {
             if let Err(e) = self.record(
                 operation,
@@ -1586,7 +1606,7 @@ impl NamespaceSession for Overlay {
             }
         }
         self.pending = None;
-        if mutation {
+        if mutation && !kernel_refused {
             self.poisoned = true;
             return Err(error(
                 ErrorKind::InvalidState,

@@ -126,15 +126,16 @@ new resolutions are blocked while a transaction is pending.
   logical symlink keeps the base identity, so it still does. The path is what
   stays resolvable in both cases, for the same reason `CopyUp` carries one.
 
-  A chown the **kernel** rejects takes the mutation abort path: the `Abort` is
-  journaled, the session is poisoned, and `abort` returns `InvalidState`, which
-  ends the run rather than handing the tracee its errno. That is the shared
+  A chown the **kernel** rejects is reconciled, not fatal: the `Abort` is
+  journaled and `abort` returns `Ok`, so the supervisor resumes the tracee with
+  the errno already in its return register
+  ([#53](https://github.com/invakid404/umbra/issues/53)). That is the shared
   `Materialise` contract, not something specific to ownership, but `fchownat` is
   the first operation to route a routinely-failing syscall into it — an
   unprivileged tracee chowning to another uid gets `EPERM`, which most programs
-  would otherwise shrug off. `FsOp::Chmod`, `FsOp::Fchmod` and `FsOp::Link`
-  remain unimplemented at `resolve`; ownership is the only metadata mutation
-  wired through today.
+  shrug off and which used to end the whole run. `FsOp::Chmod`, `FsOp::Fchmod`
+  and `FsOp::Link` remain unimplemented at `resolve`; ownership is the only
+  metadata mutation wired through today.
 - Rename materializes a regular-file or logical-symlink source, creates shadow destination parents,
   and returns source/destination kernel rewrites for one native shadow rename.
   On observed success the source whiteout is set and destination whiteout cleared.
@@ -176,10 +177,36 @@ Unit tests inject an in-memory Journal to model ordering and failure boundaries;
 restart recovery still requires reconciliation that this engine does not implement.
 
 Abort never claims that copy-up, creation, unlink, or a kernel mutation was undone.
-An aborted mutation requires recovery and leaves the session stopped. Checkpoint
-flushes storage and journal, takes whiteouts from authoritative control markers,
-and publishes a logical checkpoint with `clean: false`. Only the supervisor can
-establish the broader clean-handoff conditions.
+An aborted mutation requires recovery and leaves the session stopped, with one
+structurally distinct exception: `AbortReason::KernelRefused(errno)`. That reason
+says the rewritten syscall reached the kernel and the kernel refused it, so the
+effects are exactly the ones `prepare` journaled, the verdict is the one
+`observe_result` journaled, and the tracee is owed the errno. Such an abort still
+writes its `Abort` record and still rolls nothing back, but it returns `Ok` and
+leaves the session usable, which is what lets an ordinary `EPERM`/`ENOSPC` reach
+the tracee instead of ending the run
+([#53](https://github.com/invakid404/umbra/issues/53)). The reason is a claim by
+the caller, so it is honoured only when `Pending.outcome` — the failure this
+session itself observed — carries the same errno; an unobserved or mismatched
+claim is an interception inconsistency and takes the poison path. `Cancelled`,
+`Failed` and `RecoveryRequired` are unchanged: they mean the interception broke
+down, and neither mode widens to cover the other.
+
+Reconciling does not undo what `prepare` already did, and that is visible for the
+plans whose preparation materialises something new. Copy-up is benign: the shadow
+object is byte-identical to the base, so a refused `fchownat` leaves the logical
+view unchanged. A refused **creating** open is not: the shadow object `prepare`
+created stays, so the path becomes logically present and empty while the tracee
+was told its open failed. Rolling that back is future work and needs the
+reconciliation this MVP does not implement. Commit-time effects are unaffected
+either way — a refused `rename` sets no whiteout and retires no symlink index,
+because both are applied in `commit` and never in `abort`. `FsOp::Unlink`, the
+only `Whiteout` member, cannot reach this path at all: it resolves to `Emulate`,
+and `observe_result` refuses an outcome that differs from the emulated one.
+
+Checkpoint flushes storage and journal, takes whiteouts from authoritative control
+markers, and publishes a logical checkpoint with `clean: false`. Only the
+supervisor can establish the broader clean-handoff conditions.
 
 ## Byte resolution
 

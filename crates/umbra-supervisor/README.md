@@ -69,10 +69,16 @@ time: decode through the negotiated ABI, resolve through the namespace, prepare
 (which journals intent and performs copy-up or creation), ask the platform to
 prepare the physical rewrite, apply it, then resume to the matching exit, observe
 the outcome and commit or abort. A kernel errno is an observed outcome, not an
-interception failure.
+interception failure: it is aborted as `AbortReason::KernelRefused(errno)`, which
+the namespace reconciles instead of poisoning, so the tracee is resumed and the
+errno already sitting in its return register stands
+([#53](https://github.com/invakid404/umbra/issues/53)). No register work is
+needed there, because the rewritten syscall actually executed.
 
-Any failure in that chain poisons the run: nothing resumes afterwards. A `Deny`,
-reached only for a whiteout-hidden non-mutating path, is answered here without
+Any failure in that chain poisons the run: nothing resumes afterwards — including
+an abort the namespace refuses to reconcile, which is its verdict to give and not
+an error the supervisor may swallow. A `Deny`, reached only for a whiteout-hidden
+non-mutating path, is answered here without
 minting an operation: the supervisor asks the platform to emulate its errno, which
 steps the tracee past the trapped syscall so the still-present base object stays
 hidden ([#49](https://github.com/invakid404/umbra/issues/49)). A backend whose

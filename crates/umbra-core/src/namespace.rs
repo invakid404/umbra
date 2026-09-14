@@ -1,6 +1,6 @@
 //! Namespace transaction and checkpoint values shared by providers and supervisor.
 use crate::{
-    CheckpointId, DurabilityReceipt, ExitStatus, JournalFingerprints, JournalLogicalState,
+    CheckpointId, DurabilityReceipt, Errno, ExitStatus, JournalFingerprints, JournalLogicalState,
     OperationId, ResolvedAction, RunId, Sequence, UmbraError,
 };
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,25 @@ pub enum AbortReason {
     Failed(UmbraError),
     /// Recovery required.
     RecoveryRequired(String),
+    /// The rewritten syscall reached the kernel and the kernel refused it with
+    /// this errno.
+    ///
+    /// This is an *observed outcome of a syscall that ran*, not a failure of the
+    /// interception: the transaction's effects are exactly the ones `prepare`
+    /// journaled, the kernel's verdict is journaled by `observe_result`, and the
+    /// tracee is owed the errno in its own return register. It is therefore
+    /// reconcilable and must not poison the session
+    /// ([#53](https://github.com/invakid404/umbra/issues/53)): without it an
+    /// ordinary `EPERM` on a `Materialise` operation ends the whole run.
+    ///
+    /// Every other variant means the *interception* broke down — the effects a
+    /// mutating `prepare` already applied are unaccounted for — and keeps the
+    /// poison-and-error behaviour. The two modes stay structurally distinct:
+    /// this variant never widens to cover them, and they never narrow to cover
+    /// it. A namespace that honours this variant must also corroborate it
+    /// against the outcome it already observed, so a caller cannot claim a
+    /// kernel refusal that never happened.
+    KernelRefused(Errno),
 }
 
 /// Logical checkpoint input excluding physical roots and live process state.
