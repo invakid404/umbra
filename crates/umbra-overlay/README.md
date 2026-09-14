@@ -218,27 +218,48 @@ hardcoded `0o755` rather than the base directory's mode, so a base directory at
 was told had failed. That was a fidelity defect in `parents` rather than a
 property of this contract, and it is fixed
 ([#56](https://github.com/invakid404/umbra/issues/56)): a shadow ancestor now
-carries the mode of the base directory it shadows, on the success path and the
-reconciled-abort path alike. Three ancestors keep the default instead, because
-none of them shadows a live base directory: a Control-anchored one — a symlink
-blob, a whiteout marker — which shadows nothing; one the base does not hold, or
-holds as something other than a directory; and one whose logical path is
+carries the **group and other bits of the base directory it shadows, exactly,
+with its owner bits widened to at least `rwx`** — on the success path and the
+reconciled-abort path alike.
+
+The widening is not a rounding error, it is the point. umbra *owns* the shadow,
+so POSIX judges umbra's own writes by the shadow's **owner** bits, and the engine
+must be able to create inside every ancestor it materialises. A base directory
+without owner-write is the ordinary case rather than an exotic one — read-only
+artifact trees are exactly what an overlay exists to make writable — and copying
+`0o555` verbatim yields an ancestor the next create cannot enter. Since `parents`
+runs inside `prepare`, which poisons the run on any error, that would kill the
+session for an operation POSIX itself permits: writing `d/f` needs write on the
+file, not on `d`. Forcing the owner bits never widens group or other beyond what
+the base granted, so against a hardcoded `0o755` this is strictly more faithful
+there: a base at `0o500` yields `0o700` rather than leaking `g+rx,o+rx` the base
+never gave. It is *less* restrictive in one direction only — a base at `0o077`
+yields `0o777`, faithful to that base's own `o+rwx`.
+
+Mode is not ownership, and this is a mode-only fix: `CreateOptions` carries no
+owner field, so the shadow still belongs to whoever runs umbra.
+
+Four ancestors keep the default `0o755` instead: a Control-anchored one — a
+symlink blob, a whiteout marker — which shadows nothing; one the base does not
+hold, or holds as something other than a directory; one whose logical path is
 whiteouted **at any level**, since a whiteouted directory is logically deleted
-and what replaces it is a different directory. That last check scans every
-prefix, not just the ancestor being materialised: a shadow directory and a
-whiteout marker for the same path coexist by design — that is what `mkdir` keeps
-one for, as an opaque-base marker — and `parents` skips ancestors already in the
-shadow, so a marker above the first materialised ancestor would otherwise go
-unseen.
+and what replaces it is a different directory; and one whose base stat *fails*,
+which is a live base directory whose bits are merely not legible, not an absent
+one. The whiteout check scans every prefix, not just the ancestor being
+materialised: a shadow directory and a whiteout marker for the same path coexist
+by design — that is what `mkdir` keeps one for, as an opaque-base marker — and
+`parents` skips ancestors already in the shadow, so a marker above the first
+materialised ancestor would otherwise go unseen.
 
 Note separately that `created` is shadow-shaped: `parents` decides it from the
 shadow only, so a cross-path `rename` onto a destination parent that exists in
 the base but has not been copied up yet is counted as a creation and poisons.
 That is fail-closed and under-delivers for `rename`. #56 weakened one of the two
 arguments for leaving it that way — a materialised ancestor no longer differs
-from the base directory it shadows *in mode* — but only that far: #56 is a
-mode-only fix, `CreateOptions` carries no owner field, and the shadow still
-belongs to whoever runs umbra rather than to the base directory's owner. And it
+from the base directory it shadows in its *group and other* bits — but only that
+far: the owner bits are deliberately widened, mode is not ownership, and since
+`CreateOptions` carries no owner field the shadow still belongs to whoever runs
+umbra rather than to the base directory's owner. And it
 does not touch the other argument at all: narrowing the predicate needs the
 creation rollback [#55](https://github.com/invakid404/umbra/issues/55) tracks and
 this MVP does not implement, so the over-approximation stays until that lands.
@@ -354,7 +375,9 @@ restriction. This is an executable regular-file MVP, not complete POSIX coverage
 Run `cargo test -p umbra-overlay`. Tests inject real `umbra-storage-local` base and
 shadow runs, with no NFS or fixture environment variables. They exercise copy-up,
 shadow/stat precedence, create parents, the mode a materialised shadow ancestor
-takes from its base counterpart, whiteouts and recreation, merged snapshot pages,
+takes from its base counterpart — including a read-only base directory, whose
+owner bits must be widened or the run would be poisoned — whiteouts and
+recreation, merged snapshot pages,
 native-encoder continuation, rename journal grouping, containment, non-UTF-8
 bytes, logical symlink creation/readlink/traversal, absolute and relative targets,
 loop bounds, symlink escape and unchecked physical-link rejection, rename identity,
