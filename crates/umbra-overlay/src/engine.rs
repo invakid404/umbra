@@ -295,15 +295,29 @@ struct Pending {
     outcome: Option<OperationOutcome>,
     whiteouts: Vec<(StoragePath, bool)>,
     retired_index: Option<StoragePath>,
-    /// Whether `prepare` materialised an object that did not logically exist.
+    /// Whether `prepare` had to create a shadow object that was not there before.
     ///
-    /// Copy-up does not set this: it puts a byte-identical duplicate of a base
-    /// object into the shadow, so the logical view is the same before and after.
-    /// Creation does, and that is the difference `abort` needs, because a
-    /// reconciled abort leaves prepare's effects in place. Reconciling a
-    /// creation would publish a path the tracee was told its syscall failed to
-    /// make — and, because the shadow object outranks even a stale whiteout, a
-    /// later `O_CREAT|O_EXCL` on it would fail `EEXIST` forever.
+    /// This is what `abort` gates reconciliation on, because a reconciled abort
+    /// leaves prepare's effects standing. Creating a file or directory that did
+    /// not already exist is the case that must not be reconciled: it would
+    /// publish a path the tracee was told its syscall failed to make — and,
+    /// because the shadow object outranks even a stale whiteout, a later
+    /// `O_CREAT|O_EXCL` on it would fail `EEXIST` forever.
+    ///
+    /// Copy-up deliberately does not set this, and the reason is *not* that
+    /// copy-up is invisible. It duplicates an object the base already holds, so
+    /// the content view is unchanged, and treating it as a creation would poison
+    /// the run on the first write into any not-yet-shadowed base subdirectory —
+    /// a large share of the ordinary `EPERM` cases
+    /// [#53](https://github.com/invakid404/umbra/issues/53) exists to survive.
+    /// But materialising shadow ancestors does change one thing: `parents` gives
+    /// them a hardcoded `0o755` instead of the base directory's mode, so a base
+    /// directory at `0700` is reported as `0755` afterwards. That divergence
+    /// fires on the success path too — it is a fidelity defect in `parents`
+    /// ([#56](https://github.com/invakid404/umbra/issues/56)), not something this
+    /// flag is gating, and fixing it there removes the divergence on both paths.
+    ///
+    /// The predicate is shadow-shaped rather than logical; see `parents`.
     created: bool,
 }
 
@@ -722,9 +736,22 @@ impl Overlay {
         }
         Ok(())
     }
-    /// Materialise the shadow parent directories of `path`, reporting whether
-    /// any had to be created. The caller needs that answer because a created
-    /// directory is a logical namespace change that `abort` cannot undo.
+    /// Materialise the shadow parent directories of `path`, reporting whether any
+    /// had to be created.
+    ///
+    /// The answer is *shadow*-shaped, not logical: this consults `shadow_stat`
+    /// only and never the base, so an ancestor that already exists in the base but
+    /// has not been copied up yet is reported as created. `Pending.created`
+    /// inherits that over-approximation, which is why a refused cross-path rename
+    /// onto a base-only destination parent poisons rather than reconciles — #53
+    /// under-delivers there. That is fail-closed, so it stays: narrowing the
+    /// predicate to consult the base would have to answer for the fact that the
+    /// directory created here does not carry the base directory's mode
+    /// ([#56](https://github.com/invakid404/umbra/issues/56)), and so is not
+    /// logically the same directory it shadows.
+    ///
+    /// `create` discards the answer, so `copy_up` is not treated as a creation.
+    /// See `Pending.created` for why, and for the asymmetry that leaves.
     fn parents(&mut self, path: &StoragePath) -> Result<bool> {
         let parts: Vec<_> = path.as_bytes().split(|b| *b == b'/').collect();
         let mut created = false;

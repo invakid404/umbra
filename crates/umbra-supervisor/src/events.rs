@@ -986,13 +986,19 @@ mod tests {
     // copies of the rule are not mechanically linked: no test wires a real
     // `Overlay` to a real `Supervisor`, so a change to the real rule that is not
     // mirrored here leaves these tests passing while the real system behaves
-    // differently. Closing that gap needs an integration harness, which is
-    // tracked separately.
+    // differently. That is not hypothetical - it happened once during #53's
+    // review, when the `created` gate landed on `Overlay::abort` alone and this
+    // suite stayed green. Closing the gap needs an integration harness, tracked
+    // in [#57](https://github.com/invakid404/umbra/issues/57); once it exists,
+    // delete this double's rule rather than maintaining it.
     struct Journaling {
         log: Arc<Mutex<Journaled>>,
         // The `Pending.created` flag of the transaction being aborted: true when
-        // `prepare` materialised an object that did not logically exist, which
-        // the overlay refuses to reconcile because nothing rolls it back.
+        // `prepare` had to create a shadow object that was not there before,
+        // which the overlay refuses to reconcile because nothing rolls it back.
+        // A session constant here, where `Pending.created` is per-transaction;
+        // equivalent only because every test below drives exactly one
+        // transaction, so a harness that drives several needs the real shape.
         created: bool,
     }
     fn unreconcilable() -> UmbraError {

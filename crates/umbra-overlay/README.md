@@ -193,20 +193,33 @@ claim is an interception inconsistency and takes the poison path. `Cancelled`,
 down, and neither mode widens to cover the other.
 
 Reconciling does not undo what `prepare` already did, so it is confined to the
-plans whose preparation materialises nothing new. Copy-up is benign: the shadow
-object is byte-identical to the base, so a refused `fchownat`, or a refused write
-open on an object that already existed, leaves the logical view unchanged.
-Creation is not, and `Pending.created` records the difference. A reconciled
-creating open would publish a path the tracee was just told its open failed to
-make, and because the shadow object outranks even a stale whiteout marker that
-`commit` would have cleared, every later `O_CREAT|O_EXCL` on it would answer
-`AlreadyExists` permanently. Such a transaction therefore keeps the pre-#53
-poison behaviour: the run ends, loudly, instead of the namespace diverging. The
-same applies to `Symlink`, `Mkdir` and a cross-path `rename` that had to create
-destination parents. Lifting that — so a refused creating operation is retryable
-rather than fatal — needs rollback of prepare-time creations, which needs the
-reconciliation this MVP does not implement, and is tracked in
-[#55](https://github.com/invakid404/umbra/issues/55).
+plans whose preparation created nothing. `Pending.created` records the
+difference. A reconciled creating open would publish a path the tracee was just
+told its open failed to make, and because the shadow object outranks even a stale
+whiteout marker that `commit` would have cleared, every later `O_CREAT|O_EXCL` on
+it would answer `AlreadyExists` permanently. Such a transaction therefore keeps
+the pre-#53 poison behaviour: the run ends, loudly, instead of the namespace
+diverging. The same applies to `Symlink`, `Mkdir` and a cross-path `rename` that
+had to materialise destination parents. Lifting that — so a refused creating
+operation is retryable rather than fatal — needs rollback of prepare-time
+creations, which needs the reconciliation this MVP does not implement, and is
+tracked in [#55](https://github.com/invakid404/umbra/issues/55).
+
+Copy-up is deliberately not counted as a creation, so a refused `fchownat`, or a
+refused write open on an object the base already holds, reconciles. The content
+view is unchanged, and counting it would poison the run on the first write into
+any not-yet-shadowed base subdirectory — a large share of the ordinary `EPERM`
+cases this contract exists to survive. That is **not** a claim that copy-up is
+invisible: materialising shadow ancestors gives them a hardcoded `0o755` rather
+than the base directory's mode, so a base directory at `0700` is reported as
+`0755` afterwards, including after a syscall the tracee was told had failed. That
+divergence also fires on the success path, so it is a fidelity defect in
+`parents` rather than a property of this contract, and it is tracked in
+[#56](https://github.com/invakid404/umbra/issues/56). Note also that `created` is
+shadow-shaped: `parents` consults the shadow only, so a cross-path `rename` onto
+a destination parent that exists in the base but has not been copied up yet is
+counted as a creation and poisons. That is fail-closed and under-delivers for
+`rename`; the same issue covers it.
 
 Commit-time effects are never applied by `abort`: `pending.whiteouts` and
 `retired_index` are consumed in `commit` alone, so a reconciled `rename` sets no
@@ -215,11 +228,17 @@ than an end-to-end guarantee, because most of the class cannot reach a kernel
 refusal at all yet. `FsOp::Unlink` — the whole `Whiteout` half — and also
 `FsOp::Symlink`, `FsOp::Mkdir` and a same-path `rename` resolve to `Emulate`, and
 `observe_result` refuses an outcome that differs from the emulated one; a
-cross-path `rename` resolves to a two-path `Rewrite` that the supervisor's
-`apply_rewrite` refuses before the tracee ever reaches a syscall exit. The
-reachable surface today is a write-mode `Open` and `FsOp::Fchownat`. The
-behaviour is keyed on the dispatch class, not on a variant list, so the rest
-inherits it as those paths are wired.
+cross-path `rename` resolves to a two-path `Rewrite` that, as `apply_rewrite`
+stands in `umbra-supervisor` today, is refused before the tracee ever reaches a
+syscall exit — a fact owned by that crate, not this one. The reachable surface
+today is a write-mode `Open` and `FsOp::Fchownat`. The behaviour is keyed on the
+dispatch class, not on a variant list, so the rest of the class inherits it as
+those paths are wired — with one exception to settle first: `Unlink`'s `prepare`
+*destroys* the shadow object outright, and `FsOp::Link` will materialise a new
+name through the `_ => {}` arm, so neither sets `created` and the gate has no
+counterpart for them. Whoever wires those paths has to revisit it rather than
+assume the inheritance; noted on
+[#57](https://github.com/invakid404/umbra/issues/57).
 
 Checkpoint flushes storage and journal, takes whiteouts from authoritative control
 markers, and publishes a logical checkpoint with `clean: false`. Only the
