@@ -10,11 +10,31 @@ fn unsupported(message: &str) -> UmbraError {
     error(ErrorKind::UnsupportedCapability, message)
 }
 /// Mode for a shadow directory with no base counterpart to inherit from: a
-/// control-anchored path, a whiteouted base ancestor, one the base does not
-/// hold, or one the base holds as something other than a directory. Shadow
-/// ancestors that *do* shadow a base directory carry its mode instead; see
-/// `Overlay::shadow_parent_mode`.
+/// control-anchored path, one whose logical path is whiteouted at any level, one
+/// the base does not hold, or one the base holds as something other than a
+/// directory. Shadow ancestors that *do* shadow a live base directory carry its
+/// mode instead; see `Overlay::shadow_parent_mode`.
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
+
+/// Whether the logical path `parents` is materialising is whiteouted, carried
+/// across one walk so the prefix scan runs at most once.
+///
+/// The distinction that matters is `Unscanned` vs `Clear`. `parents` skips
+/// ancestors that already exist in the shadow, so the ancestors
+/// `shadow_parent_mode` is asked about are not the whole prefix chain, and a
+/// marker above the first of them would otherwise never be seen — a shadow
+/// directory and a whiteout marker for the same path coexist by design, which is
+/// what `prepare`'s `FsOp::Mkdir` arm means by keeping one as an opaque-base
+/// marker. So the first ancestor scans every prefix; after that the chain is
+/// contiguous and each ancestor's own marker is the only one still unexamined.
+enum Whiteout {
+    /// No prefix examined yet: the next ancestor needs a full scan from the root.
+    Unscanned,
+    /// Every prefix down to the last ancestor examined is live.
+    Clear,
+    /// Some prefix is whiteouted, so every deeper one is too.
+    Hidden,
+}
 
 fn absent<T>(result: Result<T>) -> Result<Option<T>> {
     match result {
@@ -773,7 +793,7 @@ impl Overlay {
     fn parents(&mut self, path: &StoragePath) -> Result<bool> {
         let parts: Vec<_> = path.as_bytes().split(|b| *b == b'/').collect();
         let mut created = false;
-        let mut hidden = false;
+        let mut whiteout = Whiteout::Unscanned;
         for n in 1..parts.len() {
             let parent = StoragePath::new(path.anchor(), parts[..n].join(&b'/'))?;
             if let Some(stat) = self.shadow_stat(&parent)? {
@@ -784,7 +804,7 @@ impl Overlay {
                     ));
                 }
             } else {
-                let mode = self.shadow_parent_mode(&parent, &mut hidden)?;
+                let mode = self.shadow_parent_mode(&parent, &mut whiteout)?;
                 let context = self.context()?;
                 self.storage.create(
                     &context,
@@ -803,9 +823,9 @@ impl Overlay {
     /// base directory it shadows, or `DEFAULT_DIRECTORY_MODE` when there is no
     /// base directory it can be said to shadow.
     ///
-    /// `hidden` latches across one `parents` walk: once a prefix is whiteouted
-    /// every deeper one is too, so the marker probe stops after the first hit.
-    fn shadow_parent_mode(&mut self, parent: &StoragePath, hidden: &mut bool) -> Result<u32> {
+    /// `whiteout` carries the scan across one `parents` walk; see `Whiteout` for
+    /// why the first ancestor needs every prefix checked and later ones do not.
+    fn shadow_parent_mode(&mut self, parent: &StoragePath, whiteout: &mut Whiteout) -> Result<u32> {
         // `Base` is Root-anchored only — `lookup` answers `Denied` for anything
         // else — and `write_control` and `set_whiteout` drive this walk over
         // Control paths for symlink blobs and whiteout markers. Those ancestors
@@ -813,29 +833,30 @@ impl Overlay {
         if parent.anchor() != StorageAnchor::Root {
             return Ok(DEFAULT_DIRECTORY_MODE);
         }
-        // Ordering: `context()` goes through `config()`, and `bind` sets `config`
-        // and `base` in the same call, so reaching past this proves `base()`'s
-        // `expect("bound base")` cannot fire.
-        let context = self.context()?;
-        if !*hidden {
-            // Probe the marker directly rather than calling `whiteouted`, which
-            // latches `self.whiteout_hit` — the latch `hidden_or` consumes to turn
-            // a later NotFound into Deny(ENOENT) (#49/#54). This walk runs from
-            // `prepare` and `commit`, after resolve has returned, so a latch set
-            // here outlives the operation that set it. Today `resolve` clears the
-            // latch on entry and would mask that, but the guarantee #49 rests on
-            // is "only a real whiteout lookup latches", not the order two
-            // unrelated functions happen to run in. Keep the probe non-latching so
-            // it holds without that coincidence.
-            let marker = Self::marker(parent)?;
-            *hidden = absent(self.storage.stat(&context, &marker))?.is_some();
+        match whiteout {
+            Whiteout::Hidden => {}
+            Whiteout::Unscanned => {
+                *whiteout = if self.marked_prefix(parent)? {
+                    Whiteout::Hidden
+                } else {
+                    Whiteout::Clear
+                };
+            }
+            Whiteout::Clear => {
+                if self.marked(parent)? {
+                    *whiteout = Whiteout::Hidden;
+                }
+            }
         }
         // A whiteouted base directory is logically deleted. The shadow directory
         // materialised over its grave is a new directory, not that one, and must
         // not wear its mode.
-        if *hidden {
+        if matches!(whiteout, Whiteout::Hidden) {
             return Ok(DEFAULT_DIRECTORY_MODE);
         }
+        // Ordering: `bind` sets `config` and `base` in the same call, so a bound
+        // config proves `base()`'s `expect("bound base")` cannot fire.
+        self.config()?;
         match self.base().stat(parent) {
             // `LocalStorage` rejects `mode & !0o7777` outright, and setgid and
             // sticky are part of the directory's identity, so mask rather than
@@ -853,6 +874,36 @@ impl Overlay {
             // no base counterpart at all) and is not an error worth reporting.
             Err(_) => Ok(DEFAULT_DIRECTORY_MODE),
         }
+    }
+    /// Whether a whiteout marker exists for `path` itself.
+    ///
+    /// Non-latching, and that is the point: `whiteouted` sets `self.whiteout_hit`
+    /// — the latch `hidden_or` consumes to turn a later NotFound into
+    /// Deny(ENOENT) (#49/#54) — and this runs from `prepare` and `commit`, after
+    /// resolve has returned, so a latch set here would outlive the operation that
+    /// set it. `resolve` clearing the latch on entry happens to mask that today,
+    /// but the guarantee #49 rests on is "only a real whiteout lookup latches",
+    /// not the order two unrelated functions run in.
+    fn marked(&mut self, path: &StoragePath) -> Result<bool> {
+        let marker = Self::marker(path)?;
+        let context = self.context()?;
+        Ok(absent(self.storage.stat(&context, &marker))?.is_some())
+    }
+    /// Whether `path` or any prefix of it carries a whiteout marker. Walks the
+    /// same prefixes `whiteouted` does, without its latch.
+    fn marked_prefix(&mut self, path: &StoragePath) -> Result<bool> {
+        let mut prefix = root(b"")?;
+        for component in path
+            .as_bytes()
+            .split(|b| *b == b'/')
+            .filter(|c| !c.is_empty())
+        {
+            prefix = join(&prefix, component)?;
+            if self.marked(&prefix)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     fn create(&mut self, path: &StoragePath, kind: CreateKind, mode: u32) -> Result<()> {
         self.parents(path)?;

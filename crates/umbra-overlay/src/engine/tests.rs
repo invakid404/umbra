@@ -183,6 +183,8 @@ impl Storage for BadReceipt {
 type Creates = Arc<Mutex<Vec<(StoragePath, CreateOptions)>>>;
 /// Every path the engine asked the base to stat, in order.
 type BaseStats = Arc<Mutex<Vec<StoragePath>>>;
+/// Switch that makes every base *directory* stat fail with this kind.
+type BaseFailure = Arc<Mutex<Option<ErrorKind>>>;
 
 /// Records the `CreateOptions` the engine *requests*, which is the only
 /// umask-independent view of the mode `parents` chose. `LocalStorage` materialises
@@ -237,13 +239,19 @@ struct WatchedBase {
     inner: StorageBase,
     stats: BaseStats,
     force_directory_mode: Option<u32>,
+    fail_directory_stat: BaseFailure,
 }
 impl Base for WatchedBase {
     fn stat(&mut self, path: &StoragePath) -> Result<BlobStat> {
         self.stats.lock().unwrap().push(path.clone());
         let mut stat = self.inner.stat(path)?;
-        if let Some(mode) = self.force_directory_mode {
-            if stat.kind == ObjectKind::Directory {
+        if stat.kind == ObjectKind::Directory {
+            // Switchable so a test can let `resolve` run against a healthy base
+            // and fail only the stat `shadow_parent_mode` makes during `prepare`.
+            if let Some(kind) = *self.fail_directory_stat.lock().unwrap() {
+                return Err(UmbraError::new(kind, "test-base", "injected base failure"));
+            }
+            if let Some(mode) = self.force_directory_mode {
                 stat.mode = mode;
             }
         }
@@ -283,6 +291,8 @@ struct Setup<'a> {
     base_stats: Option<BaseStats>,
     /// Report this unmasked `st_mode` for every base directory.
     force_directory_mode: Option<u32>,
+    /// Handle the test flips to make base directory stats fail.
+    fail_directory_stat: Option<BaseFailure>,
 }
 
 impl Fixture {
@@ -353,22 +363,37 @@ impl Fixture {
             lease,
         };
         let storage: Box<dyn Storage> = match (mismatch, setup.creates) {
-            (Some(mismatch), _) => Box::new(BadReceipt {
-                inner: shadow,
-                mismatch,
-            }),
+            (Some(mismatch), creates) => {
+                // `BadReceipt` does not record, so a caller asking for both would
+                // get a silently empty recorder and a vacuously passing
+                // assertion. No test needs the combination; say so loudly rather
+                // than let a future one pass for the wrong reason.
+                debug_assert!(
+                    creates.is_none(),
+                    "Setup::creates is ignored when a bad receipt is requested"
+                );
+                Box::new(BadReceipt {
+                    inner: shadow,
+                    mismatch,
+                })
+            }
             (None, Some(creates)) => Box::new(Recorder {
                 inner: shadow,
                 creates,
             }),
             (None, None) => Box::new(shadow),
         };
-        let base: Box<dyn Base> = match (setup.base_stats, setup.force_directory_mode) {
-            (None, None) => Box::new(base),
-            (stats, force_directory_mode) => Box::new(WatchedBase {
+        let base: Box<dyn Base> = match (
+            setup.base_stats,
+            setup.force_directory_mode,
+            setup.fail_directory_stat,
+        ) {
+            (None, None, None) => Box::new(base),
+            (stats, force_directory_mode, fail_directory_stat) => Box::new(WatchedBase {
                 inner: base,
                 stats: stats.unwrap_or_default(),
                 force_directory_mode,
+                fail_directory_stat: fail_directory_stat.unwrap_or_default(),
             }),
         };
         let mut overlay = Overlay::new(storage, Box::new(journal));
@@ -2841,25 +2866,25 @@ fn a_non_directory_or_absent_base_ancestor_falls_back_instead_of_inheriting() {
     // these are exercised directly. The guards are still load-bearing: a `Base`
     // whose tree disagrees with the walk's view must never put a file's mode on a
     // directory, and must never propagate its own error out of `parents`.
-    let mut hidden = false;
+    let mut whiteout = Whiteout::Unscanned;
     assert_eq!(
         f.overlay
-            .shadow_parent_mode(&root(b"d").unwrap(), &mut hidden)
+            .shadow_parent_mode(&root(b"d").unwrap(), &mut whiteout)
             .unwrap(),
         0o700
     );
-    let mut hidden = false;
+    let mut whiteout = Whiteout::Unscanned;
     assert_eq!(
         f.overlay
-            .shadow_parent_mode(&root(b"d/f").unwrap(), &mut hidden)
+            .shadow_parent_mode(&root(b"d/f").unwrap(), &mut whiteout)
             .unwrap(),
         0o755,
         "a file's mode must not be adopted for a directory"
     );
-    let mut hidden = false;
+    let mut whiteout = Whiteout::Unscanned;
     assert_eq!(
         f.overlay
-            .shadow_parent_mode(&root(b"nowhere").unwrap(), &mut hidden)
+            .shadow_parent_mode(&root(b"nowhere").unwrap(), &mut whiteout)
             .unwrap(),
         0o755,
         "an absent base ancestor falls back rather than propagating NotFound"
@@ -2881,4 +2906,118 @@ fn a_non_directory_or_absent_base_ancestor_falls_back_instead_of_inheriting() {
     );
     f.run(&write_open(b"d/f"));
     assert_eq!(requested_directory_mode(&creates, b"d"), Some(0o700));
+}
+
+// Case (h): the whiteouted ancestor is already in the shadow.
+#[test]
+fn a_whiteouted_ancestor_already_in_the_shadow_still_blocks_inheritance() {
+    // `parents` skips ancestors that already exist in the shadow, so those never
+    // reach `shadow_parent_mode` and a scan that only looked at the ancestors it
+    // was handed would never see a marker above them. The shape is not
+    // hypothetical: `prepare`'s `FsOp::Mkdir` arm deliberately keeps an existing
+    // directory whiteout as an opaque-base marker, so after whiteout-then-recreate
+    // the shadow directory `a` and `a`'s marker coexist. Everything the base holds
+    // under `a` is logically deleted, and none of it may lend its mode.
+    let creates = Creates::default();
+    let mut f = Fixture::build(
+        &[(b"a/b/c/f", b"base bytes")],
+        Setup {
+            base_modes: &[(b"a/b/c", 0o777), (b"a/b", 0o700), (b"a", 0o750)],
+            creates: Some(creates.clone()),
+            ..Setup::default()
+        },
+    );
+    let marker = Overlay::marker(&root(b"a").unwrap()).unwrap();
+    let path = f
+        .control
+        .join(std::ffi::OsStr::from_bytes(marker.as_bytes()));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"").unwrap();
+    // Recreate `a` in the shadow. The marker survives, which is the point.
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"a"),
+        mode: 0o755,
+    });
+    assert!(path.exists(), "mkdir must keep the opaque-base marker");
+    assert!(shadow(&f, b"a").is_dir());
+    creates.lock().unwrap().clear();
+
+    // `a` is now skipped by `parents` -- present in the shadow -- so `a/b` is the
+    // first ancestor `shadow_parent_mode` is asked about, and the marker that
+    // hides it sits above it.
+    f.run(&create_open(b"a/b/c/f"));
+    for name in [&b"a/b"[..], b"a/b/c"] {
+        assert_eq!(
+            requested_directory_mode(&creates, name),
+            Some(0o755),
+            "an ancestor under a whiteouted prefix must not inherit the dead base mode"
+        );
+    }
+    // The `0o777` level is the one that shows why this is not cosmetic: inherited,
+    // it would be a world-writable shadow directory taken from a directory the
+    // tracee deleted. `LocalStorage` masks it to `0o755` via umask, so the
+    // requested mode above is the assertion that sees it; a backend honouring
+    // `CreateOptions.mode` as written would materialise it.
+    assert!(
+        !creates
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, o)| o.kind == CreateKind::Directory && o.mode == 0o777),
+        "no shadow directory may be requested world-writable from a dead base"
+    );
+    // Still non-latching (#49/#54), and the run is still usable.
+    f.overlay.whiteout_hit = false;
+    f.overlay.parents(&root(b"a/b/c/other").unwrap()).unwrap();
+    assert!(!f.overlay.whiteout_hit, "the prefix scan must not latch");
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &stat(b"never"))
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+}
+
+// Case (i): the blanket base-error swallow.
+#[test]
+fn a_failing_base_stat_falls_back_to_the_default_mode_instead_of_poisoning() {
+    // `shadow_parent_mode` swallows *every* base-stat error, not just NotFound.
+    // Deliberate: `parents` runs inside `prepare` and `commit`, so a base that
+    // fails there would turn a create that succeeds today into a poisoned run and
+    // take #53/#59's kernel-refusal reconciliation with it -- on a path that
+    // never consulted the base at all before #56. The cost of swallowing is one
+    // directory's mode fidelity, degrading to exactly the pre-#56 value and never
+    // to a wrong non-default one. This pins the non-NotFound half of that arm,
+    // which nothing else exercises.
+    let creates = Creates::default();
+    let failure = BaseFailure::default();
+    let mut f = Fixture::build(
+        &[(b"d/f", b"base bytes")],
+        Setup {
+            base_modes: &[(b"d", 0o700)],
+            creates: Some(creates.clone()),
+            fail_directory_stat: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    // Resolve against a healthy base, then fail only the stat `parents` makes.
+    let action = f.overlay.resolve(&f.process, &write_open(b"d/f")).unwrap();
+    *failure.lock().unwrap() = Some(ErrorKind::Io);
+    let prepared = f
+        .overlay
+        .prepare(OperationId(Uuid::new_v4()), &action)
+        .expect("a failing base stat must not fail prepare");
+    assert_eq!(
+        requested_directory_mode(&creates, b"d"),
+        Some(0o755),
+        "an unreadable base ancestor falls back to the default, not to an error"
+    );
+    assert!(!f.overlay.poisoned);
+    // The transaction still completes and the session stays usable.
+    f.complete(prepared);
+    assert!(!f.overlay.poisoned);
+    *failure.lock().unwrap() = None;
+    assert_eq!(f.read(b"d/f").unwrap(), b"base bytes");
 }

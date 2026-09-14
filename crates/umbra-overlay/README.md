@@ -219,19 +219,29 @@ was told had failed. That was a fidelity defect in `parents` rather than a
 property of this contract, and it is fixed
 ([#56](https://github.com/invakid404/umbra/issues/56)): a shadow ancestor now
 carries the mode of the base directory it shadows, on the success path and the
-reconciled-abort path alike. A Control-anchored ancestor — a symlink blob, a
-whiteout marker — shadows nothing and keeps the default, and so does one whose
-base counterpart is whiteouted, since a whiteouted directory is logically deleted
-and its replacement is not the same directory.
+reconciled-abort path alike. Three ancestors keep the default instead, because
+none of them shadows a live base directory: a Control-anchored one — a symlink
+blob, a whiteout marker — which shadows nothing; one the base does not hold, or
+holds as something other than a directory; and one whose logical path is
+whiteouted **at any level**, since a whiteouted directory is logically deleted
+and what replaces it is a different directory. That last check scans every
+prefix, not just the ancestor being materialised: a shadow directory and a
+whiteout marker for the same path coexist by design — that is what `mkdir` keeps
+one for, as an opaque-base marker — and `parents` skips ancestors already in the
+shadow, so a marker above the first materialised ancestor would otherwise go
+unseen.
 
 Note separately that `created` is shadow-shaped: `parents` decides it from the
 shadow only, so a cross-path `rename` onto a destination parent that exists in
 the base but has not been copied up yet is counted as a creation and poisons.
-That is fail-closed and under-delivers for `rename`. #56 removed one of the two
-arguments for leaving it that way — the shadow ancestor really is the directory
-it shadows now — but not the other: narrowing the predicate needs the creation
-rollback [#55](https://github.com/invakid404/umbra/issues/55) tracks and this MVP
-does not implement, so the over-approximation stays until that lands.
+That is fail-closed and under-delivers for `rename`. #56 weakened one of the two
+arguments for leaving it that way — a materialised ancestor no longer differs
+from the base directory it shadows *in mode* — but only that far: #56 is a
+mode-only fix, `CreateOptions` carries no owner field, and the shadow still
+belongs to whoever runs umbra rather than to the base directory's owner. And it
+does not touch the other argument at all: narrowing the predicate needs the
+creation rollback [#55](https://github.com/invakid404/umbra/issues/55) tracks and
+this MVP does not implement, so the over-approximation stays until that lands.
 
 Commit-time effects are never applied by `abort`: `pending.whiteouts` and
 `retired_index` are consumed in `commit` alone, so a reconciled `rename` sets no
