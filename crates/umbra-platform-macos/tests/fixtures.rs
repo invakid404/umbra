@@ -613,6 +613,34 @@ fn overlay_fixture(
                                 continue;
                             }
                         };
+                        // A denial mints no operation: the overlay returns it
+                        // before planning (`self.planned` stays `None`), so
+                        // `prepare` would refuse with "resolve must precede
+                        // prepare". Mirror the supervisor
+                        // (crates/umbra-supervisor/src/events.rs) and answer the
+                        // tracee directly — emulate the errno, install the
+                        // registers, resume, mint no operation. A whiteout-hidden
+                        // path (e.g. dirfd_rename looking up the removed name)
+                        // now arrives here as `Deny`; genuinely-absent and
+                        // non-NotFound refusals still arrive as `Err` above.
+                        if let ResolvedAction::Deny(errno) = action {
+                            let result = EmulatedResult {
+                                outcome: OperationOutcome::Failure(errno),
+                                memory_writes: vec![],
+                            };
+                            DarwinArm64Abi
+                                .emulate_result(&mut registers, &result)
+                                .unwrap();
+                            tracer.set_registers(thread, &registers).unwrap();
+                            tracer
+                                .resume(ResumeCommand {
+                                    thread,
+                                    mode: ResumeMode::Syscall,
+                                    signal: None,
+                                })
+                                .unwrap();
+                            continue;
+                        }
                         let prepared = overlay
                             .prepare(OperationId(Uuid::new_v4()), &action)
                             .unwrap();
