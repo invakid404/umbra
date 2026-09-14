@@ -192,17 +192,34 @@ claim is an interception inconsistency and takes the poison path. `Cancelled`,
 `Failed` and `RecoveryRequired` are unchanged: they mean the interception broke
 down, and neither mode widens to cover the other.
 
-Reconciling does not undo what `prepare` already did, and that is visible for the
-plans whose preparation materialises something new. Copy-up is benign: the shadow
-object is byte-identical to the base, so a refused `fchownat` leaves the logical
-view unchanged. A refused **creating** open is not: the shadow object `prepare`
-created stays, so the path becomes logically present and empty while the tracee
-was told its open failed. Rolling that back is future work and needs the
-reconciliation this MVP does not implement. Commit-time effects are unaffected
-either way — a refused `rename` sets no whiteout and retires no symlink index,
-because both are applied in `commit` and never in `abort`. `FsOp::Unlink`, the
-only `Whiteout` member, cannot reach this path at all: it resolves to `Emulate`,
-and `observe_result` refuses an outcome that differs from the emulated one.
+Reconciling does not undo what `prepare` already did, so it is confined to the
+plans whose preparation materialises nothing new. Copy-up is benign: the shadow
+object is byte-identical to the base, so a refused `fchownat`, or a refused write
+open on an object that already existed, leaves the logical view unchanged.
+Creation is not, and `Pending.created` records the difference. A reconciled
+creating open would publish a path the tracee was just told its open failed to
+make, and because the shadow object outranks even a stale whiteout marker that
+`commit` would have cleared, every later `O_CREAT|O_EXCL` on it would answer
+`AlreadyExists` permanently. Such a transaction therefore keeps the pre-#53
+poison behaviour: the run ends, loudly, instead of the namespace diverging. The
+same applies to `Symlink`, `Mkdir` and a cross-path `rename` that had to create
+destination parents. Lifting that — so a refused creating operation is retryable
+rather than fatal — needs rollback of prepare-time creations, which needs the
+reconciliation this MVP does not implement, and is tracked in
+[#55](https://github.com/invakid404/umbra/issues/55).
+
+Commit-time effects are never applied by `abort`: `pending.whiteouts` and
+`retired_index` are consumed in `commit` alone, so a reconciled `rename` sets no
+whiteout and retires no symlink index. That is a property of this engine rather
+than an end-to-end guarantee, because most of the class cannot reach a kernel
+refusal at all yet. `FsOp::Unlink` — the whole `Whiteout` half — and also
+`FsOp::Symlink`, `FsOp::Mkdir` and a same-path `rename` resolve to `Emulate`, and
+`observe_result` refuses an outcome that differs from the emulated one; a
+cross-path `rename` resolves to a two-path `Rewrite` that the supervisor's
+`apply_rewrite` refuses before the tracee ever reaches a syscall exit. The
+reachable surface today is a write-mode `Open` and `FsOp::Fchownat`. The
+behaviour is keyed on the dispatch class, not on a variant list, so the rest
+inherits it as those paths are wired.
 
 Checkpoint flushes storage and journal, takes whiteouts from authoritative control
 markers, and publishes a logical checkpoint with `clean: false`. Only the

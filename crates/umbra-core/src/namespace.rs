@@ -38,10 +38,15 @@ pub enum AbortReason {
     /// This is an *observed outcome of a syscall that ran*, not a failure of the
     /// interception: the transaction's effects are exactly the ones `prepare`
     /// journaled, the kernel's verdict is journaled by `observe_result`, and the
-    /// tracee is owed the errno in its own return register. It is therefore
-    /// reconcilable and must not poison the session
+    /// tracee is owed the errno in its own return register. It is therefore the
+    /// one reason a namespace may reconcile rather than poison
     /// ([#53](https://github.com/invakid404/umbra/issues/53)): without it an
     /// ordinary `EPERM` on a `Materialise` operation ends the whole run.
+    ///
+    /// It is a licence to reconcile, not an instruction to. A namespace that
+    /// cannot account for the transaction's effects must still refuse — an abort
+    /// does not roll anything back, so a preparation that materialised an object
+    /// which did not previously exist stays fatal whatever the kernel said.
     ///
     /// Every other variant means the *interception* broke down — the effects a
     /// mutating `prepare` already applied are unaccounted for — and keeps the

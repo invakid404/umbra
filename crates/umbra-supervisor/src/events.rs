@@ -971,20 +971,29 @@ mod tests {
     struct Journaled {
         observed: Vec<OperationOutcome>,
         aborts: Vec<AbortReason>,
-        commits: usize,
     }
 
     // A namespace double for the syscall-exit path. It mirrors the overlay's
     // real abort contract instead of accepting anything: a mutating transaction
     // is reconcilable only when the reason is a `KernelRefused` naming the errno
-    // this session itself observed, and every other reason is an interception
-    // failure that errors. Getting the reason right is the supervisor's job
+    // this session itself observed *and* `prepare` materialised nothing new.
+    // Every other reason is an interception failure that errors. Getting the
+    // reason right is the supervisor's job
     // ([#53](https://github.com/invakid404/umbra/issues/53)), so the double
-    // enforces it end to end rather than rubber-stamping the call. `refuse_abort`
-    // models a namespace that cannot reconcile at all, which must still poison.
+    // enforces it end to end rather than rubber-stamping the call.
+    //
+    // KEEP IN SYNC WITH `Overlay::abort` (`umbra-overlay/src/engine.rs`). The two
+    // copies of the rule are not mechanically linked: no test wires a real
+    // `Overlay` to a real `Supervisor`, so a change to the real rule that is not
+    // mirrored here leaves these tests passing while the real system behaves
+    // differently. Closing that gap needs an integration harness, which is
+    // tracked separately.
     struct Journaling {
         log: Arc<Mutex<Journaled>>,
-        refuse_abort: bool,
+        // The `Pending.created` flag of the transaction being aborted: true when
+        // `prepare` materialised an object that did not logically exist, which
+        // the overlay refuses to reconcile because nothing rolls it back.
+        created: bool,
     }
     fn unreconcilable() -> UmbraError {
         UmbraError::new(
@@ -1007,22 +1016,19 @@ mod tests {
             Ok(())
         }
         fn commit(&mut self, _: OperationId) -> Result<CommitReceipt> {
-            self.log.lock().unwrap().commits += 1;
             panic!("an observed kernel failure must never commit")
         }
         fn abort(&mut self, _: OperationId, reason: &AbortReason) -> Result<()> {
             let mut log = self.log.lock().unwrap();
             log.aborts.push(reason.clone());
-            if self.refuse_abort {
-                return Err(unreconcilable());
-            }
-            let reconcilable = matches!(
-                (reason, log.observed.last()),
-                (
-                    AbortReason::KernelRefused(claimed),
-                    Some(OperationOutcome::Failure(observed))
-                ) if claimed == observed
-            );
+            let reconcilable = !self.created
+                && matches!(
+                    (reason, log.observed.last()),
+                    (
+                        AbortReason::KernelRefused(claimed),
+                        Some(OperationOutcome::Failure(observed))
+                    ) if claimed == observed
+                );
             if reconcilable {
                 Ok(())
             } else {
@@ -1039,7 +1045,7 @@ mod tests {
 
     fn exit_supervisor(
         op: FsOp,
-        refuse_abort: bool,
+        created: bool,
     ) -> (Supervisor, Arc<Mutex<Recording>>, Arc<Mutex<Journaled>>) {
         let log = Arc::new(Mutex::new(Recording::default()));
         let journaled = Arc::new(Mutex::new(Journaled::default()));
@@ -1057,7 +1063,7 @@ mod tests {
             },
             Box::new(Journaling {
                 log: journaled.clone(),
-                refuse_abort,
+                created,
             }),
             None,
         );
@@ -1104,7 +1110,6 @@ mod tests {
             "the observed errno must reach the namespace as the abort reason"
         );
         assert_eq!(journaled.observed, vec![OperationOutcome::Failure(errno)]);
-        assert_eq!(journaled.commits, 0);
         let log = log.lock().unwrap();
         // The rewritten syscall executed, so the tracee's own return register
         // already carries the kernel's errno: the exit resumes it and emulates
@@ -1152,19 +1157,26 @@ mod tests {
         );
     }
 
-    // Case (d) at supervisor level: reconciliation is the namespace's verdict to
-    // give, not an error the supervisor may swallow. When the namespace cannot
-    // reconcile, the exit still fails closed -- the run poisons, the lifecycle
-    // latches, and nothing is resumed.
+    // Case (d) at supervisor level, and the supervisor-side counterpart of the
+    // overlay's creating-open boundary. Reconciliation is the namespace's
+    // verdict to give, not an error the supervisor may swallow: when `prepare`
+    // materialised a new object the namespace refuses to reconcile, and the exit
+    // must fail closed -- the run poisons, the lifecycle latches, and nothing is
+    // resumed. The supervisor still passes `KernelRefused` down; what changes is
+    // the answer it gets back.
     #[test]
-    fn an_unreconcilable_abort_still_poisons_the_run_and_resumes_nothing() {
+    fn a_refused_creating_open_poisons_the_run_and_resumes_nothing() {
         let thread = ThreadId(task(1).0);
         let (mut s, log, journaled) = exit_supervisor(
-            FsOp::Chmod {
+            FsOp::Open {
                 dir: DirRef::Cwd,
-                path: BytePath::new(b"/file".to_vec()).unwrap(),
-                mode: 0o600,
-                follow: true,
+                path: BytePath::new(b"/fresh".to_vec()).unwrap(),
+                flags: OpenFlags {
+                    write: true,
+                    create: true,
+                    ..OpenFlags::default()
+                },
+                mode: 0o640,
             },
             true,
         );
@@ -1181,7 +1193,12 @@ mod tests {
         );
         assert!(s.is_poisoned());
         assert_eq!(s.state.lifecycle, RunLifecycle::RecoveryRequired);
-        assert_eq!(journaled.lock().unwrap().aborts.len(), 1);
+        // The reason the supervisor sent is still the observed fact; the refusal
+        // is the namespace's, not a different reason having been constructed.
+        assert!(matches!(
+            journaled.lock().unwrap().aborts.as_slice(),
+            [AbortReason::KernelRefused(e)] if *e == Errno(1)
+        ));
         assert!(
             log.lock().unwrap().order().is_empty(),
             "a run that could not reconcile must resume nothing"

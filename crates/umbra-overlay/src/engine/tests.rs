@@ -2190,6 +2190,109 @@ fn a_kernel_rejected_write_open_reconciles_and_the_session_keeps_serving_reads()
     assert_eq!(fs::read(f.base_root.join("file")).unwrap(), b"base bytes");
 }
 
+// The boundary between the two branches of `prepare`'s mutating `Open` arm,
+// pinned in both directions. Nothing else in the suite distinguishes them -- the
+// case (c) test above deliberately opens an *existing* file, so it exercises
+// copy-up only -- and a change that erased the distinction would otherwise be
+// invisible to CI.
+#[test]
+fn a_refused_creating_open_poisons_while_a_refused_copy_up_open_reconciles() {
+    // Copy-up side. The object already existed in the base, so `prepare` only
+    // put a byte-identical duplicate in the shadow: the logical view is the same
+    // before and after, and the transaction is reconcilable.
+    let mut f = Fixture::new(&[(b"existing", b"base bytes")]);
+    let prepared = f.prepare(&open(
+        b"existing",
+        OpenFlags {
+            write: true,
+            ..Default::default()
+        },
+    ));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    assert_eq!(f.read(b"existing").unwrap(), b"base bytes");
+
+    // Creating side. `prepare` materialised an object that did not logically
+    // exist, and `abort` does not roll it back, so reconciling would publish a
+    // path the tracee was just told it failed to create. It stays on the poison
+    // path instead.
+    let mut f = Fixture::new(&[]);
+    assert_eq!(f.read(b"fresh").unwrap_err().kind, ErrorKind::NotFound);
+    let prepared = f.prepare(&open(
+        b"fresh",
+        OpenFlags {
+            write: true,
+            create: true,
+            ..Default::default()
+        },
+    ));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState,
+        "prepare materialised the object, so this refusal is not reconcilable"
+    );
+    assert!(f.overlay.poisoned);
+    // The divergence stays unreachable. A reconciled session would report the
+    // path present and empty and answer every later `O_CREAT|O_EXCL` on it with
+    // `AlreadyExists` forever; a poisoned one refuses both, loudly.
+    assert_eq!(f.read(b"fresh").unwrap_err().kind, ErrorKind::InvalidState);
+    assert_eq!(
+        f.overlay
+            .resolve(
+                &f.process,
+                &open(
+                    b"fresh",
+                    OpenFlags {
+                        write: true,
+                        create: true,
+                        exclusive: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState
+    );
+}
+
+// The same boundary on the rename plan, which materialises through `parents`
+// rather than `create`. Case (b) above renames onto an existing root-level path
+// and reconciles; this one has to create a destination parent directory and
+// therefore must not.
+#[test]
+fn a_refused_rename_that_created_destination_parents_poisons() {
+    let mut f = Fixture::new(&[(b"source", b"base bytes")]);
+    let prepared = f.prepare(&rename(b"source", b"fresh/target"));
+    assert!(
+        f.shadow_root.join("fresh").is_dir(),
+        "prepare created the destination parent"
+    );
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(EACCES))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(EACCES))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState,
+        "a phantom destination directory is a logical change abort cannot undo"
+    );
+    assert!(f.overlay.poisoned);
+}
+
 // Case (d), the guard: every abort that is *not* a corroborated kernel refusal
 // still poisons a mutating transaction. This is what keeps the two modes
 // structurally distinct rather than collapsing into one always-reconcile path.

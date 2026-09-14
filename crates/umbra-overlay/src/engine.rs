@@ -295,6 +295,16 @@ struct Pending {
     outcome: Option<OperationOutcome>,
     whiteouts: Vec<(StoragePath, bool)>,
     retired_index: Option<StoragePath>,
+    /// Whether `prepare` materialised an object that did not logically exist.
+    ///
+    /// Copy-up does not set this: it puts a byte-identical duplicate of a base
+    /// object into the shadow, so the logical view is the same before and after.
+    /// Creation does, and that is the difference `abort` needs, because a
+    /// reconciled abort leaves prepare's effects in place. Reconciling a
+    /// creation would publish a path the tracee was told its syscall failed to
+    /// make — and, because the shadow object outranks even a stale whiteout, a
+    /// later `O_CREAT|O_EXCL` on it would fail `EEXIST` forever.
+    created: bool,
 }
 
 /// Standard storage-independent namespace engine. Construction performs no I/O.
@@ -712,8 +722,12 @@ impl Overlay {
         }
         Ok(())
     }
-    fn parents(&mut self, path: &StoragePath) -> Result<()> {
+    /// Materialise the shadow parent directories of `path`, reporting whether
+    /// any had to be created. The caller needs that answer because a created
+    /// directory is a logical namespace change that `abort` cannot undo.
+    fn parents(&mut self, path: &StoragePath) -> Result<bool> {
         let parts: Vec<_> = path.as_bytes().split(|b| *b == b'/').collect();
+        let mut created = false;
         for n in 1..parts.len() {
             let parent = StoragePath::new(path.anchor(), parts[..n].join(&b'/'))?;
             if let Some(stat) = self.shadow_stat(&parent)? {
@@ -733,9 +747,10 @@ impl Overlay {
                         mode: 0o755,
                     },
                 )?;
+                created = true;
             }
         }
-        Ok(())
+        Ok(created)
     }
     fn create(&mut self, path: &StoragePath, kind: CreateKind, mode: u32) -> Result<()> {
         self.parents(path)?;
@@ -1388,6 +1403,7 @@ impl NamespaceSession for Overlay {
             outcome: None,
             whiteouts: vec![],
             retired_index: None,
+            created: false,
         });
         // Any failure after append may have left durable intent or storage effects.
         // Keep the session stopped for explicit recovery instead of guessing rollback.
@@ -1402,6 +1418,7 @@ impl NamespaceSession for Overlay {
                         self.copy_up(&plan.path)?;
                     } else {
                         self.create(&plan.path, CreateKind::File, *mode)?;
+                        self.pending.as_mut().unwrap().created = true;
                         self.pending
                             .as_mut()
                             .unwrap()
@@ -1422,6 +1439,7 @@ impl NamespaceSession for Overlay {
                 }
                 FsOp::Symlink { target, .. } => {
                     self.create_symlink(&plan.path, target, ObjectId(operation.0))?;
+                    self.pending.as_mut().unwrap().created = true;
                     self.pending
                         .as_mut()
                         .unwrap()
@@ -1430,6 +1448,7 @@ impl NamespaceSession for Overlay {
                 }
                 FsOp::Mkdir { mode, .. } => {
                     self.create(&plan.path, CreateKind::Directory, *mode)?;
+                    self.pending.as_mut().unwrap().created = true;
                     // Keep an existing directory whiteout as an opaque-base marker.
                 }
                 FsOp::Unlink { .. } => {
@@ -1454,7 +1473,12 @@ impl NamespaceSession for Overlay {
                     let destination = plan.destination.as_ref().unwrap();
                     if destination != &plan.path {
                         self.copy_up(&plan.path)?;
-                        self.parents(destination)?;
+                        // Only parents this call had to create count: renaming
+                        // into a directory that already existed materialises
+                        // nothing and stays reconcilable.
+                        if self.parents(destination)? {
+                            self.pending.as_mut().unwrap().created = true;
+                        }
                         if let Some(stat) = self.shadow_stat(destination)? {
                             let index = symlink_index(stat.object_id)?;
                             if self.shadow_stat(&index)?.is_some() {
@@ -1588,11 +1612,16 @@ impl NamespaceSession for Overlay {
         // the poison path below. Every other reason means the interception broke
         // down and keeps the poison-and-error behaviour unchanged; the two modes
         // never merge.
-        let kernel_refused = matches!(
-            (reason, &pending.outcome),
-            (AbortReason::KernelRefused(claimed), Some(OperationOutcome::Failure(observed)))
-                if claimed == observed
-        );
+        // Reconciling does not undo what `prepare` did. Copy-up is benign - the
+        // shadow object is byte-identical to the base - but a plan that
+        // materialised something new leaves a path the tracee was told does not
+        // exist, so it stays on the poison path until rollback exists.
+        let kernel_refused = !pending.created
+            && matches!(
+                (reason, &pending.outcome),
+                (AbortReason::KernelRefused(claimed), Some(OperationOutcome::Failure(observed)))
+                    if claimed == observed
+            );
         if mutation {
             if let Err(e) = self.record(
                 operation,
