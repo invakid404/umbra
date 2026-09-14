@@ -35,6 +35,19 @@ mints distinct storage operation identities from one logical transaction, becaus
 a backend may bind an operation ID to the single idempotency key it was first
 used with.
 
+`AbortReason::KernelRefused(Errno)` is the one abort reason that reports an
+observed syscall outcome rather than a failed interception: the rewritten call
+reached the kernel and the kernel refused it, and the tracee is owed the errno in
+its own return register. Every other variant still means the interception broke
+down. It is a licence for the namespace to reconcile instead of poisoning, not an
+instruction to — a namespace that cannot account for the aborted transaction's
+effects must still refuse, because abort rolls nothing back, and may discharge
+that obligation with a conservative approximation that refuses more often than
+strictly needed. The variant is
+appended, so already-encoded values still decode; a peer built without it cannot
+decode the new name, and `provider::PROTOCOL_VERSION` is unchanged because both
+ends ship together in-tree.
+
 `provider` contains runtime registry descriptors, JSON encoding and bounded private
 Unix transport primitives. Common protocol version 2 requires current installation
 descriptors and rejects older peers before sandbox/rewrite request decoding.

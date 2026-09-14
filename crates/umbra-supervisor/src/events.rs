@@ -385,18 +385,17 @@ impl Supervisor {
             }
             // A kernel errno is an observed syscall outcome, not an interception
             // failure: reconcile the transaction and let the tracee see it.
+            // `KernelRefused` is what makes the namespace agree — it names the
+            // observed fact instead of synthesising an interception failure, so
+            // the namespace reconciles instead of poisoning, the `resume_thread`
+            // below is reached, and the tracee's own return register, already
+            // carrying the kernel's errno, stands
+            // ([#53](https://github.com/invakid404/umbra/issues/53)). No register
+            // work is needed here: the rewritten syscall executed, unlike the
+            // `Deny` path above, where nothing ran and the result is emulated.
             OperationOutcome::Failure(errno) => {
-                self.namespace.abort(
-                    id,
-                    &AbortReason::Failed(
-                        error(
-                            ErrorKind::Io,
-                            "supervisor.syscall_exit",
-                            "operation failed in the kernel",
-                        )
-                        .with_errno(errno),
-                    ),
-                )?;
+                self.namespace
+                    .abort(id, &AbortReason::KernelRefused(errno))?;
             }
         }
         self.resume_thread(thread)
@@ -964,6 +963,252 @@ mod tests {
         // No operation slot was minted (the Scripted panics did not fire).
         assert!(s.operations.is_empty());
         assert!(!s.is_poisoned());
+    }
+
+    // What the namespace was asked to journal on the exit path, so a test can
+    // pin the abort *reason* and not merely that abort was called.
+    #[derive(Default)]
+    struct Journaled {
+        observed: Vec<OperationOutcome>,
+        aborts: Vec<AbortReason>,
+    }
+
+    // A namespace double for the syscall-exit path. It mirrors the overlay's
+    // real abort contract instead of accepting anything: a mutating transaction
+    // is reconcilable only when the reason is a `KernelRefused` naming the errno
+    // this session itself observed *and* `prepare` materialised nothing new.
+    // Every other reason is an interception failure that errors. Getting the
+    // reason right is the supervisor's job
+    // ([#53](https://github.com/invakid404/umbra/issues/53)), so the double
+    // enforces it end to end rather than rubber-stamping the call.
+    //
+    // KEEP IN SYNC WITH `Overlay::abort` (`umbra-overlay/src/engine.rs`). The two
+    // copies of the rule are not mechanically linked: no test wires a real
+    // `Overlay` to a real `Supervisor`, so a change to the real rule that is not
+    // mirrored here leaves these tests passing while the real system behaves
+    // differently. That is not hypothetical - it happened once during #53's
+    // review, when the `created` gate landed on `Overlay::abort` alone and this
+    // suite stayed green. Closing the gap needs an integration harness, tracked
+    // in [#57](https://github.com/invakid404/umbra/issues/57); once it exists,
+    // delete this double's rule rather than maintaining it.
+    struct Journaling {
+        log: Arc<Mutex<Journaled>>,
+        // The `Pending.created` flag of the transaction being aborted: true when
+        // `prepare` had to create a shadow object that was not there before,
+        // which the overlay refuses to reconcile because nothing rolls it back.
+        // A session constant here, where `Pending.created` is per-transaction;
+        // equivalent only because every test below drives exactly one
+        // transaction, so a harness that drives several needs the real shape.
+        created: bool,
+    }
+    fn unreconcilable() -> UmbraError {
+        UmbraError::new(
+            ErrorKind::InvalidState,
+            "overlay.abort",
+            "aborted effects require reconciliation",
+        )
+    }
+    impl NamespaceResolver for Journaling {
+        fn resolve(&mut self, _: &ProcessContext, _: &FsOp) -> Result<ResolvedAction> {
+            panic!("only the syscall exit is driven; the entry already resolved")
+        }
+    }
+    impl NamespaceSession for Journaling {
+        fn prepare(&mut self, _: OperationId, _: &ResolvedAction) -> Result<PreparedAction> {
+            panic!("only the syscall exit is driven; the entry already prepared")
+        }
+        fn observe_result(&mut self, _: OperationId, outcome: &OperationOutcome) -> Result<()> {
+            self.log.lock().unwrap().observed.push(outcome.clone());
+            Ok(())
+        }
+        fn commit(&mut self, _: OperationId) -> Result<CommitReceipt> {
+            panic!("an observed kernel failure must never commit")
+        }
+        fn abort(&mut self, _: OperationId, reason: &AbortReason) -> Result<()> {
+            let mut log = self.log.lock().unwrap();
+            log.aborts.push(reason.clone());
+            let reconcilable = !self.created
+                && matches!(
+                    (reason, log.observed.last()),
+                    (
+                        AbortReason::KernelRefused(claimed),
+                        Some(OperationOutcome::Failure(observed))
+                    ) if claimed == observed
+                );
+            if reconcilable {
+                Ok(())
+            } else {
+                Err(unreconcilable())
+            }
+        }
+        fn checkpoint(&mut self, _: &CheckpointRequest) -> Result<Checkpoint> {
+            unreachable!()
+        }
+        fn renew_writer(&mut self) -> Result<WriterLease> {
+            unreachable!()
+        }
+    }
+
+    fn exit_supervisor(
+        op: FsOp,
+        created: bool,
+    ) -> (Supervisor, Arc<Mutex<Recording>>, Arc<Mutex<Journaled>>) {
+        let log = Arc::new(Mutex::new(Recording::default()));
+        let journaled = Arc::new(Mutex::new(Journaled::default()));
+        let mut s = Supervisor::with_namespace(
+            RunId(Uuid::new_v4()),
+            PlatformSession {
+                control: Box::new(Recorder {
+                    op: op.clone(),
+                    log: log.clone(),
+                }),
+                abi: Box::new(Recorder {
+                    op,
+                    log: log.clone(),
+                }),
+            },
+            Box::new(Journaling {
+                log: journaled.clone(),
+                created,
+            }),
+            None,
+        );
+        s.track_process(task(1), None);
+        s.state.processes.root = Some(ProcessHandle(task(1)));
+        s.live = 1;
+        s.state.lifecycle = RunLifecycle::Running;
+        (s, log, journaled)
+    }
+
+    // The shared body of the kernel-refusal cases. The entry path is covered
+    // elsewhere, so only the exit is driven: the operation slot the entry would
+    // have minted is seeded, which keeps the recorded platform calls below the
+    // exit's behaviour alone.
+    fn a_refused_syscall_reconciles_and_resumes(op: FsOp, errno: Errno) {
+        assert!(
+            matches!(
+                umbra_overlay::dispatch(&op),
+                umbra_overlay::Dispatch::Materialise | umbra_overlay::Dispatch::Whiteout
+            ),
+            "the contract under test is the Materialise/Whiteout class"
+        );
+        let thread = ThreadId(task(1).0);
+        let (mut s, log, journaled) = exit_supervisor(op, false);
+        s.operations.insert(thread, OperationId(Uuid::new_v4()));
+        s.handle_event(TraceEvent::SyscallExit {
+            task: task(1),
+            thread,
+            outcome: OperationOutcome::Failure(errno),
+        })
+        .unwrap();
+        // The run continues: no poison latch and no recovery lifecycle.
+        assert!(!s.is_poisoned());
+        assert_eq!(s.state.lifecycle, RunLifecycle::Running);
+        // The slot is released, so the thread's next entry is not rejected as
+        // one still awaiting its exit.
+        assert!(s.operations.is_empty());
+        let journaled = journaled.lock().unwrap();
+        // Assert the reason's value, not just the call: a synthetic
+        // `Failed(..)` here is exactly the pre-#53 behaviour, and a bare count
+        // would not notice it coming back.
+        assert!(
+            matches!(journaled.aborts.as_slice(), [AbortReason::KernelRefused(e)] if *e == errno),
+            "the observed errno must reach the namespace as the abort reason"
+        );
+        assert_eq!(journaled.observed, vec![OperationOutcome::Failure(errno)]);
+        let log = log.lock().unwrap();
+        // The rewritten syscall executed, so the tracee's own return register
+        // already carries the kernel's errno: the exit resumes it and emulates
+        // nothing. Contrast the `Deny` path, where no syscall ran.
+        assert_eq!(log.order(), vec!["resume"]);
+        assert!(log.set_register_threads().is_empty());
+        assert_eq!(
+            log.resumes(),
+            vec![ResumeCommand {
+                thread,
+                mode: ResumeMode::Syscall,
+                signal: None,
+            }]
+        );
+    }
+
+    // Case (a): a metadata mutation the kernel refuses with EPERM, which is what
+    // an unprivileged tracee gets routinely. `Chmod` also pins that the fix is
+    // keyed on the dispatch class and not on the variants the overlay engine
+    // happens to resolve today.
+    #[test]
+    fn a_kernel_refused_chmod_is_reconciled_and_the_tracee_keeps_its_errno() {
+        a_refused_syscall_reconciles_and_resumes(
+            FsOp::Chmod {
+                dir: DirRef::Cwd,
+                path: BytePath::new(b"/file".to_vec()).unwrap(),
+                mode: 0o600,
+                follow: true,
+            },
+            Errno(1),
+        );
+    }
+
+    // Case (c): the data path, to show the reconciliation is class-wide rather
+    // than metadata-shaped.
+    #[test]
+    fn a_kernel_refused_write_is_reconciled_and_the_tracee_keeps_its_errno() {
+        a_refused_syscall_reconciles_and_resumes(
+            FsOp::Write {
+                fd: TracedFd(3),
+                length: 4096,
+                offset: None,
+            },
+            Errno(28),
+        );
+    }
+
+    // Case (d) at supervisor level, and the supervisor-side counterpart of the
+    // overlay's creating-open boundary. Reconciliation is the namespace's
+    // verdict to give, not an error the supervisor may swallow: when `prepare`
+    // materialised a new object the namespace refuses to reconcile, and the exit
+    // must fail closed -- the run poisons, the lifecycle latches, and nothing is
+    // resumed. The supervisor still passes `KernelRefused` down; what changes is
+    // the answer it gets back.
+    #[test]
+    fn a_refused_creating_open_poisons_the_run_and_resumes_nothing() {
+        let thread = ThreadId(task(1).0);
+        let (mut s, log, journaled) = exit_supervisor(
+            FsOp::Open {
+                dir: DirRef::Cwd,
+                path: BytePath::new(b"/fresh".to_vec()).unwrap(),
+                flags: OpenFlags {
+                    write: true,
+                    create: true,
+                    ..OpenFlags::default()
+                },
+                mode: 0o640,
+            },
+            true,
+        );
+        s.operations.insert(thread, OperationId(Uuid::new_v4()));
+        assert_eq!(
+            s.handle_event(TraceEvent::SyscallExit {
+                task: task(1),
+                thread,
+                outcome: OperationOutcome::Failure(Errno(1)),
+            })
+            .unwrap_err()
+            .kind,
+            ErrorKind::InvalidState
+        );
+        assert!(s.is_poisoned());
+        assert_eq!(s.state.lifecycle, RunLifecycle::RecoveryRequired);
+        // The reason the supervisor sent is still the observed fact; the refusal
+        // is the namespace's, not a different reason having been constructed.
+        assert!(matches!(
+            journaled.lock().unwrap().aborts.as_slice(),
+            [AbortReason::KernelRefused(e)] if *e == Errno(1)
+        ));
+        assert!(
+            log.lock().unwrap().order().is_empty(),
+            "a run that could not reconcile must resume nothing"
+        );
     }
 
     #[test]

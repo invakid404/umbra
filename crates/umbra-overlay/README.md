@@ -126,15 +126,16 @@ new resolutions are blocked while a transaction is pending.
   logical symlink keeps the base identity, so it still does. The path is what
   stays resolvable in both cases, for the same reason `CopyUp` carries one.
 
-  A chown the **kernel** rejects takes the mutation abort path: the `Abort` is
-  journaled, the session is poisoned, and `abort` returns `InvalidState`, which
-  ends the run rather than handing the tracee its errno. That is the shared
+  A chown the **kernel** rejects is reconciled, not fatal: the `Abort` is
+  journaled and `abort` returns `Ok`, so the supervisor resumes the tracee with
+  the errno already in its return register
+  ([#53](https://github.com/invakid404/umbra/issues/53)). That is the shared
   `Materialise` contract, not something specific to ownership, but `fchownat` is
   the first operation to route a routinely-failing syscall into it — an
   unprivileged tracee chowning to another uid gets `EPERM`, which most programs
-  would otherwise shrug off. `FsOp::Chmod`, `FsOp::Fchmod` and `FsOp::Link`
-  remain unimplemented at `resolve`; ownership is the only metadata mutation
-  wired through today.
+  shrug off and which used to end the whole run. `FsOp::Chmod`, `FsOp::Fchmod`
+  and `FsOp::Link` remain unimplemented at `resolve`; ownership is the only
+  metadata mutation wired through today.
 - Rename materializes a regular-file or logical-symlink source, creates shadow destination parents,
   and returns source/destination kernel rewrites for one native shadow rename.
   On observed success the source whiteout is set and destination whiteout cleared.
@@ -176,10 +177,77 @@ Unit tests inject an in-memory Journal to model ordering and failure boundaries;
 restart recovery still requires reconciliation that this engine does not implement.
 
 Abort never claims that copy-up, creation, unlink, or a kernel mutation was undone.
-An aborted mutation requires recovery and leaves the session stopped. Checkpoint
-flushes storage and journal, takes whiteouts from authoritative control markers,
-and publishes a logical checkpoint with `clean: false`. Only the supervisor can
-establish the broader clean-handoff conditions.
+An aborted mutation requires recovery and leaves the session stopped, with one
+structurally distinct exception: `AbortReason::KernelRefused(errno)`. That reason
+says the rewritten syscall reached the kernel and the kernel refused it, so the
+effects are exactly the ones `prepare` journaled, the verdict is the one
+`observe_result` journaled, and the tracee is owed the errno. Such an abort still
+writes its `Abort` record and still rolls nothing back, but it returns `Ok` and
+leaves the session usable, which is what lets an ordinary `EPERM`/`ENOSPC` reach
+the tracee instead of ending the run
+([#53](https://github.com/invakid404/umbra/issues/53)). The reason is a claim by
+the caller, so it is honoured only when `Pending.outcome` — the failure this
+session itself observed — carries the same errno; an unobserved or mismatched
+claim is an interception inconsistency and takes the poison path. `Cancelled`,
+`Failed` and `RecoveryRequired` are unchanged: they mean the interception broke
+down, and neither mode widens to cover the other.
+
+Reconciling does not undo what `prepare` already did, so it is confined to the
+plans whose preparation created nothing. `Pending.created` records the
+difference. A reconciled creating open would publish a path the tracee was just
+told its open failed to make, and because the shadow object outranks even a stale
+whiteout marker that `commit` would have cleared, every later `O_CREAT|O_EXCL` on
+it would answer `AlreadyExists` permanently. Such a transaction therefore keeps
+the pre-#53 poison behaviour: the run ends, loudly, instead of the namespace
+diverging. The same applies to `Symlink`, `Mkdir` and a cross-path `rename` that
+had to materialise destination parents. Lifting that — so a refused creating
+operation is retryable rather than fatal — needs rollback of prepare-time
+creations, which needs the reconciliation this MVP does not implement, and is
+tracked in [#55](https://github.com/invakid404/umbra/issues/55).
+
+Copy-up is deliberately not counted as a creation, so a refused `fchownat`, or a
+refused write open on an object the base already holds, reconciles. The content
+view is unchanged, and counting it would poison the run on the first write into
+any not-yet-shadowed base subdirectory — a large share of the ordinary `EPERM`
+cases this contract exists to survive. That is **not** a claim that copy-up is
+invisible: materialising shadow ancestors gives them a hardcoded `0o755` rather
+than the base directory's mode, so a base directory at `0700` is reported as
+`0755` afterwards, including after a syscall the tracee was told had failed. That
+divergence also fires on the success path, so it is a fidelity defect in
+`parents` rather than a property of this contract, and it is tracked in
+[#56](https://github.com/invakid404/umbra/issues/56). Note also that `created` is
+shadow-shaped: `parents` consults the shadow only, so a cross-path `rename` onto
+a destination parent that exists in the base but has not been copied up yet is
+counted as a creation and poisons. That is fail-closed and under-delivers for
+`rename`; the same issue covers it.
+
+Commit-time effects are never applied by `abort`: `pending.whiteouts` and
+`retired_index` are consumed in `commit` alone, so a reconciled `rename` sets no
+whiteout and retires no symlink index. That is a property of this engine rather
+than an end-to-end guarantee, because most of the class cannot reach a kernel
+refusal at all yet. `FsOp::Unlink` — the whole `Whiteout` half — and also
+`FsOp::Symlink`, `FsOp::Mkdir` and a same-path `rename` resolve to `Emulate`, and
+`observe_result` refuses an outcome that differs from the emulated one; a
+cross-path `rename` resolves to a two-path `Rewrite` that, as `apply_rewrite`
+stands in `umbra-supervisor` today, is refused before the tracee ever reaches a
+syscall exit — a fact owned by that crate, not this one. The reachable surface
+today is a write-mode `Open` and `FsOp::Fchownat`. The behaviour is keyed on the
+dispatch class, not on a variant list, so the rest of the class inherits it as
+those paths are wired — with two caveats to settle first. `Unlink`'s `prepare`
+*destroys* the shadow object outright and sets no `created`, so a `Whiteout`-class
+refusal reaching `abort` would reconcile after discarding shadow-only data: the
+mirror image of the creation case, and a real gap in the gate rather than a
+question of wiring. `FsOp::Link` is a different shape — `resolve` refuses it as
+beyond-MVP, so `prepare` is never entered for it and the `_ => {}` arm it would
+fall to materialises nothing; when it *is* wired it will need an arm of its own
+doing `copy_up` of the source and `parents` of the destination, exactly as
+`rename` does, and that is where setting `created` is easy to forget. Whoever
+wires either path has to revisit the gate rather than assume the inheritance;
+noted on [#57](https://github.com/invakid404/umbra/issues/57).
+
+Checkpoint flushes storage and journal, takes whiteouts from authoritative control
+markers, and publishes a logical checkpoint with `clean: false`. Only the
+supervisor can establish the broader clean-handoff conditions.
 
 ## Byte resolution
 

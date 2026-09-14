@@ -295,6 +295,30 @@ struct Pending {
     outcome: Option<OperationOutcome>,
     whiteouts: Vec<(StoragePath, bool)>,
     retired_index: Option<StoragePath>,
+    /// Whether `prepare` had to create a shadow object that was not there before.
+    ///
+    /// This is what `abort` gates reconciliation on, because a reconciled abort
+    /// leaves prepare's effects standing. Creating a file or directory that did
+    /// not already exist is the case that must not be reconciled: it would
+    /// publish a path the tracee was told its syscall failed to make — and,
+    /// because the shadow object outranks even a stale whiteout, a later
+    /// `O_CREAT|O_EXCL` on it would fail `EEXIST` forever.
+    ///
+    /// Copy-up deliberately does not set this, and the reason is *not* that
+    /// copy-up is invisible. It duplicates an object the base already holds, so
+    /// the content view is unchanged, and treating it as a creation would poison
+    /// the run on the first write into any not-yet-shadowed base subdirectory —
+    /// a large share of the ordinary `EPERM` cases
+    /// [#53](https://github.com/invakid404/umbra/issues/53) exists to survive.
+    /// But materialising shadow ancestors is not free: `parents` gives them a
+    /// hardcoded `0o755` instead of the base directory's mode, so a base
+    /// directory at `0700` is reported as `0755` afterwards. That divergence
+    /// fires on the success path too — it is a fidelity defect in `parents`
+    /// ([#56](https://github.com/invakid404/umbra/issues/56)), not something this
+    /// flag is gating, and fixing it there removes the divergence on both paths.
+    ///
+    /// The predicate is shadow-shaped rather than logical; see `parents`.
+    created: bool,
 }
 
 /// Standard storage-independent namespace engine. Construction performs no I/O.
@@ -712,8 +736,25 @@ impl Overlay {
         }
         Ok(())
     }
-    fn parents(&mut self, path: &StoragePath) -> Result<()> {
+    /// Materialise the shadow parent directories of `path`, reporting whether any
+    /// had to be created.
+    ///
+    /// The answer is *shadow*-shaped, not logical: this consults `shadow_stat`
+    /// only and never the base, so an ancestor that already exists in the base but
+    /// has not been copied up yet is reported as created. `Pending.created`
+    /// inherits that over-approximation, which is why a refused cross-path rename
+    /// onto a base-only destination parent poisons rather than reconciles — #53
+    /// under-delivers there. That is fail-closed, so it stays: narrowing the
+    /// predicate to consult the base would have to answer for the fact that the
+    /// directory created here does not carry the base directory's mode
+    /// ([#56](https://github.com/invakid404/umbra/issues/56)), and so is not
+    /// logically the same directory it shadows.
+    ///
+    /// `create` discards the answer, so `copy_up` is not treated as a creation.
+    /// See `Pending.created` for why, and for the asymmetry that leaves.
+    fn parents(&mut self, path: &StoragePath) -> Result<bool> {
         let parts: Vec<_> = path.as_bytes().split(|b| *b == b'/').collect();
+        let mut created = false;
         for n in 1..parts.len() {
             let parent = StoragePath::new(path.anchor(), parts[..n].join(&b'/'))?;
             if let Some(stat) = self.shadow_stat(&parent)? {
@@ -733,9 +774,10 @@ impl Overlay {
                         mode: 0o755,
                     },
                 )?;
+                created = true;
             }
         }
-        Ok(())
+        Ok(created)
     }
     fn create(&mut self, path: &StoragePath, kind: CreateKind, mode: u32) -> Result<()> {
         self.parents(path)?;
@@ -1388,6 +1430,7 @@ impl NamespaceSession for Overlay {
             outcome: None,
             whiteouts: vec![],
             retired_index: None,
+            created: false,
         });
         // Any failure after append may have left durable intent or storage effects.
         // Keep the session stopped for explicit recovery instead of guessing rollback.
@@ -1402,6 +1445,7 @@ impl NamespaceSession for Overlay {
                         self.copy_up(&plan.path)?;
                     } else {
                         self.create(&plan.path, CreateKind::File, *mode)?;
+                        self.pending.as_mut().unwrap().created = true;
                         self.pending
                             .as_mut()
                             .unwrap()
@@ -1422,6 +1466,7 @@ impl NamespaceSession for Overlay {
                 }
                 FsOp::Symlink { target, .. } => {
                     self.create_symlink(&plan.path, target, ObjectId(operation.0))?;
+                    self.pending.as_mut().unwrap().created = true;
                     self.pending
                         .as_mut()
                         .unwrap()
@@ -1430,6 +1475,7 @@ impl NamespaceSession for Overlay {
                 }
                 FsOp::Mkdir { mode, .. } => {
                     self.create(&plan.path, CreateKind::Directory, *mode)?;
+                    self.pending.as_mut().unwrap().created = true;
                     // Keep an existing directory whiteout as an opaque-base marker.
                 }
                 FsOp::Unlink { .. } => {
@@ -1454,7 +1500,14 @@ impl NamespaceSession for Overlay {
                     let destination = plan.destination.as_ref().unwrap();
                     if destination != &plan.path {
                         self.copy_up(&plan.path)?;
-                        self.parents(destination)?;
+                        // Only parents this call had to create count: renaming
+                        // into a directory that is already in the shadow
+                        // materialises nothing and stays reconcilable. A
+                        // base-only parent is counted as created - see
+                        // `parents`.
+                        if self.parents(destination)? {
+                            self.pending.as_mut().unwrap().created = true;
+                        }
                         if let Some(stat) = self.shadow_stat(destination)? {
                             let index = symlink_index(stat.object_id)?;
                             if self.shadow_stat(&index)?.is_some() {
@@ -1573,6 +1626,32 @@ impl NamespaceSession for Overlay {
         // Materialisation or emulated unlink may already have effects. We do not
         // clear a mutated session or claim those effects were rolled back.
         let mutation = pending.plan.mutation;
+        // A kernel refusal is the one abort whose effects are fully accounted
+        // for: `prepare` journaled them, `observe_result` journaled the kernel's
+        // verdict, and nothing else ran. Reconciling it and letting the tracee
+        // see its errno is the contract the supervisor's `syscall_exit` states;
+        // poisoning here would kill the run over an ordinary `EPERM`, which is
+        // the defect in [#53](https://github.com/invakid404/umbra/issues/53).
+        //
+        // `reason` is only a claim by the caller, so it is honoured only when
+        // the outcome this session itself recorded corroborates it. An abort
+        // claiming a refusal for a transaction whose kernel verdict was never
+        // observed, or whose observed errno differs from the claimed one, is an
+        // interception inconsistency, not a refused syscall: it falls through to
+        // the poison path below. Every other reason means the interception broke
+        // down and keeps the poison-and-error behaviour unchanged; the two modes
+        // never merge.
+        // Reconciling does not undo what `prepare` did. A plan that created a
+        // shadow object leaves a path the tracee was told does not exist, so it
+        // stays on the poison path until rollback exists. Copy-up is
+        // deliberately not counted - see `Pending.created` for why, and for what
+        // it does change.
+        let kernel_refused = !pending.created
+            && matches!(
+                (reason, &pending.outcome),
+                (AbortReason::KernelRefused(claimed), Some(OperationOutcome::Failure(observed)))
+                    if claimed == observed
+            );
         if mutation {
             if let Err(e) = self.record(
                 operation,
@@ -1586,7 +1665,7 @@ impl NamespaceSession for Overlay {
             }
         }
         self.pending = None;
-        if mutation {
+        if mutation && !kernel_refused {
             self.poisoned = true;
             return Err(error(
                 ErrorKind::InvalidState,

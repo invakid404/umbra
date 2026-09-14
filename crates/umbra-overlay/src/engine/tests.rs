@@ -872,7 +872,13 @@ fn copy_up_spans_multiple_bounded_io_chunks_and_creates_directories() {
 }
 
 #[test]
-fn same_path_base_rename_is_a_noop_and_mutation_abort_does_not_claim_rollback() {
+fn same_path_base_rename_is_a_noop_and_a_cancelled_mutation_abort_does_not_claim_rollback() {
+    // The abort here is `Cancelled`: the caller abandoned the transaction, which
+    // is an interception failure and still poisons. A kernel-returned errno is
+    // the other mode and does *not* behave this way -- see
+    // `a_kernel_rejected_write_open_reconciles_and_the_session_keeps_serving_reads`.
+    // The observed `Failure` below is only what puts the transaction in an
+    // abortable state; it is not what decides the outcome.
     let mut f = Fixture::new(&[(b"base", b"unchanged")]);
     f.run(&rename(b"base", b"base"));
     assert!(!f.shadow_root.join("base").exists());
@@ -2015,27 +2021,31 @@ fn chowning_a_base_only_logical_symlink_copies_it_up_and_keeps_its_identity() {
         if *o == id && path.as_bytes() == b"/link"));
 }
 
+// Errnos the kernel routinely hands back on a Materialise operation. Named so
+// the abort-contract tests read as the failures they model; test-local because
+// nothing in the crate API spells them.
+const EPERM: Errno = Errno(1);
+const EACCES: Errno = Errno(13);
+const ENOSPC: Errno = Errno(28);
+
+// Case (a): a kernel-returned errno on a metadata mutation.
 #[test]
-fn a_kernel_rejected_chown_aborts_into_a_session_that_requires_reconciliation() {
+fn a_kernel_rejected_chown_reconciles_and_leaves_the_session_usable() {
     // EPERM is the ordinary answer when an unprivileged tracee chowns to
-    // another uid. Because Fchownat is a Materialise operation, that routine
-    // failure takes the mutation abort path: the Abort is journaled, the
-    // session is poisoned and abort itself errors, which ends the run rather
-    // than handing the tracee its errno. Pinned here so the limitation is a
-    // recorded property rather than something discovered in a live run.
+    // another uid. Fchownat is a Materialise operation, so before #53 that
+    // routine failure took the poisoning mutation abort path and ended the run
+    // instead of handing the tracee its errno. `KernelRefused` names the
+    // observed fact, so the abort reconciles: it returns Ok, the session stays
+    // usable, and the supervisor goes on to resume the tracee.
     let mut f = Fixture::new(&[(b"file", b"base bytes")]);
     let prepared = f.prepare(&chown(b"file", Some(0), Some(0), true));
     f.overlay
-        .observe_result(prepared.operation_id, &OperationOutcome::Failure(Errno(1)))
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(EPERM))
         .unwrap();
-    assert_eq!(
-        f.overlay
-            .abort(prepared.operation_id, &AbortReason::Cancelled)
-            .unwrap_err()
-            .kind,
-        ErrorKind::InvalidState
-    );
-    assert!(f.overlay.poisoned);
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(EPERM))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
     let payloads = f.log.lock().unwrap().records.clone();
     assert!(matches!(
         &payloads[0].payload,
@@ -2047,7 +2057,12 @@ fn a_kernel_rejected_chown_aborts_into_a_session_that_requires_reconciliation() 
         payloads[1].payload,
         JournalPayload::ObservedResult { .. }
     ));
-    assert!(matches!(payloads[2].payload, JournalPayload::Abort { .. }));
+    // Reconciling does not make the transaction vanish: the Abort record is
+    // still written, and now names the kernel's own verdict.
+    assert!(matches!(
+        &payloads[2].payload,
+        JournalPayload::Abort { reason } if reason.contains("KernelRefused")
+    ));
     assert!(
         !payloads
             .iter()
@@ -2055,7 +2070,327 @@ fn a_kernel_rejected_chown_aborts_into_a_session_that_requires_reconciliation() 
         "a failed chown must not commit"
     );
     // The copy-up is not rolled back, and abort does not claim it was: the
-    // shadow object stays, byte-identical to the base it came from.
+    // shadow object stays, carrying the base's bytes. `file` is at the root, so
+    // `copy_up` materialised no ancestors here; under a not-yet-shadowed base
+    // directory it would also have conjured one at `0o755` (#56). Copy-up is
+    // uncounted by choice, not because it changes nothing -- see
+    // `Pending.created`.
     assert_eq!(fs::read(f.shadow_root.join("file")).unwrap(), b"base bytes");
     assert_eq!(fs::read(f.base_root.join("file")).unwrap(), b"base bytes");
+    // The run continues: a reconciled session still serves reads and still
+    // accepts the next transaction.
+    assert_eq!(f.read(b"file").unwrap(), b"base bytes");
+    let retried = f.prepare(&chown(b"file", Some(0), Some(0), true));
+    f.complete(retried);
+}
+
+// Case (b): a kernel-returned errno on the rename/whiteout path.
+#[test]
+fn a_kernel_rejected_rename_reconciles_without_applying_commit_time_whiteouts() {
+    // A rename across paths is the widest Materialise plan: it carries both
+    // source/destination whiteouts and, when the destination is a logical
+    // symlink, a retired symlink index. Those are applied in `commit`, never in
+    // `abort`, so reconciling a refused rename must leave the namespace exactly
+    // as it was -- no whiteout set, no index retired.
+    let mut f = Fixture::new(&[(b"source", b"base bytes")]);
+    f.run(&symlink(b"target", b"elsewhere"));
+    let indexes = f.control.join("symlinks/objects");
+    let count = |dir: &PathBuf| fs::read_dir(dir).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(
+        count(&indexes),
+        1,
+        "the destination symlink has an index to retire"
+    );
+    // Everything the setup symlink journaled is already behind us; only the
+    // refused rename's own records are inspected below.
+    let before = f.log.lock().unwrap().records.len();
+    let prepared = f.prepare(&rename(b"source", b"target"));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(EACCES))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(EACCES))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    let payloads = f.log.lock().unwrap().records[before..].to_vec();
+    assert!(matches!(
+        &payloads[0].payload,
+        JournalPayload::Prepare {
+            intent: JournalIntent::Rename { .. }
+        }
+    ));
+    assert!(matches!(
+        payloads[1].payload,
+        JournalPayload::ObservedResult { .. }
+    ));
+    assert!(matches!(
+        &payloads[2].payload,
+        JournalPayload::Abort { reason } if reason.contains("KernelRefused")
+    ));
+    assert!(
+        !payloads
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Commit)),
+        "the refused rename must not commit"
+    );
+    // No whiteout marker was written at all: the source is still visible and
+    // the control tree has no whiteout namespace.
+    assert!(!f.control.join("whiteouts").exists());
+    assert_eq!(f.read(b"source").unwrap(), b"base bytes");
+    // The destination index was not retired, so the destination is still the
+    // logical symlink it was before the refused rename.
+    assert_eq!(count(&indexes), 1);
+    assert_eq!(
+        f.overlay.read_link(&root(b"target").unwrap()).unwrap(),
+        bytes(b"elsewhere")
+    );
+}
+
+// Case (c): a kernel-returned errno on the data path.
+#[test]
+fn a_kernel_rejected_write_open_reconciles_and_the_session_keeps_serving_reads() {
+    let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+    // `FsOp::Write` itself cannot reach `prepare` in this engine: `resolve`
+    // still refuses descriptor-addressed data operations as beyond-MVP, even
+    // though `dispatch` already classifies them `Materialise`. The resolvable
+    // data-path member of the same class is a write-mode `Open`, exercised
+    // below; the real `FsOp::Write` is covered against the supervisor in
+    // `umbra-supervisor`'s `events.rs` tests, which drive a namespace double.
+    assert_eq!(
+        f.overlay
+            .resolve(
+                &f.process,
+                &FsOp::Write {
+                    fd: TracedFd(3),
+                    length: 4,
+                    offset: None,
+                },
+            )
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsupportedCapability
+    );
+    let prepared = f.prepare(&open(
+        b"file",
+        OpenFlags {
+            write: true,
+            ..Default::default()
+        },
+    ));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    let payloads = f.log.lock().unwrap().records.clone();
+    assert!(matches!(
+        &payloads.last().unwrap().payload,
+        JournalPayload::Abort { reason } if reason.contains("KernelRefused")
+    ));
+    assert_eq!(f.read(b"file").unwrap(), b"base bytes");
+    assert_eq!(fs::read(f.base_root.join("file")).unwrap(), b"base bytes");
+}
+
+// The boundary between the two branches of `prepare`'s mutating `Open` arm,
+// pinned in both directions. Nothing else in the suite distinguishes them -- the
+// case (c) test above deliberately opens an *existing* file, so it exercises
+// copy-up only -- and a change that erased the distinction would otherwise be
+// invisible to CI.
+#[test]
+fn a_refused_creating_open_poisons_while_a_refused_copy_up_open_reconciles() {
+    // Copy-up side. The base already holds the object, so `prepare` duplicated
+    // it into the shadow instead of creating it, and the transaction is
+    // reconcilable. A root-level path, so no ancestors were materialised
+    // either; `Pending.created` records what copy-up does still change.
+    let mut f = Fixture::new(&[(b"existing", b"base bytes")]);
+    let prepared = f.prepare(&open(
+        b"existing",
+        OpenFlags {
+            write: true,
+            ..Default::default()
+        },
+    ));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    assert_eq!(f.read(b"existing").unwrap(), b"base bytes");
+
+    // Creating side. `prepare` materialised an object that did not logically
+    // exist, and `abort` does not roll it back, so reconciling would publish a
+    // path the tracee was just told it failed to create. It stays on the poison
+    // path instead.
+    let mut f = Fixture::new(&[]);
+    assert_eq!(f.read(b"fresh").unwrap_err().kind, ErrorKind::NotFound);
+    let prepared = f.prepare(&open(
+        b"fresh",
+        OpenFlags {
+            write: true,
+            create: true,
+            ..Default::default()
+        },
+    ));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState,
+        "prepare materialised the object, so this refusal is not reconcilable"
+    );
+    assert!(f.overlay.poisoned);
+    // The divergence stays unreachable. A reconciled session would report the
+    // path present and empty and answer every later `O_CREAT|O_EXCL` on it with
+    // `AlreadyExists` forever; a poisoned one refuses both, loudly.
+    assert_eq!(f.read(b"fresh").unwrap_err().kind, ErrorKind::InvalidState);
+    assert_eq!(
+        f.overlay
+            .resolve(
+                &f.process,
+                &open(
+                    b"fresh",
+                    OpenFlags {
+                        write: true,
+                        create: true,
+                        exclusive: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState
+    );
+}
+
+// The same boundary on the rename plan, which materialises through `parents`
+// rather than `create`. Case (b) above renames onto an existing root-level path
+// and reconciles; this one has to create a destination parent directory and
+// therefore must not.
+#[test]
+fn a_refused_rename_that_created_destination_parents_poisons() {
+    let mut f = Fixture::new(&[(b"source", b"base bytes")]);
+    let prepared = f.prepare(&rename(b"source", b"fresh/target"));
+    assert!(
+        f.shadow_root.join("fresh").is_dir(),
+        "prepare created the destination parent"
+    );
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(EACCES))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(EACCES))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState,
+        "a phantom destination directory is a logical change abort cannot undo"
+    );
+    assert!(f.overlay.poisoned);
+}
+
+// Case (d), the guard: every abort that is *not* a corroborated kernel refusal
+// still poisons a mutating transaction. This is what keeps the two modes
+// structurally distinct rather than collapsing into one always-reconcile path.
+#[test]
+fn a_genuine_mid_transaction_abort_still_poisons_a_mutation() {
+    for reason in [
+        AbortReason::Cancelled,
+        AbortReason::RecoveryRequired("interception lost".into()),
+        AbortReason::Failed(error(ErrorKind::Io, "supervisor gave up")),
+    ] {
+        let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+        let prepared = f.prepare(&chown(b"file", Some(0), Some(0), true));
+        f.overlay
+            .observe_result(prepared.operation_id, &OperationOutcome::Failure(EPERM))
+            .unwrap();
+        assert_eq!(
+            f.overlay
+                .abort(prepared.operation_id, &reason)
+                .unwrap_err()
+                .kind,
+            ErrorKind::InvalidState,
+            "{reason:?} is an interception failure, not an observed kernel verdict"
+        );
+        assert!(f.overlay.poisoned, "{reason:?} must poison");
+    }
+}
+
+#[test]
+fn an_uncorroborated_kernel_refusal_claim_poisons_instead_of_reconciling() {
+    // The reason is a claim by the caller; the observed outcome is this
+    // session's own record. A claim with no observed verdict behind it, or one
+    // naming an errno the session never saw, is an interception inconsistency,
+    // so it fails closed onto the poison path.
+    let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+    let prepared = f.prepare(&chown(b"file", Some(0), Some(0), true));
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(EPERM))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState,
+        "no result was ever observed for this transaction"
+    );
+    assert!(f.overlay.poisoned);
+
+    let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+    let prepared = f.prepare(&chown(b"file", Some(0), Some(0), true));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(EPERM))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(EACCES))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState,
+        "the claimed errno is not the one the session observed"
+    );
+    assert!(f.overlay.poisoned);
+
+    // An observed *success* is not a refusal either, whatever the caller claims.
+    let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+    let prepared = f.prepare(&chown(b"file", Some(0), Some(0), true));
+    f.overlay
+        .observe_result(
+            prepared.operation_id,
+            &OperationOutcome::Success { return_value: 0 },
+        )
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(EPERM))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState
+    );
+    assert!(f.overlay.poisoned);
+}
+
+#[test]
+fn a_non_mutating_abort_stays_infallible_under_every_reason() {
+    // ReadThrough operations have no effects to reconcile, so abort has always
+    // returned Ok for them regardless of reason. `KernelRefused` joins that set
+    // without disturbing it -- including when nothing was observed, because the
+    // corroboration check only gates the mutation path.
+    for reason in [
+        AbortReason::Cancelled,
+        AbortReason::RecoveryRequired("gone".into()),
+        AbortReason::Failed(error(ErrorKind::Io, "gone")),
+        AbortReason::KernelRefused(EPERM),
+    ] {
+        let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+        let prepared = f.prepare(&stat(b"file"));
+        f.overlay.abort(prepared.operation_id, &reason).unwrap();
+        assert!(!f.overlay.poisoned, "{reason:?} must not poison a lookup");
+    }
 }
