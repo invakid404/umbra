@@ -429,9 +429,12 @@ fn base_and_shadow_unlinks_are_journaled_and_recreation_clears_whiteout() {
     for name in [b"a", b"b"] {
         f.run(&unlink(name));
         assert_eq!(f.read(name).unwrap_err().kind, ErrorKind::NotFound);
+        // The base object is still on the host, so a non-mutating resolve of the
+        // whiteouted path must deny with ENOENT rather than raise a bare NotFound
+        // the supervisor would resume into a host-visible read (#49).
         assert_eq!(
-            f.overlay.resolve(&f.process, &stat(name)).unwrap_err().kind,
-            ErrorKind::NotFound
+            f.overlay.resolve(&f.process, &stat(name)).unwrap(),
+            ResolvedAction::Deny(Errno::ENOENT)
         );
         assert!(!f
             .shadow_root
@@ -461,6 +464,47 @@ fn base_and_shadow_unlinks_are_journaled_and_recreation_clears_whiteout() {
     assert!(f.read(b"a").unwrap().is_empty());
     assert!(!f.overlay.whiteouted(&root(b"a").unwrap()).unwrap());
     assert_eq!(fs::read(f.base_root.join("a")).unwrap(), b"base");
+}
+
+#[test]
+fn whiteout_hidden_resolves_to_enoent_while_truly_absent_stays_not_found() {
+    let mut f = Fixture::new(&[(b"gone", b"base"), (b"dir/child", b"base")]);
+    // A whiteouted final component: the base object is still on the host, so a
+    // non-mutating resolve must deny with ENOENT rather than raise a bare
+    // NotFound the supervisor would resume into a host-visible read (#49).
+    f.run(&unlink(b"gone"));
+    assert_eq!(
+        f.overlay.resolve(&f.process, &stat(b"gone")).unwrap(),
+        ResolvedAction::Deny(Errno::ENOENT)
+    );
+    // A name never in base or shadow is truly absent. The base *is* the host, so
+    // its NotFound equals what the tracee's own syscall would see; it is left to
+    // resume as passthrough, unchanged. This is the discriminator: the same op
+    // shape yields Deny for a whiteout and NotFound for a true absence.
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &stat(b"never"))
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+    // A whiteouted *ancestor directory* hides everything beneath it. Path
+    // resolution fails at the ancestor's own lookup, before the final-component
+    // lookup runs, so a fix confined to the final lookup would leak this. Write
+    // the directory marker the way the engine stores one (rmdir is unsupported,
+    // so there is no op that whiteouts a directory), then confirm the child
+    // beneath it also denies with ENOENT.
+    let marker = Overlay::marker(&root(b"dir").unwrap()).unwrap();
+    let marker_path = f
+        .control
+        .join(std::ffi::OsStr::from_bytes(marker.as_bytes()));
+    fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+    fs::write(&marker_path, b"").unwrap();
+    assert!(f.overlay.whiteouted(&root(b"dir").unwrap()).unwrap());
+    assert_eq!(
+        f.overlay.resolve(&f.process, &stat(b"dir/child")).unwrap(),
+        ResolvedAction::Deny(Errno::ENOENT)
+    );
 }
 
 #[test]
@@ -1593,14 +1637,10 @@ fn access_probes_the_namespace_without_materialising_or_journaling() {
         native(&plan.paths[0].path.0),
         f.shadow_root.join("nested/file")
     );
-    // An absent target, and one hidden by a whiteout, are both ENOENT *from the
-    // resolver*. This is the namespace's answer at the resolve boundary, not
-    // what a tracee observes: the supervisor turns NotFound on a non-mutating
-    // operation into a plain resume, so the tracee's own unrewritten faccessat
-    // still runs against the host and can see a whiteouted base file. That gap
-    // is the supervisor's, it predates this operation and it applies equally to
-    // Stat/Read/ReadLink, so nothing here should be read as an end-to-end
-    // guarantee; issue #49 tracks closing it.
+    // A truly-absent target resolves to NotFound: the base is the host, so the
+    // supervisor resumes the tracee's own unrewritten faccessat and the kernel's
+    // ENOENT equals the namespace's answer. This is the passthrough #49 must not
+    // disturb.
     assert_eq!(
         f.overlay
             .resolve(&f.process, &access(b"nested/missing", READ, true))
@@ -1608,13 +1648,15 @@ fn access_probes_the_namespace_without_materialising_or_journaling() {
             .kind,
         ErrorKind::NotFound
     );
+    // A whiteout-hidden target resolves to Deny(ENOENT) instead, so the supervisor
+    // emulates the errno rather than resuming a faccessat that would see the
+    // still-present base file (#49).
     f.run(&unlink(b"nested/file"));
     assert_eq!(
         f.overlay
             .resolve(&f.process, &access(b"nested/file", READ, true))
-            .unwrap_err()
-            .kind,
-        ErrorKind::NotFound
+            .unwrap(),
+        ResolvedAction::Deny(Errno::ENOENT)
     );
     // A bare existence probe (F_OK, all-false) of a directory still resolves.
     assert!(matches!(

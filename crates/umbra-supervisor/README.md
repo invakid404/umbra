@@ -71,10 +71,16 @@ prepare the physical rewrite, apply it, then resume to the matching exit, observ
 the outcome and commit or abort. A kernel errno is an observed outcome, not an
 interception failure.
 
-Any failure in that chain poisons the run: nothing resumes afterwards. Denial and
-emulation fail closed, because skipping a trapped syscall is not in the platform
-contract and rewriting return registers alone would execute the very call the
-namespace refused. The loop ends when every process has exited, not when the root
+Any failure in that chain poisons the run: nothing resumes afterwards. A `Deny`,
+reached only for a whiteout-hidden non-mutating path, is answered here without
+minting an operation: the supervisor asks the platform to emulate its errno, which
+steps the tracee past the trapped syscall so the still-present base object stays
+hidden ([#49](https://github.com/invakid404/umbra/issues/49)). A backend whose
+`emulate_result` cannot skip the trap, such as the Linux stub, fails closed
+instead. The remaining `Emulate` actions (`ReadLink`, a logical-symlink `Stat`)
+still fail closed as a separate wiring gap, because rewriting return registers
+alone would execute the very call the namespace refused. The loop ends when every
+process has exited, not when the root
 does. Fork preserves every inherited descriptor; only Exec drops close-on-exec
 entries. An Exit for an uncaptured task poisons the run without reducing its live
 process count, and duplicate exits do not count twice.
@@ -108,9 +114,12 @@ skip unrepresentable special entries and advance past them; listings of `/dev`
 and its descendants, including resolved aliases, are refused. Freezing is
 enforced by the installed sandbox — a tracee may write only inside its own run
 root — not by copying the host. One consequence is deliberate: when the namespace
-resolves a non-mutating open to `NotFound`, the syscall resumes unmodified,
-because with this base the kernel produces exactly the outcome the namespace
-predicted. That equivalence holds only while the base is the host.
+resolves a non-mutating open to `NotFound` — a *truly-absent* target — the syscall
+resumes unmodified, because with this base the kernel produces exactly the outcome
+the namespace predicted. That equivalence holds only while the base is the host. A
+whiteout-hidden target does not take this branch: the namespace resolves it to
+`Deny` instead, which the supervisor emulates, so the host object the whiteout
+hides is never revealed.
 
 ```sh
 cargo check -p umbra-supervisor

@@ -49,6 +49,13 @@ pub type Result<T> = std::result::Result<T, UmbraError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Errno(pub i32);
 
+impl Errno {
+    /// POSIX "no such file or directory". 2 on every Unix target Umbra supports;
+    /// named here so the overlay never spells a native number inline when it
+    /// denies a whiteout-hidden path.
+    pub const ENOENT: Errno = Errno(2);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Machine-readable error categories preserved across provider boundaries.
 pub enum ErrorKind {
