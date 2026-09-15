@@ -78,9 +78,19 @@ needed there, because the rewritten syscall actually executed.
 Any failure in that chain poisons the run: nothing resumes afterwards — including
 an abort the namespace refuses to reconcile, which is its verdict to give and not
 an error the supervisor may swallow. That refusal is reached today when the
-refused syscall's preparation had to create a shadow object that was not there
-before — a creating open is the reachable case — since nothing rolls that back
-([#55](https://github.com/invakid404/umbra/issues/55)). A `Deny`, reached only for
+refused syscall's preparation materialised something the namespace cannot take
+back. The overlay now unlinks the prepare-time creations its storage surface can
+undo — a shadow file, and so an ordinary creating open, which used to be the
+reachable case and no longer refuses at all — and keeps refusing the rest: a
+directory, because `LocalStorage` does not implement `RemoveDirectory`; a logical
+symlink, whose placeholder is inseparable from the control blobs keyed on it; and
+a shadow ancestor materialised over nothing, which is what makes a creating open
+under a *base-absent parent* the reachable case instead
+([#55](https://github.com/invakid404/umbra/issues/55)). That is why
+`creating_open_under_an_absent_parent` in `src/events.rs` — the op both exit-path
+refusal tests drive — names `/newdir/fresh` rather than `/fresh`.
+
+A `Deny`, reached only for
 a whiteout-hidden non-mutating path, is answered here without
 minting an operation: the supervisor asks the platform to emulate its errno, which
 steps the tracee past the trapped syscall so the still-present base object stays
