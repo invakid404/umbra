@@ -49,14 +49,23 @@ pub enum AbortReason {
     /// that the namespace cannot take back, stays fatal whatever the kernel said.
     /// That is the obligation, not a predicate — a namespace may discharge it
     /// with a conservative approximation that refuses more often than strictly
-    /// needed, and the overlay does. The overlay now undoes the prepare-time
-    /// creations its storage surface can undo (a shadow file, by unlinking it)
-    /// and keeps refusing the rest: a directory, which its storage backend
-    /// cannot remove, and a logical symlink, whose placeholder is inseparable from the
-    /// control blobs that back it
-    /// ([#55](https://github.com/invakid404/umbra/issues/55)). Rolling back is
+    /// needed, and the overlay does. The overlay now records an undo for every
+    /// prepare-time creation it makes — a file via `unlink`, a directory
+    /// materialised over nothing via `remove_directory`, and a logical symlink
+    /// as three ordered `unlink`s of its backing index, target blob and
+    /// placeholder — and on a corroborated `KernelRefused`, `abort` unwinds
+    /// the recorded list in reverse insertion order; the three `unlink`s
+    /// inside a symlink entry run in field order (index first, so no later
+    /// removal outlives the identity-dependent name that resolves the
+    /// index — see [#69](https://github.com/invakid404/umbra/issues/69)). An undo that itself fails
+    /// still poisons; the mirror direction (prepare-time destruction with no
+    /// recorded inverse) also still poisons, tracked in
+    /// [#66](https://github.com/invakid404/umbra/issues/66). Rolling back is
     /// still the namespace's own business — this variant neither promises nor
-    /// requires it.
+    /// requires it. See [#53](https://github.com/invakid404/umbra/issues/53)
+    /// → [#55](https://github.com/invakid404/umbra/issues/55) →
+    /// [#64](https://github.com/invakid404/umbra/issues/64) →
+    /// [#69](https://github.com/invakid404/umbra/issues/69) for the arc.
     ///
     /// Every other variant means the *interception* broke down — the effects a
     /// mutating `prepare` already applied are unaccounted for — and keeps the
@@ -64,7 +73,10 @@ pub enum AbortReason {
     /// this variant never widens to cover them, and they never narrow to cover
     /// it. A namespace that honours this variant must also corroborate it
     /// against the outcome it already observed, so a caller cannot claim a
-    /// kernel refusal that never happened.
+    /// kernel refusal that never happened. A `KernelRefused` whose errno the
+    /// session did not observe is structural corruption of the namespace's
+    /// own record — it never reaches the reconcile path, no recorded undo
+    /// runs, and the abort poisons the run unconditionally.
     KernelRefused(Errno),
 }
 
