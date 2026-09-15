@@ -44,9 +44,20 @@ instruction to — a namespace that cannot account for the aborted transaction's
 effects, or cannot take them back, must still refuse, and may discharge that
 obligation with a conservative approximation that refuses more often than
 strictly needed. Rolling anything back is the namespace's own business: this
-crate neither promises it nor requires it, and the overlay does as much of it as
-its storage surface allows
-([#55](https://github.com/invakid404/umbra/issues/55)). The variant is
+crate neither promises it nor requires it. The overlay now records an undo for
+every prepare-time creation it makes — file (`unlink`), directory materialised
+over nothing (`remove_directory`), and logical symlink (three ordered `unlink`s
+of its backing index, target blob, and placeholder) — and its `abort` performs
+those in reverse creation order on a corroborated `KernelRefused`. An undo that
+itself fails still poisons; the mirror direction (prepare-time destruction with
+no recorded inverse) also still poisons, tracked in
+[#66](https://github.com/invakid404/umbra/issues/66); and a `KernelRefused`
+whose errno the session did not observe never reaches the reconcile path at
+all — no recorded undo runs, and the abort poisons unconditionally. See
+[#53](https://github.com/invakid404/umbra/issues/53) →
+[#55](https://github.com/invakid404/umbra/issues/55) →
+[#64](https://github.com/invakid404/umbra/issues/64) →
+[#69](https://github.com/invakid404/umbra/issues/69) for the arc. The variant is
 appended, so already-encoded values still decode; a peer built without it cannot
 decode the new name, and `provider::PROTOCOL_VERSION` is unchanged because both
 ends ship together in-tree.
