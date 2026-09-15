@@ -766,6 +766,7 @@ dependencies = [
  "umbra-overlay",
  "umbra-platform",
  "umbra-storage",
+ "umbra-storage-local",
  "uuid",
 ]
 

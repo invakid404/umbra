@@ -89,26 +89,32 @@ logical symlink's backing index, target blob and placeholder as one entry, plus
 the ancestors materialised for that placeholder. There is no third case, and in
 particular no latch: `Pending.created` was retired with the last arm that set it.
 
-The two exit-path refusal tests in `src/events.rs` still drive two different ops,
-but the split between them has changed. It used to be *rollback versus latch*: the
-resumed case took an op the overlay rolled back and the poisoning case an op it
-refused to undo at all. It is now *corroboration versus a refused undo* — the
-resumed case keeps `creating_open_under_an_absent_parent` (`/newdir/fresh`, which
-the overlay rolls back down to the ancestor), and the poisoning case takes
-`a_symlink_whose_undo_the_backend_can_refuse`, whose four-object undo gives a
-backend four chances to refuse. #55 had narrowed the reachable set until the two
-collapsed onto one op; #64 restored the split; #69 keeps it on these new terms.
+The two exit-path refusal tests in `src/events.rs` drive two different ops and
+script two different verdicts: `creating_open_under_an_absent_parent`
+(`/newdir/fresh`, which the overlay rolls back down to the ancestor) reconciles,
+and `a_symlink_whose_undo_the_backend_can_refuse`, whose four-object undo gives a
+backend four chances to refuse, does not. The supervisor only ever *reads* that
+verdict and never computes it, so the namespace double reports a scripted one and
+models none of `Overlay::abort`'s rule; the op choice is a fidelity claim about
+which real verdict each test stands for.
 
-*In the double*, which is the honest scope of the claim. The overlay emulates a
-logical symlink rather than letting the kernel execute one, so the supervisor's
-`syscall_exit` does not reach a real refusal of it either — the poisoning test
-drives the double with `undo_refused` set, and what it pins is the supervisor's
-behaviour when the namespace refuses, not that this op refuses today. The helper's
-own comment in `src/events.rs` states this; so does `umbra-overlay`'s note on
-`Pending.rollback`. The double's flag no longer names a field the overlay has,
-which makes the duplication slightly cheaper to get wrong: turning the coupling
-from prose into machinery needs the integration harness in
-[#57](https://github.com/invakid404/umbra/issues/57).
+That claim is now checked rather than restated in prose. `tests/kernel_refusal.rs`
+binds a real `Overlay` over `LocalStorage` on tempdirs into a real `Supervisor`
+through `Supervisor::with_namespace` and drives real syscall entry/exit pairs
+([#57](https://github.com/invakid404/umbra/issues/57)): a reconciled `Fchownat`
+refusal that resumes the tracee and leaves its copy-up standing, an uncorroborated
+abort claim that poisons and undoes nothing, a rollback the storage backend
+refuses — which reports the backend's own `Denied`, never the engine's
+`InvalidState` — and two transactions in one session reconciled independently.
+Deleting that file un-pins `Overlay::abort`'s rule, because the double no longer
+carries a copy of it.
+
+Only write-mode `Open` and `Fchownat` are reachable end to end today, which is why
+the double still carries the rest: `Overlay::resolve` refuses `Chmod` and `Write`
+outright, and it emulates a logical symlink rather than letting the kernel execute
+one, so the supervisor's `syscall_exit` never reaches a real refusal of that op.
+What those tests pin is the supervisor's behaviour when the namespace refuses, not
+that the op refuses today.
 
 A `Deny`, reached only for
 a whiteout-hidden non-mutating path, is answered here without
