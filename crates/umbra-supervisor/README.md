@@ -79,16 +79,31 @@ Any failure in that chain poisons the run: nothing resumes afterwards — includ
 an abort the namespace refuses to reconcile, which is its verdict to give and not
 an error the supervisor may swallow. That refusal is reached today when the
 refused syscall's preparation materialised something the namespace cannot take
-back. The overlay now unlinks the prepare-time creations its storage surface can
-undo — a shadow file, and so an ordinary creating open, which used to be the
-reachable case and no longer refuses at all — and keeps refusing the rest: a
-directory, because `LocalStorage` does not implement `RemoveDirectory`; a logical
-symlink, whose placeholder is inseparable from the control blobs keyed on it; and
-a shadow ancestor materialised over nothing, which is what makes a creating open
-under a *base-absent parent* the reachable case instead
-([#55](https://github.com/invakid404/umbra/issues/55)). That is why
-`creating_open_under_an_absent_parent` in `src/events.rs` — the op both exit-path
-refusal tests drive — names `/newdir/fresh` rather than `/fresh`.
+back. The overlay removes the prepare-time creations its storage surface can
+undo — a shadow file, and so an ordinary creating open
+([#55](https://github.com/invakid404/umbra/issues/55)), and since
+[#64](https://github.com/invakid404/umbra/issues/64) a materialised shadow
+directory too, whether an explicit `mkdir`'s or an ancestor `parents` created
+over nothing. One case is left: a logical symlink, whose placeholder is
+inseparable from the control blobs keyed on it.
+
+The two exit-path refusal tests in `src/events.rs` therefore drive two different
+ops, which is what their comments have always claimed they should: the resumed
+case keeps `creating_open_under_an_absent_parent` (`/newdir/fresh`, which the
+real overlay now rolls back down to the ancestor), and the poisoning case takes
+`logical_symlink_whose_placeholder_cannot_be_undone`. #55 had narrowed the latch
+set until the two collapsed onto one op with the double's flag flipped; #64
+restores the split.
+
+Restores it *in the double*, which is the honest scope of the claim. The overlay
+emulates a logical symlink rather than letting the kernel execute one, so the
+supervisor's `syscall_exit` does not reach a real refusal of it either — the
+poisoning test drives the double with the latch set, and what it pins is the
+supervisor's behaviour when the namespace refuses, not that this op refuses
+today. The helper's own comment in `src/events.rs` states this; so does
+`umbra-overlay`'s note on `Pending.created`. Turning the coupling from prose into
+machinery needs the integration harness in
+[#57](https://github.com/invakid404/umbra/issues/57).
 
 A `Deny`, reached only for
 a whiteout-hidden non-mutating path, is answered here without

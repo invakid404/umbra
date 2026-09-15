@@ -366,6 +366,19 @@ struct Plan {
     mutation: bool,
     directory_next: Option<(DirectoryKey, Vec<DirectoryEntry>)>,
 }
+/// Which removal undoes one `Pending.rollback` entry.
+///
+/// The discriminant is the storage surface's, not this engine's invention:
+/// removal is split into `StorageOperation::Unlink` and
+/// `StorageOperation::RemoveDirectory`, and the backends that implement both
+/// already carry the split as a local `bool`. This is that bool, named and
+/// hoisted to the site that has to *decide* it -- `prepare` knows whether it
+/// asked for a file or a directory; `abort` would have to stat to find out.
+#[derive(Clone, Copy)]
+enum RollbackKind {
+    File,
+    Directory,
+}
 struct Pending {
     id: OperationId,
     plan: Plan,
@@ -373,17 +386,47 @@ struct Pending {
     whiteouts: Vec<(StoragePath, bool)>,
     retired_index: Option<StoragePath>,
     /// Shadow objects `prepare` created that `abort` can undo, in creation
-    /// order. A reconciled abort unlinks them in reverse.
+    /// order, each tagged with the removal that undoes it. A reconciled abort
+    /// walks the list in reverse and issues `unlink` or `remove_directory` per
+    /// entry.
     ///
-    /// Only objects `Unlink` can remove belong here. `RemoveDirectory` is
-    /// defined on the storage surface, but `LocalStorage` — the backend the MVP
-    /// ships on and every overlay test runs against — does not implement it and
-    /// falls through to `unsupported("execute")`. (The NFS backends do implement
-    /// it; the engine cannot depend on that.) So a materialised shadow
-    /// *directory* has no undo the engine can rely on, and latches `created`
-    /// instead — that is the half of
-    /// [#55](https://github.com/invakid404/umbra/issues/55) this engine still
-    /// cannot close.
+    /// Directories belong here since
+    /// [#64](https://github.com/invakid404/umbra/issues/64) gave `LocalStorage`
+    /// the `RemoveDirectory` arm the other backends already had. Before that the
+    /// engine could not rely on the storage *surface* for a directory removal, so
+    /// a materialised shadow directory had no undo and latched `created`
+    /// instead; it can now, and does.
+    ///
+    /// Reverse-insertion order is sufficient without a depth key, and the reason
+    /// is structural rather than lucky. `parents` walks root-to-leaf and creates
+    /// only where `shadow_stat` misses, so one walk contributes ancestors in
+    /// strictly increasing depth with no duplicates; `create` runs `parents`
+    /// before creating the object, so the object always lands after every
+    /// ancestor it needs; and each prepare arm performs at most one
+    /// rollback-pushing walk per transaction, so two independently-rooted groups
+    /// never interleave. `a/b/c/fresh` over an empty base therefore inserts
+    /// `[(a,Dir), (a/b,Dir), (a/b/c,Dir), (a/b/c/fresh,File)]` and unwinds
+    /// leaf-first, every `rmdir` seeing an empty directory. A `depth` field
+    /// would today be a function of the path and would never change the order.
+    ///
+    /// A removal that fails poisons, `ENOTEMPTY` included — see `abort`. Given
+    /// which sites push (below), a non-empty shadow directory here means the
+    /// invariant above is broken, so the loud backstop is the point.
+    ///
+    /// Not every materialised ancestor is here. `parents` returns only those it
+    /// created over *nothing*; one that shadows a live base directory stays
+    /// standing, because it publishes no path the run did not already expose.
+    /// And `parents` itself pushes nothing — it *returns*, and only the prepare
+    /// arms that read the verdict record it. That is load-bearing rather than
+    /// stylistic: `parents` is also reached from `copy_up`, `write_control`,
+    /// `create_symlink` and `set_whiteout`, which deliberately keep their own
+    /// object off this list, so a `parents` that pushed would queue an ancestor
+    /// whose contents are not queued. A refused write-open onto a base file
+    /// under a not-yet-shadowed base directory would then reach abort with
+    /// `[(dir,Dir)]` and a copied-up file inside `dir`: `rmdir` → `ENOTEMPTY` →
+    /// poison, converting today's clean reconcile into a dead run — exactly the
+    /// ordinary `EPERM` class [#53](https://github.com/invakid404/umbra/issues/53)
+    /// exists to survive.
     ///
     /// Nothing else has to be restored alongside the object. `whiteouts` and
     /// `retired_index` are plans consumed in `commit` alone, so a reconciled
@@ -399,12 +442,13 @@ struct Pending {
     /// readable today. See `bind`, which states the same premise from the other
     /// side; widening that refusal without first making prepare-time creations
     /// durable would invalidate this comment rather than merely outdate it.
-    rollback: Vec<StoragePath>,
+    rollback: Vec<(StoragePath, RollbackKind)>,
     /// Whether `prepare` materialised something `abort` cannot undo.
     ///
     /// This is the fail-closed half of the rollback gate: what lands in
-    /// `rollback` is unlinked on a reconciled abort, and what latches this keeps
-    /// the pre-#53 poison behaviour instead. Both halves exist to prevent one
+    /// `rollback` is removed on a reconciled abort — `unlink` for a file,
+    /// `remove_directory` for a directory — and what latches this keeps the
+    /// pre-#53 poison behaviour instead. Both halves exist to prevent one
     /// divergence — publishing a path the tracee was told its syscall failed to
     /// make — which is not merely cosmetic: because the shadow object outranks
     /// even a stale whiteout, a later `O_CREAT|O_EXCL` on such a path would fail
@@ -412,14 +456,41 @@ struct Pending {
     ///
     /// The predicate is *logical*, not shadow-shaped. A shadow object that
     /// shadows a base object the run already exposes is not a creation; one that
-    /// stands over nothing is. What still latches it today: `FsOp::Mkdir`, whose
-    /// directory `LocalStorage` cannot remove; `FsOp::Symlink`, whose placeholder comes
-    /// with Control blobs whose removal is a second rollback problem; and any
-    /// ancestor `parents` had to materialise over *nothing* — no base directory
-    /// there, or one a whiteout logically deleted, or one whose base stat did not
-    /// answer at all. A creating `Open` no longer latches it by itself: the
-    /// object it creates is a file, `abort` unlinks it, and only its ancestors
-    /// can still latch.
+    /// stands over nothing is. Exactly one thing still latches it:
+    /// `FsOp::Symlink`, whose placeholder comes with Control blobs whose removal
+    /// is a second rollback problem — the backing index is keyed on the
+    /// placeholder's `ObjectId`, so unlinking the placeholder alone strands it.
+    ///
+    /// One setter is the intended end state of
+    /// [#64](https://github.com/invakid404/umbra/issues/64), not a sign the field
+    /// should go. What *stopped* latching: a materialised shadow directory,
+    /// whether `FsOp::Mkdir`'s own or an ancestor `parents` had to create over
+    /// nothing, because `remove_directory` now answers on every backend and those
+    /// go on `rollback` instead. A creating `Open` had already stopped latching
+    /// for its object in
+    /// [#55](https://github.com/invakid404/umbra/issues/55); after #64 its
+    /// ancestors do not latch either, so **no latch originates from `parents`**
+    /// at all.
+    ///
+    /// Be precise about what the one remaining setter buys today: **nothing that
+    /// the gate's other conjunct does not already buy.** The latch is currently
+    /// subsumed. `created` is set only by the `FsOp::Symlink` arm; `resolve`
+    /// answers `Emulate(Success)` for `FsOp::Symlink`; `observe_result` refuses
+    /// any outcome differing from an emulation's, so such a transaction's
+    /// `outcome` can only be `None` or `Some(Success)`; and the reconciling arm
+    /// in `abort` requires `Some(Failure(_))` corroborating the claimed errno.
+    /// So `!self.created` is a provably redundant conjunct at that gate — a
+    /// latched transaction reaches the poison path anyway, for want of a
+    /// corroborated kernel failure rather than for want of an undo.
+    ///
+    /// It is kept as a fail-closed backstop, not as a live safety net, and the
+    /// distinction is worth stating because the two read identically at the call
+    /// site. The day a `Symlink` stops being emulated — a real `symlinkat` the
+    /// kernel executes and can refuse — the subsumption disappears and this field
+    /// is the only thing standing between that refusal and a reconciled abort
+    /// that strands the backing index. Removing it as dead code would be correct
+    /// today and wrong on that day, and nothing in the type system would catch
+    /// the difference.
     ///
     /// Copy-up deliberately does not set this, and the reason is *not* that
     /// copy-up is invisible. It duplicates an object the base already holds, so
@@ -864,8 +935,8 @@ impl Overlay {
         }
         Ok(())
     }
-    /// Materialise the shadow parent directories of `path`, reporting whether any
-    /// of them was a *logical* creation.
+    /// Materialise the shadow parent directories of `path`, returning the ones
+    /// that were *logical* creations, in walk (root-to-leaf) order.
     ///
     /// The answer used to be shadow-shaped: decided by `shadow_stat` alone, so an
     /// ancestor that already existed in the base but had not been copied up yet
@@ -875,35 +946,45 @@ impl Overlay {
     /// README as #53 under-delivering, and held in place by the missing rollback
     /// [#55](https://github.com/invakid404/umbra/issues/55) tracks.
     ///
-    /// It is now logical. The rollback exists for the cases `Unlink` can undo,
-    /// and the evidence for the rest was already being gathered and discarded:
-    /// `shadow_parent_mode` stats the base for the *mode*
+    /// It is now logical, and the evidence was already being gathered and
+    /// discarded: `shadow_parent_mode` stats the base for the *mode*
     /// ([#56](https://github.com/invakid404/umbra/issues/56)) and carries a
     /// `WhiteoutScan` across the walk, which is exactly what separates
     /// "materialised a shadow over a base directory the run already exposes"
     /// from "created a directory that logically did not exist". Only the second
-    /// is reported here, and only it latches `Pending.created`:
+    /// is reported here. A caller that records the answer gets the ancestor
+    /// removed on a reconciled abort; one that discards it leaves the ancestor
+    /// standing, which is the right answer for both — see below:
     ///
     /// | evidence | verdict |
     /// |---|---|
     /// | base holds a directory, no whiteout hides it | shadow of an existing directory — not a creation |
     /// | a whiteout hides it | the base directory is logically deleted; this is a new one |
     /// | the base holds nothing, or not a directory | a genuine logical creation |
-    /// | the base stat failed | evidence unavailable — fail closed |
+    /// | the base stat failed | evidence unavailable — report it, and remove it |
     ///
-    /// The last two rows are why `shadow_parent_mode` reports its verdict
-    /// separately from its mode rather than letting the mode stand in for it: it
-    /// **deliberately swallows base errors**, because propagating one would fail
-    /// a `create` that succeeds today and would take `commit` — and with it
-    /// #53's reconciliation — down. That swallow must not be read as "no base
-    /// directory, therefore benign". The mode decision keeps swallowing; the
-    /// creation decision fails closed on the same evidence.
+    /// The last row used to read "fail closed", and
+    /// [#64](https://github.com/invakid404/umbra/issues/64) **retired it rather
+    /// than reversing it**. `shadow_parent_mode` deliberately swallows base
+    /// errors, because propagating one would fail a `create` that succeeds today
+    /// and would take `commit` — and with it #53's reconciliation — down; the
+    /// creation decision therefore had to guess what the swallow hid, and guessed
+    /// "a creation", because a directory could not be removed and a wrong guess
+    /// the other way would publish a phantom path forever. Removal makes the
+    /// guess unnecessary under *both* readings: if the base does hold a directory
+    /// at that name, the shadow was a benign uncopied shadow and removing it is
+    /// harmless; if it holds nothing, the shadow was a phantom and removing it is
+    /// required. The mode half of the swallow is untouched.
     ///
-    /// `copy_up` still discards the answer, so it is not treated as a creation.
-    /// See `Pending.created` for why, and for the asymmetry that leaves.
-    fn parents(&mut self, path: &StoragePath) -> Result<bool> {
+    /// The answer is **returned, never pushed**. Four of `create`'s callers
+    /// (`copy_up`, `write_control`, `create_symlink`, `set_whiteout`) reach this
+    /// walk while deliberately keeping their own object off `Pending.rollback`;
+    /// queueing an ancestor from here would queue a directory whose contents are
+    /// not queued, and the `rmdir` would meet `ENOTEMPTY`. Only the prepare arms
+    /// that read the verdict record it — see `Pending.rollback`.
+    fn parents(&mut self, path: &StoragePath) -> Result<Vec<StoragePath>> {
         let parts: Vec<_> = path.as_bytes().split(|b| *b == b'/').collect();
-        let mut created = false;
+        let mut created = Vec::new();
         let mut whiteout = WhiteoutScan::Unscanned;
         for n in 1..parts.len() {
             let parent = StoragePath::new(path.anchor(), parts[..n].join(&b'/'))?;
@@ -938,7 +1019,9 @@ impl Overlay {
                 // commit path has already accepted since #56 — the reconciled
                 // abort inherits it rather than introducing it, and `copy_up`
                 // has been leaving it behind on this exact walk all along.
-                created |= !ancestor.shadows_base_directory;
+                if !ancestor.shadows_base_directory {
+                    created.push(parent);
+                }
             }
         }
         Ok(created)
@@ -1008,9 +1091,10 @@ impl Overlay {
             //
             // Swallowing it for the *mode* is not swallowing it for the creation
             // verdict: `shadows_base_directory` stays false here, so `parents`
-            // reports a logical creation and `abort` fails closed. The two
-            // decisions read the same evidence and round it opposite ways, which
-            // is deliberate — see `parents`.
+            // reports a logical creation and the ancestor joins the rollback
+            // list. Since #64 that is no longer a guess rounded one way — the
+            // shadow is removed on a reconciled abort, which is the right answer
+            // whether or not the base holds a directory there. See `parents`.
             Err(_) => Ok(ShadowAncestor::unshadowed()),
         }
     }
@@ -1049,23 +1133,45 @@ impl Overlay {
         }
         Ok(false)
     }
-    /// Create one shadow object and every shadow ancestor it needs, reporting
+    /// Create one shadow object and every shadow ancestor it needs, forwarding
     /// `parents`'s verdict on those ancestors — *not* on the object itself,
     /// which every caller already knows it asked for.
     ///
-    /// Five callers discard the answer, and none of them needs it. `copy_up` and
+    /// Four callers discard the answer, and none of them needs it. `copy_up` and
     /// `write_control` duplicate or annotate what the run already exposes;
     /// `set_whiteout` writes under Control, which shadows nothing at all; and
-    /// `prepare`'s `FsOp::Mkdir` arm and `create_symlink`'s placeholder create
-    /// latch `Pending.created` unconditionally anyway, so an ancestor verdict
-    /// could only agree with a latch that is already set. The one caller that
-    /// reads it is `prepare`'s creating-`Open` arm.
-    fn create(&mut self, path: &StoragePath, kind: CreateKind, mode: u32) -> Result<bool> {
+    /// `create_symlink`'s placeholder create is reached either from the
+    /// `FsOp::Symlink` prepare arm, which latches `Pending.created` for the whole
+    /// operation immediately afterwards, or from `copy_up`, which is not a
+    /// creation at all — so in neither case would an ancestor verdict change what
+    /// the caller does. Discarding here is what keeps those four off
+    /// `Pending.rollback` — see `parents` for why that matters and is not merely
+    /// tidy. The callers that read it are `prepare`'s creating-`Open` and
+    /// `Mkdir` arms.
+    fn create(
+        &mut self,
+        path: &StoragePath,
+        kind: CreateKind,
+        mode: u32,
+    ) -> Result<Vec<StoragePath>> {
         let created_parents = self.parents(path)?;
         let context = self.context()?;
         self.storage
             .create(&context, path, &CreateOptions { kind, mode })?;
         Ok(created_parents)
+    }
+    /// Record the ancestors `parents` materialised over nothing for rollback.
+    ///
+    /// In walk order, before whatever the arm creates under them, so the reverse
+    /// walk in `abort` unwinds leaf-first and every `remove_directory` meets an
+    /// empty directory. Called only from the prepare arms that read the verdict;
+    /// see `parents` for why this is not `parents`' own job.
+    fn queue_ancestors(&mut self, ancestors: Vec<StoragePath>) {
+        self.pending
+            .as_mut()
+            .unwrap()
+            .rollback
+            .extend(ancestors.into_iter().map(|p| (p, RollbackKind::Directory)));
     }
     fn copy_up(&mut self, path: &StoragePath) -> Result<()> {
         let (stat, shadow) = self.lookup(path)?;
@@ -1737,13 +1843,18 @@ impl NamespaceSession for Overlay {
                     if absent(self.lookup(&plan.path))?.is_some() {
                         self.copy_up(&plan.path)?;
                     } else {
-                        // The object itself is a file, so `abort` can unlink it.
-                        // Only an ancestor materialised over nothing is beyond
-                        // rollback, and only that latches.
-                        let created_parents = self.create(&plan.path, CreateKind::File, *mode)?;
+                        // The object itself is a file, so `abort` can unlink it;
+                        // the ancestors materialised over nothing are
+                        // directories `abort` can now `rmdir`. Ancestors first
+                        // and in walk order, object last, so the reverse walk
+                        // empties each directory before removing it. Nothing
+                        // latches here any more.
+                        let ancestors = self.create(&plan.path, CreateKind::File, *mode)?;
+                        self.queue_ancestors(ancestors);
                         let pending = self.pending.as_mut().unwrap();
-                        pending.rollback.push(plan.path.clone());
-                        pending.created |= created_parents;
+                        pending
+                            .rollback
+                            .push((plan.path.clone(), RollbackKind::File));
                         pending.whiteouts.push((plan.path.clone(), false));
                     }
                     // Creation was executed through Storage, so O_EXCL must not run twice.
@@ -1773,12 +1884,28 @@ impl NamespaceSession for Overlay {
                         .whiteouts
                         .push((plan.path.clone(), false));
                 }
-                // Latches unconditionally: `LocalStorage` does not implement
-                // `RemoveDirectory`, so there is no undo to record even for the
-                // directory this creates, let alone its ancestors.
+                // The creating-`Open` arm with `CreateKind::Directory`: the
+                // directory this makes and every ancestor materialised over
+                // nothing are all removable through `remove_directory`, so the
+                // arm records an undo instead of latching. It latched
+                // unconditionally until #64, on the premise that `LocalStorage`
+                // could not remove a directory at all — that premise is now false.
+                //
+                // `resolve` answers `Emulate` for `Mkdir` (see the
+                // `Symlink | Mkdir | Unlink` arm), so the supervisor's
+                // `syscall_exit` never drives a `KernelRefused` abort here today.
+                // Wired anyway: leaving `created = true` standing on a dead
+                // premise is worse than either alternative, and `Overlay::abort`
+                // is callable directly, so the rule is pinned at the layer that
+                // owns it.
                 FsOp::Mkdir { mode, .. } => {
-                    self.create(&plan.path, CreateKind::Directory, *mode)?;
-                    self.pending.as_mut().unwrap().created = true;
+                    let ancestors = self.create(&plan.path, CreateKind::Directory, *mode)?;
+                    self.queue_ancestors(ancestors);
+                    self.pending
+                        .as_mut()
+                        .unwrap()
+                        .rollback
+                        .push((plan.path.clone(), RollbackKind::Directory));
                     // Keep an existing directory whiteout as an opaque-base marker.
                 }
                 FsOp::Unlink { .. } => {
@@ -1811,10 +1938,28 @@ impl NamespaceSession for Overlay {
                         // reconcilable now that `parents` answers logically. The
                         // destination object itself is not created here - the
                         // kernel's own rename would have made it - so there is
-                        // nothing to roll back either.
-                        if self.parents(destination)? {
-                            self.pending.as_mut().unwrap().created = true;
-                        }
+                        // nothing to roll back for the object itself. The
+                        // ancestors created over nothing *are* rolled back, in
+                        // walk order so the reverse walk unwinds leaf-first.
+                        //
+                        // `copy_up` above contributes no entry, and the reason
+                        // no directory queued here can be non-empty because of it
+                        // is **statement order**, not path shape. It is not that
+                        // the source lies outside the destination's subtree --
+                        // it frequently does not: `rename("d/a", "d/target")`
+                        // puts the copied-up source directly inside the
+                        // destination's own parent. What holds is that `copy_up`
+                        // runs *first*, so every ancestor it had to materialise
+                        // already answers `shadow_stat` by the time `parents`
+                        // walks, and `parents` only returns ancestors it created
+                        // itself. A shared ancestor is therefore excluded from
+                        // this list and stays standing, which is also the right
+                        // answer: the copied-up file inside it is not ours to
+                        // remove. The exclusion therefore depends on this order;
+                        // treat the two statements as ordered rather than
+                        // independent.
+                        let ancestors = self.parents(destination)?;
+                        self.queue_ancestors(ancestors);
                         if let Some(stat) = self.shadow_stat(destination)? {
                             let index = symlink_index(stat.object_id)?;
                             if self.shadow_stat(&index)?.is_some() {
@@ -1949,11 +2094,12 @@ impl NamespaceSession for Overlay {
         // down and keeps the poison-and-error behaviour unchanged; the two modes
         // never merge.
         // Reconciling undoes what `prepare` created, as far as the storage
-        // surface allows: `rollback` carries the shadow objects `Unlink` can
-        // remove, and `created` latches whatever it cannot. A latched
-        // transaction leaves a path the tracee was told does not exist, so it
-        // stays on the poison path - see `Pending.created` for what still
-        // latches, and for why copy-up deliberately does not.
+        // surface allows: `rollback` carries the shadow objects `Unlink` and
+        // `RemoveDirectory` can remove, each tagged with which, and `created`
+        // latches whatever it cannot. A latched transaction leaves a path the
+        // tracee was told does not exist, so it stays on the poison path - see
+        // `Pending.created` for the one op that still latches, and for why
+        // copy-up deliberately does not.
         let rollback = pending.rollback.clone();
         let kernel_refused = !pending.created
             && matches!(
@@ -1990,9 +2136,12 @@ impl NamespaceSession for Overlay {
         // something.
         //
         // Reverse creation order, so a nested object is gone before anything
-        // that might contain it. Nothing here restores whiteouts or the symlink
-        // index: both are `commit`-only plans a reconciled abort never applied,
-        // and the marker a removed object was hiding regains its rank by itself.
+        // that might contain it - which is what makes every `remove_directory`
+        // below meet an empty directory without this loop tracking depth. See
+        // `Pending.rollback` for the insertion-order invariant that guarantees
+        // it. Nothing here restores whiteouts or the symlink index: both are
+        // `commit`-only plans a reconciled abort never applied, and the marker a
+        // removed object was hiding regains its rank by itself.
         //
         // `pending` is still live here, and deliberately: `context()` stamps each
         // request with the *transaction's* operation ID, and the undo of a
@@ -2000,9 +2149,12 @@ impl NamespaceSession for Overlay {
         // backend log most needs to be right. Clearing it first would have
         // charged these unlinks to the run-level context instead.
         let rolled_back = (|| {
-            for path in rollback.iter().rev() {
+            for (path, kind) in rollback.iter().rev() {
                 let context = self.context()?;
-                self.storage.unlink(&context, path)?;
+                match kind {
+                    RollbackKind::File => self.storage.unlink(&context, path)?,
+                    RollbackKind::Directory => self.storage.remove_directory(&context, path)?,
+                }
             }
             Ok(())
         })();
@@ -2010,7 +2162,17 @@ impl NamespaceSession for Overlay {
         // A rollback that fails leaves exactly the divergence the gate exists to
         // prevent, so it poisons rather than reporting a reconciliation it did
         // not perform. This is the one `abort` path whose error is the storage
-        // backend's own kind rather than `InvalidState`.
+        // backend's own kind rather than `InvalidState`, and it needs no
+        // per-kind branch: a non-empty `remove_directory` lands here like any
+        // other failure, as `ENOTEMPTY`-shaped `Io` from `LocalStorage`,
+        // `InvalidState` from tar, the kernel's errno from the NFS backends.
+        // Matching on the kind would make the engine backend-aware for no gain.
+        //
+        // Deliberately not a best-effort recursive remove: a shadow directory
+        // that is non-empty here is non-empty because of something *this*
+        // prepare did not create, so emptying it would delete committed state to
+        // undo an uncommitted one. Nor a best-effort skip, which reintroduces
+        // exactly the phantom path the gate exists to prevent.
         if rolled_back.is_err() {
             self.poisoned = true;
         }

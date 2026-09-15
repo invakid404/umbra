@@ -18,9 +18,11 @@ grants nothing.
 `Storage` owns one active run. Its required methods are `capabilities`, `open_run`,
 `acquire_writer`, `renew_writer`, `release_writer`, `execute`, `flush`, and
 `close_run`. Constructors and backend connection options live outside the trait.
-The convenience methods `read_at`, `write_at`, `create`, `unlink`, `list`, `stat`,
-and `atomic_swap` dispatch typed requests through `execute`; implementations retain
-one place to enforce lifecycle, containment, idempotency, and writer authority.
+The convenience methods `read_at`, `write_at`, `create`, `unlink`, `remove_directory`,
+`list`, `stat`, and `atomic_swap` dispatch typed requests through `execute`;
+implementations retain one place to enforce lifecycle, containment, idempotency, and
+writer authority. They are trait defaults, so a backend that answers the corresponding
+operation in `execute` acquires them without declaring anything.
 All fallible methods use `umbra_core::Result`.
 
 Paths preserve arbitrary non-NUL bytes, including non-UTF-8 names. Storage paths
@@ -33,7 +35,10 @@ owns namespace policy, directory merging, and transaction sequencing.
 Reads/writes and directory pages are bounded. Short reads and writes are allowed;
 a zero-byte read on a nonempty buffer denotes EOF. File offsets are explicit and
 must not modify a shared seek position. Create is exclusive; unlink removes a
-name and preserves other hard links. Stat does not follow the final symlink.
+name and preserves other hard links. Remove-directory removes an empty directory
+name; a non-empty directory is the backend's error and never a recursive removal,
+and the refusal's error kind is the backend's own rather than a shared one. Stat
+does not follow the final symlink.
 Atomic swap exchanges two existing names in one atomic operation, including when
 they denote different object types if the backend advertises that support; it
 must never be emulated as a sequence of visible renames. Atomic replacement is

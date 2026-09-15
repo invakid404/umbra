@@ -168,6 +168,31 @@ pub trait Storage: Send {
         }
     }
 
+    /// Remove an empty directory name. Non-empty is the backend's error, never a
+    /// recursive removal: the caller asked for one name to go away, and a
+    /// backend that emptied the directory to satisfy that would be destroying
+    /// state the caller never named.
+    ///
+    /// A default body dispatching through `execute`, deliberately: every backend
+    /// that answers `StorageOperation::RemoveDirectory` acquires this without
+    /// declaring anything, and one that does not answer it keeps whatever its
+    /// `execute` already says. Error kinds are the backend's own and differ
+    /// between them for the same refusal (a non-empty directory is `Io` with
+    /// `ENOTEMPTY` from `umbra-storage-local`, `InvalidState` from
+    /// `umbra-storage-tar`, the kernel's errno from the NFS backends); callers
+    /// that propagate the error rather than matching on its kind are portable
+    /// across all of them.
+    fn remove_directory(&mut self, context: &RequestContext, path: &StoragePath) -> Result<()> {
+        check_writer(context, "remove_directory")?;
+        match self.execute(&StorageRequest {
+            context: context.clone(),
+            operation: StorageOperation::RemoveDirectory { path: path.clone() },
+        })? {
+            StorageResponse::DirectoryRemoved => Ok(()),
+            _ => Err(protocol_error("remove_directory")),
+        }
+    }
+
     /// List one bounded page of direct children, excluding `.` and `..`.
     /// Cursors are opaque and scoped to the run/directory/session. Concurrent
     /// mutation may invalidate a cursor explicitly, never escape its directory.

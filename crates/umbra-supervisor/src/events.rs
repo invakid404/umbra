@@ -977,15 +977,18 @@ mod tests {
     // real abort contract instead of accepting anything: a mutating transaction
     // is reconcilable only when the reason is a `KernelRefused` naming the errno
     // this session itself observed *and* every object `prepare` created is one
-    // `abort` can unlink. Every other reason is an interception failure that
+    // `abort` can remove. Every other reason is an interception failure that
     // errors. Note what the second half is no longer: "materialised nothing new".
-    // The overlay rolls back the prepare-time creations `Unlink` can undo — a
-    // shadow file, and so an ordinary creating `open` — and latches only what it
-    // cannot: a directory (`LocalStorage` does not implement `RemoveDirectory`),
-    // a logical
-    // symlink's placeholder-plus-control-blobs, and a shadow ancestor
-    // materialised over nothing
-    // ([#55](https://github.com/invakid404/umbra/issues/55)). Getting the
+    // The overlay rolls back the prepare-time creations its storage surface can
+    // undo — a shadow file, and so an ordinary creating `open`
+    // ([#55](https://github.com/invakid404/umbra/issues/55)); and, since
+    // [#64](https://github.com/invakid404/umbra/issues/64) gave `LocalStorage`
+    // the `RemoveDirectory` arm the other backends already had, a materialised
+    // shadow directory too, whether `mkdir`'s own or an ancestor `parents`
+    // created over nothing. One case is left, and it is what the poisoning test
+    // below now drives: a logical symlink's placeholder-plus-control-blobs,
+    // whose backing index is keyed on the placeholder's object ID, so removing
+    // the placeholder alone would strand it. Getting the
     // reason right is the supervisor's job
     // ([#53](https://github.com/invakid404/umbra/issues/53)), so the double
     // enforces it end to end rather than rubber-stamping the call.
@@ -1004,8 +1007,9 @@ mod tests {
         // The `Pending.created` latch of the transaction being aborted: true when
         // `prepare` materialised something `abort` cannot take back, which the
         // overlay refuses to reconcile. Logical rather than shadow-shaped since
-        // #55 — creating a shadow file no longer sets it, creating a directory
-        // over nothing still does. A session constant here, where
+        // #55, and narrowed again by #64 — neither a shadow file nor a shadow
+        // directory sets it any more; a logical symlink is the one op that does.
+        // A session constant here, where
         // `Pending.created` is per-transaction; equivalent only because every
         // test below drives exactly one transaction, so a harness that drives
         // several needs the real shape.
@@ -1173,22 +1177,27 @@ mod tests {
         );
     }
 
-    // The creating `Open` the real overlay *does* still refuse: one whose parent
-    // directory exists in neither the shadow nor the base, so `parents` has to
-    // materialise a directory shadowing nothing and `Pending.created` latches.
-    // Kept as a distinct helper from the path below so the two supervisor
-    // outcomes are driven by two genuinely different overlay verdicts rather
-    // than by the same op with the double's flag flipped.
+    // The creating `Open` the real overlay reconciles, and the one the
+    // resumed-with-its-errno test below drives. Its parent directory exists in
+    // neither the shadow nor the base, so `parents` materialises a directory
+    // shadowing nothing -- which used to latch `Pending.created`, and since
+    // [#64](https://github.com/invakid404/umbra/issues/64) does not: the
+    // materialised ancestor is `rmdir`-able, so the overlay rolls back both the
+    // file and the directory above it and the refusal reconciles.
     //
-    // The coupling to the real overlay is a claim in this comment, not machinery:
-    // these tests drive `Journaling`, which never consults an `Overlay`. It also
-    // rests on a known fidelity divergence -- `resolve_path_follow` is called with
-    // `create_parents = flags.create` and `walk` swallows a `NotFound` on a
-    // non-final prefix, so this open is *reachable* where POSIX would answer
-    // `ENOENT`. If that is fixed, `umbra-overlay`'s
-    // `a_refused_creating_open_under_a_base_absent_parent_still_poisons` fails
-    // first and loudly; these two keep passing on a comment that has quietly
-    // become false, so re-pick the trigger here when it does.
+    // That is why the double's `created = false` matches reality here with no
+    // caveat, and why this helper's earlier paragraph about a
+    // `resolve_path_follow` / `walk` reachability divergence is gone rather than
+    // re-hedged: the claim it was protecting -- that this op is one the real
+    // overlay *latches* -- is no longer the claim being made. Nothing about
+    // whether this open is reachable changes what the supervisor does with the
+    // verdict it gets.
+    //
+    // Kept as a distinct helper from the poisoning path's op, which is the
+    // point: the two supervisor outcomes are driven by two genuinely different
+    // overlay verdicts rather than by the same op with the double's flag
+    // flipped. #55 narrowed the reachable latch set until the two tests had
+    // collapsed onto one op; #64 restores the split.
     fn creating_open_under_an_absent_parent() -> FsOp {
         FsOp::Open {
             dir: DirRef::Cwd,
@@ -1202,19 +1211,55 @@ mod tests {
         }
     }
 
+    // The op the real overlay still latches, and after #64 the only one: a
+    // logical symlink. `create_symlink` writes the placeholder *and* two Control
+    // blobs, and the backing index is keyed on the placeholder's object ID, so
+    // unlinking the placeholder alone would strand the index; undoing the set is
+    // its own problem, so the whole operation latches `Pending.created` and the
+    // refusal cannot reconcile. Pinned in `umbra-overlay` by
+    // `a_refused_symlink_creation_still_poisons`.
+    //
+    // Four things this comment deliberately does not over-claim, where its
+    // predecessor did:
+    //
+    // (a) This is the *only* remaining `Pending.created` setter. A creating
+    //     `Open` stopped latching in #55 and its ancestors stopped in #64, so
+    //     there is no directory-shaped trigger left to pick.
+    // (b) `resolve` answers `Emulate` for `FsOp::Symlink`, so the supervisor's
+    //     own `syscall_exit` would not reach this refusal today. The property
+    //     under test is "when the namespace refuses, the exit fails closed",
+    //     which is the supervisor's behaviour and not the op's reachability.
+    // (c) That is a *weaker* claim than the old comment's, honestly stated
+    //     rather than a regression: the old one rested on a known fidelity
+    //     divergence it named in the same breath (`resolve_path_follow` called
+    //     with `create_parents = flags.create`, `walk` swallowing a `NotFound`
+    //     on a non-final prefix), so its reachability was already conditional.
+    // (d) Turning any of this from prose into machinery needs the integration
+    //     harness tracked in
+    //     [#57](https://github.com/invakid404/umbra/issues/57); these tests
+    //     drive `Journaling`, which never consults an `Overlay`.
+    fn logical_symlink_whose_placeholder_cannot_be_undone() -> FsOp {
+        FsOp::Symlink {
+            target: BytePath::new(b"/target".to_vec()).unwrap(),
+            link_dir: DirRef::Cwd,
+            link_name: BytePath::new(b"/link".to_vec()).unwrap(),
+        }
+    }
+
     // Case (d) at supervisor level. The property is about the supervisor, not
     // about which op triggers it: reconciliation is the namespace's verdict to
     // give, not an error the supervisor may swallow, so when the namespace
     // refuses, the exit must fail closed -- the run poisons, the lifecycle
     // latches, and nothing is resumed. The supervisor still passes
     // `KernelRefused` down; what changes is the answer it gets back. Named for
-    // the property rather than the trigger because the trigger moved once
-    // already: a plain creating `open` is reconcilable since #55, so the op
-    // below is one the real overlay still latches.
+    // the property rather than the trigger because the trigger keeps moving: a
+    // plain creating `open` became reconcilable in #55, a creating `open` under
+    // an absent parent in #64, and the op below is what is left.
     #[test]
     fn a_namespace_refusal_on_the_exit_path_poisons_the_run_and_resumes_nothing() {
         let thread = ThreadId(task(1).0);
-        let (mut s, log, journaled) = exit_supervisor(creating_open_under_an_absent_parent(), true);
+        let (mut s, log, journaled) =
+            exit_supervisor(logical_symlink_whose_placeholder_cannot_be_undone(), true);
         s.operations.insert(thread, OperationId(Uuid::new_v4()));
         assert_eq!(
             s.handle_event(TraceEvent::SyscallExit {
@@ -1249,9 +1294,12 @@ mod tests {
     fn a_refused_creating_open_the_namespace_rolls_back_is_resumed_with_its_errno() {
         let errno = Errno(28);
         let thread = ThreadId(task(1).0);
-        // The same op as the poisoning case above -- only the namespace's verdict
-        // differs, which is the point: the supervisor reads the answer, it does
-        // not compute it from the op.
+        // A different op from the poisoning case above, and genuinely different:
+        // the real overlay rolls this one back and latches that one, so the two
+        // supervisor outcomes are driven by two overlay verdicts rather than by
+        // one op with the double's flag flipped. The supervisor still only reads
+        // the answer -- it does not compute it from the op -- which is what makes
+        // the double's flag the right knob and the op choice a fidelity claim.
         let (mut s, log, journaled) =
             exit_supervisor(creating_open_under_an_absent_parent(), false);
         s.operations.insert(thread, OperationId(Uuid::new_v4()));

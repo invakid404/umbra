@@ -177,7 +177,7 @@ Unit tests inject an in-memory Journal to model ordering and failure boundaries;
 restart recovery still requires reconciliation that this engine does not implement.
 
 Abort never claims that copy-up, unlink, or a kernel mutation was undone, and
-claims a creation was undone only where it actually unlinked it (below).
+claims a creation was undone only where it actually removed it (below).
 An aborted mutation requires recovery and leaves the session stopped, with one
 structurally distinct exception: `AbortReason::KernelRefused(errno)`. That reason
 says the rewritten syscall reached the kernel and the kernel refused it, so the
@@ -194,9 +194,11 @@ claim is an interception inconsistency and takes the poison path. `Cancelled`,
 down, and neither mode widens to cover the other.
 
 Reconciling *does* undo what `prepare` created, as far as the storage surface
-allows. `Pending.rollback` lists the shadow objects an `Unlink` can remove, and a
-reconciled abort unlinks them in reverse creation order, after the `Abort`
-record; a rollback that itself fails poisons rather than reporting a
+allows. `Pending.rollback` lists the shadow objects the storage surface can
+remove — files and, since
+[#64](https://github.com/invakid404/umbra/issues/64), directories — each tagged
+with which removal undoes it, and a reconciled abort removes them in reverse
+creation order, after the `Abort` record; a rollback that itself fails poisons rather than reporting a
 reconciliation it did not perform, and is the one `abort` path whose error kind
 is the storage backend's rather than `InvalidState`. A refused creating `Open` at
 a path whose ancestors were all already present therefore leaves no trace: the
@@ -217,17 +219,47 @@ left it behind on the same walk since #56, and the commit path accepts it
 deliberately. The gate is about *paths*, and no path the run did not already
 expose survives a reconciled abort.
 
+The rollback list carries directories as well as files, each entry tagged with
+which removal undoes it, and unwinds in reverse creation order so every `rmdir`
+meets an empty directory. That is not an ordering to maintain by hand: `parents`
+walks root-to-leaf and `create` runs it before creating the object, so one
+transaction's entries are already strictly increasing in depth. Only ancestors
+materialised over *nothing* go on the list; one that shadows a live base
+directory stays standing, because it publishes no path the run did not already
+expose. And `parents` returns them rather than recording them itself — `copy_up`,
+`write_control`, `create_symlink` and `set_whiteout` all reach that walk while
+deliberately keeping their own object off the list, so a `parents` that recorded
+would queue a directory whose contents are not queued and turn an ordinary
+`EPERM` into a dead run.
+
+A removal that fails poisons, a non-empty directory included. The engine does not
+match on the error's kind and could not usefully: the same refusal is `Io` with
+`ENOTEMPTY` from `LocalStorage`, `InvalidState` from the tar backend and the
+kernel's errno from the NFS backends. Nor is the alternative a recursive remove —
+a shadow directory that is non-empty at that point is non-empty because of
+something *this* prepare did not create, so emptying it would delete committed
+state to undo an uncommitted one.
+
 `Pending.created` is what is left when rollback runs out, and it still poisons.
-It latches for `Mkdir`, because `StorageOperation::RemoveDirectory` is defined on
-the storage surface but `LocalStorage` does not implement it — it falls through to
-`unsupported("execute")`, and the NFS backends implementing it does not help an
-engine that must work against any backend; for `Symlink`, whose
-placeholder is inseparable from the two control blobs `create_symlink` writes
-with it; and for any shadow ancestor `parents` had to materialise over *nothing*
-— no base directory there, one a whiteout logically deleted, or one whose base
-stat did not answer. Those transactions keep the pre-#53 behaviour: the run ends,
-loudly, instead of the namespace diverging. Closing that half needs
-`RemoveDirectory` on the storage surface first.
+`Mkdir` and materialised shadow ancestors latched it until
+[#64](https://github.com/invakid404/umbra/issues/64) put `RemoveDirectory` on
+`LocalStorage`, the one backend that did not answer it; they are rolled back now.
+One setter is left: `Symlink`, whose placeholder is inseparable from the two
+control blobs `create_symlink` writes with it — the backing index is keyed on the
+placeholder's object ID, so removing the placeholder alone would strand it.
+
+That last setter is a **backstop, not a live safety net**, and the difference
+matters when reading the abort path. `resolve` emulates `Symlink`, so such a
+transaction's observed outcome can only be a success or nothing at all, and it
+fails the abort gate's corroborated-kernel-failure conjunct independently of the
+latch — the latch is currently subsumed and defends nothing today. It is
+retained because the subsumption is a property of `Symlink` being emulated, not
+of the rollback: the day a real `symlinkat` the kernel can refuse reaches this
+path, this field is the only thing between that refusal and a reconciled abort
+that strands the index. A latched transaction keeps the pre-#53 behaviour: the
+run ends, loudly, instead of the namespace diverging. Closing the last half means
+undoing the placeholder and both control blobs together, atomically enough that a
+partial undo cannot strand the index.
 
 The rollback list is in-memory and dies with the session, and that is sufficient
 rather than best-effort: `bind` refuses to reopen a journal that is not pristine,

@@ -282,10 +282,30 @@ impl LocalStorage {
                 }
                 Ok(StorageResponse::Created(self.object(&physical)?))
             }
-            StorageOperation::Unlink { path } => {
+            // Fused the way `umbra-storage-nfs` and `umbra-storage-tar` already
+            // fuse them: one path resolution, one kind bit. `self.path(path,
+            // false)` is the guard that matters for a removal -- it refuses
+            // symlink components and revalidates the run directory and anchor --
+            // and unlike tar no explicit kind check is needed, because the kernel
+            // supplies it (`remove_dir` on a file is `ENOTDIR`, `remove_file` on
+            // a directory is `EISDIR`/`EPERM`). It arrives through `io_error` as
+            // `ErrorKind::Io` where tar answers `InvalidPath`; see
+            // `Storage::remove_directory` for why no caller may depend on that.
+            //
+            // #64 closed exactly one of this match's fallthrough operations --
+            // the one the overlay's reconciled abort needs -- and is not a
+            // completion push: `Rename`, `Link`, `ReadLink`, `AtomicSwap`,
+            // `CreateParents` and `CopyUp` all still hit `unsupported`.
+            StorageOperation::Unlink { path } | StorageOperation::RemoveDirectory { path } => {
+                let directory = matches!(operation, StorageOperation::RemoveDirectory { .. });
                 let physical = self.path(path, false)?;
-                fs::remove_file(physical).map_err(|e| io_error("unlink", e))?;
-                Ok(StorageResponse::Unlinked)
+                if directory {
+                    fs::remove_dir(physical).map_err(|e| io_error("remove_directory", e))?;
+                    Ok(StorageResponse::DirectoryRemoved)
+                } else {
+                    fs::remove_file(physical).map_err(|e| io_error("unlink", e))?;
+                    Ok(StorageResponse::Unlinked)
+                }
             }
             StorageOperation::Stat { path } => {
                 Ok(StorageResponse::Stat(metadata(&self.path(path, false)?)?))
