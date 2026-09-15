@@ -77,32 +77,37 @@ needed there, because the rewritten syscall actually executed.
 
 Any failure in that chain poisons the run: nothing resumes afterwards — including
 an abort the namespace refuses to reconcile, which is its verdict to give and not
-an error the supervisor may swallow. That refusal is reached today when the
-refused syscall's preparation materialised something the namespace cannot take
-back. The overlay removes the prepare-time creations its storage surface can
-undo — a shadow file, and so an ordinary creating open
-([#55](https://github.com/invakid404/umbra/issues/55)), and since
-[#64](https://github.com/invakid404/umbra/issues/64) a materialised shadow
-directory too, whether an explicit `mkdir`'s or an ancestor `parents` created
-over nothing. One case is left: a logical symlink, whose placeholder is
-inseparable from the control blobs keyed on it.
+an error the supervisor may swallow. Two things can produce that refusal, and after
+[#69](https://github.com/invakid404/umbra/issues/69) only two: an abort whose
+claimed errno this session never observed, and a recorded undo the storage backend
+would not perform. The overlay now records an undo for *every* prepare-time
+logical creation — a shadow file, and so an ordinary creating open
+([#55](https://github.com/invakid404/umbra/issues/55)); a materialised shadow
+directory since [#64](https://github.com/invakid404/umbra/issues/64), whether an
+explicit `mkdir`'s or an ancestor `parents` created over nothing; and since #69 a
+logical symlink's backing index, target blob and placeholder as one entry, plus
+the ancestors materialised for that placeholder. There is no third case, and in
+particular no latch: `Pending.created` was retired with the last arm that set it.
 
-The two exit-path refusal tests in `src/events.rs` therefore drive two different
-ops, which is what their comments have always claimed they should: the resumed
-case keeps `creating_open_under_an_absent_parent` (`/newdir/fresh`, which the
-real overlay now rolls back down to the ancestor), and the poisoning case takes
-`logical_symlink_whose_placeholder_cannot_be_undone`. #55 had narrowed the latch
-set until the two collapsed onto one op with the double's flag flipped; #64
-restores the split.
+The two exit-path refusal tests in `src/events.rs` still drive two different ops,
+but the split between them has changed. It used to be *rollback versus latch*: the
+resumed case took an op the overlay rolled back and the poisoning case an op it
+refused to undo at all. It is now *corroboration versus a refused undo* — the
+resumed case keeps `creating_open_under_an_absent_parent` (`/newdir/fresh`, which
+the overlay rolls back down to the ancestor), and the poisoning case takes
+`a_symlink_whose_undo_the_backend_can_refuse`, whose four-object undo gives a
+backend four chances to refuse. #55 had narrowed the reachable set until the two
+collapsed onto one op; #64 restored the split; #69 keeps it on these new terms.
 
-Restores it *in the double*, which is the honest scope of the claim. The overlay
-emulates a logical symlink rather than letting the kernel execute one, so the
-supervisor's `syscall_exit` does not reach a real refusal of it either — the
-poisoning test drives the double with the latch set, and what it pins is the
-supervisor's behaviour when the namespace refuses, not that this op refuses
-today. The helper's own comment in `src/events.rs` states this; so does
-`umbra-overlay`'s note on `Pending.created`. Turning the coupling from prose into
-machinery needs the integration harness in
+*In the double*, which is the honest scope of the claim. The overlay emulates a
+logical symlink rather than letting the kernel execute one, so the supervisor's
+`syscall_exit` does not reach a real refusal of it either — the poisoning test
+drives the double with `undo_refused` set, and what it pins is the supervisor's
+behaviour when the namespace refuses, not that this op refuses today. The helper's
+own comment in `src/events.rs` states this; so does `umbra-overlay`'s note on
+`Pending.rollback`. The double's flag no longer names a field the overlay has,
+which makes the duplication slightly cheaper to get wrong: turning the coupling
+from prose into machinery needs the integration harness in
 [#57](https://github.com/invakid404/umbra/issues/57).
 
 A `Deny`, reached only for

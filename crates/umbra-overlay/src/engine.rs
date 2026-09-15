@@ -62,8 +62,8 @@ enum WhiteoutScan {
 /// The two fields answer different questions off the same evidence and must not
 /// be collapsed into one: the mode is a fidelity choice that rounds *down* to a
 /// safe default whenever the base cannot be consulted, while the creation
-/// verdict is a safety gate that rounds the same non-answer *up* to "a creation
-/// that cannot be rolled back". See `parents`.
+/// verdict is a safety gate that rounds the same non-answer *up* to "a logical
+/// creation, so record an undo for it". See `parents`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ShadowAncestor {
     /// The mode to materialise the ancestor with.
@@ -71,13 +71,14 @@ struct ShadowAncestor {
     /// Whether the base holds a live directory at this path — the one arm the
     /// base corroborates. Every early return, every whiteouted prefix, every
     /// non-directory and every swallowed base error answers `false`, because
-    /// `parents` turns this into `Pending.created` and false is the fail-closed
-    /// side.
+    /// `parents` turns this into the ancestor's place on `Pending.rollback`, and
+    /// false — "record it, and remove it on a reconciled abort" — is the
+    /// fail-closed side.
     shadows_base_directory: bool,
 }
 impl ShadowAncestor {
     /// An ancestor that shadows no base directory: default mode, and a logical
-    /// creation as far as `Pending.created` is concerned.
+    /// creation as far as `Pending.rollback` is concerned.
     fn unshadowed() -> Self {
         Self {
             mode: DEFAULT_DIRECTORY_MODE,
@@ -366,18 +367,95 @@ struct Plan {
     mutation: bool,
     directory_next: Option<(DirectoryKey, Vec<DirectoryEntry>)>,
 }
-/// Which removal undoes one `Pending.rollback` entry.
+/// What `create_symlink` created, for a caller that has to record an undo.
 ///
-/// The discriminant is the storage surface's, not this engine's invention:
-/// removal is split into `StorageOperation::Unlink` and
+/// Returned rather than pushed, on the same terms as `parents`: `copy_up` also
+/// reaches `create_symlink` and deliberately records nothing (see `copy_up`), so
+/// the recording decision belongs to the caller. `placeholder` is not here --
+/// every caller passes it in.
+struct CreatedSymlink {
+    /// `symlinks/objects/<backend object id>`. The one path here the caller could
+    /// not have derived: the backend object ID is whatever the shadow assigned
+    /// the placeholder, so re-deriving it means stat-ing a placeholder that the
+    /// undo is about to remove. See `RollbackEntry::Symlink`.
+    backing_index: StoragePath,
+    /// `symlinks/targets/<logical object id>`, derivable from the identity the
+    /// caller passed in and returned anyway so the entry transcribes one answer
+    /// rather than recomputing half of it.
+    target_blob: StoragePath,
+    /// The Root-anchored ancestors `parents` materialised over nothing **for the
+    /// placeholder only**. The two Control-path walks `write_control` drives
+    /// (`symlinks/targets/`, `symlinks/objects/`) are deliberately not here:
+    /// those directories are shared by every symlink in the run, so recording
+    /// them would make a second live symlink meet `ENOTEMPTY` at
+    /// `remove_directory` and poison a run that should have reconciled.
+    ancestors: Vec<StoragePath>,
+}
+
+/// One undo a reconciled `abort` performs, and the removal(s) that perform it.
+///
+/// `File` and `Directory` are the storage surface's own split, not this engine's
+/// invention: removal is split into `StorageOperation::Unlink` and
 /// `StorageOperation::RemoveDirectory`, and the backends that implement both
 /// already carry the split as a local `bool`. This is that bool, named and
 /// hoisted to the site that has to *decide* it -- `prepare` knows whether it
 /// asked for a file or a directory; `abort` would have to stat to find out.
-#[derive(Clone, Copy)]
-enum RollbackKind {
-    File,
-    Directory,
+///
+/// `Symlink` is **not** a storage-surface discriminant, and the enum should not
+/// be read as if every variant were one. It is three `Unlink`s that only make
+/// sense as a single entry, because the pieces are not independently reachable --
+/// see the variant's own note. Recording them as three separate entries would
+/// remove the same three objects in the same order today, but the order would be
+/// an emergent property of three independent pushes rather than a stated one, and
+/// a future arm could interleave an entry between them.
+#[derive(Clone)]
+enum RollbackEntry {
+    /// A shadow file `prepare` created: `unlink`.
+    File(StoragePath),
+    /// A shadow directory `prepare` materialised over nothing:
+    /// `remove_directory`.
+    Directory(StoragePath),
+    /// A logical symlink `prepare` created: three `unlink`s, **in field order**.
+    ///
+    /// The backing index goes first and that step is *forced*. Its name is
+    /// `symlinks/objects/<backend object id>`, derived from whatever the shadow
+    /// assigned the placeholder, so once the placeholder is gone nothing in the
+    /// session can derive it -- `JournalIntent::Symlink` carries the link path and
+    /// the *logical* identity, not the backend's. Recording the path here is what
+    /// lets a rollback that *runs* remove it; it does nothing for a rollback that
+    /// fails, which is the second reason for the order: the README's own rule is
+    /// that a retired index is removed so backend inode reuse cannot inherit a
+    /// deleted link, and an index outliving its placeholder is the one residue
+    /// that can make a later, unrelated object read back as a logical symlink.
+    ///
+    /// Target blob before placeholder is a **tiebreak, not a constraint**, and
+    /// saying so plainly is the point. Once the index is gone there is no
+    /// referential structure left -- the blob is unreferenced and the placeholder
+    /// is an ordinary empty `0o444` file -- so either order is correct. What
+    /// decides it is residue quality on a rollback that *fails*. The placeholder
+    /// unlink is the one of the three that can plausibly fail on an otherwise
+    /// healthy backend: it is Root-anchored, inside the tracee-visible shadow
+    /// tree, subject to that tree's own directory permissions, which is exactly
+    /// what `a_symlink_rollback_that_cannot_unlink_the_placeholder_poisons`
+    /// injects. The two Control blobs live in a tree only umbra writes, and their
+    /// unlink fails only under conditions that would fail all three. Ordering the
+    /// most-likely-to-fail step last therefore puts the two-object residue on the
+    /// rare failure rather than the common one.
+    ///
+    /// On the success path the order buys nothing and is unobservable, which is
+    /// why `the_symlink_undo_unlinks_the_index_before_the_blob_and_the_placeholder`
+    /// pins it against the recorder rather than against the tree.
+    ///
+    /// The ancestors `parents` materialised for the placeholder are *not* here.
+    /// They are ordinary `Directory` entries the `FsOp::Symlink` arm queues before
+    /// this one, so the reverse walk in `abort` unwinds them leaf-first like every
+    /// other materialised ancestor; folding them in would duplicate that ordering
+    /// logic inside one variant for no gain.
+    Symlink {
+        backing_index: StoragePath,
+        target_blob: StoragePath,
+        placeholder: StoragePath,
+    },
 }
 struct Pending {
     id: OperationId,
@@ -386,16 +464,26 @@ struct Pending {
     whiteouts: Vec<(StoragePath, bool)>,
     retired_index: Option<StoragePath>,
     /// Shadow objects `prepare` created that `abort` can undo, in creation
-    /// order, each tagged with the removal that undoes it. A reconciled abort
-    /// walks the list in reverse and issues `unlink` or `remove_directory` per
-    /// entry.
+    /// order, each carrying the removal that undoes it. A reconciled abort walks
+    /// the list in reverse and performs each entry's removal(s).
+    ///
+    /// **Every prepare-time logical creation records an entry here.** That rule
+    /// used to have an escape: an arm that could not express its undo latched
+    /// `Pending.created` instead, and the gate poisoned. There is no such latch
+    /// any more ([#69](https://github.com/invakid404/umbra/issues/69) gave the
+    /// last holdout, `FsOp::Symlink`, the `RollbackEntry::Symlink` arm), so an arm
+    /// that creates and forgets to record does not fail closed -- it publishes a
+    /// path the tracee was told its syscall failed to make, and a later
+    /// `O_CREAT|O_EXCL` on that path answers `EEXIST` forever. A new
+    /// materialising arm has to record; see `RollbackEntry` for the shapes
+    /// available and `FsOp::Link` in the README for the arm most likely to forget.
     ///
     /// Directories belong here since
     /// [#64](https://github.com/invakid404/umbra/issues/64) gave `LocalStorage`
     /// the `RemoveDirectory` arm the other backends already had. Before that the
     /// engine could not rely on the storage *surface* for a directory removal, so
-    /// a materialised shadow directory had no undo and latched `created`
-    /// instead; it can now, and does.
+    /// a materialised shadow directory had no undo and latched the since-retired
+    /// `Pending.created` instead; it can now, and does.
     ///
     /// Reverse-insertion order is sufficient without a depth key, and the reason
     /// is structural rather than lucky. `parents` walks root-to-leaf and creates
@@ -405,9 +493,17 @@ struct Pending {
     /// ancestor it needs; and each prepare arm performs at most one
     /// rollback-pushing walk per transaction, so two independently-rooted groups
     /// never interleave. `a/b/c/fresh` over an empty base therefore inserts
-    /// `[(a,Dir), (a/b,Dir), (a/b/c,Dir), (a/b/c/fresh,File)]` and unwinds
+    /// `[Directory(a), Directory(a/b), Directory(a/b/c), File(a/b/c/fresh)]` and
+    /// unwinds
     /// leaf-first, every `rmdir` seeing an empty directory. A `depth` field
     /// would today be a function of the path and would never change the order.
+    ///
+    /// `RollbackEntry::Symlink` does not disturb that invariant. It is pushed by
+    /// the `FsOp::Symlink` arm *after* that arm's `queue_ancestors`, like every
+    /// other object entry, and the three paths inside it are removed in the
+    /// variant's own field order rather than by this loop's reversal -- two
+    /// Control blobs that no directory entry here contains, and the placeholder,
+    /// which is a file.
     ///
     /// A removal that fails poisons, `ENOTEMPTY` included — see `abort`. Given
     /// which sites push (below), a non-empty shadow directory here means the
@@ -418,10 +514,10 @@ struct Pending {
     /// standing, because it publishes no path the run did not already expose.
     /// And `parents` itself pushes nothing — it *returns*, and only the prepare
     /// arms that read the verdict record it. That is load-bearing rather than
-    /// stylistic: `parents` is also reached from `copy_up`, `write_control`,
-    /// `create_symlink` and `set_whiteout`, which deliberately keep their own
-    /// object off this list, so a `parents` that pushed would queue an ancestor
-    /// whose contents are not queued. A refused write-open onto a base file
+    /// stylistic: `parents` is also reached from `copy_up`, `write_control` and
+    /// `set_whiteout`, which deliberately keep their own object off this list, so
+    /// a `parents` that pushed would queue an ancestor whose contents are not
+    /// queued. A refused write-open onto a base file
     /// under a not-yet-shadowed base directory would then reach abort with
     /// `[(dir,Dir)]` and a copied-up file inside `dir`: `rmdir` → `ENOTEMPTY` →
     /// poison, converting today's clean reconcile into a dead run — exactly the
@@ -442,82 +538,7 @@ struct Pending {
     /// readable today. See `bind`, which states the same premise from the other
     /// side; widening that refusal without first making prepare-time creations
     /// durable would invalidate this comment rather than merely outdate it.
-    rollback: Vec<(StoragePath, RollbackKind)>,
-    /// Whether `prepare` materialised something `abort` cannot undo.
-    ///
-    /// This is the fail-closed half of the rollback gate: what lands in
-    /// `rollback` is removed on a reconciled abort — `unlink` for a file,
-    /// `remove_directory` for a directory — and what latches this keeps the
-    /// pre-#53 poison behaviour instead. Both halves exist to prevent one
-    /// divergence — publishing a path the tracee was told its syscall failed to
-    /// make — which is not merely cosmetic: because the shadow object outranks
-    /// even a stale whiteout, a later `O_CREAT|O_EXCL` on such a path would fail
-    /// `EEXIST` forever.
-    ///
-    /// The predicate is *logical*, not shadow-shaped. A shadow object that
-    /// shadows a base object the run already exposes is not a creation; one that
-    /// stands over nothing is. Exactly one thing still latches it:
-    /// `FsOp::Symlink`, whose placeholder comes with Control blobs whose removal
-    /// is a second rollback problem — the backing index is keyed on the
-    /// placeholder's `ObjectId`, so unlinking the placeholder alone strands it.
-    ///
-    /// One setter is the intended end state of
-    /// [#64](https://github.com/invakid404/umbra/issues/64), not a sign the field
-    /// should go. What *stopped* latching: a materialised shadow directory,
-    /// whether `FsOp::Mkdir`'s own or an ancestor `parents` had to create over
-    /// nothing, because `remove_directory` now answers on every backend and those
-    /// go on `rollback` instead. A creating `Open` had already stopped latching
-    /// for its object in
-    /// [#55](https://github.com/invakid404/umbra/issues/55); after #64 its
-    /// ancestors do not latch either, so **no latch originates from `parents`**
-    /// at all.
-    ///
-    /// Be precise about what the one remaining setter buys today: **nothing that
-    /// the gate's other conjunct does not already buy.** The latch is currently
-    /// subsumed. `created` is set only by the `FsOp::Symlink` arm; `resolve`
-    /// answers `Emulate(Success)` for `FsOp::Symlink`; `observe_result` refuses
-    /// any outcome differing from an emulation's, so such a transaction's
-    /// `outcome` can only be `None` or `Some(Success)`; and the reconciling arm
-    /// in `abort` requires `Some(Failure(_))` corroborating the claimed errno.
-    /// So `!self.created` is a provably redundant conjunct at that gate — a
-    /// latched transaction reaches the poison path anyway, for want of a
-    /// corroborated kernel failure rather than for want of an undo.
-    ///
-    /// It is kept as a fail-closed backstop, not as a live safety net, and the
-    /// distinction is worth stating because the two read identically at the call
-    /// site. The day a `Symlink` stops being emulated — a real `symlinkat` the
-    /// kernel executes and can refuse — the subsumption disappears and this field
-    /// is the only thing standing between that refusal and a reconciled abort
-    /// that strands the backing index. Removing it as dead code would be correct
-    /// today and wrong on that day, and nothing in the type system would catch
-    /// the difference.
-    ///
-    /// Copy-up deliberately does not set this, and the reason is *not* that
-    /// copy-up is invisible. It duplicates an object the base already holds, so
-    /// the content view is unchanged, and treating it as a creation would poison
-    /// the run on the first write into any not-yet-shadowed base subdirectory —
-    /// a large share of the ordinary `EPERM` cases
-    /// [#53](https://github.com/invakid404/umbra/issues/53) exists to survive.
-    /// Materialising shadow ancestors is still not nothing — they are new
-    /// objects in the shadow either way — but it is no longer *wrong*. `parents`
-    /// once gave every one of them a hardcoded `0o755` instead of the base
-    /// directory's mode, so a base directory at `0700` was answered as `0755`
-    /// afterwards, including after a syscall the tracee was told had failed. That
-    /// was a fidelity defect in `parents` rather than something this flag gated,
-    /// and it is fixed: `parents` carries the base directory's group and other
-    /// bits onto the shadow it materialises, with the owner bits widened to at
-    /// least `rwx` because umbra owns the shadow and has to be able to write into
-    /// it ([#56](https://github.com/invakid404/umbra/issues/56)), on the success
-    /// and reconciled-abort paths alike.
-    ///
-    /// The latch is per transaction and lives only in this `Pending`, so any
-    /// verdict reached *without* a live `Pending` has no evidence to consult. A
-    /// journal replay — once `bind`'s reopen refusal is widened — must therefore
-    /// assume it was set for every `Prepare` whose intent implies a creation,
-    /// rather than infer reconcilability from the absence of a `Pending`.
-    ///
-    /// See `parents` for how the per-ancestor evidence is gathered.
-    created: bool,
+    rollback: Vec<RollbackEntry>,
 }
 
 /// Standard storage-independent namespace engine. Construction performs no I/O.
@@ -900,12 +921,19 @@ impl Overlay {
         }
         Ok(())
     }
+    /// Materialise a logical symlink: the target blob, the placeholder, and the
+    /// backing index keyed on the placeholder's backend object ID.
+    ///
+    /// Reports what it created so a caller that has to undo it can record the
+    /// paths rather than re-derive them. Only the *placeholder's* ancestors are
+    /// reported; `write_control`'s own two `parents` walks keep discarding theirs,
+    /// for the reason `CreatedSymlink::ancestors` gives.
     fn create_symlink(
         &mut self,
         path: &StoragePath,
         target: &BytePath,
         object: ObjectId,
-    ) -> Result<()> {
+    ) -> Result<CreatedSymlink> {
         let metadata = symlink_target(object)?;
         let context = self.context()?;
         match read_control(self.storage.as_mut(), &context, &metadata)? {
@@ -918,12 +946,18 @@ impl Overlay {
             Some(_) => {}
             None => self.write_control(&metadata, target.as_bytes())?,
         }
-        self.create(path, CreateKind::File, 0o444)?;
+        let ancestors = self.create(path, CreateKind::File, 0o444)?;
         let backend = self
             .shadow_stat(path)?
             .expect("created placeholder")
             .object_id;
-        self.write_control(&symlink_index(backend)?, object.0.to_string().as_bytes())
+        let backing_index = symlink_index(backend)?;
+        self.write_control(&backing_index, object.0.to_string().as_bytes())?;
+        Ok(CreatedSymlink {
+            backing_index,
+            target_blob: metadata,
+            ancestors,
+        })
     }
     fn remove_symlink_index(&mut self, path: &StoragePath) -> Result<()> {
         if let Some(stat) = self.shadow_stat(path)? {
@@ -940,8 +974,8 @@ impl Overlay {
     ///
     /// The answer used to be shadow-shaped: decided by `shadow_stat` alone, so an
     /// ancestor that already existed in the base but had not been copied up yet
-    /// was reported as created, and `Pending.created` inherited the
-    /// over-approximation. That is what made a refused cross-path rename onto a
+    /// was reported as created, and the since-retired `Pending.created` latch
+    /// inherited the over-approximation. That is what made a refused cross-path rename onto a
     /// base-only destination parent poison rather than reconcile — named in the
     /// README as #53 under-delivering, and held in place by the missing rollback
     /// [#55](https://github.com/invakid404/umbra/issues/55) tracks.
@@ -976,12 +1010,29 @@ impl Overlay {
     /// harmless; if it holds nothing, the shadow was a phantom and removing it is
     /// required. The mode half of the swallow is untouched.
     ///
-    /// The answer is **returned, never pushed**. Four of `create`'s callers
-    /// (`copy_up`, `write_control`, `create_symlink`, `set_whiteout`) reach this
-    /// walk while deliberately keeping their own object off `Pending.rollback`;
-    /// queueing an ancestor from here would queue a directory whose contents are
-    /// not queued, and the `rmdir` would meet `ENOTEMPTY`. Only the prepare arms
-    /// that read the verdict record it — see `Pending.rollback`.
+    /// The answer is **returned, never pushed**, and the decision of what to do
+    /// with it belongs to the caller. Three of `create`'s callers — `copy_up`,
+    /// `write_control` and `set_whiteout` — reach this walk while deliberately
+    /// keeping their own object off `Pending.rollback`, and so must discard the
+    /// verdict too: queueing an ancestor from here would queue a directory whose
+    /// contents are not queued, and the `rmdir` would meet `ENOTEMPTY`.
+    ///
+    /// That is the test a new `create` caller has to apply, and it is about the
+    /// *object*, not the caller: **record the ancestors exactly when the object
+    /// under them is recorded.** `create_symlink` was a fourth discarder until
+    /// [#69](https://github.com/invakid404/umbra/issues/69) and is no longer one,
+    /// because its object is now recorded — but only on one of its two paths, so
+    /// it does not simply move to the other list either. It *forwards*: the
+    /// `FsOp::Symlink` prepare arm queues what it forwards, while `copy_up`, whose
+    /// symlink is not a creation, drops it. Its two `write_control` calls reach
+    /// this walk separately, under Control, and still discard there — those
+    /// ancestors are the `symlinks/targets/` and `symlinks/objects/` directories,
+    /// shared by every symlink in the run, so recording them would make a second
+    /// live symlink meet `ENOTEMPTY` and poison a run that should have reconciled.
+    ///
+    /// See `create` for the same split from the caller's side, and
+    /// `Pending.rollback` for what the prepare arms that read the verdict do
+    /// with it.
     fn parents(&mut self, path: &StoragePath) -> Result<Vec<StoragePath>> {
         let parts: Vec<_> = path.as_bytes().split(|b| *b == b'/').collect();
         let mut created = Vec::new();
@@ -1137,17 +1188,24 @@ impl Overlay {
     /// `parents`'s verdict on those ancestors — *not* on the object itself,
     /// which every caller already knows it asked for.
     ///
-    /// Four callers discard the answer, and none of them needs it. `copy_up` and
-    /// `write_control` duplicate or annotate what the run already exposes;
-    /// `set_whiteout` writes under Control, which shadows nothing at all; and
-    /// `create_symlink`'s placeholder create is reached either from the
-    /// `FsOp::Symlink` prepare arm, which latches `Pending.created` for the whole
-    /// operation immediately afterwards, or from `copy_up`, which is not a
-    /// creation at all — so in neither case would an ancestor verdict change what
-    /// the caller does. Discarding here is what keeps those four off
-    /// `Pending.rollback` — see `parents` for why that matters and is not merely
-    /// tidy. The callers that read it are `prepare`'s creating-`Open` and
-    /// `Mkdir` arms.
+    /// Three callers discard the answer, and none of them needs it. `copy_up` and
+    /// `write_control` duplicate or annotate what the run already exposes, and
+    /// `set_whiteout` writes under Control, which shadows nothing at all.
+    /// Discarding here is what keeps those three off `Pending.rollback` — see
+    /// `parents` for why that matters and is not merely tidy.
+    ///
+    /// `create_symlink` used to be a fourth, on the premise that the whole
+    /// operation latched and an ancestor verdict could not change the caller's
+    /// mind. [#69](https://github.com/invakid404/umbra/issues/69) removed the
+    /// latch, so it *forwards* the placeholder's verdict now (a
+    /// `symlink("newdir/link", …)` materialises `newdir/` over nothing, and a
+    /// reconciled abort that left it standing would publish exactly the phantom
+    /// path the gate exists to prevent). Forwarding is not recording: its
+    /// `copy_up` caller still discards, and its two `write_control` calls still
+    /// reach this walk under Control and discard there.
+    ///
+    /// The callers that read the answer are `prepare`'s creating-`Open`, `Mkdir`
+    /// and `Symlink` arms.
     fn create(
         &mut self,
         path: &StoragePath,
@@ -1171,7 +1229,7 @@ impl Overlay {
             .as_mut()
             .unwrap()
             .rollback
-            .extend(ancestors.into_iter().map(|p| (p, RollbackKind::Directory)));
+            .extend(ancestors.into_iter().map(RollbackEntry::Directory));
     }
     fn copy_up(&mut self, path: &StoragePath) -> Result<()> {
         let (stat, shadow) = self.lookup(path)?;
@@ -1180,7 +1238,15 @@ impl Overlay {
         }
         if stat.kind == ObjectKind::LogicalSymlink {
             let target = self.base().read_link(path)?;
-            return self.create_symlink(path, &target, stat.object_id);
+            // Discarded, deliberately, all of it. Copy-up is not a creation (see
+            // the note on this function and `Pending.rollback`), so neither the
+            // symlink's own three objects nor the ancestors materialised for its
+            // placeholder go on the rollback list: recording them would poison
+            // the first refused write into a not-yet-shadowed base subdirectory,
+            // which is a large share of the ordinary `EPERM` cases #53 exists to
+            // survive.
+            self.create_symlink(path, &target, stat.object_id)?;
+            return Ok(());
         }
         if stat.kind != ObjectKind::File {
             return Err(unsupported("recursive directory copy-up is deferred"));
@@ -1829,7 +1895,6 @@ impl NamespaceSession for Overlay {
             whiteouts: vec![],
             retired_index: None,
             rollback: vec![],
-            created: false,
         });
         // Any failure after append may have left durable intent or storage effects.
         // Keep the session stopped for explicit recovery instead of guessing rollback.
@@ -1854,7 +1919,7 @@ impl NamespaceSession for Overlay {
                         let pending = self.pending.as_mut().unwrap();
                         pending
                             .rollback
-                            .push((plan.path.clone(), RollbackKind::File));
+                            .push(RollbackEntry::File(plan.path.clone()));
                         pending.whiteouts.push((plan.path.clone(), false));
                     }
                     // Creation was executed through Storage, so O_EXCL must not run twice.
@@ -1869,35 +1934,49 @@ impl NamespaceSession for Overlay {
                         }
                     }
                 }
-                // The placeholder is a file, so `Unlink` could remove it - but
-                // removing it alone is not a rollback. `create_symlink` also
-                // writes two Control blobs, the target and the backing index,
-                // and the index is keyed on the placeholder's object ID, so
-                // dropping the placeholder would strand it. Undoing the set is
-                // its own problem, so the whole operation latches instead.
+                // Four objects, not the three the placeholder-plus-blobs framing
+                // names. `create_symlink` writes the target blob, the placeholder
+                // and the backing index — and reaching the placeholder through
+                // `create` also materialises its shadow ancestors over nothing,
+                // exactly as the creating-`Open` arm's do. So the ancestors are
+                // queued first, as ordinary `Directory` entries, and the reverse
+                // walk in `abort` unwinds them leaf-first like every other
+                // materialised ancestor; the other three go in one
+                // `RollbackEntry::Symlink`, because they are not independently
+                // reachable — the index's *name* is derived from the
+                // placeholder's backend object ID, so removing the placeholder
+                // first leaves the index underivable and stranded.
+                //
+                // This arm latched `Pending.created` until
+                // [#69](https://github.com/invakid404/umbra/issues/69), on the
+                // premise that undoing the set was its own problem. It is this
+                // entry now, and there is no latch left to fall back on — see
+                // `Pending.rollback`.
                 FsOp::Symlink { target, .. } => {
-                    self.create_symlink(&plan.path, target, ObjectId(operation.0))?;
-                    self.pending.as_mut().unwrap().created = true;
-                    self.pending
-                        .as_mut()
-                        .unwrap()
-                        .whiteouts
-                        .push((plan.path.clone(), false));
+                    let created = self.create_symlink(&plan.path, target, ObjectId(operation.0))?;
+                    self.queue_ancestors(created.ancestors);
+                    let pending = self.pending.as_mut().unwrap();
+                    pending.rollback.push(RollbackEntry::Symlink {
+                        backing_index: created.backing_index,
+                        target_blob: created.target_blob,
+                        placeholder: plan.path.clone(),
+                    });
+                    pending.whiteouts.push((plan.path.clone(), false));
                 }
                 // The creating-`Open` arm with `CreateKind::Directory`: the
                 // directory this makes and every ancestor materialised over
                 // nothing are all removable through `remove_directory`, so the
                 // arm records an undo instead of latching. It latched
-                // unconditionally until #64, on the premise that `LocalStorage`
-                // could not remove a directory at all — that premise is now false.
+                // `Pending.created` unconditionally until #64, on the premise that
+                // `LocalStorage` could not remove a directory at all — that
+                // premise is now false, and after #69 the latch itself is gone.
                 //
                 // `resolve` answers `Emulate` for `Mkdir` (see the
                 // `Symlink | Mkdir | Unlink` arm), so the supervisor's
                 // `syscall_exit` never drives a `KernelRefused` abort here today.
-                // Wired anyway: leaving `created = true` standing on a dead
-                // premise is worse than either alternative, and `Overlay::abort`
-                // is callable directly, so the rule is pinned at the layer that
-                // owns it.
+                // Wired anyway: leaving a latch standing on a dead premise is
+                // worse than either alternative, and `Overlay::abort` is callable
+                // directly, so the rule is pinned at the layer that owns it.
                 FsOp::Mkdir { mode, .. } => {
                     let ancestors = self.create(&plan.path, CreateKind::Directory, *mode)?;
                     self.queue_ancestors(ancestors);
@@ -1905,7 +1984,7 @@ impl NamespaceSession for Overlay {
                         .as_mut()
                         .unwrap()
                         .rollback
-                        .push((plan.path.clone(), RollbackKind::Directory));
+                        .push(RollbackEntry::Directory(plan.path.clone()));
                     // Keep an existing directory whiteout as an opaque-base marker.
                 }
                 FsOp::Unlink { .. } => {
@@ -2093,20 +2172,23 @@ impl NamespaceSession for Overlay {
         // the poison path below. Every other reason means the interception broke
         // down and keeps the poison-and-error behaviour unchanged; the two modes
         // never merge.
-        // Reconciling undoes what `prepare` created, as far as the storage
-        // surface allows: `rollback` carries the shadow objects `Unlink` and
-        // `RemoveDirectory` can remove, each tagged with which, and `created`
-        // latches whatever it cannot. A latched transaction leaves a path the
-        // tracee was told does not exist, so it stays on the poison path - see
-        // `Pending.created` for the one op that still latches, and for why
-        // copy-up deliberately does not.
+        // Reconciling undoes what `prepare` created: `rollback` carries every
+        // prepare-time logical creation, each entry naming the removal(s) that
+        // undo it. There is no second conjunct here any more. A `Pending.created`
+        // latch used to stand beside the corroboration for whatever the storage
+        // surface could not take back, and
+        // [#69](https://github.com/invakid404/umbra/issues/69) retired it with the
+        // last arm that set it: what an arm cannot undo is now a missing entry
+        // rather than a flag, and a flag no arm sets cannot fail closed. The gate
+        // is corroboration alone; the undo's own failure is what poisons below.
+        // See `Pending.rollback` for the rule that replaced the latch, and
+        // `copy_up` for why copy-up records nothing.
         let rollback = pending.rollback.clone();
-        let kernel_refused = !pending.created
-            && matches!(
-                (reason, &pending.outcome),
-                (AbortReason::KernelRefused(claimed), Some(OperationOutcome::Failure(observed)))
-                    if claimed == observed
-            );
+        let kernel_refused = matches!(
+            (reason, &pending.outcome),
+            (AbortReason::KernelRefused(claimed), Some(OperationOutcome::Failure(observed)))
+                if claimed == observed
+        );
         if mutation {
             if let Err(e) = self.record(
                 operation,
@@ -2148,12 +2230,40 @@ impl NamespaceSession for Overlay {
         // journaled `Prepare` is the one storage request whose attribution a
         // backend log most needs to be right. Clearing it first would have
         // charged these unlinks to the run-level context instead.
+        //
+        // `RollbackEntry::Symlink`'s three paths are removed in the variant's own
+        // field order, which the arm below transcribes rather than restates: the
+        // backing index first because its name is derived from the placeholder's
+        // backend object ID, then the target blob, then the placeholder. No step
+        // tolerates `ENOENT` — a missing piece is not a tidier world, it is
+        // evidence that something outside this transaction is writing the control
+        // tree — so all three go through this same closure and poison on failure
+        // with the backend's own kind. Deliberately not `remove_symlink_index`:
+        // that helper re-derives the index from a live `shadow_stat` of the
+        // placeholder and silently skips when absent, and both behaviours are
+        // wrong here — the recorded path is authoritative, and silence is the
+        // opposite of what this path wants.
         let rolled_back = (|| {
-            for (path, kind) in rollback.iter().rev() {
-                let context = self.context()?;
-                match kind {
-                    RollbackKind::File => self.storage.unlink(&context, path)?,
-                    RollbackKind::Directory => self.storage.remove_directory(&context, path)?,
+            for entry in rollback.iter().rev() {
+                match entry {
+                    RollbackEntry::File(path) => {
+                        let context = self.context()?;
+                        self.storage.unlink(&context, path)?;
+                    }
+                    RollbackEntry::Directory(path) => {
+                        let context = self.context()?;
+                        self.storage.remove_directory(&context, path)?;
+                    }
+                    RollbackEntry::Symlink {
+                        backing_index,
+                        target_blob,
+                        placeholder,
+                    } => {
+                        for path in [backing_index, target_blob, placeholder] {
+                            let context = self.context()?;
+                            self.storage.unlink(&context, path)?;
+                        }
+                    }
                 }
             }
             Ok(())

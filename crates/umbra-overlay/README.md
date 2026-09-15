@@ -193,12 +193,16 @@ claim is an interception inconsistency and takes the poison path. `Cancelled`,
 `Failed` and `RecoveryRequired` are unchanged: they mean the interception broke
 down, and neither mode widens to cover the other.
 
-Reconciling *does* undo what `prepare` created, as far as the storage surface
-allows. `Pending.rollback` lists the shadow objects the storage surface can
-remove — files and, since
-[#64](https://github.com/invakid404/umbra/issues/64), directories — each tagged
-with which removal undoes it, and a reconciled abort removes them in reverse
-creation order, after the `Abort` record; a rollback that itself fails poisons rather than reporting a
+Reconciling *does* undo what `prepare` created. `Pending.rollback` lists every
+prepare-time logical creation — files; directories since
+[#64](https://github.com/invakid404/umbra/issues/64); and, since
+[#69](https://github.com/invakid404/umbra/issues/69), a logical symlink's three
+objects as one entry — each carrying the removal(s) that undo it, and a reconciled
+abort walks the *list* in reverse creation order, after the `Abort` record,
+performing each entry's removal(s). Reverse creation order governs the list, not
+the inside of an entry: the symlink entry's own three paths go in the order given
+below, which is deliberately not the order they were created in. A rollback that
+itself fails poisons rather than reporting a
 reconciliation it did not perform, and is the one `abort` path whose error kind
 is the storage backend's rather than `InvalidState`. A refused creating `Open` at
 a path whose ancestors were all already present therefore leaves no trace: the
@@ -219,18 +223,18 @@ left it behind on the same walk since #56, and the commit path accepts it
 deliberately. The gate is about *paths*, and no path the run did not already
 expose survives a reconciled abort.
 
-The rollback list carries directories as well as files, each entry tagged with
-which removal undoes it, and unwinds in reverse creation order so every `rmdir`
+The rollback list carries directories as well as files, each entry carrying the
+removal that undoes it, and unwinds in reverse creation order so every `rmdir`
 meets an empty directory. That is not an ordering to maintain by hand: `parents`
 walks root-to-leaf and `create` runs it before creating the object, so one
 transaction's entries are already strictly increasing in depth. Only ancestors
 materialised over *nothing* go on the list; one that shadows a live base
 directory stays standing, because it publishes no path the run did not already
 expose. And `parents` returns them rather than recording them itself — `copy_up`,
-`write_control`, `create_symlink` and `set_whiteout` all reach that walk while
-deliberately keeping their own object off the list, so a `parents` that recorded
-would queue a directory whose contents are not queued and turn an ordinary
-`EPERM` into a dead run.
+`write_control` and `set_whiteout` all reach that walk while deliberately keeping
+their own object off the list, so a `parents` that recorded would queue a
+directory whose contents are not queued and turn an ordinary `EPERM` into a dead
+run.
 
 A removal that fails poisons, a non-empty directory included. The engine does not
 match on the error's kind and could not usefully: the same refusal is `Io` with
@@ -240,26 +244,52 @@ a shadow directory that is non-empty at that point is non-empty because of
 something *this* prepare did not create, so emptying it would delete committed
 state to undo an uncommitted one.
 
-`Pending.created` is what is left when rollback runs out, and it still poisons.
-`Mkdir` and materialised shadow ancestors latched it until
-[#64](https://github.com/invakid404/umbra/issues/64) put `RemoveDirectory` on
-`LocalStorage`, the one backend that did not answer it; they are rolled back now.
-One setter is left: `Symlink`, whose placeholder is inseparable from the two
-control blobs `create_symlink` writes with it — the backing index is keyed on the
-placeholder's object ID, so removing the placeholder alone would strand it.
+A logical symlink is the one entry that is not a single removal. `create_symlink`
+writes a Control target blob, a placeholder and a backing index keyed on the
+placeholder's *backend* object ID — and reaching the placeholder through `create`
+also materialises its shadow ancestors, so it is **four** objects to undo, not the
+three the set names. The ancestors are ordinary `Directory` entries the arm queues
+before its own, so they unwind leaf-first like every other materialised ancestor;
+the other three are one `RollbackEntry::Symlink`, because they are not
+independently reachable.
 
-That last setter is a **backstop, not a live safety net**, and the difference
-matters when reading the abort path. `resolve` emulates `Symlink`, so such a
-transaction's observed outcome can only be a success or nothing at all, and it
-fails the abort gate's corroborated-kernel-failure conjunct independently of the
-latch — the latch is currently subsumed and defends nothing today. It is
-retained because the subsumption is a property of `Symlink` being emulated, not
-of the rollback: the day a real `symlinkat` the kernel can refuse reaches this
-path, this field is the only thing between that refusal and a reconciled abort
-that strands the index. A latched transaction keeps the pre-#53 behaviour: the
-run ends, loudly, instead of the namespace diverging. Closing the last half means
-undoing the placeholder and both control blobs together, atomically enough that a
-partial undo cannot strand the index.
+That entry's three `unlink`s run **in its field order: backing index, target blob,
+placeholder** — three steps, and the two orderings between them are not equally
+forced. Index-first is a
+constraint. The index's name is `symlinks/objects/<backend object id>`, derived
+from whatever the shadow assigned the placeholder, so once the placeholder is gone
+nothing can derive it; and the rule stated under *Logical symlinks* below — a
+retired index is removed so backend inode reuse cannot inherit a deleted link —
+makes a stale index the one residue that can make a later, unrelated object read
+back as a logical symlink. Blob-before-placeholder is a **tiebreak, not a
+constraint**: once the index is gone nothing points at either, so either order is
+correct, and what decides it is residue quality on a rollback that *fails*. The
+placeholder `unlink` is the one of the three that can plausibly fail on an
+otherwise healthy backend — it is Root-anchored, inside the tracee-visible shadow
+tree, subject to that tree's own directory permissions — so putting it last leaves
+the two-object residue on the rare failure rather than the common one. Stated as a
+rule for future entries: *remove the piece whose name depends on another piece
+before that piece; among name-independent pieces, remove the one most likely to
+fail last.*
+
+No step tolerates `ENOENT`. A missing index or blob at rollback time is not a
+tidier world, it is evidence that something outside this transaction is writing
+the control tree, so it propagates and poisons like any other failed removal — the
+same rule a `File` entry has followed since #55. The rollback deliberately does
+not reuse `remove_symlink_index`, which re-derives the index from a live
+`shadow_stat` of the placeholder and silently skips when absent: the recorded path
+is authoritative, and silence is the opposite of what this path wants.
+
+**Nothing latches any more.** `Pending.created` was what was left when rollback ran
+out: a transaction that materialised something `abort` could not take back kept
+the pre-#53 poison behaviour. #64 took the directory arms off it, and #69 took the
+last one — `Symlink` — with the entry above, retiring the field and its conjunct in
+`abort`'s gate. The gate is now corroboration alone: a mutating abort reconciles
+iff the reason is a `KernelRefused` naming the errno this session observed, and
+poisons if any recorded removal then fails. What replaces the latch is a rule
+rather than a flag: *every prepare-time logical creation records an entry.* A
+latch nothing sets cannot fail closed, and would only give a future author the
+false impression that an unrecorded creation would be caught.
 
 The rollback list is in-memory and dies with the session, and that is sufficient
 rather than best-effort: `bind` refuses to reopen a journal that is not pristine,
@@ -268,7 +298,11 @@ poisoning would. A durable pre-image would buy nothing readable today, so it is
 deferred to M1.5 along with the widening of that refusal — and the replay path
 that widens it must poison for every `Prepare` whose intent implies a creation,
 because the rollback list is gone by then and its absence is not evidence of
-reconcilability.
+reconcilability. #69 adds a second, sharper reason for the symlink case
+specifically: the backing index's key is the *backend* object ID the shadow
+assigned the placeholder, and the journal carries the link path and the logical
+identity but never that, so a durable replay could not rebuild a symlink undo from
+durable state at all — not merely "less precisely", but not at all.
 
 Copy-up is deliberately not counted as a creation, so a refused `fchownat`, or a
 refused write open on an object the base already holds, reconciles. The content
@@ -316,7 +350,7 @@ by design — that is what `mkdir` keeps one for, as an opaque-base marker — a
 `parents` skips ancestors already in the shadow, so a marker above the first
 materialised ancestor would otherwise go unseen.
 
-`created` used to be shadow-shaped: `parents` decided it from the shadow alone,
+The creation verdict used to be shadow-shaped: `parents` decided it from the shadow alone,
 so a cross-path `rename` onto a destination parent that existed in the base but
 had not been copied up yet was counted as a creation and poisoned. That was
 fail-closed and under-delivered for `rename`, and it is now narrowed. `parents`
@@ -324,7 +358,7 @@ answers logically, off evidence it was already gathering and discarding —
 `shadow_parent_mode` stats the base for the mode (#56) and carries a whiteout
 scan across the walk, which is exactly what distinguishes a shadow of a directory
 the run already exposes from a directory that logically did not exist. Only the
-second latches. The base stat's **error swallow does not widen the benign side**:
+second is recorded. The base stat's **error swallow does not widen the benign side**:
 it exists so that an illegible base cannot fail a `create` that succeeds today,
 and it is deliberately not read as "no base directory, therefore benign" — every
 arm but a corroborated live base directory fails closed. So a refused `rename`
@@ -344,14 +378,19 @@ syscall exit — a fact owned by that crate, not this one. The reachable surface
 today is a write-mode `Open` and `FsOp::Fchownat`. The behaviour is keyed on the
 dispatch class, not on a variant list, so the rest of the class inherits it as
 those paths are wired — with two caveats to settle first. `Unlink`'s `prepare`
-*destroys* the shadow object outright and sets no `created`, so a `Whiteout`-class
-refusal reaching `abort` would reconcile after discarding shadow-only data: the
-mirror image of the creation case, and a real gap in the gate rather than a
-question of wiring. `FsOp::Link` is a different shape — `resolve` refuses it as
-beyond-MVP, so `prepare` is never entered for it and the `_ => {}` arm it would
-fall to materialises nothing; when it *is* wired it will need an arm of its own
-doing `copy_up` of the source and `parents` of the destination, exactly as
-`rename` does, and that is where setting `created` is easy to forget. Whoever
+*destroys* the shadow object outright, so a `Whiteout`-class refusal reaching
+`abort` would reconcile after discarding shadow-only data: the mirror image of the
+creation case, and a real gap in the gate rather than a question of wiring. That
+gap is unchanged by #69 — that arm never latched either, so retiring
+`Pending.created` lost it no defence — and it is a *restore* problem rather than a
+rollback-entry one: whatever closes it wants its own honestly-named
+destroyed-state flag, not a revived creation latch. `FsOp::Link` is a different
+shape — `resolve` refuses it as beyond-MVP, so `prepare` is never entered for it
+and the `_ => {}` arm it would fall to materialises nothing; when it *is* wired it
+will need an arm of its own doing `copy_up` of the source and `parents` of the
+destination, exactly as `rename` does, and that is where **recording an undo** is
+easy to forget — there is no longer a latch to forget to set, and nothing fails
+closed on an arm that creates and records nothing. Whoever
 wires either path has to revisit the gate rather than assume the inheritance;
 noted on [#57](https://github.com/invakid404/umbra/issues/57).
 
@@ -394,7 +433,16 @@ Control metadata lives outside tracee listings:
   ASCII. This index identifies placeholders across rename and exposes the same
   logical identity in stat and merged directory entries. Unlink and successful
   replacement remove the retired index so backend inode reuse cannot inherit a
-  deleted link. Immutable target records remain for future journal reconciliation.
+  deleted link. Target records for *committed* symlinks are immutable and remain
+  for future journal reconciliation.
+
+A **reconciled abort removes both blobs**, which is what
+[#69](https://github.com/invakid404/umbra/issues/69) added and the reason the
+immutability above is scoped to committed symlinks. A `symlink(2)` the kernel
+refused leaves no target record and no index: the abort unlinks the index first
+(its name is derived from the placeholder's backend object ID, so the placeholder
+has to outlive it), then the blob, then the placeholder, and poisons if any of the
+three fails. See the rollback-list section above for the ordering rule.
 
 The iterative resolver expands at most **40 symlinks per lookup**, including cwd
 or dirfd anchor expansion, and returns structured `SymlinkLoop` on overflow —

@@ -974,24 +974,55 @@ mod tests {
     }
 
     // A namespace double for the syscall-exit path. It mirrors the overlay's
-    // real abort contract instead of accepting anything: a mutating transaction
-    // is reconcilable only when the reason is a `KernelRefused` naming the errno
-    // this session itself observed *and* every object `prepare` created is one
-    // `abort` can remove. Every other reason is an interception failure that
-    // errors. Note what the second half is no longer: "materialised nothing new".
-    // The overlay rolls back the prepare-time creations its storage surface can
-    // undo — a shadow file, and so an ordinary creating `open`
-    // ([#55](https://github.com/invakid404/umbra/issues/55)); and, since
-    // [#64](https://github.com/invakid404/umbra/issues/64) gave `LocalStorage`
-    // the `RemoveDirectory` arm the other backends already had, a materialised
-    // shadow directory too, whether `mkdir`'s own or an ancestor `parents`
-    // created over nothing. One case is left, and it is what the poisoning test
-    // below now drives: a logical symlink's placeholder-plus-control-blobs,
-    // whose backing index is keyed on the placeholder's object ID, so removing
-    // the placeholder alone would strand it. Getting the
-    // reason right is the supervisor's job
+    // real abort contract instead of accepting anything, and after
+    // [#69](https://github.com/invakid404/umbra/issues/69) that contract has two
+    // halves rather than a gate with two conjuncts: a mutating abort reconciles
+    // iff the reason is a `KernelRefused` naming the errno this session itself
+    // observed **and** every undo `prepare` recorded was removed successfully.
+    // Every other reason is an interception failure that errors.
+    //
+    // Note what the second half is no longer. It is not "materialised nothing
+    // new", and it is no longer "materialised nothing the storage surface cannot
+    // take back" either. The overlay records an undo for *every* prepare-time
+    // logical creation now — a shadow file and so an ordinary creating `open`
+    // ([#55](https://github.com/invakid404/umbra/issues/55)); a materialised
+    // shadow directory, whether `mkdir`'s own or an ancestor `parents` created
+    // over nothing, since [#64](https://github.com/invakid404/umbra/issues/64)
+    // gave `LocalStorage` the `RemoveDirectory` arm the other backends already
+    // had; and, since #69, a logical symlink's backing index, target blob and
+    // placeholder as one entry, plus the ancestors materialised for that
+    // placeholder. `Pending.created` is gone with that last arm: the overlay has
+    // no latch, so the only refusals left are an *uncorroborated* claim and a
+    // *removal that failed*. `undo_refused` below stands for the second. Getting
+    // the reason right is the supervisor's job
     // ([#53](https://github.com/invakid404/umbra/issues/53)), so the double
     // enforces it end to end rather than rubber-stamping the call.
+    //
+    // What this double does **not** mirror, stated here rather than left to be
+    // discovered: it **flattens the two refusal modes onto one error kind**.
+    // `unreconcilable()` below is `InvalidState` + "aborted effects require
+    // reconciliation", which is verbatim the real overlay's *uncorroborated*
+    // early return, and `abort` returns it for a refused undo too. The real
+    // refused-undo path does not return `InvalidState` at all: a removal that
+    // fails inside `Overlay::abort`'s rollback loop propagates the **storage
+    // backend's own kind** — `Io` with `ENOTEMPTY` from `LocalStorage`,
+    // `InvalidState` from the tar backend, the kernel's errno from the NFS
+    // backends — and `Overlay::abort`'s own comment calls that out as the one
+    // abort path whose error is the backend's rather than the engine's, with
+    // `umbra-overlay`'s three `a_symlink_rollback_that_cannot_unlink_…_poisons`
+    // asserting `Io` "deliberately not `InvalidState`".
+    //
+    // The flattening is deliberate and costs these tests nothing, because every
+    // property they assert — poison, `RecoveryRequired`, resume nothing — is
+    // kind-independent: the supervisor propagates whatever kind the namespace
+    // returned (`syscall_exit`'s bare `?` on `abort`) and branches on none of it.
+    // It is disclosed because this block is what an integration harness would
+    // later be written against, and a harness that took the kind from here would
+    // be checking a claim no real `Overlay` can satisfy for this mode. Pre-#69
+    // the double *was* faithful on this point by accident: the flag meant the
+    // `Pending.created` latch, whose real return was exactly `unreconcilable()`.
+    // Retiring the latch moved the flag onto a mode with a different error kind,
+    // and the return did not move with it.
     //
     // KEEP IN SYNC WITH `Overlay::abort` (`umbra-overlay/src/engine.rs`). The two
     // copies of the rule are not mechanically linked: no test wires a real
@@ -999,22 +1030,31 @@ mod tests {
     // mirrored here leaves these tests passing while the real system behaves
     // differently. That is not hypothetical - it happened once during #53's
     // review, when the `created` gate landed on `Overlay::abort` alone and this
-    // suite stayed green. Closing the gap needs an integration harness, tracked
-    // in [#57](https://github.com/invakid404/umbra/issues/57); once it exists,
+    // suite stayed green. #69 makes it cheaper still to get wrong, because this
+    // flag no longer names a field the overlay has at all — and the flattening
+    // above is the second instance, caught in review of the same commit that
+    // introduced it. Closing the gap needs an integration harness, tracked in
+    // [#57](https://github.com/invakid404/umbra/issues/57); once it exists,
     // delete this double's rule rather than maintaining it.
     struct Journaling {
         log: Arc<Mutex<Journaled>>,
-        // The `Pending.created` latch of the transaction being aborted: true when
-        // `prepare` materialised something `abort` cannot take back, which the
-        // overlay refuses to reconcile. Logical rather than shadow-shaped since
-        // #55, and narrowed again by #64 — neither a shadow file nor a shadow
-        // directory sets it any more; a logical symlink is the one op that does.
-        // A session constant here, where
-        // `Pending.created` is per-transaction; equivalent only because every
-        // test below drives exactly one transaction, so a harness that drives
-        // several needs the real shape.
-        created: bool,
+        // Whether the namespace refuses this abort for a reason other than
+        // corroboration: the undo it recorded could not be performed. In the real
+        // overlay that is a `unlink`/`remove_directory` that failed inside
+        // `abort`'s rollback loop — the object is still standing, so reporting a
+        // reconciliation would publish a path the tracee was told does not exist,
+        // and the run ends instead. Modelled as a flag because the supervisor
+        // only ever *reads* the namespace's verdict; it does not compute it.
+        //
+        // A session constant here, where the real thing is decided per
+        // transaction; equivalent only because every test below drives exactly
+        // one transaction, so a harness that drives several needs the real shape.
+        undo_refused: bool,
     }
+    // The real overlay's *uncorroborated* refusal, verbatim. `abort` below also
+    // returns it for `undo_refused`, where the real kind would be the storage
+    // backend's — see the flattening paragraph in the block above before reading
+    // any asserted kind here as a mirror of production.
     fn unreconcilable() -> UmbraError {
         UmbraError::new(
             ErrorKind::InvalidState,
@@ -1041,7 +1081,7 @@ mod tests {
         fn abort(&mut self, _: OperationId, reason: &AbortReason) -> Result<()> {
             let mut log = self.log.lock().unwrap();
             log.aborts.push(reason.clone());
-            let reconcilable = !self.created
+            let reconcilable = !self.undo_refused
                 && matches!(
                     (reason, log.observed.last()),
                     (
@@ -1065,7 +1105,7 @@ mod tests {
 
     fn exit_supervisor(
         op: FsOp,
-        created: bool,
+        undo_refused: bool,
     ) -> (Supervisor, Arc<Mutex<Recording>>, Arc<Mutex<Journaled>>) {
         let log = Arc::new(Mutex::new(Recording::default()));
         let journaled = Arc::new(Mutex::new(Journaled::default()));
@@ -1083,7 +1123,7 @@ mod tests {
             },
             Box::new(Journaling {
                 log: journaled.clone(),
-                created,
+                undo_refused,
             }),
             None,
         );
@@ -1185,7 +1225,7 @@ mod tests {
     // materialised ancestor is `rmdir`-able, so the overlay rolls back both the
     // file and the directory above it and the refusal reconciles.
     //
-    // That is why the double's `created = false` matches reality here with no
+    // That is why the double's `undo_refused = false` matches reality here with no
     // caveat, and why this helper's earlier paragraph about a
     // `resolve_path_follow` / `walk` reachability divergence is gone rather than
     // re-hedged: the claim it was protecting -- that this op is one the real
@@ -1197,7 +1237,10 @@ mod tests {
     // point: the two supervisor outcomes are driven by two genuinely different
     // overlay verdicts rather than by the same op with the double's flag
     // flipped. #55 narrowed the reachable latch set until the two tests had
-    // collapsed onto one op; #64 restores the split.
+    // collapsed onto one op; #64 restored the split; #69 keeps it, on new terms —
+    // after it the difference between the two ops is not rollback-versus-latch
+    // but how much undo there is to refuse: one file and one directory here,
+    // three `unlink`s plus an ancestor at the symlink.
     fn creating_open_under_an_absent_parent() -> FsOp {
         FsOp::Open {
             dir: DirRef::Cwd,
@@ -1211,34 +1254,30 @@ mod tests {
         }
     }
 
-    // The op the real overlay still latches, and after #64 the only one: a
-    // logical symlink. `create_symlink` writes the placeholder *and* two Control
-    // blobs, and the backing index is keyed on the placeholder's object ID, so
-    // unlinking the placeholder alone would strand the index; undoing the set is
-    // its own problem, so the whole operation latches `Pending.created` and the
-    // refusal cannot reconcile. Pinned in `umbra-overlay` by
-    // `a_refused_symlink_creation_still_poisons`.
+    // An op whose undo the backend can refuse, which after
+    // [#69](https://github.com/invakid404/umbra/issues/69) is the shape of the
+    // remaining non-corroboration refusal. A logical symlink is the richest
+    // instance: `create_symlink` writes a target blob, a placeholder and a
+    // backing index keyed on the placeholder's backend object ID, and the
+    // reconciled abort removes all three plus any ancestor materialised for the
+    // placeholder — four objects, any one of whose removals the storage backend
+    // can refuse, at which point the overlay poisons rather than reporting a
+    // reconciliation it did not perform. Pinned in `umbra-overlay` by the three
+    // `a_symlink_rollback_that_cannot_unlink_…_poisons` siblings.
     //
-    // Four things this comment deliberately does not over-claim, where its
-    // predecessor did:
+    // The op no longer *latches* — #69 retired `Pending.created` with this very
+    // arm, so the claim its predecessor made here, that this was the only
+    // remaining setter, is deleted rather than reworded. What survives:
     //
-    // (a) This is the *only* remaining `Pending.created` setter. A creating
-    //     `Open` stopped latching in #55 and its ancestors stopped in #64, so
-    //     there is no directory-shaped trigger left to pick.
     // (b) `resolve` answers `Emulate` for `FsOp::Symlink`, so the supervisor's
     //     own `syscall_exit` would not reach this refusal today. The property
     //     under test is "when the namespace refuses, the exit fails closed",
     //     which is the supervisor's behaviour and not the op's reachability.
-    // (c) That is a *weaker* claim than the old comment's, honestly stated
-    //     rather than a regression: the old one rested on a known fidelity
-    //     divergence it named in the same breath (`resolve_path_follow` called
-    //     with `create_parents = flags.create`, `walk` swallowing a `NotFound`
-    //     on a non-final prefix), so its reachability was already conditional.
     // (d) Turning any of this from prose into machinery needs the integration
     //     harness tracked in
     //     [#57](https://github.com/invakid404/umbra/issues/57); these tests
     //     drive `Journaling`, which never consults an `Overlay`.
-    fn logical_symlink_whose_placeholder_cannot_be_undone() -> FsOp {
+    fn a_symlink_whose_undo_the_backend_can_refuse() -> FsOp {
         FsOp::Symlink {
             target: BytePath::new(b"/target".to_vec()).unwrap(),
             link_dir: DirRef::Cwd,
@@ -1259,7 +1298,7 @@ mod tests {
     fn a_namespace_refusal_on_the_exit_path_poisons_the_run_and_resumes_nothing() {
         let thread = ThreadId(task(1).0);
         let (mut s, log, journaled) =
-            exit_supervisor(logical_symlink_whose_placeholder_cannot_be_undone(), true);
+            exit_supervisor(a_symlink_whose_undo_the_backend_can_refuse(), true);
         s.operations.insert(thread, OperationId(Uuid::new_v4()));
         assert_eq!(
             s.handle_event(TraceEvent::SyscallExit {
@@ -1269,6 +1308,13 @@ mod tests {
             })
             .unwrap_err()
             .kind,
+            // The *double's* kind, not a claim about production. This op models a
+            // refused undo, which a real `Overlay` surfaces as the storage
+            // backend's own kind; `Journaling` flattens both refusal modes onto
+            // `unreconcilable()`. The property under test is kind-independent —
+            // the supervisor propagates whatever it got and branches on none of
+            // it — so the assertion pins that the error *reached* the caller, not
+            // which kind it was. See the flattening paragraph on `Journaling`.
             ErrorKind::InvalidState
         );
         assert!(s.is_poisoned());
@@ -1295,9 +1341,10 @@ mod tests {
         let errno = Errno(28);
         let thread = ThreadId(task(1).0);
         // A different op from the poisoning case above, and genuinely different:
-        // the real overlay rolls this one back and latches that one, so the two
-        // supervisor outcomes are driven by two overlay verdicts rather than by
-        // one op with the double's flag flipped. The supervisor still only reads
+        // the real overlay reconciles this one, while that one's four-object undo
+        // gives a backend four chances to refuse, so the two supervisor outcomes
+        // are driven by two overlay verdicts rather than by one op with the
+        // double's flag flipped. The supervisor still only reads
         // the answer -- it does not compute it from the op -- which is what makes
         // the double's flag the right knob and the op choice a fidelity claim.
         let (mut s, log, journaled) =
