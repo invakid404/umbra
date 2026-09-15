@@ -188,6 +188,17 @@ type BaseStats = Arc<Mutex<Vec<StoragePath>>>;
 type Unlinks = Arc<Mutex<Vec<(StoragePath, RequestContext)>>>;
 /// Switch that makes every base *directory* stat fail with this kind.
 type BaseFailure = Arc<Mutex<Option<ErrorKind>>>;
+/// Switch that makes every shadow `RemoveDirectory` fail with this kind.
+///
+/// The directory analogue of the mode-based `unlink(2)` injection
+/// `a_rollback_that_cannot_unlink_poisons_instead_of_claiming_success` uses. A
+/// mode cannot express it: the rollback's `rmdir` and the `create` that
+/// materialised the directory need the same write bit on the same parent, so
+/// revoking it would fail `prepare` instead of the undo. Modelled on
+/// `WatchedBase::fail_directory_stat` -- a switch the test flips *between*
+/// `prepare` and `abort`, so everything before the undo runs against a healthy
+/// backend.
+type RemoveDirectoryFailure = Arc<Mutex<Option<ErrorKind>>>;
 
 /// Records the `CreateOptions` the engine *requests*, which is the only
 /// umask-independent view of the mode `parents` chose. `LocalStorage` materialises
@@ -199,6 +210,7 @@ struct Recorder {
     inner: LocalStorage,
     creates: Creates,
     unlinks: Unlinks,
+    fail_remove_directory: RemoveDirectoryFailure,
 }
 impl Storage for Recorder {
     fn capabilities(&self) -> StorageCapabilities {
@@ -228,6 +240,17 @@ impl Storage for Recorder {
                 .lock()
                 .unwrap()
                 .push((path.clone(), request.context.clone())),
+            // Refused before delegating, so the directory the engine could not
+            // remove is still standing when the test looks for it.
+            StorageOperation::RemoveDirectory { .. } => {
+                if let Some(kind) = *self.fail_remove_directory.lock().unwrap() {
+                    return Err(UmbraError::new(
+                        kind,
+                        "test-storage",
+                        "injected remove_directory failure",
+                    ));
+                }
+            }
             _ => {}
         }
         self.inner.execute(request)
@@ -306,6 +329,8 @@ struct Setup<'a> {
     force_directory_mode: Option<u32>,
     /// Handle the test flips to make base directory stats fail.
     fail_directory_stat: Option<BaseFailure>,
+    /// Handle the test flips to make shadow directory removals fail.
+    fail_remove_directory: Option<RemoveDirectoryFailure>,
 }
 
 impl Fixture {
@@ -380,18 +405,24 @@ impl Fixture {
             setup
                 .creates
                 .clone()
-                .or_else(|| setup.unlinks.clone().map(|_| Creates::default())),
+                .or_else(|| setup.unlinks.clone().map(|_| Creates::default()))
+                .or_else(|| {
+                    setup
+                        .fail_remove_directory
+                        .clone()
+                        .map(|_| Creates::default())
+                }),
         ) {
             (Some(mismatch), creates) => {
                 // `BadReceipt` does not record, so a caller asking for both would
                 // get a silently empty recorder and a vacuously passing
                 // assertion. No test needs either combination; say so loudly
                 // rather than let a future one pass for the wrong reason. The
-                // binding covers `unlinks` as well, because a recorder is built
-                // for either request.
+                // binding covers `unlinks` and `fail_remove_directory` as well,
+                // because a recorder is built for any of the three.
                 debug_assert!(
                     creates.is_none(),
-                    "Setup::creates and Setup::unlinks are ignored when a bad receipt is requested"
+                    "Setup::creates, Setup::unlinks and Setup::fail_remove_directory are ignored when a bad receipt is requested"
                 );
                 Box::new(BadReceipt {
                     inner: shadow,
@@ -402,6 +433,7 @@ impl Fixture {
                 inner: shadow,
                 creates,
                 unlinks: setup.unlinks.unwrap_or_default(),
+                fail_remove_directory: setup.fail_remove_directory.unwrap_or_default(),
             }),
             (None, None) => Box::new(shadow),
         };
@@ -442,6 +474,35 @@ impl Fixture {
             log,
             _dirs: [base_dir, shadow_dir],
         }
+    }
+    /// Record the kernel refusal of a transaction whose action is an
+    /// `Emulate`, bypassing `observe_result`.
+    ///
+    /// `resolve` answers `Emulate(Success)` for `Symlink` and `Mkdir` (the
+    /// `Symlink | Mkdir | Unlink` arm), and `observe_result` rejects any outcome
+    /// that differs from the one an emulation reported. So a *refused* one of
+    /// those cannot be driven through the public sequence at all -- which is the
+    /// honest form of the reachability caveat the tests using this carry: no
+    /// supervisor produces this sequence today, and the property under test is
+    /// the engine's own abort rule at those branches.
+    ///
+    /// Writing the outcome directly is what keeps those tests discriminating. An
+    /// abort with no corroborated outcome poisons *regardless* of
+    /// `Pending.created` and regardless of what `rollback` holds, so without this
+    /// the reconciling cases could not be driven and the latching ones would pass
+    /// for the wrong reason.
+    ///
+    /// It is **not** a drop-in for `observe_result`: only the outcome field is
+    /// written. The real call also appends a
+    /// `JournalPayload::ObservedResult` record for a mutating plan, so a test
+    /// that used this and then asserted on journal *shape* would see one record
+    /// fewer than production and would be asserting a sequence the engine never
+    /// emits. Nothing does that today -- the tests using this assert on
+    /// `poisoned`, error kinds and the shadow tree. Extend this helper to
+    /// `record(..)` before adding the first such assertion rather than
+    /// discovering the gap from a confusing diff.
+    fn observe_emulated_refusal(&mut self, errno: Errno) {
+        self.overlay.pending.as_mut().unwrap().outcome = Some(OperationOutcome::Failure(errno));
     }
     fn prepare(&mut self, op: &FsOp) -> PreparedAction {
         let action = self.overlay.resolve(&self.process, op).unwrap();
@@ -2535,8 +2596,10 @@ fn the_rollbacks_unlink_is_attributed_to_the_transaction_it_undoes() {
 // The benign-ancestor half at the `create` site. The reconciled-rename test below
 // pins this at the `parents` site, but this is where a rollback entry and a
 // surviving benign ancestor actually coexist: `dir` is base-only, so `parents`
-// materialises a shadow of a directory the run already exposes and does not latch,
-// while the file underneath it goes on the rollback list and is unlinked.
+// materialises a shadow of a directory the run already exposes and does not
+// report it, while the file underneath it goes on the rollback list and is
+// unlinked. This is the pin that keeps #64's directory rollback from
+// over-reaching into "remove every ancestor prepare touched".
 #[test]
 fn a_refused_creating_open_under_a_base_only_parent_rolls_back_only_the_object() {
     // `0o555` on the base directory, so the widening is observable: without it
@@ -2553,9 +2616,12 @@ fn a_refused_creating_open_under_a_base_only_parent_rolls_back_only_the_object()
         .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
         .unwrap();
     assert!(!f.overlay.poisoned);
-    // The object is gone; the ancestor stays. Unlinking the ancestor is not
-    // possible anyway -- `LocalStorage` has no `RemoveDirectory` -- but it is also
-    // not wanted: it shadows a directory the run already exposed.
+    // The object is gone; the ancestor stays. Removing the ancestor is possible
+    // since #64 -- `LocalStorage` answers `RemoveDirectory` now -- and is still
+    // not wanted: it shadows a directory the run already exposed, so `parents`
+    // does not report it and it never reaches the rollback list. That this
+    // survives a build that *can* remove it is what makes the assertion mean
+    // something it did not mean before.
     assert!(!f.shadow_root.join("dir/fresh").exists());
     assert!(f.shadow_root.join("dir").is_dir());
     assert_eq!(f.read(b"dir/fresh").unwrap_err().kind, ErrorKind::NotFound);
@@ -2576,15 +2642,18 @@ fn a_refused_creating_open_under_a_base_only_parent_rolls_back_only_the_object()
     assert_eq!(f.read(b"dir/fresh").unwrap(), b"");
 }
 
-// The sibling that carries the poison half, so the boundary stays pinned in both
-// directions -- which was the whole purpose of the single test these two were
-// split out of. `newdir` exists in neither the shadow nor the base, so `parents`
-// materialises a directory shadowing nothing; `LocalStorage` does not implement
-// `RemoveDirectory`, so `Pending.created` latches and the refusal is not
-// reconcilable. Every assertion below is inherited verbatim from that test's
-// creating half.
+// The sibling that used to carry the poison half at this site, flipped by
+// [#64](https://github.com/invakid404/umbra/issues/64). `newdir` exists in
+// neither the shadow nor the base, so `parents` still materialises a directory
+// shadowing nothing -- the materialisation is unchanged and is still the case
+// under test. What changed is its undo: `LocalStorage` answers `RemoveDirectory`
+// now, so the ancestor goes on `rollback` rather than latching `Pending.created`,
+// and the refusal reconciles. The poison half did not disappear with it; it moved
+// to two siblings, one per surviving mechanism -- `a_refused_symlink_creation_still_poisons`
+// (the last op that latches) and `a_refused_rename_whose_destination_parent_rollback_fails_poisons`
+// (an undo that fails).
 #[test]
-fn a_refused_creating_open_under_a_base_absent_parent_still_poisons() {
+fn a_refused_creating_open_under_a_base_absent_parent_rolls_back_the_object_and_its_ancestor() {
     let mut f = Fixture::new(&[]);
     assert_eq!(
         f.read(b"newdir/fresh").unwrap_err().kind,
@@ -2598,28 +2667,158 @@ fn a_refused_creating_open_under_a_base_absent_parent_still_poisons() {
     f.overlay
         .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
         .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    // The *ancestor* is the assertion that earns the rename: a build that
+    // unlinked the file and left the phantom directory standing would pass on
+    // `newdir/fresh` alone, and would have left exactly the divergence the gate
+    // exists to prevent.
+    assert!(!f.shadow_root.join("newdir/fresh").exists());
+    assert!(
+        !f.shadow_root.join("newdir").exists(),
+        "the ancestor materialised over nothing must be gone too"
+    );
+    assert_eq!(
+        f.read(b"newdir/fresh").unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+    // The retry is not wedged, one level deeper than the root-level case above:
+    // the `O_CREAT|O_EXCL` lock-file idiom works after the refusal instead of
+    // answering `AlreadyExists` forever.
+    f.run(&exclusive_open(b"newdir/fresh"));
+    assert_eq!(f.read(b"newdir/fresh").unwrap(), b"");
+}
+
+// The multi-level case, and the only place the reverse-insertion claim in
+// `Pending.rollback` is observable: with one ancestor, "leaf before parents" and
+// "any order" are the same walk. `a`, `a/b` and `a/b/c` are all materialised over
+// nothing, so the list is `[(a,Dir), (a/b,Dir), (a/b/c,Dir), (a/b/c/fresh,File)]`
+// and only the reverse walk gives each `rmdir` an empty directory -- forward
+// order would meet `ENOTEMPTY` at `a` and poison.
+#[test]
+fn a_refused_creating_open_rolls_back_a_whole_materialised_ancestor_cascade() {
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&create_open(b"a/b/c/fresh"));
+    assert!(f.shadow_root.join("a/b/c/fresh").exists());
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    // Every level, not just the deepest: a rollback that stopped at `a/b/c`
+    // would leave two phantom directories and still satisfy an assertion about
+    // the leaf alone.
+    for level in ["a/b/c/fresh", "a/b/c", "a/b", "a"] {
+        assert!(
+            !f.shadow_root.join(level).exists(),
+            "{level} survived the rollback"
+        );
+    }
+    assert_eq!(
+        f.read(b"a/b/c/fresh").unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+    f.run(&exclusive_open(b"a/b/c/fresh"));
+    assert_eq!(f.read(b"a/b/c/fresh").unwrap(), b"");
+}
+
+// The poison half's first surviving mechanism: the last op whose `prepare` the
+// engine still refuses to undo. It is not a directory case any more -- the
+// placeholder `create_symlink` writes is a *file*, and `Unlink` could remove it.
+// What cannot be undone is the rest of the set: `create_symlink` also writes two
+// Control blobs, and the backing index is keyed on the placeholder's `ObjectId`,
+// so dropping the placeholder alone would strand the index. Undoing the set is
+// its own problem, so the whole operation latches -- after #64 it is the only
+// remaining `Pending.created` setter.
+//
+// The two "divergence stays unreachable" assertions are inherited verbatim from
+// the flipped test above, which is where they used to live.
+//
+// Honest about reachability, on the same terms as
+// `a_refused_mkdir_rolls_back_the_directory_it_created` below and for the same
+// reason -- and more sharply, because this is the test that carries the poison
+// guarantee forward. `resolve` answers `Emulate` for `FsOp::Symlink` too, so the
+// supervisor never produces this sequence and `observe_emulated_refusal` is what
+// fabricates it. That is not a harness inconvenience, it is the current shape of
+// the system: a latched transaction's outcome can only be `None` or
+// `Some(Success)`, so it fails `abort`'s corroboration conjunct regardless of
+// `Pending.created` -- the latch decides nothing that the corroboration did not
+// already decide. What this test pins is therefore the
+// engine's *rule* -- a latched transaction does not reconcile -- at a branch the
+// latch alone would have to defend if a `Symlink` ever stopped being emulated.
+// See `Pending.created` for the subsumption argument in full. Read as "the
+// poison path is live in production today", this test would be claiming more
+// than it shows.
+#[test]
+fn a_refused_symlink_creation_still_poisons() {
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&symlink(b"link", b"/target"));
+    assert!(
+        fs::symlink_metadata(f.shadow_root.join("link"))
+            .unwrap()
+            .is_file(),
+        "prepare wrote the placeholder"
+    );
+    f.observe_emulated_refusal(ENOSPC);
     assert_eq!(
         f.overlay
             .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
             .unwrap_err()
             .kind,
         ErrorKind::InvalidState,
-        "prepare materialised a directory abort cannot remove"
+        "the placeholder's Control blobs are a second rollback problem"
     );
     assert!(f.overlay.poisoned);
-    // The divergence stays unreachable. A reconciled session would report the
-    // path present and empty and answer every later `O_CREAT|O_EXCL` on it with
-    // `AlreadyExists` forever; a poisoned one refuses both, loudly.
-    assert_eq!(
-        f.read(b"newdir/fresh").unwrap_err().kind,
-        ErrorKind::InvalidState
-    );
+    // A reconciled session would report the path present and answer every later
+    // `O_CREAT|O_EXCL` on it with `AlreadyExists` forever; a poisoned one refuses
+    // both, loudly.
+    assert_eq!(f.read(b"link").unwrap_err().kind, ErrorKind::InvalidState);
     assert_eq!(
         f.overlay
-            .resolve(&f.process, &exclusive_open(b"newdir/fresh"))
+            .resolve(&f.process, &exclusive_open(b"link"))
             .unwrap_err()
             .kind,
         ErrorKind::InvalidState
+    );
+}
+
+// The newly wired `FsOp::Mkdir` arm, which latched unconditionally until #64 on
+// the premise that `LocalStorage` could not remove a directory. Both the
+// directory the op names and the ancestor `parents` materialised under it are
+// removable now, so the arm records an undo instead.
+//
+// Honest about reachability: `resolve` answers `Emulate` for `Mkdir`, so the
+// supervisor's `syscall_exit` never drives a `KernelRefused` abort here -- see
+// `observe_emulated_refusal`, which is why the outcome is seeded rather than
+// observed. `Overlay::abort` is a namespace API this suite calls directly, so
+// the engine's rule is pinned at the layer that owns it, and the arm is not
+// dead-and-unpinned against the day a non-emulated `mkdir` reaches it.
+#[test]
+fn a_refused_mkdir_rolls_back_the_directory_it_created() {
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"/newdir/made"),
+        mode: 0o755,
+    });
+    assert!(f.shadow_root.join("newdir/made").is_dir());
+    f.observe_emulated_refusal(ENOSPC);
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    assert!(!f.shadow_root.join("newdir/made").exists());
+    assert!(
+        !f.shadow_root.join("newdir").exists(),
+        "the ancestor materialised under it goes back too"
+    );
+    assert_eq!(
+        f.read(b"newdir/made").unwrap_err().kind,
+        ErrorKind::NotFound
     );
 }
 
@@ -2641,10 +2840,13 @@ fn the_creation_latch_is_per_transaction_not_per_session() {
         .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
         .unwrap();
     assert!(!f.overlay.poisoned);
-    let prepared = f.prepare(&create_open(b"newdir/fresh"));
-    f.overlay
-        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
-        .unwrap();
+    // The latching op is a symlink rather than a creating open under an absent
+    // parent: #64 gave the latter an undo, so after it the only branch of
+    // `prepare` that still latches at all is `FsOp::Symlink`. The outcome is
+    // seeded rather than observed because `resolve` emulates a symlink -- see
+    // `observe_emulated_refusal`.
+    let prepared = f.prepare(&symlink(b"link", b"/target"));
+    f.observe_emulated_refusal(ENOSPC);
     assert_eq!(
         f.overlay
             .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
@@ -2657,14 +2859,13 @@ fn the_creation_latch_is_per_transaction_not_per_session() {
     // The other order, which is the one a stale latch would break: a creating
     // open that reconciles after one that did not would be refused if `created`
     // outlived its transaction. It cannot be driven through a poisoned session,
-    // so the latching transaction is a committed `mkdir` rather than a refused
-    // one -- same branch of `prepare`, same latch, no poison.
+    // so the latching transaction is committed rather than refused -- same
+    // branch of `prepare`, same latch, no poison. A committed `mkdir` served
+    // that role until #64 wired its arm to record an undo; `symlink` is the
+    // substitute because it is the one branch that still latches, and the
+    // property being pinned is unchanged.
     let mut f = Fixture::new(&[]);
-    f.run(&FsOp::Mkdir {
-        dir: DirRef::Cwd,
-        path: bytes(b"/dir"),
-        mode: 0o755,
-    });
+    f.run(&symlink(b"link", b"/target"));
     let prepared = f.prepare(&create_open(b"fresh"));
     f.overlay
         .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
@@ -2677,14 +2878,19 @@ fn the_creation_latch_is_per_transaction_not_per_session() {
 }
 
 // The same boundary on the rename plan, which materialises through `parents`
-// rather than `create`. Case (b) above renames onto an existing root-level path
-// and reconciles; this one has to create a destination parent directory that
-// shadows nothing, and therefore must not. It is the load-bearing pin for the
-// un-rollbackable half at the `parents` site: `fresh/` has no base counterpart,
-// so #55's narrowing leaves it exactly where #53 put it.
+// rather than `create`. Case (b) above renames onto an existing root-level path;
+// this one has to create a destination parent directory that shadows nothing.
+// That used to be the load-bearing pin for the un-rollbackable half at the
+// `parents` site -- `fresh/` has no base counterpart, so #55's narrowing left it
+// exactly where #53 put it -- and #64 removes it: the ancestor is `rmdir`-able,
+// so the arm records it and the refusal reconciles. Its assertions now match its
+// reconciling neighbour below, which is the point: the two halves of the
+// `parents` site answer the same way once the undo exists, and the difference
+// that remains is only which ancestors survive.
 #[test]
-fn a_refused_rename_that_created_destination_parents_poisons() {
+fn a_refused_rename_that_created_destination_parents_rolls_them_back() {
     let mut f = Fixture::new(&[(b"source", b"base bytes")]);
+    let before = f.log.lock().unwrap().records.len();
     let prepared = f.prepare(&rename(b"source", b"fresh/target"));
     assert!(
         f.shadow_root.join("fresh").is_dir(),
@@ -2693,15 +2899,78 @@ fn a_refused_rename_that_created_destination_parents_poisons() {
     f.overlay
         .observe_result(prepared.operation_id, &OperationOutcome::Failure(EACCES))
         .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(EACCES))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    assert!(
+        !f.shadow_root.join("fresh").exists(),
+        "the phantom destination parent is gone"
+    );
+    let payloads = f.log.lock().unwrap().records[before..].to_vec();
+    assert!(matches!(
+        &payloads.last().unwrap().payload,
+        JournalPayload::Abort { reason } if reason.contains("KernelRefused")
+    ));
+    assert!(
+        !payloads
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Commit)),
+        "the refused rename must not commit"
+    );
+    // Commit-time effects stay unapplied, exactly as in the neighbour: no
+    // whiteout was written at all, so the source is still visible.
+    assert!(!f.control.join("whiteouts").exists());
+    assert_eq!(f.read(b"source").unwrap(), b"base bytes");
+    assert_eq!(
+        f.read(b"fresh/target").unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+}
+
+// The poison half's second surviving mechanism at this site, and the one that
+// replaces "a directory cannot be removed": a removal that *failed*. This is
+// #55's rollback-fails-poison rule extended to directories, and the reason the
+// flipped test above could not simply drop its poison assertions.
+//
+// The asserted kind is the backend's own -- `Io` here, from the injected
+// failure -- and deliberately not `InvalidState`. This is the one `abort` path
+// whose error is the storage backend's rather than the engine's, and the engine
+// must not match on it: the same refusal is `Io` with `ENOTEMPTY` from
+// `LocalStorage`, `InvalidState` from `umbra-storage-tar` and the kernel's errno
+// from the NFS backends. A sibling that asserted `InvalidState` out of habit
+// would be asserting the engine had classified something it must pass through.
+#[test]
+fn a_refused_rename_whose_destination_parent_rollback_fails_poisons() {
+    let failure = RemoveDirectoryFailure::default();
+    let mut f = Fixture::build(
+        &[(b"source", b"base bytes")],
+        Setup {
+            fail_remove_directory: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    let prepared = f.prepare(&rename(b"source", b"fresh/target"));
+    assert!(f.shadow_root.join("fresh").is_dir());
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(EACCES))
+        .unwrap();
+    // Flipped after `prepare`, so the materialisation ran against a healthy
+    // backend and only the undo is refused.
+    *failure.lock().unwrap() = Some(ErrorKind::Io);
     assert_eq!(
         f.overlay
             .abort(prepared.operation_id, &AbortReason::KernelRefused(EACCES))
             .unwrap_err()
             .kind,
-        ErrorKind::InvalidState,
-        "a phantom destination directory is a logical change abort cannot undo"
+        ErrorKind::Io,
+        "a failed rollback reports the backend's error, not the engine's"
     );
     assert!(f.overlay.poisoned);
+    // The directory the engine could not remove is still there, which is exactly
+    // why the run had to end: reporting a reconciliation it did not perform would
+    // leave a phantom path answering `AlreadyExists` forever.
+    assert!(f.shadow_root.join("fresh").is_dir());
 }
 
 // Its complement, and what #55 newly delivers at the `parents` site: a
@@ -2823,29 +3092,79 @@ fn an_uncorroborated_abort_does_not_roll_back_what_prepare_created() {
 }
 
 // The other direction of the same invariant, at the latch. A transaction that
-// poisons because `created` latched must leave its `rollback` list unapplied too:
-// the run is over, and a half-undo on the way out is not an improvement on no
-// undo. `newdir/fresh` has both -- a rollback entry for the file and a latch for
-// the directory above it.
+// poisons because `created` latched must undo nothing on the way out: the run is
+// over, and a half-undo is not an improvement on no undo.
+//
+// It used to drive `newdir/fresh`, which carried both halves at once -- a
+// rollback entry for the file and a latch for the directory above it. After
+// [#64](https://github.com/invakid404/umbra/issues/64) those two can no longer
+// co-occur in one transaction at all: `FsOp::Symlink` is the sole remaining
+// `Pending.created` setter and its arm records no undo, so a latched
+// transaction's `rollback` is always empty and an assertion about it would be
+// vacuous here.
+//
+// That is a narrowing of *this* test, not a coverage hole, and the distinction
+// is worth being exact about because the two look alike. The property -- the
+// early return sits above the rollback loop, so a poisoning abort consumes
+// nothing -- is pinned with a genuinely non-empty list by
+// `an_uncorroborated_abort_does_not_roll_back_what_prepare_created` directly
+// above, which reaches the same early return through the gate's *other*
+// conjunct and asserts the object is still standing. What is no longer
+// observable is only the `created`-specific route to that branch, and it is
+// unobservable because it is unconstructible: see `Pending.created` for why a
+// latched transaction cannot also carry a rollback entry.
+//
+// Fabricating one via the direct `pending` access this module has was considered
+// and rejected, and not for squeamishness -- `observe_emulated_refusal` one
+// screen up does exactly that. The two are different in kind. That helper
+// fabricates an internally consistent state that only *policy* excludes: a
+// kernel refusal of an op `resolve` currently chooses to emulate, which is the
+// very thing that could change. `created = true` beside a rollback entry is
+// excluded by the arm structure itself -- no arm both latches and records -- so
+// a test asserting the gate's response to it would be asserting behaviour for an
+// input the gate's own preconditions forbid, and would fail on a legitimate
+// refactor (the `RollbackEntry` enum the symlink rollback will want), and it is
+// hard to see what real defect it could catch in exchange.
+//
+// What this test still earns: a symlink's placeholder, its materialised
+// ancestor, its Control target blob and its backing index are four objects that
+// would each have to survive a partial undo.
 #[test]
-fn a_latched_transaction_leaves_its_rollback_list_unapplied() {
+fn a_latched_transaction_undoes_nothing_it_created() {
     let mut f = Fixture::new(&[]);
-    let prepared = f.prepare(&create_open(b"newdir/fresh"));
-    assert!(f.shadow_root.join("newdir/fresh").exists());
-    f.overlay
-        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
-        .unwrap();
+    let prepared = f.prepare(&symlink(b"newdir/link", b"/target"));
+    let id = prepared.operation_id;
+    assert!(f.shadow_root.join("newdir/link").exists());
+    f.observe_emulated_refusal(ENOSPC);
     assert_eq!(
         f.overlay
-            .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+            .abort(id, &AbortReason::KernelRefused(ENOSPC))
             .unwrap_err()
             .kind,
         ErrorKind::InvalidState
     );
     assert!(f.overlay.poisoned);
+    // All four objects `prepare` wrote: the placeholder, the ancestor `parents`
+    // materialised for it, the Control target blob, and the backing index. A
+    // poisoned run is left exactly as it was. The index is asserted by count
+    // rather than by name because it is keyed on the *backend* object ID the
+    // shadow assigned the placeholder, which this test never sees -- and that
+    // opacity is precisely why unlinking the placeholder alone would strand it.
     assert!(
-        f.shadow_root.join("newdir/fresh").exists(),
+        f.shadow_root.join("newdir/link").exists(),
         "a poisoned run is left exactly as it was, not partly undone"
+    );
+    assert!(f.shadow_root.join("newdir").is_dir());
+    assert!(f
+        .control
+        .join(format!("symlinks/targets/{}", id.0))
+        .exists());
+    assert_eq!(
+        fs::read_dir(f.control.join("symlinks/objects"))
+            .unwrap()
+            .count(),
+        1,
+        "the backing index survives too, or a partial undo stranded it"
     );
 }
 
@@ -3317,9 +3636,10 @@ fn a_whiteouted_base_directory_does_not_lend_its_mode_to_its_replacement() {
     // assertion below holds either way -- this direct one is the discriminating
     // check.
     f.overlay.whiteout_hit = false;
-    assert!(
+    assert_eq!(
         f.overlay.parents(&root(b"e/new").unwrap()).unwrap(),
-        "the shadow ancestor was missing, so parents reports it created one"
+        vec![root(b"e").unwrap()],
+        "the shadow ancestor was missing, so parents reports having created it"
     );
     assert!(
         !f.overlay.whiteout_hit,
@@ -3564,15 +3884,29 @@ fn a_failing_base_stat_falls_back_to_the_default_mode_instead_of_poisoning() {
     assert_eq!(f.read(b"d/f").unwrap(), b"base bytes");
 }
 
-// The other half of case (i), and the one #55 makes load-bearing: the swallow
-// applies to the *mode* only. `shadow_parent_mode` rounds an illegible base down
-// to the default mode so `prepare` cannot fail, and rounds the same non-answer up
-// to "a creation `abort` cannot undo" so a refusal cannot reconcile on evidence
-// nobody has. Reading the swallow as "no base directory, therefore benign" is the
-// exact mistake this pins against: `d` is a perfectly ordinary base directory
-// here, and the only thing wrong with it is that the stat did not answer.
+// The other half of case (i). The swallow still applies to the *mode* only:
+// `shadow_parent_mode` rounds an illegible base down to the default mode so
+// `prepare` cannot fail, and still reports `shadows_base_directory = false` for
+// the same non-answer, so `d` is treated as materialised over nothing.
+//
+// What that verdict *costs* is what [#64](https://github.com/invakid404/umbra/issues/64)
+// changed, and the change is a retirement rather than a reversal. The row read
+// "fail closed" because a directory could not be removed, so the engine had to
+// guess what the base held and had to guess the expensive way: a wrong guess
+// towards "benign" publishes a phantom path that answers `AlreadyExists`
+// forever. With the removal available the guess is unnecessary under *both*
+// readings -- if the base does hold a directory at `d` the shadow was a benign
+// uncopied shadow and removing it is harmless; if it holds nothing the shadow
+// was a phantom and removing it is required -- so the evidence row stops having
+// a consequence instead of acquiring the opposite one. #64's body does not name
+// this test; it flips all the same.
+//
+// The companion `a_failing_base_stat_falls_back_to_the_default_mode_instead_of_poisoning`
+// above is untouched: the mode half of the swallow is exactly as it was, and
+// what collapses is only the swallow-for-mode / fail-closed-for-creation
+// asymmetry the pair used to document.
 #[test]
-fn a_creating_open_under_an_illegible_base_ancestor_fails_closed() {
+fn a_creating_open_under_an_illegible_base_ancestor_is_rolled_back_rather_than_guessed() {
     let failure = BaseFailure::default();
     let mut f = Fixture::build(
         &[(b"d/f", b"base bytes")],
@@ -3593,16 +3927,20 @@ fn a_creating_open_under_an_illegible_base_ancestor_fails_closed() {
         .prepare(OperationId(Uuid::new_v4()), &action)
         .expect("a failing base stat must not fail prepare");
     assert!(!f.overlay.poisoned);
+    assert!(f.shadow_root.join("d").is_dir());
     f.overlay
         .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
         .unwrap();
-    assert_eq!(
-        f.overlay
-            .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
-            .unwrap_err()
-            .kind,
-        ErrorKind::InvalidState,
-        "an ancestor materialised on evidence that never arrived must not reconcile"
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    assert!(
+        !f.shadow_root.join("d").exists(),
+        "an ancestor materialised on evidence that never arrived is removed, not kept"
     );
-    assert!(f.overlay.poisoned);
+    // The base is untouched by any of it, so the reading under which `d` was a
+    // benign shadow loses nothing: with the injection cleared, `d/f` reads back.
+    *failure.lock().unwrap() = None;
+    assert_eq!(f.read(b"d/f").unwrap(), b"base bytes");
 }
