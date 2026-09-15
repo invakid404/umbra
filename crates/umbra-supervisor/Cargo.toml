@@ -20,3 +20,6 @@ umbra-agent = { path = "../umbra-agent" }
 
 [dev-dependencies]
 tempfile.workspace = true
+# `tests/kernel_refusal.rs` binds a real `Overlay` to real storage on
+# tempdirs; this is the only backend a test target here selects.
+umbra-storage-local = { path = "../umbra-storage-local" }
