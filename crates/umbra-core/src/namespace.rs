@@ -44,12 +44,19 @@ pub enum AbortReason {
     /// ordinary `EPERM` on a `Materialise` operation ends the whole run.
     ///
     /// It is a licence to reconcile, not an instruction to. A namespace that
-    /// cannot account for the transaction's effects must still refuse — an abort
-    /// does not roll anything back, so a preparation that materialised an object
-    /// which did not previously exist stays fatal whatever the kernel said. That
-    /// is the obligation, not a predicate: a namespace may discharge it with a
-    /// conservative approximation that refuses more often than strictly needed,
-    /// and the overlay does.
+    /// cannot account for the transaction's effects must still refuse: a
+    /// preparation that published an object which did not previously exist, and
+    /// that the namespace cannot take back, stays fatal whatever the kernel said.
+    /// That is the obligation, not a predicate — a namespace may discharge it
+    /// with a conservative approximation that refuses more often than strictly
+    /// needed, and the overlay does. The overlay now undoes the prepare-time
+    /// creations its storage surface can undo (a shadow file, by unlinking it)
+    /// and keeps refusing the rest: a directory, which its storage backend
+    /// cannot remove, and a logical symlink, whose placeholder is inseparable from the
+    /// control blobs that back it
+    /// ([#55](https://github.com/invakid404/umbra/issues/55)). Rolling back is
+    /// still the namespace's own business — this variant neither promises nor
+    /// requires it.
     ///
     /// Every other variant means the *interception* broke down — the effects a
     /// mutating `prepare` already applied are unaccounted for — and keeps the

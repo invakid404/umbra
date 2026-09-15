@@ -176,15 +176,16 @@ implements append and fsync-backed flush; the record payload carries
 Unit tests inject an in-memory Journal to model ordering and failure boundaries;
 restart recovery still requires reconciliation that this engine does not implement.
 
-Abort never claims that copy-up, creation, unlink, or a kernel mutation was undone.
+Abort never claims that copy-up, unlink, or a kernel mutation was undone, and
+claims a creation was undone only where it actually unlinked it (below).
 An aborted mutation requires recovery and leaves the session stopped, with one
 structurally distinct exception: `AbortReason::KernelRefused(errno)`. That reason
 says the rewritten syscall reached the kernel and the kernel refused it, so the
 effects are exactly the ones `prepare` journaled, the verdict is the one
 `observe_result` journaled, and the tracee is owed the errno. Such an abort still
-writes its `Abort` record and still rolls nothing back, but it returns `Ok` and
-leaves the session usable, which is what lets an ordinary `EPERM`/`ENOSPC` reach
-the tracee instead of ending the run
+writes its `Abort` record, but it returns `Ok` and leaves the session usable,
+which is what lets an ordinary `EPERM`/`ENOSPC` reach the tracee instead of
+ending the run
 ([#53](https://github.com/invakid404/umbra/issues/53)). The reason is a claim by
 the caller, so it is honoured only when `Pending.outcome` — the failure this
 session itself observed — carries the same errno; an unobserved or mismatched
@@ -192,18 +193,50 @@ claim is an interception inconsistency and takes the poison path. `Cancelled`,
 `Failed` and `RecoveryRequired` are unchanged: they mean the interception broke
 down, and neither mode widens to cover the other.
 
-Reconciling does not undo what `prepare` already did, so it is confined to the
-plans whose preparation created nothing. `Pending.created` records the
-difference. A reconciled creating open would publish a path the tracee was just
-told its open failed to make, and because the shadow object outranks even a stale
-whiteout marker that `commit` would have cleared, every later `O_CREAT|O_EXCL` on
-it would answer `AlreadyExists` permanently. Such a transaction therefore keeps
-the pre-#53 poison behaviour: the run ends, loudly, instead of the namespace
-diverging. The same applies to `Symlink`, `Mkdir` and a cross-path `rename` that
-had to materialise destination parents. Lifting that — so a refused creating
-operation is retryable rather than fatal — needs rollback of prepare-time
-creations, which needs the reconciliation this MVP does not implement, and is
-tracked in [#55](https://github.com/invakid404/umbra/issues/55).
+Reconciling *does* undo what `prepare` created, as far as the storage surface
+allows. `Pending.rollback` lists the shadow objects an `Unlink` can remove, and a
+reconciled abort unlinks them in reverse creation order, after the `Abort`
+record; a rollback that itself fails poisons rather than reporting a
+reconciliation it did not perform, and is the one `abort` path whose error kind
+is the storage backend's rather than `InvalidState`. A refused creating `Open` at
+a path whose ancestors were all already present therefore leaves no trace: the
+shadow file is gone, the path reads `NotFound` again, and the `O_CREAT|O_EXCL`
+retry that the lock-file and atomic-temp-file idioms depend on succeeds instead
+of answering `AlreadyExists` forever
+([#55](https://github.com/invakid404/umbra/issues/55)). Nothing has to be
+restored alongside the object: `whiteouts` and `retired_index` are `commit`-only
+plans a reconciled abort never applied, and since the shadow object outranks even
+a stale whiteout marker, removing it restores that marker's rank by itself.
+
+One thing does survive, and the "no trace" above is deliberately scoped to
+exclude it. Where an ancestor *was* materialised and reconciling was still
+allowed — it shadowed a live base directory — that ancestor stays, and it carries
+#56's widened owner bits, so a base directory at `0o555` reads back as `0o755`.
+That mode divergence is not new and not what this gate is about: `copy_up` has
+left it behind on the same walk since #56, and the commit path accepts it
+deliberately. The gate is about *paths*, and no path the run did not already
+expose survives a reconciled abort.
+
+`Pending.created` is what is left when rollback runs out, and it still poisons.
+It latches for `Mkdir`, because `StorageOperation::RemoveDirectory` is defined on
+the storage surface but `LocalStorage` does not implement it — it falls through to
+`unsupported("execute")`, and the NFS backends implementing it does not help an
+engine that must work against any backend; for `Symlink`, whose
+placeholder is inseparable from the two control blobs `create_symlink` writes
+with it; and for any shadow ancestor `parents` had to materialise over *nothing*
+— no base directory there, one a whiteout logically deleted, or one whose base
+stat did not answer. Those transactions keep the pre-#53 behaviour: the run ends,
+loudly, instead of the namespace diverging. Closing that half needs
+`RemoveDirectory` on the storage surface first.
+
+The rollback list is in-memory and dies with the session, and that is sufficient
+rather than best-effort: `bind` refuses to reopen a journal that is not pristine,
+so a crash between `prepare` and `abort` already ends the run exactly as
+poisoning would. A durable pre-image would buy nothing readable today, so it is
+deferred to M1.5 along with the widening of that refusal — and the replay path
+that widens it must poison for every `Prepare` whose intent implies a creation,
+because the rollback list is gone by then and its absence is not evidence of
+reconcilability.
 
 Copy-up is deliberately not counted as a creation, so a refused `fchownat`, or a
 refused write open on an object the base already holds, reconciles. The content
@@ -251,18 +284,20 @@ by design — that is what `mkdir` keeps one for, as an opaque-base marker — a
 `parents` skips ancestors already in the shadow, so a marker above the first
 materialised ancestor would otherwise go unseen.
 
-Note separately that `created` is shadow-shaped: `parents` decides it from the
-shadow only, so a cross-path `rename` onto a destination parent that exists in
-the base but has not been copied up yet is counted as a creation and poisons.
-That is fail-closed and under-delivers for `rename`. #56 weakened one of the two
-arguments for leaving it that way — a materialised ancestor no longer differs
-from the base directory it shadows in its *group and other* bits — but only that
-far: the owner bits are deliberately widened, mode is not ownership, and since
-`CreateOptions` carries no owner field the shadow still belongs to whoever runs
-umbra rather than to the base directory's owner. And it
-does not touch the other argument at all: narrowing the predicate needs the
-creation rollback [#55](https://github.com/invakid404/umbra/issues/55) tracks and
-this MVP does not implement, so the over-approximation stays until that lands.
+`created` used to be shadow-shaped: `parents` decided it from the shadow alone,
+so a cross-path `rename` onto a destination parent that existed in the base but
+had not been copied up yet was counted as a creation and poisoned. That was
+fail-closed and under-delivered for `rename`, and it is now narrowed. `parents`
+answers logically, off evidence it was already gathering and discarding —
+`shadow_parent_mode` stats the base for the mode (#56) and carries a whiteout
+scan across the walk, which is exactly what distinguishes a shadow of a directory
+the run already exposes from a directory that logically did not exist. Only the
+second latches. The base stat's **error swallow does not widen the benign side**:
+it exists so that an illegible base cannot fail a `create` that succeeds today,
+and it is deliberately not read as "no base directory, therefore benign" — every
+arm but a corroborated live base directory fails closed. So a refused `rename`
+onto a base-only destination parent reconciles, while one that had to invent a
+destination directory still poisons.
 
 Commit-time effects are never applied by `abort`: `pending.whiteouts` and
 `retired_index` are consumed in `commit` alone, so a reconciled `rename` sets no

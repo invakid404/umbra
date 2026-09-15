@@ -183,6 +183,9 @@ impl Storage for BadReceipt {
 type Creates = Arc<Mutex<Vec<(StoragePath, CreateOptions)>>>;
 /// Every path the engine asked the base to stat, in order.
 type BaseStats = Arc<Mutex<Vec<StoragePath>>>;
+/// Every `Unlink` the engine asked the shadow storage for, with the request
+/// context it carried, in order.
+type Unlinks = Arc<Mutex<Vec<(StoragePath, RequestContext)>>>;
 /// Switch that makes every base *directory* stat fail with this kind.
 type BaseFailure = Arc<Mutex<Option<ErrorKind>>>;
 
@@ -195,6 +198,7 @@ type BaseFailure = Arc<Mutex<Option<ErrorKind>>>;
 struct Recorder {
     inner: LocalStorage,
     creates: Creates,
+    unlinks: Unlinks,
 }
 impl Storage for Recorder {
     fn capabilities(&self) -> StorageCapabilities {
@@ -213,11 +217,18 @@ impl Storage for Recorder {
         self.inner.release_writer(lease)
     }
     fn execute(&mut self, request: &StorageRequest) -> Result<StorageResponse> {
-        if let StorageOperation::Create { path, options } = &request.operation {
-            self.creates
+        match &request.operation {
+            StorageOperation::Create { path, options } => self
+                .creates
                 .lock()
                 .unwrap()
-                .push((path.clone(), options.clone()));
+                .push((path.clone(), options.clone())),
+            StorageOperation::Unlink { path } => self
+                .unlinks
+                .lock()
+                .unwrap()
+                .push((path.clone(), request.context.clone())),
+            _ => {}
         }
         self.inner.execute(request)
     }
@@ -287,6 +298,8 @@ struct Setup<'a> {
     base_modes: &'a [(&'a [u8], u32)],
     /// Capture requested `CreateOptions`.
     creates: Option<Creates>,
+    /// Capture `Unlink` requests and the context they carried.
+    unlinks: Option<Unlinks>,
     /// Capture the paths the base is asked about.
     base_stats: Option<BaseStats>,
     /// Report this unmasked `st_mode` for every base directory.
@@ -362,15 +375,23 @@ impl Fixture {
             binding,
             lease,
         };
-        let storage: Box<dyn Storage> = match (mismatch, setup.creates) {
+        let storage: Box<dyn Storage> = match (
+            mismatch,
+            setup
+                .creates
+                .clone()
+                .or_else(|| setup.unlinks.clone().map(|_| Creates::default())),
+        ) {
             (Some(mismatch), creates) => {
                 // `BadReceipt` does not record, so a caller asking for both would
                 // get a silently empty recorder and a vacuously passing
-                // assertion. No test needs the combination; say so loudly rather
-                // than let a future one pass for the wrong reason.
+                // assertion. No test needs either combination; say so loudly
+                // rather than let a future one pass for the wrong reason. The
+                // binding covers `unlinks` as well, because a recorder is built
+                // for either request.
                 debug_assert!(
                     creates.is_none(),
-                    "Setup::creates is ignored when a bad receipt is requested"
+                    "Setup::creates and Setup::unlinks are ignored when a bad receipt is requested"
                 );
                 Box::new(BadReceipt {
                     inner: shadow,
@@ -380,6 +401,7 @@ impl Fixture {
             (None, Some(creates)) => Box::new(Recorder {
                 inner: shadow,
                 creates,
+                unlinks: setup.unlinks.unwrap_or_default(),
             }),
             (None, None) => Box::new(shadow),
         };
@@ -2373,17 +2395,18 @@ fn a_kernel_rejected_write_open_reconciles_and_the_session_keeps_serving_reads()
     assert_eq!(fs::read(f.base_root.join("file")).unwrap(), b"base bytes");
 }
 
-// The boundary between the two branches of `prepare`'s mutating `Open` arm,
-// pinned in both directions. Nothing else in the suite distinguishes them -- the
-// case (c) test above deliberately opens an *existing* file, so it exercises
-// copy-up only -- and a change that erased the distinction would otherwise be
-// invisible to CI.
+// The two branches of `prepare`'s mutating `Open` arm. Nothing else in the suite
+// distinguishes them -- the case (c) test above deliberately opens an *existing*
+// file, so it exercises copy-up only -- and a change that erased the distinction
+// would otherwise be invisible to CI. The boundary that used to run between them
+// has moved: both reconcile now, and the poison line runs between a creation
+// `abort` can unlink and one it cannot, pinned by the base-absent-parent sibling
+// below.
 #[test]
-fn a_refused_creating_open_poisons_while_a_refused_copy_up_open_reconciles() {
-    // Copy-up side. The base already holds the object, so `prepare` duplicated
-    // it into the shadow instead of creating it, and the transaction is
-    // reconcilable. A root-level path, so no ancestors were materialised
-    // either; `Pending.created` records what copy-up does still change.
+fn a_refused_copy_up_open_reconciles() {
+    // The base already holds the object, so `prepare` duplicated it into the
+    // shadow instead of creating it, and the transaction is reconcilable. A
+    // root-level path, so no ancestors were materialised either.
     let mut f = Fixture::new(&[(b"existing", b"base bytes")]);
     let prepared = f.prepare(&open(
         b"existing",
@@ -2400,21 +2423,178 @@ fn a_refused_creating_open_poisons_while_a_refused_copy_up_open_reconciles() {
         .unwrap();
     assert!(!f.overlay.poisoned);
     assert_eq!(f.read(b"existing").unwrap(), b"base bytes");
+    // The copy the shadow now holds is not rolled back and must not be: it
+    // duplicates what the base already exposes, so nothing about the content
+    // view turns on whether it is there.
+    assert_eq!(
+        fs::read(f.shadow_root.join("existing")).unwrap(),
+        b"base bytes"
+    );
+}
 
-    // Creating side. `prepare` materialised an object that did not logically
-    // exist, and `abort` does not roll it back, so reconciling would publish a
-    // path the tracee was just told it failed to create. It stays on the poison
-    // path instead.
+// The creating side, which is what #55 changes. `prepare` materialises an object
+// that did not logically exist; `abort` unlinks it and reconciles, so the tracee
+// gets its errno and the namespace is left exactly as it was found.
+#[test]
+fn a_refused_creating_open_rolls_back_the_object_and_reconciles() {
     let mut f = Fixture::new(&[]);
     assert_eq!(f.read(b"fresh").unwrap_err().kind, ErrorKind::NotFound);
-    let prepared = f.prepare(&open(
-        b"fresh",
-        OpenFlags {
-            write: true,
-            create: true,
-            ..Default::default()
-        },
+    let before = f.log.lock().unwrap().records.len();
+    let prepared = f.prepare(&create_open(b"fresh"));
+    assert!(
+        f.shadow_root.join("fresh").exists(),
+        "prepare materialised the object, so the rollback below is not vacuous"
+    );
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    // Filesystem-level, not merely the engine's view of it: a "rollback" that
+    // only cleared in-memory state would satisfy every other assertion here.
+    assert!(
+        !f.shadow_root.join("fresh").exists(),
+        "abort unlinked what prepare created"
+    );
+    // The divergence is *absent*, not merely refused. A session that reconciled
+    // without rolling back would report the path present and empty.
+    assert_eq!(f.read(b"fresh").unwrap_err().kind, ErrorKind::NotFound);
+    // The Abort record is still written for every mutating abort (#53); the
+    // rollback runs after it, and no Commit is forged to describe it.
+    let payloads = f.log.lock().unwrap().records[before..].to_vec();
+    assert!(matches!(
+        &payloads.last().unwrap().payload,
+        JournalPayload::Abort { reason } if reason.contains("KernelRefused")
     ));
+    assert!(
+        !payloads
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Commit)),
+        "a refused open must not commit"
+    );
+    // The load-bearing one. Before the rollback this path answered every later
+    // `O_CREAT|O_EXCL` with `AlreadyExists` forever, which wedges the lock-file
+    // and atomic-temp-file idioms permanently after a single transient ENOSPC.
+    // It now resolves, and the whole retry runs to completion.
+    assert!(matches!(
+        f.overlay
+            .resolve(&f.process, &exclusive_open(b"fresh"))
+            .unwrap(),
+        ResolvedAction::Rewrite(_)
+    ));
+    f.run(&exclusive_open(b"fresh"));
+    assert_eq!(f.read(b"fresh").unwrap(), b"");
+}
+
+// The rollback's storage requests belong to the transaction, not to the run.
+// `context()` seeds each request's operation ID from the live `Pending`, falling
+// back to the run-level context when there is none, so clearing `self.pending`
+// before the unlink loop would silently charge the undo of a journaled `Prepare`
+// to the session -- the one storage request whose attribution a backend log most
+// needs to be right.
+#[test]
+fn the_rollbacks_unlink_is_attributed_to_the_transaction_it_undoes() {
+    let unlinks = Unlinks::default();
+    let mut f = Fixture::build(
+        &[],
+        Setup {
+            unlinks: Some(unlinks.clone()),
+            ..Setup::default()
+        },
+    );
+    let prepared = f.prepare(&create_open(b"fresh"));
+    unlinks.lock().unwrap().clear();
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    let unlinks = unlinks.lock().unwrap();
+    let (path, context) = match unlinks.as_slice() {
+        [one] => one,
+        other => panic!("the rollback issues exactly one unlink, got {other:?}"),
+    };
+    assert_eq!(path, &root(b"fresh").unwrap());
+    // Derived, not equal: `context()` gives every request inside one transaction
+    // its own identity so a backend cannot bind two different requests to one
+    // idempotency key. What must hold is that the *seed* was the transaction's
+    // ID rather than the run-level one.
+    assert_ne!(context.operation_id, prepared.operation_id);
+    assert!(
+        (1..=64).any(
+            |serial| prepared.operation_id.derive(f.overlay.session, serial)
+                == context.operation_id
+        ),
+        "the unlink must derive from the aborted transaction's operation ID"
+    );
+}
+
+// The benign-ancestor half at the `create` site. The reconciled-rename test below
+// pins this at the `parents` site, but this is where a rollback entry and a
+// surviving benign ancestor actually coexist: `dir` is base-only, so `parents`
+// materialises a shadow of a directory the run already exposes and does not latch,
+// while the file underneath it goes on the rollback list and is unlinked.
+#[test]
+fn a_refused_creating_open_under_a_base_only_parent_rolls_back_only_the_object() {
+    // `0o555` on the base directory, so the widening is observable: without it
+    // the shadow would come back `0o555` too, and against a default `0o755` base
+    // the assertion below would hold whether or not the widening happened.
+    let mut f = Fixture::with_base_modes(&[(b"dir/other", b"other")], &[(b"dir", 0o555)]);
+    assert!(!f.shadow_root.join("dir").exists());
+    let prepared = f.prepare(&create_open(b"dir/fresh"));
+    assert!(f.shadow_root.join("dir/fresh").exists());
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    // The object is gone; the ancestor stays. Unlinking the ancestor is not
+    // possible anyway -- `LocalStorage` has no `RemoveDirectory` -- but it is also
+    // not wanted: it shadows a directory the run already exposed.
+    assert!(!f.shadow_root.join("dir/fresh").exists());
+    assert!(f.shadow_root.join("dir").is_dir());
+    assert_eq!(f.read(b"dir/fresh").unwrap_err().kind, ErrorKind::NotFound);
+    assert_eq!(f.read(b"dir/other").unwrap(), b"other");
+    // What the ancestor does leave behind, so the narrowed claim in `parents` is
+    // pinned rather than asserted only in prose: a shadow directory now outranks
+    // the base one in `lookup`, and it carries #56's widened owner bits, so a
+    // `0o555` base directory reads back `0o755` after a syscall the tracee was
+    // told had failed. This is the commit path's pre-existing divergence,
+    // inherited rather than introduced -- `copy_up` leaves the same thing behind
+    // on the same walk -- but it survives a *reconciled abort*, which is what this
+    // pins. `& !umask()` because `mkdir(2)` masks what `LocalStorage` requests.
+    assert_eq!(mode_of(&shadow(&f, b"dir")), 0o755 & !umask());
+    // And the base is never modified to make any of it work.
+    assert_eq!(mode_of(&f.base_root.join("dir")), 0o555);
+    // The retry is not wedged: the path is creatable again.
+    f.run(&exclusive_open(b"dir/fresh"));
+    assert_eq!(f.read(b"dir/fresh").unwrap(), b"");
+}
+
+// The sibling that carries the poison half, so the boundary stays pinned in both
+// directions -- which was the whole purpose of the single test these two were
+// split out of. `newdir` exists in neither the shadow nor the base, so `parents`
+// materialises a directory shadowing nothing; `LocalStorage` does not implement
+// `RemoveDirectory`, so `Pending.created` latches and the refusal is not
+// reconcilable. Every assertion below is inherited verbatim from that test's
+// creating half.
+#[test]
+fn a_refused_creating_open_under_a_base_absent_parent_still_poisons() {
+    let mut f = Fixture::new(&[]);
+    assert_eq!(
+        f.read(b"newdir/fresh").unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+    let prepared = f.prepare(&create_open(b"newdir/fresh"));
+    assert!(
+        f.shadow_root.join("newdir").is_dir(),
+        "prepare materialised a directory that shadows nothing"
+    );
     f.overlay
         .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
         .unwrap();
@@ -2424,37 +2604,84 @@ fn a_refused_creating_open_poisons_while_a_refused_copy_up_open_reconciles() {
             .unwrap_err()
             .kind,
         ErrorKind::InvalidState,
-        "prepare materialised the object, so this refusal is not reconcilable"
+        "prepare materialised a directory abort cannot remove"
     );
     assert!(f.overlay.poisoned);
     // The divergence stays unreachable. A reconciled session would report the
     // path present and empty and answer every later `O_CREAT|O_EXCL` on it with
     // `AlreadyExists` forever; a poisoned one refuses both, loudly.
-    assert_eq!(f.read(b"fresh").unwrap_err().kind, ErrorKind::InvalidState);
+    assert_eq!(
+        f.read(b"newdir/fresh").unwrap_err().kind,
+        ErrorKind::InvalidState
+    );
     assert_eq!(
         f.overlay
-            .resolve(
-                &f.process,
-                &open(
-                    b"fresh",
-                    OpenFlags {
-                        write: true,
-                        create: true,
-                        exclusive: true,
-                        ..Default::default()
-                    },
-                ),
-            )
+            .resolve(&f.process, &exclusive_open(b"newdir/fresh"))
             .unwrap_err()
             .kind,
         ErrorKind::InvalidState
     );
 }
 
+// `Pending.created` is per transaction, not per session: a latched one must not
+// leave the next one refusing, and a reconciled one must not leave the next one
+// accepting. The supervisor's `Journaling` double flattens this to a session
+// constant and says so; nothing else in either suite drives two transactions
+// through the gate, so it is pinned here.
+#[test]
+fn the_creation_latch_is_per_transaction_not_per_session() {
+    // Reconciled first, then latched: the run survives the first and ends on the
+    // second.
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&create_open(b"fresh"));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    let prepared = f.prepare(&create_open(b"newdir/fresh"));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState
+    );
+    assert!(f.overlay.poisoned);
+
+    // The other order, which is the one a stale latch would break: a creating
+    // open that reconciles after one that did not would be refused if `created`
+    // outlived its transaction. It cannot be driven through a poisoned session,
+    // so the latching transaction is a committed `mkdir` rather than a refused
+    // one -- same branch of `prepare`, same latch, no poison.
+    let mut f = Fixture::new(&[]);
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"/dir"),
+        mode: 0o755,
+    });
+    let prepared = f.prepare(&create_open(b"fresh"));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    assert!(!f.shadow_root.join("fresh").exists());
+}
+
 // The same boundary on the rename plan, which materialises through `parents`
 // rather than `create`. Case (b) above renames onto an existing root-level path
-// and reconciles; this one has to create a destination parent directory and
-// therefore must not.
+// and reconciles; this one has to create a destination parent directory that
+// shadows nothing, and therefore must not. It is the load-bearing pin for the
+// un-rollbackable half at the `parents` site: `fresh/` has no base counterpart,
+// so #55's narrowing leaves it exactly where #53 put it.
 #[test]
 fn a_refused_rename_that_created_destination_parents_poisons() {
     let mut f = Fixture::new(&[(b"source", b"base bytes")]);
@@ -2475,6 +2702,55 @@ fn a_refused_rename_that_created_destination_parents_poisons() {
         "a phantom destination directory is a logical change abort cannot undo"
     );
     assert!(f.overlay.poisoned);
+}
+
+// Its complement, and what #55 newly delivers at the `parents` site: a
+// destination parent the base holds but the shadow has not copied up yet. The
+// predicate used to be shadow-shaped, so this poisoned; it is logical now, the
+// materialised ancestor shadows a directory the run already exposes, and the
+// refusal reconciles. Matches the assertions of the reconciled-rename test in
+// case (b) above, because the same commit-only effects must stay unapplied.
+#[test]
+fn a_refused_rename_onto_a_base_only_destination_parent_reconciles() {
+    let mut f = Fixture::new(&[(b"source", b"base bytes"), (b"dir/other", b"other")]);
+    assert!(
+        !f.shadow_root.join("dir").exists(),
+        "the destination parent is base-only, which is the case under test"
+    );
+    let before = f.log.lock().unwrap().records.len();
+    let prepared = f.prepare(&rename(b"source", b"dir/target"));
+    assert!(
+        f.shadow_root.join("dir").is_dir(),
+        "prepare materialised a shadow of the base directory"
+    );
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(EACCES))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(EACCES))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    let payloads = f.log.lock().unwrap().records[before..].to_vec();
+    assert!(matches!(
+        &payloads.last().unwrap().payload,
+        JournalPayload::Abort { reason } if reason.contains("KernelRefused")
+    ));
+    assert!(
+        !payloads
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Commit)),
+        "the refused rename must not commit"
+    );
+    // Commit-time effects stay unapplied: no whiteout was written at all, so the
+    // source is still visible and the control tree has no whiteout namespace.
+    assert!(!f.control.join("whiteouts").exists());
+    assert_eq!(f.read(b"source").unwrap(), b"base bytes");
+    assert_eq!(f.read(b"dir/target").unwrap_err().kind, ErrorKind::NotFound);
+    // Nothing was rolled back either, and nothing should have been: the shadow
+    // directory is a faithful stand-in for the base directory it shadows (#56),
+    // publishing no path the run did not already expose.
+    assert!(f.shadow_root.join("dir").is_dir());
+    assert_eq!(f.read(b"dir/other").unwrap(), b"other");
 }
 
 // Case (d), the guard: every abort that is *not* a corroborated kernel refusal
@@ -2502,6 +2778,122 @@ fn a_genuine_mid_transaction_abort_still_poisons_a_mutation() {
         );
         assert!(f.overlay.poisoned, "{reason:?} must poison");
     }
+}
+
+// The same guard on a transaction that actually *has* a rollback entry, which
+// the loop above cannot reach: `chown` prepares through `copy_up` alone, so its
+// `Pending.rollback` is empty and an unlink loop that ran unconditionally would
+// still pass it. A creating `Open` is the branch where the two interact.
+//
+// The ordering is the invariant: the rollback runs only *after* the corroboration
+// gate has been cleared, never before it. An uncorroborated abort means the
+// interception broke down and the kernel's real verdict is unknown -- the
+// rewritten `open` may well have succeeded, and the tracee may be holding a live
+// fd to that very object. Unlinking there would destroy data on the strength of a
+// verdict nobody observed, so the object must still be standing afterwards.
+#[test]
+fn an_uncorroborated_abort_does_not_roll_back_what_prepare_created() {
+    for reason in [
+        AbortReason::Cancelled,
+        AbortReason::RecoveryRequired("interception lost".into()),
+        AbortReason::Failed(error(ErrorKind::Io, "supervisor gave up")),
+    ] {
+        let mut f = Fixture::new(&[]);
+        let prepared = f.prepare(&create_open(b"fresh"));
+        assert!(f.shadow_root.join("fresh").exists());
+        // Observed, so the *only* thing separating this from the reconciling
+        // test is the reason itself.
+        f.overlay
+            .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+            .unwrap();
+        assert_eq!(
+            f.overlay
+                .abort(prepared.operation_id, &reason)
+                .unwrap_err()
+                .kind,
+            ErrorKind::InvalidState,
+            "{reason:?} is an interception failure, not an observed kernel verdict"
+        );
+        assert!(f.overlay.poisoned, "{reason:?} must poison");
+        assert!(
+            f.shadow_root.join("fresh").exists(),
+            "{reason:?} must not unlink: the kernel's verdict was never established"
+        );
+    }
+}
+
+// The other direction of the same invariant, at the latch. A transaction that
+// poisons because `created` latched must leave its `rollback` list unapplied too:
+// the run is over, and a half-undo on the way out is not an improvement on no
+// undo. `newdir/fresh` has both -- a rollback entry for the file and a latch for
+// the directory above it.
+#[test]
+fn a_latched_transaction_leaves_its_rollback_list_unapplied() {
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&create_open(b"newdir/fresh"));
+    assert!(f.shadow_root.join("newdir/fresh").exists());
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState
+    );
+    assert!(f.overlay.poisoned);
+    assert!(
+        f.shadow_root.join("newdir/fresh").exists(),
+        "a poisoned run is left exactly as it was, not partly undone"
+    );
+}
+
+// The rollback's own failure path, which is the one `abort` return whose error
+// kind is the storage backend's rather than `InvalidState`. Revoking write on the
+// shadow root makes the `unlink(2)` fail after `prepare` has already created the
+// object; the session must poison rather than report a reconciliation it did not
+// perform, and the object it could not remove must still be there.
+//
+// Mode-based injection because `Setup` has no storage-failure hook -- it injects
+// base-stat and journal failures only. A uid that ignores the mode makes the
+// `unwrap_err` below panic, so under root this fails loudly rather than passing
+// vacuously.
+#[test]
+fn a_rollback_that_cannot_unlink_poisons_instead_of_claiming_success() {
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&create_open(b"fresh"));
+    let object = f.shadow_root.join("fresh");
+    assert!(object.exists());
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    // r-x: the directory is still searchable, so the object is still reachable
+    // and `stat`-able; only the unlink is refused.
+    let restore = fs::metadata(&f.shadow_root).unwrap().permissions();
+    fs::set_permissions(&f.shadow_root, fs::Permissions::from_mode(0o500)).unwrap();
+    let aborted = f
+        .overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC));
+    // Before the unwrap, not after: a uid that ignores the mode makes this an
+    // `Ok` and the unwrap below a panic, and an unrestored `0o500` would then
+    // defeat `TempDir::drop` and leak the directory.
+    fs::set_permissions(&f.shadow_root, restore).unwrap();
+    let failure = aborted.unwrap_err();
+    assert_ne!(
+        failure.kind,
+        ErrorKind::NotFound,
+        "the unlink failed for want of permission, not because the object was gone"
+    );
+    assert!(
+        f.overlay.poisoned,
+        "a rollback that did not happen must not leave the session usable"
+    );
+    assert!(
+        object.exists(),
+        "the object the rollback could not remove is still standing, which is why \
+         the session had to poison"
+    );
 }
 
 #[test]
@@ -2632,6 +3024,17 @@ fn create_open(path: &[u8]) -> FsOp {
         OpenFlags {
             write: true,
             create: true,
+            ..OpenFlags::default()
+        },
+    )
+}
+fn exclusive_open(path: &[u8]) -> FsOp {
+    open(
+        path,
+        OpenFlags {
+            write: true,
+            create: true,
+            exclusive: true,
             ..OpenFlags::default()
         },
     )
@@ -2967,6 +3370,10 @@ fn control_anchored_shadow_ancestors_never_consult_the_base() {
 }
 
 // The two shapes under (a) that no operation can drive end to end, plus the mask.
+// Also the row-by-row pin on the creation verdict `parents` folds into
+// `Pending.created` (#55): the mode rounds a missing answer *down* to the
+// default, the verdict rounds the same non-answer *up* to "a creation abort
+// cannot undo", and only a corroborated live base directory answers benign.
 #[test]
 fn a_non_directory_or_absent_base_ancestor_falls_back_instead_of_inheriting() {
     let mut f = Fixture::with_base_modes(&[(b"d/f", b"base bytes")], &[(b"d", 0o700)]);
@@ -2979,23 +3386,50 @@ fn a_non_directory_or_absent_base_ancestor_falls_back_instead_of_inheriting() {
         f.overlay
             .shadow_parent_mode(&root(b"d").unwrap(), &mut whiteout)
             .unwrap(),
-        0o700
+        ShadowAncestor {
+            mode: 0o700,
+            shadows_base_directory: true,
+        },
+        "a live base directory is the one arm that is not a logical creation"
     );
     let mut whiteout = WhiteoutScan::Unscanned;
     assert_eq!(
         f.overlay
             .shadow_parent_mode(&root(b"d/f").unwrap(), &mut whiteout)
             .unwrap(),
-        0o755,
-        "a file's mode must not be adopted for a directory"
+        ShadowAncestor {
+            mode: 0o755,
+            shadows_base_directory: false,
+        },
+        "a file's mode must not be adopted for a directory, nor its existence \
+         read as a directory this shadows"
     );
     let mut whiteout = WhiteoutScan::Unscanned;
     assert_eq!(
         f.overlay
             .shadow_parent_mode(&root(b"nowhere").unwrap(), &mut whiteout)
             .unwrap(),
-        0o755,
+        ShadowAncestor {
+            mode: 0o755,
+            shadows_base_directory: false,
+        },
         "an absent base ancestor falls back rather than propagating NotFound"
+    );
+    // The remaining row of the verdict table, reached by handing the walk a scan
+    // that has already found a marker above this ancestor. The base directory is
+    // there and legible; it is *logically deleted*, so the shadow materialised
+    // over its grave is a different directory and wears neither its mode nor its
+    // existence.
+    let mut whiteout = WhiteoutScan::Hidden;
+    assert_eq!(
+        f.overlay
+            .shadow_parent_mode(&root(b"d").unwrap(), &mut whiteout)
+            .unwrap(),
+        ShadowAncestor {
+            mode: 0o755,
+            shadows_base_directory: false,
+        },
+        "a whiteouted base directory is not something a shadow can be said to shadow"
     );
 
     // `& 0o7777`: `LocalStorage` masks its own stat (`lib.rs:110`), so only a
@@ -3128,4 +3562,47 @@ fn a_failing_base_stat_falls_back_to_the_default_mode_instead_of_poisoning() {
     assert!(!f.overlay.poisoned);
     *failure.lock().unwrap() = None;
     assert_eq!(f.read(b"d/f").unwrap(), b"base bytes");
+}
+
+// The other half of case (i), and the one #55 makes load-bearing: the swallow
+// applies to the *mode* only. `shadow_parent_mode` rounds an illegible base down
+// to the default mode so `prepare` cannot fail, and rounds the same non-answer up
+// to "a creation `abort` cannot undo" so a refusal cannot reconcile on evidence
+// nobody has. Reading the swallow as "no base directory, therefore benign" is the
+// exact mistake this pins against: `d` is a perfectly ordinary base directory
+// here, and the only thing wrong with it is that the stat did not answer.
+#[test]
+fn a_creating_open_under_an_illegible_base_ancestor_fails_closed() {
+    let failure = BaseFailure::default();
+    let mut f = Fixture::build(
+        &[(b"d/f", b"base bytes")],
+        Setup {
+            fail_directory_stat: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    // Resolve against a healthy base, then fail only the stat `parents` makes,
+    // exactly as the mode half above does.
+    let action = f
+        .overlay
+        .resolve(&f.process, &create_open(b"d/fresh"))
+        .unwrap();
+    *failure.lock().unwrap() = Some(ErrorKind::Io);
+    let prepared = f
+        .overlay
+        .prepare(OperationId(Uuid::new_v4()), &action)
+        .expect("a failing base stat must not fail prepare");
+    assert!(!f.overlay.poisoned);
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState,
+        "an ancestor materialised on evidence that never arrived must not reconcile"
+    );
+    assert!(f.overlay.poisoned);
 }

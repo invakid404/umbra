@@ -976,8 +976,16 @@ mod tests {
     // A namespace double for the syscall-exit path. It mirrors the overlay's
     // real abort contract instead of accepting anything: a mutating transaction
     // is reconcilable only when the reason is a `KernelRefused` naming the errno
-    // this session itself observed *and* `prepare` materialised nothing new.
-    // Every other reason is an interception failure that errors. Getting the
+    // this session itself observed *and* every object `prepare` created is one
+    // `abort` can unlink. Every other reason is an interception failure that
+    // errors. Note what the second half is no longer: "materialised nothing new".
+    // The overlay rolls back the prepare-time creations `Unlink` can undo — a
+    // shadow file, and so an ordinary creating `open` — and latches only what it
+    // cannot: a directory (`LocalStorage` does not implement `RemoveDirectory`),
+    // a logical
+    // symlink's placeholder-plus-control-blobs, and a shadow ancestor
+    // materialised over nothing
+    // ([#55](https://github.com/invakid404/umbra/issues/55)). Getting the
     // reason right is the supervisor's job
     // ([#53](https://github.com/invakid404/umbra/issues/53)), so the double
     // enforces it end to end rather than rubber-stamping the call.
@@ -993,12 +1001,14 @@ mod tests {
     // delete this double's rule rather than maintaining it.
     struct Journaling {
         log: Arc<Mutex<Journaled>>,
-        // The `Pending.created` flag of the transaction being aborted: true when
-        // `prepare` had to create a shadow object that was not there before,
-        // which the overlay refuses to reconcile because nothing rolls it back.
-        // A session constant here, where `Pending.created` is per-transaction;
-        // equivalent only because every test below drives exactly one
-        // transaction, so a harness that drives several needs the real shape.
+        // The `Pending.created` latch of the transaction being aborted: true when
+        // `prepare` materialised something `abort` cannot take back, which the
+        // overlay refuses to reconcile. Logical rather than shadow-shaped since
+        // #55 — creating a shadow file no longer sets it, creating a directory
+        // over nothing still does. A session constant here, where
+        // `Pending.created` is per-transaction; equivalent only because every
+        // test below drives exactly one transaction, so a harness that drives
+        // several needs the real shape.
         created: bool,
     }
     fn unreconcilable() -> UmbraError {
@@ -1163,29 +1173,48 @@ mod tests {
         );
     }
 
-    // Case (d) at supervisor level, and the supervisor-side counterpart of the
-    // overlay's creating-open boundary. Reconciliation is the namespace's
-    // verdict to give, not an error the supervisor may swallow: when `prepare`
-    // materialised a new object the namespace refuses to reconcile, and the exit
-    // must fail closed -- the run poisons, the lifecycle latches, and nothing is
-    // resumed. The supervisor still passes `KernelRefused` down; what changes is
-    // the answer it gets back.
-    #[test]
-    fn a_refused_creating_open_poisons_the_run_and_resumes_nothing() {
-        let thread = ThreadId(task(1).0);
-        let (mut s, log, journaled) = exit_supervisor(
-            FsOp::Open {
-                dir: DirRef::Cwd,
-                path: BytePath::new(b"/fresh".to_vec()).unwrap(),
-                flags: OpenFlags {
-                    write: true,
-                    create: true,
-                    ..OpenFlags::default()
-                },
-                mode: 0o640,
+    // The creating `Open` the real overlay *does* still refuse: one whose parent
+    // directory exists in neither the shadow nor the base, so `parents` has to
+    // materialise a directory shadowing nothing and `Pending.created` latches.
+    // Kept as a distinct helper from the path below so the two supervisor
+    // outcomes are driven by two genuinely different overlay verdicts rather
+    // than by the same op with the double's flag flipped.
+    //
+    // The coupling to the real overlay is a claim in this comment, not machinery:
+    // these tests drive `Journaling`, which never consults an `Overlay`. It also
+    // rests on a known fidelity divergence -- `resolve_path_follow` is called with
+    // `create_parents = flags.create` and `walk` swallows a `NotFound` on a
+    // non-final prefix, so this open is *reachable* where POSIX would answer
+    // `ENOENT`. If that is fixed, `umbra-overlay`'s
+    // `a_refused_creating_open_under_a_base_absent_parent_still_poisons` fails
+    // first and loudly; these two keep passing on a comment that has quietly
+    // become false, so re-pick the trigger here when it does.
+    fn creating_open_under_an_absent_parent() -> FsOp {
+        FsOp::Open {
+            dir: DirRef::Cwd,
+            path: BytePath::new(b"/newdir/fresh".to_vec()).unwrap(),
+            flags: OpenFlags {
+                write: true,
+                create: true,
+                ..OpenFlags::default()
             },
-            true,
-        );
+            mode: 0o640,
+        }
+    }
+
+    // Case (d) at supervisor level. The property is about the supervisor, not
+    // about which op triggers it: reconciliation is the namespace's verdict to
+    // give, not an error the supervisor may swallow, so when the namespace
+    // refuses, the exit must fail closed -- the run poisons, the lifecycle
+    // latches, and nothing is resumed. The supervisor still passes
+    // `KernelRefused` down; what changes is the answer it gets back. Named for
+    // the property rather than the trigger because the trigger moved once
+    // already: a plain creating `open` is reconcilable since #55, so the op
+    // below is one the real overlay still latches.
+    #[test]
+    fn a_namespace_refusal_on_the_exit_path_poisons_the_run_and_resumes_nothing() {
+        let thread = ThreadId(task(1).0);
+        let (mut s, log, journaled) = exit_supervisor(creating_open_under_an_absent_parent(), true);
         s.operations.insert(thread, OperationId(Uuid::new_v4()));
         assert_eq!(
             s.handle_event(TraceEvent::SyscallExit {
@@ -1208,6 +1237,53 @@ mod tests {
         assert!(
             log.lock().unwrap().order().is_empty(),
             "a run that could not reconcile must resume nothing"
+        );
+    }
+
+    // The mirror, and the behaviour this PR exists to produce: the same exit
+    // path, the same `KernelRefused` reason, but a namespace that rolled the
+    // prepare-time creation back and reconciled. Without this the supervisor
+    // suite would pin only the failure half and stay silent about the half #55
+    // delivers.
+    #[test]
+    fn a_refused_creating_open_the_namespace_rolls_back_is_resumed_with_its_errno() {
+        let errno = Errno(28);
+        let thread = ThreadId(task(1).0);
+        // The same op as the poisoning case above -- only the namespace's verdict
+        // differs, which is the point: the supervisor reads the answer, it does
+        // not compute it from the op.
+        let (mut s, log, journaled) =
+            exit_supervisor(creating_open_under_an_absent_parent(), false);
+        s.operations.insert(thread, OperationId(Uuid::new_v4()));
+        s.handle_event(TraceEvent::SyscallExit {
+            task: task(1),
+            thread,
+            outcome: OperationOutcome::Failure(errno),
+        })
+        .unwrap();
+        assert!(!s.is_poisoned());
+        assert_eq!(s.state.lifecycle, RunLifecycle::Running);
+        assert!(s.operations.is_empty());
+        let journaled = journaled.lock().unwrap();
+        assert!(
+            matches!(journaled.aborts.as_slice(), [AbortReason::KernelRefused(e)] if *e == errno),
+            "the observed errno must reach the namespace as the abort reason"
+        );
+        assert_eq!(journaled.observed, vec![OperationOutcome::Failure(errno)]);
+        let log = log.lock().unwrap();
+        // The rewritten syscall already ran and already carries the kernel's
+        // errno in the tracee's return register, so the exit resumes it and
+        // installs nothing. A `set_registers` here would mean the supervisor had
+        // synthesised a verdict of its own.
+        assert_eq!(log.order(), vec!["resume"]);
+        assert!(log.set_register_threads().is_empty());
+        assert_eq!(
+            log.resumes(),
+            vec![ResumeCommand {
+                thread,
+                mode: ResumeMode::Syscall,
+                signal: None,
+            }]
         );
     }
 
