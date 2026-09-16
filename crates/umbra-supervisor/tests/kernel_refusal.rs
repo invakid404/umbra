@@ -26,6 +26,20 @@
 //! as an unsupported capability before any exit can be driven — and `Rename`
 //! resolves to a two-path `Rewrite` the supervisor's single-path rewrite surface
 //! refuses.
+//!
+//! `Unlink` is the one of those whose engine-side rule has since changed
+//! ([#66](https://github.com/invakid404/umbra/issues/66)): its `prepare` no
+//! longer destroys the shadow object, so whoever wires emulation here inherits a
+//! transaction that is plan-shaped throughout rather than a destroy-gap to
+//! re-derive. Nothing is owed to this file for it, and the reason is worth
+//! stating exactly, because the plausible version of it is false. `syscall_entry`
+//! mints an `OperationId` and *does* run `prepare` for an `Emulate`; it refuses
+//! only afterwards, on the match over the prepared action. `Deny` is the action
+//! that short-circuits ahead of the mint, and its own comment there says so. An
+//! `Unlink` therefore reaches `prepare` and stops: no exit is ever driven for it,
+//! so no `KernelRefused` abort is drivable here whatever the engine does. That is
+//! what makes the rule unwritable in this file and pinned in `umbra-overlay`'s
+//! `engine/tests.rs` instead -- unreachability of the *exit*, not of `prepare`.
 
 mod support;
 

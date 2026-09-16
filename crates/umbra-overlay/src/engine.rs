@@ -463,6 +463,21 @@ struct Pending {
     outcome: Option<OperationOutcome>,
     whiteouts: Vec<(StoragePath, bool)>,
     retired_index: Option<StoragePath>,
+    /// The shadow object this transaction's whiteout replaces, removed in
+    /// `commit` beside the marker.
+    ///
+    /// A plan, like `whiteouts` and `retired_index` and for the same reason: a
+    /// transaction that does not commit must leave the namespace as it found it,
+    /// and an object `prepare` had already unlinked could not be put back. The
+    /// bytes of a shadow-only object exist nowhere else in the run, and even a
+    /// byte-exact restore would hand the tracee a new backend object ID for a
+    /// syscall it was told had failed. So the destruction waits (#66).
+    ///
+    /// `None` for every other operation. `commit` re-probes `shadow_stat` rather
+    /// than trusting a prepare-time probe: the two are equivalent because the
+    /// engine serialises the transaction, and probing next to the removal keeps
+    /// the condition and the effect in one place.
+    destroy: Option<StoragePath>,
     /// Shadow objects `prepare` created that `abort` can undo, in creation
     /// order, each carrying the removal that undoes it. A reconciled abort walks
     /// the list in reverse and performs each entry's removal(s).
@@ -524,9 +539,10 @@ struct Pending {
     /// ordinary `EPERM` class [#53](https://github.com/invakid404/umbra/issues/53)
     /// exists to survive.
     ///
-    /// Nothing else has to be restored alongside the object. `whiteouts` and
-    /// `retired_index` are plans consumed in `commit` alone, so a reconciled
-    /// abort never wrote either; and the shadow object outranks even a stale
+    /// Nothing else has to be restored alongside the object. `whiteouts`,
+    /// `retired_index` and `destroy` are plans consumed in `commit` alone, so a
+    /// reconciled abort never applied any of them; and the shadow object
+    /// outranks even a stale
     /// whiteout marker, because `lookup` consults `shadow_stat` first and
     /// `whiteouted` only on a shadow miss. Removing the object therefore
     /// restores the marker's rank by itself.
@@ -1894,6 +1910,7 @@ impl NamespaceSession for Overlay {
             outcome: None,
             whiteouts: vec![],
             retired_index: None,
+            destroy: None,
             rollback: vec![],
         });
         // Any failure after append may have left durable intent or storage effects.
@@ -1987,17 +2004,26 @@ impl NamespaceSession for Overlay {
                         .push(RollbackEntry::Directory(plan.path.clone()));
                     // Keep an existing directory whiteout as an opaque-base marker.
                 }
+                // Nothing is destroyed here, deliberately. This arm used to
+                // call `remove_symlink_index` and `storage.unlink` inline, which
+                // made an `Unlink` the one `Whiteout`-class transaction with an
+                // effect outside `commit`, so any abort of one arrived after the
+                // shadow object was already gone. An abort was the *lucky* case
+                // and not the reachable one: the supervisor's entry path refuses
+                // an `Emulate` only after `prepare` has run, so on the path an
+                // intercepted `unlink(2)` actually took, the run was abandoned
+                // into recovery with `pending` still set, a dangling `Prepare`
+                // record and no `Abort` record at all -- and the object went with
+                // it whenever the target had been materialised in the shadow,
+                // both steps here having been gated on `shadow_stat`.
+                // It is a plan now, consumed in `commit` beside the whiteout it
+                // belongs to. See `Pending.destroy`, and `Pending.rollback` for
+                // why this needs no entry: there is nothing created to roll
+                // back.
                 FsOp::Unlink { .. } => {
-                    self.remove_symlink_index(&plan.path)?;
-                    if self.shadow_stat(&plan.path)?.is_some() {
-                        let context = self.context()?;
-                        self.storage.unlink(&context, &plan.path)?;
-                    }
-                    self.pending
-                        .as_mut()
-                        .unwrap()
-                        .whiteouts
-                        .push((plan.path.clone(), true));
+                    let pending = self.pending.as_mut().unwrap();
+                    pending.destroy = Some(plan.path.clone());
+                    pending.whiteouts.push((plan.path.clone(), true));
                 }
                 // Ownership is changed by the kernel against the rewritten
                 // shadow path, so the object has to be in the shadow first;
@@ -2110,6 +2136,7 @@ impl NamespaceSession for Overlay {
         }
         let whiteouts = pending.whiteouts.clone();
         let retired_index = pending.retired_index.clone();
+        let destroy = pending.destroy.clone();
         let result = (|| {
             if let Some(index) = retired_index {
                 let context = self.context()?;
@@ -2117,6 +2144,25 @@ impl NamespaceSession for Overlay {
             }
             for (path, present) in whiteouts {
                 self.set_whiteout(&path, present)?;
+            }
+            // After the markers and before the flush. A shadow object outranks
+            // its own whiteout, so a destruction that fails here leaves the path
+            // visible -- the pre-transaction view plus an inert marker -- and the
+            // session poisons with the object still standing for recovery to
+            // find. The other order would leave the object gone and nothing
+            // hiding the base, resurrecting a base object at a path the tracee
+            // was told is deleted.
+            //
+            // Index before placeholder, transcribing #69's rule rather than
+            // restating it: `remove_symlink_index` derives the index name from a
+            // live `shadow_stat` of the placeholder, so the placeholder has to
+            // outlive it.
+            if let Some(path) = destroy {
+                self.remove_symlink_index(&path)?;
+                if self.shadow_stat(&path)?.is_some() {
+                    let context = self.context()?;
+                    self.storage.unlink(&context, &path)?;
+                }
             }
             let context = self.context()?;
             let receipt = self.storage.flush(&FlushRequest {
@@ -2154,8 +2200,10 @@ impl NamespaceSession for Overlay {
     }
     fn abort(&mut self, operation: OperationId, reason: &AbortReason) -> Result<()> {
         let pending = self.pending_for(operation)?;
-        // Materialisation or emulated unlink may already have effects. We do not
-        // clear a mutated session or claim those effects were rolled back.
+        // Materialisation may already have effects. We do not clear a mutated
+        // session or claim those effects were rolled back. An emulated `Unlink`
+        // used to belong in that sentence and no longer does: its `prepare`
+        // records a plan and performs nothing (#66).
         let mutation = pending.plan.mutation;
         // A kernel refusal is the one abort whose effects are fully accounted
         // for: `prepare` journaled them, `observe_result` journaled the kernel's
