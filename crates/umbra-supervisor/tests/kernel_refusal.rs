@@ -43,7 +43,10 @@
 
 mod support;
 
-use std::{fs, os::unix::fs::PermissionsExt};
+use std::{
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+};
 
 use support::Harness;
 use umbra_core::{
@@ -314,4 +317,115 @@ fn two_transactions_in_one_session_are_reconciled_independently() {
         h.shadow_root.join("second").exists(),
         "the object the rollback could not remove is still standing"
     );
+}
+
+/// A non-creating write `open`: the operand whose `prepare` is a copy-up of a
+/// base-only file and nothing else.
+fn write_open(path: &[u8]) -> FsOp {
+    FsOp::Open {
+        dir: DirRef::Cwd,
+        path: bytes(path),
+        flags: OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+        mode: 0o640,
+    }
+}
+
+// The one place the ownership carry added by
+// [#61](https://github.com/invakid404/umbra/issues/61) runs through the real
+// syscall path rather than a fake: a tracee opening a read-only base file for
+// writing, resolved to a `Rewrite`, prepared through a real `Overlay` over real
+// `LocalStorage`.
+//
+// It is also the end-to-end form of the latent `EACCES` that fix uncovered.
+// `copy_up` used to create the shadow at the base's mode verbatim, and
+// `LocalStorage::write_at` reopens the object `OpenOptions::write(true)` to copy
+// the content in -- which on a `0o444` file it owns is errno 13. So this exact
+// syscall, against this exact base object, failed before `| SHADOW_OWNER_BITS`
+// was added at that `create`.
+//
+// What this cannot discriminate, stated rather than implied: CI runs as one
+// user, so the base tree is already owned by the test process and a successful
+// carry lands the shadow object on the same uid a missing carry would have. The
+// assertion below is the real end-to-end property and is not the *discriminating*
+// one; `umbra-overlay`'s `a_base_only_ancestor_carries_the_base_directorys_
+// ownership` and its siblings assert on the emitted `SetMetadata`, which is.
+#[test]
+fn a_write_to_a_read_only_base_file_copies_up_through_a_real_overlay_with_base_ownership() {
+    let mut h = Harness::new(&[(b"ro", b"base bytes")]);
+    // After bring-up and before anything reads the base: `fs::write` above went
+    // through the umask and could not have produced this.
+    let base = h.base_root.join("ro");
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o444)).unwrap();
+    let expected = fs::metadata(&base).unwrap();
+
+    let mark = h.prepared_entry(write_open(b"ro"), "ro");
+
+    let copied = h.shadow_root.join("ro");
+    assert_eq!(
+        fs::read(&copied).unwrap(),
+        b"base bytes",
+        "the content copy is what the un-widened mode used to refuse with EACCES"
+    );
+    let shadow = fs::metadata(&copied).unwrap();
+    assert_eq!(
+        (shadow.uid(), shadow.gid()),
+        (expected.uid(), expected.gid()),
+        "the shadow object wears the base object's ownership"
+    );
+    assert!(
+        shadow.permissions().mode() & 0o200 != 0,
+        "the widening the copy needed is still on the object; the chown that \
+         followed it clears setuid/setgid and nothing else"
+    );
+    assert_eq!(fs::read(&base).unwrap(), b"base bytes");
+    assert_eq!(
+        fs::metadata(&base).unwrap().permissions().mode() & 0o7777,
+        0o444,
+        "the immutable base is untouched by any of it"
+    );
+
+    // And the reconciled refusal still does not over-undo the copy, exactly as
+    // for the chown above: `copy_up` records nothing on `Pending.rollback`, and
+    // the ownership carry inside it added no entry.
+    h.exit(EPERM).expect("a corroborated refusal reconciles");
+    assert!(!h.supervisor.is_poisoned());
+    assert_eq!(h.supervisor.state().lifecycle, RunLifecycle::Running);
+    assert_eq!(h.order_since(mark), vec!["resume"]);
+    assert!(copied.exists());
+}
+
+// The `parents()` half, [#60](https://github.com/invakid404/umbra/issues/60),
+// reached the only way an end-to-end test can reach it: `parents` is never
+// called by name, so a syscall has to resolve to a `Rewrite` that materialises
+// an ancestor. A creating write `open` beneath a base-only directory does.
+//
+// `Mkdir` would be the more direct operand and is **not** reachable here, for
+// the reason this file's header already gives: `Overlay::resolve` answers
+// `Emulate` for it and `syscall_entry` rejects an `Emulate` as an unsupported
+// capability before any exit can be driven.
+#[test]
+fn a_creating_open_under_a_base_directory_materialises_the_ancestor_with_its_ownership() {
+    let mut h = Harness::new(&[(b"d/f", b"base bytes")]);
+    let base = fs::metadata(h.base_root.join("d")).unwrap();
+
+    h.prepared_entry(create_open(b"d/made"), "d/made");
+
+    let ancestor = h.shadow_root.join("d");
+    assert!(ancestor.is_dir());
+    let shadow = fs::metadata(&ancestor).unwrap();
+    assert_eq!(
+        (shadow.uid(), shadow.gid()),
+        (base.uid(), base.gid()),
+        "the materialised ancestor wears the base directory's ownership"
+    );
+    assert!(
+        shadow.permissions().mode() & 0o300 != 0,
+        "`SHADOW_OWNER_BITS` is what let the create inside the carried ancestor \
+         succeed, and it survives the chown"
+    );
+    assert!(h.shadow_root.join("d/made").is_file());
+    assert!(!h.supervisor.is_poisoned());
 }

@@ -14,6 +14,9 @@ umbra-journal = { path = "../umbra-journal" }
 [dependencies.serde]
 workspace = true
 
+[dependencies.tracing]
+workspace = true
+
 [dev-dependencies]
 umbra-storage-local = { path = "../umbra-storage-local" }
 tempfile.workspace = true

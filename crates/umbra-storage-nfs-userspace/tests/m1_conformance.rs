@@ -584,7 +584,16 @@ fn an_open_run_claims_no_durability_no_fencing_and_no_physical_path() {
         assert!(!capabilities.xattrs);
         assert!(!capabilities.atomic_replace);
         assert!(!capabilities.atomic_swap);
-        assert!(capabilities.features.is_empty());
+        // `ownership-fidelity-v1` is the one name an open run claims, and it is
+        // an M1 claim, not an M2/M3 one: `SetMetadata` is `Support::Supported`
+        // in the capability table and the dispatch maps `update.uid`/`gid` onto
+        // `FATTR4_OWNER`/`FATTR4_OWNER_GROUP`. Pinned as the whole set, so a
+        // future advertisement cannot slip in beside it unremarked.
+        assert_eq!(
+            capabilities.features.iter().collect::<Vec<_>>(),
+            vec![umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1],
+            "{backend:?}"
+        );
 
         // The finite limits are real, derived from the transport's own reply cap.
         assert!(capabilities.max_io_bytes > 0);

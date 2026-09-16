@@ -2,7 +2,7 @@ use super::*;
 use std::cell::Cell;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 fn fixture() -> (tempfile::TempDir, File, File) {
     let temp = tempfile::tempdir().unwrap();
@@ -221,4 +221,84 @@ fn os_sync_barrier_completes_on_a_local_fixture() {
     let health = FlushHealth::default();
     flush(&dir, &parent, &health, &mut || Ok(())).unwrap();
     health.check().unwrap();
+}
+
+/// The syscall boundary `StorageOperation::SetMetadata` is built on, exercised
+/// the way the rest of this module exercises `native`: against a real directory
+/// FD in a tempdir, with no NFS mount involved. The kernel's NFS client is what
+/// turns these into SETATTR on the wire; this crate never encodes one.
+///
+/// Self-chown rather than cross-uid, because CI has no second identity to give
+/// an object to. That is the shape `STORAGE_OWNERSHIP_FIDELITY_V1` actually
+/// claims -- "what the kernel permits is applied and a refusal is reported" --
+/// and the refusal half arrives through the errno mapper already tested above.
+#[test]
+fn chown_honours_the_unchanged_sentinel_and_chmod_sets_the_mode() {
+    let (temp, dir, _parent) = fixture();
+    let before = native_stat(&dir, b"sub/file");
+
+    // `None` in both positions is `(uid_t)-1` twice: POSIX's "change nothing",
+    // which is what `MetadataUpdate`'s absent fields have to mean.
+    chown(&dir, b"sub/file", None, None).unwrap();
+    let after = native_stat(&dir, b"sub/file");
+    assert_eq!((after.uid, after.gid), (before.uid, before.gid));
+
+    // Naming the identity it already has is the chown an unprivileged process is
+    // always permitted, and it is exactly the carry the overlay emits when the
+    // base object is one umbra already owns.
+    chown(&dir, b"sub/file", Some(before.uid), Some(before.gid)).unwrap();
+    assert_eq!(native_stat(&dir, b"sub/file").uid, before.uid);
+
+    chmod(&dir, b"sub/file", 0o640).unwrap();
+    assert_eq!(native_stat(&dir, b"sub/file").mode, 0o640);
+    assert_eq!(
+        fs::metadata(temp.path().join("run/sub/file"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o640
+    );
+
+    // An absent name is `NotFound`, through the same mapper every other arm uses.
+    assert_eq!(
+        chown(&dir, b"sub/absent", Some(before.uid), None)
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+    assert_eq!(
+        chmod(&dir, b"sub/absent", 0o600).unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+}
+
+fn native_stat(dir: &File, name: &[u8]) -> BlobStat {
+    stat(dir, name).unwrap()
+}
+
+/// The probe `open_run` gates `STORAGE_OWNERSHIP_FIDELITY_V1` on.
+///
+/// It must answer `true` on a store that honours ownership updates -- a tempdir
+/// on a local filesystem does -- and it must be a *no-op*, because it runs on
+/// every `open_run` against a directory the run needs afterwards.
+#[test]
+fn the_ownership_probe_answers_yes_on_a_store_that_chowns_and_changes_nothing() {
+    let (temp, dir, _parent) = fixture();
+    let sub = File::open(temp.path().join("run/sub")).unwrap();
+    let before = stat(&dir, b"sub").unwrap();
+
+    assert!(
+        ownership_supported(&sub),
+        "a local filesystem honours an ownership update, so the probe qualifies it"
+    );
+
+    let after = stat(&dir, b"sub").unwrap();
+    assert_eq!(
+        (after.uid, after.gid, after.mode),
+        (before.uid, before.gid, before.mode),
+        "the probe sets the ownership the object already had, so nothing moves"
+    );
+    // And the directory is still usable for everything open_run does next.
+    assert_eq!(stat(&sub, b"file").unwrap().len, 5);
 }

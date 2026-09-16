@@ -34,3 +34,16 @@ pub const PLATFORM_SYSCALL_REWRITE_V1: &str = "experimental-syscall-rewrite-v1";
 /// leaving a failed one explicitly failed. Advertise only when `renew_writer`,
 /// `finish_run` and `fail_run` are implemented, not merely routed.
 pub const NAMESPACE_RUN_LIFECYCLE_V1: &str = "namespace-run-lifecycle-v1";
+
+/// Storage applies [`crate::storage::MetadataUpdate::uid`]/`gid` on a
+/// `SetMetadata` and reflects the result in [`crate::storage::BlobStat`].
+///
+/// The claim is "what the kernel permits is applied, and a refusal is reported",
+/// not "every chown succeeds": a backend over a real filesystem cannot give an
+/// object away to another uid without privilege it does not have, and the name
+/// would be worthless if it promised otherwise. A consumer that carries
+/// ownership onto a shadow object therefore requires this name to decide whether
+/// to *try*, and still handles [`crate::ErrorKind::Denied`] on the attempt.
+/// Advertise only after qualifying it against a live store, never from
+/// configuration alone.
+pub const STORAGE_OWNERSHIP_FIDELITY_V1: &str = "ownership-fidelity-v1";

@@ -106,6 +106,15 @@ refusal that resumes the tracee and leaves its copy-up standing, an uncorroborat
 abort claim that poisons and undoes nothing, a rollback the storage backend
 refuses — which reports the backend's own `Denied`, never the engine's
 `InvalidState` — and two transactions in one session reconciled independently.
+Since [#60](https://github.com/invakid404/umbra/issues/60) and
+[#61](https://github.com/invakid404/umbra/issues/61) it also drives the ownership
+carry through the real stack: a write to a read-only base file, which copies up
+and takes the base object's ownership, and a creating open beneath a base
+directory, which materialises the ancestor with that directory's ownership.
+Neither can *discriminate* a carry from a missing one on a single-user CI, where
+the base tree is already owned by the test process — the engine's own tests
+assert on the emitted `SetMetadata` for that — but they are the only place the
+carry runs against a real filesystem through a real syscall pair.
 Deleting that file un-pins `Overlay::abort`'s rule, because the double no longer
 carries a copy of it.
 

@@ -14,7 +14,18 @@ kernel-shadow qualification and strict remote persistence are unsupported.
 built with `new` advertises `mounted-nfsv4-v1` only after `open_run` performs that
 validation; configuration alone never earns the capability. `experimental-open-rewrite-v1` is
 advertised alongside it, since runs supply real physical paths for kernel syscall
-rewriting and the sandbox write root. Nothing here advertises remote durability:
+rewriting and the sandbox write root. `ownership-fidelity-v1` is advertised only
+after `open_run` **probes the live export** and the probe succeeds: whether an
+ownership update is honoured belongs to the export, not to this crate, so the
+syscall being available proves nothing. The probe sets the run's provider-private
+directory to the ownership it already has — a real SETATTR on the wire that
+changes nothing, deliberately not `chown(-1, -1)`, which carries no owner
+attribute and which a client may answer locally. Any failure, including the
+`ENOTSUP` an export that refuses chown returns, answers "not qualified" and the
+name is omitted; the probe never fails `open_run`. A read-only run is never
+probed and never advertises it, since the probe is itself a mutation that run
+would refuse. The qualification is per run and is dropped by `close_run`.
+Nothing here advertises remote durability:
 `strict_remote_persistence` stays false and `durability` stays `Local`, because
 the boundary reached is the client fsync.
 Construction does not mount anything. `NfsStorage::new` retains the config and
@@ -53,6 +64,15 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
   - `unlink` / `RemoveDirectory` — `unlinkat` with `AT_REMOVEDIR` selection.
   - `stat` — `fstatat(AT_SYMLINK_NOFOLLOW)`; does not follow the final
     symlink.
+  - `set_metadata` — `fchownat(AT_SYMLINK_NOFOLLOW)` for uid/gid, with the
+    POSIX `(uid_t)-1` sentinel for an absent one, and `fchmodat` for the mode.
+    A symlink leaf is refused outright rather than followed: Linux has no
+    `lchmod` and refuses `AT_SYMLINK_NOFOLLOW` on `fchmodat` with `ENOTSUP`, so
+    the leaf is checked with `stat` first. An update naming nothing or a mode
+    outside 07777 is `InvalidInput`; one naming a timestamp is
+    `UnsupportedCapability` and applies none of the update. This is a native
+    syscall backend over a mounted NFS filesystem — the kernel's NFS client is
+    what turns these into SETATTR on the wire, and nothing here encodes one.
   - `list` — bounded pages through opaque cursor tokens keyed by run,
     invalidated on `(ino, mtime+nsec, ctime+nsec)` directory-stamp change.
   - `atomic_swap` — `renameatx_np(RENAME_SWAP)` is implemented, but

@@ -95,10 +95,13 @@ impl State {
         for anchor in [StorageAnchor::Root, StorageAnchor::Control] {
             nodes.insert(
                 StoragePath::new(anchor, Vec::new()).unwrap(),
-                new_node(&CreateOptions {
-                    kind: CreateKind::Directory,
-                    mode: 0o700,
-                }),
+                new_node(
+                    &CreateOptions {
+                        kind: CreateKind::Directory,
+                        mode: 0o700,
+                    },
+                    ANCHOR_OWNER,
+                ),
             );
         }
         Self {
@@ -152,7 +155,29 @@ impl State {
         bytes
     }
 }
-pub(crate) fn new_node(options: &CreateOptions) -> Node {
+/// Ownership of the two anchor roots, and so of everything created under them
+/// until a `SetMetadata` says otherwise.
+///
+/// The one place with no parent to inherit from. It stays `(0, 0)` deliberately:
+/// this crate is `forbid(unsafe_code)` with no `libc`, so it cannot ask the
+/// kernel who is running it, and inventing a plausible uid would be worse than
+/// naming the archive convention. An archive is a portable artifact, and `0/0`
+/// is what every reproducible-archive tool writes for "no host identity is
+/// recorded here".
+pub(crate) const ANCHOR_OWNER: (u32, u32) = (0, 0);
+
+/// A new node, owned by `owner` rather than by a hardcoded root.
+///
+/// `owner` is the uid/gid pair the caller supplies; every call site takes it
+/// from the node's own parent directory, and [`ANCHOR_OWNER`] seeds the chain at
+/// the two anchor roots. This was `uid: 0, gid: 0` verbatim, which said every
+/// object in every archive belonged to root -- a claim the header writer then
+/// faithfully copied out through `h.set_uid`/`h.set_gid`, so extracting as root
+/// reproduced it. Inheriting from the parent instead keeps the archive
+/// self-consistent and reproducible (no host uid leaks into the bytes), and it
+/// makes an ownership carry propagate: a directory chowned through `SetMetadata`
+/// hands its new ownership to everything created under it afterwards.
+pub(crate) fn new_node(options: &CreateOptions, owner: (u32, u32)) -> Node {
     let (kind, target) = match &options.kind {
         CreateKind::File => (ObjectKind::File, None),
         CreateKind::Directory => (ObjectKind::Directory, None),
@@ -165,8 +190,8 @@ pub(crate) fn new_node(options: &CreateOptions) -> Node {
             len: target.as_ref().map_or(0, |t| t.as_bytes().len() as u64),
             link_count: 1,
             mode: options.mode & 0o7777,
-            uid: 0,
-            gid: 0,
+            uid: owner.0,
+            gid: owner.1,
             modified_nanos: now(),
         },
         target,

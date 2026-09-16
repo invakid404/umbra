@@ -16,9 +16,11 @@
 //! exactly what this harness replaces.
 //!
 //! Deliberately smaller than `Fixture`: no `Setup`, no `BadReceipt`, no
-//! `base_modes`, no storage `Recorder` and no `WatchedBase`. Nothing here
-//! injects a storage failure — the one test that needs a refused rollback
-//! provokes a real `EACCES` with `chmod`, the way `umbra-overlay`'s own
+//! `base_modes` (`base_root` is exposed instead, so the one test that needs a
+//! read-only base object `chmod`s it itself), no storage `Recorder` and no
+//! `WatchedBase`. Nothing here injects a storage failure — the one test that
+//! needs a refused rollback provokes a real `EACCES` with `chmod`, the way
+//! `umbra-overlay`'s own
 //! `a_rollback_that_cannot_unlink_poisons_instead_of_claiming_success` does.
 
 pub mod journal;
@@ -277,6 +279,14 @@ pub struct Harness {
     pub supervisor: Supervisor,
     /// Physical root of the shadow run, where every materialised object lands.
     pub shadow_root: PathBuf,
+    /// Physical root of the immutable base.
+    ///
+    /// Exposed so a test can `chmod` a base object after bring-up, the way the
+    /// refused-rollback test already `chmod`s a shadow one: `create_dir_all` and
+    /// `fs::write` go through the umask and cannot express a `0o444`. Still no
+    /// `Setup` and no `base_modes` -- the mode is applied by the one test that
+    /// needs it, in its own body, where the reason for it is readable.
+    pub base_root: PathBuf,
     log: Arc<Mutex<Recording>>,
     op: Arc<Mutex<Option<FsOp>>>,
     thread: ThreadId,
@@ -370,6 +380,7 @@ impl Harness {
         Self {
             supervisor,
             shadow_root,
+            base_root,
             log,
             op,
             thread: ThreadId(task().0),

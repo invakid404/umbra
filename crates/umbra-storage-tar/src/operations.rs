@@ -28,6 +28,37 @@ fn parent(path: &StoragePath) -> Result<StoragePath> {
         .unwrap_or(0);
     StoragePath::new(path.anchor(), path.as_bytes()[..end].to_vec())
 }
+/// Refuse a metadata update this backend cannot apply *before* applying any of
+/// it, so a mixed update can never half-land.
+///
+/// The same refusal `umbra-storage-local` and `umbra-storage-nfs` make, in the
+/// same words, so a consumer reads one contract across all three rather than
+/// learning a backend identity. `modified_nanos` is refused with the rest even
+/// though `BlobStat` has a field for it: a uniform surface is worth more than
+/// one backend accepting one field the other two do not.
+fn check_update(update: &MetadataUpdate) -> Result<()> {
+    if update.accessed_nanos.is_some() || update.modified_nanos.is_some() {
+        return Err(unsupported());
+    }
+    if update.mode.is_none() && update.uid.is_none() && update.gid.is_none() {
+        return Err(error(ErrorKind::InvalidInput, "update names nothing"));
+    }
+    if update.mode.is_some_and(|mode| mode & !0o7777 != 0) {
+        return Err(error(ErrorKind::InvalidInput, "invalid mode"));
+    }
+    Ok(())
+}
+/// The uid/gid a new node at `path` inherits: its parent directory's.
+///
+/// tar has no kernel to ask who is creating the object, so the archive answers
+/// from itself. See `archive::new_node` for why that is the honest answer here
+/// and what it replaced.
+fn owner(state: &State, path: &StoragePath) -> (u32, u32) {
+    parent(path)
+        .ok()
+        .and_then(|p| state.nodes.get(&p))
+        .map_or(archive::ANCHOR_OWNER, |n| (n.stat.uid, n.stat.gid))
+}
 pub(crate) fn validate_parents(state: &State, path: &StoragePath) -> Result<()> {
     let mut p = path.clone();
     while !p.as_bytes().is_empty() {
@@ -91,12 +122,16 @@ fn parents(state: &mut State, path: &StoragePath, mode: u32) -> Result<()> {
                 ));
             }
         } else {
+            let owner = owner(state, &p);
             state.nodes.insert(
                 p,
-                archive::new_node(&CreateOptions {
-                    kind: CreateKind::Directory,
-                    mode,
-                }),
+                archive::new_node(
+                    &CreateOptions {
+                        kind: CreateKind::Directory,
+                        mode,
+                    },
+                    owner,
+                ),
             );
         }
     }
@@ -122,7 +157,7 @@ pub(crate) fn mutate(state: &mut State, op: &StorageOperation) -> Result<Storage
             if state.nodes.contains_key(path) {
                 return Err(error(ErrorKind::AlreadyExists, "name exists"));
             }
-            let n = archive::new_node(options);
+            let n = archive::new_node(options, owner(state, path));
             let result = StorageResponse::Created(object(&n));
             state.nodes.insert(path.clone(), n);
             Ok(result)
@@ -138,12 +173,16 @@ pub(crate) fn mutate(state: &mut State, op: &StorageOperation) -> Result<Storage
                 }
                 Some(_) => (),
                 None => {
+                    let owner = owner(state, path);
                     state.nodes.insert(
                         path.clone(),
-                        archive::new_node(&CreateOptions {
-                            kind: CreateKind::Directory,
-                            mode: *mode,
-                        }),
+                        archive::new_node(
+                            &CreateOptions {
+                                kind: CreateKind::Directory,
+                                mode: *mode,
+                            },
+                            owner,
+                        ),
                     );
                 }
             }
@@ -174,6 +213,32 @@ pub(crate) fn mutate(state: &mut State, op: &StorageOperation) -> Result<Storage
                 };
             }
             Ok(StorageResponse::WriteAt(bytes.len() as u32))
+        }
+        // A pure node mutation: there is no kernel here to refuse a chown, and
+        // any uid/gid is representable in a tar header -- `archive::header`
+        // already writes `stat.uid`/`stat.gid` out through `set_uid`/`set_gid`,
+        // and the round-trip check in `archive` already reads them back. So this
+        // backend is the one where `STORAGE_OWNERSHIP_FIDELITY_V1` is
+        // unconditionally true.
+        //
+        // `accessed_nanos` is refused rather than dropped: `BlobStat` has no
+        // field for it, so applying it would be a write the next `Stat` cannot
+        // show. Refused with the rest of the update, before anything lands.
+        StorageOperation::SetMetadata { path, update } => {
+            named(path)?;
+            check_update(update)?;
+            node(state, path)?;
+            let n = state.nodes.get_mut(path).unwrap();
+            if let Some(mode) = update.mode {
+                n.stat.mode = mode;
+            }
+            if let Some(uid) = update.uid {
+                n.stat.uid = uid;
+            }
+            if let Some(gid) = update.gid {
+                n.stat.gid = gid;
+            }
+            Ok(StorageResponse::MetadataSet(n.stat.clone()))
         }
         StorageOperation::Unlink { path } | StorageOperation::RemoveDirectory { path } => {
             named(path)?;

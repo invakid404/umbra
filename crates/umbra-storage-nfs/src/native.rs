@@ -80,6 +80,76 @@ pub(crate) fn mkdir(dir: &File, bytes: &[u8], mode: u32) -> Result<()> {
     )?;
     Ok(())
 }
+/// `fchownat` with the POSIX "leave unchanged" sentinel for an absent ID.
+///
+/// `(uid_t)-1` is what POSIX spells "do not change this ID", and it is exactly
+/// what `MetadataUpdate`'s `Option::None` means, so the mapping needs no
+/// branching. `AT_SYMLINK_NOFOLLOW` keeps this on the named object, matching
+/// `stat`'s `fstatat` above and `unlink`'s never-follow rule.
+///
+/// The caller syncs the parent directory, as `mkdir`/`unlink`/`rename` callers
+/// do; nothing here is durable on its own.
+pub(crate) fn chown(dir: &File, bytes: &[u8], uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+    let name = name(bytes)?;
+    // SAFETY: valid directory FD and NUL-terminated C string.
+    cvt(
+        unsafe {
+            libc::fchownat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                uid.unwrap_or(u32::MAX),
+                gid.unwrap_or(u32::MAX),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        },
+        "fchownat",
+    )?;
+    Ok(())
+}
+/// Whether this export actually applies an ownership update, measured rather
+/// than assumed.
+///
+/// `STORAGE_OWNERSHIP_FIDELITY_V1`'s own doc comment requires it be advertised
+/// "only after qualifying it against a live store, never from configuration
+/// alone", and an NFS export is exactly the case that makes the rule bite: the
+/// syscall is always *available* here, and whether the server honours it is a
+/// property of the export, not of this crate. So `open_run` asks the store.
+///
+/// The probe sets `dir`'s ownership to the ownership it already has. That is a
+/// no-op in effect and a real SETATTR on the wire -- deliberately not
+/// `chown(-1, -1)`, which carries no owner attribute at all and which a client
+/// is free to answer locally without ever asking the server, making it no
+/// evidence of anything. The caller points this at a directory umbra created and
+/// owns inside the run, never at user data.
+///
+/// Any failure answers `false` rather than propagating. The capability is
+/// additive and its absence is exactly the pre-`#60` behaviour, so refusing to
+/// claim it is the fail-closed direction, and a store that cannot chown must not
+/// fail `open_run` over a capability nothing has asked for yet.
+pub(crate) fn ownership_supported(dir: &File) -> bool {
+    let Ok(current) = stat(dir, b"") else {
+        return false;
+    };
+    chown(dir, b".", Some(current.uid), Some(current.gid)).is_ok()
+}
+/// `fchmodat` on a leaf the caller has already established is not a symlink.
+///
+/// No `AT_SYMLINK_NOFOLLOW`: Linux's `fchmodat` refuses that flag outright with
+/// `ENOTSUP` -- there is no `lchmod` on Linux -- so passing it would make this
+/// arm work on macOS and fail on the platform NFS is actually deployed on. The
+/// caller therefore stats the leaf with `stat` (which *is* no-follow) and refuses
+/// a symlink before calling here. That leaves a window between the stat and the
+/// chmod which this crate's path-based mutations share, and which its own
+/// module doc already claims no protection against.
+pub(crate) fn chmod(dir: &File, bytes: &[u8], mode: u32) -> Result<()> {
+    let name = name(bytes)?;
+    // SAFETY: valid directory FD and NUL-terminated C string.
+    cvt(
+        unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) },
+        "fchmodat",
+    )?;
+    Ok(())
+}
 pub(crate) fn walk(dir: &File, bytes: &[u8], create: bool) -> Result<File> {
     StoragePath::new(StorageAnchor::Root, bytes.to_vec())?;
     let mut current = open(dir, b".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;

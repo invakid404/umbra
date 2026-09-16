@@ -220,9 +220,21 @@ impl Operations {
     /// [`Fencing::ReadOnly`]: this node qualified no persistence boundary and owns
     /// no termination verifier, and neither the WRITE/COMMIT verifier flow nor a
     /// successful lease renewal changes that.
+    ///
+    /// `STORAGE_OWNERSHIP_FIDELITY_V1` is advertised only here, on an *open* run,
+    /// and not on the unbound capabilities in `storage.rs`, for the same reason
+    /// the limits are zero there: without a bound transport there is nothing
+    /// qualified to claim. The claim itself is corroborated by the capability
+    /// table in `capability.rs`, where `SetMetadata` is `Support::Supported`, and
+    /// by `namespace::dispatch`, which maps `update.uid`/`gid` onto
+    /// `FATTR4_OWNER`/`FATTR4_OWNER_GROUP` and has a test reading them back.
+    /// Advertising a name the table marked `Deferred` would be exactly the drift
+    /// this crate's doc comment makes load-bearing.
     pub fn capabilities(&self) -> StorageCapabilities {
         StorageCapabilities {
-            features: Default::default(),
+            features: [umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned()]
+                .into_iter()
+                .collect(),
             durability: Durability::None,
             strict_remote_persistence: false,
             fencing: Fencing::ReadOnly,
@@ -1237,7 +1249,15 @@ mod tests {
         assert!(!binding.capabilities.hard_links);
         assert!(!binding.capabilities.atomic_swap);
         assert!(!binding.capabilities.kernel_shadow);
-        assert!(binding.capabilities.features.is_empty());
+        // The one name this node has qualified, and the whole set rather than
+        // just its size: `SetMetadata` is `Support::Supported` in
+        // `capability.rs`'s table and `namespace::dispatch` maps `update.uid`
+        // and `update.gid` onto `FATTR4_OWNER`/`FATTR4_OWNER_GROUP`, which is
+        // what `ownership-fidelity-v1` claims. Nothing else is claimed.
+        assert_eq!(
+            binding.capabilities.features.iter().collect::<Vec<_>>(),
+            vec![umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1],
+        );
     }
 
     #[test]
