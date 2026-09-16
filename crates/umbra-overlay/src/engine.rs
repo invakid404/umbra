@@ -457,6 +457,33 @@ enum RollbackEntry {
         placeholder: StoragePath,
     },
 }
+/// What `commit` must remove for a `Pending.destroy`, and the storage call that
+/// removes it.
+///
+/// The same split `RollbackEntry::File`/`Directory` names, for the same reason
+/// and hoisted to the same kind of site: removal is `StorageOperation::Unlink`
+/// or `StorageOperation::RemoveDirectory`, and `prepare` knows which one it is
+/// asking for from `FsOp::Unlink`'s own `directory` flag, while `commit` would
+/// have to stat to find out.
+///
+/// A separate enum rather than a reuse of `RollbackEntry`: that list means
+/// "things this transaction created and an abort must un-create", this field
+/// means "the thing this transaction's whiteout replaces and a commit must
+/// destroy", and `RollbackEntry::Symlink` has no meaning here at all.
+///
+/// One `Option<Destroy>` rather than a second `destroy_directory` field, so
+/// "both set" is unrepresentable: two `Option`s would put a silent
+/// double-destroy of two different paths in one transaction one typo away, and
+/// would need a written cannot-happen note in place of a type that says it.
+#[derive(Clone)]
+enum Destroy {
+    /// A shadow file or logical-symlink placeholder: retire the backing index,
+    /// then `unlink`.
+    File(StoragePath),
+    /// A shadow directory: `remove_directory`. No index to retire -- a
+    /// directory's object ID never keys a `symlinks/objects/` entry.
+    Directory(StoragePath),
+}
 struct Pending {
     id: OperationId,
     plan: Plan,
@@ -477,7 +504,11 @@ struct Pending {
     /// than trusting a prepare-time probe: the two are equivalent because the
     /// engine serialises the transaction, and probing next to the removal keeps
     /// the condition and the effect in one place.
-    destroy: Option<StoragePath>,
+    ///
+    /// The variant says which storage removal `commit` performs; see `Destroy`
+    /// for why the kind is carried here rather than restated as a second field
+    /// or re-derived by a stat in `commit`.
+    destroy: Option<Destroy>,
     /// Shadow objects `prepare` created that `abort` can undo, in creation
     /// order, each carrying the removal that undoes it. A reconciled abort walks
     /// the list in reverse and performs each entry's removal(s).
@@ -1595,9 +1626,60 @@ impl NamespaceResolver for Overlay {
                     return Err(error(ErrorKind::InvalidPath, "unlink kind mismatch"));
                 }
                 if *directory {
-                    return Err(unsupported(
-                        "rmdir awaits backend directory removal support",
-                    ));
+                    // The merged view, not the shadow half and not the base
+                    // half. Two cases decide this and they point opposite ways:
+                    // a base directory whose children were all unlinked in-run
+                    // is empty although `Base::list` still reports them
+                    // (`merged` filters them at the per-name whiteout pass),
+                    // and an opaque recreated directory is empty although the
+                    // base is full (`merged` skips the base enumeration
+                    // entirely when the directory's own path is whiteouted).
+                    // Only one implementation of the merged view knows both
+                    // rules, and `ReadDir` answers the tracee from that same
+                    // one -- so the emptiness this refuses on is the emptiness
+                    // the tracee can observe.
+                    //
+                    // An `Err`, not `Emulate(Failure(ENOTEMPTY))`, joining the
+                    // three sibling POSIX refusals in this function
+                    // (`Mkdir`/`AlreadyExists`, absent-target/`NotFound`,
+                    // kind-mismatch/`InvalidPath`). The supervisor refuses an
+                    // `Emulate` only *after* `prepare` has journaled, so a
+                    // failure-shaped `Emulate` would leave a dangling `Prepare`
+                    // for an unlink that never happened; and the engine has no
+                    // view of the tracee ABI, where `ENOTEMPTY` is 39 on Linux
+                    // and 66 on macOS/BSD -- `Errno::ENOENT` is the sole named
+                    // constant precisely because it is ABI-stable. `Denied` is
+                    // this function's idiom for "POSIX says no" and is
+                    // distinguishable from the kind mismatch two lines above.
+                    //
+                    // `merged` latches `whiteout_hit` through `whiteouted`.
+                    // Harmless here, and the obvious reason is the wrong one:
+                    // there *is* a `hidden_or` site below this, in the `_ =>`
+                    // arm of this same `match`, so "every site is above" would
+                    // be false. What actually holds is that the arm cannot run
+                    // for an `FsOp::Unlink` -- the arms are mutually exclusive
+                    // -- and that `resolve` clears the latch at its head on
+                    // every call, so nothing this sets can carry into another.
+                    // Stated so a future reorder has to preserve those two
+                    // facts rather than a claim about line order.
+                    //
+                    // Accepted cost, recorded here rather than left to be
+                    // discovered: `merged` pages the base half to exhaustion
+                    // and stat-fills every surviving entry before `is_empty`
+                    // reads the first of them, so an `rmdir` of a 100k-child
+                    // directory pays 100k round trips to answer a one-entry
+                    // question POSIX answers in one. Not a regression --
+                    // `ReadDir` reaches the same function and already pays this
+                    // shape -- and deliberately not fixed at this call site: an
+                    // early-out here would be a second merged-view
+                    // implementation, which is precisely what the bifurcated
+                    // predicate was rejected for. The fix is an entry limit
+                    // honoured *inside* `merged`, on a hot path `Overlay::list`
+                    // and `resolve_directory` share; that is a wider change
+                    // than this arm, and is left as a follow-up.
+                    if !self.merged(&path)?.is_empty() {
+                        return Err(error(ErrorKind::Denied, "rmdir target is not empty"));
+                    }
                 }
             }
             // Refuse here rather than at prepare. `copy_up` rejects a base-only
@@ -2020,9 +2102,17 @@ impl NamespaceSession for Overlay {
                 // belongs to. See `Pending.destroy`, and `Pending.rollback` for
                 // why this needs no entry: there is nothing created to roll
                 // back.
-                FsOp::Unlink { .. } => {
+                //
+                // The discriminant comes straight off the `FsOp` the tracee
+                // supplied, which `resolve` has already validated against
+                // `stat.kind`, so the plan and the object can never disagree.
+                FsOp::Unlink { directory, .. } => {
                     let pending = self.pending.as_mut().unwrap();
-                    pending.destroy = Some(plan.path.clone());
+                    pending.destroy = Some(if *directory {
+                        Destroy::Directory(plan.path.clone())
+                    } else {
+                        Destroy::File(plan.path.clone())
+                    });
                     pending.whiteouts.push((plan.path.clone(), true));
                 }
                 // Ownership is changed by the kernel against the rewritten
@@ -2153,16 +2243,49 @@ impl NamespaceSession for Overlay {
             // hiding the base, resurrecting a base object at a path the tracee
             // was told is deleted.
             //
-            // Index before placeholder, transcribing #69's rule rather than
-            // restating it: `remove_symlink_index` derives the index name from a
-            // live `shadow_stat` of the placeholder, so the placeholder has to
-            // outlive it.
-            if let Some(path) = destroy {
-                self.remove_symlink_index(&path)?;
-                if self.shadow_stat(&path)?.is_some() {
-                    let context = self.context()?;
-                    self.storage.unlink(&context, &path)?;
+            // For a directory that residue argument does **not** transfer
+            // verbatim, and inheriting it silently would be wrong. A failed
+            // `remove_directory` leaves the shadow directory standing, so
+            // `lookup` still resolves it -- but the marker *was* written, so
+            // `merged` now short-circuits its base enumeration and the base
+            // children are hidden. The residue is "the directory is still there,
+            // but its base children are not", which is not the pre-transaction
+            // view. The order stays anyway: reversing it makes a *successful*
+            // destroy followed by a failed `set_whiteout` expose the whole base
+            // directory and every child at a path the tracee was told it had
+            // removed, and lying to a live tracee about a completed `rmdir` is
+            // worse than an imperfect residue in a session that has already
+            // poisoned and whose only reader is recovery.
+            match destroy {
+                // Index before placeholder, transcribing #69's rule rather than
+                // restating it: `remove_symlink_index` derives the index name
+                // from a live `shadow_stat` of the placeholder, so the
+                // placeholder has to outlive it.
+                Some(Destroy::File(path)) => {
+                    self.remove_symlink_index(&path)?;
+                    if self.shadow_stat(&path)?.is_some() {
+                        let context = self.context()?;
+                        self.storage.unlink(&context, &path)?;
+                    }
                 }
+                // No `remove_symlink_index`: a directory's object ID never keys
+                // a `symlinks/objects/` entry, so the call could only ever be a
+                // stat that misses. The `shadow_stat` re-probe is the same one
+                // the file arm does and for the same reason (#66) -- a base-only
+                // directory has nothing in the shadow to remove, and the marker
+                // alone is the whole effect.
+                Some(Destroy::Directory(path)) => {
+                    // Bound rather than inlined into the `if`: the probe is
+                    // fallible, so it cannot be a match guard, and clippy reads
+                    // a bare `if` as the sole arm body as one that should have
+                    // been.
+                    let materialised = self.shadow_stat(&path)?.is_some();
+                    if materialised {
+                        let context = self.context()?;
+                        self.storage.remove_directory(&context, &path)?;
+                    }
+                }
+                None => {}
             }
             let context = self.context()?;
             let receipt = self.storage.flush(&FlushRequest {
