@@ -618,6 +618,13 @@ fn unlink(path: &[u8]) -> FsOp {
         directory: false,
     }
 }
+fn rmdir(path: &[u8]) -> FsOp {
+    FsOp::Unlink {
+        dir: DirRef::Cwd,
+        path: bytes(path),
+        directory: true,
+    }
+}
 fn rename(from: &[u8], to: &[u8]) -> FsOp {
     FsOp::Rename {
         from_dir: DirRef::Cwd,
@@ -790,8 +797,9 @@ fn whiteout_hidden_resolves_to_enoent_while_truly_absent_stays_not_found() {
     // A whiteouted *ancestor directory* hides everything beneath it. Path
     // resolution fails at the ancestor's own lookup, before the final-component
     // lookup runs, so a fix confined to the final lookup would leak this. Write
-    // the directory marker the way the engine stores one (rmdir is unsupported,
-    // so there is no op that whiteouts a directory), then confirm the child
+    // the directory marker the way the engine stores one (`rmdir` writes one
+    // since #77; hand-writing it keeps this independent of the `FsOp::Unlink`
+    // arm, and of that arm's own emptiness gate), then confirm the child
     // beneath it also denies with ENOENT.
     let marker = Overlay::marker(&root(b"dir").unwrap()).unwrap();
     let marker_path = f
@@ -4294,9 +4302,12 @@ fn a_whiteouted_base_directory_does_not_lend_its_mode_to_its_replacement() {
             ..Setup::default()
         },
     );
-    // rmdir is unsupported, so no operation whiteouts a directory; write the
-    // markers the way the engine stores them, as
-    // `whiteout_hidden_resolves_to_enoent_while_truly_absent_stays_not_found` does.
+    // `rmdir` whiteouts a directory since #77, but the markers stay
+    // hand-written here on purpose: the subject is `parents` and
+    // `shadow_parent_mode`, and writing them the way the engine stores them --
+    // as `whiteout_hidden_resolves_to_enoent_while_truly_absent_stays_not_found`
+    // does -- keeps this independent of the `FsOp::Unlink` arm, so a change
+    // there cannot make this pass or fail for an unrelated reason.
     for name in [&b"d"[..], b"e"] {
         let marker = Overlay::marker(&root(name).unwrap()).unwrap();
         let path = f
@@ -4635,4 +4646,544 @@ fn a_creating_open_under_an_illegible_base_ancestor_is_rolled_back_rather_than_g
     // benign shadow loses nothing: with the injection cleared, `d/f` reads back.
     *failure.lock().unwrap() = None;
     assert_eq!(f.read(b"d/f").unwrap(), b"base bytes");
+}
+
+// `FsOp::Unlink { directory: true }` (#77). The arm refused with "rmdir awaits
+// backend directory removal support" until here, on a premise that had been
+// false since #64 gave `LocalStorage` its `RemoveDirectory` arm --
+// `Overlay::abort` has been calling `storage.remove_directory` on the reconcile
+// path throughout, pinned by
+// `a_refused_mkdir_rolls_back_the_directory_it_created`. A directory unlink is
+// `Dispatch::Whiteout` like a file one and inherits #66's contract verbatim:
+// `prepare` records a `Pending::destroy` plan, `commit` performs it beside the
+// marker, an abort destroys nothing because nothing was created. The only
+// directory-specific addition is the emptiness gate, and it is taken against the
+// *merged* view. Three tests own that between them, and which one owns which
+// direction matters: `a_base_directory_whose_children_were_all_unlinked_rmdirs_as_empty`
+// and `an_opaque_base_directory_rmdirs_on_its_shadow_contents_alone` are the two
+// cases that point opposite ways, and both falsify a predicate that consults the
+// base listing separately -- but both assert *success*, so neither can catch a
+// predicate that is too permissive. `a_rmdir_counts_base_and_shadow_children_alike`
+// is the one that asserts refusals, and it is what falsifies a shadow-half-only
+// check.
+//
+// Honest about reachability, in the idiom the `Mkdir` and file-`Unlink` blocks
+// above already carry: `resolve` answers `Emulate` for `Unlink`, so the
+// supervisor refuses it at entry and `kernel_refusal.rs` can carry no sibling
+// for any of this. `Overlay::abort` and `Overlay::commit` are namespace APIs
+// this suite calls directly. The refusals seed the outcome through
+// `observe_emulated_refusal`, so none of these assert on journal *shape*.
+//
+// The gate's refusal is an `Err(Denied)`, not an `Emulate(Failure(ENOTEMPTY))`:
+// the supervisor refuses an `Emulate` only after `prepare` has journaled, and
+// the engine has no view of the tracee ABI in which `ENOTEMPTY` is 39 on Linux
+// and 66 on macOS/BSD. See the arm's own comment.
+
+// Case 1. The whole plan end to end on the simplest shape: a directory this run
+// created, with nothing in the base behind it.
+#[test]
+fn an_empty_shadow_only_directory_rmdir_removes_it_and_leaves_a_marker() {
+    let mut f = Fixture::new(&[]);
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"fresh"),
+        mode: 0o755,
+    });
+    assert!(f.shadow_root.join("fresh").is_dir());
+    f.run(&rmdir(b"fresh"));
+    assert!(
+        !f.shadow_root.join("fresh").exists(),
+        "commit performs the remove_directory the plan recorded"
+    );
+    let marker = Overlay::marker(&root(b"fresh").unwrap()).unwrap();
+    assert!(f
+        .control
+        .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+        .is_file());
+    assert_eq!(
+        f.overlay.resolve(&f.process, &stat(b"fresh")).unwrap(),
+        ResolvedAction::Deny(Errno::ENOENT)
+    );
+    assert!(f
+        .overlay
+        .list(&root(b"").unwrap(), None, 10)
+        .unwrap()
+        .entries
+        .is_empty());
+}
+
+// Case 2. Nothing of this directory was ever in the shadow, so `commit`'s
+// `shadow_stat` re-probe skips the destroy entirely and the marker is the whole
+// effect. The base directory is immutable and must come through untouched.
+#[test]
+fn an_empty_base_only_directory_rmdir_marks_it_and_destroys_nothing() {
+    let mut f = Fixture::new(&[]);
+    // An *empty* base directory: the fixture's file list can only make
+    // directories as a side effect of the files under them.
+    fs::create_dir(f.base_root.join("empty")).unwrap();
+    f.run(&rmdir(b"empty"));
+    assert!(
+        f.base_root.join("empty").is_dir(),
+        "the base is immutable; hiding it is the whole of the effect"
+    );
+    assert!(!f.shadow_root.join("empty").exists());
+    let marker = Overlay::marker(&root(b"empty").unwrap()).unwrap();
+    assert!(f
+        .control
+        .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+        .is_file());
+    // #49: the base object is still on the host, so a NotFound the supervisor
+    // would resume as passthrough must not escape -- it denies with ENOENT.
+    assert_eq!(
+        f.overlay.resolve(&f.process, &stat(b"empty")).unwrap(),
+        ResolvedAction::Deny(Errno::ENOENT)
+    );
+}
+
+// Case 2b, and one of the two tests that decide the gate's predicate. The base
+// listing still reports both children; the merged view does not, because every
+// name carries a whiteout. A predicate that consults the base list separately
+// refuses here -- and `rm d/* && rmdir d` is the single most common real
+// sequence there is.
+//
+// It does **not** discriminate against a shadow-half-only predicate, and saying
+// so is the point rather than an omission. `d`'s children are base-only, so a
+// shadow-only check sees no shadow directory at all, calls that empty, agrees
+// with the assertion below and permits the rmdir. No test that asserts success
+// can falsify a predicate whose error is being too *permissive*. That direction
+// needs a refusal to assert against while an un-unlinked child is still there,
+// which is what `a_rmdir_counts_base_and_shadow_children_alike` owns.
+#[test]
+fn a_base_directory_whose_children_were_all_unlinked_rmdirs_as_empty() {
+    let mut f = Fixture::new(&[(b"d/a", b"a bytes"), (b"d/b", b"b bytes")]);
+    f.run(&unlink(b"d/a"));
+    f.run(&unlink(b"d/b"));
+    assert!(
+        f.overlay
+            .list(&root(b"d").unwrap(), None, 10)
+            .unwrap()
+            .entries
+            .is_empty(),
+        "the merged view is what the tracee can observe, and it is empty"
+    );
+    assert!(
+        f.base_root.join("d/a").is_file() && f.base_root.join("d/b").is_file(),
+        "the base still holds both, which is exactly why a base-shaped check fails"
+    );
+    f.run(&rmdir(b"d"));
+    let marker = Overlay::marker(&root(b"d").unwrap()).unwrap();
+    assert!(f
+        .control
+        .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+        .is_file());
+    assert!(f.base_root.join("d").is_dir());
+    assert!(f
+        .overlay
+        .list(&root(b"").unwrap(), None, 10)
+        .unwrap()
+        .entries
+        .is_empty());
+}
+
+// Case 3b, the other deciding test, and it points the opposite way: the base
+// directory is *non-empty and unmarked* underneath, and the rmdir must still
+// succeed, because the marker left standing by the earlier rmdir makes the
+// directory opaque and `merged` skips the base enumeration outright. A predicate
+// that consulted the base would refuse a directory the tracee has just observed
+// as empty.
+#[test]
+fn an_opaque_base_directory_rmdirs_on_its_shadow_contents_alone() {
+    let mut f = Fixture::new(&[(b"d/f", b"base bytes")]);
+    f.run(&unlink(b"d/f"));
+    f.run(&rmdir(b"d"));
+    // Written *after* the marker, so it carries no whiteout of its own and
+    // `Base::list` reports it. That is what makes this decisive: a predicate
+    // that consulted the base listing separately sees a non-empty directory and
+    // refuses. The merged view hides it either way -- the opaque-base gate skips
+    // the base enumeration outright, and `whiteouted`'s prefix scan would filter
+    // the name under the surviving marker regardless.
+    fs::write(f.base_root.join("d/late"), b"late bytes").unwrap();
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"d"),
+        mode: 0o755,
+    });
+    assert!(f.shadow_root.join("d").is_dir());
+    assert!(
+        f.overlay
+            .list(&root(b"d").unwrap(), None, 10)
+            .unwrap()
+            .entries
+            .is_empty(),
+        "the recreated directory is opaque: the base half is not enumerated at all"
+    );
+    // `set_whiteout` is idempotent, so re-marking the already-opaque directory
+    // is a no-op rather than a double create.
+    f.run(&rmdir(b"d"));
+    assert!(!f.shadow_root.join("d").exists());
+    let marker = Overlay::marker(&root(b"d").unwrap()).unwrap();
+    assert!(f
+        .control
+        .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+        .is_file());
+    assert!(f.base_root.join("d/late").is_file());
+}
+
+// Cases 3 and 4. One visible child is enough to refuse, wherever it lives, and
+// the refusal is a gate rather than a latch: remove the child and the retried
+// rmdir commits.
+#[test]
+fn a_rmdir_counts_base_and_shadow_children_alike() {
+    let mut f = Fixture::new(&[(b"baseonly/child", b"base"), (b"both/child", b"base")]);
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"shadowonly"),
+        mode: 0o755,
+    });
+    f.run(&create_open(b"shadowonly/child"));
+    // A base child copied into the shadow: visible through both halves at once,
+    // and the merged view must not double-count or miss it.
+    f.run(&open(
+        b"both/child",
+        OpenFlags {
+            read: true,
+            write: true,
+            ..Default::default()
+        },
+    ));
+    assert!(f.shadow_root.join("both/child").is_file());
+    for name in [&b"baseonly"[..], b"shadowonly", b"both"] {
+        let failure = f.overlay.resolve(&f.process, &rmdir(name)).unwrap_err();
+        assert_eq!(failure.kind, ErrorKind::Denied);
+        assert_eq!(failure.context, "rmdir target is not empty");
+        let child = [name, b"/child"].concat();
+        f.run(&unlink(&child));
+        f.run(&rmdir(name));
+        let marker = Overlay::marker(&root(name).unwrap()).unwrap();
+        assert!(f
+            .control
+            .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+            .is_file());
+        assert!(!f
+            .shadow_root
+            .join(std::ffi::OsStr::from_bytes(name))
+            .exists());
+    }
+    assert!(f
+        .overlay
+        .list(&root(b"").unwrap(), None, 10)
+        .unwrap()
+        .entries
+        .is_empty());
+}
+
+// Why the gate is at `resolve` and not at `prepare`, in the shape
+// `a_base_only_directory_chown_is_refused_before_anything_is_journaled`
+// established for `FsOp::Fchownat`. `prepare` appends and flushes the Unlink
+// intent before the arm bodies run, and any error after that poisons -- so a
+// prepare-time refusal would leave a durable record of an rmdir that never
+// happened, with neither Commit nor Abort, for what is an ordinary POSIX
+// outcome. Refusing at `resolve` costs the run nothing at all.
+#[test]
+fn a_non_empty_rmdir_is_refused_before_anything_is_journaled() {
+    let mut f = Fixture::new(&[]);
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"d"),
+        mode: 0o755,
+    });
+    f.run(&create_open(b"d/child"));
+    let before = f.log.lock().unwrap().records.len();
+    let failure = f.overlay.resolve(&f.process, &rmdir(b"d")).unwrap_err();
+    assert_eq!(failure.kind, ErrorKind::Denied);
+    assert_eq!(failure.context, "rmdir target is not empty");
+    assert_eq!(
+        f.log.lock().unwrap().records.len(),
+        before,
+        "a refusal at resolve journals nothing"
+    );
+    assert!(!f.overlay.poisoned);
+    assert!(f.overlay.pending.is_none());
+    let marker = Overlay::marker(&root(b"d").unwrap()).unwrap();
+    assert!(!f
+        .control
+        .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+        .exists());
+    assert!(f.shadow_root.join("d").is_dir());
+    // The session is still usable, which is the whole of the improvement over
+    // the refusal this replaced: that one ended the run.
+    assert_eq!(f.read(b"d/child").unwrap(), b"");
+    f.run(&unlink(b"d/child"));
+    f.run(&rmdir(b"d"));
+    assert!(!f.shadow_root.join("d").exists());
+}
+
+// The end-to-end pin the "Keep an existing directory whiteout as an opaque-base
+// marker" comment in `prepare`'s `FsOp::Mkdir` arm has never had. The marker
+// that survives the recreation is load-bearing in both directions: `lookup`
+// consults the shadow first, so the recreated directory outranks it and is
+// visible; `merged` consults it, so the base children stay hidden.
+#[test]
+fn rmdir_then_mkdir_keeps_the_marker_so_base_contents_stay_hidden() {
+    let mut f = Fixture::new(&[(b"d/old", b"base bytes")]);
+    f.run(&unlink(b"d/old"));
+    f.run(&rmdir(b"d"));
+    // As in `an_opaque_base_directory_rmdirs_on_its_shadow_contents_alone`: an
+    // unmarked base child, so the hiding below is the surviving marker's doing
+    // and not a per-name whiteout the unlink above left behind.
+    fs::write(f.base_root.join("d/hidden"), b"still on the host").unwrap();
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"d"),
+        mode: 0o755,
+    });
+    f.run(&create_open(b"d/new"));
+    assert_eq!(
+        f.overlay
+            .list(&root(b"d").unwrap(), None, 10)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.name.as_bytes().to_vec())
+            .collect::<Vec<_>>(),
+        vec![b"new".to_vec()],
+        "the recreated directory shows its own contents, not the base's"
+    );
+    assert_eq!(
+        f.overlay.resolve(&f.process, &stat(b"d/hidden")).unwrap(),
+        ResolvedAction::Deny(Errno::ENOENT)
+    );
+    let marker = Overlay::marker(&root(b"d").unwrap()).unwrap();
+    assert!(
+        f.control
+            .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+            .is_file(),
+        "the mkdir arm keeps the marker; consuming it would expose the base"
+    );
+    // The directory itself is reachable, so the marker hides the base without
+    // hiding the recreation.
+    assert_eq!(f.read(b"d/new").unwrap(), b"");
+    assert_eq!(
+        fs::read(f.base_root.join("d/hidden")).unwrap(),
+        b"still on the host"
+    );
+}
+
+// `merged`'s per-name whiteout filter, from the parent's side: the rmdir'd name
+// leaves the listing its parent answers, and its unrelated sibling does not.
+#[test]
+fn a_rmdir_removes_the_name_from_its_parents_merged_listing() {
+    let mut f = Fixture::new(&[(b"p/keep", b"base bytes")]);
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"p/gone"),
+        mode: 0o755,
+    });
+    let names = |f: &mut Fixture| {
+        f.overlay
+            .list(&root(b"p").unwrap(), None, 10)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.name.as_bytes().to_vec())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&mut f), vec![b"gone".to_vec(), b"keep".to_vec()]);
+    f.run(&rmdir(b"p/gone"));
+    assert_eq!(names(&mut f), vec![b"keep".to_vec()]);
+}
+
+// The poison mirror, directory-shaped. Sibling of
+// `an_unlink_prepare_destroys_nothing_before_commit`: the destruction is a plan,
+// and the phase that performs it is `commit`.
+#[test]
+fn an_rmdir_prepare_destroys_nothing_before_commit() {
+    let mut f = Fixture::new(&[]);
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"fresh"),
+        mode: 0o755,
+    });
+    let prepared = f.prepare(&rmdir(b"fresh"));
+    assert!(
+        f.shadow_root.join("fresh").is_dir(),
+        "prepare records a plan; it performs no destruction"
+    );
+    assert!(
+        !f.control.join("whiteouts").exists(),
+        "the marker is a commit-time effect too"
+    );
+    f.complete(prepared);
+    assert!(
+        !f.shadow_root.join("fresh").exists(),
+        "commit is where the destruction happens"
+    );
+}
+
+// Sibling of `a_refused_unlink_leaves_the_shadow_object_and_its_bytes_standing`,
+// and the reason the destruction had to be a plan: `Overlay::abort`'s gate is
+// corroboration alone, unchanged by this work, and a reconciled abort of an
+// rmdir must leave the directory and everything it was hiding exactly as it
+// found them. Both shapes are driven, because they lose different things: a
+// shadow-only directory has no second copy anywhere in the run, and a base
+// directory's children would be hidden by a marker that should never have been
+// written.
+#[test]
+fn a_refused_rmdir_leaves_the_directory_and_its_contents_standing() {
+    let mut f = Fixture::new(&[(b"d/a", b"base bytes")]);
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"fresh"),
+        mode: 0o755,
+    });
+    let prepared = f.prepare(&rmdir(b"fresh"));
+    f.observe_emulated_refusal(ENOSPC);
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    assert!(f.shadow_root.join("fresh").is_dir());
+    assert!(
+        !f.control.join("whiteouts").exists(),
+        "the whiteout is a commit-time plan a reconciled abort never applied"
+    );
+    // The base-backed half. `d` is empty in the merged view only because its one
+    // child is whiteouted, so the child's bytes are what a premature destroy or
+    // a prematurely written marker would take with it.
+    f.run(&unlink(b"d/a"));
+    let prepared = f.prepare(&rmdir(b"d"));
+    f.observe_emulated_refusal(ENOSPC);
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    assert!(f.base_root.join("d").is_dir());
+    assert_eq!(fs::read(f.base_root.join("d/a")).unwrap(), b"base bytes");
+    let marker = Overlay::marker(&root(b"d").unwrap()).unwrap();
+    assert!(
+        !f.control
+            .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+            .exists(),
+        "no marker on the directory: an aborted rmdir hides nothing"
+    );
+    // And the tracee's view is what it was: the directory is still listable, and
+    // `fresh` is still named by the root.
+    assert!(f
+        .overlay
+        .list(&root(b"d").unwrap(), None, 10)
+        .unwrap()
+        .entries
+        .is_empty());
+    assert_eq!(
+        f.overlay
+            .list(&root(b"").unwrap(), None, 10)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.name.as_bytes().to_vec())
+            .collect::<Vec<_>>(),
+        vec![b"d".to_vec(), b"fresh".to_vec()]
+    );
+}
+
+// The arm a real session's rmdir abort would take, and the corroboration gate
+// holding: `resolve` answers `Emulate(Success)`, `observe_result` refuses any
+// differing outcome, so the claimed errno cannot match the observed one and the
+// abort poisons. Sibling of
+// `an_uncorroborated_unlink_abort_poisons_and_still_destroys_nothing` -- and
+// poisoning is still not a licence to have destroyed something first.
+#[test]
+fn an_uncorroborated_rmdir_abort_poisons_and_still_destroys_nothing() {
+    let mut f = Fixture::new(&[]);
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"fresh"),
+        mode: 0o755,
+    });
+    let before = f.log.lock().unwrap().records.len();
+    let prepared = f.prepare(&rmdir(b"fresh"));
+    f.observe_emulated_refusal(EPERM);
+    let failure = f
+        .overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap_err();
+    assert_eq!(failure.kind, ErrorKind::InvalidState);
+    assert_eq!(failure.context, "aborted effects require reconciliation");
+    assert!(f.overlay.poisoned);
+    assert!(f.shadow_root.join("fresh").is_dir());
+    assert!(!f.control.join("whiteouts").exists());
+    // #53: every mutating abort journals its reason, poison arm included.
+    // Asserted by presence, not position -- the seeded outcome appends no
+    // `ObservedResult`, so these records are one shorter than production's.
+    let payloads = f.log.lock().unwrap().records[before..].to_vec();
+    assert!(payloads.iter().any(
+        |r| matches!(&r.payload, JournalPayload::Abort { reason } if reason.contains("KernelRefused"))
+    ));
+    assert!(
+        !payloads
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Commit)),
+        "a poisoned rmdir must not commit"
+    );
+}
+
+// The `Destroy::Directory` arm's own failure, and the marker-before-destroy
+// ordering it inherits. Sibling of
+// `an_unlink_commit_that_cannot_unlink_the_object_poisons_with_the_backends_own_kind`,
+// with `fail_remove_directory` flipped after `prepare` for the same reason.
+//
+// The residue is where the file argument stops transferring, and this asserts
+// the difference rather than the likeness. For a file, marker-first leaves the
+// pre-transaction view: the shadow object outranks its own whiteout in `lookup`,
+// and a file has no contents for the marker to suppress. For a directory the
+// marker also makes `merged` skip the base half, so what recovery finds is "the
+// directory is still there, but its base children are hidden" -- not the
+// pre-transaction view. The order is still right: reversing it would let a
+// *successful* destroy followed by a failed `set_whiteout` expose the entire
+// base directory at a path the tracee was told it had removed, and lying to a
+// live tracee beats an imperfect residue in an already-poisoned session whose
+// only reader is recovery.
+#[test]
+fn an_rmdir_commit_that_cannot_remove_the_directory_poisons_with_the_backends_own_kind() {
+    let failure = RemoveDirectoryFailure::default();
+    let mut f = Fixture::build(
+        &[(b"d/f", b"base bytes")],
+        Setup {
+            fail_remove_directory: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    f.run(&unlink(b"d/f"));
+    // A shadow `d` over the base `d`, so there is something for the destroy to
+    // fail on and base children for the marker to hide.
+    f.run(&create_open(b"d/tmp"));
+    f.run(&unlink(b"d/tmp"));
+    assert!(f.shadow_root.join("d").is_dir());
+    let prepared = f.prepare(&rmdir(b"d"));
+    let id = prepared.operation_id;
+    f.overlay
+        .observe_result(id, &OperationOutcome::Success { return_value: 0 })
+        .unwrap();
+    // Flipped after `prepare` -- which destroys nothing now -- so only the
+    // commit-time removal is refused.
+    *failure.lock().unwrap() = Some(ErrorKind::Io);
+    assert_eq!(
+        f.overlay.commit(id).unwrap_err().kind,
+        ErrorKind::Io,
+        "a failed destruction reports the backend's error, not the engine's"
+    );
+    assert!(f.overlay.poisoned);
+    assert!(
+        f.shadow_root.join("d").is_dir(),
+        "the directory the destruction could not remove is what recovery finds"
+    );
+    let marker = Overlay::marker(&root(b"d").unwrap()).unwrap();
+    assert!(
+        f.control
+            .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+            .is_file(),
+        "the marker went first, and for a directory that means the base children \
+         are hidden while the directory itself still stands"
+    );
+    assert!(f.base_root.join("d/f").is_file());
 }

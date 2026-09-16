@@ -56,8 +56,14 @@ new resolutions are blocked while a transaction is pending.
   Truncation is performed by the prepared shadow open. Copy-up preserves file
   bytes and requests the base permission bits; exact metadata preservation across
   umask, owner/group, timestamps, ACLs and xattrs needs richer backend support.
-- Unlink removes an existing shadow file through Storage and prepares a base
-  whiteout, including for base-only files. Recreation clears its exact whiteout.
+- Unlink removes an existing shadow object through Storage and prepares a base
+  whiteout, including for base-only targets. `rmdir` is the same operation with
+  `directory: true`; it is refused with `Denied` unless the merged view of the
+  directory is empty, and `commit` removes it with `remove_directory` rather than
+  `unlink`. Recreating a file or a symlink clears its exact whiteout. Recreating
+  a directory deliberately does not: `prepare`'s `FsOp::Mkdir` arm keeps the
+  surviving marker as an opaque-base marker, so the recreated directory is
+  visible and the base contents underneath it stay hidden.
 - `FsOp::Access` is a read-through probe of the merged namespace: it rewrites to
   the shadow object when one exists and to the base otherwise, and it never
   copies up, not even for a `W_OK` probe. Nothing is journaled, because a probe
@@ -407,10 +413,51 @@ destruction that
 fails leaves the path visible and the object standing for recovery, where the
 other order would resurrect a base object at a path the tracee was told is
 deleted; and the index goes before the placeholder because its name is derived
-from a live stat of the placeholder. What is left to settle is the dispatch
-class: if `Unlink` is later wired as a `Rewrite`, with the *kernel* performing the
-shadow unlink between `prepare` and `commit`, then `commit`'s destruction must
-become conditional on the class the engine itself performs, and
+from a live stat of the placeholder. The directory half of the class is settled
+too ([#77](https://github.com/invakid404/umbra/issues/77)): `rmdir` used to be
+refused outright as "awaiting backend directory removal support", a premise that
+had been false since [#64](https://github.com/invakid404/umbra/issues/64) gave
+`LocalStorage` its `RemoveDirectory` arm — `abort` had been calling
+`storage.remove_directory` on the reconcile path throughout. A directory `Unlink`
+is `Dispatch::Whiteout` like a file one and inherits the plan shape verbatim;
+`Pending.destroy` carries a `Destroy::File`/`Destroy::Directory` discriminant so
+`commit` dispatches `unlink` or `remove_directory` without re-statting, and the
+`Directory` arm skips `remove_symlink_index` because a directory's object ID never
+keys a `symlinks/objects/` entry. One `Option<Destroy>` rather than a second
+field, so "both set" — a silent double-destroy of two paths in one transaction —
+is unrepresentable rather than merely documented. The commit-side order is the
+same, but its *residue* argument is not, and the comment there says so: a failed
+`remove_directory` leaves the directory standing while the marker already written
+makes `merged` skip the base half, so recovery finds "still there, but its base
+children hidden" rather than the pre-transaction view. The order stays anyway,
+because reversing it would let a successful destroy followed by a failed
+`set_whiteout` expose the entire base directory at a path the tracee was told it
+had removed. The only directory-specific addition is an emptiness gate, and it is
+taken at `resolve` against the **merged** view, not the shadow half and not the
+base half. Two cases point opposite ways and rule out consulting the base listing
+separately: a base directory whose children were all unlinked in-run is empty
+although `Base::list` still reports them, and an opaque recreated directory is
+empty although the base is full. A third rules out the other cheap predicate in
+the other direction — a shadow-half-only check calls a base-only directory
+vacuously empty and would let any base directory be `rmdir`ed whatever it holds,
+which is the permissive failure only a test asserting a *refusal* can catch.
+Only one implementation of the merged view knows all three rules, and it is the
+one `ReadDir` answers the tracee from. The gate refuses with
+`Err(ErrorKind::Denied)`, joining the sibling POSIX refusals in the same function,
+rather than `Emulate(Failure(ENOTEMPTY))`: the supervisor refuses an `Emulate`
+only *after* `prepare` has journaled, so a failure-shaped emulation would leave a
+dangling `Prepare` for an rmdir that never happened, and the engine has no view of
+the tracee ABI, where `ENOTEMPTY` is 39 on Linux and 66 on macOS/BSD. Upgrading it
+to `ResolvedAction::Deny(Errno::ENOTEMPTY)` waits on an ABI-owned errno channel;
+`events.rs` already handles `Deny` generically, before an `OperationId` is minted
+and with no journal record. The gate also pays a full enumeration to answer a
+one-entry question, which is the cost `ReadDir` already pays through the same
+function rather than a new one; narrowing it wants an entry limit honoured
+*inside* `merged`, not an early-out at the call site, and is likewise left as a
+follow-up. What is left to settle is the dispatch class: if
+`Unlink` is later wired as a `Rewrite`, with the *kernel* performing the shadow
+unlink between `prepare` and `commit`, then `commit`'s destruction must become
+conditional on the class the engine itself performs, and
 `an_unlink_prepare_destroys_nothing_before_commit` will not catch that — it pins
 that `prepare` destroys nothing, not who destroys it. Deferring also rests on a
 precondition this crate cannot enforce: `commit` runs *before* the tracee is
@@ -511,7 +558,7 @@ Physical rewrites assume a trusted immutable base and serialized namespace;
 race-proof native dirfd execution still needs platform qualification. The existing
 refusal to reopen nonempty journals also applies to symlink transactions.
 
-Directory subtree rename/rmdir, hard links, metadata mutations, pathless native
+Directory subtree rename, hard links, metadata mutations, pathless native
 read/write emulation, descriptor duplication/close/reuse bookkeeping, renamed or
 unlinked directory handles, and restart recovery fail explicitly or require future
 caller integration. Directory streams must not reuse a tracked fd/object identity
@@ -525,7 +572,12 @@ shadow runs, with no NFS or fixture environment variables. They exercise copy-up
 shadow/stat precedence, create parents, the mode a materialised shadow ancestor
 takes from its base counterpart — including a read-only base directory, whose
 owner bits must be widened or the run would be poisoned — whiteouts and
-recreation, merged snapshot pages,
+recreation, `rmdir` across the shapes the merged-view emptiness gate has to tell
+apart — shadow-only, base-only, a base directory whose children were all
+unlinked, and an opaque recreated one whose base counterpart is still full — the
+directory whiteout that survives a recreation so the base contents stay hidden,
+and the abort and commit-failure mirrors that pin a directory destroy as a
+commit-time plan, merged snapshot pages,
 native-encoder continuation, rename journal grouping, containment, non-UTF-8
 bytes, logical symlink creation/readlink/traversal, absolute and relative targets,
 loop bounds, symlink escape and unchecked physical-link rejection, rename identity,
