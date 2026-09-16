@@ -365,10 +365,11 @@ arm but a corroborated live base directory fails closed. So a refused `rename`
 onto a base-only destination parent reconciles, while one that had to invent a
 destination directory still poisons.
 
-Commit-time effects are never applied by `abort`: `pending.whiteouts` and
-`retired_index` are consumed in `commit` alone, so a reconciled `rename` sets no
-whiteout and retires no symlink index. That is a property of this engine rather
-than an end-to-end guarantee, because most of the class cannot reach a kernel
+Commit-time effects are never applied by `abort`: `pending.whiteouts`,
+`retired_index` and `destroy` are consumed in `commit` alone, so a reconciled
+`rename` sets no whiteout and retires no symlink index, and a reconciled `unlink`
+destroys nothing. That is a property of this engine rather than an end-to-end
+guarantee, because most of the class cannot reach a kernel
 refusal at all yet. `FsOp::Unlink` — the whole `Whiteout` half — and also
 `FsOp::Symlink`, `FsOp::Mkdir` and a same-path `rename` resolve to `Emulate`, and
 `observe_result` refuses an outcome that differs from the emulated one; a
@@ -378,13 +379,45 @@ syscall exit — a fact owned by that crate, not this one. The reachable surface
 today is a write-mode `Open` and `FsOp::Fchownat`. The behaviour is keyed on the
 dispatch class, not on a variant list, so the rest of the class inherits it as
 those paths are wired — with two caveats to settle first. `Unlink`'s `prepare`
-*destroys* the shadow object outright, so a `Whiteout`-class refusal reaching
-`abort` would reconcile after discarding shadow-only data: the mirror image of the
-creation case, and a real gap in the gate rather than a question of wiring. That
-gap is unchanged by #69 — that arm never latched either, so retiring
-`Pending.created` lost it no defence — and it is a *restore* problem rather than a
-rollback-entry one: whatever closes it wants its own honestly-named
-destroyed-state flag, not a revived creation latch. `FsOp::Link` is a different
+used to *destroy* the shadow object outright, which made it the one
+`Whiteout`-class transaction carrying an effect outside `commit`: any abort of one
+arrived after shadow-only data was already discarded. An abort was the better case
+and not the reachable one, which is worth stating plainly because it makes the fix
+larger rather than smaller. The supervisor's entry path refuses an `Emulate` only
+*after* `prepare` has run, so every intercepted `unlink(2)` reached `prepare` and
+abandoned the run into recovery — `pending` still set, a dangling `Prepare` record,
+and no `Abort` record to describe any of it — and every one whose target had been
+materialised in the shadow had it destroyed on the way. Both destructive steps sat
+behind `shadow_stat(path).is_some()`, so a base-only target lost nothing and still
+ended the run. That is closed
+([#66](https://github.com/invakid404/umbra/issues/66)), and closed structurally
+rather than defended. `prepare` records the removal as `Pending.destroy` and
+`commit` performs it — the backing symlink index first, then the object — between
+the whiteout markers and the flush, so the whole `Whiteout` class is now
+plan-shaped, and `abort` restores nothing because nothing was destroyed. Neither
+half of the remedy this section used to predict was built, and for separate
+reasons. No destroyed-state flag: a flag no arm sets is the dead latch #69
+removed. And no restore either, which is the more interesting half — a shadow-only
+object's bytes exist nowhere else in the run, and even a byte-exact restore would
+re-`create` the object and hand the tracee a *new* backend object ID for a syscall
+it was told had failed, which is a quieter divergence than the one it repairs. See
+`Pending.destroy`, which carries that argument in full. The commit-side order is
+load-bearing in both directions — a shadow object outranks its own whiteout, so a
+destruction that
+fails leaves the path visible and the object standing for recovery, where the
+other order would resurrect a base object at a path the tracee was told is
+deleted; and the index goes before the placeholder because its name is derived
+from a live stat of the placeholder. What is left to settle is the dispatch
+class: if `Unlink` is later wired as a `Rewrite`, with the *kernel* performing the
+shadow unlink between `prepare` and `commit`, then `commit`'s destruction must
+become conditional on the class the engine itself performs, and
+`an_unlink_prepare_destroys_nothing_before_commit` will not catch that — it pins
+that `prepare` destroys nothing, not who destroys it. Deferring also rests on a
+precondition this crate cannot enforce: `commit` runs *before* the tracee is
+resumed, as `umbra-supervisor`'s `events.rs` does today by observing, committing
+and only then resuming. A supervisor that ever resumed first would have to revisit
+this, because a tracee could then observe the path still present after being told
+its `unlink` succeeded. `FsOp::Link` is a different
 shape — `resolve` refuses it as beyond-MVP, so `prepare` is never entered for it
 and the `_ => {}` arm it would fall to materialises nothing; when it *is* wired it
 will need an arm of its own doing `copy_up` of the source and `parents` of the

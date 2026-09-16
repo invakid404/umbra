@@ -532,9 +532,13 @@ impl Fixture {
     /// `JournalPayload::ObservedResult` record for a mutating plan, so a test
     /// that used this and then asserted on journal *shape* would see one record
     /// fewer than production and would be asserting a sequence the engine never
-    /// emits. Nothing does that today -- the tests using this assert on
-    /// `poisoned`, error kinds and the shadow tree. Extend this helper to
-    /// `record(..)` before adding the first such assertion rather than
+    /// emits. Nothing does that today. Most callers assert on `poisoned`, error
+    /// kinds and the shadow tree;
+    /// `an_uncorroborated_unlink_abort_poisons_and_still_destroys_nothing` also
+    /// reads `f.log`, but for record *content* only -- that an `Abort` naming
+    /// `KernelRefused` is present, and that no `Commit` is -- and a missing
+    /// `ObservedResult` can falsify neither. Extend this helper to `record(..)`
+    /// before adding the first assertion on journal shape rather than
     /// discovering the gap from a confusing diff.
     fn observe_emulated_refusal(&mut self, errno: Errno) {
         self.overlay.pending.as_mut().unwrap().outcome = Some(OperationOutcome::Failure(errno));
@@ -3133,6 +3137,400 @@ fn a_refused_mkdir_rolls_back_the_directory_it_created() {
     assert_eq!(
         f.read(b"newdir/made").unwrap_err().kind,
         ErrorKind::NotFound
+    );
+}
+
+// The `FsOp::Unlink` destroy-gap (#66), from both directions. `prepare` used to
+// call `remove_symlink_index` and `storage.unlink` inline, which made an
+// `Unlink` the one `Whiteout`-class transaction carrying an effect outside
+// `commit`: an abort of it -- reconciling or poisoning -- arrived after the
+// shadow object was already gone, and shadow-only bytes have no second copy
+// anywhere in the run. Nor was an abort the reachable path: the supervisor
+// refuses an `Emulate` only after `prepare` has run, so an intercepted
+// `unlink(2)` abandoned the run into recovery, taking any shadow object its
+// target had with it. The destruction is a `Pending.destroy` plan now,
+// performed in `commit` beside the whiteout it belongs to.
+//
+// Honest about reachability, in the same idiom as the `Mkdir` arm above:
+// `resolve` answers `Emulate` for `Unlink`, so the supervisor's `syscall_exit`
+// never drives a `KernelRefused` abort here -- see `observe_emulated_refusal`,
+// which is why the outcome is seeded rather than observed, and why
+// `kernel_refusal.rs` carries no sibling for any of this. `Overlay::abort` and
+// `Overlay::commit` are namespace APIs this suite calls directly, so the rule is
+// pinned at the layer that owns it. None of these assert on journal *shape*,
+// which the seeding helper cannot reproduce.
+#[test]
+fn a_refused_unlink_leaves_the_shadow_object_and_its_bytes_standing() {
+    let mut f = Fixture::new(&[]);
+    // Shadow-only, created in-run: its bytes exist nowhere else. A copied-up base
+    // file would have left the base as a second copy and made the assertion below
+    // pass for a reason that has nothing to do with the gap.
+    f.run(&open(
+        b"fresh",
+        OpenFlags {
+            write: true,
+            create: true,
+            ..Default::default()
+        },
+    ));
+    fs::write(f.shadow_root.join("fresh"), b"shadow only").unwrap();
+    let prepared = f.prepare(&unlink(b"fresh"));
+    assert!(f.shadow_root.join("fresh").exists());
+    f.observe_emulated_refusal(ENOSPC);
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    // Asserted at the filesystem, not at the engine's view of it: the object is
+    // there and so are its bytes. Before the destruction moved into `commit`
+    // this read failed outright.
+    assert_eq!(
+        fs::read(f.shadow_root.join("fresh")).unwrap(),
+        b"shadow only"
+    );
+    assert_eq!(f.read(b"fresh").unwrap(), b"shadow only");
+    assert!(
+        !f.control.join("whiteouts").exists(),
+        "the whiteout is a commit-time plan a reconciled abort never applied"
+    );
+}
+
+#[test]
+fn a_refused_unlink_of_a_logical_symlink_leaves_the_link_readable() {
+    let mut f = Fixture::new(&[]);
+    f.run(&symlink(b"link", b"/target"));
+    let indexes = f.control.join("symlinks/objects");
+    let count = |dir: &PathBuf| fs::read_dir(dir).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(count(&indexes), 1, "the link has a backing index to lose");
+    let prepared = f.prepare(&unlink(b"link"));
+    f.observe_emulated_refusal(ENOSPC);
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    // The index is the half a fix that deferred only the object unlink would
+    // miss: without it the placeholder reads back as an ordinary empty `0o444`
+    // file rather than as a logical symlink.
+    assert_eq!(count(&indexes), 1);
+    assert!(f.shadow_root.join("link").exists());
+    assert_eq!(
+        f.overlay.read_link(&root(b"link").unwrap()).unwrap(),
+        bytes(b"/target")
+    );
+}
+
+// The invariant `Pending.unreconcilable` was specified for and then not shipped:
+// no `prepare` arm performs an irreversible effect, so no arm would have set it,
+// and a flag no arm sets is the dead latch #69 removed. This is the compiler
+// behind that sentence, and it deliberately spans both sides of the transaction
+// so it cannot pass by the work having been deleted rather than deferred.
+#[test]
+fn an_unlink_prepare_destroys_nothing_before_commit() {
+    let unlinks = Unlinks::default();
+    let mut f = Fixture::build(
+        &[],
+        Setup {
+            unlinks: Some(unlinks.clone()),
+            ..Setup::default()
+        },
+    );
+    f.run(&open(
+        b"fresh",
+        OpenFlags {
+            write: true,
+            create: true,
+            ..Default::default()
+        },
+    ));
+    // Cleared after the setup, so only the unlink transaction's own requests are
+    // under assertion.
+    unlinks.lock().unwrap().clear();
+    let prepared = f.prepare(&unlink(b"fresh"));
+    assert!(
+        unlinks.lock().unwrap().is_empty(),
+        "prepare records a plan; it performs no destruction"
+    );
+    assert!(f.shadow_root.join("fresh").exists());
+    f.complete(prepared);
+    assert_eq!(
+        unlinks.lock().unwrap().len(),
+        1,
+        "commit is where the destruction happens"
+    );
+    assert!(!f.shadow_root.join("fresh").exists());
+}
+
+// The anti-regression for the happy path: deferring is not forgetting. If the
+// plan ever stopped being consumed, every assertion here flips.
+#[test]
+fn the_unlink_commit_still_removes_the_object_the_index_and_sets_the_whiteout() {
+    let mut f = Fixture::new(&[]);
+    f.run(&open(
+        b"fresh",
+        OpenFlags {
+            write: true,
+            create: true,
+            ..Default::default()
+        },
+    ));
+    f.run(&unlink(b"fresh"));
+    assert!(!f.shadow_root.join("fresh").exists());
+    let marker = Overlay::marker(&root(b"fresh").unwrap()).unwrap();
+    assert!(f
+        .control
+        .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+        .is_file());
+    assert_eq!(f.read(b"fresh").unwrap_err().kind, ErrorKind::NotFound);
+
+    let mut f = Fixture::new(&[]);
+    f.run(&symlink(b"link", b"/target"));
+    let indexes = f.control.join("symlinks/objects");
+    let count = |dir: &PathBuf| fs::read_dir(dir).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(count(&indexes), 1);
+    f.run(&unlink(b"link"));
+    assert!(!f.shadow_root.join("link").exists());
+    assert_eq!(count(&indexes), 0, "the index goes with the placeholder");
+    let marker = Overlay::marker(&root(b"link").unwrap()).unwrap();
+    assert!(f
+        .control
+        .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+        .is_file());
+    assert_eq!(
+        f.overlay
+            .read_link(&root(b"link").unwrap())
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+}
+
+// Reconciling leaves no half-state behind: no stale `destroy`, no stale whiteout
+// plan, no consumed operation slot. The retry is the proof, in the idiom case (a)
+// ends on.
+#[test]
+fn a_reconciled_unlink_leaves_the_session_usable_and_the_retried_unlink_commits() {
+    let mut f = Fixture::new(&[]);
+    f.run(&open(
+        b"fresh",
+        OpenFlags {
+            write: true,
+            create: true,
+            ..Default::default()
+        },
+    ));
+    fs::write(f.shadow_root.join("fresh"), b"shadow only").unwrap();
+    let prepared = f.prepare(&unlink(b"fresh"));
+    f.observe_emulated_refusal(ENOSPC);
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    assert_eq!(f.read(b"fresh").unwrap(), b"shadow only");
+    let retried = f.prepare(&unlink(b"fresh"));
+    f.complete(retried);
+    assert!(!f.shadow_root.join("fresh").exists());
+    assert_eq!(f.read(b"fresh").unwrap_err().kind, ErrorKind::NotFound);
+}
+
+// The poison mirror. Moving the removal into `commit` does not make the
+// transaction infallible -- it makes it atomic in the direction that matters. A
+// commit-time destruction that fails still poisons, and the residue is the one
+// recovery can act on: the object is still standing.
+#[test]
+fn an_unlink_commit_that_cannot_unlink_the_object_poisons_with_the_backends_own_kind() {
+    let failure = UnlinkFailure::default();
+    let mut f = Fixture::build(
+        &[],
+        Setup {
+            fail_unlink: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    f.run(&open(
+        b"fresh",
+        OpenFlags {
+            write: true,
+            create: true,
+            ..Default::default()
+        },
+    ));
+    fs::write(f.shadow_root.join("fresh"), b"shadow only").unwrap();
+    let prepared = f.prepare(&unlink(b"fresh"));
+    let id = prepared.operation_id;
+    f.overlay
+        .observe_result(id, &OperationOutcome::Success { return_value: 0 })
+        .unwrap();
+    // Flipped after `prepare` -- which destroys nothing now -- so only the
+    // commit-time removal is refused.
+    *failure.lock().unwrap() = Some((ErrorKind::Io, StorageAnchor::Root, b"fresh".to_vec()));
+    assert_eq!(
+        f.overlay.commit(id).unwrap_err().kind,
+        ErrorKind::Io,
+        "a failed destruction reports the backend's error, not the engine's"
+    );
+    assert!(f.overlay.poisoned);
+    assert_eq!(
+        fs::read(f.shadow_root.join("fresh")).unwrap(),
+        b"shadow only",
+        "the object the destruction could not remove is what recovery finds"
+    );
+    // The marker went first and is inert while the object stands: a shadow
+    // object outranks its own whiteout, so the residue is the pre-transaction
+    // view rather than a base object resurfacing at a path claimed deleted.
+    let marker = Overlay::marker(&root(b"fresh").unwrap()).unwrap();
+    assert!(f
+        .control
+        .join(std::ffi::OsStr::from_bytes(marker.as_bytes()))
+        .is_file());
+}
+
+// #69's ordering rule, transcribed into `commit` and pinned there: the index name
+// is derived from a live `shadow_stat` of the placeholder, so an index-first
+// failure strands nothing. The sibling in spirit of
+// `a_symlink_rollback_that_cannot_unlink_the_placeholder_poisons`, one phase over.
+#[test]
+fn an_unlink_commit_that_cannot_remove_the_symlink_index_poisons_before_the_placeholder_goes() {
+    let failure = UnlinkFailure::default();
+    let mut f = Fixture::build(
+        &[],
+        Setup {
+            fail_unlink: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    f.run(&symlink(b"link", b"/target"));
+    let prepared = f.prepare(&unlink(b"link"));
+    let id = prepared.operation_id;
+    f.overlay
+        .observe_result(id, &OperationOutcome::Success { return_value: 0 })
+        .unwrap();
+    // By prefix because the index's name is the backend object ID this test never
+    // sees -- the same handle the rollback siblings use.
+    *failure.lock().unwrap() = Some((
+        ErrorKind::Io,
+        StorageAnchor::Control,
+        b"symlinks/objects/".to_vec(),
+    ));
+    assert_eq!(f.overlay.commit(id).unwrap_err().kind, ErrorKind::Io);
+    assert!(f.overlay.poisoned);
+    assert_eq!(
+        fs::read_dir(f.control.join("symlinks/objects"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert!(
+        f.shadow_root.join("link").exists(),
+        "index-first means a failure there removes nothing, so the residue is a \
+         live logical symlink rather than an index nothing can re-derive"
+    );
+}
+
+// The other half of the gate, and the arm an `Unlink` actually takes today:
+// `resolve` answers `Emulate(Success)` for it, `observe_result` refuses any
+// outcome differing from the emulated one, so a real session's abort can only be
+// uncorroborated. Before this change that arm destroyed first and poisoned
+// second; this is the test that would have failed.
+#[test]
+fn an_uncorroborated_unlink_abort_poisons_and_still_destroys_nothing() {
+    let mut f = Fixture::new(&[]);
+    f.run(&open(
+        b"fresh",
+        OpenFlags {
+            write: true,
+            create: true,
+            ..Default::default()
+        },
+    ));
+    fs::write(f.shadow_root.join("fresh"), b"shadow only").unwrap();
+    let before = f.log.lock().unwrap().records.len();
+    let prepared = f.prepare(&unlink(b"fresh"));
+    f.observe_emulated_refusal(EPERM);
+    let failure = f
+        .overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap_err();
+    assert_eq!(failure.kind, ErrorKind::InvalidState);
+    assert_eq!(failure.context, "aborted effects require reconciliation");
+    assert!(f.overlay.poisoned);
+    assert_eq!(
+        fs::read(f.shadow_root.join("fresh")).unwrap(),
+        b"shadow only",
+        "poisoning is not a licence to have destroyed something first"
+    );
+    assert!(!f.control.join("whiteouts").exists());
+    // #53's guarantee: every mutating abort journals its reason, poison arm
+    // included. Asserted by presence rather than by position -- the seeded
+    // outcome appends no `ObservedResult`, so this suite's records are one
+    // shorter here than production's.
+    let payloads = f.log.lock().unwrap().records[before..].to_vec();
+    assert!(payloads.iter().any(
+        |r| matches!(&r.payload, JournalPayload::Abort { reason } if reason.contains("KernelRefused"))
+    ));
+    assert!(
+        !payloads
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Commit)),
+        "a poisoned unlink must not commit"
+    );
+}
+
+// The residue-ordering claim of the arm, pinned against the recorder in the idiom
+// `the_symlink_undo_unlinks_the_index_before_the_blob_and_the_placeholder`
+// established. It needs the refusal as a stop rather than reading a successful
+// run: the marker is a `Create` and the destruction an `Unlink`, so the two logs
+// share no clock and a run in which both succeed is identical under either order.
+// `Recorder` records the request and refuses it before delegating, and the
+// closure returns at that point, so the creates below are exactly the ones that
+// ran before the removal was attempted.
+#[test]
+fn the_unlink_commit_writes_the_whiteout_marker_before_it_removes_the_object() {
+    let creates = Creates::default();
+    let unlinks = Unlinks::default();
+    let failure = UnlinkFailure::default();
+    let mut f = Fixture::build(
+        &[],
+        Setup {
+            creates: Some(creates.clone()),
+            unlinks: Some(unlinks.clone()),
+            fail_unlink: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    f.run(&open(
+        b"fresh",
+        OpenFlags {
+            write: true,
+            create: true,
+            ..Default::default()
+        },
+    ));
+    creates.lock().unwrap().clear();
+    unlinks.lock().unwrap().clear();
+    let prepared = f.prepare(&unlink(b"fresh"));
+    let id = prepared.operation_id;
+    f.overlay
+        .observe_result(id, &OperationOutcome::Success { return_value: 0 })
+        .unwrap();
+    *failure.lock().unwrap() = Some((ErrorKind::Io, StorageAnchor::Root, b"fresh".to_vec()));
+    assert_eq!(f.overlay.commit(id).unwrap_err().kind, ErrorKind::Io);
+    let unlinks = unlinks.lock().unwrap();
+    let paths: Vec<_> = unlinks.iter().map(|(path, _)| path.clone()).collect();
+    assert_eq!(
+        paths.as_slice(),
+        [root(b"fresh").unwrap()],
+        "the destruction was attempted, and it is the only unlink the commit issues"
+    );
+    let marker = Overlay::marker(&root(b"fresh").unwrap()).unwrap();
+    assert!(
+        creates
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path == &marker),
+        "the marker was already written when the removal was attempted; under the \
+         other order the removal would have been refused first and this create \
+         would never have run"
     );
 }
 
