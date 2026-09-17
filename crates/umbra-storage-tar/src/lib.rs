@@ -251,9 +251,18 @@ impl Storage for TarStorage {
             // writes uid/gid straight into the node, `archive::header` writes
             // them into the tar header, and there is no kernel in the path to
             // refuse a chown for want of privilege.
-            features: [umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned()]
-                .into_iter()
-                .collect(),
+            //
+            // It also qualifies parent-identity, and unconditionally for the
+            // same reason: `archive::new_node` copies the parent node's uid/gid
+            // pair onto every new node (`operations::owner`), so an object's
+            // created identity *is* its parent directory's, with no kernel and
+            // no setgid analogue to make it otherwise.
+            features: [
+                umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned(),
+                umbra_core::capabilities::STORAGE_PARENT_IDENTITY_V1.to_owned(),
+            ]
+            .into_iter()
+            .collect(),
             durability: Durability::Local,
             strict_remote_persistence: false,
             fencing: Fencing::ConfirmedTermination,
@@ -733,6 +742,94 @@ mod tests {
                 .iter()
                 .all(|(_, uid, gid)| (*uid, *gid) == (4242, 99)),
             "the carried ownership is what the header writer emits: {owners:?}"
+        );
+    }
+    /// The advertisement half of #84: tar promises that a new object takes its
+    /// parent directory's identity, which is what lets the overlay read a
+    /// materialised shadow parent instead of the shadow root when it predicts
+    /// whether an unchanged-ID chown will carry. Mirrors the ownership-fidelity
+    /// assertion above; the behaviour behind the name is pinned by
+    /// `a_new_node_takes_its_parent_directory_identity_rather_than_the_anchor_owner`.
+    #[test]
+    fn tar_advertises_parent_identity_inheritance() {
+        let temp = tempfile::tempdir().unwrap();
+        let s = TarStorage::new(TarStorageConfig::new(temp.path().join("run.tar")));
+        assert!(
+            s.capabilities()
+                .features
+                .contains(umbra_core::capabilities::STORAGE_PARENT_IDENTITY_V1),
+            "tar inherits the parent node's uid/gid unconditionally, so it \
+             qualifies parent-identity with no kernel and no privilege"
+        );
+    }
+    /// The behaviour the advertisement stands for, and the reason `ANCHOR_OWNER`
+    /// is a two-root seed rather than the create rule: a new node takes its
+    /// parent directory's identity, so once a directory has been chowned away
+    /// from `(0, 0)` its children are created wearing the new owner, not the
+    /// anchor's. Asserted in prose at `archive.rs` and by the ownership test
+    /// above as a side effect; pinned here directly and in isolation.
+    #[test]
+    fn a_new_node_takes_its_parent_directory_identity_rather_than_the_anchor_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut s = TarStorage::new(TarStorageConfig::new(temp.path().join("run.tar")));
+        let req = request();
+        s.open_run(&req).unwrap();
+        let lease = s.acquire_writer(&writer(req.run_id)).unwrap();
+        let path = |bytes: &[u8]| StoragePath::new(StorageAnchor::Root, bytes.to_vec()).unwrap();
+        let directory = CreateOptions {
+            kind: CreateKind::Directory,
+            mode: 0o755,
+        };
+        let file = CreateOptions {
+            kind: CreateKind::File,
+            mode: 0o600,
+        };
+
+        // A child created under a pristine directory inherits the anchor's
+        // (0, 0), because that is what its parent still wears -- the seed
+        // propagating, not a hardcoded create rule.
+        s.create(&ctx(&lease), &path(b"seeded"), &directory)
+            .unwrap();
+        s.create(&ctx(&lease), &path(b"seeded/child"), &file)
+            .unwrap();
+        let seeded_child = s.stat(&ctx(&lease), &path(b"seeded/child")).unwrap();
+        assert_eq!(
+            (seeded_child.uid, seeded_child.gid),
+            archive::ANCHOR_OWNER,
+            "under a pristine parent the inherited identity happens to equal the anchor seed"
+        );
+
+        // Chown the directory away from the seed, then create a child. The
+        // child takes the directory's new identity, not `ANCHOR_OWNER`, which
+        // is the whole point: identity comes from the parent, and the anchor
+        // owner only seeds the roots.
+        s.execute(&StorageRequest {
+            context: ctx(&lease),
+            operation: StorageOperation::SetMetadata {
+                path: path(b"seeded"),
+                update: MetadataUpdate {
+                    mode: None,
+                    uid: Some(4242),
+                    gid: Some(99),
+                    accessed_nanos: None,
+                    modified_nanos: None,
+                },
+            },
+        })
+        .unwrap();
+        s.create(&ctx(&lease), &path(b"seeded/carried"), &file)
+            .unwrap();
+        let carried = s.stat(&ctx(&lease), &path(b"seeded/carried")).unwrap();
+        assert_eq!(
+            (carried.uid, carried.gid),
+            (4242, 99),
+            "a new node takes its parent directory's identity, not the anchor owner"
+        );
+        assert_ne!(
+            (carried.uid, carried.gid),
+            archive::ANCHOR_OWNER,
+            "and the anchor owner is precisely what it is *not* -- ANCHOR_OWNER \
+             seeds the roots, it is not the create rule"
         );
     }
     #[test]

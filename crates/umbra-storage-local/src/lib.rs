@@ -444,22 +444,32 @@ fn check_io(offset: u64, len: usize) -> Result<()> {
 
 impl Storage for LocalStorage {
     fn capabilities(&self) -> StorageCapabilities {
+        // Explicitly a development store: it advertises the local mode and
+        // the narrow rewrite surface, and nothing about remote durability.
+        // `STORAGE_OWNERSHIP_FIDELITY_V1` is qualified by the `SetMetadata`
+        // arm above and by `metadata`, which has read `uid`/`gid` back since
+        // this backend was written. What the flag promises is that the
+        // uid/gid a caller names are applied and a refusal is reported, not
+        // that the kernel permits every chown -- an unprivileged cross-uid
+        // chown is `Denied` here and the caller is told so.
+        //
+        // This backend deliberately does *not* advertise
+        // `STORAGE_PARENT_IDENTITY_V1`. On BSD/macOS a new object does inherit
+        // its parent directory's gid unconditionally, but `LocalStorage::new`
+        // places no restriction on the backing filesystem, so the store may sit
+        // on a network mount whose server assigns child identity instead -- and
+        // the capability's own contract forbids advertising it "from
+        // configuration alone", which a `cfg(target_os)` is. Qualifying it needs
+        // a live per-filesystem probe; that is deferred to a follow-up.
+        let features: std::collections::BTreeSet<String> = [
+            umbra_core::capabilities::STORAGE_LOCAL_DEVELOPMENT_V1.to_owned(),
+            umbra_core::capabilities::STORAGE_OPEN_REWRITE_V1.to_owned(),
+            umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned(),
+        ]
+        .into_iter()
+        .collect();
         StorageCapabilities {
-            // Explicitly a development store: it advertises the local mode and
-            // the narrow rewrite surface, and nothing about remote durability.
-            // `STORAGE_OWNERSHIP_FIDELITY_V1` is qualified by the `SetMetadata`
-            // arm above and by `metadata`, which has read `uid`/`gid` back since
-            // this backend was written. What the flag promises is that the
-            // uid/gid a caller names are applied and a refusal is reported, not
-            // that the kernel permits every chown -- an unprivileged cross-uid
-            // chown is `Denied` here and the caller is told so.
-            features: [
-                umbra_core::capabilities::STORAGE_LOCAL_DEVELOPMENT_V1.to_owned(),
-                umbra_core::capabilities::STORAGE_OPEN_REWRITE_V1.to_owned(),
-                umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned(),
-            ]
-            .into_iter()
-            .collect(),
+            features,
             durability: Durability::Local,
             strict_remote_persistence: false,
             fencing: Fencing::ConfirmedTermination,
