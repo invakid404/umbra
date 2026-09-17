@@ -536,7 +536,15 @@ anchors over the bound transport, acquires product admission, and only then
 publishes a binding whose advertised `max_io_bytes` and `max_directory_entries`
 come from that transport's own limits. `Durability::None` and `Fencing::ReadOnly`
 stay: no persistence boundary is qualified and no independent termination
-verifier exists. `OpenRunIntent::CreateNew` writes the run directory, both
+verifier exists. The binding advertises exactly one `features` name,
+`ownership-fidelity-v1`: `SetMetadata` is `Support::Supported` in the capability
+table, and `NamespaceMutation::SetAttributes` maps `update.uid` and `update.gid`
+onto `FATTR4_OWNER` and `FATTR4_OWNER_GROUP` as stringified numeric ids, which is
+what that name claims. It is advertised on an *open* run only, never on the
+unbound capabilities, for the same reason the limits are zero there: without a
+bound transport there is nothing qualified to claim.
+
+`OpenRunIntent::CreateNew` writes the run directory, both
 contract anchors, `.provider/`, `.provider/retries/`, `.provider/epoch` and
 `.provider/manifest` with the mounted adapter's names, modes and encodings. It
 does not create the export or run-parent directories: those are deployment

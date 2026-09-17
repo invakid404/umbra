@@ -26,7 +26,15 @@ signalled, which is a run result rather than an Umbra malfunction.
 boundary is the client fsync from local development and from unqualified strict
 remote persistence. `StorageCapabilities::features` is the open extension point
 for narrowly qualified storage behavior, defaulting to empty so older encodings
-still decode and an absent name grants nothing. `FinishRunRequest`,
+still decode and an absent name grants nothing.
+`capabilities::STORAGE_OWNERSHIP_FIDELITY_V1` is another name that uses it: a
+backend advertising it applies the `uid`/`gid` a `MetadataUpdate` names and
+reflects the result in the next `BlobStat`. It claims what the kernel permits is
+applied and a refusal reported, never that every chown succeeds, so a consumer
+requires the name to decide whether to attempt an ownership carry and still
+handles `ErrorKind::Denied` on the attempt. Adding it changed no struct and no
+`PROTOCOL_VERSION`, which is the property the `features` set exists to give.
+`FinishRunRequest`,
 `FinishRunReceipt` and `FailedRunRequest` describe the namespace run lifecycle,
 which `capabilities::NAMESPACE_RUN_LIFECYCLE_V1` names for the handshake,
 and `JournalLifecycle::RunCompleted` is the durable completion record for a fresh

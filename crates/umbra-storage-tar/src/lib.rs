@@ -246,8 +246,14 @@ impl Storage for TarStorage {
     fn capabilities(&self) -> StorageCapabilities {
         StorageCapabilities {
             // The tar backend qualifies neither run mode, so it advertises no
-            // mode feature and cannot be selected by `umbra run`.
-            features: Default::default(),
+            // mode feature and cannot be selected by `umbra run`. It does
+            // qualify ownership fidelity, and unconditionally: `SetMetadata`
+            // writes uid/gid straight into the node, `archive::header` writes
+            // them into the tar header, and there is no kernel in the path to
+            // refuse a chown for want of privilege.
+            features: [umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned()]
+                .into_iter()
+                .collect(),
             durability: Durability::Local,
             strict_remote_persistence: false,
             fencing: Fencing::ConfirmedTermination,
@@ -592,6 +598,142 @@ mod tests {
             assert!(s.run.is_none());
         }
         assert!(!config.archive_path.exists());
+    }
+    /// tar is the backend where `STORAGE_OWNERSHIP_FIDELITY_V1` is
+    /// unconditionally true: there is no kernel here to refuse a chown and any
+    /// uid/gid is representable in a header, so the flag needs no privilege to
+    /// qualify. That also makes this the one backend whose ownership path the
+    /// suite can exercise with no privilege at all.
+    ///
+    /// Also pins what replaced `new_node`'s hardcoded `uid: 0, gid: 0`: a new
+    /// node inherits its parent directory's ownership, so a carried chown
+    /// propagates to everything created under it afterwards.
+    #[test]
+    fn set_metadata_carries_ownership_and_new_nodes_inherit_it_from_their_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut s = TarStorage::new(TarStorageConfig::new(temp.path().join("run.tar")));
+        let req = request();
+        s.open_run(&req).unwrap();
+        let lease = s.acquire_writer(&writer(req.run_id)).unwrap();
+        let path = |bytes: &[u8]| StoragePath::new(StorageAnchor::Root, bytes.to_vec()).unwrap();
+        let directory = CreateOptions {
+            kind: CreateKind::Directory,
+            mode: 0o755,
+        };
+        let file = CreateOptions {
+            kind: CreateKind::File,
+            mode: 0o600,
+        };
+        s.create(&ctx(&lease), &path(b"d"), &directory).unwrap();
+
+        let set = |s: &mut TarStorage, p: StoragePath, update: MetadataUpdate| {
+            s.execute(&StorageRequest {
+                context: ctx(&lease),
+                operation: StorageOperation::SetMetadata { path: p, update },
+            })
+        };
+        let carry = MetadataUpdate {
+            mode: None,
+            uid: Some(4242),
+            gid: Some(99),
+            accessed_nanos: None,
+            modified_nanos: None,
+        };
+        let StorageResponse::MetadataSet(stat) = set(&mut s, path(b"d"), carry.clone()).unwrap()
+        else {
+            panic!("set_metadata answers with the object's new stat");
+        };
+        assert_eq!((stat.uid, stat.gid, stat.mode), (4242, 99, 0o755));
+        assert_eq!(s.stat(&ctx(&lease), &path(b"d")).unwrap().uid, 4242);
+
+        // The inheritance `new_node` now performs, and the reason the hardcoded
+        // root ownership had to go: a node created under a carried directory
+        // takes the ownership the carry gave it.
+        s.create(&ctx(&lease), &path(b"d/f"), &file).unwrap();
+        let child = s.stat(&ctx(&lease), &path(b"d/f")).unwrap();
+        assert_eq!((child.uid, child.gid), (4242, 99));
+        // And a sibling outside it is untouched.
+        s.create(&ctx(&lease), &path(b"other"), &file).unwrap();
+        assert_eq!(s.stat(&ctx(&lease), &path(b"other")).unwrap().uid, 0);
+
+        // Refused before anything lands, in the same words as the other two
+        // backends.
+        let empty = MetadataUpdate {
+            mode: None,
+            uid: None,
+            gid: None,
+            accessed_nanos: None,
+            modified_nanos: None,
+        };
+        assert_eq!(
+            set(&mut s, path(b"d"), empty).unwrap_err().kind,
+            ErrorKind::InvalidInput
+        );
+        let timestamp = MetadataUpdate {
+            mode: Some(0o700),
+            uid: None,
+            gid: None,
+            accessed_nanos: Some(0),
+            modified_nanos: None,
+        };
+        assert_eq!(
+            set(&mut s, path(b"d"), timestamp).unwrap_err().kind,
+            ErrorKind::UnsupportedCapability,
+            "`BlobStat` has no accessed field, so applying it would be a write \
+             the next `Stat` could not show"
+        );
+        assert_eq!(
+            s.stat(&ctx(&lease), &path(b"d")).unwrap().mode,
+            0o755,
+            "and the mode it named alongside did not land"
+        );
+        assert_eq!(
+            set(&mut s, path(b"absent"), carry).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+
+        assert!(s
+            .capabilities()
+            .features
+            .contains(umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1));
+
+        // The ownership reaches the archive bytes, which is the whole point of
+        // carrying it in a backend that has no kernel.
+        s.flush(&FlushRequest {
+            context: ctx(&lease),
+            scope: FlushScope::EntireRun,
+        })
+        .unwrap();
+        s.release_writer(&lease).unwrap();
+        s.close_run().unwrap();
+        let archive = fs::File::open(temp.path().join("run.tar")).unwrap();
+        let owners: Vec<_> = tar::Archive::new(archive)
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| {
+                let p = e.path().unwrap().to_string_lossy().into_owned();
+                p.ends_with("/d") || p.ends_with("/d/f")
+            })
+            .map(|e| {
+                (
+                    e.path().unwrap().to_string_lossy().into_owned(),
+                    e.header().uid().unwrap(),
+                    e.header().gid().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            owners.len(),
+            2,
+            "both entries are in the archive: {owners:?}"
+        );
+        assert!(
+            owners
+                .iter()
+                .all(|(_, uid, gid)| (*uid, *gid) == (4242, 99)),
+            "the carried ownership is what the header writer emits: {owners:?}"
+        );
     }
     #[test]
     fn expiration_blocks_mutations_renewal_and_takeover_but_allows_release() {

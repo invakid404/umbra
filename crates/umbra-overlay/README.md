@@ -54,8 +54,16 @@ new resolutions are blocked while a transaction is pending.
 - Writable opens copy existing base regular files through bounded reads/writes,
   including short I/O, then rewrite the open to shadow. Existing shadow bytes win.
   Truncation is performed by the prepared shadow open. Copy-up preserves file
-  bytes and requests the base permission bits; exact metadata preservation across
-  umask, owner/group, timestamps, ACLs and xattrs needs richer backend support.
+  bytes and requests the base permission bits **widened by `SHADOW_OWNER_BITS`**,
+  for the reason ancestors are — copy-up reopens the object it just created to
+  write the content in, and a `0o444` base file cannot be reopened write-only
+  even by its owner. So a `0o444` base file materialises `0o744` — the same
+  divergence #56 accepted for ancestors, discussed with `SHADOW_OWNER_BITS`
+  under *Journal and whiteouts*. Owner and group are carried from the base
+  where the backend advertises `ownership-fidelity-v1` and privilege permits it
+  ([#61](https://github.com/invakid404/umbra/issues/61)); timestamps, ACLs and
+  xattrs still need richer backend support, and umask still applies to the
+  create.
 - Unlink removes an existing shadow object through Storage and prepares a base
   whiteout, including for base-only targets. `rmdir` is the same operation with
   `directory: true`; it is refused with `Denied` unless the merged view of the
@@ -86,25 +94,48 @@ new resolutions are blocked while a transaction is pending.
     rather than resuming into a host-visible read.
   - `W_OK` against a base-only object is answered from the **base** file's
     ownership, because that is the path the probe rewrites to. Copy-up carries
-    `mode` but not uid/gid, so a base file owned by another user can fail
-    `access(W_OK)` and still be writable through a later open, which copies it
-    into a shadow object this run owns. The probe and the write disagree in that
-    case.
+    the base object's uid/gid onto the shadow where privilege allows, and falls
+    back to umbra's where it does not, so a base file owned by another user can
+    fail `access(W_OK)` and still be writable through a later open, which copies
+    it into a shadow object this run owns. The probe and the write disagree in
+    that case.
 - `FsOp::Fchownat` resolves to a shadow rewrite, then copies the target up after
   a flushed `JournalIntent::Chown` Prepare, so the kernel applies the ownership
   to the shadow object and never to the immutable base. Two shapes are refused at
   `resolve`, before any journal record exists, rather than half-performed:
-  - A **base-only** target with an unchanged-ID sentinel in either position.
-    Copy-up recreates the object through `CreateOptions`, which carries `mode`
-    but not uid/gid, so the shadow belongs to whoever runs umbra; the kernel then
-    sets only the IDs the tracee supplied, and the ID it asked to leave alone
-    would silently become ours. The sentinel means "unchanged", and this path
-    cannot honour it. Setting **both** IDs is allowed, because the copy
-    contributes nothing to the result, and so is a sentinel against an object
-    already in the shadow, where copy-up is a no-op. Lifting the restriction
-    needs ownership-preserving copy-up, which needs `SetMetadata` in the storage
-    backend and, for a base object owned by another user, privilege umbra does
-    not have.
+  - A **base-only** target with an unchanged-ID sentinel in either position,
+    **where copy-up cannot take ownership of that object**. The kernel sets only
+    the IDs the tracee supplied, so on a shadow object that does not wear the
+    base object's ownership the ID the tracee asked to leave alone would
+    silently become ours. The sentinel means "unchanged", and such a copy cannot
+    honour it. Setting **both** IDs is allowed, because the copy contributes
+    nothing to the result, and so is a sentinel against an object already in the
+    shadow, where copy-up is a no-op.
+
+    A backend refusing the carry — for want of privilege, or because the store
+    itself declines an ownership update — leaves the object with umbra's
+    ownership and lets the operation stand rather than ending the run. That is
+    safe for the sentinel specifically, because the sentinel is admitted only
+    where the base object already wears the identity a shadow `create` produces,
+    so a refused carry there is a refused *no-op*.
+
+    Copy-up is ownership-preserving since
+    [#61](https://github.com/invakid404/umbra/issues/61): `CreateOptions` still
+    carries `mode` and not uid/gid, so the engine emits a `SetMetadata` naming
+    the base object's uid/gid immediately after the `create`, against a backend
+    that advertises `ownership-fidelity-v1`. So the refusal above is no longer
+    about a missing mechanism — that half is closed
+    ([#60](https://github.com/invakid404/umbra/issues/60)). What remains is
+    **privilege, per object**: a non-root process cannot give an object away to
+    another uid, and a base tree owned by root is the ordinary case for an
+    overlay. Where the carry holds, the sentinel is honourable and the operation
+    is admitted; where it cannot, the shadow keeps umbra's ownership — the run
+    continues rather than failing, because `parents` and `copy_up` run inside
+    `prepare`, where a failure poisons the run — and this refusal stands. It is
+    decided per object rather than per run because privilege to chown is: umbra
+    may own one base file and not the one beside it. A backend that does not
+    advertise `ownership-fidelity-v1` carries nothing, and the refusal applies
+    to every base-only target on it.
   - A **base-only directory**, because recursive directory copy-up is deferred.
     A directory already in the shadow needs no copy-up and chowns normally.
 
@@ -229,6 +260,14 @@ left it behind on the same walk since #56, and the commit path accepts it
 deliberately. The gate is about *paths*, and no path the run did not already
 expose survives a reconciled abort.
 
+Since [#61](https://github.com/invakid404/umbra/issues/61) the same divergence
+reaches copied-up **files**, not only the ancestors above them, and for the same
+reason: `copy_up` reopens the file it just created to write the content in, so a
+`0o444` base file materialises `0o744` rather than `0o444`. The
+`SHADOW_OWNER_BITS` discussion below covers both. Nothing about this gate
+changes for it: a copied-up file is not a creation, `copy_up` records no
+rollback entry for it, and it publishes no path the run did not already expose.
+
 The rollback list carries directories as well as files, each entry carrying the
 removal that undoes it, and unwinds in reverse creation order so every `rmdir`
 meets an empty directory. That is not an ordering to maintain by hand: `parents`
@@ -327,9 +366,12 @@ carries the **group and other bits of the base directory it shadows, exactly,
 with its owner bits widened to at least `rwx`** — on the success path and the
 reconciled-abort path alike.
 
-The widening is not a rounding error, it is the point. umbra *owns* the shadow,
-so POSIX judges umbra's own writes by the shadow's **owner** bits, and the engine
-must be able to create inside every ancestor it materialises. A base directory
+The widening is not a rounding error, it is the point. The engine must be able
+to create inside every ancestor it materialises, and POSIX decides that from the
+shadow ancestor's **owner** bits whenever umbra owns it — which it did
+unconditionally until
+[#60](https://github.com/invakid404/umbra/issues/60), and still does wherever
+the ownership carry below does not fire. A base directory
 without owner-write is the ordinary case rather than an exotic one — read-only
 artifact trees are exactly what an overlay exists to make writable — and copying
 `0o555` verbatim yields an ancestor the next create cannot enter. Since `parents`
@@ -341,8 +383,34 @@ there: a base at `0o500` yields `0o700` rather than leaking `g+rx,o+rx` the base
 never gave. It is *less* restrictive in one direction only — a base at `0o077`
 yields `0o777`, faithful to that base's own `o+rwx`.
 
-Mode is not ownership, and this is a mode-only fix: `CreateOptions` carries no
-owner field, so the shadow still belongs to whoever runs umbra.
+Mode is not ownership, and #56 was a mode-only fix: `CreateOptions` carries a
+mode and no owner field, so the shadow ancestor belonged to whoever ran umbra
+regardless of whose base directory it shadowed.
+[#60](https://github.com/invakid404/umbra/issues/60) closed that half. Against a
+backend advertising `ownership-fidelity-v1`, `parents` follows the `create` with
+a `SetMetadata` naming the base directory's own uid/gid, so an ancestor that
+shadows a live base directory now wears that directory's ownership as well as
+its group and other bits. An ancestor that shadows nothing — the four cases
+below — is a new directory and keeps umbra's.
+
+The widening above survives that, and is **more** load-bearing after it rather
+than less. Once the ancestor wears the base's uid, umbra is no longer its owner,
+so POSIX judges umbra's writes into it by the *other* bits: a `0o555` base
+directory carried to root would leave the next `create` inside it with `r-x` and
+an `EACCES` that poisons the run. Ordering is what makes the two compose — the
+chown is emitted after the `create` has already used the widened mode, and a
+successful `chown(2)` by an unprivileged process clears setuid and setgid and
+nothing else, so the owner bits survive it. `SHADOW_OWNER_BITS` is therefore
+kept unconditionally, and was not split into a carry-path constant and a
+fallback-path one: under every live policy it is required.
+
+Where privilege refuses the chown — a base tree owned by root, the ordinary case
+for an overlay — the carry answers `Denied`, the ancestor keeps umbra's
+ownership, and the run continues rather than failing: `parents` runs inside
+`prepare`, where failing would not degrade the session but end it. That
+fallback is byte-for-byte the behaviour described above it. A backend that does
+not advertise `ownership-fidelity-v1` carries nothing at all, and this whole
+section reads exactly as it did before #60.
 
 Four ancestors keep the default `0o755` instead: a Control-anchored one — a
 symlink blob, a whiteout marker — which shadows nothing; one the base does not

@@ -53,8 +53,11 @@ the workspace's exact-pin style ([tar documentation](https://docs.rs/tar/0.4.46/
   return the complete accepted byte count or an error, including zero-byte no-ops.
   I/O is capped at 1 MiB per request and offsets at signed 64-bit file bounds.
 - Stat/Lookup expose persistent UUID object identity, logical kind/length, mode,
-  logical uid/gid (initially zero), creation/write modification time, and link count
-  one. No host inode metadata or rewrite target is claimed. Renames preserve IDs.
+  logical uid/gid, creation/write modification time, and link count one. No host
+  inode metadata or rewrite target is claimed. Renames preserve IDs. A new object
+  inherits its parent directory's uid/gid, and the two anchor roots start at
+  zero, so an archive records no host identity unless a caller puts one there
+  through SetMetadata.
 - Logical symlinks support create, ReadLink, stat, rename, and unlink. Their targets
   are opaque bytes and are never followed, even when they name an in-anchor object.
   Any symlink in a path's parent components is rejected. Unlink removes the name;
@@ -70,7 +73,14 @@ the workspace's exact-pin style ([tar documentation](https://docs.rs/tar/0.4.46/
   successful mutation or writer acquisition, with at most 64 outstanding cursors.
 - Other sessions read the snapshot they opened. Reopen or acquiring writer
   authority refreshes that snapshot; there is no live cross-session read refresh.
-- CopyUp, Link, SetMetadata, Truncate, xattrs, whiteouts, and AtomicSwap are deferred
+- SetMetadata applies mode, uid and gid, and answers with the object's new stat.
+  An update naming nothing, or a mode outside 07777, is InvalidInput; one naming
+  a timestamp is UnsupportedCapability and applies none of the update, because
+  BlobStat has no accessed field and a uniform refusal across the three backends
+  is worth more than one of them accepting one extra field. There is no kernel
+  here to refuse a chown and any uid/gid is representable in a header, so
+  `ownership-fidelity-v1` is advertised unconditionally.
+- CopyUp, Link, Truncate, xattrs, whiteouts, and AtomicSwap are deferred
   and return UnsupportedCapability. Kernel shadow, complete emulation, remote
   durability, and kernel fencing are not advertised.
 

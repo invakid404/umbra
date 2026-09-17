@@ -188,6 +188,22 @@ type BaseStats = Arc<Mutex<Vec<StoragePath>>>;
 type Unlinks = Arc<Mutex<Vec<(StoragePath, RequestContext)>>>;
 /// Switch that makes every base *directory* stat fail with this kind.
 type BaseFailure = Arc<Mutex<Option<ErrorKind>>>;
+/// Every `SetMetadata` the engine asked the shadow storage for, in order.
+///
+/// The only umask-independent, filesystem-independent view of the ownership
+/// carry: on a CI runner the base tree is already owned by the test process, so
+/// a successful carry leaves the shadow object's uid exactly where a *missing*
+/// carry would have left it. Asserting that no `SetMetadata` was emitted, or
+/// that one naming the base's uid/gid was, is what distinguishes them.
+type Metadata = Arc<Mutex<Vec<(StoragePath, MetadataUpdate)>>>;
+/// Switch that makes every shadow `SetMetadata` fail with this kind.
+///
+/// How the privilege edge case is driven without root: a real `EPERM` needs a
+/// base object owned by someone else, which CI cannot create. `ErrorKind::Denied`
+/// is what `umbra-storage-local` maps that `EPERM` to, so injecting the kind
+/// exercises the engine's fallback on exactly the value the kernel would have
+/// produced.
+type MetadataFailure = Arc<Mutex<Option<ErrorKind>>>;
 /// Switch that makes every shadow `RemoveDirectory` fail with this kind.
 ///
 /// The directory analogue of the mode-based `unlink(2)` injection
@@ -225,12 +241,28 @@ struct Recorder {
     inner: LocalStorage,
     creates: Creates,
     unlinks: Unlinks,
+    metadata: Metadata,
     fail_remove_directory: RemoveDirectoryFailure,
     fail_unlink: UnlinkFailure,
+    fail_metadata: MetadataFailure,
+    /// Report `LocalStorage`'s capabilities with `STORAGE_OWNERSHIP_FIDELITY_V1`
+    /// removed, modelling a backend that has not qualified ownership carry.
+    ///
+    /// Removing the name from a real backend's real set, rather than returning a
+    /// hand-written `StorageCapabilities`, is deliberate: the degraded mode has
+    /// to be the *same* backend minus one advertisement, or the test proves
+    /// nothing about the gate.
+    drop_ownership_fidelity: bool,
 }
 impl Storage for Recorder {
     fn capabilities(&self) -> StorageCapabilities {
-        self.inner.capabilities()
+        let mut capabilities = self.inner.capabilities();
+        if self.drop_ownership_fidelity {
+            capabilities
+                .features
+                .remove(capabilities::STORAGE_OWNERSHIP_FIDELITY_V1);
+        }
+        capabilities
     }
     fn open_run(&mut self, request: &OpenRunRequest) -> Result<RunBinding> {
         self.inner.open_run(request)
@@ -269,6 +301,22 @@ impl Storage for Recorder {
                     }
                 }
             }
+            StorageOperation::SetMetadata { path, update } => {
+                self.metadata
+                    .lock()
+                    .unwrap()
+                    .push((path.clone(), update.clone()));
+                // Recorded first and refused before delegating, so a test can
+                // assert both that the carry was attempted and that the object
+                // kept the ownership the create gave it.
+                if let Some(kind) = *self.fail_metadata.lock().unwrap() {
+                    return Err(UmbraError::new(
+                        kind,
+                        "test-storage",
+                        "injected set_metadata failure",
+                    ));
+                }
+            }
             // Refused before delegating, so the directory the engine could not
             // remove is still standing when the test looks for it.
             StorageOperation::RemoveDirectory { .. } => {
@@ -303,11 +351,42 @@ struct WatchedBase {
     stats: BaseStats,
     force_directory_mode: Option<u32>,
     fail_directory_stat: BaseFailure,
+    /// Report this uid/gid for every base object.
+    ///
+    /// A base owned by another user is the ordinary case for an overlay and the
+    /// one CI cannot construct: creating a root-owned file needs root. Reporting
+    /// the ownership is enough for everything decided *before* the chown --
+    /// which is where the sentinel refusal lives -- and the chown itself is
+    /// driven separately by `MetadataFailure`.
+    force_owner: Option<(u32, u32)>,
+    /// Report this uid/gid for these base paths only, overriding `force_owner`.
+    ///
+    /// The blanket switch above cannot express the property Axis 5 actually
+    /// delivers: ownership carry is decided **per object**, so demonstrating it
+    /// needs two targets with *opposite* answers reached through one engine,
+    /// one backend and one base. A whole-fixture owner gives every object the
+    /// same answer, which two fixtures can only put side by side, never in one
+    /// run.
+    force_owners: Vec<(Vec<u8>, (u32, u32))>,
 }
 impl Base for WatchedBase {
     fn stat(&mut self, path: &StoragePath) -> Result<BlobStat> {
         self.stats.lock().unwrap().push(path.clone());
         let mut stat = self.inner.stat(path)?;
+        // Path-specific first, so a fixture can carve one object out of a
+        // blanket owner, or name owners for some objects and leave the rest as
+        // the real filesystem reports them.
+        if let Some((_, (uid, gid))) = self
+            .force_owners
+            .iter()
+            .find(|(name, _)| name.as_slice() == path.as_bytes())
+        {
+            stat.uid = *uid;
+            stat.gid = *gid;
+        } else if let Some((uid, gid)) = self.force_owner {
+            stat.uid = uid;
+            stat.gid = gid;
+        }
         if stat.kind == ObjectKind::Directory {
             // Switchable so a test can let `resolve` run against a healthy base
             // and fail only the stat `shadow_parent_mode` makes during `prepare`.
@@ -362,6 +441,16 @@ struct Setup<'a> {
     fail_remove_directory: Option<RemoveDirectoryFailure>,
     /// Handle the test flips to make selected shadow unlinks fail.
     fail_unlink: Option<UnlinkFailure>,
+    /// Capture the `SetMetadata` requests the engine issues.
+    metadata: Option<Metadata>,
+    /// Handle the test flips to make shadow `SetMetadata` fail.
+    fail_metadata: Option<MetadataFailure>,
+    /// Advertise the shadow backend's capabilities without ownership fidelity.
+    drop_ownership_fidelity: bool,
+    /// Report this uid/gid for every base object.
+    force_owner: Option<(u32, u32)>,
+    /// Report this uid/gid for these base paths only, overriding `force_owner`.
+    force_owners: &'a [(&'a [u8], (u32, u32))],
 }
 
 impl Fixture {
@@ -443,7 +532,10 @@ impl Fixture {
                         .clone()
                         .map(|_| Creates::default())
                 })
-                .or_else(|| setup.fail_unlink.clone().map(|_| Creates::default())),
+                .or_else(|| setup.fail_unlink.clone().map(|_| Creates::default()))
+                .or_else(|| setup.metadata.clone().map(|_| Creates::default()))
+                .or_else(|| setup.fail_metadata.clone().map(|_| Creates::default()))
+                .or_else(|| setup.drop_ownership_fidelity.then(Creates::default)),
         ) {
             (Some(mismatch), creates) => {
                 // `BadReceipt` does not record, so a caller asking for both would
@@ -466,8 +558,11 @@ impl Fixture {
                 inner: shadow,
                 creates,
                 unlinks: setup.unlinks.unwrap_or_default(),
+                metadata: setup.metadata.unwrap_or_default(),
                 fail_remove_directory: setup.fail_remove_directory.unwrap_or_default(),
                 fail_unlink: setup.fail_unlink.unwrap_or_default(),
+                fail_metadata: setup.fail_metadata.unwrap_or_default(),
+                drop_ownership_fidelity: setup.drop_ownership_fidelity,
             }),
             (None, None) => Box::new(shadow),
         };
@@ -475,14 +570,24 @@ impl Fixture {
             setup.base_stats,
             setup.force_directory_mode,
             setup.fail_directory_stat,
+            setup.force_owner,
+            setup.force_owners.is_empty(),
         ) {
-            (None, None, None) => Box::new(base),
-            (stats, force_directory_mode, fail_directory_stat) => Box::new(WatchedBase {
-                inner: base,
-                stats: stats.unwrap_or_default(),
-                force_directory_mode,
-                fail_directory_stat: fail_directory_stat.unwrap_or_default(),
-            }),
+            (None, None, None, None, true) => Box::new(base),
+            (stats, force_directory_mode, fail_directory_stat, force_owner, _) => {
+                Box::new(WatchedBase {
+                    inner: base,
+                    stats: stats.unwrap_or_default(),
+                    force_directory_mode,
+                    fail_directory_stat: fail_directory_stat.unwrap_or_default(),
+                    force_owner,
+                    force_owners: setup
+                        .force_owners
+                        .iter()
+                        .map(|(name, owner)| (name.to_vec(), *owner))
+                        .collect(),
+                })
+            }
         };
         let mut overlay = Overlay::new(storage, Box::new(journal));
         overlay.bind(config, base).unwrap();
@@ -2231,12 +2336,28 @@ fn a_base_only_directory_chown_is_refused_before_anything_is_journaled() {
 
 #[test]
 fn an_unchanged_id_chown_of_a_base_object_is_refused_rather_than_silently_re_owning_it() {
-    // copy_up recreates a base object through CreateOptions, which carries mode
-    // but no uid/gid, so the shadow belongs to whoever runs umbra. The kernel then
-    // sets only the IDs the tracee supplied. Were this allowed, a POSIX no-op
+    // The kernel sets only the IDs the tracee supplied. Were this allowed on a
+    // shadow object that does not wear the base's ownership, a POSIX no-op
     // chown(-1, -1) would silently move the object to our identity, which is the
     // opposite of what the sentinel asks for.
-    let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+    //
+    // #60 lifted the half of this that was a missing mechanism: copy-up now
+    // carries the base's uid/gid onto the shadow, so the sentinel is honourable
+    // wherever the carry holds. What remains is privilege, per object -- and
+    // this test is the case where it does not hold. `force_owner` is what makes
+    // it that case: a base object owned by a uid umbra cannot take ownership of
+    // is the ordinary situation for an overlay and the one CI cannot construct
+    // for real, because creating a root-owned file needs root. Every assertion
+    // below is the one this test has always made; only the fixture now names the
+    // condition the refusal still depends on. The lifted half is pinned by
+    // `an_unchanged_id_chown_is_admitted_once_copy_up_can_carry_the_base_owner`.
+    let mut f = Fixture::build(
+        &[(b"file", b"base bytes")],
+        Setup {
+            force_owner: Some((4242, 4242)),
+            ..Setup::default()
+        },
+    );
     for (uid, gid) in [(None, None), (Some(501), None), (None, Some(20))] {
         assert_eq!(
             f.overlay
@@ -5186,4 +5307,673 @@ fn an_rmdir_commit_that_cannot_remove_the_directory_poisons_with_the_backends_ow
          are hidden while the directory itself still stands"
     );
     assert!(f.base_root.join("d/f").is_file());
+}
+
+// ---------------------------------------------------------------------------
+// Ownership fidelity on materialised shadow objects
+// ([#60](https://github.com/invakid404/umbra/issues/60),
+// [#61](https://github.com/invakid404/umbra/issues/61)).
+//
+// `CreateOptions` carries a mode and no uid/gid, so the engine emits a
+// `SetMetadata` after each of its two `create` sites and the shadow object takes
+// the ownership of the base object it shadows. Where there is no base
+// counterpart there is no carry; where privilege refuses, the object keeps
+// umbra's ownership and the run continues.
+//
+// Why these assert on the emitted `SetMetadata` rather than on `st_uid`: CI runs
+// as one user, so the base tree is already owned by the test process and a
+// *successful* carry leaves the shadow object's uid exactly where a *missing*
+// carry would have left it. The request is the only thing that distinguishes
+// them. `Metadata` says the same thing at more length.
+// ---------------------------------------------------------------------------
+
+/// The carry requests for `path`, in order.
+fn carried(metadata: &Metadata, path: &[u8]) -> Vec<MetadataUpdate> {
+    metadata
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.anchor() == StorageAnchor::Root && p.as_bytes() == path)
+        .map(|(_, update)| update.clone())
+        .collect()
+}
+/// Every path a carry was requested for, in order.
+fn carried_paths(metadata: &Metadata) -> Vec<String> {
+    metadata
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(p, _)| String::from_utf8_lossy(p.as_bytes()).into_owned())
+        .collect()
+}
+/// The uid/gid the base reports for `name`, which is what a carry must name.
+fn base_owner(f: &mut Fixture, name: &[u8]) -> (u32, u32) {
+    let stat = f.overlay.base().stat(&root(name).unwrap()).unwrap();
+    (stat.uid, stat.gid)
+}
+fn with_metadata(files: &[(&[u8], &[u8])], metadata: &Metadata) -> Fixture {
+    Fixture::build(
+        files,
+        Setup {
+            metadata: Some(metadata.clone()),
+            ..Setup::default()
+        },
+    )
+}
+
+// (a) `parents()` -- #60. Directory targets.
+
+// δ step 3, the negative half: an ancestor with no base counterpart is a *new*
+// directory, not a shadow of anything, so there is nothing whose ownership it
+// could take and umbra's is simply correct.
+#[test]
+fn a_shadow_only_ancestor_takes_no_base_ownership() {
+    let metadata = Metadata::default();
+    let mut f = with_metadata(&[(b"elsewhere", b"base bytes")], &metadata);
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"fresh/deep/dir"),
+        mode: 0o750,
+    });
+    assert!(f.shadow_root.join("fresh/deep/dir").is_dir());
+    assert!(!f.base_root.join("fresh").exists());
+    assert!(
+        carried_paths(&metadata).is_empty(),
+        "no ancestor here shadows a base directory, so nothing may be chowned: {:?}",
+        carried_paths(&metadata)
+    );
+}
+
+// δ step 1, at `parents`. The one arm the base corroborates is the one arm that
+// carries, and it carries the base directory's own uid/gid -- not a constant,
+// and not the object's.
+#[test]
+fn a_base_only_ancestor_carries_the_base_directorys_ownership() {
+    let metadata = Metadata::default();
+    let mut f = with_metadata(&[(b"d/f", b"base bytes")], &metadata);
+    let owner = base_owner(&mut f, b"d");
+    f.run(&open(
+        b"d/new",
+        OpenFlags {
+            create: true,
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert!(f.shadow_root.join("d/new").is_file());
+    assert_eq!(
+        carried(&metadata, b"d"),
+        vec![MetadataUpdate {
+            mode: None,
+            uid: Some(owner.0),
+            gid: Some(owner.1),
+            accessed_nanos: None,
+            modified_nanos: None,
+        }],
+        "the materialised ancestor takes the base directory's ownership, and \
+         names only ownership -- the mode was already settled by `create`"
+    );
+    assert_eq!(
+        carried_paths(&metadata),
+        vec!["d".to_owned()],
+        "the created object itself is not a shadow of a base object and must not \
+         be carried onto"
+    );
+}
+
+// The existing-shadow branch must not grow a side effect. Re-chowning an
+// ancestor the run has already materialised would overwrite ownership the tracee
+// may have set on it deliberately.
+#[test]
+fn an_ancestor_already_in_the_shadow_is_not_re_owned() {
+    let metadata = Metadata::default();
+    let mut f = with_metadata(&[(b"d/f", b"base bytes")], &metadata);
+    let creating = |name: &[u8]| {
+        open(
+            name,
+            OpenFlags {
+                create: true,
+                write: true,
+                ..OpenFlags::default()
+            },
+        )
+    };
+    f.run(&creating(b"d/one"));
+    assert_eq!(carried_paths(&metadata), vec!["d".to_owned()]);
+    f.run(&creating(b"d/two"));
+    assert_eq!(
+        carried_paths(&metadata),
+        vec!["d".to_owned()],
+        "the second walk skips the ancestor it found in the shadow, so it must \
+         not chown it a second time"
+    );
+}
+
+// The grave case. `shadow_parent_mode` already refuses to let the shadow wear a
+// whiteouted base directory's *mode*, on the grounds that the directory over its
+// grave is a different directory; its ownership follows the same rule, and for
+// the same reason.
+#[test]
+fn an_ancestor_over_a_whiteouted_base_directory_carries_no_ownership() {
+    let metadata = Metadata::default();
+    let mut f = with_metadata(&[(b"d/f", b"base bytes")], &metadata);
+    f.run(&unlink(b"d/f"));
+    f.run(&rmdir(b"d"));
+    metadata.lock().unwrap().clear();
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"d/fresh"),
+        mode: 0o750,
+    });
+    assert!(f.shadow_root.join("d/fresh").is_dir());
+    assert!(
+        carried_paths(&metadata).is_empty(),
+        "a directory materialised over a whiteouted base directory is a new \
+         directory and must no more wear the dead one's uid than its mode: {:?}",
+        carried_paths(&metadata)
+    );
+}
+
+// Axis 6, pinned. The constant is *more* load-bearing after a carry, not less:
+// once the ancestor wears the base's uid, umbra is no longer its owner, so the
+// `other` bits would govern umbra's own writes into it. A `0o555` base directory
+// carried without the widening leaves the next `create` inside it with `r-x`.
+//
+// Also pins that this PR neither widens nor narrows the mode divergence #56
+// documented: the ancestor still reads back `0o755` against the usual umask,
+// exactly as it did before ownership carry existed.
+#[test]
+fn shadow_owner_bits_survive_the_ownership_carry() {
+    let metadata = Metadata::default();
+    let creates = Creates::default();
+    let mut f = Fixture::build(
+        &[(b"d/f", b"base bytes")],
+        Setup {
+            base_modes: &[(b"d", 0o555)],
+            creates: Some(creates.clone()),
+            metadata: Some(metadata.clone()),
+            ..Setup::default()
+        },
+    );
+    let owner = base_owner(&mut f, b"d");
+    f.run(&open(
+        b"d/new",
+        OpenFlags {
+            create: true,
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    let requested = creates
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(p, _)| p.as_bytes() == b"d")
+        .map(|(_, options)| options.mode)
+        .expect("the ancestor was created");
+    assert_eq!(
+        requested,
+        0o555 | SHADOW_OWNER_BITS,
+        "the widening is what lets umbra create inside the ancestor it carried"
+    );
+    assert_eq!(
+        carried(&metadata, b"d"),
+        vec![MetadataUpdate {
+            mode: None,
+            uid: Some(owner.0),
+            gid: Some(owner.1),
+            accessed_nanos: None,
+            modified_nanos: None,
+        }]
+    );
+    // The chown ran after the create, and a successful `chown(2)` clears only
+    // setuid/setgid -- the owner permission bits survive it.
+    assert_eq!(mode_of(&f.shadow_root.join("d")), 0o755 & !umask());
+    assert!(
+        f.shadow_root.join("d/new").is_file(),
+        "the create inside the carried ancestor is the thing the widening exists \
+         to keep working"
+    );
+}
+
+// (b) `copy_up()` -- #61. File targets.
+
+// The #61 fidelity test and, simultaneously, the regression test for a latent
+// `EACCES` that predates it: `copy_up` created the shadow at the base's mode
+// verbatim, and both syscall backends reopen the object *write-only* to copy the
+// content into it. Opening your own `0o444` file `O_WRONLY` is `EACCES`, so
+// copy-up of a read-only base file with content has been failing here all along.
+// `| SHADOW_OWNER_BITS` at the `create` is what fixes it, and this test cannot
+// pass without it.
+#[test]
+fn copy_up_of_a_read_only_base_file_carries_content_and_base_ownership() {
+    let metadata = Metadata::default();
+    let mut f = Fixture::build(
+        &[(b"ro", b"base bytes")],
+        Setup {
+            base_modes: &[(b"ro", 0o444)],
+            metadata: Some(metadata.clone()),
+            ..Setup::default()
+        },
+    );
+    let owner = base_owner(&mut f, b"ro");
+    f.run(&open(
+        b"ro",
+        OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert_eq!(
+        fs::read(f.shadow_root.join("ro")).unwrap(),
+        b"base bytes",
+        "the content copy is what the missing owner-write bit used to refuse"
+    );
+    assert_eq!(
+        carried(&metadata, b"ro"),
+        vec![MetadataUpdate {
+            mode: None,
+            uid: Some(owner.0),
+            gid: Some(owner.1),
+            accessed_nanos: None,
+            modified_nanos: None,
+        }]
+    );
+    assert_eq!(fs::read(f.base_root.join("ro")).unwrap(), b"base bytes");
+}
+
+#[test]
+fn copy_up_of_a_private_base_file_carries_ownership_and_keeps_its_mode() {
+    let metadata = Metadata::default();
+    let mut f = Fixture::build(
+        &[(b"private", b"base bytes")],
+        Setup {
+            base_modes: &[(b"private", 0o600)],
+            metadata: Some(metadata.clone()),
+            ..Setup::default()
+        },
+    );
+    let owner = base_owner(&mut f, b"private");
+    f.run(&open(
+        b"private",
+        OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert_eq!(
+        fs::read(f.shadow_root.join("private")).unwrap(),
+        b"base bytes"
+    );
+    // `0o600 | 0o700` is `0o700`: the widening adds nothing a `0o600` base had
+    // not already granted its owner except execute, and the umask does not touch
+    // owner bits.
+    assert_eq!(mode_of(&f.shadow_root.join("private")), 0o700 & !umask());
+    assert_eq!(carried(&metadata, b"private").len(), 1);
+    assert_eq!(carried(&metadata, b"private")[0].uid, Some(owner.0));
+    assert_eq!(carried(&metadata, b"private")[0].gid, Some(owner.1));
+}
+
+#[test]
+fn copy_up_of_an_executable_base_file_keeps_its_execute_bits_through_the_carry() {
+    let metadata = Metadata::default();
+    let mut f = Fixture::build(
+        &[(b"tool", b"base bytes")],
+        Setup {
+            base_modes: &[(b"tool", 0o755)],
+            metadata: Some(metadata.clone()),
+            ..Setup::default()
+        },
+    );
+    let owner = base_owner(&mut f, b"tool");
+    f.run(&open(
+        b"tool",
+        OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    // The chown runs after the create and after the writes. An unprivileged
+    // `chown(2)` clears setuid/setgid and nothing else, so the execute bits the
+    // base granted are still there.
+    assert_eq!(mode_of(&f.shadow_root.join("tool")), 0o755 & !umask());
+    assert_eq!(carried(&metadata, b"tool").len(), 1);
+    assert_eq!(carried(&metadata, b"tool")[0].uid, Some(owner.0));
+    assert_eq!(carried(&metadata, b"tool")[0].gid, Some(owner.1));
+}
+
+// `copy_up`'s early return for an object already in the shadow must not grow a
+// side effect: the object is not a shadow of a base object any more, and
+// chowning it would overwrite whatever the run has since made of it.
+#[test]
+fn copy_up_of_an_already_shadowed_file_emits_no_set_metadata() {
+    let metadata = Metadata::default();
+    let mut f = with_metadata(&[], &metadata);
+    f.run(&open(
+        b"made",
+        OpenFlags {
+            create: true,
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    metadata.lock().unwrap().clear();
+    let prepared = f.prepare(&chown(b"made", Some(501), Some(20), true));
+    f.complete(prepared);
+    assert!(
+        carried_paths(&metadata).is_empty(),
+        "copy-up returned early, so nothing was materialised and nothing may be \
+         carried: {:?}",
+        carried_paths(&metadata)
+    );
+}
+
+// `copy_up` routes a logical symlink to `create_symlink`, which is a different
+// contract: the placeholder carries a `0o444` mode and `logical_stat`
+// substitutes `0o777`, none of which this change may perturb. The placeholder is
+// not a copy of the base object, so it takes none of its ownership either.
+#[test]
+fn copy_up_of_a_logical_symlink_carries_no_ownership() {
+    let metadata = Metadata::default();
+    let mut f = with_metadata(&[(b"target", b"base bytes")], &metadata);
+    f.run(&symlink(b"link", b"target"));
+    let prepared = f.prepare(&chown(b"link", Some(501), Some(20), false));
+    f.complete(prepared);
+    assert!(
+        carried_paths(&metadata).is_empty(),
+        "the symlink placeholder is not a copy of anything: {:?}",
+        carried_paths(&metadata)
+    );
+}
+
+// The guardrail's regression test. A carry failure that is *not* `Denied` is an
+// ordinary `prepare` error, handled by the machinery that already handles a
+// `create` failure -- `Pending.rollback` and `Pending.destroy` are not widened
+// for it, and `copy_up` still records nothing on either.
+#[test]
+fn a_failed_ownership_carry_propagates_without_touching_rollback_or_destroy() {
+    let failure = MetadataFailure::default();
+    let mut f = Fixture::build(
+        &[(b"file", b"base bytes")],
+        Setup {
+            fail_metadata: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    *failure.lock().unwrap() = Some(ErrorKind::Io);
+    let action = f
+        .overlay
+        .resolve(
+            &f.process,
+            &open(
+                b"file",
+                OpenFlags {
+                    write: true,
+                    ..OpenFlags::default()
+                },
+            ),
+        )
+        .unwrap();
+    let id = OperationId(Uuid::new_v4());
+    assert_eq!(
+        f.overlay.prepare(id, &action).unwrap_err().kind,
+        ErrorKind::Io,
+        "anything but `Denied` propagates, exactly as a `create` failure does"
+    );
+    let pending = f.overlay.pending.as_ref().expect("the transaction is open");
+    assert!(
+        pending.rollback.is_empty(),
+        "copy-up records no undo, and a failed carry inside it adds none"
+    );
+    assert!(
+        pending.destroy.is_none(),
+        "#66's destroy plan is for `Unlink` and must not have grown a second writer"
+    );
+}
+
+// (c) Privilege -- Axis 5.
+
+// Pick (ii): fall back to umbra's uid. Fail-closed was rejected outright,
+// because `parents` and `copy_up` run inside `prepare` where a failure poisons
+// the run -- so refusing a base object umbra cannot chown to would not degrade
+// the session, it would end it, for the overlay's primary use case.
+//
+// Driven by injection rather than by root: `ErrorKind::Denied` is what
+// `umbra-storage-local` maps a cross-uid `EPERM` to, so this is the engine
+// meeting exactly the value the kernel would have produced.
+#[test]
+fn an_ownership_carry_the_backend_denies_falls_back_to_umbras_uid() {
+    let failure = MetadataFailure::default();
+    let metadata = Metadata::default();
+    let mut f = Fixture::build(
+        &[(b"d/file", b"base bytes")],
+        Setup {
+            metadata: Some(metadata.clone()),
+            fail_metadata: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    *failure.lock().unwrap() = Some(ErrorKind::Denied);
+    f.run(&open(
+        b"d/file",
+        OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    // The operation succeeded: both the ancestor and the object were carried
+    // onto, both were refused, and neither refusal reached the tracee.
+    assert_eq!(
+        carried_paths(&metadata),
+        vec!["d".to_owned(), "d/file".to_owned()]
+    );
+    assert!(!f.overlay.poisoned);
+    assert!(f.shadow_root.join("d").is_dir());
+    assert_eq!(
+        fs::read(f.shadow_root.join("d/file")).unwrap(),
+        b"base bytes"
+    );
+}
+
+// The lifted half of #60, and the pair to
+// `an_unchanged_id_chown_of_a_base_object_is_refused_rather_than_silently_re_owning_it`.
+// Without this the PR would change ownership bits and unblock nothing.
+#[test]
+fn an_unchanged_id_chown_is_admitted_once_copy_up_can_carry_the_base_owner() {
+    let metadata = Metadata::default();
+    let mut f = with_metadata(&[(b"file", b"base bytes")], &metadata);
+    let owner = base_owner(&mut f, b"file");
+    for (uid, gid) in [(None, None), (Some(owner.0), None), (None, Some(owner.1))] {
+        let action = f
+            .overlay
+            .resolve(&f.process, &chown(b"file", uid, gid, true))
+            .unwrap_or_else(|e| panic!("uid {uid:?} gid {gid:?} was refused: {e:?}"));
+        assert!(matches!(action, ResolvedAction::Rewrite(_)));
+        let prepared = f
+            .overlay
+            .prepare(OperationId(Uuid::new_v4()), &action)
+            .unwrap();
+        f.complete(prepared);
+    }
+    assert!(f.shadow_root.join("file").is_file());
+    assert_eq!(
+        carried(&metadata, b"file").len(),
+        1,
+        "the first chown copied the object up and carried its ownership; the two \
+         after it found it in the shadow and carried nothing"
+    );
+    assert!(!f.overlay.poisoned);
+}
+
+// Axis 5 narrowed to per object rather than per run, which is what privilege to
+// chown actually is: umbra may own one base file and not the one beside it. Both
+// targets are in the same run, against the same backend, and get opposite
+// answers.
+#[test]
+fn the_sentinel_refusal_tracks_ownership_carry_per_object_not_per_run() {
+    // Both targets live in one base, reached through one engine, one backend and
+    // one shadow, and get *opposite* answers. Two fixtures could only put the
+    // two answers side by side; "per object, not per run" is the claim that one
+    // run gives different answers for different objects, so it needs one run.
+    // `force_owners` carves `theirs` out and leaves `ours` as the filesystem
+    // reports it -- which is umbra's own identity, since CI creates the fixture.
+    let mut f = Fixture::build(
+        &[(b"ours", b"base bytes"), (b"theirs", b"base bytes")],
+        Setup {
+            force_owners: &[(b"theirs", (4242, 4242))],
+            ..Setup::default()
+        },
+    );
+    assert!(
+        f.overlay
+            .resolve(&f.process, &chown(b"ours", None, None, true))
+            .is_ok(),
+        "the base object umbra already owns carries, so the sentinel is honourable"
+    );
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &chown(b"theirs", None, None, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsupportedCapability,
+        "the carry cannot be guaranteed for this object, so the refusal stands \
+         -- in the same run that just admitted the one beside it"
+    );
+    // And the order is not what decides it: ask again, reversed.
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &chown(b"theirs", None, None, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsupportedCapability
+    );
+    assert!(f
+        .overlay
+        .resolve(&f.process, &chown(b"ours", None, None, true))
+        .is_ok());
+    assert!(!f.overlay.poisoned);
+}
+
+// The capability gate's safety test, and the reason this change is safe to land:
+// against a backend that has not qualified ownership carry, no `SetMetadata` is
+// emitted at all and the engine behaves exactly as it did before the carry
+// existed -- including the sentinel refusal, which has no carry to be lifted by.
+#[test]
+fn a_backend_without_ownership_fidelity_emits_no_set_metadata_at_all() {
+    let metadata = Metadata::default();
+    let mut f = Fixture::build(
+        &[(b"d/file", b"base bytes"), (b"d/untouched", b"base bytes")],
+        Setup {
+            metadata: Some(metadata.clone()),
+            drop_ownership_fidelity: true,
+            ..Setup::default()
+        },
+    );
+    assert!(!f.overlay.ownership_fidelity());
+    f.run(&open(
+        b"d/file",
+        OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert_eq!(
+        fs::read(f.shadow_root.join("d/file")).unwrap(),
+        b"base bytes"
+    );
+    assert!(
+        carried_paths(&metadata).is_empty(),
+        "the gate is what makes the degraded mode a true no-op: {:?}",
+        carried_paths(&metadata)
+    );
+    // Asked about the object still only in the base: the refusal is about what
+    // copy-up would produce, and `d/file` has already been copied up above.
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &chown(b"d/untouched", None, None, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsupportedCapability,
+        "with nothing to carry the ownership, the sentinel refusal is unchanged"
+    );
+}
+
+// A store that declines the metadata update is a *refusal to carry*, not a
+// failure of the operation that needed it. `Denied` is the privilege shape;
+// `UnsupportedCapability` is the store's own, and it is the same class of answer
+// arriving under a different kind -- an NFS export that does not honour SETATTR
+// owner attributes replies `NFS4ERR_NOTSUPP`, and a mounted export that cannot
+// chown answers `ENOTSUP`. Before this was handled, such a store poisoned the
+// run on the first materialised object, because `copy_up` and `parents` run
+// inside `prepare`.
+#[test]
+fn an_ownership_carry_the_store_says_it_cannot_do_is_not_fatal_either() {
+    let failure = MetadataFailure::default();
+    let metadata = Metadata::default();
+    let mut f = Fixture::build(
+        &[(b"d/file", b"base bytes")],
+        Setup {
+            metadata: Some(metadata.clone()),
+            fail_metadata: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    *failure.lock().unwrap() = Some(ErrorKind::UnsupportedCapability);
+    f.run(&open(
+        b"d/file",
+        OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert_eq!(
+        carried_paths(&metadata),
+        vec!["d".to_owned(), "d/file".to_owned()],
+        "both the ancestor and the object were carried onto, and both refused"
+    );
+    assert!(
+        !f.overlay.poisoned,
+        "a declined carry must not poison the run"
+    );
+    assert!(f.shadow_root.join("d").is_dir());
+    assert_eq!(
+        fs::read(f.shadow_root.join("d/file")).unwrap(),
+        b"base bytes"
+    );
+}
+
+// The one kind that stays fatal, and the reason it does: `NotImplemented` names
+// a deferred or unbound code path rather than a store declining a supported
+// request, so swallowing it would hide the wiring gap it exists to report.
+#[test]
+fn an_unimplemented_ownership_carry_still_propagates() {
+    let failure = MetadataFailure::default();
+    let mut f = Fixture::build(
+        &[(b"file", b"base bytes")],
+        Setup {
+            fail_metadata: Some(failure.clone()),
+            ..Setup::default()
+        },
+    );
+    *failure.lock().unwrap() = Some(ErrorKind::NotImplemented);
+    let action = f
+        .overlay
+        .resolve(
+            &f.process,
+            &open(
+                b"file",
+                OpenFlags {
+                    write: true,
+                    ..OpenFlags::default()
+                },
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .prepare(OperationId(Uuid::new_v4()), &action)
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotImplemented
+    );
 }

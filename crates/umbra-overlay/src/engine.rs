@@ -1016,6 +1016,146 @@ impl Overlay {
         }
         Ok(())
     }
+    /// Whether the shadow backend has qualified applying `MetadataUpdate`'s
+    /// uid/gid, which is what decides whether the engine carries base ownership
+    /// onto a shadow object at all.
+    ///
+    /// Gating on an advertised name rather than on a backend identity is the
+    /// `features` set's documented purpose, and it is what makes this change's
+    /// degraded mode provably a no-op: against a backend that does not advertise
+    /// the name, no `SetMetadata` is emitted and every materialised object looks
+    /// exactly as it did before ownership carry existed.
+    fn ownership_fidelity(&self) -> bool {
+        self.storage
+            .capabilities()
+            .features
+            .contains(capabilities::STORAGE_OWNERSHIP_FIDELITY_V1)
+    }
+    /// Give a freshly materialised shadow object the ownership of the base
+    /// object it shadows, and report whether that actually held.
+    ///
+    /// `CreateOptions` carries a mode and no uid/gid, so this is necessarily a
+    /// second operation: `create` first, ownership after. The window between
+    /// them is discussed under `parents` and `copy_up`; it is not new exposure,
+    /// because both callers run inside `prepare`, and `bind` refuses to reopen a
+    /// journal carrying a durable `Prepare` at all.
+    ///
+    /// Two error kinds are **refusals to carry**, not failures, and both leave
+    /// the object wearing umbra's ownership and let the operation stand:
+    ///
+    /// - `Denied` is the privilege answer. A non-root process cannot give an
+    ///   object away to another uid, and a base tree owned by root is the
+    ///   ordinary case for an overlay, not an exotic one.
+    /// - `UnsupportedCapability` is the *store's* answer, and it is the same
+    ///   class of refusal arriving under a different kind. An NFS export that
+    ///   does not honour SETATTR owner attributes answers `NFS4ERR_NOTSUPP`, and
+    ///   a mounted export that cannot chown answers `ENOTSUP`; both land here as
+    ///   `UnsupportedCapability`. `umbra-storage-nfs` now qualifies the
+    ///   capability with a live probe before advertising it, so this should not
+    ///   be reachable there -- but a probe is a measurement at `open_run` and an
+    ///   export can change under a live run, and `umbra-storage-nfs-userspace`
+    ///   advertises from its capability table rather than from a probe. Treating
+    ///   it as fatal would mean a store that merely declines one metadata update
+    ///   kills the run.
+    ///
+    /// Failing on either would mean "you may never overlay a tree you do not
+    /// own" or "you may never overlay onto a store that will not chown", and
+    /// `parents` runs inside `prepare` where a failure poisons the run -- so
+    /// fail-closed would not degrade the session, it would kill it. The object
+    /// keeps umbra's ownership, which is byte-for-byte what it had before this
+    /// function existed, and the divergence is recorded rather than swallowed.
+    ///
+    /// `NotImplemented` is deliberately **not** in that set. It names a deferred
+    /// or unbound code path rather than a store declining a supported request,
+    /// and swallowing it would hide exactly the wiring gap it exists to report.
+    /// Every other error propagates exactly as a `create` failure does today.
+    ///
+    /// This does not weaken the unchanged-ID `Fchownat` guarantee, which is the
+    /// one contract a silent fallback could have undermined. `resolve` admits
+    /// that sentinel only when `ownership_will_carry` holds, and that predicate
+    /// is `(stat.uid, stat.gid) == shadow_identity()` -- the base object already
+    /// wears the identity `create` gives the shadow. So on the path where the
+    /// sentinel was admitted, a refused carry is a refused *no-op*: the shadow
+    /// object carries the base's uid and gid either way, and the ID the tracee
+    /// asked to leave alone is left alone.
+    ///
+    /// The carry's own verdict is deliberately **not** returned. The one decision
+    /// that depends on it -- whether `resolve` admits an unchanged-ID `Fchownat`
+    /// -- has to be made before `prepare` flushes a journal record, which is
+    /// before this runs at all, so it is answered ahead of time by
+    /// `ownership_will_carry`. A second answer derived here, after the fact,
+    /// would be a second source of truth for one question.
+    fn carry_ownership(&mut self, path: &StoragePath, owner: (u32, u32)) -> Result<()> {
+        if !self.ownership_fidelity() {
+            return Ok(());
+        }
+        let context = self.context()?;
+        let result = self.storage.execute(&StorageRequest {
+            context,
+            operation: StorageOperation::SetMetadata {
+                path: path.clone(),
+                update: MetadataUpdate {
+                    mode: None,
+                    uid: Some(owner.0),
+                    gid: Some(owner.1),
+                    accessed_nanos: None,
+                    modified_nanos: None,
+                },
+            },
+        });
+        match result {
+            Ok(StorageResponse::MetadataSet(_)) => Ok(()),
+            Ok(_) => Err(error(
+                ErrorKind::ProtocolMismatch,
+                "invalid set_metadata response",
+            )),
+            Err(e) if matches!(e.kind, ErrorKind::Denied | ErrorKind::UnsupportedCapability) => {
+                tracing::info!(
+                    uid = owner.0,
+                    gid = owner.1,
+                    error = %e,
+                    "shadow object keeps umbra ownership: carrying the base's was refused"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+    /// The uid/gid this backend gives an object umbra creates.
+    ///
+    /// Read from the shadow root, which the backend materialised when it opened
+    /// the run and which nothing else has chowned. Asking the backend rather
+    /// than the host is what keeps this correct for all four of them: the two
+    /// syscall backends answer with the process's own identity, tar answers with
+    /// its archive convention, and the userspace NFS client answers with
+    /// whatever the server assigned -- and it is the backend's answer, not the
+    /// host's, that a carried chown has to match.
+    fn shadow_identity(&mut self) -> Result<(u32, u32)> {
+        let root = StoragePath::new(StorageAnchor::Root, Vec::new())?;
+        let stat = self
+            .shadow_stat(&root)?
+            .ok_or_else(|| error(ErrorKind::InvalidState, "shadow root is absent"))?;
+        Ok((stat.uid, stat.gid))
+    }
+    /// Whether materialising `stat`'s object in the shadow will leave it wearing
+    /// the base's ownership -- answered *before* the materialisation happens.
+    ///
+    /// `resolve` has to decide the `Fchownat` sentinel question before `prepare`
+    /// flushes a `JournalIntent::Chown`, so it cannot wait for the carry and
+    /// read the result. It predicts instead, and the prediction is sound rather
+    /// than optimistic: the one case where a chown is guaranteed to be permitted
+    /// without privilege is the one where it asks for nothing -- the base object
+    /// already wears the identity the shadow would get anyway. Anything else
+    /// (another user's object, a root-owned tree) may or may not be permitted,
+    /// cannot be known without trying, and so answers `false` and keeps the
+    /// refusal. That is per object, which is what privilege to chown actually
+    /// is: umbra may own one base file and not the one beside it.
+    fn ownership_will_carry(&mut self, stat: &BlobStat) -> Result<bool> {
+        if !self.ownership_fidelity() {
+            return Ok(false);
+        }
+        Ok((stat.uid, stat.gid) == self.shadow_identity()?)
+    }
     /// Materialise the shadow parent directories of `path`, returning the ones
     /// that were *logical* creations, in walk (root-to-leaf) order.
     ///
@@ -1104,6 +1244,51 @@ impl Overlay {
                         mode: ancestor.mode,
                     },
                 )?;
+                // Ownership after the create, because `CreateOptions` carries a
+                // mode and nothing else, and after `SHADOW_OWNER_BITS` has
+                // already been folded into that mode: a successful chown by an
+                // unprivileged process clears setuid/setgid but leaves the owner
+                // permission bits alone, so the widening survives. Ordering the
+                // other way is not available anyway -- there is no object to
+                // chown until the create has made one.
+                //
+                // `SHADOW_OWNER_BITS` is *more* load-bearing after a carry, not
+                // less. Once this ancestor wears the base's uid, umbra is no
+                // longer its owner, so POSIX applies the `other` bits to umbra's
+                // own writes into it -- and a `0o555` base directory carried to
+                // root would leave the next `create` inside it with `r-x` and an
+                // `EACCES` that poisons the run. The widening is what keeps that
+                // from happening, on the carry path exactly as on the fallback
+                // path.
+                //
+                // `shadows_base_directory` is exactly the arm the base
+                // corroborated -- a live, legible, un-whiteouted base directory
+                // -- and so is exactly the set of ancestors with a counterpart
+                // whose ownership there is to carry. Everything else is the
+                // deliberate half of the policy, not a gap: an ancestor that
+                // shadows no base directory, and one materialised over a
+                // whiteouted grave, are *new* directories and belong to umbra.
+                // They must no more wear a base object's uid than its mode.
+                //
+                // The base is asked a second time here rather than having
+                // `shadow_parent_mode` hand the uid/gid back on its return
+                // value, and the cost is one extra `stat` per carried ancestor
+                // against an immutable base. The gate is ordered so that cost is
+                // only paid where a carry can actually happen: against a backend
+                // that has not qualified ownership fidelity this walk's base
+                // traffic is byte-identical to what it was before the carry
+                // existed, which is what makes the degraded mode a true no-op
+                // rather than a nearly-identical one.
+                if ancestor.shadows_base_directory && self.ownership_fidelity() {
+                    // Swallowed exactly as `shadow_parent_mode` swallows its own
+                    // base error and for the same reason: `parents` runs inside
+                    // `prepare`, where propagating costs the run and losing one
+                    // directory's ownership fidelity costs one directory's
+                    // ownership fidelity.
+                    if let Ok(stat) = self.base().stat(&parent) {
+                        self.carry_ownership(&parent, (stat.uid, stat.gid))?;
+                    }
+                }
                 // Only the ancestors that shadow nothing count. One that shadows
                 // a live base directory publishes no *path* the run did not
                 // already expose, so leaving it standing after a reconciled
@@ -1298,7 +1483,28 @@ impl Overlay {
         if stat.kind != ObjectKind::File {
             return Err(unsupported("recursive directory copy-up is deferred"));
         }
-        self.create(path, CreateKind::File, stat.mode & 0o7777)?;
+        // `| SHADOW_OWNER_BITS`, for the reason `parents` has carried it since
+        // #56 and this site never did: the write loop below reopens the object
+        // it just created, and both syscall backends reopen it *write-only*
+        // (`OpenOptions::write(true)` in `umbra-storage-local`, `O_WRONLY` in
+        // `umbra-storage-nfs`). Opening your own `0o444` file `O_WRONLY` is
+        // `EACCES`, so copy-up of a read-only base file with content has been
+        // failing here all along, whatever its ownership -- a latent defect this
+        // line fixes and `copy_up_of_a_read_only_base_file_carries_content_and_
+        // base_ownership` pins. It is also the precondition for the carry below:
+        // the chown is emitted after the writes, so the widening has already
+        // done its work by the time umbra stops being the owner.
+        //
+        // The cost is the mode divergence #56 already accepted for directories,
+        // now also on files: a `0o444` base file reads back `0o744` in the
+        // shadow. This PR neither widens nor narrows that divergence's
+        // *justification*; it applies the existing one at the second of the
+        // engine's two create sites, which is what makes them symmetric.
+        self.create(
+            path,
+            CreateKind::File,
+            stat.mode & 0o7777 | SHADOW_OWNER_BITS,
+        )?;
         let max = (self.storage.capabilities().max_io_bytes as usize).min(MAX_IO_BYTES);
         if max == 0 {
             return Err(error(ErrorKind::ProtocolMismatch, "zero storage I/O limit"));
@@ -1330,6 +1536,15 @@ impl Overlay {
             }
             offset += read as u64;
         }
+        // Last, after every write: see the `create` above for why the order is
+        // load-bearing rather than incidental. `stat` is the base object's, so
+        // `uid`/`gid` are the base's -- `lookup` returned it from `self.base()`
+        // precisely because the shadow had nothing, which is the definition of
+        // the case this function exists for.
+        //
+        // A `Denied` carry leaves the object exactly as copy-up left it before
+        // this PR; see `carry_ownership` for why no verdict comes back from it.
+        self.carry_ownership(path, (stat.uid, stat.gid))?;
         Ok(())
     }
     fn rewrite(
@@ -1698,18 +1913,33 @@ impl NamespaceResolver for Overlay {
                     if !matches!(stat.kind, ObjectKind::File | ObjectKind::LogicalSymlink) {
                         return Err(unsupported("directory chown requires recursive copy-up"));
                     }
-                    // Copy-up recreates the object through `CreateOptions`, which
-                    // carries mode but no uid/gid, so the shadow object belongs to
-                    // whoever runs umbra. The kernel then sets only the IDs the
-                    // tracee supplied, which would make every ID it asked to leave
-                    // alone silently become ours. The sentinel means "unchanged",
-                    // and this path cannot honour that, so refuse rather than
-                    // quietly re-own the object. Once the object is in the shadow
-                    // copy-up is a no-op and the sentinel is safe, and a chown that
-                    // sets both IDs explicitly inherits nothing from the copy.
-                    if uid.is_none() || gid.is_none() {
+                    // The sentinel means "unchanged", so it is honourable only
+                    // if the shadow object the kernel is about to chown wears
+                    // the base object's ownership. Copy-up now carries it --
+                    // `copy_up` emits a `SetMetadata` after the create, because
+                    // `CreateOptions` still carries a mode and no uid/gid -- so
+                    // the refusal is no longer about a missing mechanism. What
+                    // remains is privilege, and privilege to chown is **per
+                    // object**: umbra may own one base file and not the one
+                    // beside it.
+                    //
+                    // So the refusal is per object too. `ownership_will_carry`
+                    // answers for this target only, and answers `false` unless
+                    // the carry is guaranteed -- it has to be decided here,
+                    // ahead of `prepare`, because `prepare` appends and flushes
+                    // the `Chown` intent before `copy_up` runs and a failure
+                    // after that would leave a durable record of an ownership
+                    // change that never happened, with the session poisoned and
+                    // neither Commit nor Abort written. Refusing at `resolve`,
+                    // before any journal record exists, is the same discipline
+                    // this arm has always applied; only the condition narrowed.
+                    //
+                    // Once the object is in the shadow copy-up is a no-op and
+                    // the sentinel is safe, and a chown that sets both IDs
+                    // explicitly inherits nothing from the copy.
+                    if (uid.is_none() || gid.is_none()) && !self.ownership_will_carry(stat)? {
                         return Err(unsupported(
-                            "unchanged-ID chown of a base object awaits ownership-preserving copy-up",
+                            "unchanged-ID chown of a base object umbra cannot take ownership of",
                         ));
                     }
                 }

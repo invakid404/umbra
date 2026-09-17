@@ -16,17 +16,18 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use umbra_core::Errno;
 use umbra_storage::{
     AcquireWriterRequest, BlobStat, BytePath, CreateKind, DirectoryEntry, DirectoryPage,
     Durability, DurabilityReceipt, ErrorKind, Fencing, FlushRequest, FlushScope, IdempotencyKey,
-    LeaseEpoch, ListCursor, ObjectId, ObjectKind, ObjectResult, OpenRunIntent, OpenRunRequest,
-    RequestContext, Result, RunBinding, RuntimeDirectoryBinding, Storage, StorageAnchor,
-    StorageCapabilities, StorageHandle, StorageOperation, StoragePath, StorageRequest,
-    StorageResponse, TakeoverPolicy, UmbraError, WriterLease, MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
+    LeaseEpoch, ListCursor, MetadataUpdate, ObjectId, ObjectKind, ObjectResult, OpenRunIntent,
+    OpenRunRequest, RequestContext, Result, RunBinding, RuntimeDirectoryBinding, Storage,
+    StorageAnchor, StorageCapabilities, StorageHandle, StorageOperation, StoragePath,
+    StorageRequest, StorageResponse, TakeoverPolicy, UmbraError, WriterLease,
+    MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
 };
 use uuid::Uuid;
 
@@ -364,9 +365,70 @@ impl LocalStorage {
                 };
                 Ok(StorageResponse::List(DirectoryPage { entries, next }))
             }
+            // Ownership and mode on an object already in the shadow, which is how
+            // the overlay carries a base object's uid/gid onto the shadow it
+            // materialised: `CreateOptions` carries only a mode, so the create
+            // and the ownership are two operations and this is the second.
+            //
+            // `lchown` rather than `libc::fchownat`: it is `std`, so this crate
+            // keeps its `forbid(unsafe_code)` and its dependency set (core,
+            // storage, uuid) unchanged, and its `Option<u32>` parameters *are*
+            // `MetadataUpdate`'s -- `None` means "leave this ID alone" in both.
+            // It does not follow the final symlink, matching `metadata`'s
+            // `symlink_metadata` above.
+            //
+            // Order: mode first, ownership second. A successful `chown(2)` by an
+            // unprivileged process clears setuid/setgid, so setting the mode
+            // afterwards could restore bits the kernel deliberately dropped.
+            StorageOperation::SetMetadata { path, update } => {
+                check_update(update)?;
+                let physical = self.path(path, false)?;
+                if let Some(mode) = update.mode {
+                    fs::set_permissions(&physical, fs::Permissions::from_mode(mode))
+                        .map_err(|e| io_error("set_metadata", e))?;
+                }
+                if update.uid.is_some() || update.gid.is_some() {
+                    // `PermissionDenied` is already `ErrorKind::Denied` in
+                    // `io_error`, which is what the overlay matches on to fall
+                    // back to its own uid instead of failing the operation. An
+                    // unprivileged cross-uid chown arrives here as `EPERM`.
+                    std::os::unix::fs::lchown(&physical, update.uid, update.gid)
+                        .map_err(|e| io_error("set_metadata", e))?;
+                }
+                Ok(StorageResponse::MetadataSet(metadata(&physical)?))
+            }
             _ => Err(unsupported("execute")),
         }
     }
+}
+
+/// Refuse a metadata update this backend cannot apply *before* applying any of
+/// it, so a mixed update can never half-land.
+///
+/// `umbra-storage-nfs-userspace` hardened its own SETATTR the same way and for
+/// the same reason: a caller that gets an error back has to be able to read it
+/// as "nothing happened". Timestamps are refused whole rather than dropped
+/// silently -- this backend has no caller for them, and a discarded write is the
+/// one outcome worse than an honest refusal.
+fn check_update(update: &MetadataUpdate) -> Result<()> {
+    if update.accessed_nanos.is_some() || update.modified_nanos.is_some() {
+        return Err(unsupported("set_metadata: timestamps"));
+    }
+    if update.mode.is_none() && update.uid.is_none() && update.gid.is_none() {
+        return Err(error(
+            ErrorKind::InvalidInput,
+            "set_metadata",
+            "update names nothing",
+        ));
+    }
+    if update.mode.is_some_and(|mode| mode & !0o7777 != 0) {
+        return Err(error(
+            ErrorKind::InvalidInput,
+            "set_metadata",
+            "invalid mode",
+        ));
+    }
+    Ok(())
 }
 
 fn check_io(offset: u64, len: usize) -> Result<()> {
@@ -385,9 +447,16 @@ impl Storage for LocalStorage {
         StorageCapabilities {
             // Explicitly a development store: it advertises the local mode and
             // the narrow rewrite surface, and nothing about remote durability.
+            // `STORAGE_OWNERSHIP_FIDELITY_V1` is qualified by the `SetMetadata`
+            // arm above and by `metadata`, which has read `uid`/`gid` back since
+            // this backend was written. What the flag promises is that the
+            // uid/gid a caller names are applied and a refusal is reported, not
+            // that the kernel permits every chown -- an unprivileged cross-uid
+            // chown is `Denied` here and the caller is told so.
             features: [
                 umbra_core::capabilities::STORAGE_LOCAL_DEVELOPMENT_V1.to_owned(),
                 umbra_core::capabilities::STORAGE_OPEN_REWRITE_V1.to_owned(),
+                umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned(),
             ]
             .into_iter()
             .collect(),
@@ -696,6 +765,113 @@ mod tests {
                 takeover: TakeoverPolicy::Refuse,
             })
             .unwrap()
+    }
+
+    /// `STORAGE_OWNERSHIP_FIDELITY_V1` is qualified here rather than declared in
+    /// the capability function alone: the flag means "the uid/gid a caller names
+    /// are applied and reflected in the next `Stat`", and this is the
+    /// measurement behind that claim.
+    ///
+    /// Self-chown rather than cross-uid, because CI has no second identity to
+    /// give an object to. That is the shape the claim actually covers -- it is
+    /// "what the kernel permits is applied and a refusal is reported", never
+    /// "every chown succeeds"; the refusal half is the consumer's to handle and
+    /// is exercised in `umbra-overlay` by injecting the `Denied` this maps
+    /// `EPERM` to.
+    #[test]
+    fn set_metadata_applies_mode_and_ownership_and_refuses_what_it_cannot_apply() {
+        let (_dir, mut storage, _request, lease) = setup();
+        let p = path(b"file");
+        storage.create(&context(&lease), &p, &file()).unwrap();
+        let before = storage.stat(&context(&lease), &p).unwrap();
+
+        let set = |storage: &mut LocalStorage, update: MetadataUpdate| {
+            storage.execute(&StorageRequest {
+                context: context(&lease),
+                operation: StorageOperation::SetMetadata {
+                    path: p.clone(),
+                    update,
+                },
+            })
+        };
+        let update = MetadataUpdate {
+            mode: Some(0o640),
+            uid: Some(before.uid),
+            gid: Some(before.gid),
+            accessed_nanos: None,
+            modified_nanos: None,
+        };
+        let StorageResponse::MetadataSet(stat) = set(&mut storage, update).unwrap() else {
+            panic!("set_metadata answers with the object's new stat");
+        };
+        assert_eq!(
+            (stat.mode, stat.uid, stat.gid),
+            (0o640, before.uid, before.gid)
+        );
+        // Reflected in the next `Stat`, not merely in the response.
+        let read_back = storage.stat(&context(&lease), &p).unwrap();
+        assert_eq!(
+            (read_back.mode, read_back.uid, read_back.gid),
+            (0o640, before.uid, before.gid)
+        );
+
+        // `None` is "leave this one alone", which is what lets the overlay name
+        // ownership without touching the mode `create` just settled.
+        let update = MetadataUpdate {
+            mode: None,
+            uid: Some(before.uid),
+            gid: None,
+            accessed_nanos: None,
+            modified_nanos: None,
+        };
+        set(&mut storage, update).unwrap();
+        assert_eq!(storage.stat(&context(&lease), &p).unwrap().mode, 0o640);
+
+        // Refused before anything lands, so an error means nothing happened.
+        let empty = MetadataUpdate {
+            mode: None,
+            uid: None,
+            gid: None,
+            accessed_nanos: None,
+            modified_nanos: None,
+        };
+        assert_eq!(
+            set(&mut storage, empty).unwrap_err().kind,
+            ErrorKind::InvalidInput
+        );
+        let bad_mode = MetadataUpdate {
+            mode: Some(0o40755),
+            uid: None,
+            gid: None,
+            accessed_nanos: None,
+            modified_nanos: None,
+        };
+        assert_eq!(
+            set(&mut storage, bad_mode).unwrap_err().kind,
+            ErrorKind::InvalidInput
+        );
+        let timestamp = MetadataUpdate {
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            accessed_nanos: None,
+            modified_nanos: Some(0),
+        };
+        assert_eq!(
+            set(&mut storage, timestamp).unwrap_err().kind,
+            ErrorKind::UnsupportedCapability,
+            "a timestamp refuses the whole update rather than half-applying it"
+        );
+        assert_eq!(
+            storage.stat(&context(&lease), &p).unwrap().mode,
+            0o640,
+            "and the mode it named alongside did not land"
+        );
+
+        assert!(storage
+            .capabilities()
+            .features
+            .contains(umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1));
     }
 
     #[test]

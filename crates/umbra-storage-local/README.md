@@ -7,9 +7,15 @@ session-local retry deduplication. It rejects symlink components and non-UTF-8 p
 retain their bytes. Path-based checks are not a race-proof sandbox: callers must keep
 the directory private and prevent concurrent external changes.
 
-It advertises `local-development-v1` and `experimental-open-rewrite-v1`, so a run
-must select local development explicitly; it advertises nothing about remote
-durability. Runs supply real physical paths, so the supervisor can bind kernel
+It advertises `local-development-v1`, `experimental-open-rewrite-v1` and
+`ownership-fidelity-v1`, so a run must select local development explicitly; it
+advertises nothing about remote durability. `ownership-fidelity-v1` means the
+uid/gid a `SetMetadata` names are applied through `lchown` and read back by the
+next `Stat`, not that the kernel permits every chown: an unprivileged cross-uid
+chown arrives as `Denied` and the caller is told so. `SetMetadata` applies mode,
+uid and gid; an update naming nothing or a mode outside 07777 is `InvalidInput`,
+and one naming a timestamp is `UnsupportedCapability` and applies none of the
+update. Runs supply real physical paths, so the supervisor can bind kernel
 syscall rewrites and the sandbox write root to `<root>/<run-id>/root`.
 
 Kernel shadow qualification, remote persistence, writer takeover, arbitrary xattrs,

@@ -89,6 +89,15 @@ pub struct NfsStorage {
     /// Capability advertisement reads this, so a backend built with `new` (which
     /// performs no validation) cannot claim a mount it never checked.
     validated: bool,
+    /// True only once a real ownership update succeeded against this run's store.
+    ///
+    /// Separate from `validated` because it answers a different question about a
+    /// different layer: `validated` is "this is the NFSv4 mount you named",
+    /// this is "this export honours SETATTR owner attributes from this client".
+    /// A mount can be exactly what was asked for and still refuse chown, so
+    /// neither implies the other. Reset when the run closes, because the
+    /// qualification was against *that* store.
+    ownership_qualified: bool,
 }
 #[derive(Debug)]
 struct Run {
@@ -165,6 +174,7 @@ impl NfsStorage {
             run: None,
             health: native::FlushHealth::default(),
             validated: false,
+            ownership_qualified: false,
         }
     }
     /// Validate configuration and negotiated NFSv4 immediately, for provider IPC.
@@ -319,6 +329,18 @@ impl Storage for NfsStorage {
             features: {
                 let mut features = std::collections::BTreeSet::new();
                 features.insert(umbra_core::capabilities::STORAGE_OPEN_REWRITE_V1.to_owned());
+                // Only a *measured* ownership update earns this. The syscall is
+                // always available here -- `SetMetadata` calls `fchownat`
+                // unconditionally -- so availability proves nothing: whether the
+                // update is honoured belongs to the export, not to this crate,
+                // and an export that refuses it answers `ENOTSUP`. The name's own
+                // doc comment requires qualification "against a live store, never
+                // from configuration alone", so `open_run` probes and this reads
+                // the result, exactly as the NFSv4 claim below reads `validated`.
+                if self.ownership_qualified {
+                    features
+                        .insert(umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned());
+                }
                 if self.validated {
                     features.insert(umbra_core::capabilities::STORAGE_MOUNTED_NFSV4_V1.to_owned());
                 }
@@ -419,6 +441,15 @@ impl Storage for NfsStorage {
                 "base/run/format mismatch",
             ));
         }
+        // Ask the store, before anything reads `capabilities()` -- `RunBinding`
+        // below carries the answer, so the probe has to precede it.
+        //
+        // A read-only run is never probed and never advertises: the probe is a
+        // SETATTR, `SetMetadata` is a mutation this run would refuse anyway, and
+        // qualifying a capability by performing the very mutation the policy
+        // forbids would be the wrong way round.
+        self.ownership_qualified =
+            !request.policy.read_only && native::ownership_supported(&private);
         let physical = self
             .config
             .mount_root
@@ -628,6 +659,10 @@ impl Storage for NfsStorage {
             self.flush_run(&mut || Ok(()))?;
         }
         self.run = None;
+        // The qualification was against this run's store; the next one has to
+        // earn it again. `validated` is deliberately not reset beside it -- that
+        // one is about the mount, which outlives the run.
+        self.ownership_qualified = false;
         Ok(())
     }
 }
