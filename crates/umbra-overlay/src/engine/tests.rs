@@ -253,6 +253,28 @@ struct Recorder {
     /// to be the *same* backend minus one advertisement, or the test proves
     /// nothing about the gate.
     drop_ownership_fidelity: bool,
+    /// Override the shadow backend's `storage-parent-identity-v1` advertisement
+    /// independent of platform: `Some(true)` adds the name, `Some(false)`
+    /// removes it, `None` leaves the backend's own answer.
+    ///
+    /// `LocalStorage` advertises the name on macOS and not on Linux, so an
+    /// overlay test that let the platform decide would exercise a different code
+    /// path on each. Forcing it makes the Case-A widening and the
+    /// non-advertising fallback both testable on either host.
+    force_parent_identity: Option<bool>,
+    /// Report this uid/gid for these *shadow* paths on `Stat`, the shadow-side
+    /// mirror of [`WatchedBase::force_owners`].
+    ///
+    /// `identity_at`'s Case A reads a *materialised shadow parent's* live
+    /// identity, and the property under test is that the sentinel widens against
+    /// that observation. Constructing a real shadow object owned by another
+    /// user, or bearing a gid from a real setgid parent, needs a supplementary
+    /// group and privilege CI does not portably have; reporting the identity is
+    /// enough for everything decided at `resolve`, which is where the predicate
+    /// lives. The empty path (`b""`) is the shadow root, so a test can pin the
+    /// Case-B fallback's own answer too. Intercepts `Stat` after delegating, so
+    /// only the reported uid/gid change and nothing else does.
+    force_shadow_owners: Vec<(Vec<u8>, (u32, u32))>,
 }
 impl Storage for Recorder {
     fn capabilities(&self) -> StorageCapabilities {
@@ -261,6 +283,19 @@ impl Storage for Recorder {
             capabilities
                 .features
                 .remove(capabilities::STORAGE_OWNERSHIP_FIDELITY_V1);
+        }
+        match self.force_parent_identity {
+            Some(true) => {
+                capabilities
+                    .features
+                    .insert(capabilities::STORAGE_PARENT_IDENTITY_V1.to_owned());
+            }
+            Some(false) => {
+                capabilities
+                    .features
+                    .remove(capabilities::STORAGE_PARENT_IDENTITY_V1);
+            }
+            None => {}
         }
         capabilities
     }
@@ -330,7 +365,25 @@ impl Storage for Recorder {
             }
             _ => {}
         }
-        self.inner.execute(request)
+        let response = self.inner.execute(request)?;
+        // Override the reported owner of a forced shadow path, after delegating,
+        // so `identity_at`'s Case-A read of a materialised shadow parent sees the
+        // identity the test named. Only uid/gid change; kind, mode and everything
+        // else are the backend's own answer. When `force_shadow_owners` is empty
+        // this is a no-op and the response passes straight through.
+        if let StorageOperation::Stat { path } = &request.operation {
+            if let StorageResponse::Stat(stat) = &response {
+                if let Some((_, (uid, gid))) = self.force_shadow_owners.iter().find(|(name, _)| {
+                    path.anchor() == StorageAnchor::Root && name.as_slice() == path.as_bytes()
+                }) {
+                    let mut stat = stat.clone();
+                    stat.uid = *uid;
+                    stat.gid = *gid;
+                    return Ok(StorageResponse::Stat(stat));
+                }
+            }
+        }
+        Ok(response)
     }
     fn close_run(&mut self) -> Result<()> {
         self.inner.close_run()
@@ -451,6 +504,12 @@ struct Setup<'a> {
     force_owner: Option<(u32, u32)>,
     /// Report this uid/gid for these base paths only, overriding `force_owner`.
     force_owners: &'a [(&'a [u8], (u32, u32))],
+    /// Override the shadow backend's parent-identity advertisement (see
+    /// `Recorder::force_parent_identity`).
+    force_parent_identity: Option<bool>,
+    /// Report this uid/gid for these *shadow* paths (see
+    /// `Recorder::force_shadow_owners`); `b""` is the shadow root.
+    force_shadow_owners: &'a [(&'a [u8], (u32, u32))],
 }
 
 impl Fixture {
@@ -535,7 +594,9 @@ impl Fixture {
                 .or_else(|| setup.fail_unlink.clone().map(|_| Creates::default()))
                 .or_else(|| setup.metadata.clone().map(|_| Creates::default()))
                 .or_else(|| setup.fail_metadata.clone().map(|_| Creates::default()))
-                .or_else(|| setup.drop_ownership_fidelity.then(Creates::default)),
+                .or_else(|| setup.drop_ownership_fidelity.then(Creates::default))
+                .or_else(|| setup.force_parent_identity.map(|_| Creates::default()))
+                .or_else(|| (!setup.force_shadow_owners.is_empty()).then(Creates::default)),
         ) {
             (Some(mismatch), creates) => {
                 // `BadReceipt` does not record, so a caller asking for both would
@@ -563,6 +624,12 @@ impl Fixture {
                 fail_unlink: setup.fail_unlink.unwrap_or_default(),
                 fail_metadata: setup.fail_metadata.unwrap_or_default(),
                 drop_ownership_fidelity: setup.drop_ownership_fidelity,
+                force_parent_identity: setup.force_parent_identity,
+                force_shadow_owners: setup
+                    .force_shadow_owners
+                    .iter()
+                    .map(|(name, owner)| (name.to_vec(), *owner))
+                    .collect(),
             }),
             (None, None) => Box::new(shadow),
         };
@@ -5896,6 +5963,228 @@ fn a_backend_without_ownership_fidelity_emits_no_set_metadata_at_all() {
         ErrorKind::UnsupportedCapability,
         "with nothing to carry the ownership, the sentinel refusal is unchanged"
     );
+}
+
+// #84 Case A: where the shadow parent already exists and the backend advertises
+// `storage-parent-identity-v1`, the sentinel is admitted against the parent's
+// *observed* identity rather than the shadow root's. A base object whose owner
+// matches the identity a `create` under that materialised parent will produce is
+// a true no-op to carry, so the "unchanged" chown is honourable -- and today,
+// with only the shadow-root answer, it is refused.
+#[test]
+fn an_unchanged_id_chown_is_admitted_against_a_materialised_parent_the_shadow_object_will_inherit()
+{
+    let mut f = Fixture::build(
+        &[(b"d/anchor", b"x"), (b"d/file", b"base bytes")],
+        Setup {
+            // The base target wears (4242, 4242), and the materialised shadow
+            // parent `d` is made to report the same -- the identity a child
+            // `create` under it will inherit on a parent-identity backend.
+            force_owners: &[(b"d/file", (4242, 4242))],
+            force_shadow_owners: &[(b"d", (4242, 4242))],
+            force_parent_identity: Some(true),
+            ..Setup::default()
+        },
+    );
+    // Copy a sibling up so the shadow parent `d` exists at resolve time; without
+    // this the lookup falls back to the shadow root (that is the next test).
+    f.run(&open(
+        b"d/anchor",
+        OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert!(f.shadow_root.join("d").is_dir());
+    // Today's whole answer -- the shadow root -- would refuse: umbra is not uid
+    // 4242, so the base target does not match it.
+    assert_ne!(f.overlay.shadow_identity().unwrap(), (4242, 4242));
+    // But the object will be created under `d`, which wears (4242, 4242), so the
+    // carry is a genuine no-op and the sentinel is honourable.
+    let action = f
+        .overlay
+        .resolve(&f.process, &chown(b"d/file", None, None, true))
+        .expect("the sentinel is admitted against the materialised parent");
+    assert!(matches!(action, ResolvedAction::Rewrite(_)));
+    assert!(!f.overlay.poisoned);
+}
+
+// #84's load-bearing soundness test, the fail-open guard from audit section A.3.
+// At resolve time the shadow parent usually does not exist yet, and predicting
+// its post-carry identity from the *base* parent would admit the sentinel in
+// exactly the case where the carry is then `Denied` and swallowed -- silently
+// re-owning the file. `identity_at` reads the *shadow* parent, so an absent one
+// falls back to the shadow root: today's exact, conservative answer.
+#[test]
+fn the_parent_lookup_falls_back_to_the_shadow_root_when_the_parent_is_not_materialised() {
+    let mut f = Fixture::build(
+        &[(b"d/file", b"base bytes")],
+        Setup {
+            // The A.3 trap made concrete: base dir `d` and base file `d/file`
+            // share an owner umbra is not. Reading the *base* parent would see
+            // (4242,4242) == (4242,4242) and admit; the shadow parent does not
+            // exist, so `parents` would create it as umbra, the carry would be
+            // `Denied` and swallowed, and the "unchanged" chown would have
+            // changed the owner. Reading the absent *shadow* parent refuses.
+            force_owners: &[(b"d", (4242, 4242)), (b"d/file", (4242, 4242))],
+            force_parent_identity: Some(true),
+            ..Setup::default()
+        },
+    );
+    // The base parent and the base target match -- the condition a base-parent
+    // read would (wrongly) admit on.
+    assert_eq!(base_owner(&mut f, b"d"), (4242, 4242));
+    assert_eq!(base_owner(&mut f, b"d/file"), (4242, 4242));
+    // And the shadow parent is genuinely absent, so this is Case B.
+    assert!(
+        !f.shadow_root.join("d").exists(),
+        "the shadow parent must not be materialised for this to test the fallback"
+    );
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &chown(b"d/file", None, None, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsupportedCapability,
+        "the fallback answer is the shadow root, which umbra owns and (4242,4242) does not match"
+    );
+    // Refused before anything durable or material happened -- exactly the
+    // regression this guard forbids.
+    assert!(f.log.lock().unwrap().records.is_empty());
+    assert!(!f.shadow_root.join("d/file").exists());
+    assert!(!f.overlay.poisoned);
+}
+
+// The nfs / nfs-userspace disposition (audit C-ii (a)): a backend that does not
+// advertise the name is read the old way. The same materialised-parent situation
+// the Case-A test *admits* is refused here, because the lookup is gated on the
+// advertisement and falls back to the shadow root without it.
+#[test]
+fn a_backend_that_does_not_advertise_parent_identity_keeps_the_shadow_root_answer() {
+    let mut f = Fixture::build(
+        &[(b"d/anchor", b"x"), (b"d/file", b"base bytes")],
+        Setup {
+            force_owners: &[(b"d/file", (4242, 4242))],
+            force_shadow_owners: &[(b"d", (4242, 4242))],
+            // The one difference from the Case-A test: the backend stays silent.
+            force_parent_identity: Some(false),
+            ..Setup::default()
+        },
+    );
+    f.run(&open(
+        b"d/anchor",
+        OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert!(f.shadow_root.join("d").is_dir());
+    assert!(!f.overlay.parent_identity_backend());
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &chown(b"d/file", None, None, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsupportedCapability,
+        "with the name unadvertised the answer is byte-identical to before #84"
+    );
+    assert!(!f.overlay.poisoned);
+}
+
+// The gate order: `ownership_will_carry` checks ownership fidelity *first*, so
+// the parent-identity lookup never runs against a backend that has not qualified
+// the carry. Even with the name advertised and a materialised parent that would
+// admit, the missing carry mechanism refuses.
+#[test]
+fn the_parent_identity_name_is_ignored_without_ownership_fidelity() {
+    let mut f = Fixture::build(
+        &[(b"d/anchor", b"x"), (b"d/file", b"base bytes")],
+        Setup {
+            force_owners: &[(b"d/file", (4242, 4242))],
+            force_shadow_owners: &[(b"d", (4242, 4242))],
+            force_parent_identity: Some(true),
+            drop_ownership_fidelity: true,
+            ..Setup::default()
+        },
+    );
+    f.run(&open(
+        b"d/anchor",
+        OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert!(f.shadow_root.join("d").is_dir());
+    assert!(
+        f.overlay.parent_identity_backend(),
+        "the name is advertised, so this is genuinely testing that it is ignored"
+    );
+    assert!(
+        !f.overlay.ownership_fidelity(),
+        "but ownership fidelity is not, and it is the first gate"
+    );
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &chown(b"d/file", None, None, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsupportedCapability,
+        "no carry mechanism means no admission, whatever the parent identity is"
+    );
+    assert!(!f.overlay.poisoned);
+}
+
+// Section B, the setgid gid-leak corner turned into an honest refusal. A base
+// object matching the shadow *root* (so today's answer admits it) is created
+// under a parent that will hand it a *different gid* -- a setgid, or on macOS
+// any, parent. The created object would then wear the parent's gid, not the
+// base's, and the "unchanged" chown would silently change it. Case A reads the
+// parent and refuses. Case B (parent not yet materialised) keeps today's
+// exposure: this fix reduces the corner, it does not eliminate it.
+#[test]
+fn a_setgid_parent_that_will_hand_down_its_gid_refuses_the_unchanged_id_sentinel() {
+    let mut f = Fixture::build(
+        &[(b"d/anchor", b"x"), (b"d/file", b"base bytes")],
+        Setup {
+            // The shadow root is made to report (7777, 20), so `shadow_identity`
+            // -- the Case-B fallback and today's whole answer -- is (7777, 20),
+            // and the base target wears exactly that: today's shadow-root
+            // predicate admits. The shadow parent `d` reports the same uid but
+            // gid 4242, modelling a setgid (or BSD) parent that hands a new
+            // child gid 4242 -- a real supplementary group CI cannot portably
+            // construct. Case A reads `d` and sees the mismatch.
+            force_shadow_owners: &[(b"", (7777, 20)), (b"d", (7777, 4242))],
+            force_owners: &[(b"d/file", (7777, 20))],
+            force_parent_identity: Some(true),
+            ..Setup::default()
+        },
+    );
+    f.run(&open(
+        b"d/anchor",
+        OpenFlags {
+            write: true,
+            ..OpenFlags::default()
+        },
+    ));
+    assert!(f.shadow_root.join("d").is_dir());
+    // Today's fallback answer would admit: the base target wears exactly the
+    // shadow root's (forced) identity.
+    assert_eq!(
+        f.overlay.shadow_identity().unwrap(),
+        base_owner(&mut f, b"d/file"),
+        "the base target matches the shadow root, so the old shadow-root predicate admits"
+    );
+    // But the shadow parent will hand the child gid 4242, so the carry is not a
+    // no-op and the sentinel is refused honestly instead of leaking the gid.
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &chown(b"d/file", None, None, true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsupportedCapability,
+        "the object would inherit the parent's gid, not the base's, so 'unchanged' cannot hold"
+    );
+    assert!(!f.overlay.poisoned);
 }
 
 // A store that declines the metadata update is a *refusal to carry*, not a

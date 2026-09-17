@@ -1031,6 +1031,22 @@ impl Overlay {
             .features
             .contains(capabilities::STORAGE_OWNERSHIP_FIDELITY_V1)
     }
+    /// Whether the shadow backend advertises that a new object takes its
+    /// parent directory's identity, so `identity_at` may read a materialised
+    /// shadow parent rather than fall back to the shadow root.
+    ///
+    /// Gated on the advertised name for the same reason as `ownership_fidelity`:
+    /// the created-identity rule is the backend's, not the host's, and the
+    /// overlay and the storage backend are separately spawned subprocesses, so
+    /// only the backend can qualify the claim. A backend that stays silent is
+    /// read the old way and its behaviour is byte-identical to before this
+    /// name existed.
+    fn parent_identity_backend(&self) -> bool {
+        self.storage
+            .capabilities()
+            .features
+            .contains(capabilities::STORAGE_PARENT_IDENTITY_V1)
+    }
     /// Give a freshly materialised shadow object the ownership of the base
     /// object it shadows, and report whether that actually held.
     ///
@@ -1073,11 +1089,12 @@ impl Overlay {
     /// This does not weaken the unchanged-ID `Fchownat` guarantee, which is the
     /// one contract a silent fallback could have undermined. `resolve` admits
     /// that sentinel only when `ownership_will_carry` holds, and that predicate
-    /// is `(stat.uid, stat.gid) == shadow_identity()` -- the base object already
-    /// wears the identity `create` gives the shadow. So on the path where the
-    /// sentinel was admitted, a refused carry is a refused *no-op*: the shadow
-    /// object carries the base's uid and gid either way, and the ID the tracee
-    /// asked to leave alone is left alone.
+    /// is `(stat.uid, stat.gid) == identity_at(path)` -- the base object already
+    /// wears the identity `create` gives the shadow, whether that is the shadow
+    /// root's (the fallback) or a materialised shadow parent's (the widening
+    /// #84 adds). So on the path where the sentinel was admitted, a refused
+    /// carry is a refused *no-op*: the shadow object carries the base's uid and
+    /// gid either way, and the ID the tracee asked to leave alone is left alone.
     ///
     /// The carry's own verdict is deliberately **not** returned. The one decision
     /// that depends on it -- whether `resolve` admits an unchanged-ID `Fchownat`
@@ -1121,15 +1138,21 @@ impl Overlay {
             Err(e) => Err(e),
         }
     }
-    /// The uid/gid this backend gives an object umbra creates.
+    /// The uid/gid this backend gives an object umbra creates with **no
+    /// materialised parent** -- i.e. directly under the shadow root.
     ///
     /// Read from the shadow root, which the backend materialised when it opened
     /// the run and which nothing else has chowned. Asking the backend rather
-    /// than the host is what keeps this correct for all four of them: the two
-    /// syscall backends answer with the process's own identity, tar answers with
-    /// its archive convention, and the userspace NFS client answers with
-    /// whatever the server assigned -- and it is the backend's answer, not the
-    /// host's, that a carried chown has to match.
+    /// than the host is what keeps this correct for all four of them: tar
+    /// answers with its archive convention, the userspace NFS client answers
+    /// with whatever the server assigned, and the two kernel-VFS backends answer
+    /// with the identity their kernel gives a new object under the root -- which
+    /// is the process's own identity on Linux, but on macOS is the process's uid
+    /// and the *root directory's* gid, because BSD inherits the parent's gid
+    /// unconditionally. It is the backend's answer, not the host's, that a
+    /// carried chown has to match, and this is that answer only for the root's
+    /// own children; `identity_at` reads a materialised parent instead once one
+    /// exists.
     fn shadow_identity(&mut self) -> Result<(u32, u32)> {
         let root = StoragePath::new(StorageAnchor::Root, Vec::new())?;
         let stat = self
@@ -1137,24 +1160,90 @@ impl Overlay {
             .ok_or_else(|| error(ErrorKind::InvalidState, "shadow root is absent"))?;
         Ok((stat.uid, stat.gid))
     }
-    /// Whether materialising `stat`'s object in the shadow will leave it wearing
-    /// the base's ownership -- answered *before* the materialisation happens.
+    /// The shadow path of `path`'s prospective parent directory, or `None` when
+    /// `path` names a top-level object whose parent is the anchor root.
+    ///
+    /// A `None` and a `Some(root)` would give `identity_at` the same answer --
+    /// the anchor root always exists and its identity is exactly what
+    /// `shadow_identity` reads -- so `None` simply lets the fallback issue the
+    /// one stat rather than issuing it twice. Mirrors the inline parent
+    /// computation `parents` performs, byte for byte.
+    fn parent_of(path: &StoragePath) -> Result<Option<StoragePath>> {
+        match path.as_bytes().iter().rposition(|b| *b == b'/') {
+            Some(end) => Ok(Some(StoragePath::new(
+                path.anchor(),
+                path.as_bytes()[..end].to_vec(),
+            )?)),
+            None => Ok(None),
+        }
+    }
+    /// The uid/gid this backend will give an object umbra creates at `path`.
+    ///
+    /// **Case A -- the shadow parent already exists** (a sibling was copied up
+    /// earlier in the run) and the backend advertises `storage-parent-identity-v1`:
+    /// the answer is `shadow_stat` of that parent, an *observation* of the
+    /// identity a new child under it will inherit. Exact, because it is a fact
+    /// the run has already produced, not a guess about one it might.
+    ///
+    /// The caller compares the full `(uid, gid)` pair against this, even though
+    /// a kernel-VFS backend inherits only the parent's gid and gives the child
+    /// the creating process's euid for uid (tar inherits both). That stays exact
+    /// on the strength of the premise `STORAGE_PARENT_IDENTITY_V1` records and a
+    /// future advertiser must preserve: a shadow parent wears a uid other than
+    /// the creator's euid only after a *successful*, hence privileged, carry --
+    /// under which the child's own carry also succeeds -- so the pair can differ
+    /// on uid only where the carry it gates is guaranteed anyway.
+    ///
+    /// **Case B -- the shadow parent is not yet materialised, or the backend
+    /// does not advertise the name:** falls back to `shadow_identity` -- today's
+    /// exact answer.
+    ///
+    /// The split is the whole point, and it is a soundness constraint, not an
+    /// optimisation. At `resolve` time the shadow parent *usually does not exist
+    /// yet* (`parents` materialises the shadow ancestor chain inside `prepare`,
+    /// after the predicate has answered). Predicting its eventual identity from
+    /// the **base** parent would fail open: `parents` carries the base owner
+    /// onto the new shadow ancestor with `carry_ownership`, which **swallows a
+    /// `Denied` carry**, so a base parent owned by a uid umbra cannot take would
+    /// be predicted as the shadow parent's identity, the sentinel admitted, the
+    /// durable `Chown` flushed -- and then the carry refused and the object left
+    /// wearing umbra's identity, a silent re-owning with a journal record saying
+    /// otherwise. Reading the *shadow* parent (which exists only once a real
+    /// carry has already decided its identity) or falling back to the root
+    /// cannot make that mistake: the widening happens only against an identity
+    /// that is already a fact.
+    fn identity_at(&mut self, path: &StoragePath) -> Result<(u32, u32)> {
+        if self.parent_identity_backend() {
+            if let Some(parent) = Self::parent_of(path)? {
+                if let Some(stat) = self.shadow_stat(&parent)? {
+                    return Ok((stat.uid, stat.gid));
+                }
+            }
+        }
+        self.shadow_identity()
+    }
+    /// Whether materialising `stat`'s object at `path` in the shadow will leave
+    /// it wearing the base's ownership -- answered *before* the materialisation
+    /// happens.
     ///
     /// `resolve` has to decide the `Fchownat` sentinel question before `prepare`
     /// flushes a `JournalIntent::Chown`, so it cannot wait for the carry and
     /// read the result. It predicts instead, and the prediction is sound rather
-    /// than optimistic: the one case where a chown is guaranteed to be permitted
-    /// without privilege is the one where it asks for nothing -- the base object
-    /// already wears the identity the shadow would get anyway. Anything else
-    /// (another user's object, a root-owned tree) may or may not be permitted,
-    /// cannot be known without trying, and so answers `false` and keeps the
-    /// refusal. That is per object, which is what privilege to chown actually
-    /// is: umbra may own one base file and not the one beside it.
-    fn ownership_will_carry(&mut self, stat: &BlobStat) -> Result<bool> {
+    /// than optimistic: it admits the sentinel only where the base object
+    /// already wears the identity the shadow `create` would give it anyway, so a
+    /// refused carry there is a refused *no-op*. `identity_at` supplies that
+    /// identity -- the materialised shadow parent's where one exists, the shadow
+    /// root's otherwise -- so the comparison widens against an observation and
+    /// never against a prediction. Anything else (another user's object, a
+    /// root-owned tree) may or may not be permitted, cannot be known without
+    /// trying, and so answers `false` and keeps the refusal. That is per object,
+    /// which is what privilege to chown actually is: umbra may own one base file
+    /// and not the one beside it.
+    fn ownership_will_carry(&mut self, stat: &BlobStat, path: &StoragePath) -> Result<bool> {
         if !self.ownership_fidelity() {
             return Ok(false);
         }
-        Ok((stat.uid, stat.gid) == self.shadow_identity()?)
+        Ok((stat.uid, stat.gid) == self.identity_at(path)?)
     }
     /// Materialise the shadow parent directories of `path`, returning the ones
     /// that were *logical* creations, in walk (root-to-leaf) order.
@@ -1937,7 +2026,9 @@ impl NamespaceResolver for Overlay {
                     // Once the object is in the shadow copy-up is a no-op and
                     // the sentinel is safe, and a chown that sets both IDs
                     // explicitly inherits nothing from the copy.
-                    if (uid.is_none() || gid.is_none()) && !self.ownership_will_carry(stat)? {
+                    if (uid.is_none() || gid.is_none())
+                        && !self.ownership_will_carry(stat, &path)?
+                    {
                         return Err(unsupported(
                             "unchanged-ID chown of a base object umbra cannot take ownership of",
                         ));

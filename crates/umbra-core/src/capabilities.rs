@@ -47,3 +47,47 @@ pub const NAMESPACE_RUN_LIFECYCLE_V1: &str = "namespace-run-lifecycle-v1";
 /// Advertise only after qualifying it against a live store, never from
 /// configuration alone.
 pub const STORAGE_OWNERSHIP_FIDELITY_V1: &str = "ownership-fidelity-v1";
+
+/// A new object this backend creates takes an identity it inherits from its
+/// prospective parent directory rather than from the store's own root, so a
+/// consumer predicting the object's created identity may read it from that
+/// parent. Exactly which components are inherited is per-backend and stated
+/// below; it is never *less* than the parent's gid.
+///
+/// This is a *prediction* aid, not a promise about `SetMetadata`, and it is
+/// consumed alongside [`STORAGE_OWNERSHIP_FIDELITY_V1`], never instead of it: a
+/// consumer that carries base ownership onto a shadow object uses this name to
+/// decide *which* identity a shadow `create` at a given path will produce --
+/// the materialised shadow parent's, where one exists -- and still requires
+/// ownership fidelity to carry at all. A backend that does not advertise it is
+/// queried for the store's root identity instead, which is the conservative
+/// answer that predates this name.
+///
+/// The claim is narrow and per-backend. tar advertises it unconditionally and
+/// for the whole **pair**: a new node inherits its parent node's uid *and* gid,
+/// because there is no kernel in the path to answer otherwise. A kernel-VFS
+/// backend could qualify only where its platform inherits the parent's **gid**
+/// unconditionally -- as BSD/macOS does, handing a new object its parent
+/// directory's gid with no setgid bit required -- and even then only after a
+/// live probe confirms it for the actual backing filesystem, because such a
+/// backend may sit on a mount (a network filesystem, say) whose server assigns
+/// identity instead. There the uid is *not* the parent's: `create` gives the
+/// new object the creating process's euid. No kernel-VFS backend advertises
+/// this name today -- `umbra-storage-local` leaves that qualification to a
+/// follow-up -- so tar is currently its only advertiser.
+///
+/// A consumer that compares the whole `(uid, gid)` pair against the parent is
+/// nonetheless exact on such a backend, and this is the premise a future
+/// advertiser must preserve: a shadow parent can come to wear a uid other than
+/// the creator's euid *only* through a successful ownership carry, which
+/// requires privilege, and under that privilege the child's own carry succeeds
+/// too. So on every input where the pair could disagree on uid, the carry the
+/// comparison gates is guaranteed regardless -- the uid component never widens
+/// admission unsoundly. Do **not** advertise this name for a backend whose
+/// `create` can leave a child under a foreign-uid parent while that same carry
+/// may be `Denied`: that is exactly where the pair comparison would fail open.
+/// A backend whose kernel picks the process identity except under a setgid
+/// parent (Linux), or whose server assigns identity the client never names
+/// (NFS), does not advertise it. Advertise only after qualifying it against a
+/// live store, never from configuration alone.
+pub const STORAGE_PARENT_IDENTITY_V1: &str = "storage-parent-identity-v1";

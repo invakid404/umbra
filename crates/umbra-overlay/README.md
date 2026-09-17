@@ -136,6 +136,28 @@ new resolutions are blocked while a transaction is pending.
     may own one base file and not the one beside it. A backend that does not
     advertise `ownership-fidelity-v1` carries nothing, and the refusal applies
     to every base-only target on it.
+
+    The identity a shadow `create` produces is read from the object's
+    **prospective parent**, not assumed to be the store's root, since
+    [#84](https://github.com/invakid404/umbra/issues/84). Where the backend
+    advertises `storage-parent-identity-v1` — in this PR only `umbra-storage-tar`,
+    unconditionally, because a new node inherits its parent node's uid/gid pair
+    with no kernel in the path — **and the shadow parent already exists**, the
+    sentinel is compared against that parent's *observed* identity — an object
+    created under it will inherit it, so a base object wearing it is a true no-op
+    to carry. On a backend that does not advertise the name, `umbra-storage-local`
+    included, the predicate falls back to `shadow_identity()` exactly as before
+    #84.
+    Where the parent is not yet materialised (the usual case at `resolve`,
+    before `parents` runs) or the backend stays silent, it falls back to the
+    shadow root, which is the conservative answer that predates #84. The
+    widening is therefore only ever against an identity already on disk, never a
+    prediction of one: reading the *base* parent instead would admit the
+    sentinel in exactly the case where the eventual carry is `Denied` and
+    swallowed, silently re-owning the object. One corner is **reduced, not
+    closed**: a setgid base directory can still hand a new child a gid the base
+    object does not wear, and where its shadow parent is not yet materialised the
+    fallback keeps today's exposure — tracked as a follow-up, not fixed here.
   - A **base-only directory**, because recursive directory copy-up is deferred.
     A directory already in the shadow needs no copy-up and chowns normally.
 
