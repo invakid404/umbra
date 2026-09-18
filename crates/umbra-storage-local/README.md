@@ -9,8 +9,21 @@ the directory private and prevent concurrent external changes.
 
 It advertises `local-development-v1`, `experimental-open-rewrite-v1` and
 `ownership-fidelity-v1`, so a run must select local development explicitly; it
-advertises nothing about remote durability. `ownership-fidelity-v1` means the
-uid/gid a `SetMetadata` names are applied through `lchown` and read back by the
+advertises nothing about remote durability. It advertises a fourth name,
+`storage-parent-identity-v1`, conditionally: only for a non-read-only run whose
+backing filesystem a live per-run probe has measured to hand a new object its
+parent directory's gid. There is no `cfg(target_os)` behind this — the property
+is measured, not configured — so a local-disk BSD/macOS run advertises it, while
+Linux (whose child takes the process filesystem gid absent a setgid parent) and
+any mount whose server assigns child identity stay silent. So does a single-group
+host, where the probe finds no differing group to test with, and one where the gid
+a new object would receive anyway already equals the group the probe tests with,
+since a match would then be coincidence rather than inheritance. Any error during
+the probe leaves it silent too, including a failure to remove the scratch
+directory it created: the probe never fails the run over a capability nothing has
+asked for, and never reports a measurement while its own leftovers survive.
+`ownership-fidelity-v1` means the uid/gid a `SetMetadata` names are applied
+through `lchown` and read back by the
 next `Stat`, not that the kernel permits every chown: an unprivileged cross-uid
 chown arrives as `Denied` and the caller is told so. `SetMetadata` applies mode,
 uid and gid; an update naming nothing or a mode outside 07777 is `InvalidInput`,

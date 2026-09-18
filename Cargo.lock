@@ -712,6 +712,7 @@ dependencies = [
 name = "umbra-storage-local"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "tempfile",
  "umbra-core",
  "umbra-storage",

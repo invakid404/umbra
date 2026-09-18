@@ -72,9 +72,11 @@ pub const STORAGE_OWNERSHIP_FIDELITY_V1: &str = "ownership-fidelity-v1";
 /// live probe confirms it for the actual backing filesystem, because such a
 /// backend may sit on a mount (a network filesystem, say) whose server assigns
 /// identity instead. There the uid is *not* the parent's: `create` gives the
-/// new object the creating process's euid. No kernel-VFS backend advertises
-/// this name today -- `umbra-storage-local` leaves that qualification to a
-/// follow-up -- so tar is currently its only advertiser.
+/// new object the creating process's euid. `umbra-storage-local` advertises this
+/// name too, but only for a run whose backing filesystem a live probe has
+/// measured to carry the parent's gid (BSD/macOS on local disk does; a network
+/// mount whose server assigns identity, or Linux absent a setgid parent, does
+/// not), so tar remains its only *unconditional* advertiser.
 ///
 /// A consumer that compares the whole `(uid, gid)` pair against the parent is
 /// nonetheless exact on such a backend, and this is the premise a future
