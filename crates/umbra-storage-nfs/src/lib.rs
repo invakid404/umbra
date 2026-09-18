@@ -441,26 +441,35 @@ impl Storage for NfsStorage {
                 "base/run/format mismatch",
             ));
         }
-        // Ask the store, before anything reads `capabilities()` -- `RunBinding`
-        // below carries the answer, so the probe has to precede it.
+        // Compute the qualification answer up front, but do not record it until
+        // every fallible step below has succeeded: with the assignment last, the
+        // flag can no longer outlive a failed `open_run`. `capabilities()` still
+        // reads the flag when building the `RunBinding` the caller is handed, so
+        // the answer must be recorded before that binding is built -- hence the
+        // assignment sits just above it, not at the end of `open_run`.
         //
         // A read-only run is never probed and never advertises: the probe is a
         // SETATTR, `SetMetadata` is a mutation this run would refuse anyway, and
         // qualifying a capability by performing the very mutation the policy
         // forbids would be the wrong way round.
-        self.ownership_qualified =
-            !request.policy.read_only && native::ownership_supported(&private);
+        let qualified = !request.policy.read_only && native::ownership_supported(&private);
         let physical = self
             .config
             .mount_root
             .join(OsStr::from_bytes(self.config.run_parent.as_bytes()))
             .join(id);
+        // Named apart from the `root`/`control` walk handles above, which the
+        // `Run` struct below consumes; these are the caller-facing bindings.
+        let root_binding =
+            binding(physical.join(OsStr::from_bytes(self.config.root_anchor.as_bytes())))?;
+        let control_binding =
+            binding(physical.join(OsStr::from_bytes(self.config.control_anchor.as_bytes())))?;
+        // Every fallible step above has succeeded; only now record the answer.
+        self.ownership_qualified = qualified;
         let result = RunBinding {
             run_id: request.run_id,
-            root: binding(physical.join(OsStr::from_bytes(self.config.root_anchor.as_bytes())))?,
-            control: binding(
-                physical.join(OsStr::from_bytes(self.config.control_anchor.as_bytes())),
-            )?,
+            root: root_binding,
+            control: control_binding,
             capabilities: self.capabilities(),
         };
         self.run = Some(Run {
