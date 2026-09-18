@@ -36,6 +36,14 @@ use uuid::Uuid;
 pub struct LocalStorage {
     directory: PathBuf,
     run: Option<OpenRun>,
+    /// True only once a live probe measured that this run's backing filesystem
+    /// hands a new object its parent directory's gid -- the exact property
+    /// `STORAGE_PARENT_IDENTITY_V1` names. Set in `open_run` (never for a
+    /// read-only run), read by `capabilities()`, and reset in `close_run`
+    /// because the qualification was against *that* run's store. False on a
+    /// fresh `LocalStorage`, so a `capabilities()` read before any run opens --
+    /// which the overlay does -- answers "not advertised".
+    parent_identity_qualified: bool,
 }
 
 #[derive(Debug)]
@@ -123,6 +131,7 @@ impl LocalStorage {
         Ok(Self {
             directory,
             run: None,
+            parent_identity_qualified: false,
         })
     }
 
@@ -371,9 +380,11 @@ impl LocalStorage {
             // and the ownership are two operations and this is the second.
             //
             // `lchown` rather than `libc::fchownat`: it is `std`, so this crate
-            // keeps its `forbid(unsafe_code)` and its dependency set (core,
-            // storage, uuid) unchanged, and its `Option<u32>` parameters *are*
-            // `MetadataUpdate`'s -- `None` means "leave this ID alone" in both.
+            // keeps its `forbid(unsafe_code)` -- the only foreign call it makes,
+            // supplementary-group discovery, goes through the safe
+            // `rustix::process` wrappers (see `process_groups`), so no `unsafe`
+            // appears anywhere in this crate -- and its `Option<u32>` parameters
+            // *are* `MetadataUpdate`'s -- `None` means "leave this ID alone" in both.
             // It does not follow the final symlink, matching `metadata`'s
             // `symlink_metadata` above.
             //
@@ -453,21 +464,28 @@ impl Storage for LocalStorage {
         // that the kernel permits every chown -- an unprivileged cross-uid
         // chown is `Denied` here and the caller is told so.
         //
-        // This backend deliberately does *not* advertise
-        // `STORAGE_PARENT_IDENTITY_V1`. On BSD/macOS a new object does inherit
-        // its parent directory's gid unconditionally, but `LocalStorage::new`
-        // places no restriction on the backing filesystem, so the store may sit
-        // on a network mount whose server assigns child identity instead -- and
-        // the capability's own contract forbids advertising it "from
-        // configuration alone", which a `cfg(target_os)` is. Qualifying it needs
-        // a live per-filesystem probe; that is deferred to a follow-up.
-        let features: std::collections::BTreeSet<String> = [
+        // `STORAGE_PARENT_IDENTITY_V1` is advertised only after a live per-run
+        // probe *measured* that this backing filesystem hands a new object its
+        // parent directory's gid -- never from a `cfg(target_os)`, which the
+        // capability's own contract forbids ("from configuration alone") and
+        // which would be wrong regardless: `LocalStorage::new` places no
+        // restriction on the backing filesystem, so the store may sit on a
+        // network mount whose server assigns child identity instead. `open_run`
+        // runs the probe (skipping a read-only run) and this reads its answer,
+        // exactly as the nfs backend reads its ownership qualification. A fresh
+        // store, or one whose filesystem answers otherwise, is silent -- Linux
+        // included, where the kernel gives a child the process gid absent a
+        // setgid parent, so the probe measures `false` by that rule alone.
+        let mut features: std::collections::BTreeSet<String> = [
             umbra_core::capabilities::STORAGE_LOCAL_DEVELOPMENT_V1.to_owned(),
             umbra_core::capabilities::STORAGE_OPEN_REWRITE_V1.to_owned(),
             umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned(),
         ]
         .into_iter()
         .collect();
+        if self.parent_identity_qualified {
+            features.insert(umbra_core::capabilities::STORAGE_PARENT_IDENTITY_V1.to_owned());
+        }
         StorageCapabilities {
             features,
             durability: Durability::Local,
@@ -546,6 +564,17 @@ impl Storage for LocalStorage {
                 "run/base/format mismatch",
             ));
         }
+        // Ask the store, before anything reads `capabilities()` -- `RunBinding`
+        // below carries the answer, so the probe has to precede it.
+        //
+        // A read-only run is never probed and never advertises: the probe
+        // performs a `chgrp`, a mutation this run would refuse anyway, and
+        // qualifying a capability by performing the very mutation the policy
+        // forbids would be the wrong way round. Every failure inside the probe
+        // answers `false` rather than propagating -- a store that cannot probe
+        // must not fail `open_run` over a capability nothing has asked for yet.
+        self.parent_identity_qualified =
+            !request.policy.read_only && parent_identity_probe(&directory);
         let binding = RunBinding {
             run_id: request.run_id,
             root: directory_binding(&directory.join("root"))?,
@@ -697,6 +726,10 @@ impl Storage for LocalStorage {
             ));
         }
         self.run = None;
+        // The qualification was against this run's store; the next run has to
+        // earn it again. Load-bearing: without it a closed run keeps answering
+        // "advertised" from `capabilities()` with no run open.
+        self.parent_identity_qualified = false;
         Ok(())
     }
 }
@@ -711,6 +744,187 @@ fn sync_tree(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|e| io_error("flush", e))
+}
+
+/// Removes its directory (and anything under it), so a probe leaves nothing behind
+/// under the user's storage root. `remove_dir_all`, not `remove_dir`: the probe
+/// grows children before its verdict is known. Nothing survives SIGKILL --
+/// confinement under `<root>/<run-id>/` (removed with the run) and a `uuid` name
+/// are the mitigation there.
+///
+/// Two mechanisms, not one. The success path calls `remove_now` and *fails the
+/// probe closed if removal errors*, because a run must never qualify while a
+/// `.umbra-probe-*` directory survives -- the guardrail is unconditional and
+/// `Drop` alone cannot report a failure, only swallow it. `Drop` is retained as
+/// the backstop for `?`, early `return`, and unwinding, which `remove_now` cannot
+/// cover. `remove_now` disarms the guard only *after* removal has actually
+/// succeeded, so the two never double-remove in a way that could turn a success
+/// into a spurious failure, and `Drop` still fires whenever `remove_now` did not
+/// run or did not succeed.
+struct ProbeDir<'a> {
+    path: &'a Path,
+    armed: std::cell::Cell<bool>,
+}
+
+impl<'a> ProbeDir<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            armed: std::cell::Cell::new(true),
+        }
+    }
+
+    /// Remove the probe tree now, disarming the `Drop` backstop only if removal
+    /// succeeds. On failure the guard stays armed, so `Drop` still retries.
+    fn remove_now(&self) -> std::io::Result<()> {
+        fs::remove_dir_all(self.path)?;
+        self.armed.set(false);
+        Ok(())
+    }
+}
+
+impl Drop for ProbeDir<'_> {
+    fn drop(&mut self) {
+        if self.armed.get() {
+            let _ = fs::remove_dir_all(self.path);
+        }
+    }
+}
+
+/// The supplementary group set of the calling process, or `None` if it cannot be
+/// read.
+///
+/// `getgroups(2)` -- the process credential set the kernel authorises the probe's
+/// `chgrp` against -- deliberately, not `getgrouplist(3)`: the latter returns the
+/// directory service's idea of a user's groups, a superset that can include
+/// groups absent from the process credential, so a `chgrp` to one fails `EPERM`
+/// and the probe reads a spurious `false`. `rustix::process::getgroups` wraps the
+/// same syscall as a safe fn -- doing the count-then-fill two-call form and its
+/// race handling internally -- so this crate keeps `#![forbid(unsafe_code)]`. Its
+/// `Result` is folded into the fail-closed path like every other probe error.
+fn process_groups() -> Option<Vec<u32>> {
+    Some(
+        rustix::process::getgroups()
+            .ok()?
+            .into_iter()
+            .map(|g| g.as_raw())
+            .collect(),
+    )
+}
+
+/// The process's effective gid.
+fn effective_gid() -> u32 {
+    rustix::process::getegid().as_raw()
+}
+
+/// A group the process belongs to that differs from its effective gid, or `None`
+/// when it belongs to only one group -- the indecisive case, which the contract
+/// says to answer silently (no error, no warning). Pure over its inputs so the
+/// single-group path is testable without assuming the host's group count.
+fn pick_candidate(groups: &[u32], egid: u32) -> Option<u32> {
+    groups.iter().copied().find(|&g| g != egid)
+}
+
+/// A candidate group for the live probe, or `None` on the indecisive path.
+fn candidate_group() -> Option<u32> {
+    pick_candidate(&process_groups()?, effective_gid())
+}
+
+/// The measured verdict, pure over the two gids the probe observed: the child
+/// inherited the probe directory's group, so this filesystem hands a new object
+/// its parent's group identity. Factored out so both outcomes are testable with
+/// no divergent-identity filesystem actually mounted -- injecting a diverging
+/// pair discharges the macOS+NFS acceptance case deterministically.
+fn parent_identity_matches(probe_gid: u32, child_gid: u32) -> bool {
+    child_gid == probe_gid
+}
+
+/// Perform the live probe under `run_dir`, returning the gid the filesystem gave
+/// the probe directory (after it was `chgrp`'d to `candidate`) and the gid it
+/// gave a fresh child inside it. `None` on *any* failure, on the fsgid guard, on
+/// the D1 setgid refusal, or if the explicit success-path cleanup fails -- the
+/// caller then does not advertise, the fail-closed direction.
+///
+/// The probe directory is `uuid`-named and lives directly under `<root>/<run-id>/`
+/// as a sibling of `root`/`control`, never inside the agent-visible `root/`
+/// tree. The unique name is load-bearing: `open_run` holds no lock, so two
+/// reopen-intent opens on one run dir must not collide on a fixed probe path.
+///
+/// fsgid guard: `candidate` is only guaranteed `!= getegid()`, but Linux assigns a
+/// new object's group from the process *fsgid*, which `setfsgid(2)` lets diverge
+/// from the egid. A control child reveals that default creation gid empirically;
+/// if it already equals `candidate`, the later "child gid == probe gid" comparison
+/// could not tell real parent-gid inheritance apart from the process minting
+/// `candidate` regardless, so the probe fails closed. On BSD the control child
+/// inherits the probe dir's own gid, so the guard is merely conservative there; on
+/// Linux with `fsgid == egid` it never trips because `candidate != egid` by
+/// construction.
+///
+/// D1 hardening (a setgid storage root can otherwise forge a false positive on
+/// Linux): the probe dir's mode is reset to `0o700` **first, before the control
+/// child**, clearing any setgid bit inherited from a setgid root, so the control
+/// child observes the filesystem's true default gid (the fsgid) rather than the
+/// group the probe dir only carries because it inherited setgid. Without this
+/// ordering a setgid root whose gid differs from `candidate` would let the control
+/// child read that inherited gid and slip the guard, while a divergent fsgid equal
+/// to `candidate` still forged a match after the setgid was later cleared. After
+/// the `chgrp` the probe still re-stats and (b) refuses if a setgid bit somehow
+/// survived and (c) asserts the `chgrp` actually stuck before trusting the
+/// comparison -- a silently-ignored `chgrp` would compare a gid against itself and
+/// read "equal".
+fn probe_identity(run_dir: &Path, candidate: u32) -> Option<(u32, u32)> {
+    let probe = run_dir.join(format!(".umbra-probe-{}", Uuid::new_v4()));
+    fs::create_dir(&probe).ok()?;
+    // From here every non-success exit path -- `?`, early `return`, or panic --
+    // removes the probe tree (both children included) via this guard; the success
+    // path removes it explicitly and disarms the guard, see `remove_now` below.
+    let guard = ProbeDir::new(&probe);
+    // Clear any setgid bit inherited from a setgid storage root *before* creating
+    // the control child, so the control child observes the filesystem's real
+    // default creation gid (the fsgid on Linux) rather than a setgid-inherited
+    // group. See the D1 note above.
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).ok()?;
+    // Control child: it measures the gid this filesystem hands a new object by
+    // default. If that already equals `candidate`, a match below would be a
+    // coincidence, not inheritance, so the probe must not advertise.
+    let control = probe.join("control");
+    fs::create_dir(&control).ok()?;
+    if fs::symlink_metadata(&control).ok()?.gid() == candidate {
+        return None;
+    }
+    std::os::unix::fs::chown(&probe, None, Some(candidate)).ok()?;
+    let probe_meta = fs::symlink_metadata(&probe).ok()?;
+    if probe_meta.mode() & 0o2000 != 0 {
+        return None;
+    }
+    if probe_meta.gid() != candidate {
+        return None;
+    }
+    let child = probe.join("child");
+    fs::create_dir(&child).ok()?;
+    let child_meta = fs::symlink_metadata(&child).ok()?;
+    let verdict = (probe_meta.gid(), child_meta.gid());
+    // Explicit fallible cleanup on the success path: never return a verdict while
+    // a probe directory survives under the storage root. A removal failure here
+    // fails the probe closed; on success the guard is disarmed so `Drop` does not
+    // redundantly retry.
+    guard.remove_now().ok()?;
+    Some(verdict)
+}
+
+/// Measure whether `run_dir`'s backing filesystem gives a new object its parent
+/// directory's gid. `false` on the indecisive (single-group) path and on every
+/// probe error alike; the run opens normally either way. No `cfg(target_os)`
+/// anywhere -- Linux answers `false` here by the kernel's own rule, which is the
+/// whole point of #89.
+fn parent_identity_probe(run_dir: &Path) -> bool {
+    let Some(candidate) = candidate_group() else {
+        return false;
+    };
+    match probe_identity(run_dir, candidate) {
+        Some((probe_gid, child_gid)) => parent_identity_matches(probe_gid, child_gid),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -1290,5 +1504,198 @@ mod tests {
                 })
                 .is_err());
         }
+    }
+
+    const PARENT_IDENTITY: &str = umbra_core::capabilities::STORAGE_PARENT_IDENTITY_V1;
+
+    fn run_dir(dir: &TempDir, request: &OpenRunRequest) -> PathBuf {
+        dir.path().join(request.run_id.0.to_string())
+    }
+
+    fn entries(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Injected positive and negative for the pure verdict. The negative pair is
+    /// the NFS/Linux shape -- a child whose gid diverges from the chgrp'd parent
+    /// -- and injecting it discharges the macOS+NFS acceptance case deterministically
+    /// on any platform, with no divergent-identity filesystem mounted (no CI
+    /// runner has one).
+    #[test]
+    fn parent_identity_verdict_is_gid_equality() {
+        assert!(parent_identity_matches(4242, 4242));
+        assert!(!parent_identity_matches(4242, 20));
+    }
+
+    /// A process in a single group offers no candidate, and the contract says the
+    /// probe is then silent -- not an error, not a warning. Pure over an injected
+    /// group list, so the single-group case is deterministic even on a host (most
+    /// dev machines) that in fact has several groups. When there is no candidate
+    /// the probe never reaches `probe_identity`, so the indecisive path creates
+    /// nothing to leak.
+    #[test]
+    fn single_group_process_has_no_candidate() {
+        assert_eq!(pick_candidate(&[20], 20), None);
+        assert_eq!(pick_candidate(&[], 20), None);
+        assert_eq!(pick_candidate(&[20, 12, 61], 20), Some(12));
+        // The egid need not be first, and is skipped wherever it appears.
+        assert_eq!(pick_candidate(&[12, 20], 20), Some(12));
+    }
+
+    /// The probe leaves the run directory byte-for-byte as it found it, on both
+    /// the failure and the success path. The failure path -- a chgrp that cannot
+    /// stick -- creates the probe directory and then bails, so it is the RAII
+    /// drop guard, not an explicit cleanup, that has to remove it.
+    #[test]
+    fn probe_leaves_no_residue_even_when_it_fails_midway() {
+        let (dir, _storage, request, _lease) = setup();
+        let run = run_dir(&dir, &request);
+        let before = entries(&run);
+
+        // gid `u32::MAX` is the raw `chown` "leave unchanged" sentinel ((gid_t)-1),
+        // so the chgrp is a silent no-op: `probe_meta.gid()` stays the original and
+        // the "did it stick?" guard returns `None` -- but only after the probe
+        // directory already exists. Independent of privilege, so it forces the
+        // bail even when the suite runs as root.
+        assert_eq!(probe_identity(&run, u32::MAX), None);
+        assert_eq!(
+            entries(&run),
+            before,
+            "drop guard removed the probe dir after a mid-probe bail"
+        );
+
+        // The success path (only where a real candidate exists) must be clean too.
+        if let Some(candidate) = candidate_group() {
+            let _ = probe_identity(&run, candidate);
+            assert_eq!(
+                entries(&run),
+                before,
+                "drop guard removed the probe dir after success"
+            );
+        }
+    }
+
+    /// A read-only run is never probed and never advertises parent identity:
+    /// probing would perform the very chgrp mutation the policy forbids.
+    #[test]
+    fn read_only_run_does_not_advertise_parent_identity() {
+        let (dir, mut storage, mut request, lease) = setup();
+        storage.release_writer(&lease).unwrap();
+        storage.close_run().unwrap();
+        let mut reopened = LocalStorage::new(dir.path()).unwrap();
+        request.intent = OpenRunIntent::OpenExisting;
+        request.policy.read_only = true;
+        reopened.open_run(&request).unwrap();
+        assert!(!reopened.capabilities().features.contains(PARENT_IDENTITY));
+    }
+
+    /// A fresh store advertises nothing about parent identity before any run
+    /// opens. The overlay reads `capabilities()` live, not only through
+    /// `RunBinding`, so a pre-`open_run` read must answer "not advertised".
+    #[test]
+    fn fresh_storage_does_not_advertise_parent_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(dir.path()).unwrap();
+        assert!(!storage.capabilities().features.contains(PARENT_IDENTITY));
+    }
+
+    /// `capabilities()` reads the qualified field, and `close_run` resets it --
+    /// without the reset a closed run keeps advertising with no run open.
+    #[test]
+    fn close_run_resets_parent_identity_qualification() {
+        let (_dir, mut storage, _request, lease) = setup();
+        storage.parent_identity_qualified = true;
+        assert!(storage.capabilities().features.contains(PARENT_IDENTITY));
+        storage.release_writer(&lease).unwrap();
+        storage.close_run().unwrap();
+        assert!(!storage.capabilities().features.contains(PARENT_IDENTITY));
+    }
+
+    /// The live end-to-end outcome, asserted against an *independent* ground-truth
+    /// measurement rather than a hardcoded platform expectation -- so there is no
+    /// `cfg(target_os)` even here. Skipped, with a message, on a single-group host
+    /// where the probe is indecisive by construction (E1).
+    #[test]
+    fn open_run_advertises_iff_the_filesystem_carries_parent_gid() {
+        let (dir, storage, request, _lease) = setup();
+        let run = run_dir(&dir, &request);
+        let Some(candidate) = candidate_group() else {
+            eprintln!(
+                "open_run_advertises_iff_the_filesystem_carries_parent_gid: \
+                 no candidate group on this host; skipping live assertion"
+            );
+            return;
+        };
+        // Ground truth: chgrp a fresh directory ourselves and observe whether a
+        // child inherits that gid. `open_run`'s own probe used the same candidate
+        // on the same filesystem, so the two must agree -- no platform baked in.
+        let truth = run.join("truth");
+        fs::create_dir(&truth).unwrap();
+        // Mirror the probe's ordering exactly: clear any inherited setgid *before*
+        // the control child, so the control child observes the filesystem's true
+        // default creation gid (the fsgid on Linux) rather than a setgid-inherited
+        // group -- otherwise this ground truth would be less honest than the probe
+        // it cross-checks.
+        fs::set_permissions(&truth, fs::Permissions::from_mode(0o700)).unwrap();
+        // Same fsgid guard the probe applies: if the default creation gid already
+        // equals the candidate, neither this ground truth nor the probe can tell
+        // real inheritance from coincidence, so there is nothing to cross-check --
+        // the probe fails closed and so do we.
+        fs::create_dir(truth.join("control")).unwrap();
+        if fs::symlink_metadata(truth.join("control")).unwrap().gid() == candidate {
+            eprintln!(
+                "open_run_advertises_iff_the_filesystem_carries_parent_gid: \
+                 default creation gid equals the candidate; ground truth ambiguous, skipping"
+            );
+            fs::remove_dir_all(&truth).unwrap();
+            return;
+        }
+        std::os::unix::fs::chown(&truth, None, Some(candidate)).unwrap();
+        let dir_gid = fs::symlink_metadata(&truth).unwrap().gid();
+        // Decisive only if our own chgrp stuck; otherwise neither we nor the probe
+        // learned anything and there is nothing to cross-check.
+        if dir_gid == candidate {
+            fs::create_dir(truth.join("child")).unwrap();
+            let child_gid = fs::symlink_metadata(truth.join("child")).unwrap().gid();
+            let expected = child_gid == dir_gid;
+            assert_eq!(
+                storage.capabilities().features.contains(PARENT_IDENTITY),
+                expected,
+                "open_run's probe must match a direct gid observation on this host"
+            );
+        }
+        fs::remove_dir_all(&truth).unwrap();
+    }
+
+    /// The success path removes the probe tree explicitly and disarms the guard,
+    /// so a run can never qualify while a `.umbra-probe-*` survives and `Drop`
+    /// becomes a no-op backstop.
+    ///
+    /// The cleanup-*failure* branch (removal errors after a measurement) has no
+    /// test: forcing `remove_dir_all` to fail on a tree the test owns is not
+    /// portable -- the usual permission trick that fails as a normal user
+    /// succeeds as root, which Linux CI frequently runs as, so any such test
+    /// would be flaky rather than deterministic. The branch is a plain
+    /// `.ok()?`, exercised by the same fail-closed machinery every other probe
+    /// error path uses.
+    #[test]
+    fn probe_dir_explicit_cleanup_removes_tree_and_disarms_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join(".umbra-probe-test");
+        fs::create_dir(&probe).unwrap();
+        fs::create_dir(probe.join("child")).unwrap();
+        let guard = ProbeDir::new(&probe);
+        guard.remove_now().unwrap();
+        assert!(!probe.exists(), "explicit cleanup removed the probe tree");
+        assert!(
+            !guard.armed.get(),
+            "a successful removal disarms the Drop backstop"
+        );
+        // Dropping the disarmed guard at end of scope must not error or re-remove.
     }
 }
