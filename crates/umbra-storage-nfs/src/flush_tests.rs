@@ -277,6 +277,167 @@ fn native_stat(dir: &File, name: &[u8]) -> BlobStat {
     stat(dir, name).unwrap()
 }
 
+/// The #101 hazard, pinned as a positive test so the reason the probe moved off
+/// `.provider` can never be lost: a SETATTR on the live `.provider` mid-flush bumps
+/// its ctime, the barrier catches that as `.provider` changing, and because
+/// `FlushHealth` is sticky the whole provider is poisoned -- not just one flush.
+/// This is exactly what the old `ownership_supported(&self.private)` probe did on a
+/// late finish, and exactly what `ownership_probe`'s isolated target now avoids.
+///
+/// Deterministic via the `flush_with` synchronize seam: the SETATTR fires when the
+/// barrier synchronizes `.provider` itself, between its before-stamp and its final
+/// stamp check, so the "directory changed during barrier" catch is not timing
+/// dependent.
+#[test]
+fn a_setattr_on_provider_mid_flush_poisons_health() {
+    let (temp, dir, parent) = fixture();
+    fs::create_dir(temp.path().join("run/.provider")).unwrap();
+    let provider = File::open(temp.path().join("run/.provider")).unwrap();
+    let provider_ino = provider.metadata().unwrap().ino();
+    let health = FlushHealth::default();
+    let mut fired = false;
+    let result = flush_with(&dir, &parent, &health, &mut || Ok(()), &mut |fd| {
+        sync(fd)?;
+        // When the barrier syncs `.provider`, re-apply its own ownership -- the
+        // pre-#101 probe, verbatim. A no-op in effect, but a real SETATTR bumping
+        // ctime, which the immediately following stamp check inside `flush_tree`
+        // rejects.
+        if !fired && fd.metadata().unwrap().ino() == provider_ino {
+            fired = true;
+            assert!(
+                ownership_supported(&provider),
+                "a local filesystem honours the SETATTR the old probe issued"
+            );
+        }
+        Ok(())
+    });
+    assert!(fired, "the barrier reached `.provider`'s sync");
+    let failure = result.unwrap_err();
+    assert_eq!(failure.kind, ErrorKind::InvalidState);
+    assert!(failure.context.contains("changed during barrier"));
+    // Sticky: a later clean flush still surfaces the original poisoning.
+    assert_eq!(health.check().unwrap_err(), failure);
+    assert_eq!(
+        flush(&dir, &parent, &health, &mut || Ok(())).unwrap_err(),
+        failure
+    );
+}
+
+/// The complement, and the #101 fix: the *isolated* probe running mid-flush leaves
+/// the barrier clean and health untouched. The real `ownership_probe` routine --
+/// mkdir `.umbra-probes/<uuid>` under the run parent, SETATTR, rmdir -- runs at the
+/// synchronize seam exactly as `open_run`'s bounded closure runs it, yet every one
+/// of its operations lands under the run parent's `.umbra-probes`, never in the run
+/// directory the barrier is stamping. So the flush succeeds where the `.provider`
+/// probe above poisoned it.
+#[test]
+fn an_isolated_probe_mid_flush_leaves_the_barrier_and_health_clean() {
+    let (_temp, dir, parent) = fixture();
+    let health = FlushHealth::default();
+    let mut probed = false;
+    let result = flush_with(&dir, &parent, &health, &mut || Ok(()), &mut |fd| {
+        if !probed {
+            probed = true;
+            assert!(
+                ownership_probe(&parent, &dir),
+                "a local filesystem honours the isolated probe's SETATTR"
+            );
+        }
+        sync(fd)
+    });
+    assert!(probed, "the probe ran during the barrier");
+    result.expect("an isolated probe cannot disturb the run's barrier");
+    health.check().expect("and cannot poison health");
+}
+
+/// The isolated probe leaves no residue: after a successful probe the reserved
+/// container persists but holds no `<uuid>` directory, and the target it created
+/// and removed was a sibling of the run directory on the same device -- never
+/// inside the run directory the barrier walks.
+#[test]
+fn the_isolated_probe_leaves_no_residue_outside_the_run_dir() {
+    let (temp, dir, parent) = fixture();
+    assert!(
+        ownership_probe(&parent, &dir),
+        "a local filesystem honours the isolated probe"
+    );
+
+    let probes = temp.path().join(".umbra-probes");
+    assert!(probes.is_dir(), "the reserved container persists");
+    assert_eq!(
+        fs::read_dir(&probes).unwrap().count(),
+        0,
+        "the probe removed its own uuid directory"
+    );
+    // A sibling of the run directory under the run parent, never inside the run.
+    assert!(!temp.path().join("run/.umbra-probes").exists());
+    // Same export as the run directory: the dev guard requires it.
+    let container = open(&parent, PROBES_DIR, libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap();
+    assert_eq!(
+        container.metadata().unwrap().dev(),
+        dir.metadata().unwrap().dev(),
+        "the probe container shares the run directory's device"
+    );
+}
+
+/// The probe's cleanup guard directly: `remove_now` removes the `<uuid>` dir and
+/// disarms the `Drop` backstop, and a guard whose `remove_now` never ran removes
+/// the dir on drop. Mirrors the local backend's `probe_dir_*` test.
+#[test]
+fn probe_dir_cleanup_removes_the_uuid_dir_and_disarms_drop() {
+    let (temp, _dir, parent) = fixture();
+    mkdir(&parent, PROBES_DIR, 0o700).unwrap();
+    let container = open(&parent, PROBES_DIR, libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap();
+    let name = b".umbra-probe-test".to_vec();
+    let uuid_path = temp.path().join(".umbra-probes/.umbra-probe-test");
+
+    mkdir(&container, &name, 0o700).unwrap();
+    let guard = ProbeDir::new(&container, name.clone());
+    guard.remove_now().unwrap();
+    assert!(
+        !uuid_path.exists(),
+        "explicit cleanup removed the probe dir"
+    );
+    assert!(
+        !guard.armed.get(),
+        "a successful removal disarms the Drop backstop"
+    );
+
+    // A guard that never had `remove_now` called removes on drop.
+    mkdir(&container, &name, 0o700).unwrap();
+    {
+        let _backstop = ProbeDir::new(&container, name.clone());
+    }
+    assert!(
+        !uuid_path.exists(),
+        "the Drop backstop removed the probe dir"
+    );
+}
+
+/// The dev guard is against the RUN DIRECTORY's device (audit §A.2, matching
+/// local's a4), not merely the run parent's: if `<run_parent>/<run_id>` were a
+/// mount point on another filesystem, a guard against the parent's device would
+/// pass while the probe measured the wrong export and wrongly advertised
+/// `STORAGE_OWNERSHIP_FIDELITY_V1`. A real cross-device layout needs a mount, so
+/// inject through the `ownership_probe_with` seam a run-dir device the probe target
+/// (which lives under the run parent) cannot match, and assert the probe fails
+/// closed. `u64::MAX` is guaranteed absent -- device numbers are per-filesystem.
+#[test]
+fn a_run_dir_device_the_target_cannot_match_fails_the_probe_closed() {
+    let (_temp, dir, parent) = fixture();
+    // Baseline: with the real run-dir device the probe qualifies on a local fs.
+    assert!(
+        ownership_probe(&parent, &dir),
+        "the probe qualifies when the target shares the run dir's device"
+    );
+    // Inject a mismatched run-dir device: the probe target can never sit on it, so
+    // the dev guard must answer "not qualified".
+    assert!(
+        !ownership_probe_with(&parent, u64::MAX),
+        "a probe target not on the run dir's device must not qualify"
+    );
+}
+
 /// The probe `open_run` gates `STORAGE_OWNERSHIP_FIDELITY_V1` on.
 ///
 /// It must answer `true` on a store that honours ownership updates -- a tempdir

@@ -18,10 +18,17 @@ advertised alongside it, since runs supply real physical paths for kernel syscal
 rewriting and the sandbox write root. `ownership-fidelity-v1` is advertised only
 after `open_run` **probes the live export** and the probe succeeds: whether an
 ownership update is honoured belongs to the export, not to this crate, so the
-syscall being available proves nothing. The probe sets the run's provider-private
-directory to the ownership it already has — a real SETATTR on the wire that
+syscall being available proves nothing. The probe creates a fresh `0o700`
+scratch directory at `<run_parent>/.umbra-probes/<uuid>`, outside every run, and
+sets it to the ownership it already has — a real SETATTR on the wire that
 changes nothing, deliberately not `chown(-1, -1)`, which carries no owner
-attribute and which a client may answer locally. Any failure, including the
+attribute and which a client may answer locally — then removes it. Keeping it out
+of the run means a late probe can never disturb a flush, which stamps and
+revalidates everything under the run directory and would otherwise treat the
+probe's ctime change as a barrier violation. The scratch directory must share the
+run directory's device or the probe answers "not qualified", and the probe needs
+write access to `run_parent`, so a reopen-only deployment whose `run_parent` is
+read-only is not qualified. Any failure, including the
 `ENOTSUP` an export that refuses chown returns, answers "not qualified" and the
 name is omitted; the probe never fails `open_run`. `open_run` waits at most
 five seconds for the probe, which runs on its own thread: an export that has not
@@ -133,7 +140,8 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
 - **Runtime config**: mount root, `run_parent`, `root_anchor`,
   `control_anchor` all flow through `NfsStorageConfig`. The mount root is
   supplied at runtime; `root`/`control` are configurable library defaults,
-  and `.provider` is reserved internal state. Shipped provider options carry
+  and `.provider` is reserved internal state, as is `.umbra-probes` under
+  `run_parent`. Shipped provider options carry
   only the mount root as a JSON-encoded `BytePath`; custom layout fields
   are available through the library config.
 

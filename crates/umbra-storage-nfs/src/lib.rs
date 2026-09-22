@@ -53,11 +53,13 @@ const PROBE_BUDGET: usize = 16;
 ///
 /// On timeout the thread is orphaned, not killed: it keeps running its syscalls
 /// and its verdict is discarded when it finally sends into the dropped receiver.
-/// The probe's SETATTR re-applies the ownership the run's live `.provider`
-/// directory already has, so a late finish has no lasting effect and leaves no
-/// residue -- but it targets active run state, so it can overlap an active run's
-/// flush of that directory (or a later reopen). Moving the probe onto an isolated
-/// target is tracked in #101: <https://github.com/invakid404/umbra/issues/101>.
+/// The probe's SETATTR re-applies the ownership of a fresh
+/// `<run_parent>/.umbra-probes/<uuid>/` directory umbra created and owns, never the
+/// live `.provider`, so a late finish cannot bump `.provider`'s ctime and poison a
+/// concurrent flush's sticky health. The probe removes its own `<uuid>` directory
+/// even after a late finish; the container is a persistent reserved sibling of the
+/// run directories, outside everything `flush` stamps or enumerates. This is the
+/// isolation #101 delivered: <https://github.com/invakid404/umbra/issues/101>.
 ///
 /// A process-global budget caps how many probe threads are live per backend at
 /// once -- whether still in flight or orphaned past their timeout -- at
@@ -570,14 +572,25 @@ impl Storage for NfsStorage {
         // qualifying a capability by performing the very mutation the policy
         // forbids would be the wrong way round.
         // The probe is a SETATTR a wedged export can stall on, so bound it: a
-        // timeout answers `false` like any other probe failure. The probe needs an
-        // owned handle to move into the thread; `try_clone` is a local `dup`, and a
-        // clone failure fails closed. The read-only short-circuit stays in front, so
-        // a read-only run spawns nothing.
+        // timeout answers `false` like any other probe failure. It probes an
+        // isolated `<run_parent>/.umbra-probes/<uuid>/` directory rather than the
+        // live `.provider` (#101), so it needs owned handles to the run parent (the
+        // probe's own parent) and the run directory (whose device the dev guard
+        // matches against). `try_clone` is a local `dup`, and a clone failure fails
+        // closed. The container `mkdir` and the run-dir fstat both happen inside
+        // `ownership_probe`, on the probe thread, never here -- so no new blocking
+        // I/O lands on this main thread before `bounded`. The read-only short-circuit
+        // stays in front, so a read-only run spawns nothing.
         let qualified = !request.policy.read_only
-            && private.try_clone().is_ok_and(|private| {
-                bounded(PROBE_TIMEOUT, move || native::ownership_supported(&private))
-            });
+            && parent
+                .try_clone()
+                .ok()
+                .zip(directory.try_clone().ok())
+                .is_some_and(|(parent, run_dir)| {
+                    bounded(PROBE_TIMEOUT, move || {
+                        native::ownership_probe(&parent, &run_dir)
+                    })
+                });
         let physical = self
             .config
             .mount_root
