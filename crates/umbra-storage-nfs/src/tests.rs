@@ -375,6 +375,49 @@ fn bounded_layout_never_exceeds_the_budget_and_spawns_nothing_over_it() {
     }
 }
 
+/// #103: the in-backend bounds plus the framing margin fit inside the default IPC
+/// deadline, so a wedged probe or layout surfaces its own outcome before the transport
+/// kills the provider. Visible companion to the module-level compile-time drift guard.
+#[test]
+fn open_run_bounds_fit_inside_the_default_ipc_deadline() {
+    let sum = LAYOUT_TIMEOUT.as_millis() + PROBE_TIMEOUT.as_millis() + IPC_MARGIN.as_millis();
+    assert!(
+        sum <= umbra_core::provider::DEFAULT_TIMEOUT_MS as u128,
+        "layout + probe + margin ({sum}ms) must fit inside the default IPC deadline"
+    );
+    assert_eq!(sum, 5000, "1500 + 3000 + 500 == 5000");
+}
+
+/// #103: exercise the real `LAYOUT_TIMEOUT` end to end through the `open_run_with`
+/// seam. A parked layout must time out to `StorageUnavailable` in
+/// `[LAYOUT_TIMEOUT, LAYOUT_TIMEOUT + 1s)`. It drives the per-instance `layout_live`
+/// on a fresh store, so it never touches the shared budget. Costs about
+/// `LAYOUT_TIMEOUT` of wall time.
+#[test]
+fn open_run_times_out_at_the_real_layout_timeout() {
+    let mut storage = NfsStorage::new(NfsStorageConfig::new("/tmp/umbra-nfs-test-mount"));
+    let request = layout_request(OpenRunIntent::CreateNew);
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let start = std::time::Instant::now();
+    let err = storage
+        .open_run_with(
+            &request,
+            LAYOUT_TIMEOUT,
+            move || -> Result<LayoutOutcome> {
+                let _ = release_rx.recv();
+                Err(error(ErrorKind::StorageUnavailable, "open_run", "released"))
+            },
+        )
+        .unwrap_err();
+    let elapsed = start.elapsed();
+    assert_eq!(err.kind, ErrorKind::StorageUnavailable);
+    assert!(
+        elapsed >= LAYOUT_TIMEOUT && elapsed < LAYOUT_TIMEOUT + Duration::from_secs(1),
+        "returned at the real LAYOUT_TIMEOUT ({LAYOUT_TIMEOUT:?}), not before or long after: {elapsed:?}"
+    );
+    let _ = release_tx.send(()); // release the orphan so it exits cleanly
+}
+
 /// #100 test 1: a failing layout -- what `bounded_layout` hands back on a timeout,
 /// budget exhaustion, spawn failure or panic -- surfaces before the qualification
 /// line: `StorageUnavailable`, no run installed, no ownership advertised, and health

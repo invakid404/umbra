@@ -318,6 +318,71 @@ fn scratch_server_killed_after_flush_preserves_export_bytes() {
     assert_eq!(fs::read(filename).unwrap(), expected);
 }
 
+/// #104 empirical witness: with the provider blocked in the kernel on a paused NFS
+/// mount after a request misses the IPC deadline, `drop(Proxy)` -- so `Client::drop`
+/// -- must SIGKILL and reap the child without blocking the caller for the kernel wait.
+/// On the tested macOS host SIGKILL got through in about a second; the detached reaper
+/// is defense-in-depth for the configurations that were not tested. Gated and
+/// serialized exactly like the other fault tests.
+#[test]
+#[ignore = "pauses the scratch NFS server; requires UMBRA_TEST_NFS_FAULTS=1 and an idle export"]
+fn provider_drop_after_deadline_miss_returns_promptly() {
+    let _serial = FAULT_TEST_LOCK.lock().unwrap();
+    let (_temp, config) = fixture().expect("UMBRA_TEST_NFS_MOUNT is required");
+    check_fault_target(&config);
+    let root = BytePath::new(config.mount_root.as_os_str().as_bytes().to_vec()).unwrap();
+    let mut descriptor: umbra_core::provider::ProviderDescriptor =
+        serde_json::from_str(include_str!("../provider.json")).unwrap();
+    descriptor.executable =
+        BytePath::new(env!("CARGO_BIN_EXE_umbra-storage-nfs").as_bytes().to_vec()).unwrap();
+    descriptor.options = umbra_core::provider::encode(&root).unwrap();
+    // Connect the real provider over IPC at the authoritative default deadline.
+    let mut proxy = umbra_storage::provider::Proxy::connect(
+        &descriptor,
+        umbra_core::provider::DEFAULT_TIMEOUT_MS,
+    )
+    .unwrap();
+    let req = request();
+    let run_dir = config.mount_root.join(req.run_id.0.to_string());
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(run_dir);
+    proxy.open_run(&req).unwrap();
+    let lease = proxy.acquire_writer(&writer(req.run_id)).unwrap();
+    proxy
+        .create(&ctx(&lease), &path(b"payload"), &file())
+        .unwrap();
+    proxy
+        .write_at(&ctx(&lease), &path(b"payload"), 0, &payload())
+        .unwrap();
+    let mut restore = RestoreServer(Some("unpause"));
+    docker(&["pause", SCRATCH_CONTAINER]);
+    // A barrier against the paused server blocks the provider in the kernel; the IPC
+    // deadline fires and the call returns an error before the reap under test.
+    let while_paused = proxy.flush(&FlushRequest {
+        context: ctx(&lease),
+        scope: FlushScope::EntireRun,
+    });
+    assert!(
+        while_paused.is_err(),
+        "a barrier issued against a paused server must miss the deadline"
+    );
+    // The provider is now wedged on the paused mount; dropping the proxy must not
+    // block the caller for the kernel wait.
+    let start = Instant::now();
+    drop(proxy);
+    let elapsed = start.elapsed();
+    restore.restore(); // Resume before returning so the server is left healthy.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "drop(Proxy) after a deadline miss returned in {elapsed:?}, not blocked on the wedged mount"
+    );
+}
+
 #[test]
 fn crud_bytes_pagination_and_durability() {
     let Some((_temp, mut config)) = fixture() else {

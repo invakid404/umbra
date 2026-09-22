@@ -7,6 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const PROTOCOL_VERSION: u32 = 2;
 /// Maximum encoded frame size, checked before allocating a payload.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+/// Default per-request IPC deadline, in milliseconds, when a registry omits
+/// `timeout_ms`. This is the authoritative bound on every provider call (see
+/// [`Connection`]): storage backends size their in-backend `PROBE_TIMEOUT` and
+/// `LAYOUT_TIMEOUT` to fit inside it, and each backend compile-time-asserts that
+/// they, plus a framing margin, do not exceed it.
+pub const DEFAULT_TIMEOUT_MS: u64 = 5000;
 /// Explicit installed executable; runtime paths/options never enter checkpoints.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,11 +40,19 @@ pub struct ProviderRegistry {
     /// Providers.
     pub providers: BTreeMap<String, ProviderDescriptor>,
     #[serde(default = "default_timeout")]
-    /// Timeout ms.
+    /// Authoritative per-request IPC deadline, in milliseconds, applied to every
+    /// provider call on the connection. Defaults to [`DEFAULT_TIMEOUT_MS`] when
+    /// omitted and must lie in `1..=60000` (see [`ProviderRegistry::validate`]).
+    ///
+    /// It is the outer bound on the whole request: a storage backend's own
+    /// in-backend bounds (`PROBE_TIMEOUT` + `LAYOUT_TIMEOUT` + a framing margin) are
+    /// sized to sum inside the default so their own outcome surfaces before the
+    /// transport gives up. A value below roughly that sum (~4.5s) shadows those
+    /// in-backend bounds, making this deadline win instead.
     pub timeout_ms: u64,
 }
 fn default_timeout() -> u64 {
-    5000
+    DEFAULT_TIMEOUT_MS
 }
 impl ProviderRegistry {
     /// Validate.
@@ -176,4 +190,21 @@ pub struct NamespaceConnections {
     pub timeout_ms: u64,
     /// Configuration or behavior options defined by the enclosing contract.
     pub options: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_timeout_matches_the_authoritative_constant() {
+        assert_eq!(DEFAULT_TIMEOUT_MS, 5000);
+        assert_eq!(default_timeout(), DEFAULT_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn a_registry_without_timeout_ms_deserializes_to_the_default_deadline() {
+        let registry: ProviderRegistry = serde_json::from_str(r#"{"providers":{}}"#).unwrap();
+        assert_eq!(registry.timeout_ms, DEFAULT_TIMEOUT_MS);
+    }
 }

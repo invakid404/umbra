@@ -26,7 +26,7 @@ Its scratch directory lives at `<root>/.umbra-probes/<uuid>`, a reserved sibling
 the run directories rather than inside one, so a flush (which walks only the run
 directory) never meets it and a late probe cannot disturb the run it was opened for;
 the probe answers silently if that directory is not on the run directory's
-filesystem. The probe runs on its own thread and `open_run` waits at most five seconds for
+filesystem. The probe runs on its own thread and `open_run` waits at most 1.5 seconds for
 it: a probe that has not answered by then (an unresponsive network mount, say)
 also leaves the run silent and logs a `tracing` warning, and the stalled probe
 thread is left to finish or clean up on its own. At most sixteen probe threads run
@@ -34,7 +34,7 @@ per backend at once; once that many are outstanding a further open answers
 silently without starting another, so a wedged mount strands at most sixteen. Only
 the probe is bounded by that wait. `open_run`'s own layout I/O on the storage root (creating
 and validating `<root>/<run-id>/` and reading its manifest) runs on a separate thread
-too, and `open_run` waits at most thirty seconds for it: past that, `open_run` fails
+too, and `open_run` waits at most 3 seconds for it: past that, `open_run` fails
 with `StorageUnavailable` and a `tracing` warning, publishes no binding, and leaves
 the stalled thread to finish on its own. Nothing is rolled back. Late layout work
 stays inside `<root>/<run-id>/`, and a run whose layout never completed is refused on

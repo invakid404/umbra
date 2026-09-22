@@ -24,10 +24,13 @@ const LEASE_MILLIS: u64 = 60_000;
 const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Timeout bounding a single qualification probe. A healthy probe is a handful of
-/// syscalls (local) or two RPCs (nfs), in the millisecond range even over a WAN,
-/// so five seconds is >100x headroom over a slow-but-healthy export while keeping
-/// a wedged-mount startup delay tolerable.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// syscalls (local) or two RPCs (nfs), in the millisecond range even over a WAN, so
+/// 1.5 seconds is generous headroom over a slow-but-healthy export -- and it survives
+/// one NFS retransmit tick on top of a normal probe -- while still fitting, together
+/// with `LAYOUT_TIMEOUT` and `IPC_MARGIN`, inside the default IPC deadline (#103) so a
+/// timed-out probe's `false` verdict reaches IPC callers rather than the transport
+/// deadline killing the provider first.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The most probe threads allowed live per backend at once (in flight or orphaned
 /// past their timeout). `open_run` is `&mut self`, so a healthy provider runs at
@@ -143,19 +146,36 @@ fn bounded_with(
 /// than a qualification probe -- two subprocesses (`mount`/`nfsstat`), ~12 walks, six
 /// MKDIRs, two exclusive CREATEs and six COMMIT-backed fsyncs -- so it needs more
 /// headroom than `PROBE_TIMEOUT`: on a loaded server with slow stable storage a
-/// healthy layout can reach low seconds, and 30s is roughly 10x over a bad-but-healthy
-/// case while still bounding a wedged mount to an `open_run` that fails in
-/// `LAYOUT_TIMEOUT + PROBE_TIMEOUT` rather than never.
+/// healthy layout can reach hundreds of ms, and 3s is roughly 20x over the worst
+/// healthy `open_run` measured while still bounding a wedged mount to an `open_run`
+/// that fails in `LAYOUT_TIMEOUT + PROBE_TIMEOUT` rather than never.
 ///
-/// Trade-offs accepted (#100): an NFSv4 server grace period (default 90s after a
-/// server restart) makes CREATE/OPEN return NFS4ERR_GRACE; with this bound an
-/// `open_run` issued during grace fails fast and retryable rather than succeeding
-/// late. And where the caller reaches this backend through the provider IPC proxy,
-/// that transport's own request deadline (default 5s) fires first, so this bound
-/// only shortens time-to-fail for in-process callers and registries with a large
-/// `timeout_ms`. It is still the only bound for those paths, and the late-work safety
-/// it enables is a correctness fix regardless of which deadline wins.
-const LAYOUT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Trade-offs (#103, inverting the earlier #100 note): an NFSv4 server grace period
+/// (default 90s after a server restart) makes CREATE/OPEN return NFS4ERR_GRACE; with
+/// this bound an `open_run` issued during grace fails fast and retryable rather than
+/// succeeding late. And `LAYOUT_TIMEOUT + PROBE_TIMEOUT + IPC_MARGIN` is now sized to
+/// sum inside the default IPC deadline (see `IPC_MARGIN` and the drift guard below),
+/// so where the caller reaches this backend through the provider IPC proxy this
+/// in-backend bound fires *first* -- its `StorageUnavailable` and distinguishing
+/// `tracing` warning surface, rather than the transport deadline killing the provider.
+/// In-process callers and registries with a large `timeout_ms` still fail here too.
+/// The late-work safety it enables is a correctness fix regardless of which deadline
+/// wins.
+const LAYOUT_TIMEOUT: Duration = Duration::from_millis(3000);
+
+/// Framing, spawn and scheduling headroom reserved under the default IPC deadline so
+/// `PROBE_TIMEOUT` and `LAYOUT_TIMEOUT` sum strictly inside it. Byte-identical in the
+/// local and nfs backends; measured proxy overhead is well under 5ms.
+const IPC_MARGIN: Duration = Duration::from_millis(500);
+
+// Drift guard (#103): the in-backend bounds plus the framing margin must fit inside
+// the registry's default per-request IPC deadline, so a wedged probe or layout
+// surfaces its own outcome before the transport kills the provider. Any future bump
+// that breaks this is a build failure, here and in the nfs backend.
+const _: () = assert!(
+    LAYOUT_TIMEOUT.as_millis() + PROBE_TIMEOUT.as_millis() + IPC_MARGIN.as_millis()
+        <= umbra_core::provider::DEFAULT_TIMEOUT_MS as u128
+);
 
 /// The most layout threads allowed live per provider at once (in flight or orphaned
 /// past their timeout). Each stranded layout thread is an `open_run` that already
