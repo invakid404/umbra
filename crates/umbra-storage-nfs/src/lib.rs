@@ -14,7 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 use umbra_core::*;
@@ -139,6 +139,137 @@ fn bounded_with(
     }
 }
 
+/// Timeout bounding the whole `open_run` layout phase. The layout does far more work
+/// than a qualification probe -- two subprocesses (`mount`/`nfsstat`), ~12 walks, six
+/// MKDIRs, two exclusive CREATEs and six COMMIT-backed fsyncs -- so it needs more
+/// headroom than `PROBE_TIMEOUT`: on a loaded server with slow stable storage a
+/// healthy layout can reach low seconds, and 30s is roughly 10x over a bad-but-healthy
+/// case while still bounding a wedged mount to an `open_run` that fails in
+/// `LAYOUT_TIMEOUT + PROBE_TIMEOUT` rather than never.
+///
+/// Trade-offs accepted (#100): an NFSv4 server grace period (default 90s after a
+/// server restart) makes CREATE/OPEN return NFS4ERR_GRACE; with this bound an
+/// `open_run` issued during grace fails fast and retryable rather than succeeding
+/// late. And where the caller reaches this backend through the provider IPC proxy,
+/// that transport's own request deadline (default 5s) fires first, so this bound
+/// only shortens time-to-fail for in-process callers and registries with a large
+/// `timeout_ms`. It is still the only bound for those paths, and the late-work safety
+/// it enables is a correctness fix regardless of which deadline wins.
+const LAYOUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most layout threads allowed live per provider at once (in flight or orphaned
+/// past their timeout). Each stranded layout thread is an `open_run` that already
+/// failed; after this many the mount is clearly wedged, so further opens fail fast
+/// without spawning. Separate from `PROBE_BUDGET` -- a wedged layout must never
+/// starve the probe budget or vice versa.
+const LAYOUT_BUDGET: usize = 4;
+
+/// Run the `open_run` layout phase `f` on a dedicated thread and return its result,
+/// or `StorageUnavailable` if it does not finish within `timeout`.
+///
+/// This is the layout counterpart of [`bounded`], kept as a separate `Result`-typed
+/// generic helper because `bounded`/`bounded_with` are `bool`-typed and part of the
+/// untouched probe mechanism (#91). Every non-answer surfaces as `StorageUnavailable`
+/// -- the same kind the IPC transport uses for a deadline miss -- so a wedged mount
+/// fails `open_run` closed rather than hanging it:
+///   - a timeout returns `StorageUnavailable` and logs;
+///   - budget exhaustion returns `StorageUnavailable` immediately, without spawning;
+///   - a spawn failure returns `StorageUnavailable` rather than panicking;
+///   - a panicking layout drops the sender, so `Disconnected` also fails closed.
+///
+/// On timeout the thread is orphaned, not killed (a hard-mount D-state thread cannot
+/// be killed anyway): it keeps running its syscalls with owned inputs, its **own**
+/// `FlushHealth`, and no reference to `self`, so it can never touch the installed
+/// run, `self.health` or `self.validated`. Its late work touches only
+/// `<run_parent>/<run_id>/**` (plus a no-enumeration parent fsync) and leaves at most
+/// the same partial-layout residue a crash mid-`CreateNew` leaves today, which the
+/// reopen validation already refuses; there is deliberately no rollback (#100).
+///
+/// The `live` counter is the calling provider's own (`NfsStorage::layout_live`), not
+/// a process-global `static` -- see that field. That is the one shape difference from
+/// the probe's process-global [`bounded_with`]; the reserve-before-spawn,
+/// `Slot`-on-thread and `Builder::spawn` structure is otherwise identical.
+fn bounded_layout<T: Send + 'static>(
+    live: &Arc<AtomicUsize>,
+    timeout: Duration,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    bounded_layout_with(live, LAYOUT_BUDGET, timeout, f)
+}
+
+/// The core of [`bounded_layout`], parameterised over the `live`-thread counter and
+/// its `budget` so tests can exercise the guard against a private counter with a
+/// small budget. Mirrors [`bounded_with`]'s reserve-before-spawn shape, but is
+/// `Result`-typed and reserves against a per-provider (rather than `'static`) count.
+fn bounded_layout_with<T: Send + 'static>(
+    live: &Arc<AtomicUsize>,
+    budget: usize,
+    timeout: Duration,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    // Reserve one of the `budget` live-thread slots atomically before spawning, so
+    // concurrent callers can never collectively exceed it. Over budget fails closed.
+    if live
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < budget).then_some(n + 1)
+        })
+        .is_err()
+    {
+        tracing::warn!(budget, "layout budget exhausted; mount unresponsive");
+        return Err(error(
+            ErrorKind::StorageUnavailable,
+            "open_run",
+            "layout budget exhausted; mount unresponsive",
+        ));
+    }
+    let (tx, rx) = mpsc::channel();
+    let slot_live = Arc::clone(live);
+    if thread::Builder::new()
+        .name("umbra-layout".into())
+        .spawn(move || {
+            // Releases the reserved slot when this thread exits -- normal return or
+            // panic. Held for the layout's whole life, so a timed-out (orphaned)
+            // thread keeps its slot until it finally finishes.
+            struct Slot(Arc<AtomicUsize>);
+            impl Drop for Slot {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _slot = Slot(slot_live);
+            let _ = tx.send(f());
+        })
+        .is_err()
+    {
+        // The thread never started, so release the reservation the caller made.
+        live.fetch_sub(1, Ordering::AcqRel);
+        return Err(error(
+            ErrorKind::StorageUnavailable,
+            "open_run",
+            "layout thread spawn failed",
+        ));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                timeout_secs = timeout.as_secs_f64(),
+                "layout I/O timed out; mount unresponsive"
+            );
+            Err(error(
+                ErrorKind::StorageUnavailable,
+                "open_run",
+                "layout I/O timed out; mount unresponsive",
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(error(
+            ErrorKind::StorageUnavailable,
+            "open_run",
+            "layout thread panicked",
+        )),
+    }
+}
+
 /// Runtime layout, separate from persistent run identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NfsStorageConfig {
@@ -217,6 +348,13 @@ pub struct NfsStorage {
     /// neither implies the other. Reset when the run closes, because the
     /// qualification was against *that* store.
     ownership_qualified: bool,
+    /// Count of live layout threads for *this* provider (in flight or orphaned past
+    /// their timeout), the budget [`bounded_layout`] reserves against. Held per
+    /// instance rather than in a process-global `static` so independent providers
+    /// sharing a process never refuse one another's opens; `open_run` is `&mut self`,
+    /// so a healthy provider keeps this at 0 or 1 and it only climbs toward
+    /// `LAYOUT_BUDGET` as a wedged mount strands threads (#100).
+    layout_live: Arc<AtomicUsize>,
 }
 #[derive(Debug)]
 struct Run {
@@ -236,6 +374,133 @@ struct Page {
     directory: File,
     entries: native::Entries,
     stamp: (u64, i64, i64, i64, i64),
+}
+/// What the layout closure hands back through [`bounded_layout`]: the `validated`
+/// flag to apply, the thread-owned `FlushHealth` to merge into `self.health`, and the
+/// layout result itself. The layout's own success or failure travels inside the inner
+/// `Result` so its error kind (e.g. `ProtocolMismatch`) reaches the caller unchanged;
+/// the outer `Result` from `bounded_layout` carries only the bounding failures.
+type LayoutOutcome = (bool, native::FlushHealth, Result<Layout>);
+
+/// The owned handles the `open_run` layout phase produces and hands back to the main
+/// thread, which installs them into [`Run`]. `File` is `Send`, so they cross the
+/// [`bounded_layout`] thread boundary intact.
+#[derive(Debug)]
+struct Layout {
+    mount: File,
+    parent: File,
+    directory: File,
+    root: File,
+    control: File,
+    private: File,
+}
+
+/// The blocking layout phase of `open_run`, factored into free functions over owned
+/// inputs so it can run on a supervised thread (see [`bounded_layout`]) and so a
+/// wedged mount stalls that thread rather than `open_run` itself. This validates the
+/// mount, then performs every filesystem operation `open_run` does before the
+/// qualification probe. It never touches `self`: `validated` is *returned* (as today
+/// it was set right after `mount::validate` and persisted regardless of later
+/// failure), and every persistence outcome is recorded into the caller-supplied
+/// thread-owned `health` rather than `self.health` (#100 h1).
+///
+/// `validated` comes back `true` on any return once `mount::validate` succeeds, so
+/// the main thread can reproduce the old "set once, keep even if a later step fails"
+/// semantics; it is `false` only when the mount itself failed to validate.
+fn nfs_layout(
+    config: &NfsStorageConfig,
+    request: &OpenRunRequest,
+    health: &native::FlushHealth,
+) -> (bool, Result<Layout>) {
+    if let Err(e) = mount::validate(&config.mount_root) {
+        return (false, Err(e));
+    }
+    (true, nfs_layout_walk(config, request, health))
+}
+
+/// The post-`mount::validate` half of [`nfs_layout`]: open `/`, walk the configured
+/// absolute mount path (rejecting every symlink) and the run parent, then build or
+/// validate the run layout beneath it.
+fn nfs_layout_walk(
+    config: &NfsStorageConfig,
+    request: &OpenRunRequest,
+    health: &native::FlushHealth,
+) -> Result<Layout> {
+    let slash = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open("/")
+        .map_err(|e| io("mount root", e))?;
+    let mount = native::walk(
+        &slash,
+        &config.mount_root.as_os_str().as_bytes()[1..],
+        false,
+    )?;
+    let parent = native::walk(&mount, config.run_parent.as_bytes(), false)?;
+    nfs_layout_at(mount, parent, config, request, health)
+}
+
+/// The layout body proper, once the run `parent` directory FD is in hand: the
+/// `CreateNew` mkdir/create chain (each observed into `health`), then the reopen
+/// validation both intents share. Moved verbatim from `open_run` apart from
+/// `self.health` -> `health`; the run-dir `mkdir` stays the first `CreateNew`
+/// mutation (the exclusive claim, #100 n1). Split out from [`nfs_layout_walk`] so
+/// unit tests can drive it against a local tempdir parent without a real NFS mount.
+fn nfs_layout_at(
+    mount: File,
+    parent: File,
+    config: &NfsStorageConfig,
+    request: &OpenRunRequest,
+    health: &native::FlushHealth,
+) -> Result<Layout> {
+    let id = request.run_id.0.to_string();
+    let expected = serde_json::to_vec(&(
+        request.run_id,
+        &request.immutable_base,
+        request.policy.format_version,
+    ))
+    .map_err(json_error)?;
+    if request.intent == OpenRunIntent::CreateNew {
+        health.observe(native::mkdir(&parent, id.as_bytes(), 0o700))?;
+    }
+    let directory = native::walk(&parent, id.as_bytes(), false)?;
+    if request.intent == OpenRunIntent::CreateNew {
+        health.observe(native::mkdir(
+            &directory,
+            config.root_anchor.as_bytes(),
+            0o700,
+        ))?;
+        health.observe(native::mkdir(
+            &directory,
+            config.control_anchor.as_bytes(),
+            0o700,
+        ))?;
+        health.observe(native::mkdir(&directory, b".provider", 0o700))?;
+        let private = native::walk(&directory, b".provider", false)?;
+        health.observe(native::mkdir(&private, b"retries", 0o700))?;
+        health.observe(create_file(&private, b"epoch", &0u64.to_le_bytes()))?;
+        health.observe(create_file(&private, b"manifest", &expected))?;
+        health.observe(native::sync(&directory))?;
+        health.observe(native::sync(&parent))?;
+    }
+    let root = native::walk(&directory, config.root_anchor.as_bytes(), false)?;
+    let control = native::walk(&directory, config.control_anchor.as_bytes(), false)?;
+    let private = native::walk(&directory, b".provider", false)?;
+    if read_file(&private, b"manifest")? != expected {
+        return Err(error(
+            ErrorKind::ProtocolMismatch,
+            "open_run",
+            "base/run/format mismatch",
+        ));
+    }
+    Ok(Layout {
+        mount,
+        parent,
+        directory,
+        root,
+        control,
+        private,
+    })
 }
 fn read_file(dir: &File, name: &[u8]) -> Result<Vec<u8>> {
     let file = native::regular(dir, name, libc::O_RDONLY)?;
@@ -294,6 +559,7 @@ impl NfsStorage {
             health: native::FlushHealth::default(),
             validated: false,
             ownership_qualified: false,
+            layout_live: Arc::new(AtomicUsize::new(0)),
         }
     }
     /// Validate configuration and negotiated NFSv4 immediately, for provider IPC.
@@ -312,6 +578,133 @@ impl NfsStorage {
         self.run
             .as_ref()
             .ok_or_else(|| error(ErrorKind::InvalidState, "run", "no run open"))
+    }
+    /// The body of [`open_run`](Storage::open_run) with the layout phase supplied as
+    /// a parameter, so the real caller passes `LAYOUT_TIMEOUT` and the true
+    /// `nfs_layout`, while tests pass a shorter timeout or a closure that parks or
+    /// injects an outcome -- no `cfg(test)` hook in the product path (mirrors the
+    /// `bounded`/`bounded_with` and `flush`/`flush_with` seams). `self.health.check()`
+    /// stays first on this thread, then the precondition checks, `config.validate()`,
+    /// the unchanged qualification probe, the #92 flag ordering and the run install;
+    /// only the blocking `layout` runs on the supervised thread `bounded_layout`
+    /// spawns.
+    fn open_run_with(
+        &mut self,
+        request: &OpenRunRequest,
+        timeout: Duration,
+        layout: impl FnOnce() -> Result<LayoutOutcome> + Send + 'static,
+    ) -> Result<RunBinding> {
+        self.health.check()?;
+        if self.run.is_some() {
+            return Err(error(ErrorKind::InvalidState, "open_run", "already open"));
+        }
+        if request.policy.require_kernel_shadow || request.policy.require_strict_remote_persistence
+        {
+            return Err(unsupported("run policy"));
+        }
+        if request.policy.format_version != 1 {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "open_run",
+                "expected format version 1",
+            ));
+        }
+        if request.policy.read_only && request.intent == OpenRunIntent::CreateNew {
+            return Err(error(ErrorKind::Denied, "open_run", "read-only create"));
+        }
+        self.config.validate()?;
+        // Run the blocking layout on a supervised thread. A timeout, budget
+        // exhaustion, spawn failure or panic all surface as `StorageUnavailable`
+        // before the qualification line, so a failed layout never advertises a
+        // capability and never spawns a probe -- the #92 ordering is unchanged.
+        let (validated, thread_health, layout_result) =
+            bounded_layout(&self.layout_live, timeout, layout)?;
+        // `validated` is applied on any in-time return, matching the old
+        // `self.validated = true` that ran right after `mount::validate` and
+        // persisted even if a later step failed. On a timeout `bounded_layout`
+        // returns above, so `self.validated` is left unchanged (fails closed).
+        if validated {
+            self.validated = true;
+        }
+        // Merge the thread-owned health: an in-time `observe` failure poisons
+        // `self.health` with the identical `uncertain`-prefixed error today's inline
+        // `self.health.observe(..)?` would have. A non-`observe` failure (a walk, a
+        // manifest mismatch) leaves the thread health clean, so `self.health` is not
+        // poisoned -- exactly as before. A timeout never reaches here (h1).
+        if let Err(poison) = thread_health.check() {
+            self.health.fail(poison);
+        }
+        let Layout {
+            mount,
+            parent,
+            directory,
+            root,
+            control,
+            private,
+        } = layout_result?;
+        // Compute the qualification answer up front, but do not record it until
+        // every fallible step below has succeeded: with the assignment last, the
+        // flag can no longer outlive a failed `open_run`. `capabilities()` still
+        // reads the flag when building the `RunBinding` the caller is handed, so
+        // the answer must be recorded before that binding is built -- hence the
+        // assignment sits just above it, not at the end of `open_run`.
+        //
+        // A read-only run is never probed and never advertises: the probe is a
+        // SETATTR, `SetMetadata` is a mutation this run would refuse anyway, and
+        // qualifying a capability by performing the very mutation the policy
+        // forbids would be the wrong way round.
+        // The probe is a SETATTR a wedged export can stall on, so bound it: a
+        // timeout answers `false` like any other probe failure. It probes an
+        // isolated `<run_parent>/.umbra-probes/<uuid>/` directory rather than the
+        // live `.provider` (#101), so it needs owned handles to the run parent (the
+        // probe's own parent) and the run directory (whose device the dev guard
+        // matches against). `try_clone` is a local `dup`, and a clone failure fails
+        // closed. The container `mkdir` and the run-dir fstat both happen inside
+        // `ownership_probe`, on the probe thread, never here -- so no new blocking
+        // I/O lands on this main thread before `bounded`. The read-only short-circuit
+        // stays in front, so a read-only run spawns nothing.
+        let qualified = !request.policy.read_only
+            && parent
+                .try_clone()
+                .ok()
+                .zip(directory.try_clone().ok())
+                .is_some_and(|(parent, run_dir)| {
+                    bounded(PROBE_TIMEOUT, move || {
+                        native::ownership_probe(&parent, &run_dir)
+                    })
+                });
+        let id = request.run_id.0.to_string();
+        let physical = self
+            .config
+            .mount_root
+            .join(OsStr::from_bytes(self.config.run_parent.as_bytes()))
+            .join(id);
+        // Named apart from the `root`/`control` walk handles above, which the
+        // `Run` struct below consumes; these are the caller-facing bindings.
+        let root_binding =
+            binding(physical.join(OsStr::from_bytes(self.config.root_anchor.as_bytes())))?;
+        let control_binding =
+            binding(physical.join(OsStr::from_bytes(self.config.control_anchor.as_bytes())))?;
+        // Every fallible step above has succeeded; only now record the answer.
+        self.ownership_qualified = qualified;
+        let result = RunBinding {
+            run_id: request.run_id,
+            root: root_binding,
+            control: control_binding,
+            capabilities: self.capabilities(),
+        };
+        self.run = Some(Run {
+            request: request.clone(),
+            directory,
+            parent,
+            mount,
+            root,
+            control,
+            private,
+            lease: None,
+            pages: HashMap::new(),
+        });
+        Ok(result)
     }
     fn anchor(&self, path: &StoragePath) -> Result<&File> {
         let run = self.run()?;
@@ -482,146 +875,19 @@ impl Storage for NfsStorage {
         }
     }
     fn open_run(&mut self, request: &OpenRunRequest) -> Result<RunBinding> {
-        self.health.check()?;
-        if self.run.is_some() {
-            return Err(error(ErrorKind::InvalidState, "open_run", "already open"));
-        }
-        if request.policy.require_kernel_shadow || request.policy.require_strict_remote_persistence
-        {
-            return Err(unsupported("run policy"));
-        }
-        if request.policy.format_version != 1 {
-            return Err(error(
-                ErrorKind::ProtocolMismatch,
-                "open_run",
-                "expected format version 1",
-            ));
-        }
-        if request.policy.read_only && request.intent == OpenRunIntent::CreateNew {
-            return Err(error(ErrorKind::Denied, "open_run", "read-only create"));
-        }
-        self.config.validate()?;
-        mount::validate(&self.config.mount_root)?;
-        self.validated = true;
-        // Walk the configured absolute path from /, rejecting every symlink.
-        let slash = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open("/")
-            .map_err(|e| io("mount root", e))?;
-        let mount = native::walk(
-            &slash,
-            &self.config.mount_root.as_os_str().as_bytes()[1..],
-            false,
-        )?;
-        let parent = native::walk(&mount, self.config.run_parent.as_bytes(), false)?;
-        let id = request.run_id.0.to_string();
-        let expected = serde_json::to_vec(&(
-            request.run_id,
-            &request.immutable_base,
-            request.policy.format_version,
-        ))
-        .map_err(json_error)?;
-        if request.intent == OpenRunIntent::CreateNew {
-            self.health
-                .observe(native::mkdir(&parent, id.as_bytes(), 0o700))?;
-        }
-        let directory = native::walk(&parent, id.as_bytes(), false)?;
-        if request.intent == OpenRunIntent::CreateNew {
-            self.health.observe(native::mkdir(
-                &directory,
-                self.config.root_anchor.as_bytes(),
-                0o700,
-            ))?;
-            self.health.observe(native::mkdir(
-                &directory,
-                self.config.control_anchor.as_bytes(),
-                0o700,
-            ))?;
-            self.health
-                .observe(native::mkdir(&directory, b".provider", 0o700))?;
-            let private = native::walk(&directory, b".provider", false)?;
-            self.health
-                .observe(native::mkdir(&private, b"retries", 0o700))?;
-            self.health
-                .observe(create_file(&private, b"epoch", &0u64.to_le_bytes()))?;
-            self.health
-                .observe(create_file(&private, b"manifest", &expected))?;
-            self.health.observe(native::sync(&directory))?;
-            self.health.observe(native::sync(&parent))?;
-        }
-        let root = native::walk(&directory, self.config.root_anchor.as_bytes(), false)?;
-        let control = native::walk(&directory, self.config.control_anchor.as_bytes(), false)?;
-        let private = native::walk(&directory, b".provider", false)?;
-        if read_file(&private, b"manifest")? != expected {
-            return Err(error(
-                ErrorKind::ProtocolMismatch,
-                "open_run",
-                "base/run/format mismatch",
-            ));
-        }
-        // Compute the qualification answer up front, but do not record it until
-        // every fallible step below has succeeded: with the assignment last, the
-        // flag can no longer outlive a failed `open_run`. `capabilities()` still
-        // reads the flag when building the `RunBinding` the caller is handed, so
-        // the answer must be recorded before that binding is built -- hence the
-        // assignment sits just above it, not at the end of `open_run`.
-        //
-        // A read-only run is never probed and never advertises: the probe is a
-        // SETATTR, `SetMetadata` is a mutation this run would refuse anyway, and
-        // qualifying a capability by performing the very mutation the policy
-        // forbids would be the wrong way round.
-        // The probe is a SETATTR a wedged export can stall on, so bound it: a
-        // timeout answers `false` like any other probe failure. It probes an
-        // isolated `<run_parent>/.umbra-probes/<uuid>/` directory rather than the
-        // live `.provider` (#101), so it needs owned handles to the run parent (the
-        // probe's own parent) and the run directory (whose device the dev guard
-        // matches against). `try_clone` is a local `dup`, and a clone failure fails
-        // closed. The container `mkdir` and the run-dir fstat both happen inside
-        // `ownership_probe`, on the probe thread, never here -- so no new blocking
-        // I/O lands on this main thread before `bounded`. The read-only short-circuit
-        // stays in front, so a read-only run spawns nothing.
-        let qualified = !request.policy.read_only
-            && parent
-                .try_clone()
-                .ok()
-                .zip(directory.try_clone().ok())
-                .is_some_and(|(parent, run_dir)| {
-                    bounded(PROBE_TIMEOUT, move || {
-                        native::ownership_probe(&parent, &run_dir)
-                    })
-                });
-        let physical = self
-            .config
-            .mount_root
-            .join(OsStr::from_bytes(self.config.run_parent.as_bytes()))
-            .join(id);
-        // Named apart from the `root`/`control` walk handles above, which the
-        // `Run` struct below consumes; these are the caller-facing bindings.
-        let root_binding =
-            binding(physical.join(OsStr::from_bytes(self.config.root_anchor.as_bytes())))?;
-        let control_binding =
-            binding(physical.join(OsStr::from_bytes(self.config.control_anchor.as_bytes())))?;
-        // Every fallible step above has succeeded; only now record the answer.
-        self.ownership_qualified = qualified;
-        let result = RunBinding {
-            run_id: request.run_id,
-            root: root_binding,
-            control: control_binding,
-            capabilities: self.capabilities(),
+        // The blocking layout (mount validation, walks, the CreateNew chain and the
+        // reopen validation) runs on a supervised thread bounded by `LAYOUT_TIMEOUT`,
+        // so wrap the real `nfs_layout` in the closure the seam takes. The thread
+        // owns its own `FlushHealth`; an in-time result merges into `self.health`,
+        // and a timeout leaves `self.health` untouched (#100 h1).
+        let config = self.config.clone();
+        let request_owned = request.clone();
+        let layout = move || -> Result<LayoutOutcome> {
+            let health = native::FlushHealth::default();
+            let (validated, result) = nfs_layout(&config, &request_owned, &health);
+            Ok((validated, health, result))
         };
-        self.run = Some(Run {
-            request: request.clone(),
-            directory,
-            parent,
-            mount,
-            root,
-            control,
-            private,
-            lease: None,
-            pages: HashMap::new(),
-        });
-        Ok(result)
+        self.open_run_with(request, LAYOUT_TIMEOUT, layout)
     }
     fn acquire_writer(&mut self, request: &AcquireWriterRequest) -> Result<WriterLease> {
         let run = self.run()?;

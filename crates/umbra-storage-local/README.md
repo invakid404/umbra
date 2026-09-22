@@ -32,7 +32,15 @@ also leaves the run silent and logs a `tracing` warning, and the stalled probe
 thread is left to finish or clean up on its own. At most sixteen probe threads run
 per backend at once; once that many are outstanding a further open answers
 silently without starting another, so a wedged mount strands at most sixteen. Only
-the probe is bounded; `open_run`'s own layout I/O on the storage root is not.
+the probe is bounded by that wait. `open_run`'s own layout I/O on the storage root (creating
+and validating `<root>/<run-id>/` and reading its manifest) runs on a separate thread
+too, and `open_run` waits at most thirty seconds for it: past that, `open_run` fails
+with `StorageUnavailable` and a `tracing` warning, publishes no binding, and leaves
+the stalled thread to finish on its own. Nothing is rolled back. Late layout work
+stays inside `<root>/<run-id>/`, and a run whose layout never completed is refused on
+reopen, like one interrupted by a crash, because the manifest is written last. At
+most four stalled layout threads are allowed per storage instance; past that,
+`open_run` fails at once without starting another.
 `ownership-fidelity-v1` means the uid/gid a `SetMetadata` names are applied
 through `lchown` and read back by the
 next `Stat`, not that the kernel permits every chown: an unprivileged cross-uid

@@ -36,7 +36,18 @@ answered by then is likewise not qualified, with a `tracing` warning, and the
 stalled SETATTR is left to complete on its own. At most sixteen probe threads run
 per backend at once; once that many are outstanding a further open answers
 silently without starting another, so a wedged mount strands at most sixteen. Only
-the probe is bounded; the mount validation and run-layout I/O before it are not. A read-only run is never
+the probe is bounded by that wait. The mount validation and run-layout I/O before it
+(walking to `run_parent`, creating and validating the run directory, reading its
+manifest) run on a separate thread too, and `open_run` waits at most thirty seconds
+for them: past that, `open_run` fails with `StorageUnavailable` and a `tracing` warning,
+publishes no binding, and does not mark the provider's retained failure state. The
+stalled thread finishes on its own, with its own failure state, which is discarded.
+Nothing is rolled back. Late layout work stays inside `<run_parent>/<run-id>/`, and a
+run whose layout never completed is refused on reopen, because the manifest is written
+last. At most four stalled layout threads are allowed per provider instance. During
+an NFSv4 server grace period, `open_run` may fail at thirty seconds instead of
+succeeding later. When the provider is reached over IPC, the request deadline
+(five seconds by default) expires first. A read-only run is never
 probed and never advertises it, since the probe is itself a mutation that run
 would refuse. The qualification is per run and is dropped by `close_run`.
 Nothing here advertises remote durability:
