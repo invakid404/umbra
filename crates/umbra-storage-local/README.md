@@ -22,6 +22,13 @@ since a match would then be coincidence rather than inheritance. Any error durin
 the probe leaves it silent too, including a failure to remove the scratch
 directory it created: the probe never fails the run over a capability nothing has
 asked for, and never reports a measurement while its own leftovers survive.
+The probe runs on its own thread and `open_run` waits at most five seconds for
+it: a probe that has not answered by then (an unresponsive network mount, say)
+also leaves the run silent and logs a `tracing` warning, and the stalled probe
+thread is left to finish or clean up on its own. At most sixteen probe threads run
+per backend at once; once that many are outstanding a further open answers
+silently without starting another, so a wedged mount strands at most sixteen. Only
+the probe is bounded; `open_run`'s own layout I/O on the storage root is not.
 `ownership-fidelity-v1` means the uid/gid a `SetMetadata` names are applied
 through `lchown` and read back by the
 next `Stat`, not that the kernel permits every chown: an unprivileged cross-uid

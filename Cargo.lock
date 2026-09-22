@@ -714,6 +714,7 @@ version = "0.1.0"
 dependencies = [
  "rustix",
  "tempfile",
+ "tracing",
  "umbra-core",
  "umbra-storage",
  "uuid",
@@ -726,6 +727,7 @@ dependencies = [
  "libc",
  "serde_json",
  "tempfile",
+ "tracing",
  "umbra-core",
  "umbra-storage",
  "uuid",

@@ -18,6 +18,10 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use umbra_core::Errno;
 use umbra_storage::{
@@ -577,7 +581,14 @@ impl Storage for LocalStorage {
         // forbids would be the wrong way round. Every failure inside the probe
         // answers `false` rather than propagating -- a store that cannot probe
         // must not fail `open_run` over a capability nothing has asked for yet.
-        let qualified = !request.policy.read_only && parent_identity_probe(&directory);
+        // The probe does blocking filesystem I/O a wedged mount can stall on, so
+        // bound it: a timeout answers `false` like any other probe failure. The
+        // read-only short-circuit stays in front, so a read-only run spawns nothing.
+        let qualified = !request.policy.read_only
+            && bounded(PROBE_TIMEOUT, {
+                let directory = directory.clone();
+                move || parent_identity_probe(&directory)
+            });
         let root = directory_binding(&directory.join("root"))?;
         let control = directory_binding(&directory.join("control"))?;
         // Every fallible step above has succeeded; only now record the answer.
@@ -944,6 +955,120 @@ fn probe_identity(run_dir: &Path, candidate: u32) -> Option<(u32, u32)> {
     // redundantly retry.
     guard.remove_now().ok()?;
     Some(verdict)
+}
+
+/// Timeout bounding a single qualification probe. A healthy probe is a handful of
+/// syscalls (local) or two RPCs (nfs), in the millisecond range even over a WAN,
+/// so five seconds is >100x headroom over a slow-but-healthy export while keeping
+/// a wedged-mount startup delay tolerable.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most probe threads allowed live per backend at once (in flight or orphaned
+/// past their timeout). `open_run` is `&mut self`, so a healthy provider runs at
+/// most a handful of probes concurrently; the headroom over that keeps healthy
+/// concurrent qualifications from ever refusing one another, while still bounding a
+/// wedged mount to at most this many stranded threads before further probes are
+/// refused.
+const PROBE_BUDGET: usize = 16;
+
+/// Run `probe` on a dedicated thread and answer its verdict, or `false` if it
+/// does not finish within `timeout`.
+///
+/// The qualification probes do blocking filesystem I/O that a wedged mount can
+/// stall indefinitely; this wrapper is the only thing bounding that wait. Every
+/// non-answer resolves to `false`, matching the probes' existing fail-closed
+/// contract (a store that cannot probe must not fail `open_run` over a capability
+/// nothing has asked for yet):
+///   - a spawn failure answers `false` rather than panicking (hence
+///     `Builder::spawn`, not `thread::spawn`);
+///   - a timeout answers `false` and logs, so a timed-out qualification is
+///     distinguishable in the logs from one measured `false`;
+///   - a panicking probe drops the sender, so `Disconnected` also answers `false`.
+///
+/// On timeout the thread is orphaned, not killed: it keeps running its syscalls
+/// and its verdict is discarded when it finally sends into the dropped receiver.
+/// The probe's scratch `.umbra-probe-*` lives under the run directory and is
+/// removed by `ProbeDir` even after a late finish, so it leaves no residue -- but
+/// that late cleanup can race a concurrent flush's `sync_tree` of the run
+/// directory. Moving the probe onto an isolated target is tracked in #101:
+/// <https://github.com/invakid404/umbra/issues/101>.
+///
+/// A process-global budget caps how many probe threads are live per backend at
+/// once -- whether still in flight or orphaned past their timeout -- at
+/// `PROBE_BUDGET`. The slot is reserved atomically *before* spawning, so any number
+/// of concurrent opens can never collectively exceed the budget; over budget, a
+/// call answers `false` immediately (and logs) without spawning and without running
+/// the probe. Each slot is released by its own probe thread when it exits (a `Drop`
+/// guard, so a panicking probe releases it too), or by the caller if the thread
+/// never starts; a timeout does *not* release it, so a wedged mount can strand at
+/// most `PROBE_BUDGET` blocked threads before further probes are refused. A budget
+/// shared across the two backends would need a common third crate and is out of
+/// scope.
+fn bounded(timeout: Duration, probe: impl FnOnce() -> bool + Send + 'static) -> bool {
+    // Process-global count of live probe threads. Tests drive the guard through
+    // `bounded_with` against a private counter, so they never reserve against -- and
+    // never refuse against -- this real one.
+    static PROBE_LIVE: AtomicUsize = AtomicUsize::new(0);
+    bounded_with(&PROBE_LIVE, PROBE_BUDGET, timeout, probe)
+}
+
+/// The core of [`bounded`], parameterised over the `live`-thread counter and its
+/// `budget` so tests can exercise the guard against a private counter without
+/// contending on the process-global one the real `open_run` path uses.
+fn bounded_with(
+    live: &'static AtomicUsize,
+    budget: usize,
+    timeout: Duration,
+    probe: impl FnOnce() -> bool + Send + 'static,
+) -> bool {
+    // Reserve one of the `budget` live-thread slots atomically before spawning, so
+    // concurrent callers can never collectively exceed it -- closing the
+    // check-then-spawn gap a separate load would leave. Over budget fails closed.
+    if live
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < budget).then_some(n + 1)
+        })
+        .is_err()
+    {
+        tracing::warn!(
+            budget,
+            "qualification probe budget exhausted; not advertising the capability"
+        );
+        return false;
+    }
+    let (tx, rx) = mpsc::channel();
+    if thread::Builder::new()
+        .name("umbra-probe".into())
+        .spawn(move || {
+            // Releases the reserved slot when this thread exits -- normal return or
+            // panic. Held for the probe's whole life, so a timed-out (orphaned)
+            // thread keeps its slot until it finally finishes.
+            struct Slot(&'static AtomicUsize);
+            impl Drop for Slot {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _slot = Slot(live);
+            let _ = tx.send(probe());
+        })
+        .is_err()
+    {
+        // The thread never started, so release the reservation the caller made.
+        live.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(answer) => answer,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                timeout_secs = timeout.as_secs_f64(),
+                "qualification probe timed out; not advertising the capability"
+            );
+            false
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => false,
+    }
 }
 
 /// Measure whether `run_dir`'s backing filesystem gives a new object its parent
@@ -1960,5 +2085,173 @@ mod tests {
             "a successful removal disarms the Drop backstop"
         );
         // Dropping the disarmed guard at end of scope must not error or re-remove.
+    }
+
+    // A private live-probe-thread counter for the `bounded` unit tests. Reserving
+    // slots here to exercise the budget never touches the process-global counter the
+    // `open_run` tests drive, so the two cannot refuse each other under `cargo
+    // test`'s parallelism.
+    static TEST_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    // A deliberately small budget for the concurrency test, so it can oversubscribe
+    // it with only a handful of threads.
+    const TEST_BUDGET: usize = 3;
+
+    /// Shadows the crate's [`bounded`] within this module so every `bounded` unit
+    /// test runs against `TEST_LIVE`/`TEST_BUDGET` rather than the real probe
+    /// counter.
+    fn bounded(timeout: Duration, probe: impl FnOnce() -> bool + Send + 'static) -> bool {
+        bounded_with(&TEST_LIVE, TEST_BUDGET, timeout, probe)
+    }
+
+    /// Serializes the tests that exercise `bounded`. `TEST_LIVE` is a single
+    /// `static`, so these tests must neither run concurrently nor start while a
+    /// previous test's just-released probe thread is still draining. Holding this
+    /// lock excludes the others; waiting for the counter to reach zero gives each
+    /// test an empty budget to start from.
+    fn serialize_bounded_tests() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let start = std::time::Instant::now();
+        while TEST_LIVE.load(Ordering::Acquire) != 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the live-probe counter did not return to zero between bounded tests"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        guard
+    }
+
+    #[test]
+    fn bounded_returns_the_probe_verdict_when_it_finishes_in_time() {
+        let _serial = serialize_bounded_tests();
+        assert!(
+            bounded(Duration::from_secs(5), || true),
+            "a true verdict passes through"
+        );
+        assert!(
+            !bounded(Duration::from_secs(5), || false),
+            "a false verdict passes through"
+        );
+    }
+
+    #[test]
+    fn bounded_answers_false_when_the_probe_outlives_the_timeout() {
+        let _serial = serialize_bounded_tests();
+        // The probe parks on a channel whose sender the test keeps alive, so it is
+        // still running when the timeout fires. Milliseconds, not seconds, keep the
+        // test fast; the elapsed bound asserts `bounded` did not wait for the probe.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let start = std::time::Instant::now();
+        let answer = bounded(Duration::from_millis(50), move || {
+            let _ = release_rx.recv();
+            true
+        });
+        assert!(
+            !answer,
+            "a probe still running at the timeout answers false"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "bounded returned on the timeout, not after the probe finished"
+        );
+        // Release the orphaned thread so it exits cleanly instead of leaking.
+        let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn bounded_answers_false_when_the_probe_panics() {
+        let _serial = serialize_bounded_tests();
+        assert!(
+            !bounded(Duration::from_secs(5), || panic!("probe blew up")),
+            "a panicking probe drops the sender and answers false"
+        );
+    }
+
+    #[test]
+    fn bounded_never_exceeds_the_budget_under_concurrent_callers() {
+        let _serial = serialize_bounded_tests();
+
+        // Oversubscribe the budget: launch budget + 2 callers that all reserve
+        // before any can time out (a long timeout, and probes that park until the
+        // test releases them). The atomic reservation must admit exactly `budget`
+        // and refuse the rest without running their closures.
+        const N: usize = TEST_BUDGET + 2;
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let refused = std::sync::Arc::new(AtomicUsize::new(0));
+        // The admitted probes and this test thread meet here to release together.
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(TEST_BUDGET + 1));
+        // All callers line up here so their reservations race at once.
+        let lineup = std::sync::Arc::new(std::sync::Barrier::new(N));
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let ran = std::sync::Arc::clone(&ran);
+                let refused = std::sync::Arc::clone(&refused);
+                let gate = std::sync::Arc::clone(&gate);
+                let lineup = std::sync::Arc::clone(&lineup);
+                thread::spawn(move || {
+                    lineup.wait();
+                    let answer = bounded(Duration::from_secs(5), move || {
+                        ran.fetch_add(1, Ordering::AcqRel);
+                        gate.wait(); // hold the slot until the test releases us
+                        true
+                    });
+                    if !answer {
+                        refused.fetch_add(1, Ordering::AcqRel);
+                    }
+                    answer
+                })
+            })
+            .collect();
+
+        // Wait until every caller has resolved: exactly `budget` are parked in their
+        // probe and the other two were refused without running.
+        let start = std::time::Instant::now();
+        while ran.load(Ordering::Acquire) < TEST_BUDGET
+            || refused.load(Ordering::Acquire) < N - TEST_BUDGET
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "exactly the budget should reserve a slot; the rest are refused"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            ran.load(Ordering::Acquire),
+            TEST_BUDGET,
+            "exactly the budget ran their closure"
+        );
+        assert_eq!(
+            refused.load(Ordering::Acquire),
+            N - TEST_BUDGET,
+            "the over-budget callers answered false without running"
+        );
+
+        // Release the parked probes; their threads exit and free their slots.
+        gate.wait();
+        let answers: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            answers.iter().filter(|&&a| a).count(),
+            TEST_BUDGET,
+            "the admitted callers saw their probe's verdict"
+        );
+
+        // The counter returns to zero once every probe thread has exited.
+        let drain = std::time::Instant::now();
+        while TEST_LIVE.load(Ordering::Acquire) != 0 {
+            assert!(
+                drain.elapsed() < Duration::from_secs(5),
+                "every reserved slot is released after the probes exit"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // After release, a fresh probe runs again now that the budget has freed up.
+        assert!(
+            bounded(Duration::from_secs(5), || true),
+            "a new probe runs once the budget frees up"
+        );
     }
 }
