@@ -3,7 +3,8 @@
 Live NFSv4 storage backend for Umbra. This README covers this crate's mounted
 provider, binary, and tests. Direct Umbra dependencies are
 `umbra-core` and `umbra-storage`; native access via `libc`, IDs via
-`uuid`, provider options via `serde_json`.
+`uuid`, provider options via `serde_json`, and
+probe-timeout warnings via `tracing`.
 
 `NfsStorage` implements run lifecycle, bounded file I/O, directory paging
 and supported mutations through `umbra_storage::Storage` against an
@@ -22,7 +23,13 @@ directory to the ownership it already has — a real SETATTR on the wire that
 changes nothing, deliberately not `chown(-1, -1)`, which carries no owner
 attribute and which a client may answer locally. Any failure, including the
 `ENOTSUP` an export that refuses chown returns, answers "not qualified" and the
-name is omitted; the probe never fails `open_run`. A read-only run is never
+name is omitted; the probe never fails `open_run`. `open_run` waits at most
+five seconds for the probe, which runs on its own thread: an export that has not
+answered by then is likewise not qualified, with a `tracing` warning, and the
+stalled SETATTR is left to complete on its own. At most sixteen probe threads run
+per backend at once; once that many are outstanding a further open answers
+silently without starting another, so a wedged mount strands at most sixteen. Only
+the probe is bounded; the mount validation and run-layout I/O before it are not. A read-only run is never
 probed and never advertises it, since the probe is itself a mutation that run
 would refuse. The qualification is per run and is dropped by `close_run`.
 Nothing here advertises remote durability:

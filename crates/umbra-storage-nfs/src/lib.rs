@@ -13,12 +13,129 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 use umbra_core::*;
 use umbra_storage::Storage;
 use uuid::Uuid;
 const LEASE_MILLIS: u64 = 60_000;
 const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Timeout bounding a single qualification probe. A healthy probe is a handful of
+/// syscalls (local) or two RPCs (nfs), in the millisecond range even over a WAN,
+/// so five seconds is >100x headroom over a slow-but-healthy export while keeping
+/// a wedged-mount startup delay tolerable.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most probe threads allowed live per backend at once (in flight or orphaned
+/// past their timeout). `open_run` is `&mut self`, so a healthy provider runs at
+/// most a handful of probes concurrently; the headroom over that keeps healthy
+/// concurrent qualifications from ever refusing one another, while still bounding a
+/// wedged mount to at most this many stranded threads before further probes are
+/// refused.
+const PROBE_BUDGET: usize = 16;
+
+/// Run `probe` on a dedicated thread and answer its verdict, or `false` if it
+/// does not finish within `timeout`.
+///
+/// The qualification probes do blocking filesystem I/O that a wedged mount can
+/// stall indefinitely; this wrapper is the only thing bounding that wait. Every
+/// non-answer resolves to `false`, matching the probes' existing fail-closed
+/// contract (a store that cannot probe must not fail `open_run` over a capability
+/// nothing has asked for yet):
+///   - a spawn failure answers `false` rather than panicking (hence
+///     `Builder::spawn`, not `thread::spawn`);
+///   - a timeout answers `false` and logs, so a timed-out qualification is
+///     distinguishable in the logs from one measured `false`;
+///   - a panicking probe drops the sender, so `Disconnected` also answers `false`.
+///
+/// On timeout the thread is orphaned, not killed: it keeps running its syscalls
+/// and its verdict is discarded when it finally sends into the dropped receiver.
+/// The probe's SETATTR re-applies the ownership the run's live `.provider`
+/// directory already has, so a late finish has no lasting effect and leaves no
+/// residue -- but it targets active run state, so it can overlap an active run's
+/// flush of that directory (or a later reopen). Moving the probe onto an isolated
+/// target is tracked in #101: <https://github.com/invakid404/umbra/issues/101>.
+///
+/// A process-global budget caps how many probe threads are live per backend at
+/// once -- whether still in flight or orphaned past their timeout -- at
+/// `PROBE_BUDGET`. The slot is reserved atomically *before* spawning, so any number
+/// of concurrent opens can never collectively exceed the budget; over budget, a
+/// call answers `false` immediately (and logs) without spawning and without running
+/// the probe. Each slot is released by its own probe thread when it exits (a `Drop`
+/// guard, so a panicking probe releases it too), or by the caller if the thread
+/// never starts; a timeout does *not* release it, so a wedged mount can strand at
+/// most `PROBE_BUDGET` blocked threads before further probes are refused. A budget
+/// shared across the two backends would need a common third crate and is out of
+/// scope.
+fn bounded(timeout: Duration, probe: impl FnOnce() -> bool + Send + 'static) -> bool {
+    // Process-global count of live probe threads. Tests drive the guard through
+    // `bounded_with` against a private counter, so they never reserve against -- and
+    // never refuse against -- this real one.
+    static PROBE_LIVE: AtomicUsize = AtomicUsize::new(0);
+    bounded_with(&PROBE_LIVE, PROBE_BUDGET, timeout, probe)
+}
+
+/// The core of [`bounded`], parameterised over the `live`-thread counter and its
+/// `budget` so tests can exercise the guard against a private counter without
+/// contending on the process-global one the real `open_run` path uses.
+fn bounded_with(
+    live: &'static AtomicUsize,
+    budget: usize,
+    timeout: Duration,
+    probe: impl FnOnce() -> bool + Send + 'static,
+) -> bool {
+    // Reserve one of the `budget` live-thread slots atomically before spawning, so
+    // concurrent callers can never collectively exceed it -- closing the
+    // check-then-spawn gap a separate load would leave. Over budget fails closed.
+    if live
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < budget).then_some(n + 1)
+        })
+        .is_err()
+    {
+        tracing::warn!(
+            budget,
+            "qualification probe budget exhausted; not advertising the capability"
+        );
+        return false;
+    }
+    let (tx, rx) = mpsc::channel();
+    if thread::Builder::new()
+        .name("umbra-probe".into())
+        .spawn(move || {
+            // Releases the reserved slot when this thread exits -- normal return or
+            // panic. Held for the probe's whole life, so a timed-out (orphaned)
+            // thread keeps its slot until it finally finishes.
+            struct Slot(&'static AtomicUsize);
+            impl Drop for Slot {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _slot = Slot(live);
+            let _ = tx.send(probe());
+        })
+        .is_err()
+    {
+        // The thread never started, so release the reservation the caller made.
+        live.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(answer) => answer,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                timeout_secs = timeout.as_secs_f64(),
+                "qualification probe timed out; not advertising the capability"
+            );
+            false
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => false,
+    }
+}
 
 /// Runtime layout, separate from persistent run identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -452,7 +569,15 @@ impl Storage for NfsStorage {
         // SETATTR, `SetMetadata` is a mutation this run would refuse anyway, and
         // qualifying a capability by performing the very mutation the policy
         // forbids would be the wrong way round.
-        let qualified = !request.policy.read_only && native::ownership_supported(&private);
+        // The probe is a SETATTR a wedged export can stall on, so bound it: a
+        // timeout answers `false` like any other probe failure. The probe needs an
+        // owned handle to move into the thread; `try_clone` is a local `dup`, and a
+        // clone failure fails closed. The read-only short-circuit stays in front, so
+        // a read-only run spawns nothing.
+        let qualified = !request.policy.read_only
+            && private.try_clone().is_ok_and(|private| {
+                bounded(PROBE_TIMEOUT, move || native::ownership_supported(&private))
+            });
         let physical = self
             .config
             .mount_root
