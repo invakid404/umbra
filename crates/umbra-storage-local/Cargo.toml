@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 umbra-core = { path = "../umbra-core" }
 umbra-storage = { path = "../umbra-storage" }
-rustix = { version = "=1.1.4", features = ["process"] }
+rustix = { version = "=1.1.5", features = ["process"] }
 tracing.workspace = true
 uuid.workspace = true
 
