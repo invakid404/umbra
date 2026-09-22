@@ -586,8 +586,14 @@ impl Storage for LocalStorage {
         // read-only short-circuit stays in front, so a read-only run spawns nothing.
         let qualified = !request.policy.read_only
             && bounded(PROBE_TIMEOUT, {
-                let directory = directory.clone();
-                move || parent_identity_probe(&directory)
+                // The probe scratch lives in an isolated `<root>/.umbra-probes/`
+                // container, never under the run dir, so its late cleanup cannot
+                // race a concurrent flush's `sync_tree` of the run (#101). The run
+                // dir tags along only for the dev guard. The container is created
+                // inside the closure (below), never here on the main thread (#92).
+                let probes = self.directory.join(".umbra-probes");
+                let run_dir = directory.clone();
+                move || parent_identity_probe(&probes, &run_dir)
             });
         let root = directory_binding(&directory.join("root"))?;
         let control = directory_binding(&directory.join("control"))?;
@@ -890,10 +896,11 @@ fn parent_identity_matches(probe_gid: u32, child_gid: u32) -> bool {
 /// the D1 setgid refusal, or if the explicit success-path cleanup fails -- the
 /// caller then does not advertise, the fail-closed direction.
 ///
-/// The probe directory is `uuid`-named and lives directly under `<root>/<run-id>/`
-/// as a sibling of `root`/`control`, never inside the agent-visible `root/`
-/// tree. The unique name is load-bearing: `open_run` holds no lock, so two
-/// reopen-intent opens on one run dir must not collide on a fixed probe path.
+/// The probe directory is `uuid`-named and lives directly under the `parent` it
+/// is handed -- the isolated `<root>/.umbra-probes/` container (#101), a sibling
+/// of the run directory rather than a child of it, never inside the agent-visible
+/// `root/` tree. The unique name is load-bearing: `open_run` holds no lock, so two
+/// concurrent opens must not collide on a fixed probe path.
 ///
 /// fsgid guard: `candidate` is only guaranteed `!= getegid()`, but Linux assigns a
 /// new object's group from the process *fsgid*, which `setfsgid(2)` lets diverge
@@ -987,11 +994,12 @@ const PROBE_BUDGET: usize = 16;
 ///
 /// On timeout the thread is orphaned, not killed: it keeps running its syscalls
 /// and its verdict is discarded when it finally sends into the dropped receiver.
-/// The probe's scratch `.umbra-probe-*` lives under the run directory and is
-/// removed by `ProbeDir` even after a late finish, so it leaves no residue -- but
-/// that late cleanup can race a concurrent flush's `sync_tree` of the run
-/// directory. Moving the probe onto an isolated target is tracked in #101:
-/// <https://github.com/invakid404/umbra/issues/101>.
+/// The probe's scratch `.umbra-probe-*` lives in the isolated
+/// `<storage-root>/.umbra-probes/` container -- a sibling of the run directory,
+/// never inside it -- and is removed by `ProbeDir` even after a late finish. A
+/// concurrent flush's `sync_tree` walks only the run directory and the root fsync
+/// enumerates nothing, so that late cleanup can no longer race a flush; this is
+/// the isolation #101 delivered: <https://github.com/invakid404/umbra/issues/101>.
 ///
 /// A process-global budget caps how many probe threads are live per backend at
 /// once -- whether still in flight or orphaned past their timeout -- at
@@ -1071,16 +1079,47 @@ fn bounded_with(
     }
 }
 
-/// Measure whether `run_dir`'s backing filesystem gives a new object its parent
-/// directory's gid. `false` on the indecisive (single-group) path and on every
-/// probe error alike; the run opens normally either way. No `cfg(target_os)`
-/// anywhere -- Linux answers `false` here by the kernel's own rule, which is the
-/// whole point of #89.
-fn parent_identity_probe(run_dir: &Path) -> bool {
+/// Measure whether the run's backing filesystem gives a new object its parent
+/// directory's gid, probing inside the isolated `probes` container while `run_dir`
+/// anchors the dev guard (both share the storage root's filesystem). `false` on
+/// the indecisive (single-group) path and on every probe error alike; the run
+/// opens normally either way. No `cfg(target_os)` anywhere -- Linux answers
+/// `false` here by the kernel's own rule, which is the whole point of #89.
+fn parent_identity_probe(probes: &Path, run_dir: &Path) -> bool {
     let Some(candidate) = candidate_group() else {
         return false;
     };
-    match probe_identity(run_dir, candidate) {
+    // Create the isolated probe container here, inside the bounded closure, never
+    // on `open_run`'s main thread (#92): a wedged mount must stall this probe
+    // thread, not `open_run`. Tolerate a concurrent creator -- the container is a
+    // persistent reserved sibling of the run directories, created at most once and
+    // deliberately never removed, so a best-effort teardown cannot race a
+    // concurrent probe's `create_dir`.
+    match fs::create_dir(probes) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return false,
+    }
+    // Defence in depth matching `open_run`'s layout checks: the container must be a
+    // real directory, never a symlink that could redirect the probe off the root.
+    let Ok(meta) = fs::symlink_metadata(probes) else {
+        return false;
+    };
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return false;
+    }
+    // Dev guard (a4): the probe measures a property of the run's backing
+    // filesystem, so it must run on the *same* filesystem as the run dir. A mount
+    // point under the storage root (at the run dir or at the container) is exotic,
+    // but this turns "same FS" from an assumption into a checked fact for one
+    // lstat. Diverging devices fail closed.
+    let Ok(run_meta) = fs::symlink_metadata(run_dir) else {
+        return false;
+    };
+    if meta.dev() != run_meta.dev() {
+        return false;
+    }
+    match probe_identity(probes, candidate) {
         Some((probe_gid, child_gid)) => parent_identity_matches(probe_gid, child_gid),
         None => false,
     }
@@ -2085,6 +2124,101 @@ mod tests {
             "a successful removal disarms the Drop backstop"
         );
         // Dropping the disarmed guard at end of scope must not error or re-remove.
+    }
+
+    /// The #101 isolation invariant, structurally: after a writable `open_run` the
+    /// run directory carries only its own `{root, control, epoch, manifest}` and no
+    /// probe scratch, while the probe's isolated `.umbra-probes` container sits
+    /// under the storage root -- a sibling of the run directory, never inside it --
+    /// and is empty, every probe having removed its own uuid subtree. Because the
+    /// probe never touches anything inside the run dir, `flush`'s `sync_tree` of the
+    /// run can no longer see probe churn.
+    ///
+    /// The container-existence half is asserted only where a candidate group exists
+    /// (as the live end-to-end test also gates on it): with no candidate the probe
+    /// is indecisive by construction and never reaches the container creation.
+    #[test]
+    fn probe_target_is_isolated_from_the_run_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = LocalStorage::new(dir.path()).unwrap();
+        let request = request();
+        storage.open_run(&request).unwrap();
+        let run = run_dir(&dir, &request);
+
+        // The run directory holds only its own structure -- no `.umbra-probe*`.
+        let mut expected: Vec<std::ffi::OsString> = ["control", "epoch", "manifest", "root"]
+            .iter()
+            .map(Into::into)
+            .collect();
+        expected.sort();
+        assert_eq!(
+            entries(&run),
+            expected,
+            "the run directory carries no probe scratch"
+        );
+
+        if candidate_group().is_some() {
+            let probes = dir.path().join(".umbra-probes");
+            assert!(
+                probes.is_dir(),
+                "the isolated probe container exists under the storage root"
+            );
+            assert_eq!(
+                entries(&probes),
+                Vec::<std::ffi::OsString>::new(),
+                "every probe removed its own uuid subtree, leaving the container empty"
+            );
+            assert!(
+                !probes.starts_with(&run),
+                "the probe container is not inside the run directory"
+            );
+        }
+    }
+
+    /// A probe hammering the isolated container concurrently with repeated flushes
+    /// never disturbs a flush: on the fix the outcome is deterministic, because
+    /// `sync_tree` walks only the run directory and the probe touches only
+    /// `.umbra-probes`. (The e1 mutation witness -- aiming the same churn at the run
+    /// dir, where flushes then fail intermittently -- is run by hand in review, with
+    /// no `cfg(test)` seam committed into `sync_tree`.)
+    #[test]
+    fn flush_is_unaffected_by_concurrent_probe_churn() {
+        let (dir, mut storage, _request, lease) = setup();
+        let probes = dir.path().join(".umbra-probes");
+        // The churn thread needs the container to exist; `open_run`'s own probe may
+        // already have made it, so tolerate `AlreadyExists`.
+        match fs::create_dir(&probes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => panic!("could not create probe container: {e}"),
+        }
+        // A real candidate exercises the full success path; `u32::MAX` (the chown
+        // "leave unchanged" sentinel) drives the create-then-bail path independent
+        // of privilege. Either way each iteration creates and removes a uuid subtree
+        // under `.umbra-probes`.
+        let candidate = candidate_group().unwrap_or(u32::MAX);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = {
+            let probes = probes.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let _ = probe_identity(&probes, candidate);
+                }
+            })
+        };
+
+        for _ in 0..200 {
+            storage
+                .flush(&FlushRequest {
+                    context: context(&lease),
+                    scope: FlushScope::EntireRun,
+                })
+                .expect("flush is deterministically Ok while the probe stays off the run dir");
+        }
+
+        stop.store(true, Ordering::Release);
+        churn.join().unwrap();
     }
 
     // A private live-probe-thread counter for the `bounded` unit tests. Reserving

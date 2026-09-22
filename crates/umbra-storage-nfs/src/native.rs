@@ -1,5 +1,5 @@
 //! Descriptor-relative Unix syscall boundary.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -119,8 +119,9 @@ pub(crate) fn chown(dir: &File, bytes: &[u8], uid: Option<u32>, gid: Option<u32>
 /// no-op in effect and a real SETATTR on the wire -- deliberately not
 /// `chown(-1, -1)`, which carries no owner attribute at all and which a client
 /// is free to answer locally without ever asking the server, making it no
-/// evidence of anything. The caller points this at a directory umbra created and
-/// owns inside the run, never at user data.
+/// evidence of anything. The caller (`ownership_probe`) points this at a fresh
+/// directory umbra created and owns under the run parent, never at user data and
+/// never at active run state.
 ///
 /// Any failure answers `false` rather than propagating. The capability is
 /// additive and its absence is exactly the pre-`#60` behaviour, so refusing to
@@ -131,6 +132,126 @@ pub(crate) fn ownership_supported(dir: &File) -> bool {
         return false;
     };
     chown(dir, b".", Some(current.uid), Some(current.gid)).is_ok()
+}
+
+/// The reserved container both backends create for isolated probe scratch, a
+/// sibling of the run directories under the run parent (#101). Named identically
+/// to the local backend's container for symmetry, though the two are separate
+/// constants -- a shared one would need a common crate (see the follow-ups).
+pub(crate) const PROBES_DIR: &[u8] = b".umbra-probes";
+
+/// Removes the probe's `<uuid>` directory from the container, the NFS analogue of
+/// the local backend's `ProbeDir`. Two mechanisms, not one: the success path calls
+/// `remove_now`, which *fails the probe closed* if the `rmdir` errors -- a run must
+/// never qualify while probe scratch survives -- and `Drop` is the backstop for
+/// `?`, early `return`, and unwinding, which `remove_now` cannot cover. The fd on
+/// the probe dir is dropped before the `rmdir`: NFS does not silly-rename
+/// directories, so holding it buys nothing.
+struct ProbeDir<'a> {
+    container: &'a File,
+    name: Vec<u8>,
+    armed: Cell<bool>,
+}
+impl<'a> ProbeDir<'a> {
+    fn new(container: &'a File, name: Vec<u8>) -> Self {
+        Self {
+            container,
+            name,
+            armed: Cell::new(true),
+        }
+    }
+    /// Remove the probe dir now, disarming the `Drop` backstop only if removal
+    /// succeeds. On failure the guard stays armed, so `Drop` still retries.
+    fn remove_now(&self) -> Result<()> {
+        unlink(self.container, &self.name, true)?;
+        self.armed.set(false);
+        Ok(())
+    }
+}
+impl Drop for ProbeDir<'_> {
+    fn drop(&mut self) {
+        if self.armed.get() {
+            let _ = unlink(self.container, &self.name, true);
+        }
+    }
+}
+
+/// Measure whether this export honours a SETATTR carrying owner attributes,
+/// probing an *isolated* target instead of the live `.provider` (#101, b1).
+///
+/// The target is a fresh `<run_parent>/.umbra-probes/<uuid>/` directory umbra
+/// creates and owns. Before #101 the probe re-applied `.provider`'s own ownership;
+/// a late probe then bumped `.provider`'s ctime, which a concurrent flush's
+/// barrier caught as `.provider` changing -- and because `FlushHealth` is sticky,
+/// that poisoned the whole provider instance, not just one flush. Isolating the
+/// target removes that hazard entirely: the container is a sibling of the run
+/// directory, outside everything `flush` stamps or enumerates.
+///
+/// Invariants this preserves: `ownership_supported(&File)` is unchanged -- only the
+/// `File` it is handed changes; the container `mkdir` and the run-dir `fstat` both
+/// run here, inside the bounded closure, so a wedged export stalls the probe thread
+/// and never `open_run`'s main thread (#92); and probe I/O never routes through
+/// `FlushHealth`, so a probe failure can never poison the provider the way
+/// `.provider` once did. Every failure -- a symlinked container, a cross-device
+/// target, a refused SETATTR, a cleanup error -- answers `false`, the fail-closed
+/// direction.
+///
+/// `run_dir` is an owned dup of the run directory handle, moved into the bounded
+/// closure by the caller; its device (fetched here, on the probe thread) is the one
+/// the target must match -- see [`ownership_probe_with`].
+pub(crate) fn ownership_probe(parent: &File, run_dir: &File) -> bool {
+    // The dev guard is against the RUN DIRECTORY's device, not the run parent's:
+    // `<run_parent>/<run_id>` can itself be a mount point on another filesystem, so
+    // a guard against the parent would pass while the probe measured the wrong
+    // export. Fetch it here, on the probe thread (never on `open_run`'s main thread
+    // before `bounded`), and fail closed if the fstat fails.
+    let Ok(run_dev) = run_dir.metadata().map(|m| m.dev()) else {
+        return false;
+    };
+    ownership_probe_with(parent, run_dev)
+}
+
+/// The core of [`ownership_probe`], parameterised over the run directory's device
+/// so a test can inject a deliberately mismatched one -- a real cross-device layout
+/// needs a mount -- and assert the dev guard fails the probe closed. Mirrors the
+/// `bounded`/`bounded_with` and `flush`/`flush_with` seams.
+fn ownership_probe_with(parent: &File, run_dev: u64) -> bool {
+    // Persistent reserved container. Tolerate a concurrent creator; never removed,
+    // so a best-effort teardown cannot race another probe's `mkdir`.
+    match mkdir(parent, PROBES_DIR, 0o700) {
+        Ok(()) => {}
+        Err(e) if e.kind == ErrorKind::AlreadyExists => {}
+        Err(_) => return false,
+    }
+    // `open` always adds `O_NOFOLLOW`, so a symlinked container fails closed.
+    let Ok(container) = open(parent, PROBES_DIR, libc::O_RDONLY | libc::O_DIRECTORY, 0) else {
+        return false;
+    };
+    let leaf = format!(".umbra-probe-{}", Uuid::new_v4()).into_bytes();
+    if mkdir(&container, &leaf, 0o700).is_err() {
+        return false;
+    }
+    // From here every non-success exit removes the `<uuid>` dir via this guard; the
+    // success path removes it explicitly with `remove_now` and disarms the guard.
+    let guard = ProbeDir::new(&container, leaf.clone());
+    let Ok(probe) = open(&container, &leaf, libc::O_RDONLY | libc::O_DIRECTORY, 0) else {
+        return false;
+    };
+    // Dev guard (a4, matching local): the probe measures a property of the run
+    // directory's filesystem, so the target must sit on the run dir's device. A
+    // mount point at the container -- or at `<run_parent>/<run_id>` -- fails closed.
+    if same_device(&probe, run_dev).is_err() {
+        return false;
+    }
+    // The one SETATTR, unchanged, now aimed at the isolated probe dir.
+    let verdict = ownership_supported(&probe);
+    // Explicit success-path cleanup: drop the fd, then rmdir, failing the probe
+    // closed if removal errors so a run never qualifies while scratch survives.
+    drop(probe);
+    if guard.remove_now().is_err() {
+        return false;
+    }
+    verdict
 }
 /// `fchmodat` on a leaf the caller has already established is not a symlink.
 ///
