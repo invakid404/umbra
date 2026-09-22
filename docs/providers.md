@@ -85,7 +85,9 @@ individual storage writes and trace-memory transfers are capped at 1 MiB. The fr
 limit includes JSON's byte-array expansion and transport envelope overhead. Only one
 ordinary request is outstanding per connection, providing backpressure. Configured I/O
 deadlines are bounded to 1–60000 ms; malformed, disconnected or timed-out connections
-are invalidated. No failed call is retried automatically or redirected to host writes.
+are invalidated. This per-request deadline is authoritative: storage backends size
+their own probe and layout bounds to fit inside it, and a provider that overruns it is
+killed and reaped without blocking the caller. No failed call is retried automatically or redirected to host writes.
 Private IPC descriptors use Rust's non-inheritable Unix descriptors. Provider processes
 are trusted components, not tracees; future launch implementations must still sanitize
 all inherited resources and independently enforce controller/provider-death behavior.

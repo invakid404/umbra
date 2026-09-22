@@ -1028,10 +1028,13 @@ fn probe_identity(run_dir: &Path, candidate: u32) -> Option<(u32, u32)> {
 }
 
 /// Timeout bounding a single qualification probe. A healthy probe is a handful of
-/// syscalls (local) or two RPCs (nfs), in the millisecond range even over a WAN,
-/// so five seconds is >100x headroom over a slow-but-healthy export while keeping
-/// a wedged-mount startup delay tolerable.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// syscalls (local) or two RPCs (nfs), in the millisecond range even over a WAN, so
+/// 1.5 seconds is generous headroom over a slow-but-healthy export -- and it survives
+/// one NFS retransmit tick on top of a normal probe -- while still fitting, together
+/// with `LAYOUT_TIMEOUT` and `IPC_MARGIN`, inside the default IPC deadline (#103) so a
+/// timed-out probe's `false` verdict reaches IPC callers rather than the transport
+/// deadline killing the provider first.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The most probe threads allowed live per backend at once (in flight or orphaned
 /// past their timeout). `open_run` is `&mut self`, so a healthy provider runs at
@@ -1145,17 +1148,35 @@ fn bounded_with(
 /// Timeout bounding the whole `open_run` layout phase. The layout does far more
 /// work than a qualification probe -- up to five `CreateNew` mutations plus the
 /// reopen validation -- so it needs more headroom than `PROBE_TIMEOUT`: on a loaded
-/// store with slow stable storage a healthy layout can reach low seconds, and 30s
-/// is roughly 10x over a bad-but-healthy case while still bounding a wedged mount to
-/// a `open_run` that fails in `LAYOUT_TIMEOUT + PROBE_TIMEOUT` rather than never.
+/// store with slow stable storage a healthy layout can still reach hundreds of ms,
+/// and 3s is roughly 20x over the worst healthy `open_run` measured while still
+/// bounding a wedged mount to an `open_run` that fails in
+/// `LAYOUT_TIMEOUT + PROBE_TIMEOUT` rather than never.
 ///
-/// Note (#100): where the caller reaches this backend through the provider IPC
-/// proxy, that transport's own request deadline (default 5s) fires first, so this
-/// bound only shortens time-to-fail for in-process callers and for registries with
-/// a large `timeout_ms`. It is still the only bound for those paths, and the
-/// late-work safety it enables (a timed-out layout leaves only residue the reopen
-/// validation already refuses) is a correctness fix regardless of which deadline wins.
-const LAYOUT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Note (#103, inverting the earlier #100 note): `LAYOUT_TIMEOUT + PROBE_TIMEOUT +
+/// IPC_MARGIN` is now sized to sum inside the default IPC deadline (see `IPC_MARGIN`
+/// and the drift guard below), so where the caller reaches this backend through the
+/// provider IPC proxy this in-backend bound fires *first* -- its `StorageUnavailable`
+/// and distinguishing `tracing` warning surface, rather than the transport deadline
+/// killing the provider. In-process callers and registries with a large `timeout_ms`
+/// still fail here too. The late-work safety it enables (a timed-out layout leaves
+/// only residue the reopen validation already refuses) is a correctness fix
+/// regardless of which deadline wins.
+const LAYOUT_TIMEOUT: Duration = Duration::from_millis(3000);
+
+/// Framing, spawn and scheduling headroom reserved under the default IPC deadline so
+/// `PROBE_TIMEOUT` and `LAYOUT_TIMEOUT` sum strictly inside it. Byte-identical in the
+/// local and nfs backends; measured proxy overhead is well under 5ms.
+const IPC_MARGIN: Duration = Duration::from_millis(500);
+
+// Drift guard (#103): the in-backend bounds plus the framing margin must fit inside
+// the registry's default per-request IPC deadline, so a wedged probe or layout
+// surfaces its own outcome before the transport kills the provider. Any future bump
+// that breaks this is a build failure, here and in the nfs backend.
+const _: () = assert!(
+    LAYOUT_TIMEOUT.as_millis() + PROBE_TIMEOUT.as_millis() + IPC_MARGIN.as_millis()
+        <= umbra_core::provider::DEFAULT_TIMEOUT_MS as u128
+);
 
 /// The most layout threads allowed live per backend at once (in flight or orphaned
 /// past their timeout). Each stranded layout thread is an `open_run` that already
@@ -2710,6 +2731,47 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// #103: the in-backend bounds plus the framing margin fit inside the default IPC
+    /// deadline, so a wedged probe or layout surfaces its own outcome before the
+    /// transport kills the provider. This is the visible companion to the module-level
+    /// compile-time drift guard.
+    #[test]
+    fn open_run_bounds_fit_inside_the_default_ipc_deadline() {
+        let sum = LAYOUT_TIMEOUT.as_millis() + PROBE_TIMEOUT.as_millis() + IPC_MARGIN.as_millis();
+        assert!(
+            sum <= umbra_core::provider::DEFAULT_TIMEOUT_MS as u128,
+            "layout + probe + margin ({sum}ms) must fit inside the default IPC deadline"
+        );
+        assert_eq!(sum, 5000, "1500 + 3000 + 500 == 5000");
+    }
+
+    /// #103: exercise the real `LAYOUT_TIMEOUT` end to end through the `open_run_with`
+    /// seam. A parked layout must time out to `StorageUnavailable` in
+    /// `[LAYOUT_TIMEOUT, LAYOUT_TIMEOUT + 1s)`. It drives the per-instance
+    /// `layout_live` on a fresh store, so it never touches the shared budget the
+    /// parallel suite uses. Costs about `LAYOUT_TIMEOUT` of wall time.
+    #[test]
+    fn open_run_times_out_at_the_real_layout_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = LocalStorage::new(dir.path()).unwrap();
+        let request = request();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let start = std::time::Instant::now();
+        let err = storage
+            .open_run_with(&request, LAYOUT_TIMEOUT, move || {
+                let _ = release_rx.recv();
+                Ok(())
+            })
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        assert_eq!(err.kind, ErrorKind::StorageUnavailable);
+        assert!(
+            elapsed >= LAYOUT_TIMEOUT && elapsed < LAYOUT_TIMEOUT + Duration::from_secs(1),
+            "returned at the real LAYOUT_TIMEOUT ({LAYOUT_TIMEOUT:?}), not before or long after: {elapsed:?}"
+        );
+        let _ = release_tx.send(()); // release the orphan so it exits cleanly
     }
 
     /// #100 test 1: a layout that fails surfaces cleanly. A failing layout -- exactly

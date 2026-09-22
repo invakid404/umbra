@@ -17,7 +17,21 @@ fn unavailable(error: impl std::fmt::Display) -> UmbraError {
     )
 }
 
-/// Ordered stream; a deadline covers the complete request including callbacks.
+/// A read or write that expired against its `SO_{RCV,SND}TIMEO` deadline surfaces as
+/// `WouldBlock` (EAGAIN, `os error 35`) or, on some platforms, `TimedOut`. Both are
+/// the request deadline being missed, not a distinct failure, so callers report them
+/// as such rather than leaking the raw errno.
+fn is_deadline_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Ordered stream; the per-request deadline is the authoritative bound on the whole
+/// request, including callbacks. Storage backends size their in-backend bounds to fit
+/// inside the registry default (`DEFAULT_TIMEOUT_MS`) so their own outcome surfaces
+/// before this deadline; a miss invalidates the connection.
 pub struct Connection {
     stream: UnixStream,
     deadline: Instant,
@@ -91,7 +105,14 @@ impl Connection {
         while offset < out.len() {
             let remaining = self.remaining()?;
             let count = match self.stream.set_read_timeout(Some(remaining)) {
-                Ok(()) => self.stream.read(&mut out[offset..]).map_err(unavailable)?,
+                Ok(()) => match self.stream.read(&mut out[offset..]) {
+                    Ok(count) => count,
+                    // The read hit its deadline: report the miss, not the raw errno.
+                    Err(ref e) if is_deadline_timeout(e) => {
+                        return Err(unavailable("request deadline exceeded"))
+                    }
+                    Err(e) => return Err(unavailable(e)),
+                },
                 Err(timeout_error) => {
                     // macOS can reject SO_RCVTIMEO after a peer closes, despite a
                     // complete buffered reply. Drain only immediately available data;
@@ -115,7 +136,14 @@ impl Connection {
             self.stream
                 .set_write_timeout(Some(self.remaining()?))
                 .map_err(unavailable)?;
-            let count = self.stream.write(&bytes[offset..]).map_err(unavailable)?;
+            let count = match self.stream.write(&bytes[offset..]) {
+                Ok(count) => count,
+                // The write hit its deadline: report the miss, not the raw errno.
+                Err(ref e) if is_deadline_timeout(e) => {
+                    return Err(unavailable("request deadline exceeded"))
+                }
+                Err(e) => return Err(unavailable(e)),
+            };
             if count == 0 {
                 return Err(unavailable("provider disconnected"));
             }
@@ -155,7 +183,91 @@ impl Connection {
     }
 }
 
-/// Owns a child provider; losing the session closes IPC and terminates/reaps the child.
+/// How long a caller waits on its own thread for a killed provider to be reaped
+/// before handing the wait to a detached thread. A healthy provider exits in well
+/// under 5ms; past this the reap moves off the caller so an uninterruptible kernel
+/// wait can never block a drop or a connect-failure path.
+const REAP_GRACE: Duration = Duration::from_millis(100);
+
+/// Seam over the parts of [`std::process::Child`] the reaper uses, so tests can
+/// supply a child whose `wait` never returns without spawning a real process.
+trait Reap: Send + 'static {
+    fn kill(&mut self) -> std::io::Result<()>;
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+impl Reap for Child {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Child::kill(self)
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        Child::try_wait(self)
+    }
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        Child::wait(self)
+    }
+}
+
+/// Outcome of [`reap`], observable by tests. The product callers ignore it.
+#[derive(Debug, PartialEq, Eq)]
+enum Reaped {
+    /// The child was reaped synchronously within the grace window.
+    Exited,
+    /// The child outlived the grace window; its `wait` moved to a detached thread.
+    Detached,
+    /// The reaper thread could not be spawned; the child was dropped unreaped.
+    Abandoned,
+}
+
+/// SIGKILL a provider and reap it without blocking the caller past `grace`.
+///
+/// Poll `try_wait` for up to `grace` (the same 5ms idiom as [`Client::connect`]'s
+/// accept loop). A healthy provider exits at once, so the reap stays synchronous and
+/// spawns nothing. A provider stuck on an uninterruptible kernel wait is moved into a
+/// detached named thread that blocks on `wait`, so the caller returns in about
+/// `grace`, leaking at most one parked thread and one zombie until the kernel releases
+/// the wait (both cleaned up when the process exits and the provider is reparented to
+/// init). A `try_wait` error does *not* prove the child was reaped -- std's Unix
+/// `try_wait` propagates the `waitpid(WNOHANG)` error, so a transient EINTR leaves the
+/// child alive -- so it too routes to the detached wait, which actually reaps a live
+/// child and returns immediately (ECHILD) for one already reaped elsewhere.
+fn reap(mut child: impl Reap, grace: Duration) -> Reaped {
+    let _ = child.kill();
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Reaped::Exited,
+            Err(error) => {
+                // An error is not proof of reaping (only ECHILD is): hand the wait to
+                // the detached thread, which reaps a still-live child and resolves an
+                // already-reaped one immediately.
+                tracing::warn!(%error, "provider try_wait failed; reaping on a detached thread");
+                break;
+            }
+            Ok(None) if Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    tracing::warn!("provider did not exit after SIGKILL; reaping on a detached thread");
+    match std::thread::Builder::new()
+        .name("umbra-provider-reap".into())
+        .spawn(move || {
+            let _ = child.wait();
+        }) {
+        // Dropping the `JoinHandle` detaches the thread; std's `Child::drop` never
+        // waits, so the `Abandoned` path leaves only a zombie until process exit.
+        Ok(_) => Reaped::Detached,
+        Err(_) => Reaped::Abandoned,
+    }
+}
+
+/// Owns a child provider; losing the session closes IPC and reaps the child.
+///
+/// `Drop` invalidates the connection first (so the provider sees EOF), then SIGKILLs
+/// and reaps the child through [`reap`]: a short synchronous grace on the dropping
+/// thread, then a detached reaper for a child stuck on an uninterruptible wait. A
+/// zombie may outlive the drop in that case, but the caller never blocks on the
+/// kernel wait.
 pub struct Client {
     /// Connection.
     pub connection: Connection,
@@ -167,9 +279,8 @@ pub struct Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.connection.invalidate();
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = self.child.take() {
+            let _ = reap(child, REAP_GRACE);
         }
     }
 }
@@ -235,15 +346,15 @@ impl Client {
         let stream = match accepted {
             Ok(stream) => stream,
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                // A provider stuck exec-paging from a dead mount must not wedge this
+                // failure path, so reap it through the same bounded helper as `Drop`.
+                let _ = reap(child, REAP_GRACE);
                 return Err(e);
             }
         };
         // macOS may inherit O_NONBLOCK from the accepting listener.
         if let Err(error) = stream.set_nonblocking(false) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = reap(child, REAP_GRACE);
             return Err(unavailable(error));
         }
         let welcome = Welcome {
@@ -511,5 +622,230 @@ mod tests {
         client.begin();
         client.send(&42u32).unwrap();
         assert_eq!(worker.join().unwrap().unwrap(), 42);
+    }
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    fn exit_status() -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    // A `Reap` double whose `wait` blocks until the test releases it, so the detached
+    // hand-off can be observed without a real process.
+    struct FakeChild {
+        killed: Arc<AtomicBool>,
+        exits: bool,
+        errs: bool,
+        wait_calls: Arc<AtomicUsize>,
+        entered_wait: mpsc::Sender<std::thread::ThreadId>,
+        release: mpsc::Receiver<()>,
+        finished: mpsc::Sender<()>,
+    }
+    impl Reap for FakeChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            if self.errs {
+                // A try_wait error (e.g. a transient EINTR): not proof of reaping.
+                return Err(std::io::Error::other("try_wait failed"));
+            }
+            Ok(self.exits.then(exit_status))
+        }
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            self.wait_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self.entered_wait.send(std::thread::current().id());
+            let _ = self.release.recv();
+            let _ = self.finished.send(());
+            Ok(exit_status())
+        }
+    }
+    struct FakeControl {
+        killed: Arc<AtomicBool>,
+        wait_calls: Arc<AtomicUsize>,
+        entered_wait: mpsc::Receiver<std::thread::ThreadId>,
+        release: mpsc::Sender<()>,
+        finished: mpsc::Receiver<()>,
+    }
+    fn fake_child(exits: bool, errs: bool) -> (FakeChild, FakeControl) {
+        let killed = Arc::new(AtomicBool::new(false));
+        let wait_calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        (
+            FakeChild {
+                killed: killed.clone(),
+                exits,
+                errs,
+                wait_calls: wait_calls.clone(),
+                entered_wait: entered_tx,
+                release: release_rx,
+                finished: finished_tx,
+            },
+            FakeControl {
+                killed,
+                wait_calls,
+                entered_wait: entered_rx,
+                release: release_tx,
+                finished: finished_rx,
+            },
+        )
+    }
+
+    #[test]
+    fn reap_detaches_a_child_whose_wait_never_returns() {
+        let (child, control) = fake_child(false, false); // try_wait: Ok(None) forever
+        let start = Instant::now();
+        let outcome = reap(child, Duration::from_millis(50));
+        assert_eq!(outcome, Reaped::Detached);
+        assert!(
+            control.killed.load(Ordering::SeqCst),
+            "the child was killed"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(50) + Duration::from_millis(500),
+            "reap returned within the grace window plus slack, not after wait finished"
+        );
+        // `wait` ran on the detached reaper thread, not the caller's.
+        let wait_thread = control
+            .entered_wait
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait() was entered on the detached reaper thread");
+        assert_ne!(wait_thread, std::thread::current().id());
+        // Release the blocked wait and observe the reaper thread finish.
+        control.release.send(()).unwrap();
+        control
+            .finished
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the detached reaper finished after wait returned");
+        assert_eq!(control.wait_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn reap_is_synchronous_for_a_child_that_exits_on_kill() {
+        let (child, control) = fake_child(true, false); // try_wait: Ok(Some(_))
+        let outcome = reap(child, Duration::from_secs(5));
+        assert_eq!(outcome, Reaped::Exited);
+        assert!(control.killed.load(Ordering::SeqCst));
+        assert_eq!(
+            control.wait_calls.load(Ordering::SeqCst),
+            0,
+            "no detached wait for a child reaped synchronously"
+        );
+        assert!(
+            control.entered_wait.try_recv().is_err(),
+            "no reaper thread was spawned"
+        );
+    }
+
+    #[test]
+    fn reap_routes_a_try_wait_error_to_the_detached_wait() {
+        // A try_wait error is not proof of reaping, so the wait must move to the
+        // detached thread, which reaps a still-live child (or resolves immediately for
+        // an already-reaped one).
+        let (child, control) = fake_child(false, true); // try_wait: Err every poll
+        let outcome = reap(child, Duration::from_secs(5));
+        assert_eq!(outcome, Reaped::Detached);
+        // The detached `wait` actually runs and completes.
+        control.release.send(()).unwrap();
+        let start = Instant::now();
+        while control.wait_calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "the detached reaper ran wait() to completion"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        control
+            .finished
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the detached reaper finished after wait returned");
+    }
+
+    fn process_is_alive(pid: u32) -> bool {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn client_drop_kills_and_reaps_a_real_provider_promptly() {
+        let (connection, _peer) = pair(Duration::from_secs(1));
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = child.id();
+        let client = Client {
+            connection,
+            child: Some(child),
+            next_id: 1,
+            welcome: welcome(),
+        };
+        let start = Instant::now();
+        drop(client);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "dropping a Client kills and reaps its provider promptly"
+        );
+        // A beat in case this host detached rather than reaping synchronously.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!process_is_alive(pid), "the provider process was reaped");
+    }
+
+    #[test]
+    fn connect_reaps_a_provider_that_never_completes_the_handshake() {
+        // A script that ignores its args and sleeps: it stays alive but never dials
+        // back the private socket, so `connect` must hit the accept timeout (D-4).
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("stall");
+        std::fs::write(&script, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let descriptor = ProviderDescriptor {
+            id: "fake".into(),
+            role: "test".into(),
+            protocol_version: PROTOCOL_VERSION,
+            executable: crate::BytePath::new(script.as_os_str().as_bytes().to_vec()).unwrap(),
+            capabilities: Default::default(),
+            options: Vec::new(),
+        };
+        let start = Instant::now();
+        // `Client` is not `Debug`, so match rather than `unwrap_err`.
+        let error = match Client::connect(&descriptor, 200) {
+            Ok(_) => panic!("connect must not succeed against a provider that never dials back"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+        assert!(
+            error.to_string().contains("provider connection timeout"),
+            "the accept timeout is reported: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200) + REAP_GRACE + Duration::from_secs(1),
+            "connect returned about at the timeout plus the reap grace, not blocked: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_timeout_reports_the_deadline_rather_than_the_raw_errno() {
+        // The peer never answers, so the receive read expires against its deadline.
+        let (mut receiver, _sender) = pair(Duration::from_millis(30));
+        let error = receiver.receive::<Frame>().unwrap_err();
+        assert_eq!(error.kind, ErrorKind::StorageUnavailable);
+        assert!(
+            error.to_string().contains("request deadline exceeded"),
+            "a timed-out read reports the deadline miss, not `os error 35`: {error}"
+        );
     }
 }

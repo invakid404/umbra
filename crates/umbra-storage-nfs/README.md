@@ -31,23 +31,24 @@ write access to `run_parent`, so a reopen-only deployment whose `run_parent` is
 read-only is not qualified. Any failure, including the
 `ENOTSUP` an export that refuses chown returns, answers "not qualified" and the
 name is omitted; the probe never fails `open_run`. `open_run` waits at most
-five seconds for the probe, which runs on its own thread: an export that has not
+1.5 seconds for the probe, which runs on its own thread: an export that has not
 answered by then is likewise not qualified, with a `tracing` warning, and the
 stalled SETATTR is left to complete on its own. At most sixteen probe threads run
 per backend at once; once that many are outstanding a further open answers
 silently without starting another, so a wedged mount strands at most sixteen. Only
 the probe is bounded by that wait. The mount validation and run-layout I/O before it
 (walking to `run_parent`, creating and validating the run directory, reading its
-manifest) run on a separate thread too, and `open_run` waits at most thirty seconds
+manifest) run on a separate thread too, and `open_run` waits at most 3 seconds
 for them: past that, `open_run` fails with `StorageUnavailable` and a `tracing` warning,
 publishes no binding, and does not mark the provider's retained failure state. The
 stalled thread finishes on its own, with its own failure state, which is discarded.
 Nothing is rolled back. Late layout work stays inside `<run_parent>/<run-id>/`, and a
 run whose layout never completed is refused on reopen, because the manifest is written
 last. At most four stalled layout threads are allowed per provider instance. During
-an NFSv4 server grace period, `open_run` may fail at thirty seconds instead of
-succeeding later. When the provider is reached over IPC, the request deadline
-(five seconds by default) expires first. A read-only run is never
+an NFSv4 server grace period, `open_run` may fail at three seconds instead of
+succeeding later. The layout and probe bounds are sized to fit inside the default
+IPC deadline, so when the provider is reached over IPC their outcome surfaces first
+rather than the transport killing the provider. A read-only run is never
 probed and never advertises it, since the probe is itself a mutation that run
 would refuse. The qualification is per run and is dropped by `close_run`.
 Nothing here advertises remote durability:

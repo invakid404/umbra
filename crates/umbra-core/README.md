@@ -82,6 +82,14 @@ five trait crates. Runtime executable paths/options never belong in checkpoint i
 `provider::accept_connection` exposes the same identity/role/version/capability
 handshake as `accept` for injected private connections such as test socketpairs.
 
+A registry's `timeout_ms` (default `provider::DEFAULT_TIMEOUT_MS`, 5000, bounded to
+1–60000) is the authoritative deadline for a whole request, callbacks included: it is
+the bound a backend's own in-process timeouts are sized to fit inside, so the backend's
+outcome surfaces instead of a deadline miss. A missed deadline invalidates the
+connection, and dropping the client kills the provider and reaps it with a bounded
+wait — a child still stuck in the kernel is handed to a detached reaper thread rather
+than blocking the caller, so teardown proceeds and at worst a zombie outlives the drop.
+
 Check with `cargo check -p umbra-core`.
 
 Derived operation IDs are reproducible for a fixed seed and `(salt, index)` pair
