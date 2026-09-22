@@ -806,17 +806,44 @@ impl Drop for ProbeDir<'_> {
 /// directory service's idea of a user's groups, a superset that can include
 /// groups absent from the process credential, so a `chgrp` to one fails `EPERM`
 /// and the probe reads a spurious `false`. `rustix::process::getgroups` wraps the
-/// same syscall as a safe fn -- doing the count-then-fill two-call form and its
-/// race handling internally -- so this crate keeps `#![forbid(unsafe_code)]`. Its
-/// `Result` is folded into the fail-closed path like every other probe error.
+/// same syscall as a safe fn -- doing the count-then-fill two-call form internally
+/// -- so this crate keeps `#![forbid(unsafe_code)]`. Its `Result` is folded into
+/// the fail-closed path like every other probe error.
+///
+/// rustix's two-call form is only half race-safe, so we sanitise the result. If
+/// the set *grows* between the count and fill calls the fill errs and the whole
+/// read fails closed. If it *shrinks*, rustix (1.1.4 and 1.1.5,
+/// `src/process/id.rs:252-259`) discards the fill call's returned count and does
+/// not truncate the buffer it sized to the stale count, so the tail keeps
+/// `Gid::ROOT` (raw 0) padding that was never part of the credential set.
+/// [`strip_getgroups_padding`] pops that trailing zero run; see its docs for why
+/// stripping trailing zeros is the exact, fail-closed match for this bug.
 fn process_groups() -> Option<Vec<u32>> {
-    Some(
+    Some(strip_getgroups_padding(
         rustix::process::getgroups()
             .ok()?
             .into_iter()
             .map(|g| g.as_raw())
             .collect(),
-    )
+    ))
+}
+
+/// Strip the trailing `Gid::ROOT` (raw 0) padding rustix's `getgroups` can leave
+/// on its result when the supplementary set shrinks mid-read (see
+/// [`process_groups`]). Pure over its input so it is testable without racing a
+/// live `setgroups`.
+///
+/// Only *trailing* zeros are dropped: the padding is exclusively at the tail, and
+/// an interior 0 is a legitimate gid (e.g. `wheel`/`root`'s set on BSD/macOS) that
+/// must be preserved as a possible candidate. A legitimate *trailing* 0 is
+/// indistinguishable from padding and is dropped too, but that only ever removes a
+/// candidate, which moves the probe toward the indecisive/`false` verdict -- the
+/// fail-closed direction.
+fn strip_getgroups_padding(mut groups: Vec<u32>) -> Vec<u32> {
+    while groups.last() == Some(&0) {
+        groups.pop();
+    }
+    groups
 }
 
 /// The process's effective gid.
@@ -1552,6 +1579,35 @@ mod tests {
         assert_eq!(pick_candidate(&[20, 12, 61], 20), Some(12));
         // The egid need not be first, and is skipped wherever it appears.
         assert_eq!(pick_candidate(&[12, 20], 20), Some(12));
+    }
+
+    /// The shrink-race padding rustix can leave on `getgroups` is trailing
+    /// `Gid::ROOT` (raw 0), and only that tail is stripped: a real gid that
+    /// happens to sit in the interior -- including 0 -- survives, so the sanitiser
+    /// never rewrites a genuine credential set.
+    #[test]
+    fn strip_getgroups_padding_drops_only_trailing_zeros() {
+        // The bug shape: stale count leaves a `Gid::ROOT` tail.
+        assert_eq!(strip_getgroups_padding(vec![20, 12, 0, 0]), vec![20, 12]);
+        // No trailing zero: the set is returned untouched -- no false fire.
+        assert_eq!(strip_getgroups_padding(vec![20, 12, 61]), vec![20, 12, 61]);
+        // An interior 0 is a legitimate gid (wheel/root's set) and is kept.
+        assert_eq!(strip_getgroups_padding(vec![0, 20, 12]), vec![0, 20, 12]);
+    }
+
+    /// Degenerate inputs collapse to empty, and an empty set offers no candidate,
+    /// so the probe stays on the silent indecisive path rather than acting on
+    /// padding.
+    #[test]
+    fn strip_getgroups_padding_collapses_all_zero_sets() {
+        assert_eq!(strip_getgroups_padding(vec![]), Vec::<u32>::new());
+        assert_eq!(strip_getgroups_padding(vec![0]), Vec::<u32>::new());
+        // Composed with candidate selection: a set that is only egid plus padding
+        // yields no candidate, never a spurious one from the stripped 0.
+        assert_eq!(
+            pick_candidate(&strip_getgroups_padding(vec![20, 0]), 20),
+            None
+        );
     }
 
     /// The probe leaves the run directory byte-for-byte as it found it, on both
