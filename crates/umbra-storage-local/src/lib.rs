@@ -564,8 +564,12 @@ impl Storage for LocalStorage {
                 "run/base/format mismatch",
             ));
         }
-        // Ask the store, before anything reads `capabilities()` -- `RunBinding`
-        // below carries the answer, so the probe has to precede it.
+        // Compute the qualification answer up front, but do not record it until
+        // every fallible step below has succeeded: with the assignment last, the
+        // flag can no longer outlive a failed `open_run`. `capabilities()` still
+        // reads the flag when building the `RunBinding` the caller is handed, so
+        // the answer must be recorded before that binding is built -- hence the
+        // assignment sits just above it, not at the end of `open_run`.
         //
         // A read-only run is never probed and never advertises: the probe
         // performs a `chgrp`, a mutation this run would refuse anyway, and
@@ -573,12 +577,15 @@ impl Storage for LocalStorage {
         // forbids would be the wrong way round. Every failure inside the probe
         // answers `false` rather than propagating -- a store that cannot probe
         // must not fail `open_run` over a capability nothing has asked for yet.
-        self.parent_identity_qualified =
-            !request.policy.read_only && parent_identity_probe(&directory);
+        let qualified = !request.policy.read_only && parent_identity_probe(&directory);
+        let root = directory_binding(&directory.join("root"))?;
+        let control = directory_binding(&directory.join("control"))?;
+        // Every fallible step above has succeeded; only now record the answer.
+        self.parent_identity_qualified = qualified;
         let binding = RunBinding {
             run_id: request.run_id,
-            root: directory_binding(&directory.join("root"))?,
-            control: directory_binding(&directory.join("control"))?,
+            root,
+            control,
             capabilities: self.capabilities(),
         };
         self.run = Some(OpenRun {
@@ -1614,6 +1621,206 @@ mod tests {
         storage.release_writer(&lease).unwrap();
         storage.close_run().unwrap();
         assert!(!storage.capabilities().features.contains(PARENT_IDENTITY));
+    }
+
+    /// A refused `open_run` must never leave parent identity advertised: the
+    /// overlay reads `capabilities()` live, so an `Err` return that had already
+    /// set the flag would advertise a capability of a run that never opened.
+    /// After C' the assignment is the last statement before `self.run =
+    /// Some(...)`, so every reachable refusal returns before it. This table
+    /// walks each reachable refusal and asserts BOTH halves of the invariant --
+    /// nothing advertised AND no run installed.
+    ///
+    /// Honest grade: this is a forward-looking regression net, not a
+    /// reproduction of a live bug. It passes at master too, because no reachable
+    /// `open_run` input fails *after* the assignment today (the two
+    /// `directory_binding` calls do no I/O and cannot `Err`). It would start
+    /// catching regressions the moment a genuinely fallible step were added
+    /// below the assignment, or the assignment drifted back above one.
+    #[test]
+    fn open_run_failure_never_advertises_parent_identity() {
+        // Each closure parks a store immediately before a *failing* `open_run`,
+        // returning the `TempDir` too so it outlives the store.
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            Box<dyn Fn() -> (TempDir, LocalStorage, OpenRunRequest)>,
+        )> = vec![
+            (
+                "require_kernel_shadow",
+                Box::new(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let storage = LocalStorage::new(dir.path()).unwrap();
+                    let mut req = request();
+                    req.policy.require_kernel_shadow = true;
+                    (dir, storage, req)
+                }),
+            ),
+            (
+                "require_strict_remote_persistence",
+                Box::new(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let storage = LocalStorage::new(dir.path()).unwrap();
+                    let mut req = request();
+                    req.policy.require_strict_remote_persistence = true;
+                    (dir, storage, req)
+                }),
+            ),
+            (
+                "format_version",
+                Box::new(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let storage = LocalStorage::new(dir.path()).unwrap();
+                    let mut req = request();
+                    req.policy.format_version = 2;
+                    (dir, storage, req)
+                }),
+            ),
+            (
+                "read_only_create_new",
+                Box::new(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let storage = LocalStorage::new(dir.path()).unwrap();
+                    let mut req = request();
+                    req.policy.read_only = true; // intent stays CreateNew
+                    (dir, storage, req)
+                }),
+            ),
+            (
+                "invalid_layout",
+                Box::new(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut storage = LocalStorage::new(dir.path()).unwrap();
+                    let mut req = request();
+                    storage.open_run(&req).unwrap();
+                    drop(storage);
+                    let run = dir.path().join(req.run_id.0.to_string());
+                    fs::remove_dir_all(run.join("root")).unwrap();
+                    fs::write(run.join("root"), b"regular file, not a directory").unwrap();
+                    req.intent = OpenRunIntent::OpenExisting;
+                    let storage = LocalStorage::new(dir.path()).unwrap();
+                    (dir, storage, req)
+                }),
+            ),
+            (
+                "missing_manifest",
+                Box::new(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut storage = LocalStorage::new(dir.path()).unwrap();
+                    let mut req = request();
+                    storage.open_run(&req).unwrap();
+                    drop(storage);
+                    let run = dir.path().join(req.run_id.0.to_string());
+                    fs::remove_file(run.join("manifest")).unwrap();
+                    req.intent = OpenRunIntent::OpenExisting;
+                    let storage = LocalStorage::new(dir.path()).unwrap();
+                    (dir, storage, req)
+                }),
+            ),
+            (
+                "manifest_mismatch",
+                Box::new(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut storage = LocalStorage::new(dir.path()).unwrap();
+                    let mut req = request();
+                    storage.open_run(&req).unwrap();
+                    drop(storage);
+                    req.intent = OpenRunIntent::OpenExisting;
+                    req.immutable_base.fingerprint.push(9);
+                    let storage = LocalStorage::new(dir.path()).unwrap();
+                    (dir, storage, req)
+                }),
+            ),
+        ];
+
+        for (name, make) in cases {
+            let (_dir, mut storage, req) = make();
+            assert!(
+                storage.open_run(&req).is_err(),
+                "case `{name}` was expected to fail open_run"
+            );
+            assert!(
+                !storage.capabilities().features.contains(PARENT_IDENTITY),
+                "case `{name}` advertised parent identity after a failed open_run"
+            );
+            assert!(
+                storage.run.is_none(),
+                "case `{name}` left a run installed after a failed open_run"
+            );
+        }
+
+        // "run already open" is the one refusal that legitimately leaves a run
+        // in place, so `run.is_none()` cannot be asserted for it -- a run is
+        // *supposed* to be open. The invariant here is the complementary one:
+        // the refused second `open_run` disturbs neither the live run nor the
+        // flag it already carries.
+        let (_dir, mut storage, _request, _lease) = setup();
+        let advertised_before = storage.capabilities().features.contains(PARENT_IDENTITY);
+        assert_eq!(
+            storage.open_run(&request()).unwrap_err().kind,
+            ErrorKind::InvalidState
+        );
+        assert!(storage.run.is_some());
+        assert_eq!(
+            storage.capabilities().features.contains(PARENT_IDENTITY),
+            advertised_before,
+            "a refused second open_run changed the live run's advertisement"
+        );
+    }
+
+    /// Pins the invariant `parent_identity_qualified == true => run.is_some()`
+    /// at every observable boundary of a full open -> close -> reopen cycle,
+    /// including a read-only reopen. After C' the assignment and `self.run =
+    /// Some(...)` are adjacent, so the flag cannot be observed set with no run.
+    ///
+    /// Honest grade: like its sibling, this is a forward-looking net rather than
+    /// a reproduction. It passes at master because nothing fails between the
+    /// assignment and `self.run = Some(...)` today; its value is guarding that
+    /// adjacency against future edits.
+    #[test]
+    fn open_run_qualifies_only_after_its_fallible_work() {
+        let assert_inv = |storage: &LocalStorage| {
+            assert!(
+                !storage.parent_identity_qualified || storage.run.is_some(),
+                "parent_identity_qualified is set with no run open"
+            );
+            // The overlay reads capabilities() live; it must agree with the flag.
+            assert_eq!(
+                storage.capabilities().features.contains(PARENT_IDENTITY),
+                storage.parent_identity_qualified
+            );
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = LocalStorage::new(dir.path()).unwrap();
+        assert_inv(&storage); // fresh: no run, flag clear.
+
+        let mut request = request();
+        storage.open_run(&request).unwrap();
+        assert_inv(&storage); // open: run present, flag is whatever the probe said.
+
+        let lease = acquire(&mut storage, request.run_id);
+        storage.release_writer(&lease).unwrap();
+        storage.close_run().unwrap();
+        assert_inv(&storage);
+        assert!(storage.run.is_none() && !storage.parent_identity_qualified);
+
+        // Writable reopen.
+        request.intent = OpenRunIntent::OpenExisting;
+        storage.open_run(&request).unwrap();
+        assert_inv(&storage);
+        let lease = acquire(&mut storage, request.run_id);
+        storage.release_writer(&lease).unwrap();
+        storage.close_run().unwrap();
+        assert_inv(&storage);
+
+        // Read-only reopen: never probed, so never advertised, run open or not.
+        request.policy.read_only = true;
+        storage.open_run(&request).unwrap();
+        assert_inv(&storage);
+        assert!(!storage.parent_identity_qualified);
+        storage.close_run().unwrap();
+        assert_inv(&storage);
     }
 
     /// The live end-to-end outcome, asserted against an *independent* ground-truth
