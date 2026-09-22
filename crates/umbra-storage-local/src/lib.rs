@@ -19,7 +19,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
@@ -48,6 +48,15 @@ pub struct LocalStorage {
     /// fresh `LocalStorage`, so a `capabilities()` read before any run opens --
     /// which the overlay does -- answers "not advertised".
     parent_identity_qualified: bool,
+    /// Count of live layout threads for *this* provider (in flight or orphaned past
+    /// their timeout), the budget [`bounded_layout`] reserves against. Held per
+    /// instance rather than in a process-global `static` so that independent
+    /// providers sharing a process -- the overlay's in-process stores, or the many
+    /// concurrent instances a test binary spins up -- never refuse one another's
+    /// opens: a wedged mount behind one provider must not exhaust another's budget.
+    /// `open_run` is `&mut self`, so a healthy provider keeps this at 0 or 1; it
+    /// only climbs toward `LAYOUT_BUDGET` as a wedged mount strands threads (#100).
+    layout_live: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
@@ -103,6 +112,64 @@ fn manifest(request: &OpenRunRequest) -> Vec<u8> {
     bytes
 }
 
+/// The blocking layout phase of `open_run`, factored into a free function over
+/// owned inputs so it can run on a supervised thread (see [`bounded_layout`]) and
+/// so a wedged mount stalls that thread rather than `open_run` itself. It performs
+/// every filesystem operation `open_run` does before the qualification probe: the
+/// `CreateNew` mkdir/write chain, then the reopen validation both intents share.
+///
+/// Nothing here touches `self`; the storage passes an owned run `directory` and a
+/// cloned `request`. The body is the pre-probe layout of `open_run` moved verbatim,
+/// so the invariants it already holds carry over unchanged. In particular the run
+/// directory's exclusive `create_dir` stays the first `CreateNew` mutation: an
+/// orphaned late finish either wins that claim and continues alone, or loses it and
+/// stops at `AlreadyExists`, so two writers can never interleave inside one run dir
+/// (#100). The manifest is written last, after the epoch, so a complete manifest
+/// implies a complete layout and any partial residue an orphan leaves is refused by
+/// the validation below -- the same residue class a crash mid-`CreateNew` leaves
+/// today, for which there is deliberately no rollback.
+fn local_layout(directory: PathBuf, request: OpenRunRequest) -> Result<()> {
+    if request.intent == OpenRunIntent::CreateNew {
+        fs::create_dir(&directory).map_err(|e| io_error("open_run", e))?;
+        // A failed initialization remains unopenable, rather than publishing a binding.
+        fs::create_dir(directory.join("root")).map_err(|e| io_error("open_run", e))?;
+        fs::create_dir(directory.join("control")).map_err(|e| io_error("open_run", e))?;
+        fs::write(directory.join("epoch"), 0u64.to_le_bytes())
+            .map_err(|e| io_error("open_run", e))?;
+        fs::write(directory.join("manifest"), manifest(&request))
+            .map_err(|e| io_error("open_run", e))?;
+    }
+    for path in [
+        &directory,
+        &directory.join("root"),
+        &directory.join("control"),
+    ] {
+        let meta = fs::symlink_metadata(path).map_err(|e| io_error("open_run", e))?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(error(ErrorKind::InvalidPath, "open_run", "invalid layout"));
+        }
+    }
+    let manifest_path = directory.join("manifest");
+    if !fs::symlink_metadata(&manifest_path)
+        .map_err(|e| io_error("open_run", e))?
+        .is_file()
+    {
+        return Err(error(
+            ErrorKind::InvalidPath,
+            "open_run",
+            "invalid manifest",
+        ));
+    }
+    if fs::read(manifest_path).map_err(|e| io_error("open_run", e))? != manifest(&request) {
+        return Err(error(
+            ErrorKind::ProtocolMismatch,
+            "open_run",
+            "run/base/format mismatch",
+        ));
+    }
+    Ok(())
+}
+
 fn metadata(path: &Path) -> Result<BlobStat> {
     let meta = fs::symlink_metadata(path).map_err(|e| io_error("stat", e))?;
     let kind = if meta.is_file() {
@@ -136,6 +203,7 @@ impl LocalStorage {
             directory,
             run: None,
             parent_identity_qualified: false,
+            layout_live: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -457,6 +525,95 @@ fn check_io(offset: u64, len: usize) -> Result<()> {
     Ok(())
 }
 
+impl LocalStorage {
+    /// The body of [`open_run`](Storage::open_run) with the layout phase supplied as
+    /// a parameter, so the real caller passes `LAYOUT_TIMEOUT` and the true
+    /// `local_layout`, while tests pass a shorter timeout or a closure that parks --
+    /// no `cfg(test)` hook in the product path (mirrors the `bounded`/`bounded_with`
+    /// seam). The precondition checks, the unchanged qualification probe, the #92
+    /// flag ordering and the run install all stay here on the main thread; only the
+    /// blocking `layout` runs on the supervised thread `bounded_layout` spawns.
+    fn open_run_with(
+        &mut self,
+        request: &OpenRunRequest,
+        timeout: Duration,
+        layout: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<RunBinding> {
+        if self.run.is_some() {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "open_run",
+                "run already open",
+            ));
+        }
+        if request.policy.require_strict_remote_persistence || request.policy.require_kernel_shadow
+        {
+            return Err(unsupported("open_run policy"));
+        }
+        if request.policy.format_version != 1 {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "open_run",
+                "expected format version 1",
+            ));
+        }
+        if request.policy.read_only && request.intent == OpenRunIntent::CreateNew {
+            return Err(error(ErrorKind::Denied, "open_run", "read-only creation"));
+        }
+        let directory = self.directory.join(request.run_id.0.to_string());
+        // Run the blocking layout on a supervised thread. A timeout, budget
+        // exhaustion, spawn failure or panic all surface as `StorageUnavailable`
+        // *before* the qualification line below, so a failed layout never advertises
+        // a capability and never spawns a probe -- the #92 ordering is unchanged.
+        bounded_layout(&self.layout_live, timeout, layout)?;
+        // Compute the qualification answer up front, but do not record it until
+        // every fallible step below has succeeded: with the assignment last, the
+        // flag can no longer outlive a failed `open_run`. `capabilities()` still
+        // reads the flag when building the `RunBinding` the caller is handed, so
+        // the answer must be recorded before that binding is built -- hence the
+        // assignment sits just above it, not at the end of `open_run`.
+        //
+        // A read-only run is never probed and never advertises: the probe
+        // performs a `chgrp`, a mutation this run would refuse anyway, and
+        // qualifying a capability by performing the very mutation the policy
+        // forbids would be the wrong way round. Every failure inside the probe
+        // answers `false` rather than propagating -- a store that cannot probe
+        // must not fail `open_run` over a capability nothing has asked for yet.
+        // The probe does blocking filesystem I/O a wedged mount can stall on, so
+        // bound it: a timeout answers `false` like any other probe failure. The
+        // read-only short-circuit stays in front, so a read-only run spawns nothing.
+        let qualified = !request.policy.read_only
+            && bounded(PROBE_TIMEOUT, {
+                // The probe scratch lives in an isolated `<root>/.umbra-probes/`
+                // container, never under the run dir, so its late cleanup cannot
+                // race a concurrent flush's `sync_tree` of the run (#101). The run
+                // dir tags along only for the dev guard. The container is created
+                // inside the closure (below), never here on the main thread (#92).
+                let probes = self.directory.join(".umbra-probes");
+                let run_dir = directory.clone();
+                move || parent_identity_probe(&probes, &run_dir)
+            });
+        let root = directory_binding(&directory.join("root"))?;
+        let control = directory_binding(&directory.join("control"))?;
+        // Every fallible step above has succeeded; only now record the answer.
+        self.parent_identity_qualified = qualified;
+        let binding = RunBinding {
+            run_id: request.run_id,
+            root,
+            control,
+            capabilities: self.capabilities(),
+        };
+        self.run = Some(OpenRun {
+            request: request.clone(),
+            directory,
+            lease: None,
+            retries: HashMap::new(),
+            pages: HashMap::new(),
+        });
+        Ok(binding)
+    }
+}
+
 impl Storage for LocalStorage {
     fn capabilities(&self) -> StorageCapabilities {
         // Explicitly a development store: it advertises the local mode and
@@ -508,111 +665,17 @@ impl Storage for LocalStorage {
     }
 
     fn open_run(&mut self, request: &OpenRunRequest) -> Result<RunBinding> {
-        if self.run.is_some() {
-            return Err(error(
-                ErrorKind::InvalidState,
-                "open_run",
-                "run already open",
-            ));
-        }
-        if request.policy.require_strict_remote_persistence || request.policy.require_kernel_shadow
-        {
-            return Err(unsupported("open_run policy"));
-        }
-        if request.policy.format_version != 1 {
-            return Err(error(
-                ErrorKind::ProtocolMismatch,
-                "open_run",
-                "expected format version 1",
-            ));
-        }
-        if request.policy.read_only && request.intent == OpenRunIntent::CreateNew {
-            return Err(error(ErrorKind::Denied, "open_run", "read-only creation"));
-        }
-        let directory = self.directory.join(request.run_id.0.to_string());
-        if request.intent == OpenRunIntent::CreateNew {
-            fs::create_dir(&directory).map_err(|e| io_error("open_run", e))?;
-            // A failed initialization remains unopenable, rather than publishing a binding.
-            fs::create_dir(directory.join("root")).map_err(|e| io_error("open_run", e))?;
-            fs::create_dir(directory.join("control")).map_err(|e| io_error("open_run", e))?;
-            fs::write(directory.join("epoch"), 0u64.to_le_bytes())
-                .map_err(|e| io_error("open_run", e))?;
-            fs::write(directory.join("manifest"), manifest(request))
-                .map_err(|e| io_error("open_run", e))?;
-        }
-        for path in [
-            &directory,
-            &directory.join("root"),
-            &directory.join("control"),
-        ] {
-            let meta = fs::symlink_metadata(path).map_err(|e| io_error("open_run", e))?;
-            if !meta.is_dir() || meta.file_type().is_symlink() {
-                return Err(error(ErrorKind::InvalidPath, "open_run", "invalid layout"));
-            }
-        }
-        let manifest_path = directory.join("manifest");
-        if !fs::symlink_metadata(&manifest_path)
-            .map_err(|e| io_error("open_run", e))?
-            .is_file()
-        {
-            return Err(error(
-                ErrorKind::InvalidPath,
-                "open_run",
-                "invalid manifest",
-            ));
-        }
-        if fs::read(manifest_path).map_err(|e| io_error("open_run", e))? != manifest(request) {
-            return Err(error(
-                ErrorKind::ProtocolMismatch,
-                "open_run",
-                "run/base/format mismatch",
-            ));
-        }
-        // Compute the qualification answer up front, but do not record it until
-        // every fallible step below has succeeded: with the assignment last, the
-        // flag can no longer outlive a failed `open_run`. `capabilities()` still
-        // reads the flag when building the `RunBinding` the caller is handed, so
-        // the answer must be recorded before that binding is built -- hence the
-        // assignment sits just above it, not at the end of `open_run`.
-        //
-        // A read-only run is never probed and never advertises: the probe
-        // performs a `chgrp`, a mutation this run would refuse anyway, and
-        // qualifying a capability by performing the very mutation the policy
-        // forbids would be the wrong way round. Every failure inside the probe
-        // answers `false` rather than propagating -- a store that cannot probe
-        // must not fail `open_run` over a capability nothing has asked for yet.
-        // The probe does blocking filesystem I/O a wedged mount can stall on, so
-        // bound it: a timeout answers `false` like any other probe failure. The
-        // read-only short-circuit stays in front, so a read-only run spawns nothing.
-        let qualified = !request.policy.read_only
-            && bounded(PROBE_TIMEOUT, {
-                // The probe scratch lives in an isolated `<root>/.umbra-probes/`
-                // container, never under the run dir, so its late cleanup cannot
-                // race a concurrent flush's `sync_tree` of the run (#101). The run
-                // dir tags along only for the dev guard. The container is created
-                // inside the closure (below), never here on the main thread (#92).
-                let probes = self.directory.join(".umbra-probes");
-                let run_dir = directory.clone();
-                move || parent_identity_probe(&probes, &run_dir)
-            });
-        let root = directory_binding(&directory.join("root"))?;
-        let control = directory_binding(&directory.join("control"))?;
-        // Every fallible step above has succeeded; only now record the answer.
-        self.parent_identity_qualified = qualified;
-        let binding = RunBinding {
-            run_id: request.run_id,
-            root,
-            control,
-            capabilities: self.capabilities(),
+        // The blocking layout runs on a supervised thread bounded by
+        // `LAYOUT_TIMEOUT`, so wrap the real `local_layout` in the closure the seam
+        // takes. `open_run_with` keeps the cheap precondition checks and the
+        // unchanged qualification probe on this thread; only the layout I/O a wedged
+        // mount can stall on moves off it.
+        let layout = {
+            let directory = self.directory.join(request.run_id.0.to_string());
+            let request = request.clone();
+            move || local_layout(directory, request)
         };
-        self.run = Some(OpenRun {
-            request: request.clone(),
-            directory,
-            lease: None,
-            retries: HashMap::new(),
-            pages: HashMap::new(),
-        });
-        Ok(binding)
+        self.open_run_with(request, LAYOUT_TIMEOUT, layout)
     }
 
     fn acquire_writer(&mut self, request: &AcquireWriterRequest) -> Result<WriterLease> {
@@ -1076,6 +1139,134 @@ fn bounded_with(
             false
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => false,
+    }
+}
+
+/// Timeout bounding the whole `open_run` layout phase. The layout does far more
+/// work than a qualification probe -- up to five `CreateNew` mutations plus the
+/// reopen validation -- so it needs more headroom than `PROBE_TIMEOUT`: on a loaded
+/// store with slow stable storage a healthy layout can reach low seconds, and 30s
+/// is roughly 10x over a bad-but-healthy case while still bounding a wedged mount to
+/// a `open_run` that fails in `LAYOUT_TIMEOUT + PROBE_TIMEOUT` rather than never.
+///
+/// Note (#100): where the caller reaches this backend through the provider IPC
+/// proxy, that transport's own request deadline (default 5s) fires first, so this
+/// bound only shortens time-to-fail for in-process callers and for registries with
+/// a large `timeout_ms`. It is still the only bound for those paths, and the
+/// late-work safety it enables (a timed-out layout leaves only residue the reopen
+/// validation already refuses) is a correctness fix regardless of which deadline wins.
+const LAYOUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most layout threads allowed live per backend at once (in flight or orphaned
+/// past their timeout). Each stranded layout thread is an `open_run` that already
+/// failed; after this many the mount is clearly wedged, so further opens fail fast
+/// without spawning. Separate from `PROBE_BUDGET` -- a wedged layout must never
+/// starve the probe budget or vice versa -- and per-backend for the same reason.
+const LAYOUT_BUDGET: usize = 4;
+
+/// Run the `open_run` layout phase `f` on a dedicated thread and return its result,
+/// or `StorageUnavailable` if it does not finish within `timeout`.
+///
+/// This is the layout counterpart of [`bounded`], kept as a separate `Result`-typed
+/// generic helper because `bounded`/`bounded_with` are `bool`-typed and part of the
+/// untouched probe mechanism (#91). Every non-answer surfaces as `StorageUnavailable`
+/// -- the same kind the IPC transport uses for a deadline miss -- so a wedged mount
+/// fails `open_run` closed rather than hanging it:
+///   - a timeout returns `StorageUnavailable` and logs, distinguishing a wedged
+///     layout in the logs from any other open failure;
+///   - budget exhaustion returns `StorageUnavailable` immediately, without spawning;
+///   - a spawn failure returns `StorageUnavailable` rather than panicking;
+///   - a panicking layout drops the sender, so `Disconnected` also fails closed.
+///
+/// On timeout the thread is orphaned, not killed (a hard-mount D-state thread cannot
+/// be killed anyway): it keeps running its syscalls with owned inputs and no
+/// reference to `self`, so it can never touch the installed run or the qualification
+/// flag. Its late work touches only `<root>/<run_id>/**` and leaves at most the same
+/// partial-layout residue a crash mid-`CreateNew` leaves today, which the reopen
+/// validation already refuses; there is deliberately no rollback (#100).
+///
+/// The `live` counter is the calling provider's own (`LocalStorage::layout_live`),
+/// not a process-global `static` -- see that field for why. That is the one shape
+/// difference from the probe's process-global [`bounded_with`]; the reserve-before-
+/// spawn, `Slot`-on-thread and `Builder::spawn` structure is otherwise identical.
+fn bounded_layout<T: Send + 'static>(
+    live: &Arc<AtomicUsize>,
+    timeout: Duration,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    bounded_layout_with(live, LAYOUT_BUDGET, timeout, f)
+}
+
+/// The core of [`bounded_layout`], parameterised over the `live`-thread counter and
+/// its `budget` so tests can exercise the guard against a private counter with a
+/// small budget. Mirrors [`bounded_with`]'s reserve-before-spawn shape, but is
+/// `Result`-typed and reserves against a per-provider (rather than `'static`) count.
+fn bounded_layout_with<T: Send + 'static>(
+    live: &Arc<AtomicUsize>,
+    budget: usize,
+    timeout: Duration,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    // Reserve one of the `budget` live-thread slots atomically before spawning, so
+    // concurrent callers can never collectively exceed it. Over budget fails closed.
+    if live
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < budget).then_some(n + 1)
+        })
+        .is_err()
+    {
+        tracing::warn!(budget, "layout budget exhausted; mount unresponsive");
+        return Err(error(
+            ErrorKind::StorageUnavailable,
+            "open_run",
+            "layout budget exhausted; mount unresponsive",
+        ));
+    }
+    let (tx, rx) = mpsc::channel();
+    let slot_live = Arc::clone(live);
+    if thread::Builder::new()
+        .name("umbra-layout".into())
+        .spawn(move || {
+            // Releases the reserved slot when this thread exits -- normal return or
+            // panic. Held for the layout's whole life, so a timed-out (orphaned)
+            // thread keeps its slot until it finally finishes.
+            struct Slot(Arc<AtomicUsize>);
+            impl Drop for Slot {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _slot = Slot(slot_live);
+            let _ = tx.send(f());
+        })
+        .is_err()
+    {
+        // The thread never started, so release the reservation the caller made.
+        live.fetch_sub(1, Ordering::AcqRel);
+        return Err(error(
+            ErrorKind::StorageUnavailable,
+            "open_run",
+            "layout thread spawn failed",
+        ));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                timeout_secs = timeout.as_secs_f64(),
+                "layout I/O timed out; mount unresponsive"
+            );
+            Err(error(
+                ErrorKind::StorageUnavailable,
+                "open_run",
+                "layout I/O timed out; mount unresponsive",
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(error(
+            ErrorKind::StorageUnavailable,
+            "open_run",
+            "layout thread panicked",
+        )),
     }
 }
 
@@ -2387,5 +2578,330 @@ mod tests {
             bounded(Duration::from_secs(5), || true),
             "a new probe runs once the budget frees up"
         );
+    }
+
+    // A deliberately small budget for the `bounded_layout` concurrency test, so it
+    // can oversubscribe it with only a handful of threads. Each test owns a fresh
+    // `Arc<AtomicUsize>` counter (matching how a real provider owns `layout_live`),
+    // so these tests need no cross-test serialization at all.
+    const TEST_LAYOUT_BUDGET: usize = 3;
+
+    #[test]
+    fn bounded_layout_passes_an_in_time_result_through_unchanged() {
+        let live = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            bounded_layout(&live, Duration::from_secs(5), || Ok(42u32)).unwrap(),
+            42,
+            "an in-time Ok passes through"
+        );
+        let err = bounded_layout(&live, Duration::from_secs(5), || {
+            Err::<(), _>(error(ErrorKind::ProtocolMismatch, "open_run", "mismatch"))
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::ProtocolMismatch,
+            "an in-time Err passes through with its own kind, not remapped"
+        );
+    }
+
+    #[test]
+    fn bounded_layout_times_out_to_storage_unavailable() {
+        let live = Arc::new(AtomicUsize::new(0));
+        // The layout parks on a channel the test keeps open, so it is still running
+        // when the timeout fires. Milliseconds keep the test fast; the elapsed bound
+        // asserts `bounded_layout` did not wait for the layout to finish.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let start = std::time::Instant::now();
+        let err = bounded_layout(&live, Duration::from_millis(50), move || {
+            let _ = release_rx.recv();
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StorageUnavailable);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "bounded_layout returned on the timeout, not after the layout finished"
+        );
+        let _ = release_tx.send(()); // release the orphan so it exits cleanly
+    }
+
+    #[test]
+    fn bounded_layout_maps_a_panicking_layout_to_storage_unavailable() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let err = bounded_layout(&live, Duration::from_secs(5), || -> Result<()> {
+            panic!("layout blew up")
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::StorageUnavailable,
+            "a panicking layout drops the sender and fails closed"
+        );
+    }
+
+    #[test]
+    fn bounded_layout_never_exceeds_the_budget_and_spawns_nothing_over_it() {
+        // A fresh per-test counter: the guard admits exactly `TEST_LAYOUT_BUDGET`.
+        let live = Arc::new(AtomicUsize::new(0));
+        // Oversubscribe the budget: launch budget + 2 callers that all reserve before
+        // any can time out. The atomic reservation must admit exactly `budget` and
+        // refuse the rest with `StorageUnavailable` without running their closures.
+        const N: usize = TEST_LAYOUT_BUDGET + 2;
+        let ran = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(std::sync::Barrier::new(TEST_LAYOUT_BUDGET + 1));
+        let lineup = Arc::new(std::sync::Barrier::new(N));
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let live = Arc::clone(&live);
+                let ran = Arc::clone(&ran);
+                let refused = Arc::clone(&refused);
+                let gate = Arc::clone(&gate);
+                let lineup = Arc::clone(&lineup);
+                thread::spawn(move || {
+                    lineup.wait();
+                    let result = bounded_layout_with(
+                        &live,
+                        TEST_LAYOUT_BUDGET,
+                        Duration::from_secs(5),
+                        move || {
+                            ran.fetch_add(1, Ordering::AcqRel);
+                            gate.wait(); // hold the slot until the test releases us
+                            Ok(())
+                        },
+                    );
+                    if let Err(ref e) = result {
+                        assert_eq!(e.kind, ErrorKind::StorageUnavailable);
+                        refused.fetch_add(1, Ordering::AcqRel);
+                    }
+                    result.is_ok()
+                })
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        while ran.load(Ordering::Acquire) < TEST_LAYOUT_BUDGET
+            || refused.load(Ordering::Acquire) < N - TEST_LAYOUT_BUDGET
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "exactly the budget should reserve a slot; the rest are refused"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ran.load(Ordering::Acquire), TEST_LAYOUT_BUDGET);
+        assert_eq!(refused.load(Ordering::Acquire), N - TEST_LAYOUT_BUDGET);
+
+        gate.wait();
+        let admitted = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(admitted, TEST_LAYOUT_BUDGET);
+
+        let drain = std::time::Instant::now();
+        while live.load(Ordering::Acquire) != 0 {
+            assert!(
+                drain.elapsed() < Duration::from_secs(5),
+                "every reserved slot is released after the layouts exit"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// #100 test 1: a layout that fails surfaces cleanly. A failing layout -- exactly
+    /// what `bounded_layout` hands back on a timeout, budget exhaustion, spawn failure
+    /// or panic -- must surface *before* the qualification line: `open_run` returns
+    /// `StorageUnavailable`, installs no run, advertises no parent identity, and (the
+    /// proof no probe was even spawned) never creates the isolated `.umbra-probes`
+    /// container. `bounded_layout`'s own timeout behaviour is pinned by the helper
+    /// tests above, on the private counter, so this test drives the seam with a
+    /// fast-failing layout rather than parking a thread on the real budget the other
+    /// `open_run` tests share -- mirroring how the probe suite keeps its parking on
+    /// `TEST_LIVE` and never on `PROBE_LIVE`.
+    #[test]
+    fn open_run_layout_failure_installs_no_run_and_spawns_no_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = LocalStorage::new(dir.path()).unwrap();
+        let request = request();
+        let err = storage
+            .open_run_with(&request, LAYOUT_TIMEOUT, || -> Result<()> {
+                Err(error(
+                    ErrorKind::StorageUnavailable,
+                    "open_run",
+                    "layout I/O timed out; mount unresponsive",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StorageUnavailable);
+        assert!(storage.run.is_none(), "a failed layout installs no run");
+        assert!(
+            !storage.capabilities().features.contains(PARENT_IDENTITY),
+            "a failed layout advertises no parent identity"
+        );
+        assert!(
+            !dir.path().join(".umbra-probes").exists(),
+            "a failed layout returns before the probe line, so nothing is spawned"
+        );
+    }
+
+    /// #100 test 2: an orphaned layout that loses the claim race touches nothing. An
+    /// orphan is exactly what a timed-out `open_run` leaves behind -- a detached
+    /// thread still running `local_layout`. Model it directly (off the bounded
+    /// counter, so it cannot starve the budget the parallel suite shares) parked
+    /// *before* its claim `create_dir`. A retry of the same id then wins the claim
+    /// and opens intact; releasing the orphan, its first op gets `AlreadyExists` and
+    /// it stops. Two writers never interleave inside one run dir.
+    #[test]
+    fn open_run_orphan_that_loses_the_claim_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = request();
+        let directory = dir.path().join(request.run_id.0.to_string());
+
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let orphan = {
+            let directory = directory.clone();
+            let request = request.clone();
+            thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                local_layout(directory, request)
+            })
+        };
+        started_rx.recv().unwrap(); // the orphan is parked before its claim
+
+        // The retry wins the claim with the real layout and opens.
+        let mut retry = LocalStorage::new(dir.path()).unwrap();
+        retry.open_run(&request).unwrap();
+
+        // Release the orphan: its first op now loses the claim and it stops.
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            orphan.join().unwrap().unwrap_err().kind,
+            ErrorKind::AlreadyExists,
+            "the orphan that lost the claim stops at its first op"
+        );
+
+        // The retry's run is intact: exactly the four expected entries, and the
+        // manifest holds the retry's own bytes untouched.
+        assert_eq!(
+            fs::read(directory.join("manifest")).unwrap(),
+            manifest(&request)
+        );
+        let mut entries: Vec<String> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["control", "epoch", "manifest", "root"]);
+    }
+
+    /// #100 test 3: a "complete but unclaimed" run. Let an orphaned layout finish
+    /// completely while nobody holds the run. The result is a valid run: a same-id
+    /// `CreateNew` gets `AlreadyExists`, and `OpenExisting` reopens it. It is garbage
+    /// like crash residue, but it is safe -- the supervisor always uses a fresh
+    /// run_id, so nothing collides with it.
+    #[test]
+    fn open_run_orphan_may_complete_an_unclaimed_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = request();
+        let directory = dir.path().join(request.run_id.0.to_string());
+
+        // The orphan runs `local_layout` to completion with no holder.
+        let orphan = {
+            let directory = directory.clone();
+            let request = request.clone();
+            thread::spawn(move || local_layout(directory, request))
+        };
+        orphan.join().unwrap().unwrap();
+
+        // A same-id CreateNew now finds the complete residue.
+        let mut retry = LocalStorage::new(dir.path()).unwrap();
+        assert_eq!(
+            retry.open_run(&request).unwrap_err().kind,
+            ErrorKind::AlreadyExists
+        );
+        // And OpenExisting reopens the complete-but-unclaimed run.
+        let mut reopen = LocalStorage::new(dir.path()).unwrap();
+        let mut req = request.clone();
+        req.intent = OpenRunIntent::OpenExisting;
+        reopen.open_run(&req).unwrap();
+    }
+
+    /// #100 test 4: every partial-layout residue an orphan can leave is refused. Each
+    /// case is built directly on disk (the design's stall positions), then both an
+    /// `OpenExisting` (the poison detector) and a same-id `CreateNew` must refuse it.
+    /// This pins the property the "no rollback" decision relies on.
+    #[test]
+    fn open_run_refuses_every_partial_layout_residue() {
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Box<dyn Fn(&Path)>)> = vec![
+            (
+                "dir only",
+                Box::new(|run: &Path| {
+                    fs::create_dir(run).unwrap();
+                }),
+            ),
+            (
+                "+root",
+                Box::new(|run: &Path| {
+                    fs::create_dir(run).unwrap();
+                    fs::create_dir(run.join("root")).unwrap();
+                }),
+            ),
+            (
+                "+control",
+                Box::new(|run: &Path| {
+                    fs::create_dir(run).unwrap();
+                    fs::create_dir(run.join("root")).unwrap();
+                    fs::create_dir(run.join("control")).unwrap();
+                }),
+            ),
+            (
+                "+epoch, no manifest",
+                Box::new(|run: &Path| {
+                    fs::create_dir(run).unwrap();
+                    fs::create_dir(run.join("root")).unwrap();
+                    fs::create_dir(run.join("control")).unwrap();
+                    fs::write(run.join("epoch"), 0u64.to_le_bytes()).unwrap();
+                }),
+            ),
+            (
+                "+short manifest",
+                Box::new(|run: &Path| {
+                    fs::create_dir(run).unwrap();
+                    fs::create_dir(run.join("root")).unwrap();
+                    fs::create_dir(run.join("control")).unwrap();
+                    fs::write(run.join("epoch"), 0u64.to_le_bytes()).unwrap();
+                    fs::write(run.join("manifest"), b"short").unwrap();
+                }),
+            ),
+        ];
+
+        for (name, build) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let request = request();
+            let run = dir.path().join(request.run_id.0.to_string());
+            build(&run);
+
+            let mut opener = LocalStorage::new(dir.path()).unwrap();
+            let mut reopen = request.clone();
+            reopen.intent = OpenRunIntent::OpenExisting;
+            assert!(
+                opener.open_run(&reopen).is_err(),
+                "OpenExisting must refuse partial residue `{name}`"
+            );
+
+            let mut creator = LocalStorage::new(dir.path()).unwrap();
+            assert_eq!(
+                creator.open_run(&request).unwrap_err().kind,
+                ErrorKind::AlreadyExists,
+                "a same-id CreateNew over residue `{name}` gets AlreadyExists"
+            );
+        }
     }
 }
