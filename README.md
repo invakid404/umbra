@@ -61,9 +61,11 @@ the local-mount requirement by speaking NFSv4.0/TCP/AUTH_SYS itself: it carries
 the Umbra-owned client state machine, a raw transport behind an off-by-default
 feature, an operations surface that creates and opens runs, and writer admission
 with bounded outage recovery. Its suites run against an isolated NFS-Ganesha
-container from user space, with no mount anywhere. It advertises no durability
-and no fencing, and nothing has yet switched the CLI matrix over to it, so the
-opt-out stays.
+container from user space, with no mount anywhere. An open run advertises
+`Durability::Remote` — the matched-verifier `COMMIT` barrier its `flush`
+certifies over already-committed writes, with strict remote persistence still
+refused — and no fencing, and nothing has yet switched the CLI matrix over to
+it, so the opt-out stays.
 Fork pull requests cannot run the qualification job, and its checkout does
 not persist job credentials. A labeled runner must be provisioned before this
 check can supply a CI signal; a queued qualification job is not enforcement

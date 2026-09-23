@@ -10,8 +10,10 @@ journal and outage machine in `src/authority/`, the admission binding in
 `src/session.rs`, and a `Storage` implementation that creates and opens runs,
 resolves paths, stats, enumerates, reads, writes, creates, renames, removes,
 sets metadata and truncates. Semantics this provider will not offer answer
-`UnsupportedCapability`; `flush` answers `NotImplemented`, because a durability
-receipt would assert a persistence boundary nothing here has qualified.
+`UnsupportedCapability`; `flush` certifies a run-scoped completeness barrier over
+writes it has already committed and returns a `Durability::Remote` receipt — a
+zero-I/O bookkeeping barrier, not a new persistence mechanism, that re-COMMITs
+nothing. What `Remote` does and does not assert is stated under Durability below.
 
 `open_run` acquires admission before it returns a binding, so a denied session
 receives an error and nothing to use. Admission is granted only by a release the
@@ -251,7 +253,9 @@ reports the count and stability the server actually reached rather than the ones
 requested, and writes `UNSTABLE`. An unstable write is durable only once a
 `COMMIT` returns the verifier the `WRITE` did; a changed verifier is
 `ReplayError::VerifierChanged`, meaning the bytes must be rewritten from the
-retained payload. No receipt is issued here, so nothing claims persistence.
+retained payload. The write itself issues no receipt and makes no aggregate
+claim; `flush` is what reads this settled evidence and certifies the run-scoped
+barrier its receipt carries.
 
 ### Capabilities
 
@@ -279,9 +283,25 @@ the syscall-matrix entries no contract operation maps to. Three verdicts:
   `kqueue`/`kevent` with `EVFILT_VNODE` and FSEvents. Nothing in this crate
   registers, delivers or emulates a file-change notification.
 - **Deferred**, answered with `ErrorKind::NotImplemented` naming the owner:
-  `CopyUp`, which needs a base-materialisation seam that lives above storage, and
-  `flush`, whose receipt would assert a persistence boundary nothing here has
-  qualified.
+  `CopyUp`, which needs a base-materialisation seam that lives above storage.
+
+`flush` is wired. It is a zero-I/O completeness barrier over the run's
+already-committed writes: as of the call, under the current writer epoch, every
+mutation in scope is settled and verifier-matched and none is outstanding,
+indeterminate or latched-failed. It re-COMMITs nothing — a matched-verifier
+`COMMIT` already placed those bytes on the server's stable storage — so it adds
+the aggregate the per-write path cannot, not a new persistence mechanism, and it
+returns a `Durability::Remote` receipt. The receipt never outruns its evidence: a
+latched write failure returns the original error verbatim, an unsettled call is
+indeterminate, a `Data` or `DataAndMetadata` scope is certified only when every
+named object carries settled ledger evidence and is refused when any of them is
+missing or still outstanding — an object the run never recorded is refused rather
+than certified as a vacuous `Ok` — and no run open is `InvalidState`. A request naming a run other than the one this provider
+holds is refused as `InvalidInput`, exactly as `execute` refuses it — a receipt
+is issued only to the run that asked for it. An `UNSTABLE` write whose `COMMIT`
+failed leaves an unresolved-recovery obligation whatever the server's status
+mapped to, so the barrier reports it as indeterminate rather than certifying
+bytes no `COMMIT` ever proved.
 
 Namespace mutation — `Unlink`, `RemoveDirectory`, `Rename`, `Create` of a
 directory, `CreateParents`, `SetMetadata`, `Truncate` — was deferred while the
@@ -410,10 +430,12 @@ session only makes the choice explicit and reports which backend answered throug
 methods need `&mut ProtocolState` and `&mut dyn RawTransport` in one call, and
 `observe` expresses the epoch comparison that needs both by shared reference.
 
-**No live transport is constructed for `Storage` here.** `NfsUserspaceStorage`
-runs its operations over whatever `with_facades` was given, which is the fake in
-every test in this crate. Constructing a `LibnfsRawTransport` for the provider,
-and the acceptance that goes with it, is deferred.
+**No live transport is constructed for `Storage` in this seam.** `NfsUserspaceStorage`
+runs its operations over whatever `with_facades` is given — the fake in a default
+build. Where a fixture is configured, `m1_conformance.rs`, `live_state.rs` and
+`fault_matrix.rs` give the provider a live `LibnfsRawTransport` instead; that live
+provider acceptance — the persistence, server-restart and failure-handling cases
+that qualify `Durability::Remote` — is done rather than deferred.
 
 ## Authority and recovery
 
@@ -534,9 +556,11 @@ cannot select it.
 `open_run` establishes a client incarnation, resolves or creates the run's
 anchors over the bound transport, acquires product admission, and only then
 publishes a binding whose advertised `max_io_bytes` and `max_directory_entries`
-come from that transport's own limits. `Durability::None` and `Fencing::ReadOnly`
-stay: no persistence boundary is qualified and no independent termination
-verifier exists. The binding advertises exactly one `features` name,
+come from that transport's own limits. `durability` is advertised at
+`Durability::Remote`, the same level a satisfied `flush` returns, so the provider
+never advertises less than it delivers. `Fencing::ReadOnly` stays: no independent
+termination verifier exists, and the barrier says nothing about fencing. The
+binding advertises exactly one `features` name,
 `ownership-fidelity-v1`: `SetMetadata` is `Support::Supported` in the capability
 table, and `NamespaceMutation::SetAttributes` maps `update.uid` and `update.gid`
 onto `FATTR4_OWNER` and `FATTR4_OWNER_GROUP` as stringified numeric ids, which is
@@ -551,10 +575,12 @@ does not create the export or run-parent directories: those are deployment
 configuration, and creating a missing one would silently relocate every run.
 
 The `StoragePolicy` is enforced rather than recorded. `require_kernel_shadow` and
-`require_strict_remote_persistence` are refused before the run is touched, since
-this provider offers neither; a read-only run cannot be created, because creation
-is itself a mutation, and an opened read-only run refuses mutations while still
-serving reads.
+`require_strict_remote_persistence` are **still refused** before the run is
+touched: strict remote persistence is a stronger promise than the barrier `flush`
+certifies — it says nothing about the export's `fsync` policy or persistence after
+power loss — so leaving the refusal in place preserves a guarantee rather than
+weakening one. A read-only run cannot be created, because creation is itself a
+mutation, and an opened read-only run refuses mutations while still serving reads.
 
 `OpenRunIntent::OpenExisting` reads the run's own evidence before admission.
 `.provider/manifest` must decode and must name the requested run, immutable base
@@ -703,8 +729,9 @@ with atomic REMOVE, and is out of scope here.
 contract over both backends, asserting which one answered. It covers admission
 before any binding is published, a second session denied by name, denial that
 repeats because no clock is consulted, release-then-admit at the next epoch, the
-whole namespace surface end to end, and that an open run claims no durability, no
-fencing, no kernel shadow and no physical path.
+whole namespace surface end to end, and that an open run answers a qualified
+`flush`, keeps `Fencing::ReadOnly`, and claims no kernel shadow and no physical
+path.
 
 `tests/golden_compat.rs` is the sequential existing-run compatibility half:
 it creates a run through the provider, reads the result back over NFSv4.0, and
@@ -851,12 +878,13 @@ stop with the original status carried forward, and the release that follows is
 not reported clean. That covers a failed `FILE_SYNC4` journal write for a rename
 or a create, not only a failed `WriteAt`.
 
-`flush` still reports its gate rather than issuing a receipt, and the provider
-still advertises `Durability::None`. Writing a record `FILE_SYNC4` asks the
-server for stability; it does not qualify a persistence boundary, and no
-remote-durability claim is made from it. `authority::MutationJournal` remains the
-typed lower-layer model over the `ReplayLog` facade and is not itself on the
-`Storage` path.
+`flush` issues a `Durability::Remote` receipt over the run's already-committed
+writes rather than reporting a gate; it performs no I/O and re-COMMITs nothing.
+Its `Remote` claim rests on the matched-verifier `COMMIT` each `WriteAt` already
+performed — writing a record `FILE_SYNC4` asks the server for stability, but the
+barrier's claim is not made from the journal write. `authority::MutationJournal`
+remains the typed lower-layer model over the `ReplayLog` facade and is not itself
+on the `Storage` path.
 
 Held-object coherence is demonstrated against a real server.
 `tests/live_state.rs`'s `r2_006_*` case runs two NFSv4 clients — separate client
@@ -893,6 +921,18 @@ leaving a reader to assume byte equality.
 
 Overlay and session recovery, fencing, and remote-storage power-loss
 qualification are later milestones; split-brain resolution is explicitly deferred
-to M3 fencing authority. **Nothing in this crate qualifies remote durability.**
-Running against a live server proves the protocol works; it proves nothing about
-persistence after power loss, and the advertised capabilities say so.
+to M3 fencing authority.
+
+### Durability — what `Remote` asserts, and what it does not
+
+The only remote durability this crate qualifies is the matched-verifier `COMMIT`
+barrier `flush` certifies: **the server acknowledged, via a `COMMIT` whose
+verifier matched the `WRITE`'s, that every byte in scope reached its stable
+storage, and nothing in scope is outstanding.** That is exactly what a
+`Durability::Remote` receipt asserts, and no more. It asserts **nothing** about
+the server's hardware, the export's `fsync` policy or its media; nothing about
+fencing (`Fencing::ReadOnly` is unchanged); no atomic snapshot; and no continuous
+persistence. `require_strict_remote_persistence` — a stronger promise than this
+barrier — is still refused. Running against a live server proves the barrier
+holds; it proves nothing about persistence after power loss, and the advertised
+capabilities say exactly that.

@@ -29,7 +29,7 @@ use uuid::Uuid;
 use umbra_storage_nfs_userspace::fake::{FakeReplayLog, FakeTransport};
 use umbra_storage_nfs_userspace::integration::Backend;
 use umbra_storage_nfs_userspace::storage::{
-    NfsUserspaceConfig, NfsUserspaceStorage, FORMAT_VERSION,
+    NfsUserspaceConfig, NfsUserspaceStorage, FORMAT_VERSION, QUALIFIED_DURABILITY,
 };
 use umbra_storage_nfs_userspace::transport::{Deadline, FaultAction, FaultPoint, RawTransport};
 
@@ -95,6 +95,20 @@ fn backends() -> Vec<(Backend, Box<dyn RawTransport>)> {
 fn provider(transport: Box<dyn RawTransport>) -> NfsUserspaceStorage {
     NfsUserspaceStorage::with_facades(config(), transport, Box::new(FakeReplayLog::default()))
         .expect("the provider accepts the fixture configuration")
+}
+
+/// A transport for a *second* client incarnation reaching the same server.
+///
+/// Only a live backend has one: a fresh `LibnfsRawTransport` reconnects to the
+/// same Ganesha, with a new SETCLIENTID, session, stateids and handles. An
+/// in-memory `FakeTransport` server dies with the provider that owns it, so there
+/// is no same-server reincarnation to hand back, and the caller skips the reopen.
+fn incarnate(backend: Backend) -> Option<Box<dyn RawTransport>> {
+    if backend.is_live() {
+        live_transport()
+    } else {
+        None
+    }
 }
 
 /// A run id unique to this process, so a live fixture is never reused across runs.
@@ -564,17 +578,20 @@ fn unlinking_a_directory_and_rmdir_of_a_file_are_both_refused() {
 // --- honesty about what this provider is ---------------------------------
 
 #[test]
-fn an_open_run_claims_no_durability_no_fencing_and_no_physical_path() {
+fn an_open_run_claims_no_fencing_and_no_physical_path_and_a_qualified_flush() {
     for (backend, transport) in backends() {
         let mut storage = provider(transport);
         let binding = storage
             .open_run(&create_run(fresh_run()))
             .expect("open_run");
 
-        // No M2 or M3 claim: no qualified persistence boundary, no independent
-        // termination verifier, no kernel-visible path.
+        // Durability is advertised at exactly what a satisfied `flush` returns, so
+        // the provider never advertises less than it delivers, and it is never
+        // `None`: the overlay rejects a `None` receipt outright. Still no M3 claim —
+        // no independent termination verifier, no kernel-visible path.
         let capabilities = binding.capabilities;
-        assert_eq!(capabilities.durability, Durability::None, "{backend:?}");
+        assert_eq!(capabilities.durability, QUALIFIED_DURABILITY, "{backend:?}");
+        assert_ne!(capabilities.durability, Durability::None, "{backend:?}");
         assert_eq!(capabilities.fencing, Fencing::ReadOnly);
         assert!(!capabilities.strict_remote_persistence);
         assert!(!capabilities.kernel_shadow);
@@ -603,20 +620,208 @@ fn an_open_run_claims_no_durability_no_fencing_and_no_physical_path() {
         assert!(binding.root.physical_path.is_none(), "{backend:?}");
         assert!(binding.control.physical_path.is_none());
 
-        // Durability receipts stay unwired: a receipt would assert a persistence
-        // boundary nothing here has qualified.
-        assert_eq!(
-            storage
-                .flush(&umbra_core::FlushRequest {
-                    context: context(&storage, "flush"),
-                    scope: umbra_core::FlushScope::Data {
-                        objects: Vec::new()
-                    },
-                })
-                .unwrap_err()
-                .kind,
-            ErrorKind::NotImplemented
+        // A flush over an empty scope is a barrier with nothing outstanding: it
+        // certifies completeness, which is exactly what it may claim. The receipt
+        // is bound to this run and this writer, and is never `None` — the overlay
+        // rejects a `None` receipt outright (umbra-overlay engine.rs:2618).
+        let run_id = storage.admission().expect("a run is open").admitted().run();
+        let receipt = storage
+            .flush(&umbra_core::FlushRequest {
+                context: context(&storage, "flush"),
+                scope: umbra_core::FlushScope::Data {
+                    objects: Vec::new(),
+                },
+            })
+            .expect("flush answers for an empty scope");
+        assert_eq!(receipt.run_id, run_id, "{backend:?}");
+        assert_ne!(receipt.durability, Durability::None, "{backend:?}");
+        assert!(
+            !receipt.evidence.is_empty(),
+            "a receipt states its method: {backend:?}"
         );
+
+        storage.close_run().expect("close_run");
+    }
+}
+
+// --- (d1) persistence: data outlives the writing client incarnation ------------
+
+/// Written bytes, flushed and closed, are still there for a *fresh* client.
+///
+/// `open_run` → `Create` → `WriteAt` → `flush` (expect `Ok`) → `close_run` → drop
+/// the provider entirely → build a fresh [`NfsUserspaceStorage`] → reopen the same
+/// [`RunId`] → `read_at` → assert byte-identical.
+///
+/// # What this proves, and — just as important — what it does not
+///
+/// Dropping the provider and rebuilding destroys the writing client *incarnation*:
+/// the fresh provider performs a new SETCLIENTID, opens a new session, mints new
+/// stateids and new handles, and reaches the bytes only through the server. A
+/// byte-identical read back therefore proves the data survived the loss of the
+/// incarnation that wrote it — exactly what a matched-verifier COMMIT promises, and
+/// what the `flush` receipt certifies as a barrier.
+///
+/// It does **not** prove survival of a SIGKILL of the host *process*. An in-process
+/// rebuild restarts the client incarnation, not the OS process; overstating what
+/// the test proves would be the same sin as overstating the receipt. The
+/// byte-identical acceptance runs only under [`Backend::is_live`]: an in-memory
+/// fake server dies with its provider, so there the case is a shape check of the
+/// write+flush path, and the live Ganesha fixture carries the acceptance.
+#[test]
+fn written_bytes_outlive_the_client_incarnation_that_wrote_them() {
+    let payload = b"umbra-userspace-flush-persistence-payload".to_vec();
+    for (backend, transport) in backends() {
+        let run_id = fresh_run();
+
+        // --- incarnation 1: create, write, flush, close -----------------------
+        let mut first = provider(transport);
+        first
+            .open_run(&create_run(run_id))
+            .expect("open_run (create)");
+        run(
+            &mut first,
+            "touch",
+            StorageOperation::Create {
+                path: path("payload.bin"),
+                options: CreateOptions {
+                    kind: CreateKind::File,
+                    mode: 0o640,
+                },
+            },
+        );
+        run(
+            &mut first,
+            "write",
+            StorageOperation::WriteAt {
+                path: path("payload.bin"),
+                offset: 0,
+                bytes: payload.clone(),
+            },
+        );
+        // The barrier must be satisfied: nothing is outstanding, so the overlay
+        // could order its completion record after this receipt.
+        let receipt = first
+            .flush(&umbra_core::FlushRequest {
+                context: context(&first, "flush"),
+                scope: umbra_core::FlushScope::EntireRun,
+            })
+            .expect("flush certifies the barrier before close");
+        assert_ne!(receipt.durability, Durability::None, "{backend:?}");
+        first.close_run().expect("close_run");
+        drop(first);
+
+        // --- incarnation 2: a genuinely fresh client, reopen and read back ----
+        let Some(fresh) = incarnate(backend) else {
+            // No same-server reincarnation for the fake; the live backend below
+            // carries the acceptance, and `a_live_backend_actually_ran_...` guards
+            // against the suite degrading to fake-only coverage.
+            continue;
+        };
+        let mut second = provider(fresh);
+        second
+            .open_run(&open_existing(run_id))
+            .expect("reopen the same run on a fresh incarnation");
+        let mut got = vec![0u8; payload.len()];
+        let read = second
+            .read_at(&context(&second, "read"), &path("payload.bin"), 0, &mut got)
+            .expect("read the persisted bytes back");
+        assert_eq!(read, payload.len(), "{backend:?}: short read on reopen");
+        assert_eq!(
+            got, payload,
+            "{backend:?}: the bytes survived the loss of the writing incarnation"
+        );
+        assert!(
+            backend.is_live(),
+            "the byte-identical acceptance is a live result, never a fake shape check"
+        );
+        second.close_run().expect("close_run");
+    }
+}
+
+// --- (firewall case 8) a scope naming an unrecorded object is refused ----------
+
+/// A `Data` scope naming an object this run never recorded returns `Err`
+/// (indeterminate), never a vacuous `Ok`.
+///
+/// The barrier ledger keys on the derived contract id, so a random [`ObjectId`] no
+/// write in this run produced is absent from it; `all_settled` returns `false` and
+/// `flush` refuses. This pins the ratified firewall **case 8** (audit §F) — the one
+/// case neither an `EntireRun` nor an empty-scope flush exercises. A real settled
+/// write is issued first, so the refusal is provably about the named id, not an
+/// empty ledger.
+#[test]
+fn a_scope_naming_an_unrecorded_object_is_refused_not_vacuously_certified() {
+    for (backend, transport) in backends() {
+        let mut storage = provider(transport);
+        storage
+            .open_run(&create_run(fresh_run()))
+            .expect("open_run");
+
+        run(
+            &mut storage,
+            "touch",
+            StorageOperation::Create {
+                path: path("recorded.bin"),
+                options: CreateOptions {
+                    kind: CreateKind::File,
+                    mode: 0o640,
+                },
+            },
+        );
+        run(
+            &mut storage,
+            "write",
+            StorageOperation::WriteAt {
+                path: path("recorded.bin"),
+                offset: 0,
+                bytes: b"recorded".to_vec(),
+            },
+        );
+
+        // An object id no write in this run ever produced.
+        let never_written = umbra_core::ObjectId(Uuid::new_v4());
+        let error = storage
+            .flush(&umbra_core::FlushRequest {
+                context: context(&storage, "flush-unknown"),
+                scope: umbra_core::FlushScope::Data {
+                    objects: vec![never_written],
+                },
+            })
+            .expect_err("a scope naming an unrecorded object must not be certified");
+        assert_eq!(error.kind, ErrorKind::StorageUnavailable, "{backend:?}");
+
+        storage.close_run().expect("close_run");
+    }
+}
+
+// --- (CR-1) a flush naming a different run is refused --------------------------
+
+/// A `flush` whose request names a run other than the one the provider holds is
+/// refused with `Err(InvalidInput)`, never a receipt for the held run.
+///
+/// The receipt's `run_id` is the held lease's, so without this check a request
+/// naming run X under a matching epoch, while the provider holds run Y, would
+/// receive a receipt for Y. `execute` already refuses exactly this (ops.rs
+/// preflight); `flush` must too, since a non-overlay caller has no
+/// `receipt.run_id` cross-check.
+#[test]
+fn a_flush_naming_a_different_run_is_refused() {
+    for (backend, transport) in backends() {
+        let mut storage = provider(transport);
+        storage
+            .open_run(&create_run(fresh_run()))
+            .expect("open_run");
+
+        // The held epoch, but some other run id.
+        let mut wrong = context(&storage, "flush-wrong-run");
+        wrong.run_id = RunId(Uuid::new_v4());
+        let error = storage
+            .flush(&umbra_core::FlushRequest {
+                context: wrong,
+                scope: umbra_core::FlushScope::EntireRun,
+            })
+            .expect_err("a flush naming a different run must be refused");
+        assert_eq!(error.kind, ErrorKind::InvalidInput, "{backend:?}");
 
         storage.close_run().expect("close_run");
     }
