@@ -65,6 +65,9 @@ pub mod namespace;
 pub mod ops;
 pub mod pages;
 pub mod pdu;
+/// The per-run persistence-boundary probe. Private: its only output is the
+/// boolean `open_run` reads, and nothing outside this crate may assert it.
+mod probe;
 pub mod replay;
 pub mod session;
 pub mod state;

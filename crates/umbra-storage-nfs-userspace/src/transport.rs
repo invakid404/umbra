@@ -1267,6 +1267,41 @@ impl FaultPlan for NoFaults {
     }
 }
 
+/// What a COMMIT on a [`RawTransport`] is actually crossing.
+///
+/// This is the *declared* half of the provider's durability claim: an
+/// implementation states the boundary it puts bytes across, and
+/// [`NfsUserspaceStorage`](crate::storage::NfsUserspaceStorage)'s `open_run`
+/// then has to *prove* that boundary for the run before anything is advertised.
+/// Neither half alone is
+/// enough. The declaration cannot prove that a particular mount completes a
+/// matched-verifier COMMIT cycle, and a behavioural probe cannot tell an
+/// in-memory `BTreeMap` from a real server — [`crate::fake::FakeTransport`]
+/// models protocol shape, not durability, and returns the same verifier on
+/// WRITE and on COMMIT, so it passes any probe put to it.
+///
+/// # The default is the whole point
+///
+/// [`RawTransport::persistence_boundary`] defaults to [`Self::Unqualified`], so
+/// an implementation that says nothing is taken to have qualified nothing and
+/// the provider degrades to [`umbra_core::Durability::Local`]. A transport
+/// author who forgets to declare gets the weaker claim, never the stronger one:
+/// the failure mode is fail-closed, which is what makes this a mechanism rather
+/// than a convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PersistenceBoundary {
+    /// Nothing is declared, so nothing is qualified. The default.
+    ///
+    /// Every in-memory double and every transport that has not stated otherwise
+    /// lands here, including doubles that faithfully reproduce the WRITE/COMMIT
+    /// verifier protocol.
+    Unqualified,
+    /// A COMMIT crosses to a real NFSv4 server process over a network
+    /// transport, where a matched verifier is the server's RFC 7530 §16.4
+    /// acknowledgement of stable storage.
+    RemoteServer,
+}
+
 /// The raw-RPC transport surface consumed by protocol state.
 ///
 /// # Invariants an implementation must uphold
@@ -1314,6 +1349,21 @@ pub trait RawTransport: Send {
 
     /// Install a fault plan. Replaces any previous plan.
     fn install_faults(&mut self, plan: Box<dyn FaultPlan>);
+
+    /// The persistence boundary a COMMIT on this context crosses.
+    ///
+    /// Defaulted to [`PersistenceBoundary::Unqualified`] deliberately, and
+    /// additive to an otherwise frozen facade for exactly that reason: adding it
+    /// breaks no implementer, and every implementation that does not override it
+    /// — every in-memory double in this crate and in its tests — is correctly
+    /// read as having qualified nothing. Override it only from a transport that
+    /// really does put bytes across the declared boundary.
+    ///
+    /// A declaration is necessary but never sufficient. See
+    /// [`PersistenceBoundary`] for the second gate.
+    fn persistence_boundary(&self) -> PersistenceBoundary {
+        PersistenceBoundary::Unqualified
+    }
 
     // --- Shape helpers -------------------------------------------------------
     //

@@ -692,16 +692,16 @@ fn r1_010_an_over_budget_reply_retires_its_registration_on_a_real_server() {
 // (d3) live half: the flush firewall holds against real Ganesha
 // ===========================================================================
 
-/// A provider over a fresh live incarnation, with `install` applied to the live
-/// transport first — so a client-side fault is armed before any run is opened.
-/// Uses the `<umbra>/<runs>` layout the fixture seeds for the m1 suite.
-fn faulted_flush_provider(
-    config: &RawTransportConfig,
-    install: impl FnOnce(&mut dyn RawTransport),
-) -> NfsUserspaceStorage {
-    let mut transport: Box<dyn RawTransport> =
+/// A provider over a fresh live incarnation, using the `<umbra>/<runs>` layout
+/// the fixture seeds for the m1 suite.
+///
+/// It installs no fault plan. A caller that wants one arms it through
+/// [`NfsUserspaceStorage::transport`] *after* `open_run` has returned: the
+/// boundary probe performs real I/O inside `open_run`, so a plan armed at
+/// construction is spent there rather than on the operation under test.
+fn live_flush_provider(config: &RawTransportConfig) -> NfsUserspaceStorage {
+    let transport: Box<dyn RawTransport> =
         Box::new(LibnfsRawTransport::connect(config.clone()).expect("connect a fresh incarnation"));
-    install(transport.as_mut());
     let provider_config = NfsUserspaceConfig {
         host: config.host.clone().into_bytes(),
         port: config.port,
@@ -743,17 +743,7 @@ fn a_failed_commit_over_real_ganesha_is_refused_by_flush_and_never_a_receipt() {
         return;
     };
 
-    // Fail the run's single data-write COMMIT with NFS4ERR_IO. `AfterDispatch`
-    // carries the real op over the live transport, and the provider issues exactly
-    // one COMMIT — on the data write — so `open_run` (whose manifest writes are
-    // FILE_SYNC) runs unfaulted and the fault stays armed until the WriteAt.
-    let mut storage = faulted_flush_provider(&fixture.config, |transport| {
-        transport.install_faults(ScriptedFault::once(
-            FaultPoint::AfterDispatch,
-            Some(OpCode::Commit),
-            FaultAction::Substitute(Nfs4Status::IO),
-        ));
-    });
+    let mut storage = live_flush_provider(&fixture.config);
 
     let run_id = RunId(uuid::Uuid::new_v4());
     storage
@@ -772,6 +762,31 @@ fn a_failed_commit_over_real_ganesha_is_refused_by_flush_and_never_a_receipt() {
             },
         })
         .expect("open_run against the live fixture");
+
+    // Fail the run's single data-write COMMIT with NFS4ERR_IO. `AfterDispatch`
+    // carries the real op over the live transport.
+    //
+    // Armed here rather than at construction, and the ordering is the whole
+    // point. `open_run` issues a COMMIT of its own: the persistence-boundary
+    // probe, which this transport is subject to because `LibnfsRawTransport`
+    // declares `PersistenceBoundary::RemoteServer`. A one-shot plan armed before
+    // `open_run` is therefore spent on the probe, the probe fails, the run
+    // honestly degrades to `Durability::Local`, and the WriteAt below runs
+    // *unfaulted* and succeeds — which is not this test's subject. Arming after
+    // `open_run` returns leaves the probe unfaulted and the caller's write
+    // faulted, which is what the firewall assertions below are about.
+    //
+    // From here the provider issues exactly one COMMIT — `ops.rs`'s `write_at`.
+    // `Create`, the retry journal's records and the anchor writes are all
+    // FILE_SYNC and owe none, so the fault stays armed until the WriteAt.
+    storage
+        .transport()
+        .expect("the provider holds the live transport")
+        .install_faults(ScriptedFault::once(
+            FaultPoint::AfterDispatch,
+            Some(OpCode::Commit),
+            FaultAction::Substitute(Nfs4Status::IO),
+        ));
 
     storage
         .execute(&StorageRequest {

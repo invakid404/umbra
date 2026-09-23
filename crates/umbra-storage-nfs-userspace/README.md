@@ -11,9 +11,12 @@ journal and outage machine in `src/authority/`, the admission binding in
 resolves paths, stats, enumerates, reads, writes, creates, renames, removes,
 sets metadata and truncates. Semantics this provider will not offer answer
 `UnsupportedCapability`; `flush` certifies a run-scoped completeness barrier over
-writes it has already committed and returns a `Durability::Remote` receipt — a
-zero-I/O bookkeeping barrier, not a new persistence mechanism, that re-COMMITs
-nothing. What `Remote` does and does not assert is stated under Durability below.
+writes it has already committed and returns a receipt at the durability the run
+qualified for — a zero-I/O bookkeeping barrier, not a new persistence mechanism,
+that re-COMMITs nothing. `Durability::Remote` is claimed only when the boundary
+was qualified for that `open_run`; otherwise the receipt is `Durability::Local`.
+What `Remote` does and does not assert, and what qualifies it, is stated under
+Durability below.
 
 `open_run` acquires admission before it returns a binding, so a denied session
 receives an error and nothing to use. Admission is granted only by a release the
@@ -291,7 +294,10 @@ mutation in scope is settled and verifier-matched and none is outstanding,
 indeterminate or latched-failed. It re-COMMITs nothing — a matched-verifier
 `COMMIT` already placed those bytes on the server's stable storage — so it adds
 the aggregate the per-write path cannot, not a new persistence mechanism, and it
-returns a `Durability::Remote` receipt. The receipt never outruns its evidence: a
+returns a receipt at the run's qualified durability. The receipt never outruns
+its evidence: it inherits `capabilities().durability` rather than asserting a
+constant, so a run whose boundary was not qualified receives `Durability::Local`;
+a
 latched write failure returns the original error verbatim, an unsettled call is
 indeterminate, a `Data` or `DataAndMetadata` scope is certified only when every
 named object carries settled ledger evidence and is refused when any of them is
@@ -556,9 +562,14 @@ cannot select it.
 `open_run` establishes a client incarnation, resolves or creates the run's
 anchors over the bound transport, acquires product admission, and only then
 publishes a binding whose advertised `max_io_bytes` and `max_directory_entries`
-come from that transport's own limits. `durability` is advertised at
-`Durability::Remote`, the same level a satisfied `flush` returns, so the provider
-never advertises less than it delivers. `Fencing::ReadOnly` stays: no independent
+come from that transport's own limits. `durability` is derived per run, and a
+satisfied `flush` returns that same level, so the provider never advertises less
+than it delivers and never more than it proved. It is `Durability::Remote` only
+when both gates held for that `open_run` — the bound transport declared
+`PersistenceBoundary::RemoteServer`, and a synthetic `WRITE`/`COMMIT`
+verifier-compare probe succeeded against the run's own `.provider` — and
+`Durability::Local` otherwise, including on a read-only run, on a transport that
+declares nothing, and when the probe did not succeed. `Fencing::ReadOnly` stays: no independent
 termination verifier exists, and the barrier says nothing about fencing. The
 binding advertises exactly one `features` name,
 `ownership-fidelity-v1`: `SetMetadata` is `Support::Supported` in the capability
@@ -878,10 +889,10 @@ stop with the original status carried forward, and the release that follows is
 not reported clean. That covers a failed `FILE_SYNC4` journal write for a rename
 or a create, not only a failed `WriteAt`.
 
-`flush` issues a `Durability::Remote` receipt over the run's already-committed
-writes rather than reporting a gate; it performs no I/O and re-COMMITs nothing.
-Its `Remote` claim rests on the matched-verifier `COMMIT` each `WriteAt` already
-performed — writing a record `FILE_SYNC4` asks the server for stability, but the
+`flush` issues a receipt over the run's already-committed writes rather than
+reporting a gate; it performs no I/O and re-COMMITs nothing. Its claim is the
+durability the run qualified for, and a `Remote` claim rests on the
+matched-verifier `COMMIT` each `WriteAt` already performed — writing a record `FILE_SYNC4` asks the server for stability, but the
 barrier's claim is not made from the journal write. `authority::MutationJournal`
 remains the typed lower-layer model over the `ReplayLog` facade and is not itself
 on the `Storage` path.
@@ -936,3 +947,21 @@ persistence. `require_strict_remote_persistence` — a stronger promise than thi
 barrier — is still refused. Running against a live server proves the barrier
 holds; it proves nothing about persistence after power loss, and the advertised
 capabilities say exactly that.
+
+`Remote` is not a constant. It is claimed for a run only when **both** gates held
+during that run's `open_run`:
+
+1. the bound transport declared `PersistenceBoundary::RemoteServer` — a defaulted
+   `RawTransport` method whose default is `PersistenceBoundary::Unqualified`, so a
+   transport that declares nothing degrades rather than over-claims; and
+2. a synthetic `OPEN` / `WRITE(UNSTABLE)` / `COMMIT` / verifier-compare / `CLOSE` /
+   `REMOVE` probe against the run's own `.provider` succeeded, proving the
+   matched-verifier `COMMIT` cycle on that mount for that invocation.
+
+Neither gate suffices alone: an in-memory fake returns a matching verifier and so
+passes any probe, while a declaration alone says nothing about a particular mount.
+A read-only run cannot be probed and therefore claims `Durability::Local`. The
+qualification is per `open_run` and is dropped with the run, so a reopened run is
+probed again. A build with no live transport linked — the default, since the live
+backend sits behind the off-by-default `transport-raw` feature — therefore ships
+`Local`, never an unproven `Remote`.

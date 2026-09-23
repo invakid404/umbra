@@ -24,10 +24,10 @@
 //! [`AuthorityError::NoWriterEpoch`](crate::error::AuthorityError::NoWriterEpoch).
 
 use umbra_core::{
-    BlobStat, CreateKind, DirectoryPage, ErrorKind, Fencing, ListCursor, MetadataUpdate,
-    ObjectResult, OpenRunRequest, RenameMode, Result, RunBinding, RunId, StorageAnchor,
-    StorageCapabilities, StorageOperation, StoragePath, StoragePolicy, StorageRequest,
-    StorageResponse, UmbraError, MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
+    BlobStat, CreateKind, DirectoryPage, Durability, ErrorKind, Fencing, ListCursor,
+    MetadataUpdate, ObjectResult, OpenRunRequest, RenameMode, Result, RunBinding, RunId,
+    StorageAnchor, StorageCapabilities, StorageOperation, StoragePath, StoragePolicy,
+    StorageRequest, StorageResponse, UmbraError, MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
 };
 
 use crate::anchor::{Anchor, HandleMint, RunAnchors, Target};
@@ -159,6 +159,15 @@ pub struct Operations {
     /// a read-only run mutated and an unsupported durability requirement was
     /// silently accepted. Keeping it is what lets `execute` answer for it.
     policy: StoragePolicy,
+    /// Whether the persistence boundary was proven for *this* opened run.
+    ///
+    /// False until [`Self::qualify_boundary`] is told otherwise, which
+    /// [`crate::storage::NfsUserspaceStorage::open_run`] does once, after
+    /// admission, from [`crate::probe::qualify`]. It is deliberately a field on
+    /// *this* value rather than on the provider: `close_run` drops the whole
+    /// surface, so the qualification cannot outlive the run that earned it and
+    /// there is no cross-run cache to go stale. A reopened run probes again.
+    boundary_qualified: bool,
 }
 
 impl Operations {
@@ -222,6 +231,9 @@ impl Operations {
             mint: HandleMint::for_session(request.run_id, serial),
             limits: OperationLimits::from_transport(transport),
             policy: request.policy.clone(),
+            // Nothing is proven at open: the probe needs a writer epoch and a
+            // confirmed incarnation, which admission has not granted yet.
+            boundary_qualified: false,
         })
     }
 
@@ -250,16 +262,51 @@ impl Operations {
         self.limits
     }
 
+    /// Record what the boundary probe proved for this run.
+    ///
+    /// Called exactly once, by
+    /// [`crate::storage::NfsUserspaceStorage::open_run`], between admission and
+    /// the binding being built — so the binding a caller receives already
+    /// carries the probed value rather than a pre-probe one. There is no way to
+    /// set it from outside the crate, and no way to set it twice for one run.
+    pub(crate) fn qualify_boundary(&mut self, qualified: bool) {
+        self.boundary_qualified = qualified;
+    }
+
+    /// The durability level this run has actually earned.
+    ///
+    /// [`crate::storage::QUALIFIED_DURABILITY`] only when the persistence
+    /// boundary was both declared by the bound transport and proven by a
+    /// matched-verifier COMMIT cycle during this `open_run`; otherwise
+    /// [`Durability::Local`], which asserts strictly less and so cannot lie
+    /// while still clearing the overlay's `!= None` check.
+    ///
+    /// This is the single place an open run's durability is produced. Both
+    /// [`Self::capabilities`] and the `flush` receipt read it, so a receipt can
+    /// never outrun what the binding advertised.
+    pub(crate) fn durability(&self) -> Durability {
+        if self.boundary_qualified {
+            crate::storage::QUALIFIED_DURABILITY
+        } else {
+            Durability::Local
+        }
+    }
+
     /// Capabilities advertised for this opened run.
     ///
-    /// Durability is advertised at [`crate::storage::QUALIFIED_DURABILITY`], the
-    /// same level a satisfied `flush` returns, so the provider never advertises
-    /// less than it delivers: every `WriteAt` returns only after a COMMIT whose
-    /// verifier matched its WRITE's, which per RFC 7530 §16.4 is the server's
-    /// acknowledgement of stable storage, and `flush` is the barrier that certifies
-    /// none in scope is outstanding. Fencing still stays [`Fencing::ReadOnly`]:
-    /// this node owns no independent termination verifier, and the barrier says
-    /// nothing about fencing, an atomic snapshot, or continuous persistence.
+    /// Durability is `Self::durability` — the same level a satisfied `flush`
+    /// returns, so the provider never advertises less than it delivers, and
+    /// never more than it proved. [`crate::storage::QUALIFIED_DURABILITY`] is
+    /// reached only when the bound transport declared a remote persistence
+    /// boundary *and* this run's probe completed a matched-verifier COMMIT
+    /// cycle across it; every other case degrades to [`Durability::Local`].
+    /// What the qualified level then asserts is the per-write acknowledgement —
+    /// every `WriteAt` returns only after a COMMIT whose verifier matched its
+    /// WRITE's, which per RFC 7530 §16.4 is the server's acknowledgement of
+    /// stable storage — and the barrier `flush` certifies over it. Fencing still
+    /// stays [`Fencing::ReadOnly`]: this node owns no independent termination
+    /// verifier, and the barrier says nothing about fencing, an atomic snapshot,
+    /// or continuous persistence.
     ///
     /// `STORAGE_OWNERSHIP_FIDELITY_V1` is advertised only here, on an *open* run,
     /// and not on the unbound capabilities in `storage.rs`, for the same reason
@@ -275,7 +322,7 @@ impl Operations {
             features: [umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned()]
                 .into_iter()
                 .collect(),
-            durability: crate::storage::QUALIFIED_DURABILITY,
+            durability: self.durability(),
             strict_remote_persistence: false,
             fencing: Fencing::ReadOnly,
             kernel_shadow: false,
@@ -1315,10 +1362,13 @@ mod tests {
         // Durability is advertised at exactly what a satisfied `flush` returns, so
         // the provider never advertises less than it delivers, and it is never
         // `None` — the overlay rejects a `None` receipt outright.
-        assert_eq!(
-            binding.capabilities.durability,
-            crate::storage::QUALIFIED_DURABILITY
-        );
+        //
+        // `Local`, and not `QUALIFIED_DURABILITY`, because this fixture is the
+        // fake: it declares no persistence boundary, so no probe can qualify it
+        // and the run has earned nothing more. Asserting the constant here would
+        // be the tautology this issue exists to remove — the constant compared
+        // against itself, passing with zero live evidence anywhere in the build.
+        assert_eq!(binding.capabilities.durability, Durability::Local);
         assert_ne!(
             binding.capabilities.durability,
             umbra_core::Durability::None
