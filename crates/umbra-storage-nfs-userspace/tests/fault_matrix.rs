@@ -30,6 +30,21 @@ use umbra_storage_nfs_userspace::transport::{
     RawTransport, Stability, WriteVerifier,
 };
 
+// The (d3) live half drives the *public* `Storage` surface with a client-side fault
+// injected over the real connection, to prove the flush firewall holds against real
+// Ganesha, not only under the fake. Grouped here so the raw-level harness is intact.
+use umbra_core::{
+    BytePath, CreateKind, CreateOptions, FlushRequest, FlushScope, IdempotencyKey,
+    ImmutableBaseContract, OpenRunIntent, OpenRunRequest, OperationId, RequestContext, RunId,
+    StorageAnchor, StorageOperation, StoragePath, StoragePolicy, StorageRequest,
+};
+use umbra_storage::Storage;
+use umbra_storage_nfs_userspace::fake::{FakeReplayLog, ScriptedFault};
+use umbra_storage_nfs_userspace::storage::{
+    NfsUserspaceConfig, NfsUserspaceStorage, FORMAT_VERSION,
+};
+use umbra_storage_nfs_userspace::transport::OpCode;
+
 /// A plan that answers `action` the first time `point` is consulted, records
 /// every point it was asked about, and otherwise proceeds.
 struct MatrixPlan {
@@ -671,4 +686,145 @@ fn r1_010_an_over_budget_reply_retires_its_registration_on_a_real_server() {
             .lookup(&fixture.directory, &fixture.name, AttrMask::STAT, deadline)
             .expect("a valid request after decode failures must still succeed");
     }
+}
+
+// ===========================================================================
+// (d3) live half: the flush firewall holds against real Ganesha
+// ===========================================================================
+
+/// A provider over a fresh live incarnation, with `install` applied to the live
+/// transport first — so a client-side fault is armed before any run is opened.
+/// Uses the `<umbra>/<runs>` layout the fixture seeds for the m1 suite.
+fn faulted_flush_provider(
+    config: &RawTransportConfig,
+    install: impl FnOnce(&mut dyn RawTransport),
+) -> NfsUserspaceStorage {
+    let mut transport: Box<dyn RawTransport> =
+        Box::new(LibnfsRawTransport::connect(config.clone()).expect("connect a fresh incarnation"));
+    install(transport.as_mut());
+    let provider_config = NfsUserspaceConfig {
+        host: config.host.clone().into_bytes(),
+        port: config.port,
+        export: BytePath::new(b"umbra").expect("export"),
+        run_parent: BytePath::new(b"runs").expect("run parent"),
+        root_anchor: BytePath::new(b"root").expect("root anchor"),
+        control_anchor: BytePath::new(b"control").expect("control anchor"),
+        deadline: Deadline { millis: 15_000 },
+    };
+    NfsUserspaceStorage::with_facades(
+        provider_config,
+        transport,
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("the provider accepts the fixture configuration")
+}
+
+fn flush_ctx(storage: &NfsUserspaceStorage, name: &str) -> RequestContext {
+    let admitted = storage
+        .admission()
+        .expect("a run is open on this provider")
+        .admitted();
+    RequestContext {
+        run_id: admitted.run(),
+        operation_id: OperationId(uuid::Uuid::new_v4()),
+        idempotency_key: IdempotencyKey(name.into()),
+        writer_epoch: Some(admitted.epoch()),
+    }
+}
+
+fn flush_path(name: &str) -> StoragePath {
+    StoragePath::new(StorageAnchor::Root, name.as_bytes()).expect("relative path")
+}
+
+#[test]
+fn a_failed_commit_over_real_ganesha_is_refused_by_flush_and_never_a_receipt() {
+    let Some(fixture) = fixture() else {
+        eprintln!("skipped: UMBRA_NFS_RAW_FIXTURE is unset");
+        return;
+    };
+
+    // Fail the run's single data-write COMMIT with NFS4ERR_IO. `AfterDispatch`
+    // carries the real op over the live transport, and the provider issues exactly
+    // one COMMIT — on the data write — so `open_run` (whose manifest writes are
+    // FILE_SYNC) runs unfaulted and the fault stays armed until the WriteAt.
+    let mut storage = faulted_flush_provider(&fixture.config, |transport| {
+        transport.install_faults(ScriptedFault::once(
+            FaultPoint::AfterDispatch,
+            Some(OpCode::Commit),
+            FaultAction::Substitute(Nfs4Status::IO),
+        ));
+    });
+
+    let run_id = RunId(uuid::Uuid::new_v4());
+    storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::CreateNew,
+            immutable_base: ImmutableBaseContract {
+                identity: "umbra-d3-live".into(),
+                fingerprint: vec![0x44, 0x33],
+            },
+            policy: StoragePolicy {
+                read_only: false,
+                require_strict_remote_persistence: false,
+                require_kernel_shadow: false,
+                format_version: FORMAT_VERSION,
+            },
+        })
+        .expect("open_run against the live fixture");
+
+    storage
+        .execute(&StorageRequest {
+            context: flush_ctx(&storage, "d3-create"),
+            operation: StorageOperation::Create {
+                path: flush_path("faulted.bin"),
+                options: CreateOptions {
+                    kind: CreateKind::File,
+                    mode: 0o640,
+                },
+            },
+        })
+        .expect("the create itself is unfaulted");
+
+    // The data write's COMMIT comes back NFS4ERR_IO: the write is a failed stable
+    // write, not a success.
+    let write = storage.execute(&StorageRequest {
+        context: flush_ctx(&storage, "d3-write"),
+        operation: StorageOperation::WriteAt {
+            path: flush_path("faulted.bin"),
+            offset: 0,
+            bytes: b"lost-over-real-ganesha".to_vec(),
+        },
+    });
+    let write_err = write.expect_err("a COMMIT NFS4ERR_IO is not a success");
+    eprintln!(
+        "d3-live write: Err kind={:?} context={}",
+        write_err.kind, write_err.context
+    );
+
+    // The firewall: flush refuses and never certifies, and a later flush still does.
+    for label in ["d3-flush-1", "d3-flush-2"] {
+        let result = storage.flush(&FlushRequest {
+            context: flush_ctx(&storage, label),
+            scope: FlushScope::EntireRun,
+        });
+        let error = result.expect_err("a failed commit must never become a receipt");
+        assert_ne!(error.kind, umbra_core::ErrorKind::NotImplemented);
+        eprintln!("d3-live {label}: Err kind={:?}", error.kind);
+    }
+
+    // The empty-scope barrier is refused too while the failure is latched: this is
+    // not a path back to a receipt.
+    let empty = storage.flush(&FlushRequest {
+        context: flush_ctx(&storage, "d3-flush-empty"),
+        scope: FlushScope::Data {
+            objects: Vec::new(),
+        },
+    });
+    assert!(
+        empty.is_err(),
+        "even an empty scope must not certify over a latched failure"
+    );
+
+    let _ = storage.close_run();
 }

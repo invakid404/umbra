@@ -37,9 +37,11 @@ It opens and creates runs, resolves paths, stats, enumerates, reads, writes, cre
 renames, removes and sets metadata, and acquires product admission (one-session-one-Umbra)
 before it publishes a run binding. Rename is replacing only: NFSv4.0 has no atomic
 no-replace rename, so `RenameMode::NoReplace` is refused with `UnsupportedCapability`
-rather than emulated with a check-then-rename. It advertises `durability: None` and `fencing: ReadOnly`:
-no persistence boundary and no termination verifier is qualified, and `flush` reports the
-gate rather than issuing a receipt. It exposes opaque handles and no physical path, so
+rather than emulated with a check-then-rename. An open run advertises `durability: Remote` and `fencing: ReadOnly`: the matched-verifier
+`COMMIT` barrier `flush` certifies is what is qualified — no termination verifier is — and
+`flush` issues a `Durability::Remote` receipt over already-committed writes rather than
+reporting a gate. `require_strict_remote_persistence`, a stronger promise than that barrier,
+is still refused. It exposes opaque handles and no physical path, so
 `umbra run` cannot select it. Its live transport is behind the off-by-default `transport-raw`
 feature; a default build binds none. See its
 [README](../crates/umbra-storage-nfs-userspace/README.md).
@@ -52,7 +54,7 @@ Its parent directory must exist; no mount, service, or environment variables are
 | --- | --- | --- |
 | `local` | Local directory | Local filesystem |
 | `nfs` | Existing NFSv4 mount root | Client fsync; remote durability unqualified |
-| `nfs-userspace` | JSON `NfsUserspaceConfig` (server host/port, server-relative export and run parent, anchors, deadline) | None; no persistence boundary is qualified and `flush` issues no receipt |
+| `nfs-userspace` | JSON `NfsUserspaceConfig` (server host/port, server-relative export and run parent, anchors, deadline) | Matched-verifier `COMMIT` barrier; `flush` issues a `Durability::Remote` receipt over already-committed writes (no claim about hardware, `fsync` policy, media, fencing, or persistence after power loss) |
 | `tar` | Absolute tar archive filename | Indexed run with persistent staging; flush publishes a locally fsynced tar. Retry budget allows ~3 MiB cumulative written bytes per archive for three-digit byte values (capacity varies with payload/metadata); not reclaimed by flush or reopen. |
 
 For tar, use `crates/umbra-storage-tar/provider.json` and the

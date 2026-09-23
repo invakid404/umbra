@@ -1082,3 +1082,416 @@ fn a_short_write_is_recorded_as_it_happened() {
     assert!(record.is_short(4));
     assert!(record.needs_commit());
 }
+
+// ===========================================================================
+// (d3) Failure handling on the PUBLIC surface: no receipt escapes a failure
+// ===========================================================================
+//
+// These cases drive `NfsUserspaceStorage` through the `Storage` contract with a
+// fault installed on the fake, then call `flush` and assert the firewall directly:
+// whatever a fault does to a write, a following `flush` returns `Err` and never a
+// receipt. The negative assertion is the point of every case. The one exception is
+// the short write — a *legal* reply, not a failure — where the property under test
+// is instead that the ledger records the actual byte count, never the requested.
+
+use umbra_core::{
+    BytePath, CreateKind, CreateOptions, Durability, FlushRequest, FlushScope,
+    ImmutableBaseContract, OpenRunIntent, OpenRunRequest, RequestContext, RunId, StorageAnchor,
+    StorageOperation, StoragePath, StoragePolicy, StorageRequest, StorageResponse,
+};
+use umbra_storage::Storage;
+use umbra_storage_nfs_userspace::fake::ScriptedFault;
+use umbra_storage_nfs_userspace::storage::{
+    NfsUserspaceConfig, NfsUserspaceStorage, FORMAT_VERSION,
+};
+
+const FAULT_EXPORT: &[u8] = b"umbra";
+const FAULT_RUN_PARENT: &[u8] = b"runs";
+
+fn fault_config() -> NfsUserspaceConfig {
+    NfsUserspaceConfig {
+        host: b"127.0.0.1".to_vec(),
+        // A loopback port owned by no other suite; nothing opens a socket here.
+        port: 12118,
+        export: BytePath::new(FAULT_EXPORT).expect("export"),
+        run_parent: BytePath::new(FAULT_RUN_PARENT).expect("run parent"),
+        root_anchor: BytePath::new(b"root").expect("root anchor"),
+        control_anchor: BytePath::new(b"control").expect("control anchor"),
+        deadline: Deadline { millis: 1_000 },
+    }
+}
+
+/// A fake server carrying only `<export>/<run_parent>`, so a case creates its run.
+fn fault_server() -> FakeTransport {
+    let mut fake = FakeTransport::new();
+    let mut current = fake.root();
+    for part in FAULT_EXPORT.split(|byte| *byte == b'/') {
+        current = fake.insert_directory(&current, part);
+    }
+    fake.insert_directory(&current, FAULT_RUN_PARENT);
+    fake
+}
+
+/// Build a provider over a fake configured by `setup` — install a fault plan, cap
+/// writes, or leave it clean. The fault targets `OpCode::Commit`, which only the
+/// data-write path issues, so `open_run` runs unfaulted and the fault stays armed
+/// until the first `WriteAt`.
+fn provider_with(setup: impl FnOnce(&mut FakeTransport)) -> NfsUserspaceStorage {
+    let mut fake = fault_server();
+    setup(&mut fake);
+    NfsUserspaceStorage::with_facades(
+        fault_config(),
+        Box::new(fake),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("the provider accepts the fault fixture")
+}
+
+fn fault_run(run_id: RunId, intent: OpenRunIntent) -> OpenRunRequest {
+    OpenRunRequest {
+        run_id,
+        intent,
+        immutable_base: ImmutableBaseContract {
+            identity: "umbra-fault-matrix".into(),
+            fingerprint: vec![0x46, 0x4D],
+        },
+        policy: StoragePolicy {
+            read_only: false,
+            require_strict_remote_persistence: false,
+            require_kernel_shadow: false,
+            format_version: FORMAT_VERSION,
+        },
+    }
+}
+
+fn fault_ctx(storage: &NfsUserspaceStorage, key: &str) -> RequestContext {
+    let admitted = storage
+        .admission()
+        .expect("a run is open on this provider")
+        .admitted();
+    RequestContext {
+        run_id: admitted.run(),
+        operation_id: OperationId(uuid::Uuid::new_v4()),
+        idempotency_key: IdempotencyKey(key.into()),
+        writer_epoch: Some(admitted.epoch()),
+    }
+}
+
+fn fault_path(name: &str) -> StoragePath {
+    StoragePath::new(StorageAnchor::Root, name.as_bytes()).expect("relative path")
+}
+
+/// Create `name` (unfaulted), then write `bytes` to it and return the write's
+/// result — which is where a Commit-targeted fault surfaces.
+fn create_then_write(
+    storage: &mut NfsUserspaceStorage,
+    name: &str,
+    bytes: &[u8],
+) -> umbra_core::Result<StorageResponse> {
+    let create = StorageRequest {
+        context: fault_ctx(storage, &format!("create-{name}")),
+        operation: StorageOperation::Create {
+            path: fault_path(name),
+            options: CreateOptions {
+                kind: CreateKind::File,
+                mode: 0o640,
+            },
+        },
+    };
+    storage
+        .execute(&create)
+        .expect("the create itself is unfaulted");
+    let write = StorageRequest {
+        context: fault_ctx(storage, &format!("write-{name}")),
+        operation: StorageOperation::WriteAt {
+            path: fault_path(name),
+            offset: 0,
+            bytes: bytes.to_vec(),
+        },
+    };
+    storage.execute(&write)
+}
+
+/// Fails the run's single data COMMIT with a transport error, leaving that write
+/// with an unproven server-side disposition. Armed by the COMMIT's `AfterDispatch`
+/// (the one point whose context carries the real op, and the only COMMIT the whole
+/// session issues — `open_run`'s manifest writes are FILE_SYNC and owe none), then
+/// fired at that same COMMIT's `BeforeReturn`, where the fake honours `Fail`.
+#[derive(Default)]
+struct FailTheCommit {
+    armed: bool,
+    fired: bool,
+}
+
+impl FaultPlan for FailTheCommit {
+    fn decide(&mut self, point: FaultPoint, context: FaultContext) -> FaultAction {
+        if self.fired {
+            return FaultAction::Proceed;
+        }
+        match point {
+            FaultPoint::AfterDispatch if context.op == OpCode::Commit => {
+                self.armed = true;
+                FaultAction::Proceed
+            }
+            FaultPoint::BeforeReturn if self.armed => {
+                self.fired = true;
+                FaultAction::Fail(TransportError::Disconnected {
+                    epoch: ConnectionEpoch(1),
+                    detail: "fault: the commit reply never arrived".into(),
+                })
+            }
+            _ => FaultAction::Proceed,
+        }
+    }
+}
+
+/// Rotates the server's write verifier to a fresh value after *every* WRITE.
+///
+/// This is robust without counting `open_run`'s internal writes: a FILE_SYNC write
+/// owes no COMMIT and records no verifier, so rotating after one is harmless. Only
+/// the run's single UNSTABLE data write records a verifier and then COMMITs, and by
+/// then the verifier has moved on — exactly the mismatch a server that lost
+/// unstable data across a restart produces. Armed by each WRITE's `AfterDispatch`,
+/// fired at that WRITE's immediately following `BeforeReturn`.
+#[derive(Default)]
+struct RotateVerifierEachWrite {
+    armed: bool,
+    next: u8,
+}
+
+impl FaultPlan for RotateVerifierEachWrite {
+    fn decide(&mut self, point: FaultPoint, context: FaultContext) -> FaultAction {
+        match point {
+            FaultPoint::AfterDispatch if context.op == OpCode::Write => {
+                self.armed = true;
+                FaultAction::Proceed
+            }
+            FaultPoint::BeforeReturn if self.armed => {
+                self.armed = false;
+                self.next = self.next.wrapping_add(1);
+                FaultAction::RotateVerifier(WriteVerifier([self.next; 8]))
+            }
+            _ => FaultAction::Proceed,
+        }
+    }
+}
+
+/// The load-bearing assertion: neither scope a caller can issue yields a receipt.
+fn assert_no_receipt(storage: &mut NfsUserspaceStorage, key: &str) {
+    for scope in [
+        FlushScope::EntireRun,
+        FlushScope::Data {
+            objects: Vec::new(),
+        },
+    ] {
+        let request = FlushRequest {
+            context: fault_ctx(storage, key),
+            scope: scope.clone(),
+        };
+        let result = storage.flush(&request);
+        assert!(
+            result.is_err(),
+            "a failure path yielded a receipt for {scope:?}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn a_dropped_commit_reply_is_indeterminate_and_never_a_receipt() {
+    let mut storage = provider_with(|fake| {
+        fake.install_faults(Box::new(FailTheCommit::default()));
+    });
+    let run_id = RunId(uuid::Uuid::new_v4());
+    storage
+        .open_run(&fault_run(run_id, OpenRunIntent::CreateNew))
+        .expect("open_run");
+
+    // The COMMIT never returns cleanly, so the write's disposition is unproven.
+    let write = create_then_write(&mut storage, "dropped.bin", b"unproven-bytes");
+    assert!(write.is_err(), "a failed commit is not a success");
+
+    // An unproven server-side disposition is indeterminate: flush refuses.
+    assert_no_receipt(&mut storage, "flush-dropped");
+    storage.close_run().ok();
+}
+
+#[test]
+fn a_commit_returning_io_latches_and_every_later_flush_refuses() {
+    let mut storage = provider_with(|fake| {
+        fake.install_faults(ScriptedFault::once(
+            FaultPoint::AfterDispatch,
+            Some(OpCode::Commit),
+            FaultAction::Substitute(Nfs4Status::IO),
+        ));
+    });
+    let run_id = RunId(uuid::Uuid::new_v4());
+    storage
+        .open_run(&fault_run(run_id, OpenRunIntent::CreateNew))
+        .expect("open_run");
+
+    let write = create_then_write(&mut storage, "eio.bin", b"lost-write");
+    let error = write.expect_err("a COMMIT NFS4ERR_IO is a failed stable write");
+    assert_eq!(error.kind, umbra_core::ErrorKind::Io);
+
+    // The lost-write evidence is latched: a mutation is now refused with the
+    // original failure, and it is not erasable by a later flush.
+    let mutation = StorageRequest {
+        context: fault_ctx(&storage, "post-latch-write"),
+        operation: StorageOperation::WriteAt {
+            path: fault_path("eio.bin"),
+            offset: 0,
+            bytes: b"retry".to_vec(),
+        },
+    };
+    assert!(
+        storage.execute(&mutation).is_err(),
+        "a latched write failure must refuse further mutations"
+    );
+
+    // Repeated flushes keep refusing; a later flush cannot erase the evidence.
+    assert_no_receipt(&mut storage, "flush-latch-1");
+    assert_no_receipt(&mut storage, "flush-latch-2");
+    storage.close_run().ok();
+}
+
+/// A COMMIT that fails with a status mapping OUTSIDE `{StorageUnavailable, Io}` must
+/// still make `flush` refuse — it must never let the barrier certify `Remote` over
+/// bytes whose COMMIT never proved them stable.
+///
+/// This pins the durability-without-evidence hole (CR-2): a successful
+/// `WRITE(UNSTABLE)` whose COMMIT returns e.g. `NFS4ERR_ACCESS` (→ `Denied`),
+/// `NFS4ERR_STALE` (→ `StaleHandle`) or `NFS4ERR_INVAL` (→ `InvalidInput`) — all of
+/// which RFC 7530 lists among COMMIT's legal errors — records no ledger entry and
+/// trips none of `note_failure`'s kind filters. Without the write-path fix,
+/// `flush(EntireRun)` passes every guard and returns `Ok(Durability::Remote)` over
+/// data sitting in the server's volatile storage: exactly the lie the firewall
+/// exists to make impossible.
+#[test]
+fn a_commit_failing_with_a_non_io_non_transport_status_still_refuses_flush() {
+    let mut storage = provider_with(|fake| {
+        fake.install_faults(ScriptedFault::once(
+            FaultPoint::AfterDispatch,
+            Some(OpCode::Commit),
+            FaultAction::Substitute(Nfs4Status::ACCESS),
+        ));
+    });
+    let run_id = RunId(uuid::Uuid::new_v4());
+    storage
+        .open_run(&fault_run(run_id, OpenRunIntent::CreateNew))
+        .expect("open_run");
+
+    // WRITE(UNSTABLE) lands; its COMMIT returns NFS4ERR_ACCESS -> Denied, a kind
+    // outside {StorageUnavailable, Io}. The write is a failure whose durability is
+    // unproven, not a success.
+    let write = create_then_write(&mut storage, "denied.bin", b"unproven-under-access");
+    let error = write.expect_err("a COMMIT NFS4ERR_ACCESS is not a success");
+    assert_eq!(error.kind, umbra_core::ErrorKind::Denied);
+
+    // The load-bearing negative: no receipt escapes an unproven COMMIT, under either
+    // scope a caller can issue, and a later flush still refuses.
+    assert_no_receipt(&mut storage, "flush-denied-1");
+    assert_no_receipt(&mut storage, "flush-denied-2");
+    storage.close_run().ok();
+}
+
+#[test]
+fn a_changed_commit_verifier_yields_no_receipt() {
+    let mut storage = provider_with(|fake| {
+        fake.install_faults(Box::new(RotateVerifierEachWrite::default()));
+    });
+    let run_id = RunId(uuid::Uuid::new_v4());
+    storage
+        .open_run(&fault_run(run_id, OpenRunIntent::CreateNew))
+        .expect("open_run");
+
+    // The COMMIT returns a verifier that does not match the WRITE's: the server
+    // lost the unstable data, and the write surfaces that rather than succeeding.
+    let write = create_then_write(&mut storage, "drift.bin", b"pre-restart");
+    assert!(write.is_err(), "a changed verifier is not a success");
+
+    assert_no_receipt(&mut storage, "flush-drift");
+    storage.close_run().ok();
+}
+
+#[test]
+fn a_short_write_records_the_actual_count_not_the_requested() {
+    // The cap is above every write `open_run` itself issues (its epoch marker and
+    // manifest are small), so provisioning is unaffected; the data payload below is
+    // larger than the cap, so only it is truncated.
+    let cap = 1024u32;
+    let mut storage = provider_with(|fake| fake.set_write_cap(Some(cap)));
+    let run_id = RunId(uuid::Uuid::new_v4());
+    storage
+        .open_run(&fault_run(run_id, OpenRunIntent::CreateNew))
+        .expect("open_run");
+
+    // A short write is a legal reply, not a failure: it settles with the count the
+    // server actually accepted, never the requested length.
+    let payload = vec![0x5Au8; 2048];
+    let write = create_then_write(&mut storage, "short.bin", &payload)
+        .expect("a short write is a legal, settled reply");
+    assert_eq!(
+        write,
+        StorageResponse::WriteAt(cap),
+        "the settled count is the actual, never the requested"
+    );
+
+    // The barrier is satisfied, and its evidence reports the actual byte count.
+    let request = FlushRequest {
+        context: fault_ctx(&storage, "flush-short"),
+        scope: FlushScope::EntireRun,
+    };
+    let receipt = storage
+        .flush(&request)
+        .expect("a short write still settles");
+    assert_ne!(receipt.durability, Durability::None);
+    let evidence = String::from_utf8(receipt.evidence).expect("utf-8 evidence");
+    assert!(
+        evidence.contains(&format!("committed_bytes={cap}")),
+        "the ledger must record the actual count, not the requested: {evidence}"
+    );
+    storage.close_run().ok();
+}
+
+#[test]
+fn the_ledger_is_cleared_on_close_run_so_the_next_run_is_not_poisoned() {
+    let mut storage = provider_with(|_| {});
+
+    // Run 1 lands a settled write, so its ledger is non-empty.
+    let first = RunId(uuid::Uuid::new_v4());
+    storage
+        .open_run(&fault_run(first, OpenRunIntent::CreateNew))
+        .expect("open run 1");
+    create_then_write(&mut storage, "run1.bin", b"first-run-bytes").expect("run 1 write settles");
+    let run1_receipt = storage
+        .flush(&FlushRequest {
+            context: fault_ctx(&storage, "flush-run1"),
+            scope: FlushScope::EntireRun,
+        })
+        .expect("run 1 barrier");
+    let run1_evidence = String::from_utf8(run1_receipt.evidence).expect("utf-8");
+    assert!(
+        run1_evidence.contains("committed_writes=1"),
+        "run 1 must have recorded its write: {run1_evidence}"
+    );
+    storage.close_run().expect("close run 1");
+
+    // Run 2, on the SAME provider, must start from an empty ledger: close_run
+    // cleared it, so its barrier is not vacuously certified over run 1's write.
+    let second = RunId(uuid::Uuid::new_v4());
+    storage
+        .open_run(&fault_run(second, OpenRunIntent::CreateNew))
+        .expect("open run 2");
+    let run2_receipt = storage
+        .flush(&FlushRequest {
+            context: fault_ctx(&storage, "flush-run2"),
+            scope: FlushScope::EntireRun,
+        })
+        .expect("run 2 barrier over nothing outstanding");
+    let run2_evidence = String::from_utf8(run2_receipt.evidence).expect("utf-8");
+    assert!(
+        run2_evidence.contains("committed_writes=0"),
+        "the ledger leaked run 1's writes into run 2: {run2_evidence}"
+    );
+    storage.close_run().expect("close run 2");
+}

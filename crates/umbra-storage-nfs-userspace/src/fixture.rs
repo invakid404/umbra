@@ -143,5 +143,6 @@ pub(crate) fn ops_context<'a>(
             namespace: None,
         }),
         deadline: Deadline { millis: 5_000 },
+        settlement: None,
     }
 }

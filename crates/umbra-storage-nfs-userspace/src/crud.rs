@@ -39,7 +39,7 @@ use crate::state::open_owner::{close, CloseOutcome, OpenOutcome, OpenOwnerRegist
 use crate::state::verifier::{check_commit, note_write, WriteRecord};
 use crate::transport::{
     ComponentName, Deadline, OpenHow, RawTransport, ReadReply, ShareAccess, ShareDeny, Stability,
-    Verifier,
+    Verifier, WriteVerifier,
 };
 
 /// How an OPEN should treat an existing or absent name.
@@ -406,6 +406,16 @@ impl WriteTicket {
     /// Stability the server actually reached.
     pub fn committed(&self) -> Stability {
         self.record.committed
+    }
+
+    /// The verifier this write recorded, for a later COMMIT to compare against.
+    ///
+    /// Retained by the barrier ledger as evidence only, never as proof: the proof
+    /// that the bytes are on stable storage happened at COMMIT time, when this
+    /// verifier matched the one the server returned. Recording it afterwards is an
+    /// audit trail, exactly as `journal.rs` declines to store it as decision input.
+    pub fn verifier(&self) -> WriteVerifier {
+        self.record.verifier
     }
 
     /// Whether this write still owes a COMMIT before it is durable.

@@ -34,10 +34,11 @@
 //! The operations surface is wired against the frozen facades: anchoring, path
 //! resolution, stat, bounded enumeration, read, exclusive and plain create, and
 //! WRITE with `UNSTABLE`/COMMIT verifier accounting all run over whatever
-//! [`RawTransport`](transport::RawTransport) is injected. Writer authority,
-//! admission, epochs and durability receipts still answer `NotImplemented`
-//! naming `authority_recovery`, and no live transport is bound here — that is
-//! `m1_integrate`'s seam.
+//! [`RawTransport`](transport::RawTransport) is injected. `flush` is wired: it
+//! certifies a zero-I/O completeness barrier over the run's already-committed
+//! writes and returns a `Durability::Remote` receipt, refusing rather than
+//! certifying whenever the evidence is absent. No live transport is bound by
+//! `connect` — that is `m1_integrate`'s seam.
 //!
 //! Namespace mutation — REMOVE, RENAME, CREATE of a directory, SETATTR — is
 //! typed and reachable through [`namespace::NamespaceDispatcher`] but has no

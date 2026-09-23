@@ -30,8 +30,9 @@
 //! # What it deliberately does not claim
 //!
 //! Writing a record `FILE_SYNC4` asks the server for stability; it does not
-//! qualify a persistence boundary. The provider still advertises
-//! `Durability::None`, and `flush` still reports its gate. This closes the M1
+//! itself qualify the durability boundary. `flush` certifies a
+//! `Durability::Remote` barrier, but its claim rests on the matched-verifier
+//! COMMIT each `WriteAt` performs, not on this journal write. This closes the M1
 //! replay obligation — exact request, exact payload and exact settled result,
 //! recorded durably around the dispatch — and nothing more.
 

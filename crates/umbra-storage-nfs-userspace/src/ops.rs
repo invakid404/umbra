@@ -24,10 +24,10 @@
 //! [`AuthorityError::NoWriterEpoch`](crate::error::AuthorityError::NoWriterEpoch).
 
 use umbra_core::{
-    BlobStat, CreateKind, DirectoryPage, Durability, ErrorKind, Fencing, ListCursor,
-    MetadataUpdate, ObjectResult, OpenRunRequest, RenameMode, Result, RunBinding, RunId,
-    StorageAnchor, StorageCapabilities, StorageOperation, StoragePath, StoragePolicy,
-    StorageRequest, StorageResponse, UmbraError, MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
+    BlobStat, CreateKind, DirectoryPage, ErrorKind, Fencing, ListCursor, MetadataUpdate,
+    ObjectResult, OpenRunRequest, RenameMode, Result, RunBinding, RunId, StorageAnchor,
+    StorageCapabilities, StorageOperation, StoragePath, StoragePolicy, StorageRequest,
+    StorageResponse, UmbraError, MAX_DIRECTORY_ENTRIES, MAX_IO_BYTES,
 };
 
 use crate::anchor::{Anchor, HandleMint, RunAnchors, Target};
@@ -55,6 +55,41 @@ pub struct OpsContext<'a> {
     pub mutations: Option<MutationContext<'a>>,
     /// Deadline applied to every COMPOUND this request submits.
     pub deadline: Deadline,
+    /// What a `WriteAt`'s WRITE(UNSTABLE) did to the object it landed on, surfaced
+    /// so the provider can either fold a proven write into the barrier ledger or
+    /// raise an unresolved-recovery obligation for an unproven one, after the
+    /// borrow ends.
+    ///
+    /// Set by [`Operations::write_at`] once its WRITE was accepted — with
+    /// [`WriteSettlement::committed`] `true` when the COMMIT then matched, `false`
+    /// when the WRITE landed but its COMMIT failed. A read, or a write that failed
+    /// before its WRITE was accepted, leaves it `None`.
+    pub settlement: Option<WriteSettlement>,
+}
+
+/// What one `WriteAt`'s WRITE(UNSTABLE) did to the object it landed on.
+///
+/// A data write is settled-or-failed before `write_at` returns, so this records an
+/// aggregate per object rather than one entry per write: the object's derived
+/// contract id, the bytes this write added, the stability the WRITE itself
+/// reported, the verifier retained as evidence, and whether the COMMIT proved those
+/// bytes stable.
+#[derive(Clone, Debug)]
+pub struct WriteSettlement {
+    /// The derived contract id for the object the write landed on.
+    pub object: umbra_core::ObjectId,
+    /// Bytes the server accepted for this write. Never rounded up to the request.
+    pub committed_bytes: u64,
+    /// Stability the WRITE reported; the matched COMMIT is evidenced separately.
+    pub reached: Stability,
+    /// The verifier the WRITE recorded. Evidence, not proof.
+    pub verifier: crate::transport::WriteVerifier,
+    /// Whether the COMMIT matched the WRITE's verifier and so proved the bytes on
+    /// stable storage. `false` means the WRITE landed in volatile storage but its
+    /// COMMIT failed — durability unproven, whatever `ErrorKind` the COMMIT mapped
+    /// to — which the provider must record as an unresolved-recovery obligation
+    /// rather than fold into the barrier ledger.
+    pub committed: bool,
 }
 
 /// The extra state a mutation needs, and a read does not.
@@ -156,7 +191,9 @@ impl Operations {
             return Err(UmbraError::new(
                 ErrorKind::UnsupportedCapability,
                 "open_run",
-                "strict remote persistence is not qualified by this provider; it advertises                  Durability::None and must not accept a run that requires more",
+                "strict remote persistence is not qualified by this provider; its barrier flush \
+                 certifies a completeness barrier over matched-verifier COMMITs, which is a \
+                 weaker promise, and it must not accept a run that requires more",
             ));
         }
         if request.policy.format_version != crate::storage::FORMAT_VERSION {
@@ -215,11 +252,14 @@ impl Operations {
 
     /// Capabilities advertised for this opened run.
     ///
-    /// Only the finite I/O and page limits are advertised, and only because they
-    /// are met. Durability stays [`Durability::None`] and fencing stays
-    /// [`Fencing::ReadOnly`]: this node qualified no persistence boundary and owns
-    /// no termination verifier, and neither the WRITE/COMMIT verifier flow nor a
-    /// successful lease renewal changes that.
+    /// Durability is advertised at [`crate::storage::QUALIFIED_DURABILITY`], the
+    /// same level a satisfied `flush` returns, so the provider never advertises
+    /// less than it delivers: every `WriteAt` returns only after a COMMIT whose
+    /// verifier matched its WRITE's, which per RFC 7530 §16.4 is the server's
+    /// acknowledgement of stable storage, and `flush` is the barrier that certifies
+    /// none in scope is outstanding. Fencing still stays [`Fencing::ReadOnly`]:
+    /// this node owns no independent termination verifier, and the barrier says
+    /// nothing about fencing, an atomic snapshot, or continuous persistence.
     ///
     /// `STORAGE_OWNERSHIP_FIDELITY_V1` is advertised only here, on an *open* run,
     /// and not on the unbound capabilities in `storage.rs`, for the same reason
@@ -235,7 +275,7 @@ impl Operations {
             features: [umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned()]
                 .into_iter()
                 .collect(),
-            durability: Durability::None,
+            durability: crate::storage::QUALIFIED_DURABILITY,
             strict_remote_persistence: false,
             fencing: Fencing::ReadOnly,
             kernel_shadow: false,
@@ -668,6 +708,7 @@ impl Operations {
             replay,
             mutations,
             deadline,
+            settlement,
         } = context;
         let deadline = *deadline;
         let (owners, _) = require_owners(mutations, operation)?;
@@ -720,6 +761,12 @@ impl Operations {
             }
         };
         let count = ticket.count();
+        // The WRITE(UNSTABLE) was accepted, so the object's identity and this
+        // write's evidence are known now, whether or not the COMMIT below proves
+        // them stable.
+        let object = crate::identity::object_id(open.identity());
+        let reached = ticket.committed();
+        let verifier = ticket.verifier();
 
         // R2-003: the write is committed and its verifier compared before the
         // open is released. Previously the ticket's count was taken and the
@@ -729,15 +776,41 @@ impl Operations {
         // means the server lost them and they must be rewritten from the retained
         // payload — which the durable journal now holds.
         //
-        // This is not a durability claim. `Durability::None` and the `flush` gate
-        // are unchanged: committing observes what the *server* did with the bytes,
-        // it does not qualify a persistence boundary underneath it.
+        // The write itself makes no aggregate claim: committing observes what the
+        // *server* did with these bytes. It is `flush` that reads the settlement
+        // this records and certifies the run-scoped barrier the receipt carries.
         let committed = open.commit(&mut **transport, &**replay, &ticket, deadline);
         if let Err(error) = committed {
+            // The WRITE landed in the server's volatile storage but its COMMIT did
+            // not prove it stable. Record that as an *unproven* settlement so
+            // `execute` raises an unresolved-recovery obligation regardless of the
+            // ErrorKind this maps to — a COMMIT may legitimately return `ACCESS`,
+            // `STALE`, `INVAL` and the like, none of which trip `note_failure`'s
+            // filters — then close the open and surface the caller's error
+            // unchanged (a close failure must never replace it).
+            *settlement = Some(WriteSettlement {
+                object,
+                committed_bytes: u64::from(count),
+                reached,
+                verifier,
+                committed: false,
+            });
             let _ = open.close(&mut **transport, deadline);
             return Err(error.to_umbra(operation));
         }
+        // The write is settled: the COMMIT matched the WRITE's verifier, so per RFC
+        // 7530 §16.4 the bytes are on the server's stable storage. Record what that
+        // proved for the object so a later `flush` can state an aggregate barrier
+        // over evidence already held, without any new I/O.
+        let evidence = WriteSettlement {
+            object,
+            committed_bytes: u64::from(count),
+            reached,
+            verifier,
+            committed: true,
+        };
         release(open, &mut **transport, deadline, operation)?;
+        *settlement = Some(evidence);
         Ok(StorageResponse::WriteAt(count))
     }
 
@@ -1239,8 +1312,14 @@ mod tests {
         assert!(binding.capabilities.max_io_bytes > 0);
         assert!(binding.capabilities.max_directory_entries > 0);
         assert!(binding.capabilities.max_directory_entries <= umbra_core::MAX_DIRECTORY_ENTRIES);
-        // Nothing qualified is claimed.
+        // Durability is advertised at exactly what a satisfied `flush` returns, so
+        // the provider never advertises less than it delivers, and it is never
+        // `None` — the overlay rejects a `None` receipt outright.
         assert_eq!(
+            binding.capabilities.durability,
+            crate::storage::QUALIFIED_DURABILITY
+        );
+        assert_ne!(
             binding.capabilities.durability,
             umbra_core::Durability::None
         );

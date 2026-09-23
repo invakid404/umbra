@@ -33,6 +33,20 @@ use umbra_storage_nfs_userspace::transport::{
     Stability, Verifier,
 };
 
+// The (d2) barrier-flush restart case drives the *public* `Storage` surface, which
+// the rest of this suite deliberately does not. Its imports are grouped here so the
+// state-machine harness above stays untouched.
+use umbra_core::{
+    BytePath, CreateKind, CreateOptions, FlushRequest, FlushScope, ImmutableBaseContract,
+    OpenRunIntent, OpenRunRequest, RequestContext, RunId, StorageAnchor, StorageOperation,
+    StoragePath, StoragePolicy, StorageRequest,
+};
+use umbra_storage::Storage;
+use umbra_storage_nfs_userspace::storage::{
+    NfsUserspaceConfig, NfsUserspaceStorage, FORMAT_VERSION,
+};
+use umbra_storage_nfs_userspace::transport::raw::LibnfsRawTransport;
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -1914,4 +1928,183 @@ fn r3_005_a_second_client_atomically_replaces_an_occupied_open_name() {
         "r3-005: atomic RENAME over an occupied open name; A kept fileid {pinned_fileid}, \
          the name now resolves to {incoming_fileid}"
     );
+}
+
+// ===========================================================================
+// (d2) Barrier flush across a real server restart, through the public surface
+// ===========================================================================
+//
+// The precedent above proves, at the state-machine level, that a hard restart
+// changes the write verifier and that the change is a typed retained error. This
+// case raises the same proof to the public `Storage` surface: after a restart the
+// provider can no longer settle a mutation, and `flush` therefore returns `Err` and
+// never a receipt — and a *later* flush still refuses, because lost/uncertain
+// evidence is not erasable. The whole point is the negative: no `Ok(receipt)` ever
+// escapes the restart.
+
+/// Build a provider over a fresh live incarnation, using the run layout the m1
+/// conformance suite uses against this same fixture (`<umbra>/<runs>`).
+fn flush_provider(config: &RawTransportConfig) -> NfsUserspaceStorage {
+    let transport = LibnfsRawTransport::connect(config.clone())
+        .expect("connect a fresh incarnation to the fixture");
+    let provider_config = NfsUserspaceConfig {
+        host: config.host.clone().into_bytes(),
+        port: config.port,
+        export: BytePath::new(b"umbra").expect("export"),
+        run_parent: BytePath::new(b"runs").expect("run parent"),
+        root_anchor: BytePath::new(b"root").expect("root anchor"),
+        control_anchor: BytePath::new(b"control").expect("control anchor"),
+        deadline: Deadline { millis: 15_000 },
+    };
+    NfsUserspaceStorage::with_facades(
+        provider_config,
+        Box::new(transport),
+        Box::new(umbra_storage_nfs_userspace::fake::FakeReplayLog::default()),
+    )
+    .expect("the provider accepts the fixture configuration")
+}
+
+fn flush_ctx(storage: &NfsUserspaceStorage, name: &str) -> RequestContext {
+    let admitted = storage
+        .admission()
+        .expect("a run is open on this provider")
+        .admitted();
+    RequestContext {
+        run_id: admitted.run(),
+        operation_id: OperationId(uuid::Uuid::new_v4()),
+        idempotency_key: IdempotencyKey(name.into()),
+        writer_epoch: Some(admitted.epoch()),
+    }
+}
+
+fn flush_path(name: &str) -> StoragePath {
+    StoragePath::new(StorageAnchor::Root, name.as_bytes()).expect("relative path")
+}
+
+#[test]
+fn a_server_restart_makes_flush_refuse_and_never_yield_a_receipt() {
+    let Some(config) = fixture() else {
+        eprintln!("skipped: UMBRA_NFS_RAW_FIXTURE is unset");
+        return;
+    };
+    let Some(container) = container() else {
+        eprintln!("skipped: UMBRA_NFS_FIXTURE_CONTAINER is unset");
+        return;
+    };
+
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let mut storage = flush_provider(&config);
+    storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::CreateNew,
+            immutable_base: ImmutableBaseContract {
+                identity: "umbra-d2-restart".into(),
+                fingerprint: vec![0x44, 0x32],
+            },
+            policy: StoragePolicy {
+                read_only: false,
+                require_strict_remote_persistence: false,
+                require_kernel_shadow: false,
+                format_version: FORMAT_VERSION,
+            },
+        })
+        .expect("open_run against the live fixture");
+
+    // Pre-restart: a normal write settles, and the barrier is honestly satisfied.
+    storage
+        .execute(&StorageRequest {
+            context: flush_ctx(&storage, "d2-create"),
+            operation: StorageOperation::Create {
+                path: flush_path("restart.bin"),
+                options: CreateOptions {
+                    kind: CreateKind::File,
+                    mode: 0o640,
+                },
+            },
+        })
+        .expect("create the target file");
+    storage
+        .execute(&StorageRequest {
+            context: flush_ctx(&storage, "d2-write"),
+            operation: StorageOperation::WriteAt {
+                path: flush_path("restart.bin"),
+                offset: 0,
+                bytes: b"pre-restart-committed".to_vec(),
+            },
+        })
+        .expect("the pre-restart write settles");
+    let pre = storage
+        .flush(&FlushRequest {
+            context: flush_ctx(&storage, "d2-flush-pre"),
+            scope: FlushScope::EntireRun,
+        })
+        .expect("the pre-restart barrier is satisfied");
+    assert_ne!(pre.durability, umbra_core::Durability::None);
+    eprintln!(
+        "d2 pre-restart: flush Ok, durability={:?}, epoch={}",
+        pre.durability, pre.writer_epoch.0
+    );
+
+    // Hard restart: SIGKILL, then start, then wait for the server to answer again.
+    docker(&["kill", "--signal", "SIGKILL", &container]).expect("SIGKILL the fixture");
+    docker(&["start", &container]).expect("restart the fixture");
+    let waited = wait_until_serving(&config, 90_000).expect("fixture returns to service");
+    eprintln!("d2: fixture came back after {waited}ms (server now in its grace window)");
+
+    // Post-restart the incarnation is stale and the server is in grace: a mutation
+    // can no longer be settled, whatever the exact NFS status.
+    let post = storage.execute(&StorageRequest {
+        context: flush_ctx(&storage, "d2-post-write"),
+        operation: StorageOperation::WriteAt {
+            path: flush_path("restart.bin"),
+            offset: 0,
+            bytes: b"post-restart".to_vec(),
+        },
+    });
+    let post_err = post.expect_err("a post-restart mutation cannot settle");
+    eprintln!(
+        "d2 post-restart write: Err kind={:?} context={}",
+        post_err.kind, post_err.context
+    );
+
+    // The load-bearing assertion: flush returns Err and NEVER a receipt.
+    let f1 = storage.flush(&FlushRequest {
+        context: flush_ctx(&storage, "d2-flush-1"),
+        scope: FlushScope::EntireRun,
+    });
+    let f1_err = f1.expect_err("flush must refuse after a restart, never certify one");
+    eprintln!(
+        "d2 flush #1: Err kind={:?} context={}",
+        f1_err.kind, f1_err.context
+    );
+
+    // A later flush still refuses: lost/uncertain evidence is not erasable.
+    let f2 = storage.flush(&FlushRequest {
+        context: flush_ctx(&storage, "d2-flush-2"),
+        scope: FlushScope::EntireRun,
+    });
+    let f2_err = f2.expect_err("a later flush still refuses; the evidence is not erasable");
+    eprintln!(
+        "d2 flush #2: Err kind={:?} context={}",
+        f2_err.kind, f2_err.context
+    );
+
+    // And a further mutation is refused too — the run does not silently recover.
+    let post2 = storage.execute(&StorageRequest {
+        context: flush_ctx(&storage, "d2-post-write-2"),
+        operation: StorageOperation::WriteAt {
+            path: flush_path("restart.bin"),
+            offset: 0,
+            bytes: b"still-refused".to_vec(),
+        },
+    });
+    assert!(
+        post2.is_err(),
+        "a run that could not settle a mutation must keep refusing"
+    );
+
+    // Best-effort teardown; the run is unusable and close may itself report the
+    // surrendered authority, which is fine.
+    let _ = storage.close_run();
 }

@@ -297,6 +297,7 @@ fn the_surface_runs_over_a_real_client_incarnation_and_is_never_mistaken_for_liv
             namespace: Some(&mut dispatcher),
         }),
         deadline: deadline(),
+        settlement: None,
     };
 
     let created = operations
@@ -531,6 +532,7 @@ fn object_identity_is_stable_across_a_rename_and_a_copy_is_refused() {
                 namespace: Some(&mut honest),
             }),
             deadline: deadline(),
+            settlement: None,
         };
         operations
             .execute(
@@ -584,6 +586,7 @@ fn object_identity_is_stable_across_a_rename_and_a_copy_is_refused() {
             namespace: Some(&mut dishonest),
         }),
         deadline: deadline(),
+        settlement: None,
     };
     let error = operations
         .execute(
@@ -762,6 +765,7 @@ fn directory_pages_are_bounded_and_cursors_are_invalidated_explicitly() {
         replay: &mut replay,
         mutations: None,
         deadline: deadline(),
+        settlement: None,
     };
 
     let mut seen: Vec<Vec<u8>> = Vec::new();
@@ -879,6 +883,7 @@ fn unsupported_capabilities_are_refused_and_deferred_ones_name_their_owner() {
             namespace: None,
         }),
         deadline: deadline(),
+        settlement: None,
     };
 
     // Never offered: a typed refusal, no silent fallback, no empty success.

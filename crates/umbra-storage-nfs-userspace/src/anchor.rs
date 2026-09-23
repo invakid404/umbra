@@ -750,7 +750,9 @@ fn create_file(
     };
     // `FILE_SYNC` because this is run-identifying state a later reader must find,
     // and this path issues no COMMIT of its own. It is a request for stability,
-    // not a durability claim: the provider still advertises `Durability::None`.
+    // not a durability claim of its own: the provider's `Durability::Remote`
+    // barrier rests on the matched-verifier COMMIT each `WriteAt` performs, never
+    // on this anchor write.
     let written = transport.write(
         open.handle(),
         stateid,

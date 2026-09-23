@@ -20,9 +20,9 @@
 use serde::{Deserialize, Serialize};
 use umbra_core::provider::decode;
 use umbra_core::{
-    BytePath, Durability, ErrorKind, Fencing, FlushRequest, IdempotencyKey, OpenRunRequest,
-    RequestContext, Result, RunBinding, StorageAnchor, StorageCapabilities, StorageOperation,
-    StoragePath, StorageRequest, StorageResponse, UmbraError, WriterLease,
+    BytePath, Durability, ErrorKind, Fencing, FlushRequest, FlushScope, IdempotencyKey, ObjectId,
+    OpenRunRequest, RequestContext, Result, RunBinding, StorageAnchor, StorageCapabilities,
+    StorageOperation, StoragePath, StorageRequest, StorageResponse, UmbraError, WriterLease,
 };
 use umbra_storage::{AcquireWriterRequest, DurabilityReceipt, Storage};
 
@@ -32,7 +32,7 @@ use crate::ops::{Operations, OpsContext};
 use crate::replay::ReplayLog;
 use crate::session::Session;
 use crate::state::ProtocolState;
-use crate::transport::{Deadline, RawTransport, Verifier, WireProfile};
+use crate::transport::{Deadline, RawTransport, Stability, Verifier, WireProfile, WriteVerifier};
 
 /// Provider id under which this backend registers. Distinct from the mounted
 /// `nfs` adapter, which stays the qualified fallback.
@@ -44,6 +44,115 @@ pub const PROVIDER_ID: &str = "nfs-userspace";
 /// opened sequentially by `nfs-userspace`. Concurrent access by both providers is
 /// not in scope: one-session-one-Umbra admission is product-wide.
 pub const FORMAT_VERSION: u32 = 1;
+
+/// The persistence boundary this provider qualifies: advertised in the run
+/// binding's capabilities and returned by a satisfied [`Storage::flush`].
+///
+/// [`Durability::Remote`] because the barrier is qualified against the live
+/// NFSv4.0 Ganesha fixture in this crate's tests — every `WriteAt` returns only
+/// after a COMMIT whose verifier matched its WRITE's, which per RFC 7530 §16.4 is
+/// the server's acknowledgement of stable storage, and the barrier certifies that
+/// none in scope is outstanding, indeterminate or latched-failed.
+///
+/// What `Remote` asserts is exactly that acknowledgement and that barrier. It does
+/// **not** assert anything about the server's hardware, its export's `fsync`
+/// policy or its media; it does not assert fencing ([`Fencing::ReadOnly`] is
+/// unchanged), an atomic snapshot, or continuous persistence. Were the qualifying
+/// live evidence ever removed from the verification, this must degrade to
+/// [`Durability::Local`], which asserts strictly less and so cannot lie, while
+/// still clearing the overlay's `!= None` check.
+pub const QUALIFIED_DURABILITY: Durability = Durability::Remote;
+
+/// Hard cap on the per-object settlement index the barrier ledger keeps.
+///
+/// A run may touch unboundedly many objects, and the ledger is per-object rather
+/// than per-write, so it still needs a ceiling to stay bounded. On overflow the
+/// ledger sets its `truncated` flag and stops recording new identities: a scoped
+/// flush that names an object past the cap is answered `Err` (indeterminate)
+/// rather than a receipt, and the run-wide `EntireRun` barrier — which reads the
+/// `unsettled`/`stable_write_failure` predicate, never this map — is unaffected.
+const LEDGER_OBJECT_CAP: usize = 4096;
+
+/// Per-run, per-writer-epoch settlement record a `flush` reads to answer a barrier.
+///
+/// Reset wholesale in [`NfsUserspaceStorage::close_run`], beside `unsettled` and
+/// `stable_write_failure`, so it never leaks into the next `open_run`: a reopened
+/// run's flush is scoped to what *that* writer wrote, not vacuously to everything
+/// ever. Bounded by objects touched, not writes issued — each write is
+/// settled-or-failed before `WriteAt` returns, so an aggregate per object is all a
+/// barrier needs, and a per-write log would be a real memory hazard on a long run.
+#[derive(Debug, Default)]
+struct RunLedger {
+    /// Object-granular settlement, keyed by the derived contract id
+    /// ([`crate::identity::object_id`]), so a scoped flush naming the same ids the
+    /// caller derived can be answered from it.
+    objects: std::collections::BTreeMap<ObjectId, ObjectSettlement>,
+    /// Settled, verifier-matched data writes across the run. Evidence only.
+    committed_writes: u64,
+    /// The last write verifier observed on a matched COMMIT. Evidence only, never
+    /// proof: the proof happened at COMMIT time, and retaining a verifier
+    /// afterwards proves nothing on its own — it is an audit trail in the receipt.
+    last_verifier: Option<WriteVerifier>,
+    /// True once `objects` hit [`LEDGER_OBJECT_CAP`] and stopped recording ids.
+    truncated: bool,
+}
+
+/// What the ledger knows about one object the run mutated.
+#[derive(Clone, Debug)]
+struct ObjectSettlement {
+    /// Bytes acknowledged under matched-verifier COMMITs. Corroboration, not proof.
+    committed_bytes: u64,
+    /// Stability the WRITE itself reported (never the one requested); the matched
+    /// COMMIT that made the bytes stable is evidenced by the run-wide verifier.
+    reached: Stability,
+    /// Whether any obligation for this object is not yet discharged. This provider
+    /// settles a write before `WriteAt` returns, so a recorded object is always
+    /// discharged; the flag exists for the scope predicate to read and refuse.
+    outstanding: bool,
+}
+
+impl RunLedger {
+    /// Fold one settled write into the run's aggregate.
+    fn record_write(&mut self, settlement: &crate::ops::WriteSettlement) {
+        self.committed_writes = self.committed_writes.saturating_add(1);
+        self.last_verifier = Some(settlement.verifier);
+        if let Some(existing) = self.objects.get_mut(&settlement.object) {
+            existing.committed_bytes = existing
+                .committed_bytes
+                .saturating_add(settlement.committed_bytes);
+            existing.reached = settlement.reached;
+            existing.outstanding = false;
+        } else if self.objects.len() < LEDGER_OBJECT_CAP {
+            self.objects.insert(
+                settlement.object,
+                ObjectSettlement {
+                    committed_bytes: settlement.committed_bytes,
+                    reached: settlement.reached,
+                    outstanding: false,
+                },
+            );
+        } else {
+            // The cap is reached and this is a new identity: degrade the answer, not
+            // the honesty. A scoped flush for an object we can no longer record must
+            // be refused, so mark the ledger truncated and drop the record.
+            self.truncated = true;
+        }
+    }
+
+    /// Whether every named object is recorded and has no outstanding obligation.
+    ///
+    /// A named object the ledger never recorded — including one dropped after the
+    /// cap, or one written by a different writer incarnation — is not a vacuous
+    /// `true`: its disposition is unknown to this run, so the caller gets `false`
+    /// and `flush` refuses rather than certifying it (firewall case 8).
+    fn all_settled(&self, objects: &[ObjectId]) -> bool {
+        objects.iter().all(|id| {
+            self.objects
+                .get(id)
+                .is_some_and(|settlement| !settlement.outstanding)
+        })
+    }
+}
 
 /// Server endpoint and run layout for one userspace NFSv4.0 session.
 ///
@@ -119,14 +228,15 @@ fn config_error(context: &str) -> UmbraError {
     UmbraError::new(ErrorKind::InvalidPath, "config", context)
 }
 
-/// The node that owns wiring a method, named in its gate error so a reader knows
-/// where the work lands rather than seeing a bare "not implemented".
-fn gated<T>(operation: &str, owner: &str) -> Result<T> {
-    Err(UmbraError::new(
-        ErrorKind::NotImplemented,
-        operation,
-        format!("M1 gate: interfaces are frozen; {owner} wires this method"),
-    ))
+/// An indeterminate barrier: the run holds evidence that neither settles a scope
+/// nor latches a specific failure, so `flush` refuses rather than issue a receipt.
+///
+/// Surfaced as [`ErrorKind::StorageUnavailable`], the crate's kind for an unproven
+/// server-side disposition ([`unsettled_detail`] maps the same class), because
+/// there is no dedicated "indeterminate" kind and this is exactly that: absence of
+/// evidence, which is not evidence of absence.
+fn indeterminate(context: &str) -> UmbraError {
+    UmbraError::new(ErrorKind::StorageUnavailable, "flush", context)
 }
 
 fn unsupported<T>(operation: &str, context: &str) -> Result<T> {
@@ -140,9 +250,11 @@ fn unsupported<T>(operation: &str, context: &str) -> Result<T> {
 /// Userspace NFSv4.0 storage backend.
 ///
 /// Holds the facade seams rather than a connection. `connect` builds an unbound
-/// provider whose contract methods report the M1 gate; [`NfsUserspaceStorage::with_facades`]
-/// injects a transport and replay log, which is how `raw_state` and
-/// `authority_recovery` drive the same code against the fake.
+/// provider whose contract methods report that no run is open and no transport is
+/// bound rather than acting — `flush`, for one, returns `InvalidState` ("no run is
+/// open"); [`NfsUserspaceStorage::with_facades`] injects a transport and replay
+/// log, which is how `raw_state` and `authority_recovery` drive the same code
+/// against the fake.
 pub struct NfsUserspaceStorage {
     config: NfsUserspaceConfig,
     transport: Option<Box<dyn RawTransport>>,
@@ -203,6 +315,11 @@ pub struct NfsUserspaceStorage {
     /// only ever be added to, which turned R4-001's "resolve bounded outstanding
     /// operations" into a run that could neither mutate nor release.
     unsettled: Vec<UnsettledCall>,
+    /// The barrier ledger `flush` reads: an aggregate over the settled writes of
+    /// the open run, under its writer epoch. Cleared wholesale in `close_run`
+    /// beside `unsettled`, so a reopened run starts empty and its flush is scoped
+    /// to what that incarnation wrote.
+    ledger: RunLedger,
 }
 
 /// How far a call had got when its server-side disposition became unknown.
@@ -330,6 +447,7 @@ impl NfsUserspaceStorage {
             recovery_blocked: None,
             stable_write_failure: None,
             unsettled: Vec::new(),
+            ledger: RunLedger::default(),
         })
     }
 
@@ -364,6 +482,7 @@ impl NfsUserspaceStorage {
             recovery_blocked: None,
             stable_write_failure: None,
             unsettled: Vec::new(),
+            ledger: RunLedger::default(),
         })
     }
 
@@ -490,6 +609,7 @@ impl NfsUserspaceStorage {
                 replay,
                 mutations,
                 deadline,
+                settlement: None,
             },
         ))
     }
@@ -840,6 +960,52 @@ impl NfsUserspaceStorage {
         }
     }
 
+    /// The `evidence` bytes a satisfied barrier carries.
+    ///
+    /// Names the method, the writer epoch, the settled-write count, the last
+    /// matched verifier and the per-object aggregate the ledger holds, as an audit
+    /// trail. The verifier and byte counts are corroboration, not proof — the proof
+    /// happened at each COMMIT. The blob also disclaims, in words, what `Remote`
+    /// does not assert, so a reader of the receipt is not left to infer it.
+    fn barrier_evidence(&self, lease: &WriterLease) -> Vec<u8> {
+        let ledger = &self.ledger;
+        let total_bytes: u64 = ledger.objects.values().map(|o| o.committed_bytes).sum();
+        let all_discharged = ledger.objects.values().all(|o| !o.outstanding);
+        let reached_label = match ledger
+            .objects
+            .values()
+            .map(|o| o.reached)
+            .min_by_key(|s| *s as u8)
+        {
+            Some(Stability::Unstable) => "unstable+matched-commit",
+            Some(Stability::DataSync) => "data_sync",
+            Some(Stability::FileSync) => "file_sync",
+            None => "none",
+        };
+        let last_verifier = ledger
+            .last_verifier
+            .map(|verifier| format!("{:02x?}", verifier.0))
+            .unwrap_or_else(|| "none".to_owned());
+        format!(
+            "nfs-userspace barrier-flush v1: matched-verifier COMMIT completeness barrier; \
+             writer_epoch={epoch}; committed_writes={writes}; objects={objects}{truncated}; \
+             committed_bytes={bytes}; weakest_write_reached={reached}; all_discharged={discharged}; \
+             last_verifier={verifier}. Asserts: the server acknowledged, via matched-verifier \
+             COMMIT, that every byte in scope reached its stable storage, and none in scope is \
+             outstanding. Does NOT assert server hardware, export fsync policy or media; writer \
+             fencing (ReadOnly, unchanged); an atomic snapshot; or continuous persistence.",
+            epoch = lease.epoch.0,
+            writes = ledger.committed_writes,
+            objects = ledger.objects.len(),
+            truncated = if ledger.truncated { " (truncated)" } else { "" },
+            bytes = total_bytes,
+            reached = reached_label,
+            discharged = all_discharged,
+            verifier = last_verifier,
+        )
+        .into_bytes()
+    }
+
     /// Put the run into the terminal blocked state, retaining `error` verbatim.
     ///
     /// **R4-001.** Called from the paths that *are* unresolved recovery, rather
@@ -913,6 +1079,31 @@ impl NfsUserspaceStorage {
                 detail: format!("{operation}: latched write failure: {}", error.context),
             });
         }
+    }
+
+    /// Record a `WRITE(UNSTABLE)` that landed but whose `COMMIT` failed — durability
+    /// unproven — as an unresolved-recovery obligation (**CR-2**).
+    ///
+    /// [`Self::note_failure`] records the transport case (`StorageUnavailable` →
+    /// `unsettled`) and the I/O case (`Io` → `stable_write_failure`), but a COMMIT
+    /// may legitimately return `NFS4ERR_ACCESS`/`STALE`/`INVAL`/… which map to
+    /// `Denied`/`StaleHandle`/`InvalidInput` and trip neither. Left alone, such a
+    /// write leaves no ledger entry and no marker, and `flush(EntireRun)` certifies
+    /// `Remote` over bytes still in the server's volatile storage — the exact
+    /// durability-without-evidence lie the firewall exists to prevent (audit §F
+    /// case 3). The obligation is [`DispatchPhase::UnresolvedRecovery`], so it
+    /// survives `discharge_settled` and keeps `flush` refusing until the run is
+    /// reopened; it does not set `recovery_blocked`, staying an outstanding
+    /// obligation in the existing ledger rather than a new terminal state.
+    fn note_unproven_commit(&mut self, operation: &str, key: &IdempotencyKey, error: &UmbraError) {
+        self.unsettled.push(UnsettledCall {
+            key: Some(key.clone()),
+            phase: DispatchPhase::UnresolvedRecovery,
+            detail: format!(
+                "{operation}: WRITE(UNSTABLE) landed but its COMMIT did not prove it stable: {}",
+                error.context
+            ),
+        });
     }
 
     /// Record a call whose server-side effect this provider cannot rule out.
@@ -1087,10 +1278,12 @@ fn now_millis() -> u64 {
 impl Storage for NfsUserspaceStorage {
     /// Only what an open run can actually meet.
     ///
-    /// `Durability::None` and `Fencing::ReadOnly` are the honest floor and stay
-    /// there: this provider has qualified no persistence boundary and has no
-    /// independent termination verifier, so it must not claim either, and neither
-    /// the WRITE/COMMIT verifier flow nor a live NFS lease changes that.
+    /// An open run advertises the qualified barrier: `operations.capabilities()`
+    /// returns `Durability::Remote`, the level a satisfied `flush` delivers via the
+    /// WRITE/COMMIT verifier flow. Without a bound transport there is nothing
+    /// qualified to claim, so the unbound floor is `Durability::None`. Either way
+    /// `Fencing::ReadOnly` stays: this provider has no independent termination
+    /// verifier, and the barrier says nothing about fencing.
     ///
     /// The finite I/O and page limits are zero until a run is open, because
     /// without a bound transport there is no bound to honour. Advertising a limit
@@ -1499,13 +1692,17 @@ impl Storage for NfsUserspaceStorage {
             }
         }
 
-        let outcome = {
+        let (outcome, settlement) = {
             let (operations, mut context) = self.request(
                 operation,
                 Some(&request.context.idempotency_key),
                 request.context.operation_id,
             )?;
-            operations.execute(&mut context, request)
+            let outcome = operations.execute(&mut context, request);
+            // Lift the write settlement out before the borrow of `self` ends, so it
+            // can be folded into the ledger below. A read or a failed write leaves
+            // it `None`.
+            (outcome, context.settlement.take())
         };
         // R1-002: record, as it happens, any call whose server-side effect this
         // provider cannot rule out. `close_run` reads this ledger rather than
@@ -1522,6 +1719,20 @@ impl Storage for NfsUserspaceStorage {
                 self.block_recovery(operation, &request.context.idempotency_key, error);
             }
             self.note_failure(operation, request, DispatchPhase::Effect, error);
+            // CR-2: a WRITE that landed but whose COMMIT failed with a status outside
+            // `note_failure`'s coverage would otherwise leave no obligation and let
+            // `flush` certify `Remote` over volatile-only bytes. `StorageUnavailable`
+            // (which a changed verifier also maps to) and `Io` are already recorded,
+            // so they are preserved rather than doubled; every other kind gets an
+            // unresolved-recovery obligation here, before the journal result settles.
+            if settlement
+                .as_ref()
+                .is_some_and(|settlement| !settlement.committed)
+                && error.kind != ErrorKind::StorageUnavailable
+                && error.kind != ErrorKind::Io
+            {
+                self.note_unproven_commit(operation, &request.context.idempotency_key, error);
+            }
         }
         if journalled {
             // The outcome is recorded as it happened, a *settled* failure
@@ -1556,13 +1767,134 @@ impl Storage for NfsUserspaceStorage {
                 self.discharge_settled(&request.context.idempotency_key);
             }
         }
+        // A successful write is folded into the barrier ledger only here, after its
+        // outcome has settled: a `WriteAt` reaches this point Ok exactly when its
+        // WRITE was accepted and its COMMIT matched, and a journal-settle failure
+        // above has already returned before now. A failed write left the ledger
+        // untouched and its evidence is instead in `unsettled`/`stable_write_failure`.
+        if outcome.is_ok() {
+            if let Some(settlement) = settlement {
+                self.ledger.record_write(&settlement);
+            }
+        }
         outcome
     }
 
-    fn flush(&mut self, _request: &FlushRequest) -> Result<DurabilityReceipt> {
-        // A receipt would assert a persistence boundary this provider has not
-        // reached. Reporting the gate is the only honest answer.
-        gated("flush", "authority-recovery")
+    /// Certify a completeness barrier over the run's settled writes.
+    ///
+    /// # This is a zero-I/O bookkeeping barrier, not a persistence mechanism
+    ///
+    /// Every `WriteAt` already performs WRITE(UNSTABLE) → COMMIT → verifier-compare
+    /// before it returns, and per RFC 7530 §16.4 a matched-verifier COMMIT places
+    /// the bytes on the server's stable storage permanently — a later server reboot
+    /// does not un-commit them. So `flush` has nothing left to COMMIT: re-COMMITting
+    /// would be N round trips for zero new evidence. It reads in-memory state only,
+    /// consumes none of the IPC deadline, and what it adds is the aggregate the
+    /// per-write path cannot: as of this call, under this writer epoch, every
+    /// mutation in scope is settled and verifier-matched, and none is outstanding,
+    /// indeterminate or latched-failed.
+    ///
+    /// # The receipt never outruns its evidence
+    ///
+    /// A [`Durability::Remote`] receipt asserts only the matched-verifier COMMIT
+    /// acknowledgement and this barrier. It asserts nothing about the server's
+    /// hardware, its export's `fsync` policy or its media; nothing about fencing
+    /// ([`Fencing::ReadOnly`] is unchanged); no atomic snapshot; no continuous
+    /// persistence. Any failure — a latched lost write, an unsettled call, a
+    /// changed or unknown verifier, a lost authority, an object the ledger never
+    /// recorded — returns `Err` and never a receipt. That firewall is what earns
+    /// the claim, and it is why a partial scope is refused outright rather than
+    /// certified in part.
+    fn flush(&mut self, request: &FlushRequest) -> Result<DurabilityReceipt> {
+        // Case 10: no run open — matches `close_run`'s precedent.
+        let session = self.session.as_ref().ok_or_else(|| {
+            UmbraError::new(
+                ErrorKind::InvalidState,
+                "flush",
+                "no run is open on this provider",
+            )
+        })?;
+        let lease = session.lease();
+
+        // Case 11: authority lost — a receipt carries `writer_epoch`, and issuing
+        // one without authority asserts a writer we no longer are. The latched
+        // reason is reported verbatim.
+        if let Some(loss) = &self.authority_loss {
+            return Err(loss.refuse("flush"));
+        }
+        // Case 11: a blocked recovery is terminal for the run; its diagnosis is
+        // retained and reported rather than a fresh generic error.
+        if let Some(retained) = &self.recovery_blocked {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidState,
+                "flush",
+                format!(
+                    "this run is stopped: an interrupted operation could not be settled from \
+                     evidence, so no barrier can be certified over it. The original diagnosis \
+                     was: {retained}"
+                ),
+            ));
+        }
+        // Case 2: a latched write failure means lost-write evidence a later flush
+        // cannot erase (storage.rs invariant). The *original* error survives
+        // verbatim — the first failure must be the one the caller reads.
+        if let Some(retained) = &self.stable_write_failure {
+            return Err(retained.clone());
+        }
+        // Writer epoch must be the admitted one: a flush presented under a stale or
+        // absent epoch certifies a writer this provider is not, so it is refused
+        // exactly as a mutation would be.
+        self.check_presented_epoch("flush", &request.context)?;
+
+        // CR-1: the request must name the run this provider holds. The receipt's
+        // `run_id` is `lease.run_id`, so a flush naming a different run under a
+        // matching epoch would otherwise receive a receipt for the run it did not
+        // ask about. `execute` already refuses exactly this (ops.rs preflight); a
+        // caller that is not the overlay has no `receipt.run_id` cross-check.
+        if request.context.run_id != lease.run_id {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidInput,
+                "flush",
+                format!(
+                    "the request names run {}, but this provider holds run {}",
+                    request.context.run_id.0, lease.run_id.0
+                ),
+            ));
+        }
+
+        // Case 3: any unsettled call means an unproven server-side disposition in
+        // the run. `EntireRun` cannot exclude it, and a scoped flush cannot prove
+        // the unsettled call did not touch a named object, so both refuse. Absence
+        // of evidence is not evidence.
+        if !self.unsettled.is_empty() {
+            return Err(indeterminate(
+                "a call in this run has an unproven server-side disposition, so the barrier is \
+                 indeterminate; it is not a receipt",
+            ));
+        }
+
+        // Case 8/9: a scoped flush is satisfied only when every named object is
+        // recorded and discharged; an empty scope is a genuine barrier over nothing
+        // outstanding. `EntireRun` is answered wholly from the predicate above.
+        match &request.scope {
+            FlushScope::Data { objects } | FlushScope::DataAndMetadata { objects } => {
+                if !self.ledger.all_settled(objects) {
+                    return Err(indeterminate(
+                        "the scope names an object this run's ledger did not record as settled, \
+                         so its disposition is indeterminate; it is not a receipt",
+                    ));
+                }
+            }
+            FlushScope::EntireRun => {}
+        }
+
+        Ok(DurabilityReceipt {
+            run_id: lease.run_id,
+            writer_epoch: lease.epoch,
+            scope: request.scope.clone(),
+            durability: QUALIFIED_DURABILITY,
+            evidence: self.barrier_evidence(&lease),
+        })
     }
 
     fn close_run(&mut self) -> Result<()> {
@@ -1585,6 +1917,7 @@ impl Storage for NfsUserspaceStorage {
             self.authority_loss = None;
             self.stable_write_failure = None;
             self.unsettled.clear();
+            self.ledger = RunLedger::default();
             return surrendered;
         }
         // Release admission before dropping the run, so the next session can
@@ -1603,6 +1936,10 @@ impl Storage for NfsUserspaceStorage {
         self.recovery_blocked = None;
         self.stable_write_failure = None;
         self.unsettled.clear();
+        // The barrier ledger belongs to the closed run too: carrying it into the
+        // next `open_run` would let a fresh run's flush be scoped, or vacuously
+        // certified, against writes a previous incarnation made.
+        self.ledger = RunLedger::default();
         // Every handle this session issued carries its serial, which `open_run`
         // has already advanced, so all of them are now rejected on presentation.
         // A close never implies a flush.
@@ -1751,8 +2088,10 @@ mod tests {
         ] {
             assert_eq!(kind, ErrorKind::InvalidState);
         }
-        // Durability receipts remain unwired: a receipt would assert a
-        // persistence boundary this provider has not qualified.
+        // `flush` is wired now, and with no run open it reports exactly that —
+        // there is no barrier to certify without a run — rather than a gate that no
+        // longer exists. This is the firewall's "no run open" case, and it matches
+        // `close_run` above.
         assert_eq!(
             storage
                 .flush(&FlushRequest {
@@ -1768,7 +2107,7 @@ mod tests {
                 })
                 .unwrap_err()
                 .kind,
-            ErrorKind::NotImplemented
+            ErrorKind::InvalidState
         );
     }
 
