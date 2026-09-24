@@ -30,9 +30,17 @@ use umbra_journal::Journal;
 ///
 /// Hand-built rather than read back from `Journal::open`, because `bind` never
 /// calls `open`: it takes the inventory through `SessionConfig::recovery` and
-/// checks it against the binding, the lease and its own refusal to reopen a
-/// nonempty journal. An empty, intact, clean state is the only one `bind`
-/// accepts today.
+/// checks it against the binding, the lease and its own classification of that
+/// inventory.
+///
+/// Pristine, which since [#65](https://github.com/invakid404/umbra/issues/65) is
+/// a choice rather than the only option `bind` has. `bind` now accepts a journal
+/// carrying unfinished operations and poisons the session for any whose `Prepare`
+/// intent implies a prepare-time creation; only a checkpoint or a torn tail is
+/// still refused. These fixtures want a session that *serves*, so they keep
+/// handing it the state that binds clean. A supervisor test that wants the
+/// poisoned branch has to build the inventory itself — see `umbra-overlay`'s
+/// `reopen` helper for the shape.
 pub fn recovery(run_id: RunId) -> RecoveryState {
     RecoveryState {
         run_id,
@@ -41,6 +49,8 @@ pub fn recovery(run_id: RunId) -> RecoveryState {
         durable: None,
         pending: vec![],
         tail: JournalTailRecovery::Intact,
+        // Nothing declared this run unrecoverable; see the field.
+        recovery_required: false,
         clean: true,
     }
 }

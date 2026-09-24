@@ -53,6 +53,15 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace --all-targets
 
+      # `cargo test` compiles other packages' `[[bin]]` targets only as test
+      # harnesses under `deps/`, so `target/debug/umbra-storage-local` and
+      # friends do not exist on a clean checkout. The reopen suites spawn those
+      # provider executables, and without this they would skip here and run
+      # nowhere. Linking them is cheap at this point: every dependency is already
+      # built by the three steps above.
+      - name: Build provider executables for the suites that spawn them
+        run: cargo build --workspace --bins
+
       - name: Test workspace
         run: cargo test --workspace --all-targets
 
@@ -260,4 +269,5 @@ jobs:
       - name: Qualify enforcement, IPC, and the local run-fixture matrix
         run: |
           cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures -- --nocapture --test-threads=1
-          cargo test -p umbra-cli --test run_fixtures -- --nocapture --test-threads=1
+          cargo test -p umbra-cli --test run_fixtures --test resume_cli -- --nocapture --test-threads=1
+          cargo test -p umbra-supervisor --test reopen -- --nocapture --test-threads=1

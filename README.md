@@ -39,7 +39,10 @@ released and a durable run-completion record, in both the local-development and
 mounted-NFSv4 storage modes.
 
 Vendor agent adapters remain stubs, so `--agent` reports `NotImplemented`.
-Checkpoint, resume, recovery from a nonempty journal, and strict remote
+`umbra resume <run-id>` reopens an existing run and reports whether it can be
+reconciled, exiting nonzero when it cannot; it does not relaunch, and reconciling
+such a run — repairing the tree rather than detecting that it cannot be trusted —
+is still unimplemented. Checkpoint and strict remote
 durability are not implemented or not qualified; a run's base layer detects
 workspace change rather than snapshotting content. Resume means restarting an
 agent from persisted filesystem and session state, not migrating a live process.
@@ -48,9 +51,13 @@ The workspace uses Rust edition 2021 and the toolchain pinned in
 [rust-toolchain.toml](rust-toolchain.toml).
 [CI](.github/workflows/ci.yml) runs formatting, Clippy with warnings denied,
 workspace checks, tests, and doctests on macOS and Linux for pushes to `master`
-and pull requests. The additional native qualification job runs the sandbox,
-IPC, tracer fixture, and local-storage CLI matrix suites on an
-`umbra-integration` macOS ARM64 runner. It requires debugger permission. The
+and pull requests. It builds the workspace's provider executables before testing,
+because `cargo test` compiles other packages' binaries only as test harnesses and
+the reopen suites spawn them for real. The additional native qualification job
+runs the sandbox, IPC, tracer fixture, local-storage CLI matrix and reopen suites
+on an `umbra-integration` macOS ARM64 runner, with
+`UMBRA_INTEGRATION_REQUIRED=1` so a missing prerequisite fails there instead of
+skipping. It requires debugger permission. The
 NFS-backed CLI matrix (`nfs_fixture_matrix`) is opted out of CI via
 `UMBRA_TEST_SKIP_NFS_MATRIX` because the current storage-nfs adapter needs a
 real NFSv4 kernel mount and macOS Sequoia/Tahoe blocks that path from a

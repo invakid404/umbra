@@ -20,10 +20,21 @@ Construction does no I/O. The owner must call `NamespaceSession::bind` with:
   paths or chooses a base/storage implementation.
 
 The owner opens the injected Journal against `binding.control` with the same run
-and writer epoch. Binding validates matching identities and accepts only an empty,
-intact journal with no checkpoint or pending transactions. Nonempty recovery is
-explicitly unsupported until reconciliation is implemented. The supervisor's
-`run` composition supplies this initialization. Unbound engines return `InvalidState`.
+and writer epoch. Binding validates matching identities, then classifies the
+recovery inventory it was handed
+([#65](https://github.com/invakid404/umbra/issues/65)). A journal carrying
+unfinished operations is accepted: `bind` reads each one's `Prepare` intent and
+*discards* an entry only where its intent implies no prepare-time creation **and**
+its kernel outcome was an observed failure — together, proof that `prepare`
+finished and `commit` never ran. Every other entry *poisons* the session, as does
+a previous session having *declared* the run unrecoverable by journaling
+`JournalLifecycle::RecoveryRequired`, which is carried out of the log as
+`RecoveryState.recovery_required`. It returns `Ok` either way,
+so a run that cannot serve can still be opened and inspected. A checkpoint or a torn tail is still
+refused outright, with `UnsupportedCapability`. Reconciling a nonempty recovery —
+repairing the tree rather than detecting that it cannot be trusted — remains
+unimplemented. The supervisor's `run` composition supplies this initialization.
+Unbound engines return `InvalidState`.
 
 ## MVP behavior
 
@@ -226,8 +237,17 @@ its Commit is the logical publication boundary. Marker writes and native rename
 are **not one filesystem transaction**. The engine blocks observers during these
 steps, flushes storage before Commit, and poisons the session on an ambiguous
 failure. Crash-atomic recovery requires replay/reconciliation of the intent and
-both markers. This MVP refuses reopening nonempty journals rather than exposing
-partially reconciled state.
+both markers. Reopening such a journal no longer refuses: since #65 `bind`
+classifies the inventory and discards an unfinished transaction only when its
+intent implies no creation *and* its kernel outcome was an observed failure.
+Anything else poisons — `commit` applies the marker writes and the object removal
+*before* it records `Commit`, so a missing `Commit` means it may not have
+finished rather than never started. Binding such a journal rather than refusing it is deliberate, and what it exposes
+is narrower than "the state": a poisoned session serves nothing — every entry
+point gates on `poisoned` through `idle()`, `stat` and `read_link` included, which
+reach it via `typed_path`. What the owner gets is a bound session carrying a
+structured verdict it can act on, instead of an error that leaves it unable to
+distinguish an unreconcilable journal from a failed bind.
 
 The injected Journal owns persistence. The shipped `umbra-journal-file` backend
 implements append and fsync-backed flush; the record payload carries
@@ -241,11 +261,43 @@ An aborted mutation requires recovery and leaves the session stopped, with one
 structurally distinct exception: `AbortReason::KernelRefused(errno)`. That reason
 says the rewritten syscall reached the kernel and the kernel refused it, so the
 effects are exactly the ones `prepare` journaled, the verdict is the one
-`observe_result` journaled, and the tracee is owed the errno. Such an abort still
-writes its `Abort` record, but it returns `Ok` and leaves the session usable,
-which is what lets an ordinary `EPERM`/`ENOSPC` reach the tracee instead of
-ending the run
-([#53](https://github.com/invakid404/umbra/issues/53)). The reason is a claim by
+`observe_result` journaled, and the tracee is owed the errno. Such an abort
+returns `Ok` and leaves the session usable, which is what lets an ordinary
+`EPERM`/`ENOSPC` reach the tracee instead of ending the run
+([#53](https://github.com/invakid404/umbra/issues/53)).
+
+It writes its `Abort` record *after* the rollback below, and
+[#65](https://github.com/invakid404/umbra/issues/65) narrows #53's guarantee to
+say so: a mutating abort journals its reason **when its rollback succeeds**, and
+an abort whose rollback fails journals none. That is not a dropped guarantee, it
+is a sharpened one. The record asserts that every removal the transaction
+recorded was performed *and* reached the store's durability boundary — the undo
+is followed by a `storage.flush(EntireRun)` whose receipt is validated exactly as
+`commit` validates its own, `Durability::None` included — so writing it after a
+failed or uncertifiable undo would put a false invariant on disk where the next
+reader has no way to doubt it. Withholding it leaves `Prepare` with no terminal
+record, which is exactly what `bind` reopens and poisons on. The failure is loud
+twice over — this session poisons, and so does the next one to open the journal.
+
+The flush is skipped when the rollback list is empty, and that gate is what keeps
+it affordable: an abort that recorded no removal removed nothing, so the claim is
+vacuous and #53's hot path — a refused `chown`, a refused write-open onto a base
+file — pays nothing. What pays is a refused creating `Open`, `Mkdir` or
+`Symlink`, and `commit` already pays a flush for those same transactions when
+they stand. The claim's scope is likewise the *recorded* removals, not the tree:
+an ancestor `copy_up` materialised was never on the list, and the surviving-residue
+paragraph below is where that is accounted for.
+The uncorroborated path below keeps its `Abort` record unconditional and exactly
+where it was -- it never reaches a rollback, so there is no undo for that record to
+wait on. It is not otherwise unchanged: since #65 it writes a
+`JournalLifecycle::RecoveryRequired` record *ahead* of that `Abort`, because the
+`Abort` alone would clear the operation from a later reopen's inventory while the
+creation `prepare` made was never undone. The declaration is what makes that reopen
+poison; see the `bind` paragraph above, and note the ordering is load-bearing --
+declaring after the `Abort` would leave a crash window in which the `Abort` is
+durable and the declaration is not.
+
+The reason is a claim by
 the caller, so it is honoured only when `Pending.outcome` — the failure this
 session itself observed — carries the same errno; an unobserved or mismatched
 claim is an interception inconsistency and takes the poison path. `Cancelled`,
@@ -257,7 +309,7 @@ prepare-time logical creation — files; directories since
 [#64](https://github.com/invakid404/umbra/issues/64); and, since
 [#69](https://github.com/invakid404/umbra/issues/69), a logical symlink's three
 objects as one entry — each carrying the removal(s) that undo it, and a reconciled
-abort walks the *list* in reverse creation order, after the `Abort` record,
+abort walks the *list* in reverse creation order, before the `Abort` record,
 performing each entry's removal(s). Reverse creation order governs the list, not
 the inside of an entry: the symlink entry's own three paths go in the order given
 below, which is deliberately not the order they were created in. A rollback that
@@ -358,24 +410,78 @@ rather than a flag: *every prepare-time logical creation records an entry.* A
 latch nothing sets cannot fail closed, and would only give a future author the
 false impression that an unrecorded creation would be caught.
 
-The rollback list is in-memory and dies with the session, and that is sufficient
-rather than best-effort: `bind` refuses to reopen a journal that is not pristine,
-so a crash between `prepare` and `abort` already ends the run exactly as
-poisoning would. A durable pre-image would buy nothing readable today, so it is
-deferred to M1.5 along with the widening of that refusal — and the replay path
-that widens it must poison for every `Prepare` whose intent implies a creation,
-because the rollback list is gone by then and its absence is not evidence of
-reconcilability. #69 adds a second, sharper reason for the symlink case
-specifically: the backing index's key is the *backend* object ID the shadow
+The rollback list is in-memory and dies with the session, and
+[#65](https://github.com/invakid404/umbra/issues/65) prices that rather than
+deferring it. `bind` no longer refuses a journal carrying unfinished operations:
+it classifies each one and discards it only where the intent implies no
+prepare-time creation *and* the kernel outcome was an observed failure. The first
+conjunct is because the list that would have taken a creation back is gone; the
+second is the transaction's *stage*, which no intent carries: anything earlier may
+have stopped inside `copy_up`, anything later may have stopped inside `commit`,
+and a durable `ObservedResult` is what proves `prepare` returned at all. The evidence is positive and already durable — `prepare` fsyncs its
+`Prepare` record before any creating arm runs, so no creation is ever on disk
+without its intent — which is why #65 needed no new journal payload, no format
+bump and no on-disk byte change at all. The classifier is a single wildcard-free
+`match` in `engine.rs` (`replay_must_poison`), sited beside the `prepare` arms it
+restates so that a new `JournalIntent` variant is a compile error rather than a
+silent verdict.
+
+Two of `bind`'s four refusal predicates remain. A checkpoint belongs to
+checkpoint-based recovery, which is unimplemented — `Supervisor::resume` reopens a
+run and classifies it, and refuses a checkpoint-bearing recovery for this reason
+rather than despite it; a torn tail may have eaten the very
+terminal record the classification reads, and `open` has already truncated those
+bytes, so "don't know" is the honest answer and poisoning — a claim about a
+*specific* transaction — is not how to give it.
+
+What makes an operation's *absence* from the recovery inventory meaningful is
+where each terminal record sits relative to the effects it describes, and both
+records have to earn it. `commit` flushes the shadow, validates the receipt and
+writes `Commit` last. `abort` now does the same: unwind, flush, then `Abort`. So
+an operation gone from the inventory was ended by a transaction whose effects had
+reached the store before its record did — not by one that merely attempted them.
+The scope of the abort half is the removals the transaction recorded; see the
+#53 paragraph above for the empty-rollback gate and what it leaves uncovered.
+
+#69's sharper reason for the symlink case stands and is why this poisons rather
+than replays: the backing index's key is the *backend* object ID the shadow
 assigned the placeholder, and the journal carries the link path and the logical
 identity but never that, so a durable replay could not rebuild a symlink undo from
-durable state at all — not merely "less precisely", but not at all.
+durable state at all — not merely "less precisely", but not at all. A record rich
+enough would have to be written after the placeholder existed, so a crash in that
+window lands back on the poison path regardless.
+
+This classification is reachable. `Supervisor::resume` (and `Supervisor::recover`,
+which is the same call) opens a run with `OpenRunIntent::OpenExisting`, reacquires
+writer authority, replays the journal, binds, reports the verdict and closes
+again; `umbra resume <run-id>` is its operator surface and exits nonzero on a
+recovery-required run. It reports; it does not repair, and reconciling a reopened
+run remains unimplemented.
+
+The `run` path is unaffected and keeps its own, stricter gate: a `CreateNew` that
+comes back with anything other than a pristine journal is a storage/journal
+disagreement, not recovery, and is still refused outright. The reopen path has a
+parallel gate that refuses exactly what `bind` refuses — a checkpoint, or a torn
+tail — and lets `bind` classify everything else.
 
 Copy-up is deliberately not counted as a creation, so a refused `fchownat`, or a
 refused write open on an object the base already holds, reconciles. The content
 view is unchanged, and counting it would poison the run on the first write into
 any not-yet-shadowed base subdirectory — a large share of the ordinary `EPERM`
-cases this contract exists to survive. That is **not** a claim that copy-up is
+cases this contract exists to survive.
+
+**"The content view is unchanged" is a statement about a copy-up that finished**,
+and a reopen cannot assume one did. `copy_up` is `create`, then a `write_at`
+loop, then `carry_ownership`; `create_symlink` is the target blob, then the
+placeholder, then the backing index. Stopping inside either leaves a truncated
+shadow copy of a base file, or a `0o444` placeholder with no `symlinks/objects/`
+entry — which reads back as an empty *regular file*, not a logical symlink — and
+`lookup` prefers the shadow, so that is wrong content at a path the run already
+exposed. No committed copy-up produces it. Within a live session the window is
+closed by `prepare` poisoning on any error in its closure; across a reopen it is
+closed by `reconcilable_on_reopen` requiring an observed *failure*, since
+`observe_result` refuses a poisoned session and a durable `ObservedResult` is
+therefore proof that `prepare` returned. That is **not** a claim that copy-up is
 invisible: it materialises shadow ancestors, and those are new objects in the
 shadow whether or not the operation that needed them was allowed to stand. What
 they are no longer is *wrong*: `parents` used to give every one of them a
@@ -645,8 +751,11 @@ identity, and target length. Native no-follow stat of a link requires an injecte
 without it the operation fails explicitly. Provider factories install ABI encoders.
 
 Physical rewrites assume a trusted immutable base and serialized namespace;
-race-proof native dirfd execution still needs platform qualification. The existing
-refusal to reopen nonempty journals also applies to symlink transactions.
+race-proof native dirfd execution still needs platform qualification. A symlink
+transaction left unfinished in a reopened journal is the classifier's
+most-argued arm and poisons (#65): the backing index is keyed by the backend
+object ID the shadow assigned the placeholder, which no intent carries, so its
+undo cannot be rebuilt from durable state at all.
 
 Directory subtree rename, hard links, metadata mutations, pathless native
 read/write emulation, descriptor duplication/close/reuse bookkeeping, renamed or

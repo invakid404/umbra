@@ -20,10 +20,10 @@ use std::time::{Duration, Instant};
 use umbra_agent::Agent;
 pub use umbra_core::CheckpointRequest;
 use umbra_core::{
-    AgentLaunchRequest, AgentResumeRequest, AgentSession, BytePath, Checkpoint, ExitStatus, FsOp,
-    ObjectId, OperationId, OperationOutcome, PreparedRewrite, ProcessContext, ProcessHandle, Prot,
-    QuiescedTree, RecoveryState, RegisterSet, ResolvedAction, Result, RunId, TaskId,
-    TerminationPolicy, ThreadId, UmbraError,
+    AgentLaunchRequest, AgentSession, BytePath, Checkpoint, ExitStatus, FsOp, ObjectId,
+    OperationId, OperationOutcome, PreparedRewrite, ProcessContext, ProcessHandle, Prot,
+    QuiescedTree, RegisterSet, ResolvedAction, Result, RunId, TaskId, TerminationPolicy, ThreadId,
+    UmbraError,
 };
 use umbra_journal::Journal;
 use umbra_overlay::{standard_namespace, NamespaceSession};
@@ -38,7 +38,10 @@ pub mod run;
 /// Runtime rendering of the single Seatbelt policy template.
 pub mod sandbox;
 
-pub use run::{run, CommandLaunch, RunLaunch, RunObserver, RunOutcome, RunPersistence, RunSpec};
+pub use run::{
+    resume, run, CommandLaunch, ResumeOutcome, ResumeSpec, RunLaunch, RunObserver, RunOutcome,
+    RunPersistence, RunSpec,
+};
 
 /// Runtime inventory, never persisted or restored across hosts.
 #[derive(Clone, Debug, Default)]
@@ -428,21 +431,44 @@ impl Supervisor {
         Err(UmbraError::not_implemented("supervisor.handoff"))
     }
 
-    /// Reconcile unfinished effects using stable IDs and durable intent. Unsafe
-    /// takeover or uncertain effects must leave the run stopped.
-    pub fn recover(&mut self, _recovery: &RecoveryState) -> Result<()> {
-        Err(UmbraError::not_implemented("supervisor.recover"))
+    /// Reopen an existing run, reacquire exclusive ownership, and report whether
+    /// what the last session left behind can be reconciled.
+    ///
+    /// **Associated, not a method, and that is forced rather than chosen.** A
+    /// `Supervisor` reaches storage and the journal only through its
+    /// `NamespaceSession`, which exposes neither `open_run` nor `acquire_writer`
+    /// nor any journal call — so `&mut self` could not open anything. Reopening
+    /// is composition, and composition is what [`crate::run::resume`] does, in the
+    /// same shape and the same file as [`crate::run::run`].
+    ///
+    /// Returning [`ResumeOutcome`] rather than a `ProcessHandle` is the other
+    /// half of that: a reopen classifies and closes, it does not launch. Relaunch
+    /// from a checkpoint is a separate capability that checkpoint-based recovery
+    /// would have to exist for first, and it does not.
+    ///
+    /// `Ok` means the reopen succeeded, **not** that the run is usable — read
+    /// [`ResumeOutcome::recovery_required`].
+    pub fn resume(spec: ResumeSpec) -> Result<ResumeOutcome> {
+        crate::run::resume(spec)
     }
 
-    /// Validate versions/base, reacquire exclusive ownership, reconstruct logical
-    /// state at the new root and launch this exact session in a new supervised
-    /// process. This does not migrate a live process.
-    pub fn resume(
-        &mut self,
-        _request: &AgentResumeRequest,
-        _session: &AgentSession,
-        _checkpoint: &Checkpoint,
-    ) -> Result<ProcessHandle> {
-        Err(UmbraError::not_implemented("supervisor.resume"))
+    /// Reconcile unfinished effects using stable IDs and durable intent. Unsafe
+    /// takeover or uncertain effects must leave the run stopped.
+    ///
+    /// The same operation as [`Supervisor::resume`], delegating to it rather than
+    /// restating it, because there is no earlier point at which the two could
+    /// diverge: the verdict is produced by `bind`, and `bind` happens after
+    /// storage, the writer lease and the journal are already open. There is no
+    /// "recovery mode" to enter beforehand — a run that needs recovery and one
+    /// that does not are opened identically and tell you apart only afterwards.
+    /// The two names are kept because the caller's *intent* differs, and a
+    /// `recover` that redirected to `resume` silently would be worse than one
+    /// that says it is the same call.
+    ///
+    /// Reconciliation itself — repairing the tree rather than detecting that it
+    /// cannot be trusted — remains unimplemented. This reports; it does not
+    /// repair.
+    pub fn recover(spec: ResumeSpec) -> Result<ResumeOutcome> {
+        Self::resume(spec)
     }
 }

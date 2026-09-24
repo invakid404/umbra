@@ -33,9 +33,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use umbra_core::{
-    Checkpoint, CheckpointId, DurableSequence, ErrorKind, JournalAccess, JournalOpenRequest,
-    JournalPayload, JournalPendingOperation, JournalRecord, JournalTailRecovery,
-    JournalWriterAuthority, LeaseEpoch, RecoveryState, Result, RunId, Sequence, UmbraError,
+    Checkpoint, CheckpointId, DurableSequence, ErrorKind, JournalAccess, JournalLifecycle,
+    JournalOpenRequest, JournalPayload, JournalPendingOperation, JournalRecord,
+    JournalTailRecovery, JournalWriterAuthority, LeaseEpoch, RecoveryState, Result, RunId,
+    Sequence, UmbraError,
 };
 use umbra_journal::Journal;
 
@@ -320,6 +321,8 @@ impl Journal for FileJournal {
         let mut last_sequence = Sequence(0);
         let mut pending: BTreeMap<umbra_core::OperationId, JournalPendingOperation> =
             BTreeMap::new();
+        // Latched by the replay below, never cleared. See `apply_recovery`.
+        let mut recovery_required = false;
         let mut tail = JournalTailRecovery::Intact;
 
         if let Some(file) = existing.as_mut() {
@@ -367,7 +370,7 @@ impl Journal for FileJournal {
                         }
                         last_sequence = frame.record.sequence;
                         valid_bytes += frame.bytes;
-                        apply_recovery(&mut pending, &frame.record);
+                        apply_recovery(&mut pending, &mut recovery_required, &frame.record);
                     }
                 }
             }
@@ -420,7 +423,7 @@ impl Journal for FileJournal {
             closed: false,
         }));
 
-        let clean = recovery_is_clean(&pending, &tail);
+        let clean = recovery_is_clean(&pending, recovery_required, &tail);
         Ok(RecoveryState {
             run_id: request.control.run_id,
             checkpoint,
@@ -430,6 +433,10 @@ impl Journal for FileJournal {
             durable: None,
             pending: pending.into_values().collect(),
             tail,
+            // A prior session's own verdict, carried out of the log rather than
+            // inferred from it. See the field, and `apply_recovery` for why no
+            // amount of looking at `pending` could reconstruct this.
+            recovery_required,
             // Anything left prepared-but-uncommitted needs reconciliation by the
             // namespace owner before this run can be called clean.
             clean,
@@ -678,9 +685,26 @@ fn read_checkpoint(directory: &Path) -> Result<Option<Checkpoint>> {
     Ok(Some(umbra_core::provider::decode(&bytes)?))
 }
 
-/// Track prepared-but-uncommitted operations while replaying.
+/// Track prepared-but-uncommitted operations while replaying, and the one
+/// lifecycle verdict a reader cannot reconstruct without being told.
+///
+/// `recovery_required` latches on `JournalLifecycle::RecoveryRequired` and is
+/// never cleared. `Overlay::abort` writes that record on its uncorroborated path
+/// — the one where it poisons *without* running an unwind — immediately before
+/// the `Abort` record ([#65](https://github.com/invakid404/umbra/issues/65),
+/// waiver (viii)). The ordering is what makes it safe: a crash between the two
+/// leaves the `Prepare` with no terminal record at all, which the classifier in
+/// `Overlay::bind` already poisons on.
+///
+/// Why a latch here and not something `bind` could work out for itself: the
+/// `Abort` record below removes the operation from `pending`, so by the time a
+/// reader sees the inventory, the evidence that a creation was materialised and
+/// never undone is *gone*. That erasure is exactly the defect this carries
+/// around. `Lifecycle` used to be the one payload this function ignored
+/// entirely.
 fn apply_recovery(
     pending: &mut BTreeMap<umbra_core::OperationId, JournalPendingOperation>,
+    recovery_required: &mut bool,
     record: &JournalRecord,
 ) {
     match &record.payload {
@@ -704,16 +728,26 @@ fn apply_recovery(
         JournalPayload::Commit | JournalPayload::Abort { .. } => {
             pending.remove(&record.operation_id);
         }
+        JournalPayload::Lifecycle(JournalLifecycle::RecoveryRequired) => {
+            *recovery_required = true;
+        }
         JournalPayload::Lifecycle(_) => {}
     }
 }
 
-/// Unfinished operations and a damaged tail each require reconciliation.
+/// Unfinished operations, a damaged tail and a prior session's own
+/// recovery-required verdict each require reconciliation.
+///
+/// The third conjunct is not redundant with the first: the session that writes
+/// `RecoveryRequired` also writes the terminal record that empties `pending` of
+/// the operation it is about, so a run can be declared unrecoverable and still
+/// present a structurally empty, intact inventory.
 fn recovery_is_clean(
     pending: &BTreeMap<umbra_core::OperationId, JournalPendingOperation>,
+    recovery_required: bool,
     tail: &JournalTailRecovery,
 ) -> bool {
-    pending.is_empty() && matches!(tail, JournalTailRecovery::Intact)
+    pending.is_empty() && !recovery_required && matches!(tail, JournalTailRecovery::Intact)
 }
 
 #[cfg(test)]
@@ -722,7 +756,7 @@ mod tests {
     use umbra_core::{BytePath, RunId};
     use umbra_core::{
         JournalControlBinding, JournalFencingEvidence, JournalFormatPolicy, JournalIntent,
-        ObjectId, OperationId, PhysicalPath,
+        ObjectId, OperationId, OperationOutcome, PhysicalPath,
     };
 
     fn scratch(name: &str) -> tempfile::TempDir {
@@ -1070,6 +1104,397 @@ mod tests {
             crc32(b"The quick brown fox jumps over the lazy dog"),
             0x414F_A339
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The replay side of [#65](https://github.com/invakid404/umbra/issues/65).
+    //
+    // `Overlay::bind` now reads `RecoveryState.pending` and poisons the session
+    // for any operation whose `Prepare` intent implies a prepare-time creation,
+    // instead of refusing to reopen the journal at all. `apply_recovery` is what
+    // produces that inventory and it is the only `JournalPayload` parser in the
+    // repo, so these units are where "a crash left this operation unfinished"
+    // becomes a checked property of real bytes on disk rather than a fixture's
+    // assertion about itself. The classification they feed is pinned on the
+    // engine side; what is pinned here is the reduction.
+
+    /// A `Prepare` fsynced with no terminal record behind it is exactly what a
+    /// crash between `prepare` and `commit`/`abort` leaves, and it survives the
+    /// reopen as one pending entry carrying its intent.
+    ///
+    /// The intent matters, not just the count: it is the whole durable
+    /// pre-image #65 turned out to already have. `prepare` appends and fsyncs
+    /// this record *before* any arm creates anything, so a `Create` here means
+    /// "a creation may have happened and the list that would undo it is gone".
+    #[test]
+    fn a_prepare_with_no_terminal_record_survives_the_reopen_with_its_intent() {
+        let scratch = scratch("pending-intent");
+        let dir = scratch.path();
+        let run_id = RunId(uuid_v4());
+        let id = OperationId(uuid_v4());
+        let object = ObjectId(uuid_v4());
+        {
+            let mut journal = FileJournal::new();
+            journal.open(&request(dir, run_id, 1)).unwrap();
+            journal
+                .append(&record(
+                    1,
+                    id,
+                    JournalPayload::Prepare {
+                        intent: JournalIntent::Create {
+                            object,
+                            path: BytePath::new(b"/fresh".to_vec()).unwrap(),
+                            directory: false,
+                            mode: 0o644,
+                        },
+                    },
+                ))
+                .unwrap();
+            journal.flush(Sequence(1)).unwrap();
+            journal.close().unwrap();
+        }
+        let mut journal = FileJournal::new();
+        let state = journal.open(&request(dir, run_id, 2)).unwrap();
+        assert!(matches!(state.tail, JournalTailRecovery::Intact));
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.pending[0].operation_id, id);
+        assert_eq!(state.pending[0].prepared_at, Sequence(1));
+        assert!(
+            matches!(&state.pending[0].intent, JournalIntent::Create { object: o, directory: false, .. } if *o == object),
+            "the intent is what the reopen classifies, so it must survive verbatim"
+        );
+        assert!(state.pending[0].observed_result.is_none());
+        assert!(!state.clean);
+    }
+
+    /// An `ObservedResult` annotates the entry and is *not* terminal.
+    ///
+    /// This is the shape a crash during rollback leaves under #65's abort
+    /// ordering -- `prepare` journaled the intent, `observe_result` journaled
+    /// the kernel's verdict, and the `Abort` record was never written because
+    /// the undo never completed. The operation must still be pending, which is
+    /// what makes the reopen poison by construction rather than by inference
+    /// from an absent record.
+    #[test]
+    fn an_observed_result_annotates_a_pending_operation_without_terminating_it() {
+        let scratch = scratch("observed");
+        let dir = scratch.path();
+        let run_id = RunId(uuid_v4());
+        let id = OperationId(uuid_v4());
+        {
+            let mut journal = FileJournal::new();
+            journal.open(&request(dir, run_id, 1)).unwrap();
+            journal
+                .append(&record(
+                    1,
+                    id,
+                    JournalPayload::Prepare {
+                        intent: JournalIntent::Symlink {
+                            object: ObjectId(uuid_v4()),
+                            path: BytePath::new(b"/link".to_vec()).unwrap(),
+                            target: BytePath::new(b"/target".to_vec()).unwrap(),
+                        },
+                    },
+                ))
+                .unwrap();
+            journal
+                .append(&record(
+                    1,
+                    id,
+                    JournalPayload::ObservedResult {
+                        outcome: OperationOutcome::Failure(umbra_core::Errno(28)),
+                    },
+                ))
+                .unwrap();
+            journal.flush(Sequence(2)).unwrap();
+            journal.close().unwrap();
+        }
+        let mut journal = FileJournal::new();
+        let state = journal.open(&request(dir, run_id, 2)).unwrap();
+        assert_eq!(state.pending.len(), 1, "an observed result is not terminal");
+        assert_eq!(
+            state.pending[0].observed_result,
+            Some(OperationOutcome::Failure(umbra_core::Errno(28)))
+        );
+        assert!(matches!(
+            state.pending[0].intent,
+            JournalIntent::Symlink { .. }
+        ));
+        assert!(!state.clean);
+    }
+
+    /// Either terminal record ends the operation for a reopen, and the pair is
+    /// asserted together because that symmetry is what #65's abort reordering
+    /// leans on. `Commit` means the transaction stood; `Abort` now means its
+    /// recorded removals are durable, because `Overlay::abort` writes the record
+    /// only after a successful unwind *and* a validated storage flush. An empty
+    /// inventory is therefore an assertion, not an absence of information.
+    #[test]
+    fn either_terminal_record_clears_the_operation_from_the_reopen_inventory() {
+        for (label, terminal) in [
+            ("commit", JournalPayload::Commit),
+            (
+                "abort",
+                JournalPayload::Abort {
+                    reason: "KernelRefused(Errno(28))".into(),
+                },
+            ),
+        ] {
+            let scratch = scratch(&format!("terminal-{label}"));
+            let dir = scratch.path();
+            let run_id = RunId(uuid_v4());
+            let id = OperationId(uuid_v4());
+            {
+                let mut journal = FileJournal::new();
+                journal.open(&request(dir, run_id, 1)).unwrap();
+                journal
+                    .append(&record(
+                        1,
+                        id,
+                        JournalPayload::Prepare {
+                            intent: JournalIntent::Create {
+                                object: ObjectId(uuid_v4()),
+                                path: BytePath::new(b"/fresh".to_vec()).unwrap(),
+                                directory: true,
+                                mode: 0o755,
+                            },
+                        },
+                    ))
+                    .unwrap();
+                journal
+                    .append(&record(
+                        1,
+                        id,
+                        JournalPayload::ObservedResult {
+                            outcome: OperationOutcome::Failure(umbra_core::Errno(28)),
+                        },
+                    ))
+                    .unwrap();
+                journal.append(&record(1, id, terminal)).unwrap();
+                journal.flush(Sequence(3)).unwrap();
+                journal.close().unwrap();
+            }
+            let mut journal = FileJournal::new();
+            let state = journal.open(&request(dir, run_id, 2)).unwrap();
+            assert!(
+                state.pending.is_empty(),
+                "{label}: a terminal record ends the operation"
+            );
+            assert!(state.clean, "{label}: nothing is left to reconcile");
+            assert_ne!(
+                state.last_valid_sequence,
+                Sequence(0),
+                "{label}: the journal is not pristine, which a reopen must now tolerate"
+            );
+        }
+    }
+
+    /// Two interleaved transactions, one terminated and one not. The reduction
+    /// is per-operation, so the finished one leaves nothing behind and the
+    /// unfinished one is reported with its own intent -- which is what lets a
+    /// reopen poison for a single bad transaction in a journal full of good
+    /// ones.
+    #[test]
+    fn interleaved_operations_are_reduced_independently_by_operation_id() {
+        let scratch = scratch("interleaved");
+        let dir = scratch.path();
+        let run_id = RunId(uuid_v4());
+        let committed = OperationId(uuid_v4());
+        let stranded = OperationId(uuid_v4());
+        {
+            let mut journal = FileJournal::new();
+            journal.open(&request(dir, run_id, 1)).unwrap();
+            journal
+                .append(&record(
+                    1,
+                    committed,
+                    JournalPayload::Prepare {
+                        intent: JournalIntent::Unlink {
+                            object: ObjectId(uuid_v4()),
+                            path: BytePath::new(b"/gone".to_vec()).unwrap(),
+                            directory: false,
+                        },
+                    },
+                ))
+                .unwrap();
+            journal
+                .append(&record(
+                    1,
+                    stranded,
+                    JournalPayload::Prepare {
+                        intent: JournalIntent::Rename {
+                            object: ObjectId(uuid_v4()),
+                            from: BytePath::new(b"/source".to_vec()).unwrap(),
+                            to: BytePath::new(b"/fresh/target".to_vec()).unwrap(),
+                        },
+                    },
+                ))
+                .unwrap();
+            journal
+                .append(&record(1, committed, JournalPayload::Commit))
+                .unwrap();
+            journal.flush(Sequence(3)).unwrap();
+            journal.close().unwrap();
+        }
+        let mut journal = FileJournal::new();
+        let state = journal.open(&request(dir, run_id, 2)).unwrap();
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.pending[0].operation_id, stranded);
+        assert!(matches!(
+            state.pending[0].intent,
+            JournalIntent::Rename { .. }
+        ));
+        assert!(!state.clean);
+    }
+
+    /// The one verdict a reader cannot reconstruct: a prior session declaring
+    /// the run unrecoverable.
+    ///
+    /// `Overlay::abort`'s uncorroborated path writes `RecoveryRequired` and then
+    /// an `Abort` over a transaction whose creation it never undid
+    /// ([#65](https://github.com/invakid404/umbra/issues/65), waiver (viii)).
+    /// The `Abort` is terminal, so the inventory this reopen produces is
+    /// **empty** and intact -- structurally indistinguishable from a run that
+    /// finished cleanly. The latch is the only thing that tells them apart, which
+    /// is why `clean` must go false on it too: `umbra-supervisor`'s own
+    /// pristine-journal gate reads `clean` and would otherwise wave this through
+    /// before `Overlay::bind` ever saw it.
+    #[test]
+    fn a_declared_recovery_requirement_survives_an_otherwise_empty_reopen() {
+        let scratch = scratch("declared");
+        let dir = scratch.path();
+        let run_id = RunId(uuid_v4());
+        let id = OperationId(uuid_v4());
+        {
+            let mut journal = FileJournal::new();
+            journal.open(&request(dir, run_id, 1)).unwrap();
+            journal
+                .append(&record(
+                    1,
+                    id,
+                    JournalPayload::Prepare {
+                        intent: JournalIntent::Create {
+                            object: ObjectId(uuid_v4()),
+                            path: BytePath::new(b"/fresh".to_vec()).unwrap(),
+                            directory: false,
+                            mode: 0o644,
+                        },
+                    },
+                ))
+                .unwrap();
+            // The order `abort` uses: the declaration, then the terminal record
+            // it qualifies.
+            journal
+                .append(&record(
+                    1,
+                    id,
+                    JournalPayload::Lifecycle(JournalLifecycle::RecoveryRequired),
+                ))
+                .unwrap();
+            journal
+                .append(&record(
+                    1,
+                    id,
+                    JournalPayload::Abort {
+                        reason: "Cancelled".into(),
+                    },
+                ))
+                .unwrap();
+            journal.flush(Sequence(3)).unwrap();
+            journal.close().unwrap();
+        }
+        let mut journal = FileJournal::new();
+        let state = journal.open(&request(dir, run_id, 2)).unwrap();
+        assert!(
+            state.pending.is_empty(),
+            "the Abort record is still terminal -- the inventory cannot carry this"
+        );
+        assert!(matches!(state.tail, JournalTailRecovery::Intact));
+        assert!(
+            state.recovery_required,
+            "the declaration is what makes an empty inventory readable as 'do not trust this run'"
+        );
+        assert!(
+            !state.clean,
+            "a declared run is not clean, however empty its inventory looks"
+        );
+    }
+
+    /// The other direction, so the latch cannot be mistaken for "any lifecycle
+    /// record means trouble". An ordinary run journals `RunCompleted`, and a
+    /// reopen of it stays clean.
+    #[test]
+    fn an_ordinary_lifecycle_record_does_not_declare_a_recovery_requirement() {
+        let scratch = scratch("lifecycle-clean");
+        let dir = scratch.path();
+        let run_id = RunId(uuid_v4());
+        let id = OperationId(uuid_v4());
+        {
+            let mut journal = FileJournal::new();
+            journal.open(&request(dir, run_id, 1)).unwrap();
+            journal
+                .append(&record(
+                    1,
+                    id,
+                    JournalPayload::Lifecycle(JournalLifecycle::RunCompleted {
+                        through: Sequence(1),
+                    }),
+                ))
+                .unwrap();
+            journal.flush(Sequence(1)).unwrap();
+            journal.close().unwrap();
+        }
+        let mut journal = FileJournal::new();
+        let state = journal.open(&request(dir, run_id, 2)).unwrap();
+        assert!(!state.recovery_required);
+        assert!(state.clean);
+        assert_ne!(state.last_valid_sequence, Sequence(0));
+    }
+
+    /// The latch is a latch: once declared, nothing later in the log clears it.
+    /// A `Commit` for an unrelated transaction after the declaration must not
+    /// launder the run.
+    #[test]
+    fn a_declared_recovery_requirement_is_never_cleared_by_later_records() {
+        let scratch = scratch("latch");
+        let dir = scratch.path();
+        let run_id = RunId(uuid_v4());
+        let declared = OperationId(uuid_v4());
+        let later = OperationId(uuid_v4());
+        {
+            let mut journal = FileJournal::new();
+            journal.open(&request(dir, run_id, 1)).unwrap();
+            journal
+                .append(&record(
+                    1,
+                    declared,
+                    JournalPayload::Lifecycle(JournalLifecycle::RecoveryRequired),
+                ))
+                .unwrap();
+            journal
+                .append(&record(
+                    1,
+                    later,
+                    JournalPayload::Prepare {
+                        intent: JournalIntent::Unlink {
+                            object: ObjectId(uuid_v4()),
+                            path: BytePath::new(b"/gone".to_vec()).unwrap(),
+                            directory: false,
+                        },
+                    },
+                ))
+                .unwrap();
+            journal
+                .append(&record(1, later, JournalPayload::Commit))
+                .unwrap();
+            journal.flush(Sequence(3)).unwrap();
+            journal.close().unwrap();
+        }
+        let mut journal = FileJournal::new();
+        let state = journal.open(&request(dir, run_id, 2)).unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.recovery_required, "the latch is never cleared");
+        assert!(!state.clean);
     }
 
     fn uuid_v4() -> uuid::Uuid {

@@ -343,6 +343,8 @@ fn recovery(run_id: RunId) -> RecoveryState {
         durable: None,
         pending: vec![],
         tail: JournalTailRecovery::Intact,
+        // Nothing declared this run unrecoverable; see the field.
+        recovery_required: false,
         clean: true,
     }
 }

@@ -24,3 +24,13 @@ umbra-overlay = { path = "../umbra-overlay" }
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+# `tests/resume_cli.rs` builds a crashed run's durable state, then reopens it
+# through the real `umbra` binary and the real provider executables, which is the
+# only way to assert the command's exit code on a recovery-required run.
+umbra-core = { path = "../umbra-core" }
+umbra-journal = { path = "../umbra-journal" }
+umbra-journal-file = { path = "../umbra-journal-file" }
+umbra-storage = { path = "../umbra-storage" }
+umbra-storage-local = { path = "../umbra-storage-local" }
+umbra-supervisor = { path = "../umbra-supervisor" }
+uuid.workspace = true

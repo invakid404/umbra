@@ -5,9 +5,16 @@ turns an explicit provider registry into a run request. This crate owns
 `src/lib.rs`, `src/main.rs`, `src/composition.rs`, the `src/commands/` handlers and
 the CLI tests; it has no implementation-crate dependencies, including in tests.
 
-`run` is operational. `stop`, `checkpoint`, `resume` and `inspect` are stubs that
-report `not implemented` on stderr and exit 1; they no longer echo their parsed
-arguments, because argv and environment carry paths and secrets.
+`run` and `resume` are operational. `stop`, `checkpoint` and `inspect` are stubs
+that report `not implemented` on stderr and exit 1; they no longer echo their
+parsed arguments, because argv and environment carry paths and secrets.
+
+`resume` reopens an existing run and reports whether what the last session left
+can be reconciled. It does not relaunch anything — that would need checkpoint-based
+recovery, which is unimplemented. A run that requires recovery prints a status line
+on stderr and exits nonzero, so a script cannot read success from a run it cannot
+use; a healthy run exits 0. Run enumeration is out of scope: the run ID is an
+argument.
 
 ```text
 umbra run --registry PATH [--workspace PATH] --experimental
@@ -35,16 +42,23 @@ as an argument, and disables nothing.
 Storage mode is chosen by flag and enforced by negotiated capability, not by
 provider identity. The default is a validated NFSv4 mount with client-fsync
 durability, requiring the storage descriptor to declare `mounted-nfsv4-v1`;
-`--local-dev` requires `local-development-v1` instead. Both additionally require
-`experimental-open-rewrite-v1`, and the platform descriptor must declare
-`sandboxed-stopped-launch-v1` and `experimental-syscall-rewrite-v1`. Descriptors
-are checked before any provider is started, and the provider handshake then
-rejects a connection whose backend does not actually advertise the name.
+`--local-dev` requires `local-development-v1` instead. Descriptors are checked
+before any provider is started, and the provider handshake then rejects a
+connection whose backend does not actually advertise the name.
+
+`run` additionally requires `experimental-open-rewrite-v1` from the storage
+descriptor, and `sandboxed-stopped-launch-v1` plus
+`experimental-syscall-rewrite-v1` from the platform descriptor. `resume` requires
+neither set: it resolves nothing, rewrites nothing and launches nothing, so
+demanding capabilities it never exercises would turn an unqualified claim into a
+passing check. It connects storage and journal only, and enforces the persistence
+mode exactly as `run` does.
 `--strict-remote` is a deterministic `UnsupportedCapability` error: no storage
 provider qualifies strict remote durability. A registry that configures a
 `namespace` role is refused the same way, whatever that descriptor declares: the
 supervisor does not yet route a run to a configured namespace provider, so
-`umbra run` cannot use one. `namespace-run-lifecycle-v1` names the capability such
+neither `umbra run` nor `umbra resume` can use one — both go through the same
+admission, so a registry one refuses the other cannot accept. `namespace-run-lifecycle-v1` names the capability such
 a provider will have to advertise; adding it to a descriptor changes the error
 message, not the outcome. Capabilities in a registry are operator-written claims,
 qualified by the provider handshake only for roles the run actually connects.
