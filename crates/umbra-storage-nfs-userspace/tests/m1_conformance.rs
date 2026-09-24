@@ -589,8 +589,20 @@ fn an_open_run_claims_no_fencing_and_no_physical_path_and_a_qualified_flush() {
         // the provider never advertises less than it delivers, and it is never
         // `None`: the overlay rejects a `None` receipt outright. Still no M3 claim —
         // no independent termination verifier, no kernel-visible path.
+        //
+        // Conditioned on the backend, because the claim now is too. The live
+        // fixture declares a remote persistence boundary and its probe proves
+        // one, so it reaches `QUALIFIED_DURABILITY`; the fake declares nothing,
+        // so it honestly reaches only `Local`. Asserting the constant on both
+        // was a constant compared against itself, which passed in a job with no
+        // fixture at all. `durability_is_claimed_only_where_the_boundary_was_
+        // qualified_for_this_run` below is the dedicated proof of both halves.
         let capabilities = binding.capabilities;
-        assert_eq!(capabilities.durability, QUALIFIED_DURABILITY, "{backend:?}");
+        assert_eq!(
+            capabilities.durability,
+            expected_durability(backend),
+            "{backend:?}"
+        );
         assert_ne!(capabilities.durability, Durability::None, "{backend:?}");
         assert_eq!(capabilities.fencing, Fencing::ReadOnly);
         assert!(!capabilities.strict_remote_persistence);
@@ -641,6 +653,73 @@ fn an_open_run_claims_no_fencing_and_no_physical_path_and_a_qualified_flush() {
         );
 
         storage.close_run().expect("close_run");
+    }
+}
+
+/// The durability a backend has *earned*, which is the only thing it may claim.
+///
+/// `QUALIFIED_DURABILITY` requires both gates: the bound transport must declare
+/// `PersistenceBoundary::RemoteServer`, and this run's probe must have completed
+/// a matched-verifier COMMIT cycle across it. `LibnfsRawTransport` is the only
+/// declaring implementation in the crate, so the fake — which reproduces the
+/// WRITE/COMMIT verifier protocol faithfully enough to pass any probe put to it
+/// — correctly reaches only `Local`.
+fn expected_durability(backend: Backend) -> Durability {
+    if backend.is_live() {
+        QUALIFIED_DURABILITY
+    } else {
+        Durability::Local
+    }
+}
+
+/// **(e2)/(e1).** `Remote` is claimed if and only if the boundary was qualified
+/// for *this* `open_run`, on the binding and on the receipt alike.
+///
+/// Without the fixture this runs against the fake alone and pins the honest
+/// answer: `Local` everywhere, in the default CI job, with no live transport
+/// linked. With the fixture it additionally runs against a real Ganesha and pins
+/// the qualified answer. No configuration produces `Remote` without a declaring
+/// transport and a probe that actually succeeded against it.
+#[test]
+fn durability_is_claimed_only_where_the_boundary_was_qualified_for_this_run() {
+    for (backend, transport) in backends() {
+        let expected = expected_durability(backend);
+        let mut storage = provider(transport);
+
+        // Before any run, there is no bound run to qualify: the floor.
+        assert_eq!(
+            storage.capabilities().durability,
+            Durability::None,
+            "{backend:?}"
+        );
+
+        let binding = storage
+            .open_run(&create_run(fresh_run()))
+            .expect("open_run");
+        // The binding carries the probed value, not a pre-probe one.
+        assert_eq!(binding.capabilities.durability, expected, "{backend:?}");
+        assert_eq!(storage.capabilities().durability, expected, "{backend:?}");
+
+        // The receipt inherits the run's qualification rather than re-asserting
+        // a constant, so it can never outrun what the binding advertised.
+        let receipt = storage
+            .flush(&umbra_core::FlushRequest {
+                context: context(&storage, "flush-qualified"),
+                scope: umbra_core::FlushScope::EntireRun,
+            })
+            .expect("a barrier over nothing outstanding is a receipt");
+        assert_eq!(receipt.durability, expected, "{backend:?}");
+        // Degrading to `Local` stays contract-safe: the overlay rejects only
+        // `None` (umbra-overlay engine.rs:2618).
+        assert_ne!(receipt.durability, Durability::None, "{backend:?}");
+
+        storage.close_run().expect("close_run");
+        // The qualification belonged to that run and does not survive it.
+        assert_eq!(
+            storage.capabilities().durability,
+            Durability::None,
+            "{backend:?}"
+        );
     }
 }
 

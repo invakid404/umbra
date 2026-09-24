@@ -44,8 +44,8 @@ use std::num::NonZeroU64;
 use crate::error::TransportError;
 use crate::transport::{
     CallToken, Compound, CompoundReply, ConnectionEpoch, ConnectionState, Deadline, FaultAction,
-    FaultContext, FaultPlan, FaultPoint, NoFaults, OpCode, OpReply, ProtocolError, RawTransport,
-    Retirement, TransportLimits, TransportResult, WireProfile,
+    FaultContext, FaultPlan, FaultPoint, NoFaults, OpCode, OpReply, PersistenceBoundary,
+    ProtocolError, RawTransport, Retirement, TransportLimits, TransportResult, WireProfile,
 };
 
 use pump::{Completion, EventPump, ServiceOutcome};
@@ -496,6 +496,21 @@ impl RawTransport for LibnfsRawTransport {
 
     fn install_faults(&mut self, plan: Box<dyn FaultPlan>) {
         self.faults = plan;
+    }
+
+    /// The one override in the crate.
+    ///
+    /// This context speaks NFSv4.0 over TCP to a server process on the far side
+    /// of a socket, so a COMMIT here really does cross to a remote server and a
+    /// matched verifier really is that server's RFC 7530 §16.4 acknowledgement.
+    /// Every other [`RawTransport`] in this crate and its tests is in-memory and
+    /// correctly inherits [`PersistenceBoundary::Unqualified`].
+    ///
+    /// Declaring the boundary does not claim it: `open_run` still has to prove a
+    /// matched-verifier COMMIT cycle against the mount this context is connected
+    /// to before anything above [`umbra_core::Durability::Local`] is advertised.
+    fn persistence_boundary(&self) -> PersistenceBoundary {
+        PersistenceBoundary::RemoteServer
     }
 }
 

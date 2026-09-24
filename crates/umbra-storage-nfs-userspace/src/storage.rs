@@ -45,22 +45,41 @@ pub const PROVIDER_ID: &str = "nfs-userspace";
 /// not in scope: one-session-one-Umbra admission is product-wide.
 pub const FORMAT_VERSION: u32 = 1;
 
-/// The persistence boundary this provider qualifies: advertised in the run
-/// binding's capabilities and returned by a satisfied [`Storage::flush`].
+/// The persistence boundary this provider can qualify — the **ceiling** on what
+/// a run binding's capabilities advertise and a satisfied [`Storage::flush`]
+/// returns, never by itself the value of either.
 ///
-/// [`Durability::Remote`] because the barrier is qualified against the live
-/// NFSv4.0 Ganesha fixture in this crate's tests — every `WriteAt` returns only
-/// after a COMMIT whose verifier matched its WRITE's, which per RFC 7530 §16.4 is
-/// the server's acknowledgement of stable storage, and the barrier certifies that
-/// none in scope is outstanding, indeterminate or latched-failed.
+/// [`Durability::Remote`] is what a *qualified* run claims: every `WriteAt`
+/// returns only after a COMMIT whose verifier matched its WRITE's, which per RFC
+/// 7530 §16.4 is the server's acknowledgement of stable storage, and the barrier
+/// certifies that none in scope is outstanding, indeterminate or latched-failed.
 ///
 /// What `Remote` asserts is exactly that acknowledgement and that barrier. It does
 /// **not** assert anything about the server's hardware, its export's `fsync`
 /// policy or its media; it does not assert fencing ([`Fencing::ReadOnly`] is
-/// unchanged), an atomic snapshot, or continuous persistence. Were the qualifying
-/// live evidence ever removed from the verification, this must degrade to
-/// [`Durability::Local`], which asserts strictly less and so cannot lie, while
-/// still clearing the overlay's `!= None` check.
+/// unchanged), an atomic snapshot, or continuous persistence.
+///
+/// # Reaching this level is earned per run, not assumed
+///
+/// This constant used to be read straight into both
+/// [`crate::ops::Operations::capabilities`] and the `flush` receipt, which made
+/// the degradation rule below a sentence a human had to honour: a build with no
+/// live transport linked at all still advertised `Remote`. It is now a ceiling
+/// that `Operations::durability` applies only when **both** gates
+/// hold for the run in hand:
+///
+/// 1. the bound transport declares
+///    [`PersistenceBoundary::RemoteServer`](crate::transport::PersistenceBoundary::RemoteServer)
+///    — a property of the implementation compiled in, defaulting to
+///    `Unqualified` so that forgetting to declare degrades rather than
+///    over-claims; and
+/// 2. the crate-private `probe::qualify` completed a synthetic matched-verifier COMMIT
+///    cycle against this run's own mount, during this `open_run`.
+///
+/// Anything else degrades to [`Durability::Local`], which asserts strictly less
+/// and so cannot lie, while still clearing the overlay's `!= None` check. That
+/// is the same degradation this comment always demanded; it is now the code path
+/// rather than the instruction.
 pub const QUALIFIED_DURABILITY: Durability = Durability::Remote;
 
 /// Hard cap on the per-object settlement index the barrier ledger keeps.
@@ -960,6 +979,22 @@ impl NfsUserspaceStorage {
         }
     }
 
+    /// The durability this provider has actually earned right now.
+    ///
+    /// One derivation, read by both [`Storage::capabilities`] and the `flush`
+    /// receipt, so the two can never disagree. With a run open it is the run's
+    /// own probed qualification; with no run open it is the same
+    /// [`Durability::None`] floor `capabilities` reports, because without a
+    /// bound run there is nothing qualified to claim. `flush` refuses long
+    /// before it could observe that floor — case 10 has already returned — so
+    /// the arm exists to make the floor total rather than to be reached.
+    fn qualified_durability(&self) -> Durability {
+        match &self.operations {
+            Some(operations) => operations.durability(),
+            None => Durability::None,
+        }
+    }
+
     /// The `evidence` bytes a satisfied barrier carries.
     ///
     /// Names the method, the writer epoch, the settled-write count, the last
@@ -1278,12 +1313,16 @@ fn now_millis() -> u64 {
 impl Storage for NfsUserspaceStorage {
     /// Only what an open run can actually meet.
     ///
-    /// An open run advertises the qualified barrier: `operations.capabilities()`
-    /// returns `Durability::Remote`, the level a satisfied `flush` delivers via the
-    /// WRITE/COMMIT verifier flow. Without a bound transport there is nothing
-    /// qualified to claim, so the unbound floor is `Durability::None`. Either way
-    /// `Fencing::ReadOnly` stays: this provider has no independent termination
-    /// verifier, and the barrier says nothing about fencing.
+    /// An open run advertises what that run proved: `operations.capabilities()`
+    /// returns [`QUALIFIED_DURABILITY`] when the bound transport declared a
+    /// remote persistence boundary *and* this run's probe completed a
+    /// matched-verifier COMMIT cycle across it, and `Durability::Local`
+    /// otherwise — the level a satisfied `flush` then delivers, because the
+    /// receipt reads the same derivation. Without a bound transport there is
+    /// nothing qualified to claim at all, so the unbound floor is
+    /// `Durability::None`. In every case `Fencing::ReadOnly` stays: this
+    /// provider has no independent termination verifier, and the barrier says
+    /// nothing about fencing.
     ///
     /// The finite I/O and page limits are zero until a run is open, because
     /// without a bound transport there is no bound to honour. Advertising a limit
@@ -1360,7 +1399,7 @@ impl Storage for NfsUserspaceStorage {
 
         // Failure must not publish a partially usable binding, so the surface is
         // built completely before anything is stored on the provider.
-        let operations = Operations::open(transport, &config, request, serial, deadline)?;
+        let mut operations = Operations::open(transport, &config, request, serial, deadline)?;
 
         // A newly created run gets the mounted adapter's `.provider` state, so
         // the run this provider writes is one that adapter can later open.
@@ -1439,6 +1478,39 @@ impl Storage for NfsUserspaceStorage {
             },
             deadline,
         )?;
+
+        // The persistence boundary is proven here, and nowhere else.
+        //
+        // Placement is load-bearing at both ends. It cannot run earlier: the
+        // probe's OPEN is sequenced through the open owners of a *confirmed*
+        // incarnation, and those exist only once `Session::admit` above has
+        // returned. It cannot run later: `operations.binding()` on the next line
+        // publishes `capabilities.durability` to the caller, and a binding built
+        // before the probe would advertise a claim this run had not earned.
+        //
+        // A read-only run is never probed and so never qualifies. That is the
+        // honest answer rather than a gap: `preflight` refuses every mutation on
+        // such a run, so the cycle cannot be driven, and a boundary that was
+        // never proven must not be claimed.
+        //
+        // Nothing here can fail the open. `probe::qualify` consumes every error
+        // it meets and yields only this boolean; in particular it never records
+        // into `unsettled`, `stable_write_failure`, `recovery_blocked` or the
+        // barrier ledger. A probe that failed means "this run may not claim
+        // `Remote`" and must never come to mean "this run can never flush".
+        let qualified = match (
+            operations.policy().read_only,
+            operations.anchors().private(),
+            self.state.incarnation(),
+        ) {
+            (false, Some(private), Some(incarnation)) => {
+                // `private` borrows `operations`, so the qualification is
+                // computed before the surface is mutated below.
+                crate::probe::qualify(transport, incarnation.open_owners(), private, deadline)
+            }
+            _ => false,
+        };
+        operations.qualify_boundary(qualified);
 
         let binding = operations.binding();
         self.serial = self.serial.saturating_add(1);
@@ -1892,7 +1964,15 @@ impl Storage for NfsUserspaceStorage {
             run_id: lease.run_id,
             writer_epoch: lease.epoch,
             scope: request.scope.clone(),
-            durability: QUALIFIED_DURABILITY,
+            // Inherited, never re-asserted. Reading the constant here would let a
+            // receipt outrun the binding: `capabilities.durability` is now
+            // derived per run from the boundary probe, and a `flush` that
+            // stamped the constant would claim `Remote` for a run that had
+            // advertised `Local`. This is the receipt taking the run's own
+            // qualification, and it changes nothing else about the barrier —
+            // still zero I/O, still the same eight refusals above, still the
+            // same ledger and the same evidence below.
+            durability: self.qualified_durability(),
             evidence: self.barrier_evidence(&lease),
         })
     }
@@ -1918,6 +1998,11 @@ impl Storage for NfsUserspaceStorage {
             self.stable_write_failure = None;
             self.unsettled.clear();
             self.ledger = RunLedger::default();
+            // The boundary qualification goes with the ledger, for the same
+            // reason: it was true of that run's probe and of nothing else. It
+            // lives on the `Operations` this teardown dropped above, so there is
+            // no separate cache that could survive — asserted, not assumed.
+            debug_assert_eq!(self.qualified_durability(), Durability::None);
             return surrendered;
         }
         // Release admission before dropping the run, so the next session can
@@ -1940,6 +2025,11 @@ impl Storage for NfsUserspaceStorage {
         // next `open_run` would let a fresh run's flush be scoped, or vacuously
         // certified, against writes a previous incarnation made.
         self.ledger = RunLedger::default();
+        // And so does the boundary qualification: it records what *that* run's
+        // probe proved about *that* mount. It lives on the `Operations` dropped
+        // above, so one probe per `open_run` is structural and no cross-run
+        // cache exists to go stale. Asserted rather than assumed.
+        debug_assert_eq!(self.qualified_durability(), Durability::None);
         // Every handle this session issued carries its serial, which `open_run`
         // has already advanced, so all of them are now rejected on presentation.
         // A close never implies a flush.

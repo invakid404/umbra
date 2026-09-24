@@ -1363,9 +1363,12 @@ fn a_commit_returning_io_latches_and_every_later_flush_refuses() {
 /// `NFS4ERR_STALE` (→ `StaleHandle`) or `NFS4ERR_INVAL` (→ `InvalidInput`) — all of
 /// which RFC 7530 lists among COMMIT's legal errors — records no ledger entry and
 /// trips none of `note_failure`'s kind filters. Without the write-path fix,
-/// `flush(EntireRun)` passes every guard and returns `Ok(Durability::Remote)` over
-/// data sitting in the server's volatile storage: exactly the lie the firewall
-/// exists to make impossible.
+/// `flush(EntireRun)` passes every guard and returns a receipt over data sitting
+/// in the server's volatile storage: exactly the lie the firewall exists to make
+/// impossible. (That receipt read `Ok(Durability::Remote)` when this case was
+/// written. Over the fake it would now read `Ok(Durability::Local)`, because the
+/// claim is qualified per run — but a receipt is still a receipt, and certifying
+/// one here would still be the lie.)
 #[test]
 fn a_commit_failing_with_a_non_io_non_transport_status_still_refuses_flush() {
     let mut storage = provider_with(|fake| {
@@ -1494,4 +1497,453 @@ fn the_ledger_is_cleared_on_close_run_so_the_next_run_is_not_poisoned() {
         "the ledger leaked run 1's writes into run 2: {run2_evidence}"
     );
     storage.close_run().expect("close run 2");
+}
+
+// ===========================================================================
+// The persistence boundary is a mechanism, not a convention
+// ===========================================================================
+//
+// `QUALIFIED_DURABILITY` used to be read straight into every run binding and
+// every flush receipt, so this job — no fixture, no `transport-raw` feature, no
+// live transport linked at all — advertised `Durability::Remote` with zero live
+// evidence. It is now the ceiling on a claim that is earned per `open_run` from
+// two independent gates ANDed together, and this section is the proof that runs
+// unconditionally, here, with no fixture and no waiver:
+//
+// * **(e1)** the plain fake declares nothing, so it claims only `Local`;
+// * a transport that *does* declare a remote boundary, and whose probe then
+//   completes a matched-verifier COMMIT cycle, reaches `Remote` on the binding
+//   and on the receipt alike — and leaves the run's layout untouched;
+// * **(e4)** a declared boundary whose probe *fails* degrades to `Local` and
+//   does nothing else: the run still writes, and still flushes.
+//
+// The declaring transport here is a deliberate local lie — `FakeTransport`
+// wearing a declaration it has not earned — because that is the only way to
+// drive the probe path at all without a live server. It is exactly why the
+// declaration alone is never enough: the fake reproduces the WRITE/COMMIT
+// verifier protocol faithfully and passes any probe put to it.
+
+use umbra_storage_nfs_userspace::handle::FileHandle;
+use umbra_storage_nfs_userspace::storage::QUALIFIED_DURABILITY;
+use umbra_storage_nfs_userspace::transport::{
+    CallToken, Compound, CompoundReply, ConnectionState, DirCookie, DirVerifier, Nfs4Op, Nfs4Type,
+    PersistenceBoundary, ReadDirRequest, Retirement, TransportLimits, TransportResult, WireProfile,
+};
+
+/// A [`FakeTransport`] that declares a remote persistence boundary.
+///
+/// Every required method delegates to the inner fake, so the shape helpers the
+/// trait defaults build on behave identically; the only difference on the wire
+/// is `rotate_between_write_and_commit`.
+struct DeclaredRemote {
+    inner: FakeTransport,
+    /// Rotate the fake's write/commit verifier immediately after the first
+    /// `UNSTABLE` WRITE reply, exactly as a server restarting between WRITE and
+    /// COMMIT would, so the probe's COMMIT returns a verifier its WRITE never
+    /// reported.
+    ///
+    /// Keyed on `UNSTABLE` because the probe issues the only such write in an
+    /// `open_run`: the anchor and admission writes are all `FILE_SYNC` and owe
+    /// no COMMIT.
+    rotate_between_write_and_commit: bool,
+}
+
+impl DeclaredRemote {
+    fn new(inner: FakeTransport, rotate_between_write_and_commit: bool) -> Self {
+        Self {
+            inner,
+            rotate_between_write_and_commit,
+        }
+    }
+}
+
+impl RawTransport for DeclaredRemote {
+    fn wire_profile(&self) -> WireProfile {
+        self.inner.wire_profile()
+    }
+
+    fn limits(&self) -> TransportLimits {
+        self.inner.limits()
+    }
+
+    fn connection(&self) -> ConnectionState {
+        self.inner.connection()
+    }
+
+    fn submit(&mut self, call: Compound, deadline: Deadline) -> TransportResult<CompoundReply> {
+        let unstable = call.ops.iter().any(|op| {
+            matches!(
+                op,
+                Nfs4Op::Write {
+                    stability: Stability::Unstable,
+                    ..
+                }
+            )
+        });
+        let reply = self.inner.submit(call, deadline)?;
+        if unstable && self.rotate_between_write_and_commit {
+            self.rotate_between_write_and_commit = false;
+            self.inner.rotate_write_verifier(WriteVerifier([0xAB; 8]));
+        }
+        Ok(reply)
+    }
+
+    fn cancel(&mut self, token: CallToken) -> TransportResult<Retirement> {
+        self.inner.cancel(token)
+    }
+
+    fn reconnect(&mut self) -> TransportResult<ConnectionEpoch> {
+        self.inner.reconnect()
+    }
+
+    fn install_faults(&mut self, plan: Box<dyn FaultPlan>) {
+        self.inner.install_faults(plan);
+    }
+
+    fn persistence_boundary(&self) -> PersistenceBoundary {
+        PersistenceBoundary::RemoteServer
+    }
+}
+
+/// A provider whose transport declares a remote boundary; `rotate` decides
+/// whether the probe's COMMIT will find the verifier its WRITE reported.
+fn provider_declaring_remote(rotate: bool) -> NfsUserspaceStorage {
+    NfsUserspaceStorage::with_facades(
+        fault_config(),
+        Box::new(DeclaredRemote::new(fault_server(), rotate)),
+        Box::new(FakeReplayLog::default()),
+    )
+    .expect("the provider accepts the declaring fixture")
+}
+
+/// Every name in `directory`, with its type and mode, `.`/`..` dropped.
+fn boundary_listing(
+    transport: &mut dyn RawTransport,
+    directory: &FileHandle,
+) -> Vec<(Vec<u8>, Nfs4Type, u32)> {
+    let deadline = Deadline { millis: 1_000 };
+    let mut entries = Vec::new();
+    let mut cookie = DirCookie(0);
+    let mut verifier = DirVerifier([0; 8]);
+    loop {
+        let page = transport
+            .readdir(
+                directory,
+                ReadDirRequest {
+                    cookie,
+                    verifier,
+                    dir_count: 8192,
+                    max_count: 32768,
+                    attrs: AttrMask::TYPE.union(AttrMask::MODE),
+                },
+                deadline,
+            )
+            .expect("READDIR");
+        verifier = page.verifier;
+        for entry in &page.entries {
+            cookie = entry.cookie;
+            let name = entry.name.as_bytes().to_vec();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            entries.push((
+                name,
+                entry.attributes.file_type.expect("FATTR4_TYPE"),
+                entry.attributes.mode.expect("FATTR4_MODE") & 0o7777,
+            ));
+        }
+        if page.eof {
+            break;
+        }
+    }
+    entries
+}
+
+/// The run's whole layout as sorted `<path>\t<kind>\t0oMODE` rows, in the shape
+/// `tests/goldens/run-layout.txt` pins.
+fn boundary_layout(transport: &mut dyn RawTransport, run_id: RunId) -> Vec<String> {
+    let deadline = Deadline { millis: 1_000 };
+    let mut parent = transport.root_filehandle(deadline).expect("root");
+    for part in [FAULT_EXPORT, FAULT_RUN_PARENT] {
+        parent = transport
+            .lookup(
+                &parent,
+                &ComponentName::new(part.to_vec()).expect("component"),
+                AttrMask::IDENTITY,
+                deadline,
+            )
+            .expect("resolve the export path")
+            .0;
+    }
+    let run_name = ComponentName::new(run_id.0.hyphenated().to_string().into_bytes())
+        .expect("run directory component");
+    let (run, run_attrs) = transport
+        .lookup(
+            &parent,
+            &run_name,
+            AttrMask::TYPE.union(AttrMask::MODE),
+            deadline,
+        )
+        .expect("stat the run directory");
+
+    let kind = |kind| match kind {
+        Nfs4Type::Directory => "dir",
+        _ => "file",
+    };
+    let mut rows = vec![format!(
+        "<run>\tdir\t0o{:o}",
+        run_attrs.mode.expect("mode") & 0o7777
+    )];
+    for (name, entry_kind, mode) in boundary_listing(transport, &run) {
+        let label = format!("<run>/{}", String::from_utf8_lossy(&name));
+        rows.push(format!("{label}\t{}\t0o{mode:o}", kind(entry_kind)));
+        if name == umbra_storage_nfs_userspace::layout::PRIVATE_DIR {
+            let private = transport
+                .lookup(
+                    &run,
+                    &ComponentName::new(name.clone()).expect("component"),
+                    AttrMask::IDENTITY,
+                    deadline,
+                )
+                .expect("resolve .provider")
+                .0;
+            for (child, child_kind, child_mode) in boundary_listing(transport, &private) {
+                rows.push(format!(
+                    "<run>/.provider/{}\t{}\t0o{child_mode:o}",
+                    String::from_utf8_lossy(&child),
+                    kind(child_kind)
+                ));
+            }
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// The eight rows `tests/goldens/run-layout.txt` pins, sorted to match.
+fn golden_layout_rows() -> Vec<String> {
+    let golden = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/goldens/run-layout.txt"),
+    )
+    .expect("read the run-layout golden");
+    let mut rows: Vec<String> = golden
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(rows.len(), 8, "the golden pins exactly eight rows");
+    rows.sort();
+    rows
+}
+
+/// **(e1).** With no fixture and no declared boundary, the claim is `Local` —
+/// on the binding, on `capabilities()` and on the flush receipt.
+///
+/// This is the case the whole issue is about. It runs in the default CI job,
+/// which has no `UMBRA_NFS_RAW_FIXTURE` and no `transport-raw` feature, so
+/// nothing in this build could possibly have qualified a remote boundary. The
+/// old code shipped `Durability::Remote` here anyway.
+#[test]
+fn a_run_over_an_undeclared_transport_claims_only_local_durability() {
+    let mut storage = provider_with(|_| {});
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let binding = storage
+        .open_run(&fault_run(run_id, OpenRunIntent::CreateNew))
+        .expect("open_run");
+
+    assert_eq!(
+        binding.capabilities.durability,
+        Durability::Local,
+        "the fake declares no persistence boundary, so nothing may be claimed"
+    );
+    assert_eq!(storage.capabilities().durability, Durability::Local);
+
+    // A settled write and a satisfied barrier still happen — degrading the claim
+    // degrades nothing else. The receipt inherits `Local` rather than stamping
+    // the constant.
+    create_then_write(&mut storage, "undeclared.bin", b"bytes").expect("the write settles");
+    let receipt = storage
+        .flush(&FlushRequest {
+            context: fault_ctx(&storage, "flush-undeclared"),
+            scope: FlushScope::EntireRun,
+        })
+        .expect("a barrier over a settled run is a receipt");
+    assert_eq!(receipt.durability, Durability::Local);
+    // `Local` still clears the overlay's only check (engine.rs:2618).
+    assert_ne!(receipt.durability, Durability::None);
+
+    storage.close_run().expect("close_run");
+}
+
+/// A declared boundary plus a probe that proved it reaches `QUALIFIED_DURABILITY`
+/// — and the probe leaves the run exactly as the golden pins it.
+///
+/// Both halves matter. The first is that the conjunction actually admits the
+/// qualified claim, so `Local` is not simply hard-wired. The second is the
+/// orphan assertion: the probe creates a file in `.provider`, writes it, commits
+/// it, closes it and removes it, and after `open_run` + `close_run` the run's
+/// whole layout must still be the eight rows the mounted-adapter golden pins,
+/// with no `boundary-probe` among them.
+#[test]
+fn a_declared_boundary_with_a_matched_verifier_probe_claims_remote_and_leaves_no_orphan() {
+    let mut storage = provider_declaring_remote(false);
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let binding = storage
+        .open_run(&fault_run(run_id, OpenRunIntent::CreateNew))
+        .expect("open_run");
+
+    assert_eq!(
+        binding.capabilities.durability, QUALIFIED_DURABILITY,
+        "both gates held, so the run earned the qualified claim"
+    );
+    assert_eq!(storage.capabilities().durability, QUALIFIED_DURABILITY);
+
+    let receipt = storage
+        .flush(&FlushRequest {
+            context: fault_ctx(&storage, "flush-declared"),
+            scope: FlushScope::EntireRun,
+        })
+        .expect("a barrier over nothing outstanding is a receipt");
+    assert_eq!(
+        receipt.durability, QUALIFIED_DURABILITY,
+        "the receipt inherits the run's qualification"
+    );
+
+    storage.close_run().expect("close_run");
+
+    let observed = boundary_layout(storage.transport().expect("transport"), run_id);
+    assert_eq!(
+        observed,
+        golden_layout_rows(),
+        "the probe must leave the run byte-identical to the mounted-adapter layout"
+    );
+    // Named explicitly, because this is the artifact that would leak.
+    assert!(
+        !observed
+            .iter()
+            .any(|row| row.contains("<run>/.provider/boundary-probe")),
+        "the probe artifact survived its own open_run: {observed:?}"
+    );
+}
+
+/// **(e4).** A probe that fails degrades the claim and does nothing else.
+///
+/// This is the sharpest hazard in the design. `flush`'s case-3 refusal returns
+/// `Err` for the life of the run whenever `unsettled` is non-empty, so a probe
+/// that recorded its failure as run bookkeeping would turn "this run may not
+/// claim `Remote`" into "this run can never flush again" — a far worse
+/// regression than the over-claim being fixed. The probe's only output is a
+/// boolean, and this pins that: the transport declares a remote boundary, the
+/// probe's COMMIT finds a rotated verifier and fails, and the run goes on to
+/// write and to flush exactly as an unqualified run does.
+#[test]
+fn a_failed_probe_degrades_the_claim_without_bricking_the_run() {
+    let mut storage = provider_declaring_remote(true);
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let binding = storage
+        .open_run(&fault_run(run_id, OpenRunIntent::CreateNew))
+        .expect("a failed probe never fails the open");
+
+    assert_eq!(
+        binding.capabilities.durability,
+        Durability::Local,
+        "the verifier changed under the probe, so the boundary is unproven"
+    );
+
+    // The run is fully usable: a write settles, and the barrier certifies it.
+    // Both would be impossible had the probe's failure reached `unsettled`,
+    // `stable_write_failure` or `recovery_blocked`.
+    create_then_write(&mut storage, "after-failed-probe.bin", b"still-writable")
+        .expect("a failed probe must not refuse the run's writes");
+    let receipt = storage
+        .flush(&FlushRequest {
+            context: fault_ctx(&storage, "flush-after-failed-probe"),
+            scope: FlushScope::EntireRun,
+        })
+        .expect("a failed probe must not brick the barrier");
+    assert_eq!(receipt.durability, Durability::Local);
+    let evidence = String::from_utf8(receipt.evidence).expect("utf-8 evidence");
+    assert!(
+        evidence.contains("committed_writes=1"),
+        "the probe must not fold its synthetic write into the ledger: {evidence}"
+    );
+
+    storage.close_run().expect("close_run");
+
+    // And it still cleaned up after itself: a probe that failed mid-cycle owes
+    // the same empty layout as one that succeeded.
+    let observed = boundary_layout(storage.transport().expect("transport"), run_id);
+    assert!(
+        !observed
+            .iter()
+            .any(|row| row.contains("<run>/.provider/boundary-probe")),
+        "a failed probe left its artifact behind: {observed:?}"
+    );
+}
+
+/// The same run, reopened read-only.
+///
+/// Always `OpenExisting`: a read-only run cannot be *created*, because creation
+/// is itself a mutation and `Operations::open` refuses the combination outright.
+fn read_only_run(run_id: RunId) -> OpenRunRequest {
+    let mut request = fault_run(run_id, OpenRunIntent::OpenExisting);
+    request.policy.read_only = true;
+    request
+}
+
+/// **D.7.** A read-only run is never probed, so it never claims more than
+/// `Local` — even over a transport that declares a remote persistence boundary.
+///
+/// The guard exists because the probe is a *write*: `preflight` refuses every
+/// mutation on a read-only run, so the cycle cannot honestly be driven there,
+/// and a boundary that was never proven must not be claimed. Unguarded, a
+/// read-only run over a declaring transport — in production, the real
+/// `LibnfsRawTransport` — would drive a synthetic WRITE into `.provider` in
+/// breach of the run's own contract, and would then claim `Remote` on a run
+/// forbidden to mutate.
+///
+/// This case is what distinguishes the read-only arm from the undeclared arm.
+/// Every other read-only test in the crate runs over the plain fake, which
+/// declares nothing, so gate 1 short-circuits before the read-only term is ever
+/// load-bearing and deleting the guard changes no observable behaviour.
+#[test]
+fn a_read_only_run_over_a_declaring_transport_is_never_probed() {
+    let mut storage = provider_declaring_remote(false);
+    let run_id = RunId(uuid::Uuid::new_v4());
+
+    // Writable first, so the run exists to reopen — and so the qualified claim
+    // is shown to be reachable on this very transport. That makes `read_only`
+    // the single variable between the two opens below.
+    let created = storage
+        .open_run(&fault_run(run_id, OpenRunIntent::CreateNew))
+        .expect("create the run writable");
+    assert_eq!(
+        created.capabilities.durability, QUALIFIED_DURABILITY,
+        "the writable open probed and qualified over this transport"
+    );
+    storage.close_run().expect("release");
+
+    let reopened = storage
+        .open_run(&read_only_run(run_id))
+        .expect("reopen read-only");
+    assert_eq!(
+        reopened.capabilities.durability,
+        Durability::Local,
+        "a read-only run cannot drive the probe, so it has proven nothing and \
+         must claim nothing — the transport's declaration alone is never enough"
+    );
+    assert_eq!(storage.capabilities().durability, Durability::Local);
+
+    storage.close_run().expect("close the read-only run");
+
+    // And nothing was written on its behalf. Asserted as the artifact's absence
+    // rather than against the whole golden, because an `OpenExisting` succession
+    // legitimately records its own per-epoch claim in `.provider` (R1-001).
+    let observed = boundary_layout(storage.transport().expect("transport"), run_id);
+    assert!(
+        !observed
+            .iter()
+            .any(|row| row.contains("<run>/.provider/boundary-probe")),
+        "a read-only run was probed: {observed:?}"
+    );
 }
