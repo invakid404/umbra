@@ -652,8 +652,9 @@ mod tests {
     ///
     /// Without it the decode fails and the caller gets `ProtocolMismatch`, which
     /// is the repo's stated stance for a peer built against an older crate:
-    /// handshake, then fail to decode. `PROTOCOL_VERSION` is frozen at 2 and is
-    /// deliberately not a second line of defence here.
+    /// handshake, then fail to decode. `PROTOCOL_VERSION` is deliberately not a
+    /// second line of defence here: it moves for a change to the *transport's*
+    /// own message shapes, not for a payload this enum gained.
     ///
     /// The opposite direction needs no test: serde ignores unknown fields, so an
     /// older *client* decodes a newer provider's payload and drops the field --

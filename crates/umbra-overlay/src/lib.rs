@@ -12,7 +12,10 @@ pub use umbra_core::{
     AbortReason, Checkpoint, CheckpointRequest, CommitReceipt, FailedRunRequest, FinishRunReceipt,
     FinishRunRequest, OperationId, OperationOutcome, PreparedAction, WriterLease,
 };
-use umbra_core::{BytePath, FsOp, MapFlags, ProcessContext, ResolvedAction, Result};
+use umbra_core::{
+    BytePath, FdState, FsOp, MapFlags, ProcessContext, ResolvedAction, Result, RoutedRequest,
+    TracedFd,
+};
 pub use umbra_journal::Journal;
 pub use umbra_storage::{
     ApprovedBaseObject, RequestContext, Storage, StorageCapabilities, StoragePath,
@@ -52,6 +55,45 @@ pub trait NamespaceSession: NamespaceResolver {
             umbra_core::ErrorKind::UnsupportedCapability,
             "overlay.readlink_buffer",
             "provider does not support readlink buffers",
+        ))
+    }
+    /// Bind the runtime details of the next *routed* operation; see
+    /// [`RoutedRequest`]. Consumed on resolution, including a failed one.
+    ///
+    /// Defaulted to a refusal rather than to a no-op, and that distinction is the
+    /// point: a provider that silently accepted the binding and ignored it would
+    /// resolve a routed `Write` with no bytes, or answer a routed `Open` with
+    /// descriptor zero. Both are wrong answers rather than refusals, which is the
+    /// shape this codebase refuses elsewhere.
+    ///
+    /// **The IPC namespace provider inherits this default and does not carry
+    /// routing.** That is not a hidden gap: `run` and `resume` refuse a registry
+    /// declaring a `namespace` role outright (`admit_run`, "this supervisor does
+    /// not yet route a run to a configured namespace provider"), so the only
+    /// reachable implementation is the in-process [`Overlay`] this crate builds.
+    /// A future namespace provider has to implement this, and it will be told so
+    /// by this refusal rather than by a corrupted run.
+    fn set_routed_request(&mut self, _request: RoutedRequest) -> Result<()> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.routed_request",
+            "provider does not support userspace-routed operations",
+        ))
+    }
+    /// The descriptor binding the last [`NamespaceResolver::resolve`] produced
+    /// for a routed `Open`, or `None` when it resolved something else.
+    ///
+    /// The caller owns [`ProcessContext::fds`] and inserts this after the
+    /// operation's outcome has been *observed* successful, never before. It is
+    /// read from the namespace rather than assembled by the caller because the
+    /// binding carries the object identity the namespace resolved the path to,
+    /// and a caller inventing one would put a fabricated identity in the process
+    /// context -- where the directory-cursor key reads it.
+    fn routed_descriptor(&self) -> Result<Option<(TracedFd, FdState)>> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.routed_descriptor",
+            "provider does not support userspace-routed operations",
         ))
     }
     /// Inject native stat layout and the current syscall's output-buffer binding.

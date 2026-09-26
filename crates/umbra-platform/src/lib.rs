@@ -27,7 +27,7 @@
 #![deny(missing_docs)]
 
 pub use umbra_core::{
-    BytePath, EmulatedResult, FsOp, LaunchSpec, PlatformCapabilities, PreparedRewrite,
+    BytePath, EmulatedResult, FsOp, IoBuffer, LaunchSpec, PlatformCapabilities, PreparedRewrite,
     ProcessHandle, QuiescedTree, RegisterSet, Result, ResumeCommand, TaskId, TerminationPolicy,
     ThreadId, TraceEvent,
 };
@@ -90,6 +90,29 @@ pub trait SyscallAbi {
         regs: &RegisterSet,
         memory: &mut dyn TraceMemory,
     ) -> Result<Option<FsOp>>;
+
+    /// Report the tracee memory buffer this entry's data transfer names, if any.
+    ///
+    /// `None` is the answer for every operation that transfers no bytes through a
+    /// caller-supplied buffer, which is every path operation. `Some` is reachable
+    /// only for a [`FsOp::Read`] or [`FsOp::Write`] the same entry decoded, and
+    /// the two must agree about the byte count: the namespace is handed a length
+    /// in the operation and an address here, and a disagreement would write past
+    /// the binding.
+    ///
+    /// This is a second method rather than a field on [`FsOp`] because `FsOp` is
+    /// deliberately ABI-independent -- it says how *many* bytes move, never
+    /// *where* -- and only the ABI can read an address out of a register set. It
+    /// takes no [`TraceMemory`]: the address is in the registers, so answering
+    /// costs no round trip to the stopped task.
+    ///
+    /// The default refuses nothing and reports nothing, so a backend that
+    /// services no data transfers needs no implementation and cannot be mistaken
+    /// for one that does: a consumer that needs a buffer and gets `None` fails
+    /// with its own diagnosis rather than reading address zero.
+    fn io_buffer(&self, _regs: &RegisterSet) -> Result<Option<IoBuffer>> {
+        Ok(None)
+    }
 
     /// Apply an already prepared rewrite to registers for this ABI.
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()>;

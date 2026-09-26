@@ -3,6 +3,9 @@ pub mod abi;
 pub use abi::DarwinArm64Abi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod cache;
+/// Publishing the embedded userspace-routing interposer, and its launch contract.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod interpose;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod native;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

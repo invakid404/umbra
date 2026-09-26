@@ -11,3 +11,7 @@ umbra-core = { path = "../umbra-core" }
 
 [dependencies.serde]
 workspace = true
+
+[dev-dependencies]
+# `provider::tests` builds a `RunBinding`, which carries a `RunId`.
+uuid.workspace = true

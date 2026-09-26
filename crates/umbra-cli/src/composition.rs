@@ -148,7 +148,12 @@ pub fn run_spec(
     }
 
     let cwd = BytePath::new(workspace.as_os_str().as_bytes().to_vec())?;
+    let state_root = args
+        .state_dir
+        .clone()
+        .unwrap_or_else(crate::commands::default_state_root);
     Ok(RunSpec {
+        state_root,
         registry,
         launch: RunLaunch::Command(CommandLaunch {
             executable,

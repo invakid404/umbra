@@ -1140,6 +1140,7 @@ fn resolver_anchors_cwd_dirfd_and_refuses_escape_and_stale_descriptors() {
             logical_path: Some(bytes(b"/jail/dir")),
             directory: true,
             flags: OpenFlags::default(),
+            offset: 0,
         },
     );
     assert_eq!(
@@ -1325,6 +1326,7 @@ fn readdir_uses_injected_encoding_and_advances_only_after_commit() {
             logical_path: Some(bytes(b"/")),
             directory: true,
             flags: OpenFlags::default(),
+            offset: 0,
         },
     );
     f.overlay
@@ -1521,6 +1523,7 @@ fn readlink_non_utf8_is_verbatim_and_native_buffer_truncates_without_nul() {
             logical_path: Some(bytes(b"/dir")),
             directory: true,
             flags: OpenFlags::default(),
+            offset: 0,
         },
     );
     for (dir, path, capacity) in [
@@ -1974,6 +1977,7 @@ fn symlink_cwd_and_dirfd_anchors_are_resolved_before_identity_checks() {
             logical_path: Some(bytes(b"/alias")),
             directory: true,
             flags: OpenFlags::default(),
+            offset: 0,
         },
     );
     f.process.cwd = bytes(b"/alias");
@@ -2677,12 +2681,22 @@ fn a_kernel_rejected_rename_reconciles_without_applying_commit_time_whiteouts() 
 #[test]
 fn a_kernel_rejected_write_open_reconciles_and_the_session_keeps_serving_reads() {
     let mut f = Fixture::new(&[(b"file", b"base bytes")]);
-    // `FsOp::Write` itself cannot reach `prepare` in this engine: `resolve`
-    // still refuses descriptor-addressed data operations as beyond-MVP, even
-    // though `dispatch` already classifies them `Materialise`. The resolvable
-    // data-path member of the same class is a write-mode `Open`, exercised
-    // below; the real `FsOp::Write` is covered against the supervisor in
-    // `umbra-supervisor`'s `events.rs` tests, which drive a namespace double.
+    // `FsOp::Write` on *this* descriptor still cannot reach `prepare`, and the
+    // reason changed with userspace routing: `resolve` no longer refuses
+    // descriptor-addressed data operations outright, it refuses a descriptor it
+    // never issued. `f.process` binds no descriptor 3, so the answer is `EBADF`
+    // as a denial -- which `prepare` never sees, because the supervisor answers a
+    // denial before minting an operation.
+    //
+    // The assertion is kept rather than dropped because what it guards is
+    // unchanged: this case is about a *kernel-returned errno* reconciling, and it
+    // needs the data-path operation that reaches `prepare` to be the write-mode
+    // `Open` below, not the `Write`. A routed write that does reach `prepare`
+    // needs a descriptor the engine issued, which needs a routed `Open`, which
+    // needs a backend with no kernel path -- so it is covered end to end rather
+    // than here, by `userspace_run.rs`'s
+    // `a_routed_run_creates_writes_reopens_reads_and_compares_end_to_end` and
+    // `a_routed_transfer_past_the_backend_bound_is_short_rather_than_fatal`.
     assert_eq!(
         f.overlay
             .resolve(
@@ -2693,9 +2707,8 @@ fn a_kernel_rejected_write_open_reconciles_and_the_session_keeps_serving_reads()
                     offset: None,
                 },
             )
-            .unwrap_err()
-            .kind,
-        ErrorKind::UnsupportedCapability
+            .unwrap(),
+        ResolvedAction::Deny(Errno(9))
     );
     let prepared = f.prepare(&open(
         b"file",
@@ -7721,4 +7734,232 @@ fn no_operation_id_carries_two_prepare_records() {
         "every Prepare in the log must carry a distinct operation ID; a duplicate \
          would be silently overwritten by apply_recovery's insert"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The capability path from a storage backend's per-run probe to this engine's
+// live predicates.
+//
+// Round-2 scope review (N-S2) named this as the one consequence of the
+// `Proxy`-capability fix that changes behaviour on a backend outside the routing
+// slice, and observed it had no targeted test -- the `Proxy`'s own unit tests
+// cover the adoption, and a green `local` matrix is evidence that nothing broke,
+// not evidence of which branch is now taken. This pins the branch.
+// ---------------------------------------------------------------------------
+
+/// Where the workspace's provider executables are.
+///
+/// A test binary lives at `<target>/<profile>/deps/<name>-<hash>`, so its
+/// grandparent holds the built provider binaries.
+fn provider_binaries() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("UMBRA_BIN_DIR") {
+        return PathBuf::from(explicit);
+    }
+    let test = std::env::current_exe().expect("this test binary's own path");
+    test.parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives under <target>/<profile>/deps")
+        .to_path_buf()
+}
+
+/// A `local` run reached through a real `Proxy` turns on this engine's
+/// parent-identity branch, and only after its per-run probe has qualified.
+///
+/// The whole chain, each link asserted rather than assumed:
+///
+/// 1. `umbra-storage-local`'s **connect-time** answer does not carry
+///    `STORAGE_PARENT_IDENTITY_V1`. It cannot: the name's own contract requires
+///    qualification "against a live store, never from configuration alone", and
+///    before a run is open there is no run to probe.
+/// 2. `open_run` runs that probe and puts the verdict in the **binding**.
+/// 3. The `Proxy` adopts the binding, so `capabilities()` now carries the name.
+///    On master it kept the connect-time answer for the life of the proxy, which
+///    made both backends' probe machinery dead code in production.
+/// 4. `Overlay::parent_identity_backend()` reads `capabilities()` **live** and
+///    follows -- so `identity_at` may now read a materialised shadow parent
+///    rather than falling back to the shadow root.
+///
+/// Through the real provider process and the real IPC, because step 3 is the one
+/// that changed and it exists only there: calling `LocalStorage` directly would
+/// have passed before this change too.
+///
+/// **Steps 1-4 are reachable only where the backing filesystem hands a new
+/// object its parent directory's group, so they are host-dependent and this
+/// says so rather than assuming.** That is BSD semantics -- APFS and HFS+ do
+/// it, and `PARENT_IDENTITY_MUST_QUALIFY_HERE` below is what makes it a hard
+/// assertion on macOS. Linux does not: absent a setgid parent the kernel gives
+/// a child the *process* gid, so `umbra-storage-local`'s probe measures `false`
+/// by that rule alone -- its own `capabilities()` says so at `lib.rs:640-642`.
+/// There the positive half skips with a message. It is a live probe and never a
+/// `cfg`, because the capability's contract forbids qualifying "from
+/// configuration alone" and a `local` store may sit on a network mount whose
+/// server assigns child identity on either OS.
+///
+/// The **degraded** half below -- a backend advertising nothing leaves the
+/// branch off -- is platform-independent and runs unconditionally, before
+/// anything that can skip. It is what keeps a passing run meaningful where the
+/// positive half cannot execute.
+#[test]
+fn a_local_run_through_a_proxy_turns_on_the_parent_identity_branch() {
+    // First, and on every host: the degraded mode is the no-op both predicates
+    // document. This needs no provider and no probe, so it is deliberately
+    // ahead of both early returns -- otherwise a Linux run, or a run whose
+    // provider binary is not built, would assert nothing at all.
+    let silent = Overlay::new(Box::new(SilentCapabilities), Box::new(unbound_journal()));
+    assert!(!silent.parent_identity_backend());
+    assert!(!silent.ownership_fidelity());
+
+    let executable = provider_binaries().join("umbra-storage-local");
+    if !executable.is_file() {
+        // `cargo test --workspace --all-targets` builds it; a narrower
+        // invocation may not. Skipping is honest; asserting would fail for the
+        // wrong reason.
+        eprintln!(
+            "SKIP: {} is not built (build the workspace binaries, or set UMBRA_BIN_DIR)",
+            executable.display()
+        );
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let root = BytePath::new(store.path().as_os_str().as_bytes().to_vec()).unwrap();
+    let descriptor = umbra_core::provider::ProviderDescriptor {
+        id: "local".to_owned(),
+        role: "storage".to_owned(),
+        protocol_version: umbra_core::provider::PROTOCOL_VERSION,
+        executable: BytePath::new(executable.as_os_str().as_bytes().to_vec()).unwrap(),
+        capabilities: Default::default(),
+        options: umbra_core::provider::encode(&root).unwrap(),
+    };
+    let mut storage = umbra_storage::provider::Proxy::connect(&descriptor, 5_000)
+        .expect("the local storage provider starts");
+
+    // 1. Nothing is qualified before a run exists.
+    assert!(
+        !storage
+            .capabilities()
+            .features
+            .contains(capabilities::STORAGE_PARENT_IDENTITY_V1),
+        "the connect-time answer must not carry a name no probe has qualified"
+    );
+
+    // 2 and 3. The probe runs inside `open_run` and its verdict reaches the proxy.
+    let run_id = RunId(Uuid::new_v4());
+    let binding = storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::CreateNew,
+            immutable_base: ImmutableBaseContract {
+                identity: "parent-identity-branch".into(),
+                fingerprint: vec![7],
+            },
+            policy: StoragePolicy {
+                read_only: false,
+                require_strict_remote_persistence: false,
+                require_kernel_shadow: false,
+                format_version: 1,
+            },
+        })
+        .expect("open a fresh local run");
+    let qualified = binding
+        .capabilities
+        .features
+        .contains(capabilities::STORAGE_PARENT_IDENTITY_V1);
+    assert!(
+        qualified || !PARENT_IDENTITY_MUST_QUALIFY_HERE,
+        "this host's local store did not qualify parent identity. On macOS the \
+         backing filesystem is expected to hand a new object its parent's group \
+         (BSD semantics; APFS and HFS+ both do), so this is a regression in the \
+         probe or a store on an unusual filesystem -- not a host difference to \
+         skip over: {:?}",
+        binding.capabilities.features
+    );
+    if !qualified {
+        // Reached on Linux, and on any host whose store sits where the kernel
+        // or server assigns child identity instead. Not a failure and not a
+        // silent pass: steps 3 and 4 below have nothing to observe, because the
+        // name the proxy would adopt was never earned.
+        eprintln!(
+            "SKIP: this filesystem does not hand a child its parent's group, so the \
+             parent-identity branch cannot be reached here"
+        );
+        return;
+    }
+    assert!(
+        storage
+            .capabilities()
+            .features
+            .contains(capabilities::STORAGE_PARENT_IDENTITY_V1),
+        "the proxy did not adopt the opened run's answer"
+    );
+
+    // 4. And this engine follows it, live.
+    let overlay = Overlay::new(Box::new(storage), Box::new(unbound_journal()));
+    assert!(
+        overlay.parent_identity_backend(),
+        "the overlay must read the backend's current answer, not a cached one"
+    );
+}
+
+/// Whether a store on *this* host must qualify parent identity for the positive
+/// half above to be a hard assertion rather than a skip.
+///
+/// A `cfg` decides only whether the branch is **expected to be reachable**; it
+/// never decides the capability, which `umbra-storage-local` measures per run
+/// against the live store. macOS is `true` because APFS and HFS+ give a new
+/// object its parent directory's gid. Linux is `false` because absent a setgid
+/// parent the kernel gives it the process gid instead.
+const PARENT_IDENTITY_MUST_QUALIFY_HERE: bool = cfg!(target_os = "macos");
+
+/// A journal for an overlay that is never bound: both predicates above read
+/// only `self.storage`, so nothing here is ever called.
+fn unbound_journal() -> MemoryJournal {
+    MemoryJournal {
+        log: Arc::new(Mutex::new(Log::default())),
+        run: RunId(Uuid::nil()),
+        epoch: LeaseEpoch(1),
+    }
+}
+
+/// A backend that advertises no features at all, for the degraded-mode half of
+/// the case above.
+struct SilentCapabilities;
+impl Storage for SilentCapabilities {
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities {
+            features: Default::default(),
+            durability: Durability::None,
+            strict_remote_persistence: false,
+            fencing: Fencing::ReadOnly,
+            kernel_shadow: false,
+            complete_emulation: false,
+            hard_links: false,
+            logical_symlinks: false,
+            xattrs: false,
+            atomic_replace: false,
+            atomic_swap: false,
+            max_io_bytes: 0,
+            max_directory_entries: 0,
+        }
+    }
+    fn open_run(&mut self, _: &OpenRunRequest) -> Result<RunBinding> {
+        unreachable!("this double only answers capabilities")
+    }
+    fn acquire_writer(&mut self, _: &AcquireWriterRequest) -> Result<WriterLease> {
+        unreachable!()
+    }
+    fn renew_writer(&mut self, _: &WriterLease) -> Result<WriterLease> {
+        unreachable!()
+    }
+    fn release_writer(&mut self, _: &WriterLease) -> Result<()> {
+        unreachable!()
+    }
+    fn execute(&mut self, _: &StorageRequest) -> Result<StorageResponse> {
+        unreachable!()
+    }
+    fn flush(&mut self, _: &FlushRequest) -> Result<DurabilityReceipt> {
+        unreachable!()
+    }
+    fn close_run(&mut self) -> Result<()> {
+        unreachable!()
+    }
 }

@@ -132,3 +132,54 @@ must reject that capability.
    Test real service durability, disconnects, and restart recovery. State whether
    the backend qualifies for strict remote persistence and record the tested
    service/deployment assumptions; local tests cannot establish NFS durability.
+
+## Who the writer is
+
+`RunBinding::admitted_writer` reports the writer identity a backend has
+**already** admitted, when it admits at `open_run` rather than at
+`acquire_writer`. Backends differ here for a real reason.
+
+`local`, `nfs` and `tar` take writer authority in `acquire_writer` and record
+whatever identity the caller names, so they answer `None`. `nfs-userspace`
+admits during `open_run`, before it publishes any binding at all, because
+one-session-one-Umbra is what makes a binding safe to hand out -- and admission
+writes the writer identity into a durable marker on the server. By the time a
+caller could name a writer, the marker already names one, and asking that
+backend to acquire under a different name is asking it to report an admission
+that writer never obtained.
+
+So a caller receiving `Some` must acquire under exactly that identity. The field
+is `#[serde(default)]`, so a provider that does not send it decodes as `None` --
+which is also the right answer for every backend that admits late.
+
+## Proxy capabilities move when a run opens
+
+**A proxy advertises the backend's answer for whatever the backend currently has
+open**: the connect-time answer while no run is open, and the run binding's own
+capabilities while one is. `RunBinding::capabilities` is defined as the backend's
+answer for that run, so adopting it is the same value the backend would give if
+asked again, taken from a reply the caller already has.
+
+It has to move. The local bounds checks in `read_at`/`write_at` read
+`capabilities().max_io_bytes`, and a backend whose finite I/O limits exist only
+for an open run -- `nfs-userspace` advertises `max_io_bytes: 0` before one,
+deliberately, because without a bound transport there is no bound it could
+honour -- would otherwise have every byte of I/O refused with a bounds error
+naming a limit the run did not have.
+
+**The `features` set moves with it, and that is a behaviour change on two shared
+backends, stated here rather than left to be found.** `umbra-storage-local` and
+`umbra-storage-nfs` set their ownership and parent-identity flags immediately
+before building the binding, precisely so `capabilities()` reports them -- so an
+open run over either now advertises names the connect-time answer did not, and
+`umbra-overlay` reads `capabilities()` live for its ownership-carry decision.
+That is the intended reading of those names: each one's doc requires
+qualification "against a live store, never from configuration alone", and a run
+is what supplies the live store. The stale connect-time cache was the defect.
+
+A backend must therefore make its binding's capabilities *be* its own answer for
+that run. `nfs-userspace` reads them back through the trait after installing the
+run's surface, for exactly this reason: its binding used to come from a narrower
+expression that did not include its probe-gated names, so a proxy fronting it
+advertised strictly less than it did for the life of the run.
+`Advertised::adopt`/`restore` and their unit tests hold the rule in one place.

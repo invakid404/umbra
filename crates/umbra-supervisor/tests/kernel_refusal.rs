@@ -19,13 +19,28 @@
 //! *run* test. The journal is in-memory and cannot fail, so nothing here says
 //! anything about durability ordering — see `support/journal.rs`.
 //!
-//! Only write-mode `Open` and `Fchownat` are reachable end to end today, which
-//! is why every test below is driven by one of the two: `Overlay::resolve`
-//! refuses `Chmod`, `Write` and `Link` outright, answers `Emulate` for
-//! `Symlink`, `Mkdir` and `Unlink` — which the supervisor's entry path rejects
-//! as an unsupported capability before any exit can be driven — and `Rename`
+//! Write-mode `Open` and `Fchownat` are the operands with a *kernel-refusable*
+//! exit, which is why every abort test below is driven by one of the two:
+//! `Overlay::resolve` refuses `Chmod`, `Write` and `Link` outright, and `Rename`
 //! resolves to a two-path `Rewrite` the supervisor's single-path rewrite surface
 //! refuses.
+//!
+//! **`Symlink`, `Mkdir` and `Unlink` are no longer among them.** They resolve to
+//! `Emulate`, and until the routing slice wired that action the supervisor's
+//! entry path rejected it as an unsupported capability — *after* `prepare` had
+//! already applied the namespace change, so the shadow was mutated and the run
+//! then died. Wiring `Emulate` for routed `Open` necessarily wired it for these
+//! too, and the result is the correct one rather than a widening that needs
+//! arguing: `prepare` performed the operation in the namespace, so reporting
+//! success to the tracee is reporting what happened.
+//! `an_emulated_mkdir_is_answered_to_the_tracee_rather_than_killing_the_run` and
+//! `an_emulated_unlink_is_answered_to_the_tracee_rather_than_killing_the_run` pin
+//! it, one operand each: an emulated entry holds the operation slot until the
+//! platform emits the matching exit, which a real backend does off the resumed PC
+//! and this harness does not synthesise, so two of them in one test would be
+//! refused for a reason neither case is about. They still have no kernel call and
+//! therefore no kernel refusal, so they remain undrivable *as aborts* here, which
+//! is the property this file is about.
 //!
 //! `Unlink` is the one of those whose engine-side rule has since changed
 //! ([#66](https://github.com/invakid404/umbra/issues/66)): its `prepare` no
@@ -402,10 +417,11 @@ fn a_write_to_a_read_only_base_file_copies_up_through_a_real_overlay_with_base_o
 // called by name, so a syscall has to resolve to a `Rewrite` that materialises
 // an ancestor. A creating write `open` beneath a base-only directory does.
 //
-// `Mkdir` would be the more direct operand and is **not** reachable here, for
-// the reason this file's header already gives: `Overlay::resolve` answers
-// `Emulate` for it and `syscall_entry` rejects an `Emulate` as an unsupported
-// capability before any exit can be driven.
+// `Mkdir` would be the more direct operand and is still not usable *here*, but
+// no longer for the reason this file once gave: `syscall_entry` now answers an
+// `Emulate` instead of rejecting it (see the test below). It is unusable because
+// an emulated operation runs no kernel call, so there is no kernel refusal to
+// drive an abort with -- which is what this file tests.
 #[test]
 fn a_creating_open_under_a_base_directory_materialises_the_ancestor_with_its_ownership() {
     let mut h = Harness::new(&[(b"d/f", b"base bytes")]);
@@ -428,4 +444,78 @@ fn a_creating_open_under_a_base_directory_materialises_the_ancestor_with_its_own
     );
     assert!(h.shadow_root.join("d/made").is_file());
     assert!(!h.supervisor.is_poisoned());
+}
+
+/// `Mkdir` is answered to the tracee, and the namespace change `prepare` made is
+/// what it reports.
+///
+/// **The regression this pins is a crash, not a refusal.** Before the routing
+/// slice, `syscall_entry` matched `ResolvedAction::Emulate(_)` and returned
+/// `UnsupportedCapability` -- but only after `prepare` had already created the
+/// directory in the shadow. So the run died with the namespace already mutated,
+/// which is the worst of the three possible behaviours. CodeRabbit found the
+/// change on PR #116 (item 6) and asked whether it was intended; it is, and this
+/// is the test that says so.
+///
+/// Driven on a plain `local`-backed run with no routing whatsoever, because that
+/// is the configuration the widening reaches and the one nothing else covered.
+#[test]
+fn an_emulated_mkdir_is_answered_to_the_tracee_rather_than_killing_the_run() {
+    let mut h = Harness::new(&[]);
+    let thread = h.thread();
+    let mark = h.mark();
+
+    h.entry(FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"made"),
+        mode: 0o755,
+    })
+    .expect("an emulated mkdir must be answered, not refused");
+
+    assert_eq!(
+        h.order_since(mark),
+        vec!["emulate", "set_registers", "resume"],
+        "the tracee must be handed an emulated result and resumed"
+    );
+    assert!(
+        h.shadow_root.join("made").is_dir(),
+        "prepare must have made the directory the emulated success claims"
+    );
+    assert_eq!(
+        h.resumes_since(mark),
+        vec![ResumeCommand {
+            thread,
+            mode: ResumeMode::Syscall,
+            signal: None,
+        }]
+    );
+    // The half that used to be false: the run is still alive afterwards.
+    assert!(!h.supervisor.is_poisoned());
+    assert_eq!(h.supervisor.state().lifecycle, RunLifecycle::Running);
+}
+
+/// The same for `Unlink`, in its own test because an emulated entry holds the
+/// operation slot until the platform emits the matching exit -- which a real
+/// backend does off the resumed PC and this harness does not synthesise. Two
+/// emulated entries in one test are refused for that reason and not for
+/// anything this case is about.
+#[test]
+fn an_emulated_unlink_is_answered_to_the_tracee_rather_than_killing_the_run() {
+    let mut h = Harness::new(&[(b"gone", b"base bytes")]);
+    let mark = h.mark();
+
+    h.entry(FsOp::Unlink {
+        dir: DirRef::Cwd,
+        path: bytes(b"gone"),
+        directory: false,
+    })
+    .expect("an emulated unlink must be answered, not refused");
+
+    assert_eq!(
+        h.order_since(mark),
+        vec!["emulate", "set_registers", "resume"],
+        "the tracee must be handed an emulated result and resumed"
+    );
+    assert!(!h.supervisor.is_poisoned());
+    assert_eq!(h.supervisor.state().lifecycle, RunLifecycle::Running);
 }

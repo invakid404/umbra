@@ -68,6 +68,115 @@ The M1 mechanisms named in the tracker spec are all present:
 7. **SIGHUP suppression** on newly attached children.
 8. **Embedded watchdog**: an `mpsc`-cancellable worker thread terminates
    all held Mach tasks on deadline (`native.rs::Watchdog`).
+9. **Userspace-routing interposer**: `interpose/umbra_interpose.c`, compiled
+   universal (arm64 + arm64e) by `build.rs`, embedded in this binary and
+   published into the twin cache at launch. `LaunchPolicy::interpose` loads it
+   into the target image through `DYLD_INSERT_LIBRARIES`;
+   `LaunchPolicy::descriptor_limit` fences `RLIMIT_NOFILE` soft *and* hard before
+   the exec. The library ships **inert** and is switched on by
+   `Session::arm_interposer`, which writes its `__DATA,__umbra_arm` control block
+   after `install_image` has breakpointed its traps — it has no constructor and
+   reads no environment. See **What interception does not cover** below.
+10. **Inherited arming across `fork`**: a forked child of a routed tracee starts
+    with the interposer already mapped *and* already armed, because `fork` copies
+    `__DATA,__umbra_arm` with the rest of the address space. So `install` finds
+    the load address in the child's own image list instead of running it to
+    `main` — a forked child is past `main` and never reaches it again — and
+    skips `arm_interposer`, whose zero-block precondition stays strict rather
+    than being relaxed for this path. Both halves are required and the first is
+    the safety-critical one: running the child to an entry point it cannot reach
+    resumed it with nothing breakpointed, so it executed **unmediated** until its
+    first routed call became an `svc` the kernel does not know and took `SIGSYS`.
+    A child forked *before* its parent armed carries zeroes and is armed here
+    like any other image. See `Session::interposer_armed` and
+    `userspace_run.rs::a_forked_child_of_a_routed_tracee_is_mediated_and_the_run_finishes`.
+    A routed descriptor survives the fork as well, offsets included, because the
+    inherited-descriptor rule below is not limited to kernel descriptors —
+    measured, a child's write through its parent's routed descriptor continues
+    the parent's write in the store
+    (`a_routed_descriptor_survives_a_fork_and_the_child_s_write_reaches_the_store`).
+11. **Transient signals at a return gate**: a stop whose PC equals a pending
+    return gate is a syscall return only when a breakpoint trap produced it, and
+    a non-`SIGTRAP` stop there is either noise or the `SIGSYS` of an
+    unintercepted routing trap. The two are separated by one list,
+    `TRANSIENT_SIGNALS`, shared with the general stop path: `SIGCHLD` and the
+    other attach/notification signals are continued over without being
+    forwarded, and everything else — `SIGSYS` first — fails the run loudly.
+    Absorbing `SIGSYS` here is the exact defect the gate exists to refuse;
+    failing on `SIGCHLD` took `fork`/`wait4` runs out over an ordinary event.
+
+## What interception does not cover
+
+Stated here rather than implied, because two of these are architectural and a
+future reader should not have to rediscover them.
+
+**A syscall the tracee issues from memory it wrote itself is not intercepted.**
+`install_image` scans the main image's executable sections and, for a routed run,
+the interposer's; an `svc #0x80` at neither site has no address to breakpoint.
+Measured on this host: a process allocates memory, writes `movz x16,#20; svc
+#0x80; ret` into it, flips the page to `r-x` with no entitlement, and executes
+it — the syscall runs unmediated. This is inherent to intercepting syscalls at
+*known* code sites and is identical for library interposition and for
+stub-breakpoint tracing; injection does not help, because injected code has the
+same property.
+
+What this bounds is the *claim*: "filesystem operations issued through libc, or
+through the umbra interposer, are mediated" — not "all syscalls are mediated".
+What fail-closes host writes is the **kernel-enforced Seatbelt profile** this
+backend installs before the target's first instruction, never the interception.
+Closing the gap needs kernel-assisted whole-process syscall filtering, which is
+outside the accepted setup (Command Line Tools plus developer debugging
+authorization, and nothing else).
+
+**Writable shared file mappings are unreachable in principle.** A store to a
+resident page is not a call of any kind, so neither a breakpoint nor an
+interposed function observes it. This needs a pager, and is tracked separately
+in `docs/design/syscall-matrix.md`.
+
+**Library initializers run before the syscall sites are planted, on a routed
+launch, and the interposer is inert until they have.** Finding the interposer's
+load address requires letting dyld map it, which means running the tracee to its
+`LC_MAIN` entry point — see `Session::wait_for_image` for the two ways of
+watching dyld that were tried and do not work. So the window exists, and what
+makes it survivable is the arming order: `Session::arm_interposer` writes the
+library's `__DATA,__umbra_arm` control block *after* `install_image` has
+breakpointed its traps, and before that write every interposed call passes
+straight through to libc.
+
+**That window is strictly larger than a rewrite-backed run's, and saying they
+are the same was wrong.** A rewrite-backed run plants its breakpoints at the
+dyld image-notifier stop, which *precedes* every initializer — so an
+initializer's `open` is intercepted and rewritten into the store. A routed run
+cannot: `wait_for_image` has to run the tracee to `LC_MAIN` first, so
+initializers execute with no breakpoints planted and the interposer inert.
+
+What happens in that window, measured with the same program on both backends —
+a constructor doing `open(<workspace>/from-ctor.txt, O_CREAT|O_WRONLY)`:
+
+| | routed | `local` |
+| --- | --- | --- |
+| result | exit **41** (`EPERM`) | exit **0** |
+| file | nowhere — the Seatbelt profile refused the write | in the store at `<run>/root/<abs path>` |
+
+So a program that writes from an initializer works on every other backend and
+fails on a routed run. It fails *closed* — reads in the window reach the host
+unrouted, writes are refused by the kernel-enforced profile — but it is a real
+behavioural difference, not an equivalence.
+
+This is not a preference. An earlier version let the library arm itself from its
+own constructor, which put it live and un-breakpointed for that whole window:
+measured, a program whose `__attribute__((constructor))` opened a file turned
+that `open` into an `svc` the kernel does not know, took `SIGSYS`, and killed the
+launch before `main` with an undecoded debugger stop-reply for a diagnosis and a
+recovery-required run behind it. Any dynamically linked program with a
+file-touching initializer, an ObjC `+load`, or its own inserted dylib was
+affected. Do not move the arming earlier, and do not give the library a way to
+arm itself: umbra owns that instant because only umbra knows when the traps
+exist.
+
+Unarmed is therefore a *passthrough*, not a refusal, which is why `install`
+fails the launch outright when it cannot find or arm the library rather than
+continuing with an inert one.
 
 ### Dirfd-relative filesystem calls
 

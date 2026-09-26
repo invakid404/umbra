@@ -218,6 +218,50 @@ request/response variants. `set_readlink_buffer` is available through IPC as wel
 the three run-lifecycle calls: `RenewWriter`, `FinishRun` and `FailRun`. Provider factories bind the engine and install any ABI encoder
 before entering `serve_provider`; trait objects are not serialized over IPC.
 
+## Userspace-routed operations
+
+A storage backend that exposes no kernel-visible path -- `RunBinding.root` with
+`physical_path: None` -- cannot be handed a rewrite target, because `physical()`
+has nothing to build one from. For such a run the engine answers the tracee's
+descriptor operations itself, through `Storage`, and the switch is the binding
+rather than a setting: `Overlay::routed` reads `physical_path.is_none()`.
+
+Four `FsOp`s take that path. `Open` resolves to `Emulate` carrying the descriptor
+number, `Read` fetches its bytes during `resolve` and returns them as
+`memory_writes`, `Write` plans during `resolve` and performs the write inside
+`prepare` -- after the `Prepare` record is appended *and flushed*, and after
+`copy_up`, so a write to a base-only object never mutates the base -- and `Close`
+answers zero. `dispatch` already classified all four correctly, so their policy
+did not change: only `Write` is a journaled mutation.
+
+Three things a routed operation needs that an ABI-independent `FsOp` cannot
+carry travel together in `RoutedRequest`, bound with `set_routed_request` and
+consumed by `resolve` exactly like `set_readlink_buffer`: the descriptor number
+to answer an `Open` with, the tracee buffer a `Read` fills, and the bytes a
+`Write` persists. The caller allocates the descriptor because it owns
+`ProcessContext::fds`; it reads the resulting binding back with
+`routed_descriptor` after `prepare` and inserts it only on observed success,
+because a creating open has no object identity until `prepare` makes one.
+
+Refusals rather than wrong answers, in every case the engine cannot represent:
+
+- A descriptor absent from `ProcessContext::fds`, or one opened for the other
+  direction, answers `Deny(EBADF)` -- a denial the caller returns to the tracee,
+  not an error that stops the run.
+- A routed `Open` with `O_APPEND` is refused: honouring it needs an atomic
+  append-at-end storage operation, and stat-then-write is right for one writer
+  and silently wrong for two.
+- A routed `Open` of a directory is refused: directory reads are not routed, so
+  the descriptor would answer nothing.
+- A descriptor is bound to a logical *path* and re-resolved on every operation,
+  so `unlink` or `rename` of an open file is not representable. This is the
+  handle-based-`Storage` gap `docs/design/syscall-matrix.md` records.
+
+`umbra-overlay` carries two cargo features, `mutation-probe-read` and
+`mutation-probe-write`, which break one routing direction each so a test can
+prove an end-to-end fixture depends on it. They are compile-time only: no
+product build contains either branch. Never enable one outside a mutation test.
+
 ## Journal and whiteouts
 
 Each mutation appends and flushes a typed Prepare intent before effects, then an
@@ -577,16 +621,18 @@ refusal at all yet. `FsOp::Unlink` — the whole `Whiteout` half — and also
 `observe_result` refuses an outcome that differs from the emulated one; a
 cross-path `rename` resolves to a two-path `Rewrite` that, as `apply_rewrite`
 stands in `umbra-supervisor` today, is refused before the tracee ever reaches a
-syscall exit — a fact owned by that crate, not this one. The reachable surface
-today is a write-mode `Open` and `FsOp::Fchownat`. The behaviour is keyed on the
+syscall exit — a fact owned by that crate, not this one. The surface that can reach a *kernel
+refusal* is a write-mode `Open` and `FsOp::Fchownat`; the emulated operations are
+executed by the supervisor now rather than refused, but an emulation runs no
+kernel call and so has no kernel verdict to reconcile. The behaviour is keyed on the
 dispatch class, not on a variant list, so the rest of the class inherits it as
 those paths are wired — with two caveats to settle first. `Unlink`'s `prepare`
 used to *destroy* the shadow object outright, which made it the one
 `Whiteout`-class transaction carrying an effect outside `commit`: any abort of one
 arrived after shadow-only data was already discarded. An abort was the better case
 and not the reachable one, which is worth stating plainly because it makes the fix
-larger rather than smaller. The supervisor's entry path refuses an `Emulate` only
-*after* `prepare` has run, so every intercepted `unlink(2)` reached `prepare` and
+larger rather than smaller. The supervisor's entry path used to refuse an `Emulate` only
+*after* `prepare` had run, so every intercepted `unlink(2)` reached `prepare` and
 abandoned the run into recovery — `pending` still set, a dangling `Prepare` record,
 and no `Abort` record to describe any of it — and every one whose target had been
 materialised in the shadow had it destroyed on the way. Both destructive steps sat
@@ -640,10 +686,10 @@ which is the permissive failure only a test asserting a *refusal* can catch.
 Only one implementation of the merged view knows all three rules, and it is the
 one `ReadDir` answers the tracee from. The gate refuses with
 `Err(ErrorKind::Denied)`, joining the sibling POSIX refusals in the same function,
-rather than `Emulate(Failure(ENOTEMPTY))`: the supervisor refuses an `Emulate`
-only *after* `prepare` has journaled, so a failure-shaped emulation would leave a
-dangling `Prepare` for an rmdir that never happened, and the engine has no view of
-the tracee ABI, where `ENOTEMPTY` is 39 on Linux and 66 on macOS/BSD. Upgrading it
+rather than `Emulate(Failure(ENOTEMPTY))`: an `Emulate` is produced by `resolve`
+and executed after `prepare` has journaled, so a failure-shaped emulation would
+leave a dangling `Prepare` for an rmdir that never happened, and the engine has no
+view of the tracee ABI, where `ENOTEMPTY` is 39 on Linux and 66 on macOS/BSD. Upgrading it
 to `ResolvedAction::Deny(Errno::ENOTEMPTY)` waits on an ABI-owned errno channel;
 `events.rs` already handles `Deny` generically, before an `OperationId` is minted
 and with no journal record. The gate also pays a full enumeration to answer a

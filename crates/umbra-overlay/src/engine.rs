@@ -366,6 +366,15 @@ struct Plan {
     destination: Option<StoragePath>,
     mutation: bool,
     directory_next: Option<(DirectoryKey, Vec<DirectoryEntry>)>,
+    /// The absolute offset and bytes a routed `FsOp::Write` must persist.
+    ///
+    /// Carried on the plan rather than left on the engine because `prepare` is
+    /// what performs the write, and it must perform *the* write `resolve`
+    /// planned: the offset is the descriptor's position at resolve time and the
+    /// byte count is what the emulated result already promised the tracee. A
+    /// second field on `Overlay` would be a channel `prepare` could read out of
+    /// step with the plan it is validating against.
+    routed_write: Option<(u64, Vec<u8>)>,
 }
 /// What `create_symlink` created, for a caller that has to record an undo.
 ///
@@ -620,6 +629,18 @@ pub struct Overlay {
     used_operations: BTreeSet<OperationId>,
     readlink_buffer: Option<(u64, u32)>,
     stat_encoder: Option<Box<dyn StatEncoder>>,
+    /// The routing binding for the next resolution. See [`RoutedRequest`].
+    routed_request: Option<RoutedRequest>,
+    /// A routed `Open` that `resolve` planned and `prepare` has yet to complete.
+    ///
+    /// Two stages because the object's identity is not knowable at the first one:
+    /// a creating open has no object until `prepare` makes it. `resolve` records
+    /// what it decided, `prepare` reads the materialised object's identity and
+    /// turns this into [`Self::routed_descriptor`]. Both are cleared at the head
+    /// of every `resolve`, so neither can describe an earlier operation.
+    routed_open: Option<(TracedFd, OpenFlags, BytePath)>,
+    /// What the last routed `Open` bound, for the caller's descriptor table.
+    routed_descriptor: Option<(TracedFd, FdState)>,
     /// Set by `whiteouted()` whenever a marker hid a component during the current
     /// `resolve`. Reset at the top of every `resolve`, read only inside that same
     /// call, through `hidden_or`. It is the difference between "the namespace
@@ -655,6 +676,9 @@ impl Overlay {
             used_operations: BTreeSet::new(),
             readlink_buffer: None,
             stat_encoder: None,
+            routed_request: None,
+            routed_open: None,
+            routed_descriptor: None,
             whiteout_hit: false,
         }
     }
@@ -755,7 +779,28 @@ impl Overlay {
     /// supervisor and every resolve error already ends the run, so the `!mutation`
     /// guard is what confines this to the non-mutating path.
     fn hidden_or(&self, e: UmbraError, mutation: bool) -> Result<ResolvedAction> {
-        if !mutation && e.kind == ErrorKind::NotFound && self.whiteout_hit {
+        if e.kind != ErrorKind::NotFound {
+            return Err(e);
+        }
+        if !mutation && self.whiteout_hit {
+            return Ok(ResolvedAction::Deny(Errno::ENOENT));
+        }
+        // A routed run answers its own `ENOENT`, and this is the *only* place a
+        // routed name-resolution failure becomes one.
+        //
+        // The caller cannot fall back to resuming the tracee's own syscall the
+        // way a rewrite-backed run does: for a routed operation that syscall is
+        // umbra's reserved trap, which Darwin's `nosys` answers `ENOSYS` while
+        // posting `SIGSYS`. So the refusal has to be produced here.
+        //
+        // **Here, and not by matching `NotFound` in the caller**, which is the
+        // narrowing this is. An earlier shape caught any `NotFound` a routed
+        // `resolve` returned, which also caught one raised by `Storage` for an
+        // object the journal says it committed -- a namespace/store disagreement
+        // reported to the program as an ordinary missing file. Those still
+        // propagate and still stop the run; only a name that does not resolve
+        // reaches this line.
+        if self.routed()? {
             return Ok(ResolvedAction::Deny(Errno::ENOENT));
         }
         Err(e)
@@ -1657,6 +1702,335 @@ impl Overlay {
         self.carry_ownership(path, (stat.uid, stat.gid))?;
         Ok(())
     }
+    /// Whether this run's operations have to be *routed* rather than rewritten.
+    ///
+    /// Evidence, not configuration: the run binding's own `physical_path`. A
+    /// backend that has one gets the rewrite path it always got; a backend that
+    /// has none could not be handed a rewrite target at all -- `physical()`
+    /// answers `UnsupportedCapability` for exactly this case -- so there is no
+    /// third possibility to choose between.
+    ///
+    /// Read from `root`, the tracee-visible anchor, because that is the anchor
+    /// every operation reaching here resolves against. `control` is umbra's own
+    /// and no tracee operation names it.
+    fn routed(&self) -> Result<bool> {
+        Ok(self.config()?.binding.root.physical_path.is_none())
+    }
+
+    /// The largest single transfer this run's storage will accept.
+    ///
+    /// **Not [`MAX_IO_BYTES`].** That is the *contract* ceiling; a backend
+    /// advertises its own, `Storage::read_at`/`write_at` enforce it locally, and
+    /// exceeding it is an `Err` rather than a short answer. `LibnfsRawTransport`
+    /// advertises 1 048 572, so clamping to the contract ceiling produced a
+    /// request the backend refused and aborted the run -- measured, a single
+    /// 2 MiB `write` ended the run with "I/O exceeds size or offset bounds".
+    ///
+    /// Clamping here instead turns every over-large transfer into a short one,
+    /// which is what POSIX says `read` and `write` may answer and what the
+    /// program is already required to handle.
+    fn transfer_bound(&self) -> Result<u64> {
+        let bound = u64::from(self.storage.capabilities().max_io_bytes).min(MAX_IO_BYTES as u64);
+        if bound == 0 {
+            // An open run always advertises one. Zero means the capabilities
+            // being read are an unbound provider's, which is a wiring fault
+            // rather than a transfer this engine should silently answer as EOF.
+            return Err(error(
+                ErrorKind::InvalidState,
+                "storage advertises no transfer bound for this run",
+            ));
+        }
+        Ok(bound)
+    }
+
+    /// The descriptor this operation names, and the logical path it is bound to.
+    ///
+    /// A descriptor absent from `ProcessContext::fds` is not umbra's: the
+    /// interposer routes only numbers at or above the fence umbra put on the
+    /// kernel's own allocation range, so a routed operation naming an unbound
+    /// number is a stale or forged descriptor either way. It gets `EBADF`, as a
+    /// [`ResolvedAction::Deny`] rather than an error, because that is precisely
+    /// what POSIX says and the run has no reason to stop over it.
+    ///
+    /// `Errno(9)` is spelled out. `Errno::ENOENT` is the only named constant in
+    /// the contract because it is the only one this engine needed before, and the
+    /// comment in the `rmdir` arm explains why raw numbers are otherwise avoided:
+    /// they are ABI-specific, and `ENOTEMPTY` is 39 on Linux and 66 on
+    /// macOS/BSD. `EBADF` is **9 on both**, which is what makes it safe to name
+    /// here. Do not extend this pattern to an errno that is not.
+    fn routed_binding(
+        &mut self,
+        context: &ProcessContext,
+        fd: TracedFd,
+    ) -> Result<std::result::Result<(FdState, StoragePath), ResolvedAction>> {
+        let Some(state) = context.fds.get(&fd).cloned() else {
+            return Ok(Err(ResolvedAction::Deny(Errno(9))));
+        };
+        let Some(logical) = state.logical_path.clone() else {
+            return Ok(Err(ResolvedAction::Deny(Errno(9))));
+        };
+        // Re-resolved every time rather than cached as a `StoragePath`, and this
+        // is where a descriptor bound to a *name* rather than a handle shows: an
+        // operation on a descriptor whose name no longer resolves is refused,
+        // where POSIX would have kept serving the object. Fixing that needs
+        // handle-based `Storage` operations the surface does not have -- see
+        // `docs/design/syscall-matrix.md`.
+        //
+        // The refusal is `ENOENT` and it is produced *here*, for the same reason
+        // the `EBADF` above is: the caller has no way to tell a name that stopped
+        // resolving from a store that lost a committed object, and only one of
+        // those is the program's problem. A `NotFound` from anywhere else in this
+        // engine still propagates and still stops the run.
+        let path = match self.resolve_path(context, DirRef::Cwd, &logical, false) {
+            Ok(path) => path,
+            Err(e) if e.kind == ErrorKind::NotFound => {
+                return Ok(Err(ResolvedAction::Deny(Errno::ENOENT)))
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(Ok((state, path)))
+    }
+
+    /// Resolve a routed `read`: fetch the bytes now and answer with them.
+    ///
+    /// The read is performed here, during `resolve`, which is correct for a
+    /// non-mutating operation and is the same thing the `ReadLink` arm does: the
+    /// answer *is* the resolution, there is nothing to journal, and the emulated
+    /// result carries the bytes into the tracee's buffer. `Dispatch::ReadThrough`
+    /// already classifies it, so `prepare` records no intent.
+    fn resolve_routed_read(
+        &mut self,
+        context: &ProcessContext,
+        operation: &FsOp,
+        fd: TracedFd,
+        length: u64,
+        offset: Option<u64>,
+        routed: Option<RoutedRequest>,
+    ) -> Result<ResolvedAction> {
+        let (state, path) = match self.routed_binding(context, fd)? {
+            Ok(binding) => binding,
+            Err(denied) => return Ok(denied),
+        };
+        if state.directory {
+            return Ok(ResolvedAction::Deny(Errno(9)));
+        }
+        if !state.flags.read {
+            // Opened write-only. `EBADF` is what POSIX specifies for a read on a
+            // descriptor that was not opened for reading.
+            return Ok(ResolvedAction::Deny(Errno(9)));
+        }
+        // A buffer the caller could not bind is the tracee's own bad pointer, and
+        // the errno it carries is what Darwin answers. It must be a `Deny` rather
+        // than an `Err`: `read(fd, NULL, 4)` is an ordinary program bug and used
+        // to stop the whole run.
+        let buffer = match routed.as_ref().and_then(|routed| routed.read_buffer) {
+            Some(Err(errno)) => return Ok(ResolvedAction::Deny(errno)),
+            Some(Ok(buffer)) => Some(buffer),
+            None => None,
+        };
+        let (stat, shadow) = self.lookup(&path)?;
+        if stat.kind != ObjectKind::File {
+            return Err(error(ErrorKind::InvalidPath, "read target is not a file"));
+        }
+        let offset = offset.unwrap_or(state.offset);
+        // Clamped against the object's own length rather than trusting the
+        // backend to report a short read at EOF: a backend that answered the full
+        // request with zero-filled bytes would otherwise be indistinguishable
+        // from a file that really held zeroes. And against the run's own transfer
+        // bound, so an over-large request is short rather than refused -- see
+        // `transfer_bound`.
+        let remaining = stat.len.saturating_sub(offset);
+        let wanted = length.min(remaining).min(self.transfer_bound()?);
+        let mut bytes = vec![0u8; wanted as usize];
+        let read = if wanted == 0 {
+            0
+        } else if shadow {
+            let request = self.context()?;
+            self.storage.read_at(&request, &path, offset, &mut bytes)?
+        } else {
+            self.base().read_at(&path, offset, &mut bytes)?
+        };
+        bytes.truncate(read);
+        // MUTATION PROBE A -- read routing. Compiled out of every build that does
+        // not ask for it, so no product binary contains this branch.
+        //
+        // It corrupts the *provenance* of the bytes and nothing else: the count
+        // and the mechanism are left exactly as they were, so a test that passes
+        // with it enabled would be a test that never depended on the bytes coming
+        // from the store. The end-to-end toy compares what it read against what
+        // it wrote and rejects the mismatch with its own exit code, and the store
+        // still holds the correct bytes -- which is what stops this probe from
+        // being satisfiable by breaking the write direction instead.
+        #[cfg(feature = "mutation-probe-read")]
+        if let Some(first) = bytes.first_mut() {
+            *first ^= 0xFF;
+        }
+        let memory_writes = match (&buffer, bytes.is_empty()) {
+            // Nothing to copy: end of file, or a zero-length request. Answering
+            // zero needs no buffer, which is why the binding is optional here and
+            // required below.
+            (_, true) => vec![],
+            (Some(buffer), false) => {
+                if bytes.len() > buffer.length as usize {
+                    return Err(error(
+                        ErrorKind::InvalidInput,
+                        "the routed read produced more bytes than its buffer binding covers",
+                    ));
+                }
+                vec![MemoryWrite {
+                    address: buffer.address,
+                    bytes: bytes.clone(),
+                }]
+            }
+            (None, false) => {
+                return Err(unsupported(
+                    "a routed read needs a buffer binding from set_routed_request; typed \
+                     read_at is available for a caller with no tracee to write into",
+                ))
+            }
+        };
+        let action = ResolvedAction::Emulate(EmulatedResult {
+            outcome: OperationOutcome::Success {
+                return_value: bytes.len() as u64,
+            },
+            memory_writes,
+        });
+        self.planned = Some(Plan {
+            action: action.clone(),
+            operation: operation.clone(),
+            path,
+            destination: None,
+            mutation: false,
+            directory_next: None,
+            routed_write: None,
+        });
+        Ok(action)
+    }
+
+    /// Resolve a routed `write`: plan it, and leave the bytes for `prepare`.
+    ///
+    /// Nothing is written here. `Dispatch::Materialise` classifies a write, so it
+    /// is a journaled transaction, and the rule the whole engine is built on is
+    /// that the durable intent lands before the effect. `prepare` appends and
+    /// flushes `JournalIntent::Write` and *then* performs the write, which is the
+    /// same order `copy_up` and `create` already run in.
+    fn resolve_routed_write(
+        &mut self,
+        context: &ProcessContext,
+        operation: &FsOp,
+        fd: TracedFd,
+        length: u64,
+        offset: Option<u64>,
+        routed: Option<RoutedRequest>,
+    ) -> Result<ResolvedAction> {
+        let (state, path) = match self.routed_binding(context, fd)? {
+            Ok(binding) => binding,
+            Err(denied) => return Ok(denied),
+        };
+        if state.directory || !(state.flags.write || state.flags.append) {
+            return Ok(ResolvedAction::Deny(Errno(9)));
+        }
+        // Same rule as the read side: a source buffer the caller could not read is
+        // the tracee's own bad pointer, and `EFAULT` is the answer rather than a
+        // dead run.
+        let mut bytes = match routed.and_then(|routed| routed.write_bytes) {
+            Some(Err(errno)) => return Ok(ResolvedAction::Deny(errno)),
+            Some(Ok(bytes)) => bytes,
+            None => {
+                return Err(unsupported(
+                    "a routed write needs its bytes from set_routed_request; FsOp::Write \
+                     carries only their count",
+                ))
+            }
+        };
+        // The binding must describe *this* operation before anything is clamped:
+        // fewer bytes than the operation names would mean the caller read the
+        // wrong buffer, which is a wiring fault rather than a short write.
+        if bytes.len() as u64 != length {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "the bound write bytes do not match the operation's length",
+            ));
+        }
+        // Then shorten to what this run's storage accepts. A short write is
+        // POSIX-legal and is what the caller is already required to handle; the
+        // alternative, measured, was the backend refusing a 2 MiB request and the
+        // run ending on it. See `transfer_bound`.
+        let bound = self.transfer_bound()?;
+        if bytes.len() as u64 > bound {
+            bytes.truncate(bound as usize);
+        }
+        let (stat, _) = self.lookup(&path)?;
+        if stat.kind != ObjectKind::File {
+            return Err(error(ErrorKind::InvalidPath, "write target is not a file"));
+        }
+        let offset = offset.unwrap_or(state.offset);
+        if offset.checked_add(bytes.len() as u64).is_none() {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "routed write offset overflows",
+            ));
+        }
+        // The whole request or nothing: `prepare` writes in a loop until every
+        // byte has landed, exactly as `copy_up` does, so the count promised here
+        // is the count delivered. A short answer would be POSIX-legal but would
+        // leave the descriptor's position and the tracee's own accounting to
+        // disagree about a write umbra could simply finish.
+        let action = ResolvedAction::Emulate(EmulatedResult {
+            outcome: OperationOutcome::Success {
+                return_value: bytes.len() as u64,
+            },
+            memory_writes: vec![],
+        });
+        self.planned = Some(Plan {
+            action: action.clone(),
+            operation: operation.clone(),
+            path,
+            destination: None,
+            mutation: true,
+            directory_next: None,
+            routed_write: Some((offset, bytes)),
+        });
+        Ok(action)
+    }
+
+    /// Resolve a routed `close`.
+    ///
+    /// Releasing the descriptor is the caller's, on observed success: this engine
+    /// does not own `ProcessContext::fds`. What it does own is refusing a number
+    /// it never issued, so a `close` of an unbound descriptor answers `EBADF`
+    /// rather than succeeding vacuously -- which would let a later `read` on a
+    /// reused number find a stale binding.
+    ///
+    /// No flush. A `close` is not a durability barrier in this engine: every
+    /// routed write is already a committed transaction by the time it returns,
+    /// and `finish_run` is what certifies the run-wide barrier.
+    fn resolve_routed_close(
+        &mut self,
+        context: &ProcessContext,
+        operation: &FsOp,
+        fd: TracedFd,
+    ) -> Result<ResolvedAction> {
+        let (_, path) = match self.routed_binding(context, fd)? {
+            Ok(binding) => binding,
+            Err(denied) => return Ok(denied),
+        };
+        let action = ResolvedAction::Emulate(EmulatedResult {
+            outcome: OperationOutcome::Success { return_value: 0 },
+            memory_writes: vec![],
+        });
+        self.planned = Some(Plan {
+            action: action.clone(),
+            operation: operation.clone(),
+            path,
+            destination: None,
+            mutation: false,
+            directory_next: None,
+            routed_write: None,
+        });
+        Ok(action)
+    }
+
     fn rewrite(
         &self,
         operation: &FsOp,
@@ -1844,8 +2218,28 @@ impl NamespaceResolver for Overlay {
         self.idle()?;
         self.planned = None;
         self.whiteout_hit = false;
+        // Consumed here, at the head, so a resolution that fails anywhere below
+        // cannot leave a binding for the next, unrelated operation to pick up --
+        // the rule `set_readlink_buffer` already states.
+        let routed = self.routed_request.take();
+        self.routed_open = None;
+        self.routed_descriptor = None;
         if let FsOp::ReadDir { fd, max_bytes } = operation {
             return self.resolve_directory(context, operation, *fd, *max_bytes);
+        }
+        // The three descriptor-relative operations umbra services itself. They
+        // name no path operand, so they cannot go through the path-resolution
+        // machinery below; the descriptor's own logical path is what they resolve
+        // against, and it is `ProcessContext::fds` that holds it.
+        match operation {
+            FsOp::Read { fd, length, offset } => {
+                return self.resolve_routed_read(context, operation, *fd, *length, *offset, routed)
+            }
+            FsOp::Write { fd, length, offset } => {
+                return self.resolve_routed_write(context, operation, *fd, *length, *offset, routed)
+            }
+            FsOp::Close { fd } => return self.resolve_routed_close(context, operation, *fd),
+            _ => {}
         }
         let (dir, name, create_parents) = match operation {
             FsOp::Open {
@@ -1925,6 +2319,44 @@ impl NamespaceResolver for Overlay {
                     }
                 } else if flags.directory {
                     return Err(unsupported("open cannot create a directory"));
+                }
+                // Two shapes a *routed* open cannot answer honestly, refused here
+                // rather than at the first operation on the descriptor. A routed
+                // open hands back a virtual descriptor, and a virtual descriptor
+                // is only ever as capable as the operations umbra services for
+                // it, so accepting an open whose contract umbra cannot keep would
+                // hand out a descriptor that lies about what it is.
+                if self.routed()? {
+                    if flags.append {
+                        // `O_APPEND` requires every write to land at the object's
+                        // end *atomically with respect to other writers*. umbra
+                        // could stat the object and write at its length, which is
+                        // right for one writer and silently wrong for two -- and
+                        // "silently wrong under concurrency" is the class of
+                        // answer this engine refuses. Supporting it needs an
+                        // append-at-end storage operation, which the `Storage`
+                        // surface does not have.
+                        return Err(unsupported(
+                            "routed open with O_APPEND: no atomic append-at-end storage \
+                             operation exists, and stat-then-write is wrong for a second \
+                             writer",
+                        ));
+                    }
+                    if flags.directory
+                        || existing
+                            .as_ref()
+                            .is_some_and(|(stat, _)| stat.kind == ObjectKind::Directory)
+                    {
+                        // Reading a directory means `getdirentries`, which the
+                        // interposer does not replace, so the only thing the
+                        // tracee could do with this descriptor is receive `EBADF`
+                        // from the kernel for every call on it. Refusing the open
+                        // says so at the point the program can still see why.
+                        return Err(unsupported(
+                            "routed open of a directory: directory reads are not routed, so \
+                             the descriptor would answer nothing",
+                        ));
+                    }
                 }
             }
             FsOp::Symlink { target, .. } => {
@@ -2146,6 +2578,96 @@ impl NamespaceResolver for Overlay {
             {
                 success()
             }
+            // A routed open, and the branch is **forced rather than chosen**:
+            // `rewrite` reaches `physical()`, which answers
+            // `UnsupportedCapability` ("backend has no kernel path binding")
+            // whenever the run's root binding carries no `physical_path` -- and
+            // for a userspace client it never will. There is no rewrite for this
+            // backend to produce, so the only way to answer the call is to answer
+            // it ourselves.
+            //
+            // The descriptor number comes from the caller, not from here: it owns
+            // `ProcessContext::fds` and it is the caller that fenced the kernel's
+            // own allocation range below it.
+            FsOp::Open { flags, .. } if self.routed()? => {
+                let descriptor = match routed.as_ref().and_then(|routed| routed.descriptor) {
+                    // The fenced descriptor range is full. `EMFILE` is what POSIX
+                    // answers, and answering it here is the only place that can:
+                    // the binding is built before `resolve`, and `resolve` is the
+                    // only producer of a tracee-visible refusal.
+                    Some(Err(errno)) => return Ok(ResolvedAction::Deny(errno)),
+                    Some(Ok(descriptor)) => descriptor,
+                    None => {
+                        return Err(unsupported(
+                            "a routed open needs a descriptor from set_routed_request; this \
+                             backend has no kernel path for a rewrite to target",
+                        ))
+                    }
+                };
+                if descriptor.0 < 0 {
+                    return Err(error(
+                        ErrorKind::InvalidInput,
+                        "a routed descriptor must be nonnegative",
+                    ));
+                }
+                if context.fds.contains_key(&descriptor) {
+                    return Err(error(
+                        ErrorKind::InvalidState,
+                        "the supplied routed descriptor is already bound in this process",
+                    ));
+                }
+                // Recorded, not completed: the object's identity is read by
+                // `prepare`, after any `create` this open performs. A creating
+                // open has no object to identify yet, and inventing one here
+                // would put a fabricated identity into the caller's process
+                // context.
+                self.routed_open = Some((descriptor, *flags, logical(&path)?));
+                ResolvedAction::Emulate(EmulatedResult {
+                    outcome: OperationOutcome::Success {
+                        return_value: descriptor.0 as u64,
+                    },
+                    memory_writes: vec![],
+                })
+            }
+            // A routed run has no kernel path for `rewrite` to name, so every
+            // operation that would need one is refused *to the tracee* rather
+            // than stopping the run.
+            //
+            // The guard is exactly `rewrite`'s own `shadow` argument, and that
+            // precision is the point: `physical()` fails only when the target
+            // lives in the shadow -- which is to say only when this run created
+            // or copied it up. A `stat` of a base object still rewrites to the
+            // *base's* host path and works as it always did, so this arm takes
+            // nothing away.
+            //
+            // What it covers is what the tracer still breakpoints and this slice
+            // does not route: `fstatat`, `faccessat`, `renameat`, `linkat`,
+            // `fchownat`. Measured before this arm existed: `create a file, then
+            // fstatat it` -- what `cp`, `install`, and both the Rust and Go
+            // standard libraries do -- ended the run with an internal
+            // `UnsupportedCapability`, where the same program on `local` exits 0.
+            // Failing closed was never in doubt; answering an errno is the
+            // discipline every other unsupported routed operation already holds
+            // (`EBADF` for a descriptor umbra never issued, `EFAULT` for a bad
+            // pointer, `EMFILE` for an exhausted range).
+            //
+            // **`ENOTSUP` is 45 on Darwin and 95 on Linux**, so unlike `EBADF`,
+            // `EFAULT` and `EMFILE` it is *not* ABI-stable, and naming it here is
+            // safe only because routing exists on Darwin alone -- `LaunchPolicy`
+            // is honoured by `umbra-platform-macos` and by nothing else. A second
+            // routed platform must supply this value rather than inherit it.
+            //
+            // Routing these operations properly is a larger slice: `Stat` and
+            // `Access` would have to be answered the way `ReadLink` and the
+            // logical-symlink `Stat` already are, through an ABI encoder. The
+            // design gate ratified "standard utilities are not claimed; the slice
+            // claims the toy program only", and this keeps that promise while
+            // making the limit visible instead of fatal.
+            _ if self.routed()?
+                && (mutation || existing.as_ref().is_some_and(|(_, shadow)| *shadow)) =>
+            {
+                return Ok(ResolvedAction::Deny(Errno(45)));
+            }
             _ => self.rewrite(
                 operation,
                 &path,
@@ -2160,6 +2682,7 @@ impl NamespaceResolver for Overlay {
             destination,
             mutation,
             directory_next: None,
+            routed_write: None,
         });
         Ok(action)
     }
@@ -2365,6 +2888,44 @@ fn reconcilable_on_reopen(operation: &JournalPendingOperation) -> bool {
         )
 }
 impl NamespaceSession for Overlay {
+    fn set_routed_request(&mut self, request: RoutedRequest) -> Result<()> {
+        self.idle()?;
+        self.routed_request = None;
+        // A refusal is a value the caller is allowed to bind -- it is how an
+        // `EFAULT` or an `EMFILE` reaches `resolve` -- so only a *bound* input has
+        // to be well formed.
+        if let Some(Ok(buffer)) = request.read_buffer {
+            if buffer.length == 0
+                || buffer.length as usize > MAX_IO_BYTES
+                || buffer.address == 0
+                || buffer.address.checked_add(buffer.length as u64).is_none()
+            {
+                return Err(error(ErrorKind::InvalidInput, "invalid routed read buffer"));
+            }
+        }
+        if let Some(Ok(bytes)) = request.write_bytes.as_ref() {
+            if bytes.len() > MAX_IO_BYTES {
+                return Err(error(
+                    ErrorKind::InvalidInput,
+                    "routed write exceeds bounds",
+                ));
+            }
+        }
+        if let Some(Ok(descriptor)) = request.descriptor {
+            if descriptor.0 < 0 {
+                return Err(error(
+                    ErrorKind::InvalidInput,
+                    "a routed descriptor must be nonnegative",
+                ));
+            }
+        }
+        self.routed_request = Some(request);
+        Ok(())
+    }
+    fn routed_descriptor(&self) -> Result<Option<(TracedFd, FdState)>> {
+        self.config()?;
+        Ok(self.routed_descriptor.clone())
+    }
     fn set_readlink_buffer(&mut self, address: u64, len: u32) -> Result<()> {
         self.idle()?;
         self.readlink_buffer = None;
@@ -2692,6 +3253,37 @@ impl NamespaceSession for Overlay {
                             .push(RollbackEntry::File(plan.path.clone()));
                         pending.whiteouts.push((plan.path.clone(), false));
                     }
+                    // A routed open has no kernel call behind it, so anything
+                    // the flags asked the kernel to do has to be done here.
+                    // `O_TRUNC` is the only one: `O_CREAT`/`O_EXCL` were
+                    // discharged by the `create` above, and the `Rewrite` branch
+                    // below clears them for the same reason.
+                    //
+                    // Ordered after the create/copy-up, because truncating
+                    // requires the object to exist in the shadow -- and it is a
+                    // `Truncate` request rather than a zero-length write because
+                    // `WriteAt` cannot shorten an object.
+                    if flags.truncate && matches!(executable, ResolvedAction::Emulate(_)) {
+                        let length = self.lookup(&plan.path)?.0.len;
+                        if length != 0 {
+                            let context = self.context()?;
+                            match self.storage.execute(&StorageRequest {
+                                context,
+                                operation: StorageOperation::Truncate {
+                                    path: plan.path.clone(),
+                                    len: 0,
+                                },
+                            })? {
+                                StorageResponse::Truncated(_) => {}
+                                _ => {
+                                    return Err(error(
+                                        ErrorKind::ProtocolMismatch,
+                                        "storage answered a truncate with something else",
+                                    ))
+                                }
+                            }
+                        }
+                    }
                     // Creation was executed through Storage, so O_EXCL must not run twice.
                     if let ResolvedAction::Rewrite(physical) = &mut executable {
                         if let FsOp::Open {
@@ -2786,6 +3378,61 @@ impl NamespaceSession for Overlay {
                     });
                     pending.whiteouts.push((plan.path.clone(), true));
                 }
+                // The routed write: the one arm that performs a data mutation
+                // itself rather than preparing one for the kernel.
+                //
+                // Order is the same discipline every other arm follows, and each
+                // step depends on the one before it. The `Prepare` record is
+                // already appended *and flushed* above, so the durable intent
+                // exists before any byte lands. `copy_up` then makes sure the
+                // object is in the shadow: without it a write to a base-only
+                // object would mutate the immutable base in place, which is the
+                // one thing this engine must never do. Only then do the bytes go
+                // out, and `commit` records that they did.
+                //
+                // The loop is `copy_up`'s, for the same reason: `Storage::write_at`
+                // may answer short, and `resolve` already promised the tracee the
+                // whole count. A backend that makes no progress is an error rather
+                // than an infinite retry.
+                FsOp::Write { .. } => {
+                    let (offset, bytes) = plan.routed_write.clone().ok_or_else(|| {
+                        error(
+                            ErrorKind::InvalidState,
+                            "a routed write reached prepare with no bytes",
+                        )
+                    })?;
+                    self.copy_up(&plan.path)?;
+                    // MUTATION PROBE B -- write routing. Compiled out of every
+                    // build that does not ask for it.
+                    //
+                    // The bytes are dropped and the transaction still reports the
+                    // success `resolve` planned, which is the whole point: a probe
+                    // that returned an error would only prove that errors
+                    // propagate. The tracee is told its write landed, so the
+                    // end-to-end toy fails at its *read-back* -- a different exit
+                    // code from probe A's -- and the object in the store is absent
+                    // or zero-length, which is the assertion a read fault could
+                    // not also produce.
+                    #[cfg(feature = "mutation-probe-write")]
+                    let _ = (offset, bytes);
+                    #[cfg(not(feature = "mutation-probe-write"))]
+                    {
+                        let mut written = 0usize;
+                        while written < bytes.len() {
+                            let context = self.context()?;
+                            let count = self.storage.write_at(
+                                &context,
+                                &plan.path,
+                                offset + written as u64,
+                                &bytes[written..],
+                            )?;
+                            if count == 0 {
+                                return Err(error(ErrorKind::Io, "routed write made no progress"));
+                            }
+                            written += count;
+                        }
+                    }
+                }
                 // Ownership is changed by the kernel against the rewritten
                 // shadow path, so the object has to be in the shadow first;
                 // otherwise the immutable base would be mutated in place.
@@ -2844,6 +3491,31 @@ impl NamespaceSession for Overlay {
                 // the change across by hand. The compiler catches only the other
                 // direction: a new `JournalIntent` variant.
                 _ => {}
+            }
+            // Complete a routed `Open`'s descriptor binding, now that the object
+            // exists. Outside the match above because both an open that
+            // materialised something and one that only resolved an existing
+            // object need it, and the arm above runs only for the first.
+            //
+            // The identity is read from the tree rather than derived: a created
+            // object's is whatever the shadow assigned it, and a copied-up one's
+            // is the copy's, not the base's.
+            if let Some((descriptor, flags, logical_path)) = self.routed_open.take() {
+                let (stat, _) = self.lookup(&plan.path)?;
+                self.routed_descriptor = Some((
+                    descriptor,
+                    FdState {
+                        object: stat.object_id,
+                        logical_path: Some(logical_path),
+                        directory: false,
+                        flags,
+                        // Always zero, including for a descriptor opened onto an
+                        // object that already had content: POSIX starts every
+                        // `open` at offset zero, and `O_APPEND` -- the one flag
+                        // that would not -- is refused for a routed open.
+                        offset: 0,
+                    },
+                ));
             }
             // The drift guard, and the one hazard `replay_must_poison`'s
             // exhaustiveness does *not* cover. The compiler catches a new
@@ -3552,6 +4224,7 @@ impl Overlay {
             destination: None,
             mutation: false,
             directory_next: Some((key, entries[encoded.consumed..].to_vec())),
+            routed_write: None,
         });
         Ok(action)
     }
@@ -3585,6 +4258,24 @@ impl Overlay {
                     offset: None,
                     length: 0,
                 },
+            },
+            // A routed write. The offset is the resolved one -- the descriptor's
+            // position, not the operation's `Option` -- because that is the
+            // position the bytes actually went to, and a recovery reading
+            // `None` here would have nothing to place them at.
+            // `length` is what the tracee *asked* for; on a routed write
+            // `resolve_routed_write` has already shortened the bytes to the
+            // backend's `transfer_bound()` and answered the tracee the shorter
+            // count. Journalling the request would describe a write that never
+            // happened, and recovery reads this record as the effect to replay --
+            // so it is the bound count or nothing.
+            FsOp::Write { length, .. } => JournalIntent::Write {
+                object,
+                offset: plan.routed_write.as_ref().map(|(offset, _)| *offset),
+                length: plan
+                    .routed_write
+                    .as_ref()
+                    .map_or(*length, |(_, bytes)| bytes.len() as u64),
             },
             FsOp::Symlink { target, .. } => JournalIntent::Symlink {
                 object,

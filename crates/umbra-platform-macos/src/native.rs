@@ -2,7 +2,7 @@
 //! local libSystem calls and bounded remote memory copies.
 use crate::{
     abi::{self, get, set, CPSR, PC},
-    cache, error,
+    cache, error, interpose,
     rsp::{self, Rsp},
     unsupported, Options,
 };
@@ -220,8 +220,33 @@ struct Session {
     registers: Vec<(usize, usize)>,
     scratch: Vec<(u64, usize, usize)>,
     initial: bool,
+    /// The routing interposer this run loads, and the one image it routes in.
+    ///
+    /// `(published dylib, target image, descriptor floor)`. Both path halves are
+    /// needed because `install` runs once per exec and the requirement is *not*
+    /// uniform across them: `DYLD_INSERT_LIBRARIES` loads the dylib into the
+    /// sandbox installer as well as the target, and the installer is stopped and
+    /// installed before dyld has mapped anything at all.
+    ///
+    /// The installer's copy stays dormant because **nothing arms it**, which is
+    /// the mechanism since round 1 (B1) and is not the one this doc used to
+    /// describe: the library once compared its own `_NSGetExecutablePath`
+    /// against the target from a constructor, and that constructor made it live
+    /// and un-breakpointed through every library initializer. It has no
+    /// constructor now and ships inert; `arm_interposer` writes the control
+    /// block, and it is called for the one image named here and no other. So
+    /// there is nothing to breakpoint in the installer and nothing to refuse,
+    /// and requiring the image in *every* `install` failed the launch there,
+    /// before the target existed.
+    ///
+    /// Carried per session rather than read from the backend so the requirement
+    /// travels with the tree: a descendant execing the same target image is
+    /// loaded with the same interposer and must have its trap sites breakpointed
+    /// too, or its routed calls would reach the kernel unmediated.
+    interposer: Option<(PathBuf, PathBuf, u32)>,
 }
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     fn attach(
         pid: i32,
         generation: u64,
@@ -230,6 +255,7 @@ impl Session {
         options: &Options,
         deadline: Instant,
         watchdog: &Watchdog,
+        interposer: Option<(PathBuf, PathBuf, u32)>,
     ) -> Result<Self> {
         let task = Arc::new(Task::acquire(pid)?);
         watchdog.add(task.clone());
@@ -293,6 +319,7 @@ impl Session {
             registers,
             scratch: vec![],
             initial: true,
+            interposer,
         })
     }
     fn regs(&mut self) -> Result<RegisterSet> {
@@ -458,6 +485,64 @@ impl Session {
     }
     fn install(&mut self) -> Result<()> {
         self.wait_for_dyld()?;
+        // Before any breakpoint is planted, and that order is forced.
+        //
+        // At the target's exec stop dyld has recorded only the main image and
+        // itself -- measured: `[<target>, /usr/lib/dyld]` -- so an inserted dylib
+        // is not mapped yet and its trap sites have no address to plant on. The
+        // only way to reach the moment it *is* mapped is to let dyld run to its
+        // next image notification, and that means continuing the tracee. Doing
+        // that after the libc stubs were breakpointed would resume into a tree of
+        // planted breakpoints with no event loop to service them: a stub trap
+        // during the remaining image loading would leave the PC sitting on a
+        // `brk` this function does not know how to step over, and it would
+        // re-trap forever. Running to the notification first costs nothing --
+        // dyld's own loading was never intercepted anyway -- and leaves the
+        // tracee stopped before any initializer, which is still before the
+        // target's first instruction.
+        let interposer = match self.interposer.clone() {
+            Some((dylib, target, floor)) if image_path(self.id.0.native_id as i32)? == target => {
+                // **A forked child is the one case that must not run to `main`.**
+                //
+                // `fork` copies the whole address space, so a child of a routed
+                // tracee starts with the interposer already mapped *and* already
+                // armed, sitting at the instruction after the `fork` -- long
+                // past `main`, which it will never reach again. Running
+                // `wait_for_image` here therefore resumed it with no breakpoint
+                // planted on anything: it executed unmediated until its first
+                // routed call became an `svc` the kernel does not know, took
+                // `SIGSYS`, and ended the run. Both halves were wrong, and the
+                // unmediated window was the dangerous half.
+                //
+                // Neither step is needed, because a forked child already has
+                // what both produce. The address comes out of the image list
+                // that fork copied -- complete, and readable without resuming
+                // anything, which is what keeps the child stopped until its
+                // traps are planted -- and the control block is armed already.
+                //
+                // Restricted to sessions with a parent so the target's own
+                // `install` is provably unchanged: at its stop dyld has
+                // registered only the main image and itself, so the lookup
+                // would miss anyway, but this says so rather than relying on it.
+                let inherited = if self.parent.is_some() {
+                    image_base(&self.loaded_images()?, &dylib)
+                } else {
+                    None
+                };
+                match inherited {
+                    Some(base) => Some((base, floor, self.interposer_armed(base)?)),
+                    // A fresh image: `execve`/`posix_spawn` reset the address
+                    // space, so dyld maps and this run arms, exactly as for the
+                    // target itself.
+                    None => Some((self.wait_for_image(&dylib)?, floor, false)),
+                }
+            }
+            // Either this run routes nothing, or this is the sandbox installer,
+            // where `DYLD_INSERT_LIBRARIES` also loaded the interposer. umbra
+            // arms only the image it meant to route, so the installer's copy
+            // stays inert and there is nothing here to intercept.
+            _ => None,
+        };
         // Shared cache addresses are system-wide on this native host. Verify every
         // remote instruction against local code before planting any breakpoint.
         for name in [
@@ -515,9 +600,167 @@ impl Session {
                 * 4;
             self.breakpoint(start + offset as u64, false)?;
         }
-        self.install_raw()?;
+        let main = main_image_base(&self.loaded_images()?)?;
+        self.install_image(main)?;
+        // The interposer's trap is an `svc` in *its* text, so its sites have to
+        // be breakpointed explicitly: `install_image` covers one image at a time,
+        // and the main image is the only other one scanned. That is also why a
+        // tracee's self-injected `svc` is not intercepted -- it is in neither.
+        if let Some((base, floor, inherited_arming)) = interposer {
+            self.install_image(base)?;
+            // Last, and the order is the mechanism rather than a preference: the
+            // library is inert until this call, so every instruction between
+            // dyld mapping it and this poke -- the whole library-initializer
+            // window -- passes through to libc instead of trapping into
+            // breakpoints that do not exist yet.
+            //
+            // A forked child skips it because fork already copied an armed
+            // control block. Re-arming would fail anyway -- `arm_interposer`
+            // requires the block to read back as zeroes, which is what proves
+            // nothing else armed it -- and that check stays strict rather than
+            // being relaxed to accommodate this path. A child forked *before*
+            // its parent armed carries zeroes, so it is armed here like any
+            // other image and routes from this instruction on.
+            if !inherited_arming {
+                self.arm_interposer(base, floor)?;
+            }
+        }
         Ok(())
     }
+
+    /// Run the tracee forward until dyld reports the named image as mapped.
+    ///
+    /// Bounded by notifications rather than by time: dyld emits one per load
+    /// batch, and a target that has not mapped the interposer after this many has
+    /// not been given it. Failing here fails the launch, which is the right
+    /// outcome -- an interposed target whose trap sites are not breakpointed
+    /// turns every routed `open` into an `svc` the kernel answers with SIGSYS, so
+    /// the tracee would die with no diagnosis at all.
+    /// Find the interposer's load address, once dyld has actually mapped it.
+    ///
+    /// **Why this runs the tracee to its entry point rather than watching dyld.**
+    /// At the target's exec stop dyld has registered only the main image and
+    /// itself -- measured: `[<target>, /usr/lib/dyld]` -- so the interposer has
+    /// no address yet. Two ways of waiting for one were tried and are recorded
+    /// here so neither is tried again:
+    ///
+    /// * Re-querying `jGetLoadedDynamicLibrariesInfos` after each stop at
+    ///   `_lldb_image_notifier` returns the same two images however many
+    ///   notifications are consumed -- the list answers from
+    ///   `dyld_all_image_infos`, which the notifier precedes.
+    /// * Reading the batch out of the notifier's own arguments reports the main
+    ///   image and nothing else, because on this dyld the initial image set --
+    ///   libSystem and every inserted dylib -- is not announced through a second
+    ///   notification at all.
+    ///
+    /// What *is* guaranteed is the ordering dyld promises: every image is mapped
+    /// and every initializer has run before the main image's entry point. So the
+    /// tracee is run to that entry, where the image list is complete, and nothing
+    /// of the program itself has executed yet -- `LC_MAIN`'s `entryoff` is the
+    /// address of `main`, and the breakpoint is retired before it runs.
+    ///
+    /// The cost is that library initializers run before umbra's syscall sites are
+    /// planted, so a file operation issued by one is neither routed nor
+    /// intercepted. That window is dyld's own image loading either way: the
+    /// tracer has never intercepted it (`wait_for_dyld` exists precisely because
+    /// breakpoints cannot be planted before it), and enforcement is already in
+    /// force throughout, because the sandbox was installed before the exec.
+    fn wait_for_image(&mut self, path: &Path) -> Result<u64> {
+        let main = main_image_base(&self.loaded_images()?)?;
+        let entry = self.main_entry_point(main)?;
+        self.run_to(entry)?;
+        let images = self.loaded_images()?;
+        image_base(&images, path).ok_or_else(|| {
+            // What dyld actually mapped is the diagnosis. The two ways this fails
+            // -- dyld refused the insert, or the path umbra published and the path
+            // dyld loaded are not the same file -- are indistinguishable from the
+            // absence alone, and both leave a tracee that dies at its first
+            // routed call with SIGSYS and no explanation.
+            let loaded = images
+                .iter()
+                .filter_map(|image| image["pathname"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            error(
+                "interposer",
+                format!(
+                    "{} was never mapped into the tracee, so its routing traps cannot be \
+                     intercepted; loaded images: [{loaded}]",
+                    path.display()
+                ),
+            )
+        })
+    }
+
+    /// The address of the main image's `main`, from its `LC_MAIN` load command.
+    ///
+    /// `entryoff` is an offset from the start of the Mach header, which for every
+    /// image this backend accepts -- thin arm64, `__TEXT` first -- is the load
+    /// address. A `LC_UNIXTHREAD` image (a static executable) carries no
+    /// `LC_MAIN` and is refused rather than guessed at.
+    fn main_entry_point(&mut self, base: u64) -> Result<u64> {
+        const LC_MAIN: u32 = 0x8000_0028;
+        let (header, commands) = self.load_commands(base)?;
+        let mut cursor = 0;
+        for _ in 0..u32at(&header, 16)? {
+            let command = u32at(&commands, cursor)?;
+            let length = u32at(&commands, cursor + 4)? as usize;
+            if length < 8 {
+                return Err(error("Mach-O", "invalid load command"));
+            }
+            if command == LC_MAIN {
+                let entry = u64at(
+                    commands
+                        .get(cursor..cursor + length)
+                        .ok_or_else(|| error("Mach-O", "load command bounds"))?,
+                    8,
+                )?;
+                return base
+                    .checked_add(entry)
+                    .ok_or_else(|| error("Mach-O", "entry point overflow"));
+            }
+            cursor += length;
+        }
+        Err(unsupported(
+            "an interposed target must carry LC_MAIN; a static image's entry point \
+             cannot be located this way",
+        ))
+    }
+
+    /// Continue until the tracee stops at exactly this address, then retire the
+    /// breakpoint that stopped it.
+    ///
+    /// Plants no breakpoint but its own, so a caller must not have planted syscall
+    /// sites yet: a stub trap during the run would leave the PC on a `brk` this
+    /// loop does not know how to step over, and it would re-trap forever.
+    fn run_to(&mut self, address: u64) -> Result<()> {
+        self.temporary_breakpoint(address)?;
+        loop {
+            let stop = self.rsp.request("c")?;
+            if !stop.starts_with('T') {
+                return Err(error("run_to", stop));
+            }
+            let fields = rsp::fields(&stop[3..]);
+            self.thread = tid(
+                rsp::number(
+                    fields
+                        .get("thread")
+                        .ok_or_else(|| error("run_to", "no thread"))?,
+                )?,
+                self.id.0.generation,
+            );
+            let regs = self.regs()?;
+            if get(&regs, PC)? == address {
+                self.remove_breakpoint(address)?;
+                return Ok(());
+            }
+            let signal = rsp::number(&stop[1..3])? as i32;
+            if ![libc::SIGSTOP, libc::SIGTRAP, libc::SIGCONT].contains(&signal) {
+                return Err(error("run_to", stop));
+            }
+        }
+    }
+
     fn wait_for_dyld(&mut self) -> Result<()> {
         let address = rsp::number(&self.rsp.request("qShlibInfoAddr")?)?;
         let mut info = [0; 16];
@@ -525,6 +768,18 @@ impl Session {
         if u32at(&info, 4)? != 0 {
             return Ok(());
         }
+        self.run_to_dyld_notification()
+    }
+
+    /// Continue until dyld's image notifier fires once, then stop there.
+    ///
+    /// **Plants no breakpoint but its own, and retires it before returning.** The
+    /// tracee is resumed here, so a caller must not have planted syscall sites
+    /// yet: a stub trap during dyld's remaining loading would leave the PC on a
+    /// `brk` this loop does not know how to step over, and it would re-trap
+    /// forever.
+    fn run_to_dyld_notification(&mut self) -> Result<()> {
+        let address = rsp::number(&self.rsp.request("qShlibInfoAddr")?)?;
         // START_SUSPENDED stops before dyld maps libSystem. Stop at its image
         // notification before installing syscall sites, rather than reading
         // shared-cache addresses that are not mapped yet. Initial dyld pointers
@@ -553,6 +808,12 @@ impl Session {
             .checked_sub(symbol("_dyld_all_image_infos")?)
             .and_then(|base| base.checked_add(symbol("_lldb_image_notifier").ok()?))
             .ok_or_else(|| error("dyld", "invalid notification address"))?;
+        // Already parked on the notifier from a previous call, so planting a
+        // breakpoint here and continuing would execute *that* breakpoint and stop
+        // at the same instruction forever. Measured: without this step, every
+        // notification after the first reports the same one-image batch, and the
+        // wait never advances. One instruction is enough to get off the site; the
+        // breakpoint below then catches the next call to it.
         self.temporary_breakpoint(notify)?;
         loop {
             let stop = self.rsp.request("c")?;
@@ -579,26 +840,29 @@ impl Session {
             }
         }
     }
-    fn install_raw(&mut self) -> Result<()> {
+    /// Every image the tracee currently has mapped, as debugserver reports them.
+    fn loaded_images(&mut self) -> Result<Vec<serde_json::Value>> {
         let reply = self
             .rsp
             .request("jGetLoadedDynamicLibrariesInfos:{\"fetch_all_solibs\":true}")?;
         let json: serde_json::Value =
             serde_json::from_str(&reply).map_err(|e| error("images", format!("{e}: {reply}")))?;
-        let images = json["images"]
+        json["images"]
             .as_array()
-            .ok_or_else(|| error("images", "missing images"))?;
-        let main = images
-            .iter()
-            .find(|v| v["mach_header"]["filetype"].as_u64() == Some(2))
-            .ok_or_else(|| error("images", format!("no main image: {reply}")))?;
-        let base = main["load_address"]
-            .as_u64()
-            .ok_or_else(|| error("images", "no main address"))?;
+            .cloned()
+            .ok_or_else(|| error("images", "missing images"))
+    }
+
+    /// One mapped image's Mach header and load-command block.
+    ///
+    /// Shared by the three readers that need them -- the `svc` scan, the entry
+    /// point, and the interposer's arming section -- so a thin-arm64 check or a
+    /// bound is written once rather than three times.
+    fn load_commands(&mut self, base: u64) -> Result<([u8; 32], Vec<u8>)> {
         let mut header = [0; 32];
         self.task.read(base, &mut header)?;
         if u32at(&header, 0)? != 0xfeedfacf || u32at(&header, 4)? != 0x100000c {
-            return Err(unsupported("main image must be thin arm64 Mach-O"));
+            return Err(unsupported("image must be thin arm64 Mach-O"));
         }
         let size = u32at(&header, 20)? as usize;
         if size > 1024 * 1024 {
@@ -606,6 +870,146 @@ impl Session {
         }
         let mut commands = vec![0; size];
         self.task.read(base + 32, &mut commands)?;
+        Ok((header, commands))
+    }
+
+    /// The runtime address and size of one named section in a mapped image.
+    ///
+    /// `None` when the image carries no such section. The slide is taken from
+    /// `__TEXT`'s `vmaddr`, exactly as `install_image` does: for every image this
+    /// backend accepts, the load address is that segment's runtime address.
+    fn image_section(
+        &mut self,
+        base: u64,
+        segment: &[u8; 16],
+        section: &[u8; 16],
+    ) -> Result<Option<(u64, u64)>> {
+        let (header, commands) = self.load_commands(base)?;
+        let mut cursor = 0;
+        let mut text_vm = None;
+        let mut found = None;
+        for _ in 0..u32at(&header, 16)? {
+            let cmd = u32at(&commands, cursor)?;
+            let size = u32at(&commands, cursor + 4)? as usize;
+            if size < 8 {
+                return Err(error("Mach-O", "invalid load command"));
+            }
+            let command = commands
+                .get(cursor..cursor + size)
+                .ok_or_else(|| error("Mach-O", "load command bounds"))?;
+            if cmd == 0x19 {
+                if command.get(8..14) == Some(b"__TEXT") {
+                    text_vm = Some(u64at(command, 24)?);
+                }
+                for index in 0..u32at(command, 64)? as usize {
+                    let at = 72 + index * 80;
+                    if command.get(at..at + 16) == Some(section.as_slice())
+                        && command.get(at + 16..at + 32) == Some(segment.as_slice())
+                    {
+                        found = Some((u64at(command, at + 32)?, u64at(command, at + 40)?));
+                    }
+                }
+            }
+            cursor += size;
+        }
+        let Some((address, length)) = found else {
+            return Ok(None);
+        };
+        let vm = text_vm.ok_or_else(|| error("Mach-O", "missing __TEXT"))?;
+        let address = base
+            .checked_add(
+                address
+                    .checked_sub(vm)
+                    .ok_or_else(|| error("Mach-O", "invalid section address"))?,
+            )
+            .ok_or_else(|| error("Mach-O", "address overflow"))?;
+        Ok(Some((address, length)))
+    }
+
+    /// Arm the interposer, by writing its control block through the debugger port.
+    ///
+    /// **Called only after `install_image` has planted breakpoints on that
+    /// image's `svc` sites, and that order is the whole mechanism.** umbra cannot
+    /// learn the interposer's load address until dyld has mapped it, which means
+    /// running the tracee to its entry point, which means every library
+    /// initializer has already run. A library that armed itself from its own
+    /// constructor was therefore live, with no breakpoint on its trap, for that
+    /// whole window: the first `open` from any file-touching initializer became
+    /// an `svc` the kernel does not know, took SIGSYS, and killed the launch
+    /// before `main` with an undecoded debugger packet for a diagnosis.
+    ///
+    /// So umbra owns the arming instant, and it is one 16-byte poke into
+    /// `__DATA,__umbra_arm`: the magic that switches the library on, and the
+    /// descriptor floor it routes above. The block is required to read back as
+    /// zeroes first, which is what says this is the library this build shipped
+    /// and that nothing has armed it already.
+    /// Is this mapped interposer already armed?
+    ///
+    /// True only for an address space a routed process forked: `fork` copies
+    /// `__DATA,__umbra_arm` along with everything else, so the child inherits
+    /// the magic its parent was given. Anything else -- a fresh `exec`, the
+    /// sandbox installer's inert copy -- reads zeroes.
+    ///
+    /// A section that is missing or short is *not* reported as armed: that is
+    /// not this library, and `arm_interposer` is the one that gets to say so,
+    /// with the diagnosis it already carries.
+    fn interposer_armed(&mut self, base: u64) -> Result<bool> {
+        let Some((address, length)) = self.image_section(base, ARM_SEGMENT, ARM_SECTION)? else {
+            return Ok(false);
+        };
+        if length < 16 {
+            return Ok(false);
+        }
+        let mut current = [0u8; 16];
+        self.task.read(address, &mut current)?;
+        Ok(u64::from_le_bytes(current[..8].try_into().unwrap()) == interpose::ARM_MAGIC)
+    }
+
+    fn arm_interposer(&mut self, base: u64, floor: u32) -> Result<()> {
+        let (address, length) = self
+            .image_section(base, ARM_SEGMENT, ARM_SECTION)?
+            .ok_or_else(|| {
+                error(
+                    "interposer",
+                    "the loaded interposer carries no __DATA,__umbra_arm section, so it \
+                     is not the library this build shipped",
+                )
+            })?;
+        if length < 16 {
+            return Err(error(
+                "interposer",
+                format!("the interposer's control block is {length} bytes, not 16"),
+            ));
+        }
+        let mut current = [0u8; 16];
+        self.task.read(address, &mut current)?;
+        if current != [0u8; 16] {
+            return Err(error(
+                "interposer",
+                format!(
+                    "the interposer's control block is not zero before arming; something \
+                     else wrote it: pid {} parent {:?} base {base:x} block {current:02x?}",
+                    self.id.0.native_id, self.parent
+                ),
+            ));
+        }
+        let mut block = [0u8; 16];
+        block[..8].copy_from_slice(&interpose::ARM_MAGIC.to_le_bytes());
+        block[8..].copy_from_slice(&u64::from(floor).to_le_bytes());
+        self.write(address, &block)
+    }
+
+    /// Breakpoint every `svc #0x80` in one mapped image's executable sections.
+    ///
+    /// Called for the main image, and for umbra's routing interposer when the run
+    /// loads one. It is the whole of what "the tracer intercepts raw syscalls"
+    /// means, and its bound is exactly these images: a tracee that writes an
+    /// `svc` into memory it allocated itself has no site here to breakpoint, and
+    /// that syscall is not intercepted. That limit is architectural rather than an
+    /// oversight -- see `README.md` -- and what fail-closes host writes under it is
+    /// the kernel-enforced Seatbelt profile, never this scan.
+    fn install_image(&mut self, base: u64) -> Result<()> {
+        let (header, commands) = self.load_commands(base)?;
         let mut cursor = 0;
         let mut text_vm = None;
         let mut sections = Vec::new();
@@ -657,6 +1061,31 @@ impl Session {
         Ok(())
     }
 }
+/// Load address of the tracee's main executable (`MH_EXECUTE`).
+fn main_image_base(images: &[serde_json::Value]) -> Result<u64> {
+    images
+        .iter()
+        .find(|v| v["mach_header"]["filetype"].as_u64() == Some(2))
+        .and_then(|main| main["load_address"].as_u64())
+        .ok_or_else(|| error("images", "no main image"))
+}
+
+/// Load address of one mapped image, matched by the path it was loaded from.
+///
+/// Matched on the resolved path debugserver reports, compared against the path
+/// umbra published and named in `DYLD_INSERT_LIBRARIES`. Both sides canonicalise
+/// through the same cache directory, so an equality test is exact rather than
+/// approximate -- and an inexact match here would breakpoint the wrong image's
+/// `svc` sites, which is a reason to return `None` and fail the launch rather
+/// than to widen the comparison.
+fn image_base(images: &[serde_json::Value], path: &Path) -> Option<u64> {
+    let wanted = std::fs::canonicalize(path).ok()?;
+    images.iter().find_map(|image| {
+        let pathname = image["pathname"].as_str()?;
+        (std::fs::canonicalize(pathname).ok()? == wanted).then(|| image["load_address"].as_u64())?
+    })
+}
+
 fn u32at(b: &[u8], o: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(
         b.get(o..o + 4)
@@ -691,6 +1120,12 @@ pub struct MacosTraceBackend {
     deadline: Option<Instant>,
     watchdog: Option<Watchdog>,
     generation: u64,
+    /// The routing interposer this run loads and the image it routes in, if any.
+    ///
+    /// Set by `launch_traced` before the spawn and handed to every `Session` in
+    /// the tree, so a descendant execing the same image breakpoints the same trap
+    /// sites. See `Session::interposer`.
+    interposer: Option<(PathBuf, PathBuf, u32)>,
     _affine: PhantomData<Rc<()>>,
 }
 impl Default for MacosTraceBackend {
@@ -708,6 +1143,7 @@ impl MacosTraceBackend {
             deadline: None,
             watchdog: None,
             generation: 0,
+            interposer: None,
             _affine: PhantomData,
         }
     }
@@ -805,6 +1241,18 @@ impl MacosTraceBackend {
         {
             return Err(unsupported("only explicit standard descriptors supported"));
         }
+        if let Some(limit) = spec.policy.descriptor_limit {
+            // Three standard descriptors plus room for the images dyld maps. A
+            // limit this low is a configuration mistake, and the failure it would
+            // produce -- `EMFILE` during image loading, before the target's first
+            // instruction -- names nothing useful.
+            if limit < 64 {
+                return Err(error(
+                    "launch",
+                    "a descriptor limit below 64 cannot start a dynamically linked image",
+                ));
+            }
+        }
         if spec.argv.is_empty() || !spec.executable.is_absolute() || !spec.cwd.is_absolute() {
             return Err(error(
                 "launch",
@@ -823,8 +1271,58 @@ impl MacosTraceBackend {
             .map(|a| cstr(a))
             .collect::<Result<Vec<_>>>()?;
         args[0] = cstr(spec.executable.as_bytes())?;
-        let env = spec
-            .environment
+        let mut environment = spec.environment.clone();
+        let cwd = cstr(spec.cwd.as_bytes())?;
+        let deadline = Instant::now() + Duration::from_millis(self.options.timeout_ms);
+        self.deadline = Some(deadline);
+        self.watchdog = Some(Watchdog::new(deadline));
+        let twin = cache::resign(
+            Path::new(OsStr::from_bytes(spec.executable.as_bytes())),
+            &self.options,
+            deadline,
+        )?;
+        // Enforcement is installed before the target's first instruction and the
+        // interposer is loaded into that same image, so both are arranged here,
+        // before the spawn, rather than injected afterwards.
+        if spec.policy.interpose {
+            let limit = spec.policy.descriptor_limit.ok_or_else(|| {
+                error(
+                    "launch",
+                    "an interposed launch requires a descriptor limit: without the \
+                     RLIMIT_NOFILE fence a virtual descriptor can collide with one the \
+                     kernel later hands the tracee, which is a wrong-object read rather \
+                     than a refusal",
+                )
+            })?;
+            let published = interpose::publish(&self.options, deadline)?;
+            // The target runs as its resigned twin, so this is the image umbra
+            // will arm -- not the caller's `spec.executable`. Getting it wrong
+            // leaves the interposer unarmed in the very image it was loaded for,
+            // and every call it would have routed reaches the host instead. That
+            // is why `install` *fails the launch* when it cannot find and arm the
+            // library, rather than continuing with an inert one.
+            let image = std::fs::canonicalize(&twin)
+                .map_err(|e| error("launch", format!("resolving the target twin: {e}")))?;
+            // One variable, and only dyld's. The interposer used to take its
+            // image and its descriptor floor from two more, which made "the
+            // library is live" something the environment decided -- and it
+            // decided it during the library-initializer window, before the traps
+            // were breakpointed. umbra now writes both into the library's own
+            // `__DATA` after planting them; see `Session::arm_interposer`.
+            let name = interpose::INSERT_VARIABLE;
+            if environment.iter().any(|v| v.name == name.as_bytes()) {
+                return Err(error(
+                    "launch",
+                    format!("the caller's environment already sets {name}"),
+                ));
+            }
+            environment.push(EnvironmentVariable {
+                name: name.as_bytes().to_vec(),
+                value: published.as_os_str().as_bytes().to_vec(),
+            });
+            self.interposer = Some((published, image, limit));
+        }
+        let env = environment
             .iter()
             .map(|v| {
                 if v.name.is_empty() || v.name.contains(&b'=') {
@@ -836,15 +1334,6 @@ impl MacosTraceBackend {
                 cstr(&bytes)
             })
             .collect::<Result<Vec<_>>>()?;
-        let cwd = cstr(spec.cwd.as_bytes())?;
-        let deadline = Instant::now() + Duration::from_millis(self.options.timeout_ms);
-        self.deadline = Some(deadline);
-        self.watchdog = Some(Watchdog::new(deadline));
-        let twin = cache::resign(
-            Path::new(OsStr::from_bytes(spec.executable.as_bytes())),
-            &self.options,
-            deadline,
-        )?;
         // Enforcement is installed by a trusted bootstrap that applies the
         // profile and then execs the target, so the image actually spawned is
         // the bootstrap and the target becomes its exec. The bootstrap is
@@ -912,6 +1401,28 @@ impl MacosTraceBackend {
                         "spawn fd",
                     )?;
                 }
+                // The descriptor fence, applied here because `posix_spawn` has no
+                // rlimit action and the child inherits this process's limits.
+                //
+                // `RLIMIT_NOFILE` is lowered in *this* process, soft and hard,
+                // immediately before the spawn. Lowering the hard limit is what
+                // makes the bound hold for the tracee's whole lifetime -- with only
+                // the soft limit lowered the tracee raises it back and walks into
+                // umbra's virtual descriptor range -- and it is irreversible for
+                // an unprivileged process, which is why it happens last and why
+                // `launch_traced` refuses a second run per backend. This provider
+                // process holds a handful of descriptors, far below the limit, and
+                // its own ceiling for the rest of its life is that same limit.
+                if let Some(limit) = spec.policy.descriptor_limit {
+                    let fence = libc::rlimit {
+                        rlim_cur: limit as libc::rlim_t,
+                        rlim_max: limit as libc::rlim_t,
+                    };
+                    errno(
+                        libc::setrlimit(libc::RLIMIT_NOFILE, &fence),
+                        "descriptor fence",
+                    )?;
+                }
                 errno(
                     libc::posix_spawn(
                         &mut pid,
@@ -937,6 +1448,7 @@ impl MacosTraceBackend {
             &self.options,
             deadline,
             self.watchdog.as_ref().unwrap(),
+            self.interposer.clone(),
         );
         let session = match session {
             Ok(s) => s,
@@ -1147,6 +1659,7 @@ impl MacosTraceBackend {
             &self.options,
             self.deadline.unwrap(),
             self.watchdog.as_ref().unwrap(),
+            self.interposer.clone(),
         )?;
         // The parent supplied memory repairs, not breakpoints owned by this RSP.
         debug_assert!(child.breaks.is_empty());
@@ -1237,8 +1750,19 @@ impl MacosTraceBackend {
         let number = get(&regs, 16)?;
         let pc = get(&regs, PC)?;
         match number {
-            // Filesystem calls the caller decodes, rewrites and observes.
-            5 | 57 | 58 | 398 | 463..=475 | 488 => {
+            // Filesystem calls the caller decodes, rewrites and observes, plus
+            // umbra's own routing trap. The trap is delivered on this path
+            // deliberately: it *is* a filesystem operation, it is answered by the
+            // same decode / resolve / prepare / emulate / observe / commit
+            // sequence, and `resume` already synthesises the exit stop for an
+            // entry whose PC moved past the `svc`.
+            //
+            // Reaching here with `abi::INTERPOSE_TRAP` means the breakpoint that
+            // fired was planted by `install_image` on the interposer's own text,
+            // because no other image is scanned. That is the containment: a trap
+            // number issued from anywhere else was never breakpointed, so the
+            // kernel sees it and refuses it.
+            5 | 57 | 58 | 398 | 463..=475 | 488 | abi::INTERPOSE_TRAP => {
                 let s = &mut self.sessions[index];
                 s.entry = Some(pc);
                 self.events.push_back(TraceEvent::SyscallEntry {
@@ -1413,27 +1937,50 @@ impl MacosTraceBackend {
         }
         let regs = s.regs()?;
         let pc = get(&regs, PC)?;
+        let signal = rsp::number(&reply[1..3])? as i32;
         if s.pending.as_ref().is_some_and(|p| p.gate == pc) {
+            // A stop *at* the return gate is only a return when the breakpoint
+            // planted there is what produced it. Accepting any signal here ate
+            // one: a resumed umbra routing trap reaches Darwin's `nosys`, which
+            // returns ENOSYS *and* posts `SIGSYS`, and the signal stop arrives
+            // with `PC == gate` -- so it was classified as the syscall return,
+            // the signal was dropped, and the tracee carried on with `-1/ENOSYS`
+            // where it should have seen the namespace's own answer. The
+            // supervisor no longer resumes a routing trap (see
+            // `events.rs::syscall_entry`), and this refuses to hide it if
+            // anything ever does again.
+            if signal != libc::SIGTRAP {
+                // **But a stop at the gate is not always about the gate.** A
+                // transient signal can be delivered while the tracee happens to
+                // sit on this PC -- `SIGCHLD` when a forked child exits is the
+                // one that actually happens, because `fork` and `wait4` are
+                // themselves gated syscalls, so their gate is exactly where the
+                // child's death lands. Erroring on those took a `wait4` run out
+                // over an ordinary event; the hardening above was aimed at
+                // `SIGSYS`, and this keeps it aimed there.
+                //
+                // Continuing with `c` and no signal number forwards nothing,
+                // and the gate breakpoint stays planted, so the real return is
+                // still classified by the `SIGTRAP` that produced it.
+                if TRANSIENT_SIGNALS.contains(&signal) {
+                    s.continue_run()?;
+                    return Ok(());
+                }
+                return Err(error(
+                    "return gate",
+                    format!(
+                        "fatal signal {signal} at the return gate for a syscall umbra \
+                         rewrote; a return is a breakpoint trap and nothing else"
+                    ),
+                ));
+            }
             return self.finish_return(index, regs);
         }
         if s.breaks.contains_key(&pc) {
             return self.intercept(index, regs);
         }
-        let signal = rsp::number(&reply[1..3])? as i32;
         // Continuing with `c` (no C signal) suppresses these attach transients.
-        if [
-            libc::SIGHUP,
-            libc::SIGTRAP,
-            libc::SIGSTOP,
-            libc::SIGCHLD,
-            libc::SIGCONT,
-            libc::SIGWINCH,
-            libc::SIGURG,
-            libc::SIGIO,
-        ]
-        .contains(&signal)
-            || (interrupted && signal == libc::SIGINT)
-        {
+        if TRANSIENT_SIGNALS.contains(&signal) || (interrupted && signal == libc::SIGINT) {
             s.continue_run()?;
             return Ok(());
         }
@@ -1443,6 +1990,42 @@ impl MacosTraceBackend {
         ))
     }
 }
+/// The interposer's control-block segment and section, named exactly as Mach-O
+/// stores them.
+///
+/// **Padded with NULs, not spaces.** A `section_64` name is 16 raw bytes and the
+/// lookup is a byte comparison, so a space-padded copy of these literals matches
+/// nothing -- and "found nothing" is indistinguishable from "this image has no
+/// control block", which is exactly the answer that makes a forked child look
+/// unarmed and sends umbra on to re-arm an already-armed block. Defined once so
+/// the writer (`arm_interposer`) and the reader (`interposer_armed`) cannot
+/// drift; they were written twice first, and the copy was wrong.
+const ARM_SEGMENT: &[u8; 16] = b"__DATA\0\0\0\0\0\0\0\0\0\0";
+const ARM_SECTION: &[u8; 16] = b"__umbra_arm\0\0\0\0\0";
+
+/// Signals a supervised stop absorbs rather than forwards or fails on.
+///
+/// Attach transients (`SIGSTOP`, `SIGTRAP`, `SIGCONT`), terminal and I/O
+/// notifications the tracee did not ask to be stopped for, and `SIGCHLD` --
+/// which a run that forks delivers on its own schedule, including while the
+/// tracee is parked on a return gate. Shared by the gate and the general stop
+/// path so the two cannot drift: a signal that is merely noise in one place
+/// must not be fatal in the other.
+///
+/// `SIGSYS` is deliberately absent. It is what an unintercepted routing trap
+/// produces, and letting it pass is the exact failure the return gate exists to
+/// refuse.
+const TRANSIENT_SIGNALS: [i32; 8] = [
+    libc::SIGHUP,
+    libc::SIGTRAP,
+    libc::SIGSTOP,
+    libc::SIGCHLD,
+    libc::SIGCONT,
+    libc::SIGWINCH,
+    libc::SIGURG,
+    libc::SIGIO,
+];
+
 /// Upper bound for both spawn buffers handed to the tracee. The kernel copies
 /// its own `sizeof`/`offsetof` out of them and never reports what it wants, so
 /// each buffer is padded well past any released layout. Every field beyond the
@@ -1644,6 +2227,13 @@ impl TraceControl for MacosTraceBackend {
                 "darwin-arm64-abi-v1".to_owned(),
                 umbra_core::capabilities::PLATFORM_SANDBOXED_LAUNCH_V1.to_owned(),
                 umbra_core::capabilities::PLATFORM_SYSCALL_REWRITE_V1.to_owned(),
+                // The three halves the name asserts are all present in this
+                // build, and none of them is optional at run time: the interposer
+                // is compiled from source by `build.rs` and embedded, so it
+                // cannot be absent; `launch_traced` refuses an interposed launch
+                // without a descriptor limit; and `install` refuses one whose
+                // interposer image it cannot find to breakpoint.
+                umbra_core::capabilities::PLATFORM_INTERPOSE_V1.to_owned(),
             ]
             .into_iter()
             .collect(),
@@ -1753,6 +2343,35 @@ impl TraceControl for MacosTraceBackend {
 
 #[cfg(test)]
 mod tests {
+    /// `SIGCHLD` is absorbed at a stop and `SIGSYS` is not, and the return gate
+    /// reads the same list the general stop path does.
+    ///
+    /// **What this pins and what it does not.** It pins the *decision*: the two
+    /// signals whose classification is load-bearing, on the one list both sites
+    /// consult. It does not exercise the wiring, because a stop at the return
+    /// gate carrying `SIGCHLD` needs an asynchronous signal to be delivered at
+    /// one exact PC -- the gate -- and nothing can make that happen on demand.
+    /// A live test for it would be a race dressed as a gate, so there is none;
+    /// `a_forked_child_of_a_routed_tracee_is_mediated_and_the_run_finishes`
+    /// covers fork end to end but does not reliably land a signal there.
+    ///
+    /// Both halves matter in opposite directions. Dropping `SIGCHLD` fails a
+    /// `wait4` run over an ordinary event (CodeRabbit, PR #116 item 4). Adding
+    /// `SIGSYS` would re-open the B2 hole the gate exists to close: an
+    /// unintercepted routing trap would be silently continued over and the
+    /// tracee would carry on with `-1/ENOSYS`.
+    #[test]
+    fn the_gate_absorbs_sigchld_and_never_absorbs_sigsys() {
+        assert!(
+            super::TRANSIENT_SIGNALS.contains(&libc::SIGCHLD),
+            "a forked child's exit must not be fatal at a return gate"
+        );
+        assert!(
+            !super::TRANSIENT_SIGNALS.contains(&libc::SIGSYS),
+            "SIGSYS is an unintercepted routing trap; absorbing it is the B2 defect"
+        );
+    }
+
     use super::*;
     use std::os::unix::ffi::OsStrExt;
 

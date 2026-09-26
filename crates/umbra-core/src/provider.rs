@@ -3,8 +3,17 @@ use crate::{BytePath, ErrorKind, Result, UmbraError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Common transport version 2 adds required sandbox launch policy and rewrite messages.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Common transport version.
+///
+/// 2 added the required sandbox launch policy and the rewrite messages. 3 adds
+/// the platform's `IoBuffer` request -- the buffer binding a routed data
+/// transfer names -- and two fields to `LaunchPolicy`: `interpose` and
+/// `descriptor_limit`. Both are wire-visible, so the version moves with them
+/// rather than after them: a version-2 platform provider handed a version-3
+/// `Launch` would deserialize a policy with neither field and launch a tracee
+/// that is neither interposed nor descriptor-fenced, which is exactly the
+/// silently-wrong start this number exists to prevent.
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Maximum encoded frame size, checked before allocating a payload.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// Default per-request IPC deadline, in milliseconds, when a registry omits

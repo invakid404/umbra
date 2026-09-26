@@ -28,6 +28,7 @@ pub trait SyscallAbi {
         regs: &RegisterSet,
         memory: &mut dyn TraceMemory,
     ) -> Result<Option<FsOp>>;
+    fn io_buffer(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>>;
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()>;
     fn emulate_result(&self, regs: &mut RegisterSet, result: &EmulatedResult) -> Result<()>;
 }
@@ -153,3 +154,26 @@ IPC launch is exclusively the supervised contract path. ABI capability identitie
 use `<platform>-<arch>-abi-v<decimal version>`; run composition requires exactly
 one for its negotiated architecture. Protocol version 2 rejects stale providers
 before decoding the required sandbox policy and rewrite messages.
+
+## Data transfers and the `IoBuffer` seam
+
+`FsOp` is ABI-independent: `FsOp::Read` and `FsOp::Write` say how *many* bytes
+move and never *where*. Only the ABI can read an address out of a register set,
+so `SyscallAbi::io_buffer` reports it beside the decoded operation rather than
+inside it, and the two must agree about the byte count -- a disagreement would
+write past the binding. It takes no `TraceMemory`, because the address is in the
+registers the caller already holds.
+
+Its default answers `None`, which is correct for every path operation and for a
+backend that services no data transfer. A consumer needing a buffer and getting
+`None` fails with its own diagnosis rather than reading address zero.
+
+`LaunchPolicy` carries two fields a backend must honour together or refuse:
+`interpose`, which loads umbra's userspace-routing library into the target image
+before its first instruction, and `descriptor_limit`, which fences
+`RLIMIT_NOFILE` -- soft *and* hard -- before the final exec so the kernel's
+descriptor range and the interposer's virtual one cannot overlap for the
+lifetime of the tracee or any descendant. A backend that cannot do both must
+refuse the launch: an interposed tracee whose descriptors are not fenced can be
+handed a kernel descriptor number that already names something else, which is a
+wrong-object read rather than a refusal.

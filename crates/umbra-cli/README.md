@@ -19,11 +19,11 @@ use; a healthy run exits 0. Run enumeration is out of scope: the run ID is an
 argument.
 
 ```text
-umbra run --registry PATH [--workspace PATH] --experimental
+umbra run --registry PATH [--workspace PATH] [--state-dir PATH] --experimental
       [--local-dev | --strict-remote] [--agent ID]
       [--env NAME=VALUE]... [--inherit-env NAME]... -- COMMAND [ARGS...]
 umbra [--storage-root PATH] stop|checkpoint|inspect RUN_ID
-umbra [--storage-root PATH] resume RUN_ID [--workspace PATH] [-- AGENT_ARGS...]
+umbra [--storage-root PATH] resume RUN_ID [--workspace PATH] [--state-dir PATH]
 umbra providers --registry PATH [--role ROLE]
 ```
 
@@ -42,15 +42,32 @@ belongs to the supervised program; the CLI's own tests run with it closed.
 as an argument, and disables nothing.
 
 Storage mode is chosen by flag and enforced by negotiated capability, not by
-provider identity. The default is a validated NFSv4 mount with client-fsync
-durability, requiring the storage descriptor to declare `mounted-nfsv4-v1`;
-`--local-dev` requires `local-development-v1` instead. Descriptors are checked
+provider identity. The default is NFSv4 with client-fsync durability, requiring
+the storage descriptor to declare `mounted-nfsv4-v1` — a validated kernel mount —
+or `userspace-nfsv4-v1`, a userspace client that mounts nothing. Both deliver the
+same run mode by different clients, and each is earned by a live probe in its own
+backend; `--local-dev` requires `local-development-v1` instead. Descriptors are checked
 before any provider is started, and the provider handshake then rejects a
 connection whose backend does not actually advertise the name.
 
-`run` additionally requires `experimental-open-rewrite-v1` from the storage
-descriptor, and `sandboxed-stopped-launch-v1` plus
-`experimental-syscall-rewrite-v1` from the platform descriptor. `resume` requires
+`run` additionally requires `sandboxed-stopped-launch-v1` plus
+`experimental-syscall-rewrite-v1` from the platform descriptor, and one of two
+alternatives for reaching the run's storage. A descriptor declaring
+`experimental-userspace-routing-v1` — storage with no kernel-visible path —
+additionally requires `experimental-userspace-interpose-v1` from the platform;
+every other descriptor requires `experimental-open-rewrite-v1` from storage.
+They are alternatives rather than a fallback pair: a backend with no
+kernel-visible path cannot be handed a rewrite target at all, and a backend that
+has one needs no interposer.
+
+`--state-dir` names the host directory where a **routed** run — one over storage
+declaring `experimental-userspace-routing-v1` — keeps the two things it cannot
+keep in its store: umbra's own journal, and the single directory the enforcement
+profile grants the tracee. Neither holds the run's data. It defaults to
+`$HOME/Library/Caches/umbra/runs`, beside the tracer's twin cache, and
+**`umbra resume` must be given the same value**: a reopen that cannot find the
+run's journal evidence refuses rather than reporting that the run needs no
+recovery. Storage that exposes kernel paths never reads it. `resume` requires
 neither set: it resolves nothing, rewrites nothing and launches nothing, so
 demanding capabilities it never exercises would turn an unqualified claim into a
 passing check. It connects storage and journal only, and enforces the persistence

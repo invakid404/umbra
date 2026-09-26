@@ -341,6 +341,11 @@ impl Operations {
     pub fn binding(&self) -> RunBinding {
         RunBinding {
             run_id: self.run_id,
+            // Filled by `NfsUserspaceStorage::open_run`, which is the only thing
+            // that knows the session's writer identity and the only thing that
+            // publishes this binding. Left `None` here so this surface cannot
+            // report an admission it does not own.
+            admitted_writer: None,
             root: self.anchors.root().binding(&self.mint),
             control: self.anchors.control().binding(&self.mint),
             capabilities: self.capabilities(),

@@ -6,6 +6,26 @@ license.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Mutation probes for the userspace-routing data path. Each one BREAKS routing in
+# one direction, on purpose, so a test can prove the end-to-end fixture actually
+# depends on that direction rather than passing for some other reason.
+#
+# They are cargo features and not runtime switches deliberately: a release build
+# contains neither, so no product binary carries a door that turns off the data
+# path. This follows the rejection of a "test-only override" in the sandbox for
+# the same reason.
+#
+# They are two features rather than one because they must be provable
+# *separately*. With both compiled in, a failing toy would not say which
+# direction broke it, and the two probes are chosen so their failures are
+# distinguishable anyway -- the read probe makes the toy's compare reject
+# (exit 8) and the write probe makes its read-back come up short (exit 7).
+#
+# Never enable either in anything but a mutation test.
+mutation-probe-read = []
+mutation-probe-write = []
+
 [dependencies]
 umbra-core = { path = "../umbra-core" }
 umbra-storage = { path = "../umbra-storage" }

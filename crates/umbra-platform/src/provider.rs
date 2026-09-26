@@ -82,6 +82,8 @@ pub enum Request {
         /// Operation.
         operation: FsOp,
     },
+    /// Io buffer.
+    IoBuffer(RegisterSet),
 }
 /// Owned method results, including buffers copied only after response validation.
 #[derive(Serialize, Deserialize)]
@@ -102,6 +104,8 @@ pub enum Response {
     Quiesced(QuiescedTree),
     /// Decoded.
     Decoded(Option<FsOp>),
+    /// Io buffer.
+    IoBuffer(Option<umbra_core::IoBuffer>),
     /// Prepared.
     Prepared(PreparedRewrite),
 }
@@ -305,6 +309,15 @@ impl SyscallAbi for Abi {
             }
         }
     }
+    fn io_buffer(&self, regs: &RegisterSet) -> Result<Option<umbra_core::IoBuffer>> {
+        // A plain call, not `decode_entry`'s callback loop: the buffer address is
+        // in the registers the caller already holds, so answering needs no read
+        // of the stopped task's memory.
+        match call(&self.client, &Request::IoBuffer(regs.clone()))? {
+            Response::IoBuffer(binding) => Ok(binding),
+            _ => Err(protocol_error("platform.io_buffer response")),
+        }
+    }
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()> {
         match call(
             &self.client,
@@ -494,6 +507,7 @@ fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> R
                         .decode_entry(&regs, &mut memory)
                         .map(Response::Decoded)
                 }
+                Request::IoBuffer(regs) => platform.abi.io_buffer(&regs).map(Response::IoBuffer),
                 Request::Rewrite { mut regs, rewrite } => platform
                     .abi
                     .apply_rewrite(&mut regs, &rewrite)
@@ -726,6 +740,9 @@ mod tests {
                 policy: umbra_core::LaunchPolicy {
                     persistence: umbra_core::PersistencePolicy::LocalDevelopment,
                     inherited_fds: vec![],
+                    // Not a routed launch: no interposer, no descriptor fence.
+                    interpose: false,
+                    descriptor_limit: None,
                 },
                 sandbox: SandboxRequirement::UnsandboxedExperiment,
             })

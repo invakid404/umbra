@@ -15,11 +15,16 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::DirBuilderExt;
+
 use umbra_core::{
     capabilities as caps, provider::ProviderDescriptor, provider::ProviderRegistry,
     AgentLaunchRequest, BytePath, EnvironmentVariable, ErrorKind, ExitStatus, IdempotencyKey,
+    JournalAccess, JournalControlBinding, JournalFormatPolicy, JournalOpenRequest,
     JournalTailRecovery, LaunchPolicy, LaunchSpec, LeaseEpoch, OperationId, PersistencePolicy,
-    Result, RunId, SandboxRequirement, Sequence, TerminationPolicy, TracedFd, UmbraError, WriterId,
+    PhysicalPath, Result, RunId, SandboxRequirement, Sequence, StorageAnchor, StoragePath,
+    TerminationPolicy, TracedFd, UmbraError, WriterId,
 };
 
 use crate::sandbox::{self, SandboxSpec};
@@ -137,6 +142,12 @@ pub struct RunSpec {
     /// Acknowledgement that this is a bounded experimental tracing mode. It is an
     /// argument, never a runtime question, and it disables nothing.
     pub experimental: bool,
+    /// Host directory holding per-run state that cannot live in the store.
+    ///
+    /// Used **only** by a routed run -- storage exposing no kernel-visible path.
+    /// Every other backend keeps its journal inside its own run directory, and
+    /// this is not consulted for one. See [`host_state`].
+    pub state_root: PathBuf,
     /// Optional status sink.
     pub observer: Option<Box<dyn RunObserver>>,
 }
@@ -158,6 +169,8 @@ pub struct ResumeSpec {
     pub workspace: PathBuf,
     /// Storage selection.
     pub persistence: RunPersistence,
+    /// The same host state root the run was created with. See [`RunSpec::state_root`].
+    pub state_root: PathBuf,
 }
 
 /// What reopening an existing run found.
@@ -176,6 +189,23 @@ pub struct ResumeOutcome {
     /// Either a previous session declared it by journaling
     /// `JournalLifecycle::RecoveryRequired`, or the reopen inventory still held a
     /// transaction that cannot be discarded — see `reconcilable_on_reopen`.
+    ///
+    /// **There is a third outcome, and it is an `Err` rather than a value here:**
+    /// a reopen that cannot find this run's journal evidence *refuses*. For a run
+    /// whose journal lives outside its store — the only shape that has one — a
+    /// missing log would otherwise open as a fresh journal, which has nothing
+    /// pending, which would report `false` for a run that may have crashed
+    /// mid-transaction. `verify_journal_binding` turns that into a refusal by
+    /// requiring the log's own first record to carry the journal identity the
+    /// store holds, which a freshly created log does not have.
+    ///
+    /// **Scoped precisely, because the scope is what makes the claim true.**
+    /// `false` means "classified, and no reconciliation is required" for a log
+    /// that is present, opens with this run's identity, and whose tail is intact
+    /// (`resume` refuses a torn one separately). It does **not** survive a log
+    /// silently truncated to a shorter valid prefix: nothing here knows how far
+    /// the run reached, and persisting that is barrier work this slice does not
+    /// do. That residue is stated in `umbra-storage-nfs-userspace`'s README.
     pub recovery_required: bool,
     /// Unfinished operations the reopen inventory still carried.
     pub unfinished: usize,
@@ -330,16 +360,53 @@ fn admit_run(
             ),
         ));
     }
-    let mode = match persistence {
-        RunPersistence::NfsClientFsync => caps::STORAGE_MOUNTED_NFSV4_V1,
-        RunPersistence::LocalDevelopment => caps::STORAGE_LOCAL_DEVELOPMENT_V1,
+    let storage = registry.get("storage")?;
+    // One mode, two clients. `NfsClientFsync` names what the *run* promises -- an
+    // NFSv4-backed run with no strict-remote durability claim -- and both a
+    // validated kernel mount and a qualified userspace client deliver it. They
+    // are separate capability names because they are separate measurements:
+    // `mounted-nfsv4-v1` asserts a mount this host validated, and a userspace
+    // client has none to validate. Accepting either here is not a widening of the
+    // gate: each is still earned by a live probe in its own backend, and a
+    // provider that probed nothing advertises neither.
+    //
+    // A userspace client's own durability is *stronger* than the name promises --
+    // a matched-verifier COMMIT rather than a client fsync -- so the run
+    // under-claims rather than over-claims, which is the safe direction.
+    let accepted: &[&str] = match persistence {
+        RunPersistence::NfsClientFsync => &[
+            caps::STORAGE_MOUNTED_NFSV4_V1,
+            caps::STORAGE_USERSPACE_NFSV4_V1,
+        ],
+        RunPersistence::LocalDevelopment => &[caps::STORAGE_LOCAL_DEVELOPMENT_V1],
         RunPersistence::StrictRemote => unreachable!("rejected above"),
     };
-    require_capability(
-        registry.get("storage")?,
-        mode,
-        "the selected persistence mode",
-    )?;
+    if !accepted
+        .iter()
+        .any(|name| storage.capabilities.iter().any(|declared| declared == name))
+    {
+        // Report the first name, which is the ordinary one, and list the
+        // alternative rather than hiding it behind a generic message.
+        // `e.operation`, not `operation`: `require_capability` stamps
+        // `"run.capabilities"`, which is the narrower and more useful label, and
+        // it is what the same failure carries at every other call site in this
+        // file. Substituting the caller's label here made one capability refusal
+        // report a different origin from its siblings purely because it had an
+        // alternative name to list.
+        return require_capability(storage, accepted[0], "the selected persistence mode").map_err(
+            |e| {
+                if accepted.len() > 1 {
+                    error(
+                        e.kind,
+                        &e.operation,
+                        format!("{} (or '{}')", e.context, accepted[1]),
+                    )
+                } else {
+                    e
+                }
+            },
+        );
+    }
     registry.get("journal")?;
     Ok(())
 }
@@ -412,14 +479,28 @@ fn validate(spec: &RunSpec) -> Result<()> {
         }
     }
     // The launch-only half. Everything above the `match` is in `admit_run`,
-    // which `resume` shares; these three describe rewriting and launching, which
-    // a reopen does neither of.
-    require_capability(
-        spec.registry.get("storage")?,
-        caps::STORAGE_OPEN_REWRITE_V1,
-        "kernel-visible rewrite targets",
-    )?;
+    // which `resume` shares; these describe rewriting and launching, which a
+    // reopen does neither of.
+    let storage = spec.registry.get("storage")?;
     let platform = spec.registry.get("platform")?;
+    // Two ways a tracee's file operations can reach the run's storage, and a
+    // registry declares exactly one of them. They are alternatives rather than a
+    // fallback pair: a backend with no kernel-visible path cannot be handed a
+    // rewrite target at all, and a backend that has one needs no interposer.
+    if declares_routing(storage) {
+        require_capability(
+            platform,
+            caps::PLATFORM_INTERPOSE_V1,
+            "routing a tracee's file operations through umbra, for storage that exposes \
+             no kernel path to rewrite a syscall operand to",
+        )?;
+    } else {
+        require_capability(
+            storage,
+            caps::STORAGE_OPEN_REWRITE_V1,
+            "kernel-visible rewrite targets",
+        )?;
+    }
     require_capability(
         platform,
         caps::PLATFORM_SANDBOXED_LAUNCH_V1,
@@ -431,6 +512,333 @@ fn validate(spec: &RunSpec) -> Result<()> {
         "redirecting intercepted syscalls into the run's shadow",
     )?;
     Ok(())
+}
+
+/// Whether this storage descriptor declares that its runs must be routed.
+///
+/// A declaration, and only ever used to *admit* a run: what actually decides the
+/// mode is the run binding's own absent `physical_path`, checked after `open_run`
+/// against this answer. Registry capabilities are operator-written JSON, so
+/// declaring the name is a claim rather than evidence -- and a claim that
+/// disagrees with the binding stops the run rather than picking a side.
+fn declares_routing(descriptor: &ProviderDescriptor) -> bool {
+    descriptor
+        .capabilities
+        .iter()
+        .any(|name| name == caps::STORAGE_USERSPACE_ROUTING_V1)
+}
+
+/// Per-run host state for a routed run, and the reason it exists at all.
+///
+/// A routed run's storage has no kernel-visible path, and two things still need
+/// one: umbra's own journal, whose `JournalControlBinding` carries a
+/// `PhysicalPath`, and the Seatbelt profile's single write allowance, which names
+/// a path the kernel resolves. Neither is the tracee's data -- that goes to the
+/// store through the userspace client -- so neither is a weakening of where the
+/// run's contents live.
+///
+/// The two live in sibling directories under `<state_root>/<run-id>/`, and the
+/// separation is load-bearing rather than tidy: `host/` is the only path the
+/// tracee may write, and the journal must not be inside anything the tracee can
+/// write. A single directory serving both would put umbra's own log inside the
+/// tracee's write grant.
+struct HostState {
+    /// `<state_root>/<run-id>/journal` -- the journal's control directory.
+    journal: PathBuf,
+    /// `<state_root>/<run-id>/host` -- the tracee's *only* host write allowance.
+    ///
+    /// **What this is: a narrowing.** The Seatbelt template carries exactly one
+    /// write rule and it names a real path; a kernel-path run points it at the
+    /// store's own run root, and a routed run has no such path, so it points at
+    /// an empty per-run directory instead. That is strictly less than the grant a
+    /// kernel-path run receives, and nothing in the tracee's logical namespace
+    /// resolves to it.
+    ///
+    /// **What it is not: a detector for anything that escaped routing.** It
+    /// catches a write that names *this exact absolute path* and nothing else;
+    /// every other host write is refused by the profile and leaves nothing here
+    /// to find. The fixture suite asserts it is empty, and what that assertion
+    /// means is "this run did not use its one host write allowance" -- not "no
+    /// operation reached the host".
+    host: PathBuf,
+}
+
+/// Where one routed run's host state lives. Pure: creates nothing.
+///
+/// Separated from [`create_host_state`] so a *reopen* can name the directories it
+/// expects without bringing them into being. A `resume` that creates them and
+/// then refuses leaves two empty directories behind for a run it declined to
+/// touch -- and, worse, creates the very empty journal directory whose
+/// existence-without-a-log this fence exists to refuse.
+fn host_state(state_root: &Path, run_id: RunId, operation: &str) -> Result<HostState> {
+    if !state_root.is_absolute() {
+        return Err(error(
+            ErrorKind::InvalidPath,
+            operation,
+            "the host state root must be an absolute path",
+        ));
+    }
+    let run = state_root.join(run_id.0.to_string());
+    Ok(HostState {
+        journal: run.join("journal"),
+        host: run.join("host"),
+    })
+}
+
+/// Bring one routed run's host state into being. Only `run` calls this.
+fn create_host_state(state: &HostState, operation: &str) -> Result<()> {
+    for directory in [&state.journal, &state.host] {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)
+            .map_err(|e| {
+                error(
+                    ErrorKind::Io,
+                    operation,
+                    format!("creating {}: {e}", directory.display()),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Where the journal-instance nonce lives in the store, under `control/`.
+///
+/// `control/` is umbra's own anchor: the overlay refuses a tracee operation that
+/// names it (`lookup`, "control is not tracee-visible"), so nothing the
+/// supervised program does can reach this object.
+fn nonce_path() -> Result<StoragePath> {
+    StoragePath::new(StorageAnchor::Control, b"journal-id".to_vec())
+}
+
+/// The descriptor fence a routed run applies, and the floor of umbra's own
+/// virtual descriptor range.
+///
+/// One constant for both halves, because they are one boundary: the platform
+/// lowers the tracee's `RLIMIT_NOFILE` -- soft and hard -- to this value before
+/// the target execs, and the supervisor allocates routed descriptors at or above
+/// it. Two constants could drift into overlapping, which is a wrong-object read
+/// rather than a refusal.
+///
+/// It is deliberately *not* read from the platform provider. The supervisor has
+/// to know the floor to allocate against it, and the platform has to know it to
+/// fence with it; making it a supervisor constant carried in `LaunchPolicy` means
+/// the platform is told the value rather than asked for it, so there is one
+/// source and the two cannot disagree.
+const DESCRIPTOR_FENCE: u32 = 4096;
+
+/// One request identity per storage call, derived from the run's own.
+///
+/// A backend may bind an operation id to the first idempotency key it was used
+/// with and refuse a second, different request under it -- which is exactly right,
+/// and exactly what a single `RequestContext` reused across a `create` and its
+/// following `write_at` runs into. `Overlay::context` derives per request for the
+/// same reason; this is the direct-caller equivalent, and the run's own key still
+/// seeds it so every request stays attributable to the run that made it.
+#[cfg(unix)]
+fn derived(context: &umbra_core::RequestContext, label: &str) -> umbra_core::RequestContext {
+    let mut derived = context.clone();
+    derived.operation_id = OperationId(uuid::Uuid::new_v4());
+    derived.idempotency_key = IdempotencyKey(format!("{}/{label}", context.idempotency_key.0));
+    derived
+}
+
+/// Mint this run's journal-instance nonce and record it in the store.
+///
+/// The store half only. [`seal_journal`] puts the same value **inside the log**,
+/// and the two together are the fence: see [`verify_journal_binding`] for why a
+/// value beside the log was not enough.
+#[cfg(unix)]
+fn publish_nonce(
+    storage: &mut dyn umbra_storage::Storage,
+    context: &umbra_core::RequestContext,
+    operation: &str,
+) -> Result<uuid::Uuid> {
+    let nonce = uuid::Uuid::new_v4();
+    let bytes = nonce.to_string().into_bytes();
+    let path = nonce_path()?;
+    storage.create(
+        &derived(context, "nonce/create"),
+        &path,
+        &umbra_core::CreateOptions {
+            kind: umbra_core::CreateKind::File,
+            mode: 0o600,
+        },
+    )?;
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let count = storage.write_at(
+            &derived(context, &format!("nonce/write/{written}")),
+            &path,
+            written as u64,
+            &bytes[written..],
+        )?;
+        if count == 0 {
+            return Err(error(
+                ErrorKind::Io,
+                operation,
+                "storage made no progress writing the journal nonce",
+            ));
+        }
+        written += count;
+    }
+    Ok(nonce)
+}
+
+/// Write the run's nonce **into its log**, as the log's first record.
+///
+/// `JournalLifecycle::Started` carries no fields, so the nonce rides in the
+/// record's `operation_id`. That is deliberate and it is the whole mechanism:
+/// there is no operation at run-open to identify, the id has to be *some* value,
+/// and making it the journal-instance identity means the log itself says which
+/// instance it is. **Do not "tidy" this into `Uuid::new_v4()`** -- that turns the
+/// fence below back into something a freshly created log satisfies.
+///
+/// Flushed before it returns, so the binding is durable before the tracee runs.
+#[cfg(unix)]
+fn seal_journal(
+    journal: &mut dyn umbra_journal::Journal,
+    nonce: uuid::Uuid,
+    epoch: LeaseEpoch,
+) -> Result<()> {
+    let sequence = journal.append(&umbra_core::JournalRecord {
+        format_version: 1,
+        sequence: Sequence(0),
+        operation_id: OperationId(nonce),
+        writer_epoch: epoch,
+        payload: umbra_core::JournalPayload::Lifecycle(umbra_core::JournalLifecycle::Started),
+    })?;
+    journal.flush(sequence)?;
+    Ok(())
+}
+
+/// Require that the log at this state root **is** the log this run created.
+///
+/// **Never answers "no journal was found here, so nothing needs recovery".** That
+/// is the whole reason this exists: a writer `journal.open` against an
+/// existing-but-empty directory establishes a *fresh* log, which has nothing
+/// pending, which makes `Overlay::bind` decline to poison, which makes
+/// `requires_recovery()` answer `false` -- for a run that may have crashed
+/// mid-transaction. Missing evidence and matching evidence are different answers
+/// and this returns the difference.
+///
+/// **The comparison is against the log, not against a file beside it, and the
+/// difference is load-bearing.** An earlier version wrote the nonce to a
+/// `journal-id` sidecar and compared that. Measured, it left the fail-open wide
+/// open: removing the log alone -- a partial loss of the state directory, a
+/// truncating restore, an operator clearing "the big file" -- left the sidecar
+/// matching, so the reopen established a fresh log and reported "requires no
+/// reconciliation", exit 0. The nonce now lives in the log's own first record,
+/// which a fresh log does not have and cannot invent.
+///
+/// Read through a **second, read-only** journal session, before the writer open:
+/// opening as a writer is what creates the fresh log, so the absence has to be
+/// observed while it is still observable. `FileJournal::open` refuses a second
+/// session on one instance, hence a separate connection rather than an
+/// open/close/open on the caller's.
+#[cfg(unix)]
+fn verify_journal_binding(
+    storage: &mut dyn umbra_storage::Storage,
+    context: &umbra_core::RequestContext,
+    descriptor: &ProviderDescriptor,
+    timeout_ms: u64,
+    state: &HostState,
+    run_id: RunId,
+) -> Result<()> {
+    let refuse = |detail: String| {
+        error(
+            ErrorKind::InvalidState,
+            "resume.journal",
+            format!(
+                "this run's journal evidence was not found: {detail}. A run journalled \
+                 outside its store is single-host -- reopening it needs the store and the \
+                 log together, and the log lives on the host that created the run. This is \
+                 a refusal, not a verdict: it does not mean the run needs no recovery",
+            ),
+        )
+    };
+    let path = nonce_path()?;
+    let stat = storage
+        .stat(&derived(context, "nonce/stat"), &path)
+        .map_err(|e| refuse(format!("the store holds no nonce for it ({e})")))?;
+    if stat.len == 0 || stat.len > 128 {
+        return Err(refuse(
+            "the store's nonce is empty or implausibly long".to_owned(),
+        ));
+    }
+    let mut stored = vec![0u8; stat.len as usize];
+    let read = storage
+        .read_at(&derived(context, "nonce/read"), &path, 0, &mut stored)
+        .map_err(|e| refuse(format!("the store's nonce could not be read ({e})")))?;
+    stored.truncate(read);
+    let stored = std::str::from_utf8(&stored)
+        .ok()
+        .and_then(|text| uuid::Uuid::parse_str(text).ok())
+        .ok_or_else(|| refuse("the store's nonce is not a journal identity".to_owned()))?;
+
+    if !state.journal.is_dir() {
+        return Err(refuse(format!(
+            "{} does not exist, so this host holds no log for it",
+            state.journal.display()
+        )));
+    }
+    let directory = PhysicalPath(BytePath::new(
+        state.journal.as_os_str().as_bytes().to_vec(),
+    )?);
+    let mut reader: Box<dyn umbra_journal::Journal> = Box::new(
+        umbra_journal::provider::Proxy::connect(descriptor, timeout_ms)
+            .map_err(|e| refuse(format!("the journal provider would not start ({e})")))?,
+    );
+    let sealed = (|| -> Result<()> {
+        reader
+            .open(&JournalOpenRequest {
+                control: JournalControlBinding { run_id, directory },
+                access: JournalAccess::ReadOnly,
+                format: JournalFormatPolicy {
+                    readable_versions: vec![1],
+                    write_version: 1,
+                },
+            })
+            .map_err(|e| refuse(format!("its log could not be opened read-only ({e})")))?;
+        let first = reader
+            .replay(Sequence(0))
+            .map_err(|e| refuse(format!("its log could not be replayed ({e})")))?
+            .next()
+            .transpose()
+            .map_err(|e| refuse(format!("its first record will not decode ({e})")))?
+            .ok_or_else(|| {
+                refuse(
+                    "its log is empty, so it is a journal this reopen would have created \
+                     rather than the one the run wrote"
+                        .to_owned(),
+                )
+            })?;
+        match first.payload {
+            umbra_core::JournalPayload::Lifecycle(umbra_core::JournalLifecycle::Started)
+                if first.operation_id.0 == stored => {}
+            _ => {
+                return Err(refuse(
+                    "its log does not open with this run's journal identity, so it belongs \
+                     to a different journal instance"
+                        .to_owned(),
+                ))
+            }
+        }
+        Ok(())
+    })();
+    // Close the reader whatever the verdict; a refusal must not leave a provider
+    // process behind.
+    with_cleanup_unit(sealed, reader.close())
+}
+
+/// Preserve a primary verdict while still reporting a failed cleanup.
+#[cfg(unix)]
+fn with_cleanup_unit(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
+    match primary {
+        Err(e) => Err(with_cleanup(e, cleanup)),
+        Ok(()) => cleanup,
+    }
 }
 
 /// Compose and execute one run.
@@ -497,7 +905,6 @@ mod unix {
         validate(&spec)?;
         let mut observer = spec.observer.take();
         let run_id = RunId(Uuid::new_v4());
-        let writer_id = WriterId(Uuid::new_v4().to_string());
         let RunLaunch::Command(command) = spec.launch.clone() else {
             unreachable!("validated above");
         };
@@ -537,7 +944,52 @@ mod unix {
                 storage.close_run(),
             ));
         }
+        // The mode, decided by evidence: whether this run *has* kernel-visible
+        // paths, not whether its registry said so. `validate` already admitted the
+        // run on the declaration; this refuses the two ways the declaration and
+        // the binding can disagree, because either one silently changes where the
+        // tracee's writes land.
+        let routed = binding.root.physical_path.is_none();
+        if routed != declares_routing(spec.registry.get("storage")?) {
+            return Err(with_cleanup(
+                error(
+                    ErrorKind::ProtocolMismatch,
+                    "run.open",
+                    if routed {
+                        "storage exposes no kernel path for this run, but its registry \
+                         descriptor does not declare '{}'; add it, or install a backend \
+                         that binds kernel paths"
+                    } else {
+                        "storage exposes kernel paths for this run, but its registry \
+                         descriptor declares '{}'; remove it"
+                    }
+                    .replace("{}", caps::STORAGE_USERSPACE_ROUTING_V1),
+                ),
+                storage.close_run(),
+            ));
+        }
+        let host_state = if routed {
+            match host_state(&spec.state_root, run_id, "run.state")
+                .and_then(|state| create_host_state(&state, "run.state").map(|()| state))
+            {
+                Ok(state) => Some(state),
+                Err(e) => return Err(with_cleanup(e, storage.close_run())),
+            }
+        } else {
+            None
+        };
 
+        // Who this run's writer *is*, decided by the backend where the backend has
+        // already decided it. A backend that admits in `open_run` has written an
+        // identity into a durable marker before publishing anything, and asking it
+        // to acquire under a different one is asking it to report an admission that
+        // writer never obtained -- which it refuses, correctly. Minting one here is
+        // the fallback, for the backends that admit at this call and record
+        // whatever identity they are told.
+        let writer_id = binding
+            .admitted_writer
+            .clone()
+            .unwrap_or_else(|| WriterId(Uuid::new_v4().to_string()));
         let lease = match storage.acquire_writer(&AcquireWriterRequest {
             run_id,
             writer_id: writer_id.clone(),
@@ -577,21 +1029,84 @@ mod unix {
             return Err(with_cleanup(e, storage.close_run()));
         }
 
-        let control_path = binding
-            .control
-            .physical_path
-            .clone()
-            .ok_or_else(|| {
-                error(
+        // The journal's control directory comes from configuration, not from
+        // `binding.control.physical_path`, only when storage exposes no kernel
+        // path. `local` and kernel-`nfs` are unaffected and still bind the store's
+        // own control directory.
+        //
+        // This is not a neutral relocation, and the limit is load-bearing:
+        //
+        // 1. A run journalled outside its store CANNOT be resumed on another
+        //    host. Reopening needs the store *and* the log; the log is on this
+        //    host's disk. `resume` refuses such an attempt rather than reporting a
+        //    verdict.
+        //
+        // 2. The refusal is what makes (1) safe, and it is not optional. A writer
+        //    `journal.open` against an existing-but-empty directory establishes a
+        //    FRESH log (`umbra-journal-file`: `create_dir_all` + missing log => new
+        //    header). A fresh log has nothing pending, so `Overlay::bind` does not
+        //    poison and `requires_recovery()` answers `false`. Without the nonce
+        //    check below, a crashed run whose log was merely *not found* would be
+        //    reported healthy -- the silent `false` that `requires_recovery`'s own
+        //    contract refuses, and the fail-open #65 was built to remove.
+        //
+        // So a nonce is minted per run, written to the store's `control/`, and
+        // written **into the log itself** as its first record -- see
+        // `seal_journal`. A reopen requires both, and the in-log half is what
+        // makes the check mean anything: an earlier version compared the store's
+        // copy against a `journal-id` file sitting *beside* the log, and measured,
+        // removing the log alone left that sidecar matching, so the reopen
+        // established a fresh log and reported "requires no reconciliation".
+        //
+        // What this closes, exactly, is the **vanished log**: a log whose first
+        // record is not this run's identity, or which has no records at all, is
+        // refused. What it does **not** close is a log truncated to a shorter but
+        // still-valid prefix -- that needs the run's reached sequence persisted
+        // somewhere the log cannot forge, which is barrier territory and
+        // deliberately not in this slice. `JournalTailRecovery` still catches a
+        // *torn* tail, and `resume` refuses that too.
+        //
+        // Do NOT "fix" a refusal here by creating the directory, seeding a nonce,
+        // or relaxing the comparison, and do not give `seal_journal`'s record a
+        // fresh operation id. Each turns a missing-evidence refusal back into a
+        // clean verdict. The only real fix is to move the journal into the store,
+        // which needs `JournalControlBinding` to carry something other than a
+        // `PhysicalPath`; until then this limit is the honest behaviour.
+        let control_path = match (&host_state, binding.control.physical_path.clone()) {
+            (Some(state), _) => BytePath::new(state.journal.as_os_str().as_bytes().to_vec())
+                .map_err(|e| {
+                    let e = with_cleanup(e, storage.release_writer(&lease));
+                    with_cleanup(e, storage.close_run())
+                })?,
+            (None, Some(path)) => path,
+            (None, None) => {
+                let e = error(
                     ErrorKind::UnsupportedCapability,
                     "run.journal",
                     "storage exposes no kernel path for the control directory",
-                )
-            })
-            .map_err(|e| {
+                );
                 let e = with_cleanup(e, storage.release_writer(&lease));
-                with_cleanup(e, storage.close_run())
-            })?;
+                return Err(with_cleanup(e, storage.close_run()));
+            }
+        };
+
+        // Mint and publish the nonce *before* the journal is opened. A crash
+        // between the two leaves a store nonce with no log, which the reopen
+        // refuses -- the fail-closed direction. Doing it after would leave a log
+        // with no nonce, which is the same refusal, so the order is chosen for the
+        // third case: a failure while writing the store copy must not leave a
+        // usable-looking journal behind. `seal_journal` below puts the same value
+        // inside the log.
+        let journal_nonce = match &host_state {
+            Some(_) => match publish_nonce(storage.as_mut(), &context, "run.journal") {
+                Ok(nonce) => Some(nonce),
+                Err(e) => {
+                    let e = with_cleanup(e, storage.release_writer(&lease));
+                    return Err(with_cleanup(e, storage.close_run()));
+                }
+            },
+            None => None,
+        };
 
         let mut journal: Box<dyn umbra_journal::Journal> = Box::new(
             match umbra_journal::provider::Proxy::connect(spec.registry.get("journal")?, timeout) {
@@ -655,10 +1170,38 @@ mod unix {
             return Err(with_cleanup(e, storage.close_run()));
         }
 
+        // Seal the log with this run's journal identity, as its first record, and
+        // flush it before anything else touches the journal. The store already
+        // holds the same value; the pair is what a reopen checks, and putting one
+        // half *inside* the log is what stops a freshly created log from
+        // satisfying the check. See `verify_journal_binding`.
+        //
+        // After the freshness gate above, deliberately: that gate reads the
+        // recovery state `open` produced, and this record would make a CreateNew
+        // journal look non-fresh to it.
+        if let Some(nonce) = journal_nonce {
+            if let Err(e) = seal_journal(journal.as_mut(), nonce, lease.epoch) {
+                let e = with_cleanup(e, journal.close());
+                let e = with_cleanup(e, storage.release_writer(&lease));
+                return Err(with_cleanup(e, storage.close_run()));
+            }
+        }
+
         // From here the namespace owns storage and journal; failures go through
         // its own fail path so one owner decides what is released.
         let mut namespace = standard_namespace(storage, journal);
-        let root_path = binding.root.physical_path.clone();
+        // A routed run's tracee-visible root is not on this host at all, so the
+        // profile's one write allowance names an empty per-run directory instead.
+        // It is not where the run's data goes -- every routed operation reaches
+        // the store through the userspace client -- and it is strictly narrower
+        // than the store-root grant a kernel-path run receives. It is a
+        // narrowing, not a detector: see `HostState::host` for what asserting it
+        // stays empty does and does not establish.
+        let root_path = match &host_state {
+            Some(state) => BytePath::new(state.host.as_os_str().as_bytes().to_vec()).ok(),
+            None => binding.root.physical_path.clone(),
+        };
+        let interpose = host_state.is_some();
         let session = SessionConfig {
             binding,
             context,
@@ -704,6 +1247,13 @@ mod unix {
                         RunPersistence::StrictRemote => unreachable!("rejected above"),
                     },
                     inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                    interpose,
+                    // Set together with `interpose` and only with it. The fence is
+                    // what makes the interposer's virtual descriptors disjoint
+                    // from the kernel's for the tracee's whole lifetime; applying
+                    // it to a run that routes nothing would cap a tracee's
+                    // descriptors for no reason at all.
+                    descriptor_limit: interpose.then_some(DESCRIPTOR_FENCE),
                 },
                 sandbox: SandboxRequirement::Required(profile),
             })
@@ -735,6 +1285,7 @@ mod unix {
             cwd: command.cwd.clone(),
             architecture,
             abi,
+            descriptor_floor: interpose.then_some(DESCRIPTOR_FENCE),
         };
 
         if let Some(observer) = observer.as_mut() {
@@ -854,7 +1405,6 @@ mod unix {
             "resume.validate",
         )?;
         let run_id = spec.run_id;
-        let writer_id = WriterId(Uuid::new_v4().to_string());
 
         // The same fingerprint the run was created under. `OpenExisting`
         // validates it against the run's own manifest, so a workspace that has
@@ -891,6 +1441,12 @@ mod unix {
             ));
         }
 
+        // See `run`: a backend that admitted in `open_run` names the writer, and
+        // this reopen acquires under that name rather than one of its own.
+        let writer_id = binding
+            .admitted_writer
+            .clone()
+            .unwrap_or_else(|| WriterId(Uuid::new_v4().to_string()));
         let lease = match storage.acquire_writer(&AcquireWriterRequest {
             run_id,
             writer_id: writer_id.clone(),
@@ -912,21 +1468,56 @@ mod unix {
             writer_epoch: Some(lease.epoch),
         };
 
-        let control_path = binding
-            .control
-            .physical_path
-            .clone()
-            .ok_or_else(|| {
-                error(
-                    ErrorKind::UnsupportedCapability,
-                    "resume.journal",
-                    "storage exposes no kernel path for the control directory",
-                )
-            })
-            .map_err(|e| {
+        // The reopen half of the conditional journal directory `run` establishes.
+        // Its comment states the limit and why the nonce below is not optional;
+        // this is the site that enforces it.
+        let routed = binding.root.physical_path.is_none();
+        let control_path = if routed {
+            let state = match host_state(&spec.state_root, run_id, "resume.state") {
+                Ok(state) => state,
+                Err(e) => {
+                    let e = with_cleanup(e, storage.release_writer(&lease));
+                    return Err(with_cleanup(e, storage.close_run()));
+                }
+            };
+            // Before the journal is opened, deliberately, and nothing has been
+            // created yet either. Opening it as a writer against an empty
+            // directory *creates* a fresh log, and a fresh log cannot be told
+            // from an intact one afterwards -- so the evidence has to be checked
+            // while its absence is still observable, and a reopen that refuses
+            // must leave the state root exactly as it found it.
+            if let Err(e) = verify_journal_binding(
+                storage.as_mut(),
+                &context,
+                spec.registry.get("journal")?,
+                timeout,
+                &state,
+                run_id,
+            ) {
                 let e = with_cleanup(e, storage.release_writer(&lease));
-                with_cleanup(e, storage.close_run())
-            })?;
+                return Err(with_cleanup(e, storage.close_run()));
+            }
+            match BytePath::new(state.journal.as_os_str().as_bytes().to_vec()) {
+                Ok(path) => path,
+                Err(e) => {
+                    let e = with_cleanup(e, storage.release_writer(&lease));
+                    return Err(with_cleanup(e, storage.close_run()));
+                }
+            }
+        } else {
+            match binding.control.physical_path.clone() {
+                Some(path) => path,
+                None => {
+                    let e = error(
+                        ErrorKind::UnsupportedCapability,
+                        "resume.journal",
+                        "storage exposes no kernel path for the control directory",
+                    );
+                    let e = with_cleanup(e, storage.release_writer(&lease));
+                    return Err(with_cleanup(e, storage.close_run()));
+                }
+            }
+        };
 
         let mut journal: Box<dyn umbra_journal::Journal> = Box::new(
             match umbra_journal::provider::Proxy::connect(spec.registry.get("journal")?, timeout) {
@@ -1232,6 +1823,9 @@ mod validate_tests {
                 providers,
                 timeout_ms: 5_000,
             },
+            // Unused by these cases: every one of them is over a backend that
+            // binds kernel paths, so nothing consults the host state root.
+            state_root: std::path::PathBuf::from("/nonexistent/umbra-state"),
             launch: RunLaunch::Command(CommandLaunch {
                 executable: BytePath::new(b"/bin/echo".to_vec()).unwrap(),
                 argv: vec![b"echo".to_vec()],

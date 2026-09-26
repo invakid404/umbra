@@ -96,6 +96,9 @@ fn drive(case: &str, fixture: &Path, root: &Path, rewrite: bool) -> Outcome {
             policy: LaunchPolicy {
                 persistence: PersistencePolicy::NfsClientFsync,
                 inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                // Not a routed launch: no interposer, no descriptor fence.
+                interpose: false,
+                descriptor_limit: None,
             },
             sandbox: SandboxRequirement::Required(profile(root)),
         })
@@ -318,6 +321,9 @@ fn failed_installer_reports_checked_reaping_evidence() {
             policy: LaunchPolicy {
                 persistence: PersistencePolicy::LocalDevelopment,
                 inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                // Not a routed launch: no interposer, no descriptor fence.
+                interpose: false,
+                descriptor_limit: None,
             },
             sandbox: SandboxRequirement::Required(
                 SandboxProfile::new(

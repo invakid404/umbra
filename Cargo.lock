@@ -708,6 +708,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "umbra-core",
+ "uuid",
 ]
 
 [[package]]
@@ -740,10 +741,14 @@ name = "umbra-storage-nfs-userspace"
 version = "0.1.0"
 dependencies = [
  "bindgen",
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "umbra-core",
+ "umbra-journal",
+ "umbra-journal-file",
  "umbra-storage",
  "uuid",
 ]

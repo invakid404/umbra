@@ -491,6 +491,9 @@ fn launch_spec() -> LaunchSpec {
         policy: LaunchPolicy {
             persistence: PersistencePolicy::LocalDevelopment,
             inherited_fds: vec![],
+            // Not a routed launch: no interposer, no descriptor fence.
+            interpose: false,
+            descriptor_limit: None,
         },
         sandbox: SandboxRequirement::UnsandboxedExperiment,
     }
@@ -502,6 +505,9 @@ fn launch_spec() -> LaunchSpec {
 /// way `umbra-overlay`'s own fixture resolves it.
 fn budget() -> RunBudget {
     RunBudget {
+        // Rewrite-backed: this harness binds no routing and touches no
+        // descriptor table, which is what `None` selects.
+        descriptor_floor: None,
         renew_after: Duration::from_secs(3600),
         cwd: BytePath::new(b"/".to_vec()).unwrap(),
         architecture: Architecture::Aarch64,
