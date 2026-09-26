@@ -23,3 +23,8 @@ tempfile.workspace = true
 # `tests/kernel_refusal.rs` binds a real `Overlay` to real storage on
 # tempdirs; this is the only backend a test target here selects.
 umbra-storage-local = { path = "../umbra-storage-local" }
+# `tests/reopen.rs` builds a run's durable journal state directly, then reopens
+# it through the real provider executables, so it needs the backend as a library
+# as well as the binary cargo already builds for the workspace.
+umbra-journal-file = { path = "../umbra-journal-file" }
+uuid.workspace = true

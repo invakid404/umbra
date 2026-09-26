@@ -38,7 +38,14 @@ handles `ErrorKind::Denied` on the attempt. Adding it changed no struct and no
 `FinishRunReceipt` and `FailedRunRequest` describe the namespace run lifecycle,
 which `capabilities::NAMESPACE_RUN_LIFECYCLE_V1` names for the handshake,
 and `JournalLifecycle::RunCompleted` is the durable completion record for a fresh
-command run — not a checkpoint, and no authority for takeover. `OperationId::derive`
+command run — not a checkpoint, and no authority for takeover.
+`JournalLifecycle::RecoveryRequired` is the session's own verdict that its effects
+could not be accounted for; since
+[#65](https://github.com/invakid404/umbra/issues/65) it has a writer, and
+`RecoveryState::recovery_required` is how a backend reports that verdict back to
+the namespace owner. It carries no `#[serde(default)]`, so a payload from a peer
+that predates the field fails to decode rather than silently reading as "no
+verdict"; adding it changed no on-disk format and no `PROTOCOL_VERSION`. `OperationId::derive`
 mints distinct storage operation identities from one logical transaction, because
 a backend may bind an operation ID to the single idempotency key it was first
 used with.

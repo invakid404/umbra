@@ -17,6 +17,16 @@ struct Log {
     records: Vec<JournalRecord>,
     fail_prepare: bool,
     fail_commit: bool,
+    /// Injects a failure on the `Abort` record's append.
+    ///
+    /// The sibling of `fail_commit`, and it exists for the one seam
+    /// [#65](https://github.com/invakid404/umbra/issues/65) moved: `abort` now
+    /// writes its record *after* the unwind and the storage flush, so the append
+    /// failing is the one path where the undo has already happened and been made
+    /// durable while the record saying so has not. The session must poison there,
+    /// and the next reopen must poison too, because a `Prepare` with no terminal
+    /// record is indistinguishable from an undo that never ran.
+    fail_abort: bool,
     fail_close: bool,
     closes: usize,
 }
@@ -33,6 +43,7 @@ impl Journal for MemoryJournal {
         let mut log = self.log.lock().unwrap();
         if (log.fail_prepare && matches!(record.payload, JournalPayload::Prepare { .. }))
             || (log.fail_commit && matches!(record.payload, JournalPayload::Commit))
+            || (log.fail_abort && matches!(record.payload, JournalPayload::Abort { .. }))
         {
             return Err(error(ErrorKind::Io, "injected journal failure"));
         }
@@ -43,6 +54,16 @@ impl Journal for MemoryJournal {
         Ok(sequence)
     }
     fn flush(&mut self, through: Sequence) -> Result<DurableSequence> {
+        // A landmine for reopen tests, and cheaper to name than to hit. Since
+        // #65 `bind` seeds `last_committed` from `recovery.last_valid_sequence`,
+        // so a session reopened over a journal that reports N records starts
+        // with `last_committed = N` while *this* double's `records` is empty --
+        // it is a fresh log, and `bind` never calls `Journal::open`. Any path
+        // that flushes `self.last_committed` (`checkpoint`, notably) then trips
+        // this assert with a panic that says nothing about the cause. A real
+        // `FileJournal` does not care: its `flush` returns `state.last_sequence`
+        // regardless of what was asked for. Tests that need both want
+        // `last_valid_sequence` to match the records they intend to write.
         assert!(through.0 <= self.log.lock().unwrap().records.len() as u64);
         Ok(DurableSequence {
             run_id: self.run,
@@ -86,6 +107,8 @@ fn recovery(run_id: RunId) -> RecoveryState {
         durable: None,
         pending: vec![],
         tail: JournalTailRecovery::Intact,
+        // Nothing declared this run unrecoverable; see the field.
+        recovery_required: false,
         clean: true,
     }
 }
@@ -173,6 +196,12 @@ impl Storage for BadReceipt {
             0 => receipt.run_id = RunId(Uuid::new_v4()),
             1 => receipt.writer_epoch = LeaseEpoch(receipt.writer_epoch.0 + 1),
             2 => receipt.durability = Durability::None,
+            // Not a corrupt receipt but no receipt at all: the backend refusing
+            // the flush. Distinct because the two take different paths out of
+            // `abort` -- this one carries the backend's own kind, while 0..=2
+            // reach the engine's `ProtocolMismatch` -- and only this one models
+            // a store that could not make the undo durable in the first place.
+            3 => return Err(error(ErrorKind::Io, "injected flush failure")),
             _ => unreachable!(),
         }
         Ok(receipt)
@@ -6264,5 +6293,1432 @@ fn an_unimplemented_ownership_carry_still_propagates() {
             .unwrap_err()
             .kind,
         ErrorKind::NotImplemented
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #65: what a reopen makes of a journal that is not pristine.
+//
+// `Fixture` cannot reach any of this. Its `MemoryJournal::open` always answers
+// the pristine `recovery()` at the top of this file, which is precisely why
+// nothing observed `bind`'s old blanket refusal and why nothing would observe
+// the classification that replaced it either. So the inventory is substituted at
+// the same seam `MemoryJournal` already occupies, and the honest statement of
+// what these tests prove is: *given* the recovery state a crashed run leaves,
+// this is what `bind` does with it.
+//
+// That used to be the whole story, because nothing reopened a run at all. It is
+// not any more: `Supervisor::resume` and `umbra-cli resume` exist, and
+// `umbra-supervisor/tests/reopen.rs` drives a real crashed run back through the
+// provider transport end to end. These stay as the unit-level half, where every
+// intent and every stage can be enumerated cheaply; that suite is the half that
+// proves the composition around them. What produces
+// that state is pinned separately, in `umbra-journal-file`'s own units and — for
+// the abort ordering, which is the half #65 actually changes — by
+// `a_crash_during_rollback_leaves_no_abort_record_and_a_reopen_poisons` below,
+// which drives a real engine over `LocalStorage` and reduces the log it wrote.
+
+/// A reopened session and the verdict `bind` returned for it.
+///
+/// The `TempDir`s ride along because dropping them unlinks the trees a bound
+/// session still points at, and a bound-but-poisoned session is exactly what
+/// these tests go on to interrogate.
+struct Reopened {
+    overlay: Overlay,
+    bound: Result<()>,
+    process: ProcessContext,
+    /// The reopened session's own journal, empty at `bind` -- `bind` never calls
+    /// `Journal::open`, it takes the inventory through `SessionConfig::recovery`.
+    /// What lands here is only what the reopened session goes on to write.
+    log: Arc<Mutex<Log>>,
+    _dirs: [TempDir; 2],
+}
+
+/// Build the two `LocalStorage` trees a run uses and hand `bind` a recovery
+/// inventory the caller shapes.
+fn reopen(inventory: impl FnOnce(&mut RecoveryState)) -> Reopened {
+    let base_dir = tempfile::tempdir().unwrap();
+    let shadow_dir = tempfile::tempdir().unwrap();
+    let (mut base, base_binding, base_lease) = open_storage(&base_dir);
+    base.release_writer(&base_lease).unwrap();
+    let base = StorageBase::new(
+        Box::new(base),
+        base_binding.clone(),
+        context(base_binding.run_id, None),
+    )
+    .unwrap();
+    let (shadow, binding, lease) = open_storage(&shadow_dir);
+    let log = Arc::new(Mutex::new(Log::default()));
+    let journal = MemoryJournal {
+        log: log.clone(),
+        run: binding.run_id,
+        epoch: lease.epoch,
+    };
+    let mut state = recovery(binding.run_id);
+    inventory(&mut state);
+    let config = SessionConfig {
+        context: context(binding.run_id, Some(lease.epoch)),
+        recovery: state,
+        binding,
+        lease,
+    };
+    let mut overlay = Overlay::new(Box::new(shadow), Box::new(journal));
+    let bound = overlay.bind(config, Box::new(base));
+    Reopened {
+        overlay,
+        bound,
+        process: ProcessContext {
+            task: TaskId(TaskIdentity {
+                native_id: 1,
+                generation: 1,
+            }),
+            parent: None,
+            architecture: Architecture::Aarch64,
+            abi: "test".into(),
+            exec_generation: 0,
+            root: bytes(b"/"),
+            cwd: bytes(b"/"),
+            fds: BTreeMap::new(),
+        },
+        log,
+        _dirs: [base_dir, shadow_dir],
+    }
+}
+
+/// One prepared operation with no terminal record behind it -- what
+/// `apply_recovery` leaves in `RecoveryState.pending` for a transaction whose
+/// session died between `Prepare` and `Commit`/`Abort`.
+fn unfinished(intent: JournalIntent) -> JournalPendingOperation {
+    JournalPendingOperation {
+        operation_id: OperationId(Uuid::new_v4()),
+        writer_epoch: LeaseEpoch(1),
+        prepared_at: Sequence(1),
+        intent,
+        observed_result: None,
+    }
+}
+
+/// Reduce a `MemoryJournal` log to its **pending inventory**, the way
+/// `umbra-journal-file`'s `apply_recovery` reduces a replayed one: a `Prepare`
+/// opens an entry, either terminal record closes it, an `ObservedResult`
+/// annotates it.
+///
+/// **This is one of `apply_recovery`'s two outputs, not both.** That function's
+/// signature is `(&mut BTreeMap<_, JournalPendingOperation>, &mut bool,
+/// &JournalRecord)`: besides the pending map it latches `recovery_required` on a
+/// `JournalLifecycle::RecoveryRequired` record, which is the signal `Overlay::abort`
+/// writes on its uncorroborated path and which no amount of looking at the
+/// pending map can reconstruct -- the same session writes the terminal record
+/// that empties it. This helper deliberately returns only the map, and the tests
+/// that need the latch read it from the records themselves and set
+/// `RecoveryState::recovery_required` explicitly (see
+/// `an_uncorroborated_abort_over_a_creation_makes_the_next_reopen_poison`). Do
+/// not read a `recovery_required: false` beside a call to this as though this had
+/// answered for it.
+///
+/// A restatement rather than a call, and deliberately: `umbra-overlay` does not
+/// depend on `umbra-journal-file`, and the original is pinned against real bytes
+/// by that crate's own units (`a_prepare_with_no_terminal_record_survives_the_reopen`
+/// and its siblings). What this buys is the join the two crates cannot make
+/// themselves -- a log a real engine wrote, reduced, and put back in front of
+/// `bind`.
+fn inventory(records: &[JournalRecord]) -> Vec<JournalPendingOperation> {
+    let mut pending: Vec<JournalPendingOperation> = vec![];
+    for record in records {
+        match &record.payload {
+            JournalPayload::Prepare { intent } => pending.push(JournalPendingOperation {
+                operation_id: record.operation_id,
+                writer_epoch: record.writer_epoch,
+                prepared_at: record.sequence,
+                intent: intent.clone(),
+                observed_result: None,
+            }),
+            JournalPayload::ObservedResult { outcome } => {
+                if let Some(entry) = pending
+                    .iter_mut()
+                    .find(|e| e.operation_id == record.operation_id)
+                {
+                    entry.observed_result = Some(outcome.clone());
+                }
+            }
+            JournalPayload::Commit | JournalPayload::Abort { .. } => {
+                pending.retain(|e| e.operation_id != record.operation_id)
+            }
+            JournalPayload::Lifecycle(_) => {}
+        }
+    }
+    pending
+}
+
+/// A prepared operation whose kernel verdict came back a *failure* -- the only
+/// stage at which a transaction can be discarded by a reopen.
+///
+/// `unfinished` alone is not that: an entry with no observed result is one whose
+/// `prepare` may not have finished, because `observe_result` refuses a poisoned
+/// session and `prepare` poisons on any error in its closure. So a durable
+/// `ObservedResult` is what proves `prepare` returned, and a *failure* is what
+/// proves `commit` never ran. See `reconcilable_on_reopen`.
+fn refused(intent: JournalIntent) -> JournalPendingOperation {
+    JournalPendingOperation {
+        observed_result: Some(OperationOutcome::Failure(EPERM)),
+        ..unfinished(intent)
+    }
+}
+
+fn create_intent(directory: bool) -> JournalIntent {
+    JournalIntent::Create {
+        object: ObjectId(Uuid::new_v4()),
+        path: bytes(b"/fresh"),
+        directory,
+        mode: 0o644,
+    }
+}
+
+/// The poison verdict's shape, asserted once so every case below states only
+/// which intent it is about: `bind` *succeeds*, the session is poisoned, and
+/// every operation refuses through `idle()`.
+///
+/// Succeeding is the point of the widening and not an incidental choice.
+/// `poisoned` already means "requires recovery", so the run is as finished as a
+/// refused `bind` would have left it -- but the caller holds a bound session
+/// whose recovery state it can read, instead of an error and no handle.
+#[track_caller]
+fn assert_poisoned_open(mut reopened: Reopened, what: &str) {
+    reopened
+        .bound
+        .unwrap_or_else(|e| panic!("{what}: bind must succeed and poison, not refuse: {e:?}"));
+    assert!(
+        reopened.overlay.poisoned,
+        "{what}: an unfinished creation must poison the reopened session"
+    );
+    assert_eq!(
+        reopened
+            .overlay
+            .resolve(&reopened.process, &open(b"any", OpenFlags::default()))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState,
+        "{what}: a poisoned session must refuse every operation"
+    );
+}
+
+// The two intents a creating `FsOp::Open` and an `FsOp::Mkdir` journal. Both
+// materialise the object and every ancestor `parents` made over nothing, and
+// both record the undo only in memory.
+#[test]
+fn a_reopen_that_finds_an_unfinished_file_creation_binds_poisoned() {
+    assert_poisoned_open(
+        reopen(|r| r.pending = vec![unfinished(create_intent(false))]),
+        "Create{directory:false}",
+    );
+}
+
+#[test]
+fn a_reopen_that_finds_an_unfinished_directory_creation_binds_poisoned() {
+    assert_poisoned_open(
+        reopen(|r| r.pending = vec![unfinished(create_intent(true))]),
+        "Create{directory:true}",
+    );
+}
+
+// The arm that could not be reconciled from durable state even in principle:
+// the backing index is keyed by the *backend* object ID the shadow assigned the
+// placeholder, and no intent carries it. See `RollbackEntry::Symlink`.
+#[test]
+fn a_reopen_that_finds_an_unfinished_symlink_binds_poisoned() {
+    assert_poisoned_open(
+        reopen(|r| {
+            r.pending = vec![unfinished(JournalIntent::Symlink {
+                object: ObjectId(Uuid::new_v4()),
+                path: bytes(b"/link"),
+                target: bytes(b"/target"),
+            })]
+        }),
+        "Symlink",
+    );
+}
+
+// A cross-path rename may have materialised the destination's ancestors.
+#[test]
+fn a_reopen_that_finds_an_unfinished_rename_binds_poisoned() {
+    assert_poisoned_open(
+        reopen(|r| {
+            r.pending = vec![unfinished(JournalIntent::Rename {
+                object: ObjectId(Uuid::new_v4()),
+                from: bytes(b"/source"),
+                to: bytes(b"/fresh/target"),
+            })]
+        }),
+        "Rename{from != to}",
+    );
+}
+
+// The same-path rename creates nothing -- `prepare` guards the whole arm on
+// `destination != plan.path` -- and is poisoned anyway. Proving the guard took
+// the no-op branch would mean re-deriving the plan against a tree this session
+// has not looked at, and being wrong publishes a phantom path that answers
+// `AlreadyExists` forever. This test exists so that the fail-closed choice is a
+// pinned decision rather than an accident of how the arm happens to be written.
+#[test]
+fn a_reopen_that_finds_an_unfinished_self_rename_binds_poisoned_anyway() {
+    assert_poisoned_open(
+        reopen(|r| {
+            r.pending = vec![unfinished(JournalIntent::Rename {
+                object: ObjectId(Uuid::new_v4()),
+                from: bytes(b"/same"),
+                to: bytes(b"/same"),
+            })]
+        }),
+        "Rename{from == to}",
+    );
+}
+
+// Neither intent is reachable, and both are refused at the same place:
+// `resolve`'s `_ =>` arm answers `UnsupportedCapability` for `FsOp::Link` and
+// `FsOp::Chmod` alike, so no plan for either reaches `prepare` and
+// `Overlay::intent` never runs on one. A record carrying one was therefore not
+// written by this engine's `prepare`, so nothing can say what that `prepare`
+// left behind -- which is "don't know", which poisons. The arms exist so that
+// making either reachable forces the verdict to be chosen rather than inherited
+// from a wildcard.
+#[test]
+fn a_reopen_that_finds_an_intent_no_prepare_arm_produces_binds_poisoned() {
+    assert_poisoned_open(
+        reopen(|r| {
+            r.pending = vec![unfinished(JournalIntent::Link {
+                object: ObjectId(Uuid::new_v4()),
+                existing: bytes(b"/existing"),
+                new_path: bytes(b"/new"),
+            })]
+        }),
+        "Link",
+    );
+    assert_poisoned_open(
+        reopen(|r| {
+            r.pending = vec![unfinished(JournalIntent::Chmod {
+                object: ObjectId(Uuid::new_v4()),
+                mode: 0o600,
+            })]
+        }),
+        "Chmod",
+    );
+}
+
+// The reconcilable half, and the only thing the widening lets a run survive
+// that it could not before. Every one of these `prepare` arms creates nothing:
+// `Unlink` records a plan and performs nothing (#66), and the other four reach
+// `copy_up`, which deliberately keeps its object and its ancestors off
+// `Pending.rollback`.
+//
+// That is only the intent half of the test, and the entries here carry the other
+// half: `refused(..)`, a durable `Failure` outcome. It proves `prepare` returned
+// -- `observe_result` goes through `pending_for`, which refuses a poisoned
+// session, and `prepare` poisons on any error in its closure -- and it proves
+// `commit` never ran, because `commit`'s own precondition is an observed
+// *success*. Both windows are therefore closed by evidence in the inventory.
+//
+// An earlier version of this comment argued the second point from the effects'
+// provenance instead: that `whiteouts`, `retired_index` and `destroy` could not
+// have landed because `commit` is their only consumer. That is true of a
+// reconciled *abort*, which never takes the commit path at all, and false here:
+// `commit` applies every effect it has *before* it writes its terminal record,
+// so a missing `Commit` means it may not have finished rather than never
+// started. See `reconcilable_on_reopen`.
+#[test]
+fn a_reopen_that_finds_only_non_creating_intents_binds_clean() {
+    let object = ObjectId(Uuid::new_v4());
+    for (what, intent) in [
+        (
+            "Unlink",
+            JournalIntent::Unlink {
+                object,
+                path: bytes(b"/gone"),
+                directory: false,
+            },
+        ),
+        (
+            "Chown",
+            JournalIntent::Chown {
+                object,
+                path: bytes(b"/owned"),
+                uid: Some(0),
+                gid: Some(0),
+                copy_up: true,
+            },
+        ),
+        (
+            "CopyUp",
+            JournalIntent::CopyUp {
+                object,
+                path: bytes(b"/shadowed"),
+            },
+        ),
+        ("Truncate", JournalIntent::Truncate { object, length: 0 }),
+        (
+            "Write",
+            JournalIntent::Write {
+                object,
+                offset: None,
+                length: 4,
+            },
+        ),
+    ] {
+        let mut reopened = reopen(|r| {
+            // A *refused* syscall: `prepare` completed and `commit` can never
+            // have run, which is the one stage at which the intent decides.
+            r.pending = vec![refused(intent)];
+            r.last_valid_sequence = Sequence(2);
+            r.clean = false;
+        });
+        reopened
+            .bound
+            .unwrap_or_else(|e| panic!("{what}: must reopen, not refuse: {e:?}"));
+        assert!(
+            !reopened.overlay.poisoned,
+            "{what}: nothing this arm's prepare did needs an undo"
+        );
+        // Usable, not merely bound: the refusal that comes back is the tree's
+        // answer about a path that does not exist, not `idle()`'s about a
+        // session that cannot serve.
+        assert_eq!(
+            reopened
+                .overlay
+                .resolve(&reopened.process, &open(b"any", OpenFlags::default()))
+                .unwrap_err()
+                .kind,
+            ErrorKind::NotFound,
+            "{what}: the session must still serve"
+        );
+    }
+}
+
+// One unreconcilable transaction condemns the session even where every other one
+// is fine. The ordering is deliberate: the creating intent is second, so a
+// classifier that stopped at the first entry would fail this.
+//
+// The first entry is a *refused* copy-up rather than an unobserved one, so it is
+// genuinely reconcilable on its own and the poison can only be coming from the
+// second. An unobserved entry would poison by itself and the test would pass
+// without discriminating anything.
+#[test]
+fn a_reopen_poisons_when_any_pending_intent_implies_a_creation() {
+    assert_poisoned_open(
+        reopen(|r| {
+            r.pending = vec![
+                refused(JournalIntent::CopyUp {
+                    object: ObjectId(Uuid::new_v4()),
+                    path: bytes(b"/shadowed"),
+                }),
+                refused(create_intent(false)),
+            ];
+            r.clean = false;
+        }),
+        "CopyUp then Create",
+    );
+}
+
+// `last_valid_sequence` had to go with the `pending` predicate rather than
+// stay: it is non-zero for *every* run that journaled anything at all, cleanly
+// finished ones included, so leaving it would have made the widening vacuous --
+// no reopen carrying pending work could ever have got past it to be classified.
+// This is the E6 case: an empty inventory now asserts that every transaction
+// reached a terminal record its own effects had already reached the store to
+// earn -- a `Commit` after `commit`'s flush, or an `Abort` after a completed
+// unwind and `abort`'s flush of the removals it recorded. That is what the
+// reordering plus the flush buy; neither alone would do it.
+#[test]
+fn a_reopen_of_a_journal_that_recorded_work_and_finished_it_binds_clean() {
+    let mut reopened = reopen(|r| {
+        r.last_valid_sequence = Sequence(9);
+        r.durable = None;
+    });
+    reopened.bound.unwrap();
+    assert!(!reopened.overlay.poisoned);
+    assert_eq!(
+        reopened
+            .overlay
+            .resolve(&reopened.process, &open(b"any", OpenFlags::default()))
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+}
+
+// The two predicates that stay, and for reasons that were never the premise #65
+// retired. A checkpoint belongs to checkpoint-based recovery, which is
+// unimplemented -- `Supervisor::resume` reopens and classifies, and refuses a
+// checkpoint for this same reason. A torn tail may have eaten the very terminal record the
+// classification reads, and `open` has already physically truncated those bytes,
+// so they cannot be re-examined -- "don't know", which poisoning would overstate
+// because poisoning names a *specific* transaction as unreconciled.
+#[test]
+fn a_reopen_still_refuses_a_checkpoint_or_a_torn_tail() {
+    let reopened = reopen(|r| {
+        r.checkpoint = Some(Checkpoint {
+            format_version: 1,
+            id: CheckpointId(Uuid::new_v4()),
+            run_id: r.run_id,
+            writer_epoch: LeaseEpoch(1),
+            last_committed: DurableSequence {
+                run_id: r.run_id,
+                writer_epoch: LeaseEpoch(1),
+                sequence: Sequence(1),
+            },
+            fingerprints: JournalFingerprints {
+                base: "test-base".into(),
+                toolchain: "test".into(),
+                agent_provider_id: "test".into(),
+                agent_version: "test".into(),
+                supervisor_version: "test".into(),
+            },
+            state: JournalLogicalState {
+                format_version: 1,
+                entries: vec![],
+                whiteouts: vec![],
+                agent_session_id: "test".into(),
+                agent_state_paths: vec![],
+                metadata: vec![],
+            },
+            clean: true,
+        });
+    });
+    assert_eq!(
+        reopened.bound.unwrap_err().kind,
+        ErrorKind::UnsupportedCapability,
+        "checkpoint-based recovery is not this issue's"
+    );
+    assert!(
+        !reopened.overlay.poisoned,
+        "a refusal leaves no session to poison"
+    );
+
+    let reopened = reopen(|r| {
+        r.tail = JournalTailRecovery::IncompleteFinalFrame {
+            valid_bytes: 128,
+            discarded_bytes: 3,
+            repaired: true,
+        };
+    });
+    assert_eq!(
+        reopened.bound.unwrap_err().kind,
+        ErrorKind::UnsupportedCapability,
+        "a torn tail may have eaten the terminal record the classification reads"
+    );
+}
+
+// #65's single most valuable test, and the one that would have caught the old
+// ordering. A real engine over `LocalStorage` drives a refused creating `Open`
+// to an abort whose unlink is refused; the reduction of the log it wrote is then
+// put back in front of `bind`.
+//
+// Under the retired ordering the `Abort` record went first, so this log would
+// have carried one, `apply_recovery` would have dropped the operation from the
+// inventory, and the reopen below would have found an *empty* `pending` --
+// indistinguishable from a run that finished cleanly, over a shadow tree still
+// holding the object the undo could not remove. That is exactly the "infer
+// reconcilability from the absence of a record" that #65 forbids, and it is why
+// the reordering rather than any new journal payload is the load-bearing half of
+// this change.
+//
+// Mode-based injection, as in
+// `a_rollback_that_cannot_unlink_poisons_instead_of_claiming_success`: a uid
+// that ignores the mode makes the `unwrap_err` a panic, so under root this fails
+// loudly rather than passing vacuously.
+#[test]
+fn a_crash_during_rollback_leaves_no_abort_record_and_a_reopen_poisons() {
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&create_open(b"fresh"));
+    let object = f.shadow_root.join("fresh");
+    assert!(object.exists());
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    let restore = fs::metadata(&f.shadow_root).unwrap().permissions();
+    fs::set_permissions(&f.shadow_root, fs::Permissions::from_mode(0o500)).unwrap();
+    let aborted = f
+        .overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC));
+    fs::set_permissions(&f.shadow_root, restore).unwrap();
+    aborted.unwrap_err();
+    assert!(f.overlay.poisoned);
+    assert!(object.exists(), "the undo did not run to completion");
+
+    let records = f.log.lock().unwrap().records.clone();
+    assert!(
+        matches!(&records[0].payload, JournalPayload::Prepare { intent }
+            if matches!(intent, JournalIntent::Create { directory: false, .. })),
+        "the creation's intent is durable, and was before the creation happened"
+    );
+    assert!(matches!(
+        records[1].payload,
+        JournalPayload::ObservedResult { .. }
+    ));
+    assert!(
+        !records
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Abort { .. })),
+        "an undo that failed must not leave a record asserting it succeeded"
+    );
+
+    let pending = inventory(&records);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the operation is still unfinished on disk"
+    );
+    let sequence = Sequence(records.len() as u64);
+    assert_poisoned_open(
+        reopen(move |r| {
+            r.pending = pending;
+            r.last_valid_sequence = sequence;
+            r.clean = false;
+        }),
+        "reopen after a failed rollback",
+    );
+}
+
+// The other half of the same ordering, and what makes the record an assertion
+// rather than an announcement: an undo that *completes* writes its `Abort`, the
+// reduction drops the operation, and the reopen is clean. Without this the test
+// above would be satisfied by an engine that had simply stopped journaling
+// aborts.
+#[test]
+fn a_completed_rollback_writes_its_abort_record_and_a_reopen_is_clean() {
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&create_open(b"fresh"));
+    assert!(f.shadow_root.join("fresh").exists());
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+        .unwrap();
+    assert!(!f.overlay.poisoned);
+    assert!(
+        !f.shadow_root.join("fresh").exists(),
+        "the undo ran to completion, which is half of what the record below \
+         asserts; the flush is the other half"
+    );
+
+    let records = f.log.lock().unwrap().records.clone();
+    assert!(
+        matches!(&records.last().unwrap().payload,
+            JournalPayload::Abort { reason } if reason.contains("KernelRefused")),
+        "the record comes after the unwind, so it is still the last thing written"
+    );
+    let pending = inventory(&records);
+    assert!(
+        pending.is_empty(),
+        "a terminal record ends the operation for a reopen"
+    );
+    let sequence = Sequence(records.len() as u64);
+    let reopened = reopen(move |r| r.last_valid_sequence = sequence);
+    reopened.bound.unwrap();
+    assert!(!reopened.overlay.poisoned);
+}
+
+// The uncorroborated path never reaches an unwind, so its record keeps the place
+// it has always had and #53's guarantee is unqualified there. Pinned because the
+// reordering had to step around it, and a later simplification that folded the
+// two record sites together would silently take this one with it.
+#[test]
+fn an_uncorroborated_abort_still_journals_its_reason_before_it_poisons() {
+    let mut f = Fixture::new(&[(b"file", b"base bytes")]);
+    let before = f.log.lock().unwrap().records.len();
+    let prepared = f.prepare(&chown(b"file", Some(0), Some(0), true));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(EPERM))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(EACCES))
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState
+    );
+    assert!(f.overlay.poisoned);
+    let payloads = f.log.lock().unwrap().records[before..].to_vec();
+    assert!(
+        matches!(&payloads.last().unwrap().payload,
+            JournalPayload::Abort { reason } if reason.contains("KernelRefused")),
+        "an abort that never reaches an unwind journals its reason unconditionally"
+    );
+}
+
+// The crash-during-commit case. A `Commit` is durable, so the reduction drops
+// the operation and the reopen is clean -- the `Commit` is honoured and no
+// poison fires, even though the journal is anything but pristine.
+#[test]
+fn a_reopen_of_a_journal_whose_last_transaction_committed_binds_clean() {
+    let mut f = Fixture::new(&[]);
+    f.run(&create_open(b"fresh"));
+    let records = f.log.lock().unwrap().records.clone();
+    assert!(
+        records
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Commit)),
+        "the transaction committed"
+    );
+    let pending = inventory(&records);
+    assert!(pending.is_empty());
+    let sequence = Sequence(records.len() as u64);
+    assert_ne!(sequence, Sequence(0), "the journal is not pristine");
+    let reopened = reopen(move |r| r.last_valid_sequence = sequence);
+    reopened.bound.unwrap();
+    assert!(!reopened.overlay.poisoned);
+}
+
+// S1: the `Abort` record now asserts that the undo reached the *store's*
+// durability boundary, not merely that the unlinks returned. `record(.., true)`
+// fsyncs the journal and says nothing about the shadow, so without a storage
+// flush a crash between the last removal returning and the record reaching the
+// platter would leave an empty recovery inventory -- a clean, unpoisoned
+// reopen -- over a tree still holding the object.
+//
+// Driven through `BadReceipt` rather than a flush counter, because a corrupt
+// receipt proves two things at once: that a flush was issued at all, and that
+// its receipt is validated on the same three conditions `commit` validates.
+// Variant 2 is `Durability::None`, the one the design argues about; 0 and 1 are
+// run and epoch identity.
+#[test]
+fn an_abort_that_removed_something_refuses_an_invalid_durability_receipt() {
+    for mismatch in 0..3 {
+        let mut f = Fixture::with_bad_receipt(&[], Some(mismatch));
+        let prepared = f.prepare(&create_open(b"fresh"));
+        f.overlay
+            .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+            .unwrap();
+        assert_eq!(
+            f.overlay
+                .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+                .unwrap_err()
+                .kind,
+            ErrorKind::ProtocolMismatch,
+            "mismatch {mismatch}: an undo whose durability cannot be certified \
+             must not be reported as reconciled"
+        );
+        assert!(f.overlay.poisoned);
+        // The record is the assertion, so it is withheld exactly as it is after
+        // a failed unwind: a reopen finds `Prepare` with no terminal record and
+        // poisons, which is the whole point of the ordering.
+        assert!(
+            !f.log
+                .lock()
+                .unwrap()
+                .records
+                .iter()
+                .any(|r| matches!(r.payload, JournalPayload::Abort { .. })),
+            "mismatch {mismatch}: no record may claim an undo that was not certified"
+        );
+    }
+}
+
+// The gate, and the reason the flush is affordable. An abort with an empty
+// `rollback` removed nothing, so there is nothing to make durable and no flush
+// is issued -- which the same corrupt receipt proves by *not* being consulted.
+// This is #53's hot path: an ordinary `EPERM` on a chown must reach the tracee
+// without paying for a barrier. The aborts that do pay are refused creating
+// `Open`s, `Mkdir`s and `Symlink`s, and `commit` already pays a flush for those
+// same transactions when they stand.
+#[test]
+fn an_abort_that_removed_nothing_pays_for_no_flush_and_still_reconciles() {
+    for mismatch in 0..3 {
+        let mut f = Fixture::with_bad_receipt(&[(b"file", b"base bytes")], Some(mismatch));
+        let before = f.log.lock().unwrap().records.len();
+        let prepared = f.prepare(&chown(b"file", Some(0), Some(0), true));
+        f.overlay
+            .observe_result(prepared.operation_id, &OperationOutcome::Failure(EPERM))
+            .unwrap();
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(EPERM))
+            .unwrap_or_else(|e| {
+                panic!("mismatch {mismatch}: a copy-up abort must not consult a receipt: {e:?}")
+            });
+        assert!(
+            !f.overlay.poisoned,
+            "mismatch {mismatch}: #53's hot path must stay usable"
+        );
+        let payloads = f.log.lock().unwrap().records[before..].to_vec();
+        assert!(
+            matches!(&payloads.last().unwrap().payload,
+                JournalPayload::Abort { reason } if reason.contains("KernelRefused")),
+            "mismatch {mismatch}: a reconciled abort still journals its reason"
+        );
+    }
+}
+
+// S3: a clean reopen has to inherit the log's extent, not restart the session's
+// bookkeeping from zero.
+//
+// `finish_run` writes `Lifecycle(RunCompleted { through: self.last_committed })`,
+// which is the repo's terminal "this run completed cleanly, through here"
+// evidence. A reopen that left `last_committed` at zero would journal a durable
+// claim to have finished through sequence 0 over a log holding N records -- a
+// false statement made durable, which is exactly the class of defect the rest of
+// this change exists to remove.
+#[test]
+fn a_clean_reopen_inherits_the_logs_extent_for_the_run_completion_record() {
+    let reopened = reopen(|r| {
+        r.pending = vec![refused(JournalIntent::CopyUp {
+            object: ObjectId(Uuid::new_v4()),
+            path: bytes(b"/shadowed"),
+        })];
+        r.last_valid_sequence = Sequence(9);
+        r.clean = false;
+    });
+    reopened.bound.unwrap();
+    assert!(!reopened.overlay.poisoned);
+    assert_eq!(
+        reopened.overlay.last_committed,
+        Sequence(9),
+        "the reopened session must not claim the log is empty"
+    );
+}
+
+// The defect itself, driven rather than inspected: the durable record
+// `finish_run` writes must name the sequence the reopened log actually reached.
+// Without the seeding this journals `RunCompleted { through: Sequence(0) }` over
+// a log holding four records, and that record is what the rest of the system
+// reads as "this run completed cleanly, through here".
+#[test]
+fn a_run_finished_after_a_reopen_does_not_claim_it_completed_through_sequence_zero() {
+    let mut reopened = reopen(|r| r.last_valid_sequence = Sequence(4));
+    reopened.bound.unwrap();
+    let run_id = reopened.overlay.config().unwrap().binding.run_id;
+    reopened
+        .overlay
+        .finish_run(&FinishRunRequest {
+            run_id,
+            root_status: Some(ExitStatus::Code(0)),
+            processes_exited: 1,
+        })
+        .unwrap();
+    let through = reopened
+        .log
+        .lock()
+        .unwrap()
+        .records
+        .iter()
+        .find_map(|r| match r.payload {
+            JournalPayload::Lifecycle(JournalLifecycle::RunCompleted { through }) => Some(through),
+            _ => None,
+        })
+        .expect("finish_run journals a completion record");
+    assert_eq!(
+        through,
+        Sequence(4),
+        "the completion record must not claim the run finished through sequence 0"
+    );
+}
+
+// Every operation ID the *inventory still carries* stays spent. `prepare` refuses
+// a reused ID so that one ID cannot carry two `Prepare` records; a reopen that
+// forgot the unfinished ones would let a caller spend one a second time, and
+// `apply_recovery` inserts by operation ID, so the second `Prepare` would
+// silently overwrite the first's intent rather than be caught.
+//
+// Scoped to the pending IDs deliberately, and the name says so: `apply_recovery`
+// drops an operation on either terminal record, so a *committed* or *aborted* ID
+// never reaches `bind` and stays re-spendable across a reopen. That gap is real
+// and is recorded as a follow-up -- closing it needs `RecoveryState` to carry the
+// spent IDs. This test does not cover it and must not be read as if it did.
+#[test]
+fn a_reopen_treats_unfinished_operation_ids_as_spent() {
+    let spent = OperationId(Uuid::new_v4());
+    let mut reopened = reopen(move |r| {
+        r.pending = vec![JournalPendingOperation {
+            operation_id: spent,
+            writer_epoch: LeaseEpoch(1),
+            prepared_at: Sequence(1),
+            intent: JournalIntent::Unlink {
+                object: ObjectId(Uuid::new_v4()),
+                path: bytes(b"/gone"),
+                directory: false,
+            },
+            // Refused, so the entry is reconcilable and this test is about the
+            // ID rather than about the verdict.
+            observed_result: Some(OperationOutcome::Failure(EPERM)),
+        }];
+        r.last_valid_sequence = Sequence(1);
+        r.clean = false;
+    });
+    reopened.bound.unwrap();
+    assert!(!reopened.overlay.poisoned, "an Unlink intent reconciles");
+    let action = reopened
+        .overlay
+        .resolve(&reopened.process, &create_open(b"fresh"))
+        .unwrap();
+    assert_eq!(
+        reopened.overlay.prepare(spent, &action).unwrap_err().kind,
+        ErrorKind::InvalidState,
+        "an ID that already carries a durable Prepare must not be spendable again"
+    );
+}
+
+// S5: the one seam in `abort` whose *order* changed, pinned rather than left
+// correct-by-inspection.
+//
+// On master the `Abort` record went first, so an append failure meant nothing had
+// been undone yet. Now the unwind and the storage flush have both already run, so
+// this is the single path where the undo is done and durable while the record
+// asserting it is not. Two things must hold, and neither is obvious from reading:
+// the session poisons (it must not report a reconciliation whose evidence it
+// could not write), and the *next* reopen poisons too -- because a `Prepare` with
+// no terminal record is indistinguishable from an undo that never ran, and
+// fail-closed is the only honest reading of that.
+//
+// The residue is the price of the ordering and is deliberate: the object really
+// is gone, so the reopen poisons over a tree that did not need repair. That is
+// the safe direction, and it is the same direction every other "don't know" in
+// this change takes.
+#[test]
+fn an_abort_whose_record_cannot_be_written_poisons_and_the_next_reopen_poisons_too() {
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&create_open(b"fresh"));
+    assert!(f.shadow_root.join("fresh").exists());
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    f.log.lock().unwrap().fail_abort = true;
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+            .unwrap_err()
+            .kind,
+        ErrorKind::Io,
+        "the journal's own error reaches the caller"
+    );
+    assert!(
+        f.overlay.poisoned,
+        "a reconciliation whose evidence could not be written is not a reconciliation"
+    );
+    // The undo itself ran to completion before the record was attempted -- that
+    // is the ordering under test.
+    assert!(
+        !f.shadow_root.join("fresh").exists(),
+        "the unwind precedes the record, so it has already happened here"
+    );
+
+    let records = f.log.lock().unwrap().records.clone();
+    assert!(
+        !records
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Abort { .. })),
+        "the injected failure is what this test is about"
+    );
+    let pending = inventory(&records);
+    assert_eq!(pending.len(), 1);
+    let sequence = Sequence(records.len() as u64);
+    assert_poisoned_open(
+        reopen(move |r| {
+            r.pending = pending;
+            r.last_valid_sequence = sequence;
+            r.clean = false;
+        }),
+        "reopen after an unwritable Abort record",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #65 waiver (viii): the uncorroborated abort's poison, made durable.
+//
+// The defect this closes needed no crash at all. The uncorroborated path writes
+// a terminal `Abort` record and runs **no** unwind -- deliberately, because a
+// session that cannot account for a transaction's effects must not undo them on
+// a guess. But `apply_recovery` drops an operation from the inventory on either
+// terminal record, so the `Prepare` intent never reached `replay_must_poison`,
+// and a later reopen bound **clean and unpoisoned** over a shadow tree still
+// holding the object and every ancestor `parents` materialised over nothing.
+//
+// That was the one path in this engine that answered "definitely not undone"
+// with "proceed" -- worse than any crash window, because the abort runs to
+// completion and the journal it leaves reads as finished. `abort` now journals
+// `JournalLifecycle::RecoveryRequired` first, `apply_recovery` latches it, and
+// `bind` poisons on it unconditionally.
+
+// The regression test proper, and deliberately the shape of the probe that
+// found this: drive the real engine, reduce the log it wrote, reopen.
+#[test]
+fn an_uncorroborated_abort_over_a_creation_makes_the_next_reopen_poison() {
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&create_open(b"fresh"));
+    let object = f.shadow_root.join("fresh");
+    assert!(object.exists(), "prepare materialised the object");
+    // No `observe_result` at all, so `pending.outcome` is `None` and the
+    // corroboration gate cannot pass. This is the uncorroborated path.
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::Cancelled)
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidState
+    );
+    assert!(f.overlay.poisoned);
+    assert!(
+        object.exists(),
+        "no unwind runs on this path -- the creation was never undone, which is \
+         exactly why the next reopen must not be told the transaction is settled"
+    );
+
+    let records = f.log.lock().unwrap().records.clone();
+    assert!(
+        records
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Abort { .. })),
+        "the Abort record still goes where it always did"
+    );
+    assert!(
+        inventory(&records).is_empty(),
+        "and it is still terminal to the reduction -- which is the whole problem, \
+         and why the fix could not live in the inventory"
+    );
+
+    let recovery_required = records.iter().any(|r| {
+        matches!(
+            r.payload,
+            JournalPayload::Lifecycle(JournalLifecycle::RecoveryRequired)
+        )
+    });
+    assert!(recovery_required, "the poison is journaled");
+    let sequence = Sequence(records.len() as u64);
+    assert_poisoned_open(
+        reopen(move |r| {
+            r.recovery_required = recovery_required;
+            r.last_valid_sequence = sequence;
+            r.clean = false;
+        }),
+        "reopen after an uncorroborated abort",
+    );
+}
+
+// The ordering, which is the safety property rather than a preference. A crash
+// between the two records must leave the `Prepare` with no terminal record at
+// all, so the classifier poisons on it -- so `RecoveryRequired` goes first. The
+// reverse order would leave an `Abort` with no declaration behind it, which is
+// precisely the hole being closed.
+#[test]
+fn the_recovery_required_record_precedes_the_abort_it_qualifies() {
+    let mut f = Fixture::new(&[]);
+    let prepared = f.prepare(&create_open(b"fresh"));
+    let before = f.log.lock().unwrap().records.len();
+    f.overlay
+        .abort(prepared.operation_id, &AbortReason::Cancelled)
+        .unwrap_err();
+    let payloads = f.log.lock().unwrap().records[before..].to_vec();
+    let declared = payloads
+        .iter()
+        .position(|r| {
+            matches!(
+                r.payload,
+                JournalPayload::Lifecycle(JournalLifecycle::RecoveryRequired)
+            )
+        })
+        .expect("the poison is journaled");
+    let terminal = payloads
+        .iter()
+        .position(|r| matches!(r.payload, JournalPayload::Abort { .. }))
+        .expect("the Abort record is still written");
+    assert!(
+        declared < terminal,
+        "a crash between the two must leave no terminal record, not no declaration"
+    );
+    // Both carry the transaction's own operation ID, so a reader can tell which
+    // transaction the run was abandoned over. The terminal record's ID is the one
+    // that has to be right for recovery: `apply_recovery` -- and the `inventory`
+    // helper that restates it -- removes a pending entry only when the terminal
+    // record's ID matches, so a wrong ID here would leave the `Prepare` standing
+    // and everything above would still pass.
+    assert_eq!(payloads[declared].operation_id, prepared.operation_id);
+    assert_eq!(payloads[terminal].operation_id, prepared.operation_id);
+}
+
+// Honoured unconditionally, not re-derived per intent. The declaration was made
+// by a session holding the transaction's actual state; everything a reopen has
+// is the intent, and it does not even have that here, because the terminal
+// record emptied the inventory. A reader with strictly less evidence must not
+// overrule the writer.
+#[test]
+fn a_declared_recovery_requirement_poisons_even_with_an_empty_inventory() {
+    assert_poisoned_open(
+        reopen(|r| {
+            r.recovery_required = true;
+            r.last_valid_sequence = Sequence(4);
+            r.clean = false;
+        }),
+        "declared, with nothing left in the inventory to infer from",
+    );
+}
+
+// The trap, pinned from the other side: the declaration is an *additional*
+// ground for poisoning, not a replacement for the classifier, and it must not
+// swallow the ratified E5 behaviour. A journal with reconcilable intents and no
+// declaration still binds clean and still serves, which is what `bind` widened
+// for. `clean` is deliberately not the carrier -- it is already false for any
+// nonempty `pending`, so poisoning on it would have regressed exactly this.
+#[test]
+fn an_undeclared_reopen_with_reconcilable_intents_still_binds_clean() {
+    let mut reopened = reopen(|r| {
+        r.pending = vec![refused(JournalIntent::Chown {
+            object: ObjectId(Uuid::new_v4()),
+            path: bytes(b"/owned"),
+            uid: Some(0),
+            gid: None,
+            copy_up: true,
+        })];
+        r.recovery_required = false;
+        r.last_valid_sequence = Sequence(3);
+        // False, because a nonempty inventory is never clean -- and the session
+        // binds anyway. This is the distinction the carrier exists to preserve.
+        r.clean = false;
+    });
+    reopened.bound.unwrap();
+    assert!(
+        !reopened.overlay.poisoned,
+        "an undeclared, reconcilable inventory is E5 and must still bind clean"
+    );
+    assert_eq!(
+        reopened
+            .overlay
+            .resolve(&reopened.process, &open(b"any", OpenFlags::default()))
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound,
+        "and the session must still serve"
+    );
+}
+
+// R3: the flush's *failure* path, as distinct from its receipt-validation path.
+// Mismatch 3 refuses the call outright rather than corrupting its answer, which
+// is the store that could not make the undo durable at all. The error is the
+// backend's own kind here, where a rejected receipt is the engine's
+// `ProtocolMismatch` -- the two halves of the rule the `unwound` comment states.
+#[test]
+fn an_abort_whose_storage_flush_fails_poisons_with_the_backends_own_kind() {
+    let mut f = Fixture::with_bad_receipt(&[], Some(3));
+    let prepared = f.prepare(&create_open(b"fresh"));
+    f.overlay
+        .observe_result(prepared.operation_id, &OperationOutcome::Failure(ENOSPC))
+        .unwrap();
+    assert_eq!(
+        f.overlay
+            .abort(prepared.operation_id, &AbortReason::KernelRefused(ENOSPC))
+            .unwrap_err()
+            .kind,
+        ErrorKind::Io,
+        "a failed flush reports the backend's error, not the engine's"
+    );
+    assert!(f.overlay.poisoned);
+    assert!(
+        !f.log
+            .lock()
+            .unwrap()
+            .records
+            .iter()
+            .any(|r| matches!(r.payload, JournalPayload::Abort { .. })),
+        "an undo that could not be made durable is not one the record may assert"
+    );
+}
+
+// CR1: the mirror image of the `prepare` hazard, at the other end of the
+// transaction.
+//
+// `replay_must_poison` answers for what `prepare` materialised. It cannot answer
+// for what `commit` may have applied, because `commit` performs every effect it
+// has -- the retired symlink index, the whiteout markers, the `destroy` removal
+// -- and writes its terminal record last. So `Prepare` with no `Commit` does not
+// mean `commit` never ran; it means `commit` may not have finished, and for an
+// `FsOp::Unlink` that is a marker on disk with the object still standing, or the
+// object gone with no marker. The reconcilable verdict alone bound clean over
+// either.
+//
+// `bind` therefore also poisons on an observed *success*, which is the exact
+// precondition `commit` enforces before it touches anything -- so the conjunct
+// reads "`commit` was reachable for this operation".
+#[test]
+fn a_reopen_poisons_a_reconcilable_intent_whose_kernel_outcome_was_a_success() {
+    assert_poisoned_open(
+        reopen(|r| {
+            r.pending = vec![JournalPendingOperation {
+                observed_result: Some(OperationOutcome::Success { return_value: 0 }),
+                ..unfinished(JournalIntent::Unlink {
+                    object: ObjectId(Uuid::new_v4()),
+                    path: bytes(b"/gone"),
+                    directory: false,
+                })
+            }];
+            r.last_valid_sequence = Sequence(2);
+            r.clean = false;
+        }),
+        "Unlink whose commit may have started",
+    );
+}
+
+// Broader than the minimum, deliberately, and pinned so the breadth is a decision
+// rather than an accident. Today `Unlink` is the only reconcilable intent whose
+// `prepare` arm populates `whiteouts`, `retired_index` or `destroy`, so keying on
+// the intent would be exact -- and would be a restatement of which arm sets which
+// field, which is the drift `replay_must_poison` is co-located with `prepare` to
+// avoid, here with no compiler behind it. An arm that later gave `Chown` a
+// whiteout would silently invalidate the narrow rule and leave this one correct.
+#[test]
+fn an_observed_success_poisons_every_reconcilable_intent_not_only_unlink() {
+    let object = ObjectId(Uuid::new_v4());
+    for (what, intent) in [
+        (
+            "Chown",
+            JournalIntent::Chown {
+                object,
+                path: bytes(b"/owned"),
+                uid: Some(0),
+                gid: None,
+                copy_up: true,
+            },
+        ),
+        (
+            "CopyUp",
+            JournalIntent::CopyUp {
+                object,
+                path: bytes(b"/shadowed"),
+            },
+        ),
+        ("Truncate", JournalIntent::Truncate { object, length: 0 }),
+        (
+            "Write",
+            JournalIntent::Write {
+                object,
+                offset: None,
+                length: 4,
+            },
+        ),
+    ] {
+        assert_poisoned_open(
+            reopen(move |r| {
+                r.pending = vec![JournalPendingOperation {
+                    observed_result: Some(OperationOutcome::Success { return_value: 0 }),
+                    ..unfinished(intent)
+                }];
+                r.clean = false;
+            }),
+            what,
+        );
+    }
+}
+
+// The complement, which is what keeps the conjunct `Some(Success)` rather than
+// `Some(..)`. An observed *failure* never reaches `commit` -- it routes to
+// `abort`, which the record ordering and the durable declaration already cover --
+// so it must not poison here, and E5's ratified behaviour survives for it.
+#[test]
+fn a_reopen_of_a_reconcilable_intent_whose_outcome_was_a_failure_still_binds_clean() {
+    let mut reopened = reopen(|r| {
+        r.pending = vec![JournalPendingOperation {
+            observed_result: Some(OperationOutcome::Failure(EPERM)),
+            ..unfinished(JournalIntent::Unlink {
+                object: ObjectId(Uuid::new_v4()),
+                path: bytes(b"/gone"),
+                directory: false,
+            })
+        }];
+        r.last_valid_sequence = Sequence(2);
+        r.clean = false;
+    });
+    reopened.bound.unwrap();
+    assert!(
+        !reopened.overlay.poisoned,
+        "a refused syscall never reached commit, so nothing of it can be half-applied"
+    );
+    assert_eq!(
+        reopened
+            .overlay
+            .resolve(&reopened.process, &open(b"any", OpenFlags::default()))
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound,
+        "and the session must still serve"
+    );
+}
+
+// CR3: the third fail-open of the same class, and the one that made the rule
+// collapse. `replay_must_poison` calls `CopyUp`/`Chown` reconcilable because
+// copy-up residue is the divergence a *committed* copy-up leaves anyway -- and
+// that is true only once `copy_up` has run to the end. `copy_up` is `create`,
+// then a `write_at` loop, then `carry_ownership`. Stop in the middle and the
+// shadow holds a truncated or empty copy of a base file; `lookup` prefers the
+// shadow, so a clean reopen serves wrong content at a path the run already
+// exposed. Nothing a committed copy-up ever produces.
+//
+// An unobserved entry is exactly that window: `observe_result` goes through
+// `pending_for`, which refuses a poisoned session, and `prepare` poisons on any
+// error inside its closure -- so a durable `ObservedResult` proves `prepare`
+// returned, and its absence proves nothing at all.
+#[test]
+fn a_reopen_poisons_a_copy_up_whose_prepare_may_not_have_finished() {
+    assert_poisoned_open(
+        reopen(|r| {
+            r.pending = vec![unfinished(JournalIntent::CopyUp {
+                object: ObjectId(Uuid::new_v4()),
+                path: bytes(b"/shadowed"),
+            })];
+            r.last_valid_sequence = Sequence(1);
+            r.clean = false;
+        }),
+        "CopyUp with no observed outcome",
+    );
+}
+
+// The same window for every other reconcilable intent, because the hazard is the
+// transaction's *stage* and not which intent happens to materialise. `Chown`
+// reaches `copy_up` too, and `Unlink`/`Truncate`/`Write` are here so that the
+// rule cannot later be narrowed back to "the two intents that call `copy_up`"
+// without a test going red -- that narrowing would be a restatement of which arm
+// calls what, with no compiler behind it.
+#[test]
+fn an_unobserved_outcome_poisons_every_reconcilable_intent() {
+    let object = ObjectId(Uuid::new_v4());
+    for (what, intent) in [
+        (
+            "Chown",
+            JournalIntent::Chown {
+                object,
+                path: bytes(b"/owned"),
+                uid: Some(0),
+                gid: None,
+                copy_up: true,
+            },
+        ),
+        (
+            "Unlink",
+            JournalIntent::Unlink {
+                object,
+                path: bytes(b"/gone"),
+                directory: false,
+            },
+        ),
+        ("Truncate", JournalIntent::Truncate { object, length: 0 }),
+        (
+            "Write",
+            JournalIntent::Write {
+                object,
+                offset: None,
+                length: 4,
+            },
+        ),
+    ] {
+        assert_poisoned_open(
+            reopen(move |r| {
+                r.pending = vec![unfinished(intent)];
+                r.clean = false;
+            }),
+            what,
+        );
+    }
+}
+
+// The rule, stated as a truth table over the one axis that decides it, so the
+// three cases sit in one place and a future reader can check them against
+// `reconcilable_on_reopen` without reassembling them from four tests.
+//
+// `Some(Failure)` is the only reconcilable stage: `prepare` completed, and
+// `commit` can never have run because its own precondition is an observed
+// success. That is the ordinary refused syscall #53 exists to let a run survive,
+// and narrowing it further would poison every `EPERM` a reopened run inherited.
+#[test]
+fn only_a_refused_syscall_under_a_non_creating_intent_is_reconcilable() {
+    let intent = || JournalIntent::CopyUp {
+        object: ObjectId(Uuid::new_v4()),
+        path: bytes(b"/shadowed"),
+    };
+    for (stage, outcome, poisons) in [
+        ("prepare may not have finished", None, true),
+        (
+            "commit may have started",
+            Some(OperationOutcome::Success { return_value: 0 }),
+            true,
+        ),
+        (
+            "refused: prepare finished, commit never ran",
+            Some(OperationOutcome::Failure(EPERM)),
+            false,
+        ),
+    ] {
+        let reopened = reopen(|r| {
+            r.pending = vec![JournalPendingOperation {
+                observed_result: outcome,
+                ..unfinished(intent())
+            }];
+            r.clean = false;
+        });
+        reopened
+            .bound
+            .unwrap_or_else(|e| panic!("{stage}: bind must succeed, not refuse: {e:?}"));
+        assert_eq!(
+            reopened.overlay.poisoned, poisons,
+            "{stage}: a non-creating intent is reconcilable only at a refused stage"
+        );
+    }
+}
+
+// FU#2: the operation-ID uniqueness invariant, pinned at the log rather than at
+// `bind`.
+//
+// `bind` seeds `used_operations` from the recovery *inventory*, which holds only
+// operations with no terminal record -- so a committed or aborted ID is not
+// re-refused across a reopen, and pretending otherwise is what the seeding
+// comment was corrected for. The invariant that actually has to hold is one level
+// down and is checkable directly: **no operation ID may carry two `Prepare`
+// records.** `apply_recovery` inserts by operation ID, so a second `Prepare`
+// under a spent ID would not be caught -- it would silently overwrite the first's
+// intent, and a reopen would classify the wrong transaction.
+//
+// Within one session `prepare`'s `used_operations` check is what enforces it, and
+// this test drives that: several real transactions, then a deliberate reuse that
+// must be refused, then the log-level assertion. Removing the check in `prepare`
+// makes the reuse succeed and the assertion fire, which is the mutation that
+// proves this is not vacuous.
+#[test]
+fn no_operation_id_carries_two_prepare_records() {
+    let mut f = Fixture::new(&[(b"base", b"bytes")]);
+    f.run(&create_open(b"one"));
+    f.run(&create_open(b"two"));
+    f.run(&unlink(b"base"));
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"dir"),
+        mode: 0o755,
+    });
+
+    let prepares: Vec<OperationId> = f
+        .log
+        .lock()
+        .unwrap()
+        .records
+        .iter()
+        .filter(|r| matches!(r.payload, JournalPayload::Prepare { .. }))
+        .map(|r| r.operation_id)
+        .collect();
+    assert!(
+        prepares.len() >= 4,
+        "the fixture must actually have journaled several transactions"
+    );
+
+    // The reuse the invariant exists to stop, attempted through the public
+    // sequence rather than asserted about in the abstract.
+    let spent = prepares[0];
+    let action = f
+        .overlay
+        .resolve(&f.process, &create_open(b"three"))
+        .unwrap();
+    assert_eq!(
+        f.overlay.prepare(spent, &action).unwrap_err().kind,
+        ErrorKind::InvalidState,
+        "an ID that already carries a durable Prepare must not be spendable again"
+    );
+
+    let unique: BTreeSet<OperationId> = prepares.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        prepares.len(),
+        "every Prepare in the log must carry a distinct operation ID; a duplicate \
+         would be silently overwritten by apply_recovery's insert"
     );
 }

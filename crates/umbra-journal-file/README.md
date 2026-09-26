@@ -18,8 +18,11 @@ Boundaries the implementation keeps:
 - `open` validates format version, run identity, access intent and injected writer
   authority before opening anything for mutation, then replays to establish the
   last valid sequence and the prepared-but-uncommitted operations for the
-  namespace owner to reconcile. Recovery is clean only with no pending operations
-  and an intact tail. Readable frames are never treated as evidence of a
+  namespace owner to reconcile. Recovery is clean only with no pending operations,
+  an intact tail, and no `RecoveryRequired` verdict from a prior session -- the
+  third is not implied by the first, because the session that declares itself
+  unrecoverable also writes the terminal record that empties `pending` of the
+  operation it is about. Readable frames are never treated as evidence of a
   previous flush receipt. A zero-length log left by interrupted creation is
   treated as absent; writer open reinstalls its header. A nonempty invalid header
   remains corruption.
@@ -45,7 +48,11 @@ Boundaries the implementation keeps:
 
 Resumable checkpoint recovery is out of scope here: this backend publishes and
 reads checkpoints, but reconciling a nonempty recovery into a running namespace is
-not implemented in the overlay.
+not implemented in the overlay. Since
+[#65](https://github.com/invakid404/umbra/issues/65) the overlay does *read* the
+inventory `apply_recovery` builds — it poisons the session for any unfinished
+operation whose `Prepare` intent implies a creation — but that is detection, not
+reconciliation, and a recovery carrying a checkpoint is still refused.
 
 The package supplies its own provider binary and `provider.json` installation
 template. See [provider setup](../../docs/providers.md).

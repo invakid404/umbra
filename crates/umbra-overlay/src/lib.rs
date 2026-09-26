@@ -79,6 +79,26 @@ pub trait NamespaceSession: NamespaceResolver {
             "provider does not support runtime binding",
         ))
     }
+    /// Whether this session requires recovery and is refusing every operation.
+    ///
+    /// The companion to `bind`, and defaulted the same way and for the same
+    /// reason: binding is an in-process operation with no request on the provider
+    /// wire, so a provider that cannot be bound has no verdict to report and says
+    /// so rather than answering `false`. A silent `false` here would be the
+    /// fail-open shape [#65](https://github.com/invakid404/umbra/issues/65) exists
+    /// to remove — a caller would read "no recovery needed" from a session that
+    /// was never classified at all.
+    ///
+    /// This reports the session's *current* state, not a stored bind-time
+    /// verdict. Immediately after `bind` the two coincide, which is what a reopen
+    /// reads; later a failed rollback or an unaccountable abort can also set it.
+    fn requires_recovery(&self) -> Result<bool> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.requires_recovery",
+            "provider does not support runtime binding",
+        ))
+    }
     /// Read logical bytes through the overlay without native ABI memory encoding.
     fn read_at(&mut self, _path: &StoragePath, _offset: u64, _out: &mut [u8]) -> Result<usize> {
         Err(umbra_core::UmbraError::new(

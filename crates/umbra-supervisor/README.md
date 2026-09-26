@@ -6,8 +6,57 @@ core and the five contracts. This crate owns `src/lib.rs`, `src/run.rs`,
 backend and selects none: storage, journal, platform and agent arrive as
 contracts, and backend choice stays in registry descriptors.
 
-`umbra_supervisor::run(spec)` executes one command run end to end. Checkpoint,
-resume, recovery and handoff remain `NotImplemented`.
+`umbra_supervisor::run(spec)` executes one command run end to end.
+`umbra_supervisor::resume(spec)` — also reachable as `Supervisor::resume`, and as
+`Supervisor::recover`, which is the same call — reopens an existing run and
+reports whether what the last session left can be reconciled. Checkpoint and
+handoff remain `NotImplemented`, and so does reconciliation itself: a reopen
+diagnoses, it does not repair.
+
+## `resume(ResumeSpec) -> Result<ResumeOutcome>`
+
+`ResumeSpec` carries the provider registry, the run ID, the workspace as it was at
+creation, and the persistence selection. There is nothing to launch, so there is
+no `RunLaunch` and no observer.
+
+Admission is **shared with `run`, not restated**. `admit_run` holds everything
+that describes the run: registry validation, the strict-remote refusal, the
+workspace checks, the refusal of any registry configuring a `namespace` role, the
+storage descriptor's persistence-mode capability, and the presence of the journal
+role. `validate` calls it and then adds what describes the *launch* — the
+`--experimental` acknowledgement, the `RunLaunch` shape,
+`experimental-open-rewrite-v1` and the two platform capabilities. `resume` calls it
+and adds nothing, because it resolves nothing, rewrites nothing, launches nothing
+and never connects the platform role; requiring capabilities it does not exercise
+would turn an unqualified claim into a passing check.
+
+That split is a correction, and worth stating as one: this path first re-derived
+`run`'s admission and dropped a clause twice — the persistence capability, then the
+namespace-role refusal — each time letting a reopen accept a registry `run`
+refuses. One list means a third omission cannot be written.
+
+The sequence is then `run`'s opening half with three differences. Storage is opened
+with `OpenRunIntent::OpenExisting` rather than `CreateNew`. The journal gate is
+narrower: `run` refuses *any* non-fresh journal, which is right for what it guards
+— a `CreateNew` that comes back non-fresh is a storage/journal disagreement, not
+recovery — while a reopen refuses only what `Overlay::bind` refuses, a checkpoint
+or a torn tail, and lets `bind` classify the rest. And nothing launches, so
+teardown is `fail_run` with `tree_terminated: true`: honest rather than
+pessimistic, because no tree was ever started, and the only teardown a poisoned
+session accepts.
+
+`ResumeOutcome::recovery_required` is the verdict, read from the bound session
+through `NamespaceSession::requires_recovery` rather than re-derived. `Ok` means
+the reopen worked, **not** that the run is usable; a caller that ignores that
+field has ignored the point of the reopen.
+
+The writer epoch is not managed here. Every backend already advances it across a
+reopen: `umbra-storage-{local,nfs,tar}` read the run's persisted epoch in
+`acquire_writer`, add one and write it back durably on every acquisition, and
+`umbra-storage-nfs-userspace` derives an `epoch_floor` in `open_run` that is zero
+for `CreateNew` and the run's own recorded epoch otherwise, then admits at
+`floor + 1` and treats a marker below the floor as the regression it is. A bump
+here would be a fifth mechanism racing four.
 
 ## `run(RunSpec) -> Result<()>`
 
