@@ -320,3 +320,80 @@ fn repeated_environment_names_are_rejected_across_both_flags() {
             .contains("duplicate environment name: UMBRA_REPEAT"));
     }
 }
+
+/// A registry that clears every check `run` can make before it opens a
+/// connection, so the first thing able to fail is the provider spawn itself.
+///
+/// `storage` is the nonexistent one: `run` connects storage first
+/// (`umbra-supervisor/src/run.rs:511-514`), before the journal and long before
+/// the platform, so naming a missing storage executable is what reaches the
+/// spawn. A declared capability is operator-written JSON — a claim, not
+/// evidence — which is exactly why this registry parses and admits.
+fn registry_naming_a_missing_storage_executable(path: &std::path::Path) {
+    let executable = |path: &str| {
+        path.bytes()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let descriptor = |id: &str, role: &str, exe: &str, caps: &str| {
+        format!(
+            r#""{role}":{{"id":"{id}","role":"{role}","protocol_version":2,"executable":[{}],"capabilities":[{caps}],"options":[]}}"#,
+            executable(exe)
+        )
+    };
+    let body = format!(
+        r#"{{"timeout_ms":5000,"providers":{{{}}}}}"#,
+        [
+            descriptor(
+                "local",
+                "storage",
+                "/nonexistent/umbra-storage-local",
+                r#""local-development-v1","experimental-open-rewrite-v1""#
+            ),
+            descriptor("file", "journal", "/bin/true", ""),
+            descriptor(
+                "macos",
+                "platform",
+                "/bin/true",
+                r#""sandboxed-stopped-launch-v1","experimental-syscall-rewrite-v1""#
+            ),
+        ]
+        .join(",")
+    );
+    let mut file = std::fs::File::create(path).unwrap();
+    file.write_all(body.as_bytes()).unwrap();
+}
+
+#[test]
+fn a_missing_backend_executable_fails_without_installing_or_asking() {
+    let dir = scratch("missing-backend");
+    let path = dir.join("registry.json");
+    registry_naming_a_missing_storage_executable(&path);
+    let (code, stdout, stderr) = run(&[
+        "run",
+        "--registry",
+        path.to_str().unwrap(),
+        "--workspace",
+        dir.to_str().unwrap(),
+        "--experimental",
+        "--local-dev",
+        "--",
+        "/bin/true",
+    ]);
+    // Exit 1 for a structured failure, and no prompt: stdin was closed, so a
+    // question would have failed loudly here instead of blocking.
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stdout.is_empty(), "diagnostics belong on stderr: {stdout}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    // The transport reports the spawn it could not make, naming the role's
+    // failure rather than offering to install a backend.
+    assert!(stderr.contains("provider.transport"), "{stderr}");
+    assert!(
+        stderr.contains("StorageUnavailable"),
+        "the storage role is named as unavailable: {stderr}"
+    );
+    // No run was prepared, so nothing was opened and there is nothing to clean.
+    assert!(!stderr.contains(" prepared"), "{stderr}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
