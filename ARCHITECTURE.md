@@ -60,19 +60,26 @@ requirement to import every allowed crate.
   implementation crates, including optional, feature-selected, target-specific
   and build dependencies. Overlay currently uses `umbra-storage-local` as a
   dev-dependency for real-filesystem tests; the other trait crates do not.
-- Each leaf backend has only its own trait crate and core as direct Umbra
+- Each leaf backend has only its own trait crate and core as direct Umbra runtime
   dependencies. NFS cannot import local storage; the file journal cannot import
   storage; agent adapters cannot import platform implementations. Transitive trait
-  dependencies do not authorize additional direct edges.
-- Supervisor and CLI depend on contracts, never concrete backends, even in tests.
-  Backend-selecting Cargo features and closed backend enums are forbidden. Open
-  provider IDs are configuration data; operation/event/error enums remain useful.
+  dependencies do not authorize additional direct edges. `umbra-platform-macos`
+  currently dev-depends on `umbra-overlay`, `umbra-storage`, `umbra-journal` and
+  `umbra-storage-local` so one fixture test can drive the real overlay transaction
+  flow; the other leaf backends do not.
+- Supervisor and CLI depend on contracts, never concrete backends: no backend
+  appears in either crate's runtime dependencies, so neither links one. Both
+  currently dev-depend on `umbra-storage-local` and `umbra-journal-file` so their
+  test targets can build a run's durable state through the real backends and reopen
+  it through the real provider executables. Backend-selecting Cargo features and
+  closed backend enums are forbidden. Open provider IDs are configuration data;
+  operation/event/error enums remain useful.
 - Native OS bindings and target-specific build settings stay in platform and
   storage backends.
   Shared DTOs belong in core, and per-trait protocols/factories in the trait crate.
 - Conformance helpers belong with contracts and use fakes or injected trait objects.
   Tests obey the same dependency boundaries as production code except for the
-  overlay's local-storage dev-dependency described above.
+  test-only dev-dependencies named above.
 
 Contracts are synchronous and object-safe: constructors stay outside the runtime
 trait surface, which has no generic methods, unconstrained associated types, or
@@ -103,8 +110,8 @@ To add a backend:
 
 1. Create `crates/umbra-<role>-<name>` with its README and inherited workspace
    metadata, and add the package to the root member list. Its only direct Umbra
-   dependencies are its own trait crate and core. An alternative namespace backend
-   uses `umbra-overlay` and its re-exported storage/journal contracts.
+   runtime dependencies are its own trait crate and core. An alternative namespace
+   backend uses `umbra-overlay` and its re-exported storage/journal contracts.
 2. Implement the relevant object-safe traits and semantic obligations. Platforms
    qualify stopped launch, descendants, exec, sandboxing and controller loss.
    Storage qualifies containment, idempotency, durability and fencing of existing

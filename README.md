@@ -58,11 +58,11 @@ runs the sandbox, IPC, tracer fixture, local-storage CLI matrix and reopen suite
 on an `umbra-integration` macOS ARM64 runner, with
 `UMBRA_INTEGRATION_REQUIRED=1` so a missing prerequisite fails there instead of
 skipping. It requires debugger permission. The
-NFS-backed CLI matrix (`nfs_fixture_matrix`) is opted out of CI via
-`UMBRA_TEST_SKIP_NFS_MATRIX` because the current storage-nfs adapter needs a
-real NFSv4 kernel mount and macOS Sequoia/Tahoe blocks that path from a
-launchd context without user-approved MDM; that test still runs in local dev
-when `UMBRA_TEST_NFS_ROOT` is set. The
+NFS-backed CLI matrices (`nfs_fixture_matrix` and `nfs_utility_matrix`) are
+opted out of CI via `UMBRA_TEST_SKIP_NFS_MATRIX` because the current storage-nfs
+adapter needs a real NFSv4 kernel mount and macOS Sequoia/Tahoe blocks that path
+from a launchd context without user-approved MDM; those tests still run in local
+dev when `UMBRA_TEST_NFS_ROOT` is set. The
 [userspace NFSv4 backend](crates/umbra-storage-nfs-userspace/README.md) removes
 the local-mount requirement by speaking NFSv4.0/TCP/AUTH_SYS itself: it carries
 the Umbra-owned client state machine, a raw transport behind an off-by-default

@@ -1,10 +1,16 @@
 # umbra-supervisor
 
-Synchronous run composition and the debug-control event loop, depending only on
-core and the five contracts. This crate owns `src/lib.rs`, `src/run.rs`,
-`src/events.rs`, `src/base.rs`, `src/sandbox.rs` and its manifest. It links no
-backend and selects none: storage, journal, platform and agent arrive as
-contracts, and backend choice stays in registry descriptors.
+Synchronous run composition and the debug-control event loop. **Runtime
+dependencies remain `umbra-core`, the five contracts, `tracing` and `uuid` only.**
+`umbra-storage-local` and `umbra-journal-file` are dev-dependencies: the
+integration tests bind a real overlay over real storage on tempdirs, and build a
+run's durable journal state directly before reopening it. The suites that spawn
+the real provider executables skip when those are absent, and fail instead under
+`UMBRA_INTEGRATION_REQUIRED` (`tests/reopen.rs:38-67`).
+This crate owns `src/lib.rs`, `src/run.rs`, `src/events.rs`, `src/base.rs`,
+`src/sandbox.rs` and its manifest. It links no backend and selects none: storage,
+journal, platform and agent arrive as contracts, and backend choice stays in
+registry descriptors.
 
 `umbra_supervisor::run(spec)` executes one command run end to end.
 `umbra_supervisor::resume(spec)` — also reachable as `Supervisor::resume`, and as

@@ -3,7 +3,9 @@
 Clap command interface for the `umbra` binary, plus the in-process composition that
 turns an explicit provider registry into a run request. This crate owns
 `src/lib.rs`, `src/main.rs`, `src/composition.rs`, the `src/commands/` handlers and
-the CLI tests; it has no implementation-crate dependencies, including in tests.
+the CLI tests; `[dependencies]` names no implementation crate, so nothing links a
+backend into the binary. Exactly two reach the tests — `umbra-journal-file` and
+`umbra-storage-local`, for the reason recorded at `Cargo.toml:27-29`.
 
 `run` and `resume` are operational. `stop`, `checkpoint` and `inspect` are stubs
 that report `not implemented` on stderr and exit 1; they no longer echo their
@@ -85,7 +87,15 @@ supervised program that exited nonzero, which surfaces as `ProcessFailed` after 
 clean teardown. Exit 0 means the root process succeeded **and** the run's data,
 journal and writer lease were closed cleanly. The child's own exit code is not
 propagated: a 0 would describe the child while saying nothing about persistence.
-Run status goes to stderr; stdout stays the supervised program's.
+
+Run status goes to stderr, so `umbra`'s own diagnostics never reach stdout. The
+supervised program's streams are not the caller's, though: it inherits fds 0-2
+from the platform provider process, which the provider transport starts with
+stdin and stdout on `/dev/null` and stderr inherited
+(`umbra-core/src/provider/transport.rs:321-323`). A supervised program's stderr
+therefore reaches the caller and its stdout is discarded — `/bin/cat` under
+`umbra run` exits 0 and prints nothing. Plumbing the tracee's stdout through to
+the caller is unimplemented.
 
 ## Compatibility changes
 
@@ -126,9 +136,32 @@ commands report their captured stderr before any required run-ID parse. Cleanup
 uses an emitted prepared ID even when that status assertion fails; without one,
 it touches no directory in the shared NFS mount.
 
-Set `UMBRA_TEST_SKIP_NFS_MATRIX=1` to skip the `nfs_fixture_matrix` case even
-under `UMBRA_INTEGRATION_REQUIRED=1`. CI uses this because the current
-storage-nfs adapter needs a real NFSv4 kernel mount and macOS Sequoia/Tahoe
-gates that path from a launchd context without user-approved MDM. Local dev
-runs the case normally; the escape hatch retires once a userspace NFSv4
-backend lands.
+The same file's `local_utility_matrix` and `nfs_utility_matrix` run standard
+utilities behind the same gating — `/usr/bin/touch`, `/bin/mkdir`, `/bin/cat` and
+`/bin/ls` — one `umbra run` per invocation, each against its own freshly seeded
+workspace. `/bin/mkdir` is expected to fail there: bare `mkdir(2)` is outside the
+tracer's rewritten syscall set, so its operand reaches the kernel unrewritten and
+the unconditional sandbox refuses it, and nothing is then created on the host or
+in the shadow.
+
+The two read utilities each run twice, on an operand that exists and on one that
+does not. The failure leg pins that the program ran at all, by requiring its own
+`No such file or directory` line on stderr: a tracee's stderr reaches the caller
+even though its stdout does not, so that line is evidence nothing a no-op could
+produce. Neither leg pins *which* resolver answered — each operand is present or
+absent on the host exactly as it is in the run — so redirection into the shadow
+is pinned by the `/usr/bin/touch` case's exact-bytes assertion instead.
+
+Three further cases re-execute the test binary itself as the tracee to pin the
+exit surface: a child that exits 41, one that raises `SIGKILL` and one that
+raises `SIGSEGV`. The exit-41 case leaves `umbra` at exit 1 because a child's
+status is never propagated. The two signalled cases never reach that rule: the
+platform backend refuses a stop it cannot resume from, so the run fails with the
+platform's error, records no completion, and still exits 1.
+
+Set `UMBRA_TEST_SKIP_NFS_MATRIX=1` to skip the `nfs_fixture_matrix` and
+`nfs_utility_matrix` cases even under `UMBRA_INTEGRATION_REQUIRED=1`. CI uses
+this because the current storage-nfs adapter needs a real NFSv4 kernel mount
+and macOS Sequoia/Tahoe gates that path from a launchd context without
+user-approved MDM. Local dev runs the cases normally; the escape hatch retires
+once a userspace NFSv4 backend lands.

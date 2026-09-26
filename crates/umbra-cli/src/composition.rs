@@ -27,6 +27,11 @@ pub fn load_registry(path: &std::path::Path) -> Result<ProviderRegistry> {
 }
 
 /// Connect every required role before handing the contracts to the supervisor.
+///
+/// This is the `umbra providers` diagnostic path, not the run path: its only
+/// caller is `commands/providers.rs:24`, and `run` calls `umbra_supervisor::run`
+/// directly (`commands/run.rs:123`) because a run needs the staged composition
+/// that owns the writer lease, the journal binding and the sandbox.
 pub fn build_supervisor(run_id: RunId, registry: &ProviderRegistry) -> Result<Supervisor> {
     registry.validate()?;
     let timeout = registry.timeout_ms;
