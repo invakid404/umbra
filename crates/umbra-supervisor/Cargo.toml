@@ -11,6 +11,7 @@ publish = false
 # why they are compile-time only. Nothing in this crate reads them.
 mutation-probe-read = ["umbra-overlay/mutation-probe-read"]
 mutation-probe-write = ["umbra-overlay/mutation-probe-write"]
+mutation-probe-fstat = ["umbra-overlay/mutation-probe-fstat"]
 
 [dependencies]
 tracing.workspace = true

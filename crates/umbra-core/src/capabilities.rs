@@ -48,6 +48,26 @@ pub const NAMESPACE_RUN_LIFECYCLE_V1: &str = "namespace-run-lifecycle-v1";
 /// configuration alone.
 pub const STORAGE_OWNERSHIP_FIDELITY_V1: &str = "ownership-fidelity-v1";
 
+/// Storage applies [`crate::storage::MetadataUpdate::accessed_nanos`] and
+/// `modified_nanos` on a `SetMetadata` and reflects the result in
+/// [`crate::storage::BlobStat::modified_nanos`].
+///
+/// The sibling of [`STORAGE_OWNERSHIP_FIDELITY_V1`] and read the same way: the
+/// claim is "a time this backend can represent is applied, and anything else is
+/// refused whole", never "every time is settable". `umbra-storage-local`,
+/// `umbra-storage-nfs` and `umbra-storage-tar` all refuse timestamps outright
+/// and must not advertise it; `umbra-storage-nfs-userspace` maps them onto
+/// NFSv4's `FATTR4_TIME_ACCESS_SET`/`FATTR4_TIME_MODIFY_SET` and refuses an
+/// unrepresentable value before the SETATTR is dispatched, which is the whole
+/// of what this name promises.
+///
+/// A consumer requires it to decide whether to *try*: without it, a `utimensat`
+/// the tracee issued is refused **to the tracee**, at `resolve`, before any
+/// journal record exists -- rather than reaching a backend that answers
+/// `UnsupportedCapability` from inside `prepare`, where the durable intent is
+/// already flushed and the only outcome left is a stopped run.
+pub const STORAGE_TIMESTAMP_FIDELITY_V1: &str = "timestamp-fidelity-v1";
+
 /// A new object this backend creates takes an identity it inherits from its
 /// prospective parent directory rather than from the store's own root, so a
 /// consumer predicting the object's created identity may read it from that

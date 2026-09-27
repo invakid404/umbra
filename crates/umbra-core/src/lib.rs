@@ -535,6 +535,31 @@ pub enum FsOp {
         /// Mode.
         mode: u32,
     },
+    /// Set the access and modification times of a named object.
+    ///
+    /// Darwin's `utimensat` carries no syscall of its own -- it builds an
+    /// attribute list and reaches the kernel as `setattrlistat(2)` -- so this
+    /// operation is what that call decodes to. Each time is optional and `None`
+    /// means *leave this one as it is*, which is how `UTIME_OMIT` and Linux's
+    /// `utimensat` alike spell a one-sided change.
+    ///
+    /// The values are absolute, already-resolved nanoseconds. "Use the current
+    /// time" is not representable and does not need to be: the caller's libc has
+    /// substituted the clock reading before the syscall is made, so a decoder
+    /// that tried to re-resolve it here would be answering with a different
+    /// instant than the program asked for.
+    SetTimes {
+        /// Dir.
+        dir: DirRef,
+        /// Path interpreted according to the enclosing operation and path type.
+        path: BytePath,
+        /// Accessed nanos. `None` leaves the access time unchanged.
+        accessed_nanos: Option<i128>,
+        /// Modified nanos. `None` leaves the modification time unchanged.
+        modified_nanos: Option<i128>,
+        /// Follow.
+        follow: bool,
+    },
     /// Fchownat.
     Fchownat {
         /// Dir.

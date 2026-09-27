@@ -519,3 +519,50 @@ fn an_emulated_unlink_is_answered_to_the_tracee_rather_than_killing_the_run() {
     assert!(!h.supervisor.is_poisoned());
     assert_eq!(h.supervisor.state().lifecycle, RunLifecycle::Running);
 }
+
+/// A `SetTimes` whose storage cannot set times is answered to the tracee, and
+/// the run survives it.
+///
+/// **The regression this pins is a stopped run, not a refusal.** `utimensat`
+/// reaches the overlay as `FsOp::SetTimes`, and three of the four storage
+/// backends -- `LocalStorage`, which this harness is built on, among them --
+/// refuse a timestamp `SetMetadata` outright. Without the capability gate the
+/// operation would resolve, `prepare` would append and flush the `SetTimes`
+/// intent, and *then* the backend would answer `UnsupportedCapability`: a
+/// durable record of a time change that never happened, a poisoned session and
+/// neither `Commit` nor `Abort` written. That is strictly worse than what
+/// happened before this syscall was routed at all, where the call reached the
+/// kernel and Seatbelt refused it.
+///
+/// So the gate is `STORAGE_TIMESTAMP_FIDELITY_V1`, checked at `resolve` before
+/// anything is journalled, and the answer is an errno the program can branch on.
+/// Driven end to end here rather than only in `umbra-overlay` because the
+/// property is the *run's* survival, which only a supervisor can show.
+#[test]
+fn a_set_times_a_backend_cannot_serve_is_answered_rather_than_killing_the_run() {
+    let mut h = Harness::new(&[(b"seed.txt", b"base bytes")]);
+    let mark = h.mark();
+
+    h.entry(FsOp::SetTimes {
+        dir: DirRef::Cwd,
+        path: bytes(b"seed.txt"),
+        accessed_nanos: Some(1_111_111_111_222_333_444),
+        modified_nanos: Some(1_555_555_555_666_777_888),
+        follow: true,
+    })
+    .expect("a set-times this backend cannot serve must be answered, not refused");
+
+    assert_eq!(
+        h.order_since(mark),
+        vec!["emulate", "set_registers", "resume"],
+        "the tracee must be handed a refusal and resumed"
+    );
+    // The half that would otherwise be false: the run is still alive, and the
+    // base file was not copied up for a change that never happened.
+    assert!(!h.supervisor.is_poisoned());
+    assert_eq!(h.supervisor.state().lifecycle, RunLifecycle::Running);
+    assert!(
+        !h.shadow_root.join("seed.txt").exists(),
+        "a refused set-times must not materialise its target"
+    );
+}

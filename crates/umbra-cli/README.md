@@ -5,7 +5,8 @@ turns an explicit provider registry into a run request. This crate owns
 `src/lib.rs`, `src/main.rs`, `src/composition.rs`, the `src/commands/` handlers and
 the CLI tests; `[dependencies]` names no implementation crate, so nothing links a
 backend into the binary. Exactly two reach the tests — `umbra-journal-file` and
-`umbra-storage-local`, for the reason recorded at `Cargo.toml:27-29`.
+`umbra-storage-local`, for the reason recorded over `umbra-core` in
+`Cargo.toml`'s `[dev-dependencies]`.
 
 `run` and `resume` are operational. `stop`, `checkpoint` and `inspect` are stubs
 that report `not implemented` on stderr and exit 1; they no longer echo their
@@ -154,12 +155,44 @@ uses an emitted prepared ID even when that status assertion fails; without one,
 it touches no directory in the shared NFS mount.
 
 The same file's `local_utility_matrix` and `nfs_utility_matrix` run standard
-utilities behind the same gating — `/usr/bin/touch`, `/bin/mkdir`, `/bin/cat` and
-`/bin/ls` — one `umbra run` per invocation, each against its own freshly seeded
-workspace. `/bin/mkdir` is expected to fail there: bare `mkdir(2)` is outside the
-tracer's rewritten syscall set, so its operand reaches the kernel unrewritten and
-the unconditional sandbox refuses it, and nothing is then created on the host or
-in the shadow.
+utilities behind the same gating — `/usr/bin/touch`, `/bin/mkdir`, `/bin/rm`,
+`/bin/cat` and `/bin/ls` — one `umbra run` per invocation, each against its own
+freshly seeded workspace.
+
+`/bin/mkdir` **now succeeds and is captured as a directory in the shadow**
+([#114](https://github.com/invakid404/umbra/issues/114)). Bare `mkdir(2)` joined
+the tracer's stub table, so the call is intercepted instead of reaching the
+kernel — and then it is **emulated, not rewritten**. `Overlay::resolve` answers
+`FsOp::Mkdir` with `success()`, which is `ResolvedAction::Emulate`, above both
+the routed fallthrough and the `_ => self.rewrite(…)` arm; the directory is
+created through `StorageOperation::Create` in `prepare`. The repo carries a test
+whose name is the whole finding:
+`mkdir_resolves_to_an_emulated_answer_with_no_rewrite_to_depend_on`.
+
+So `mkdir`'s row in the operand table is **inert**: `path_operands` is consulted
+only when an action is a rewrite, which a `Mkdir` never is. It is there because
+the operand shape is a fact about the syscall and a future rewrite-taking caller
+would need it, not because this path uses it — worth stating, because a reader
+debugging a `mkdir` regression will otherwise look at a table that cannot be the
+cause.
+
+`/bin/rm` holds the row `mkdir` vacated — it issues bare `unlink`(10), which is
+in neither table, so its operand reaches the kernel unrewritten, the
+unconditional sandbox refuses it, and the workspace is byte-identical
+afterwards. That case is the matrix's only live coverage of enforcement as the
+containment of last resort, which is why the row was re-populated rather than
+deleted.
+
+`/usr/bin/touch` on an operand that **already exists** *is* in these matrices,
+as `Expect::RefusedByBackend`, and what it pins is the refusal rather than the
+timestamp. Both matrices here are rewrite-backed and those backends refuse a
+timestamp update, so the tracee is answered `ENOTSUP`, the run survives, nothing
+is materialised in the shadow and the workspace is byte-identical. The case
+additionally requires the tracee to have printed `Operation not supported`,
+which is what distinguishes umbra's own refusal from the sandbox's `Operation
+not permitted` on the `/bin/rm` row. The times actually moving is served on the
+`nfs-userspace` registry only and is asserted there. See `umbra_interpose.c`'s
+LIMITS item 8.
 
 The two read utilities each run twice, on an operand that exists and on one that
 does not. The failure leg pins that the program ran at all, by requiring its own
@@ -180,5 +213,7 @@ Set `UMBRA_TEST_SKIP_NFS_MATRIX=1` to skip the `nfs_fixture_matrix` and
 `nfs_utility_matrix` cases even under `UMBRA_INTEGRATION_REQUIRED=1`. CI uses
 this because the current storage-nfs adapter needs a real NFSv4 kernel mount
 and macOS Sequoia/Tahoe gates that path from a launchd context without
-user-approved MDM. Local dev runs the cases normally; the escape hatch retires
-once a userspace NFSv4 backend lands.
+user-approved MDM. Local dev runs the cases normally. A userspace NFSv4 backend
+has since landed (`umbra-storage-nfs-userspace`, #116) and the hatch has not
+retired: these two cases exercise the *kernel-mount* adapter, so it retires when
+they stop needing a mount, not when a mountless backend exists.

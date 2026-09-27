@@ -304,10 +304,32 @@ struct Recorder {
     /// Case-B fallback's own answer too. Intercepts `Stat` after delegating, so
     /// only the reported uid/gid change and nothing else does.
     force_shadow_owners: Vec<(Vec<u8>, (u32, u32))>,
+    /// Stand in for a backend that applies timestamps: advertise
+    /// `timestamp-fidelity-v1` and serve the times locally.
+    ///
+    /// `LocalStorage` refuses a timestamp `SetMetadata` outright, deliberately
+    /// and in the same words as `umbra-storage-nfs` and `umbra-storage-tar`, so
+    /// it cannot stand in for the one backend that does apply them
+    /// (`umbra-storage-nfs-userspace`). Adding the name alone would only move
+    /// the refusal from `resolve` to `prepare`, which would make a `SetTimes`
+    /// test assert the opposite of what it means to.
+    ///
+    /// So the double serves the times itself: it records the request, strips the
+    /// two fields and delegates whatever is left, answering from a `Stat` when
+    /// nothing is. The shadow file's real mtime therefore does **not** move, and
+    /// the recorded request is what a test asserts on -- the same umask- and
+    /// filesystem-independent view the ownership-carry tests already read, for
+    /// the same reason.
+    timestamp_fidelity: bool,
 }
 impl Storage for Recorder {
     fn capabilities(&self) -> StorageCapabilities {
         let mut capabilities = self.inner.capabilities();
+        if self.timestamp_fidelity {
+            capabilities
+                .features
+                .insert(capabilities::STORAGE_TIMESTAMP_FIDELITY_V1.to_owned());
+        }
         if self.drop_ownership_fidelity {
             capabilities
                 .features
@@ -380,6 +402,34 @@ impl Storage for Recorder {
                         "injected set_metadata failure",
                     ));
                 }
+                // Serve the times here rather than pass them to a backend that
+                // refuses them. See `Recorder::timestamp_fidelity`.
+                if self.timestamp_fidelity
+                    && (update.accessed_nanos.is_some() || update.modified_nanos.is_some())
+                {
+                    let rest = MetadataUpdate {
+                        accessed_nanos: None,
+                        modified_nanos: None,
+                        ..update.clone()
+                    };
+                    let names_nothing_else =
+                        rest.mode.is_none() && rest.uid.is_none() && rest.gid.is_none();
+                    let response = self.inner.execute(&StorageRequest {
+                        context: request.context.clone(),
+                        operation: if names_nothing_else {
+                            StorageOperation::Stat { path: path.clone() }
+                        } else {
+                            StorageOperation::SetMetadata {
+                                path: path.clone(),
+                                update: rest,
+                            }
+                        },
+                    })?;
+                    return Ok(match response {
+                        StorageResponse::Stat(stat) => StorageResponse::MetadataSet(stat),
+                        other => other,
+                    });
+                }
             }
             // Refused before delegating, so the directory the engine could not
             // remove is still standing when the test looks for it.
@@ -426,8 +476,9 @@ impl Storage for Recorder {
 /// which paths reached the base at all -- the anchor guard in
 /// `shadow_parent_mode` is a claim about exactly that. `force_directory_mode`
 /// additionally reports an unmasked `st_mode` for directories, the way a `Base`
-/// that does not mask its own stat would; `LocalStorage` masks at
-/// `lib.rs:110`, so there is no other way to exercise the engine's own mask.
+/// that does not mask its own stat would; `LocalStorage` masks in its own
+/// `metadata()` helper (`mode: meta.mode() & 0o7777`), so there is no other way
+/// to exercise the engine's own mask.
 struct WatchedBase {
     inner: StorageBase,
     stats: BaseStats,
@@ -529,6 +580,9 @@ struct Setup<'a> {
     fail_metadata: Option<MetadataFailure>,
     /// Advertise the shadow backend's capabilities without ownership fidelity.
     drop_ownership_fidelity: bool,
+    /// Advertise `timestamp-fidelity-v1` and serve the times in the double; see
+    /// [`Recorder::timestamp_fidelity`].
+    timestamp_fidelity: bool,
     /// Report this uid/gid for every base object.
     force_owner: Option<(u32, u32)>,
     /// Report this uid/gid for these base paths only, overriding `force_owner`.
@@ -624,6 +678,7 @@ impl Fixture {
                 .or_else(|| setup.metadata.clone().map(|_| Creates::default()))
                 .or_else(|| setup.fail_metadata.clone().map(|_| Creates::default()))
                 .or_else(|| setup.drop_ownership_fidelity.then(Creates::default))
+                .or_else(|| setup.timestamp_fidelity.then(Creates::default))
                 .or_else(|| setup.force_parent_identity.map(|_| Creates::default()))
                 .or_else(|| (!setup.force_shadow_owners.is_empty()).then(Creates::default)),
         ) {
@@ -653,6 +708,7 @@ impl Fixture {
                 fail_unlink: setup.fail_unlink.unwrap_or_default(),
                 fail_metadata: setup.fail_metadata.unwrap_or_default(),
                 drop_ownership_fidelity: setup.drop_ownership_fidelity,
+                timestamp_fidelity: setup.timestamp_fidelity,
                 force_parent_identity: setup.force_parent_identity,
                 force_shadow_owners: setup
                     .force_shadow_owners
@@ -4685,7 +4741,8 @@ fn a_non_directory_or_absent_base_ancestor_falls_back_instead_of_inheriting() {
         "a whiteouted base directory is not something a shadow can be said to shadow"
     );
 
-    // `& 0o7777`: `LocalStorage` masks its own stat (`lib.rs:110`), so only a
+    // `& 0o7777`: `LocalStorage` masks its own stat (in its `metadata()`
+    // helper), so only a
     // base that reports a raw `st_mode` can exercise the engine's mask. Without
     // it the mode carries S_IFDIR, `LocalStorage` rejects the create outright
     // (`mode & !0o7777 != 0`), and a fidelity bug becomes a failed run.
@@ -5465,6 +5522,18 @@ fn with_metadata(files: &[(&[u8], &[u8])], metadata: &Metadata) -> Fixture {
         files,
         Setup {
             metadata: Some(metadata.clone()),
+            ..Setup::default()
+        },
+    )
+}
+/// A fixture whose shadow backend both records `SetMetadata` and stands in for
+/// one that applies timestamps. See [`Recorder::timestamp_fidelity`].
+fn with_times(files: &[(&[u8], &[u8])], metadata: &Metadata) -> Fixture {
+    Fixture::build(
+        files,
+        Setup {
+            metadata: Some(metadata.clone()),
+            timestamp_fidelity: true,
             ..Setup::default()
         },
     )
@@ -7789,7 +7858,8 @@ fn provider_binaries() -> PathBuf {
 /// it, and `PARENT_IDENTITY_MUST_QUALIFY_HERE` below is what makes it a hard
 /// assertion on macOS. Linux does not: absent a setgid parent the kernel gives
 /// a child the *process* gid, so `umbra-storage-local`'s probe measures `false`
-/// by that rule alone -- its own `capabilities()` says so at `lib.rs:640-642`.
+/// by that rule alone -- `LocalStorage::capabilities` says so where it gates
+/// `STORAGE_PARENT_IDENTITY_V1` on the live per-run probe.
 /// There the positive half skips with a message. It is a live probe and never a
 /// `cfg`, because the capability's contract forbids qualifying "from
 /// configuration alone" and a `local` store may sit on a network mount whose
@@ -7962,4 +8032,369 @@ impl Storage for SilentCapabilities {
     fn close_run(&mut self) -> Result<()> {
         unreachable!()
     }
+}
+
+// ---------------------------------------------------------------------------
+// `FsOp::SetTimes` and `FsOp::Fstat` -- the two operations `touch` needs.
+//
+// The syscall decode that produces them is `umbra-platform-macos`'s and is
+// pinned there. What is pinned here is what the engine does with them once they
+// arrive, which is the half a decode test cannot reach.
+// ---------------------------------------------------------------------------
+
+/// The times a `touch` asks for reach the shadow object, and reach it through
+/// the one storage request that can carry them.
+///
+/// `resolve` answers `Emulate`, so there is no kernel call behind this operation
+/// on any backend: if `prepare` does not issue the `SetMetadata`, the tracee has
+/// been told a successful `utimensat` that did nothing. That is the failure this
+/// asserts against -- the recorder is the only umask- and
+/// filesystem-independent view of it, the same reason the ownership-carry tests
+/// read it rather than `st_uid`.
+#[test]
+fn a_set_times_on_a_base_file_copies_it_up_and_asks_storage_for_the_times() {
+    let metadata = Metadata::default();
+    let mut f = with_times(&[(b"d/seed.txt", b"seed\n")], &metadata);
+    f.run(&FsOp::SetTimes {
+        dir: DirRef::Cwd,
+        path: bytes(b"d/seed.txt"),
+        accessed_nanos: Some(1_111_111_111_222_333_444),
+        modified_nanos: Some(1_555_555_555_666_777_888),
+        follow: true,
+    });
+    // The copy-up happened and kept the bytes: a time change must not be a
+    // truncation.
+    assert_eq!(
+        fs::read(f.shadow_root.join("d/seed.txt")).unwrap(),
+        b"seed\n"
+    );
+    let requests = metadata.lock().unwrap().clone();
+    let times: Vec<_> = requests
+        .iter()
+        .filter(|(_, update)| update.modified_nanos.is_some() || update.accessed_nanos.is_some())
+        .collect();
+    assert_eq!(
+        times.len(),
+        1,
+        "exactly one SetMetadata may carry the times: {requests:?}"
+    );
+    let (path, update) = times[0];
+    assert_eq!(path.as_bytes(), b"d/seed.txt");
+    assert_eq!(update.accessed_nanos, Some(1_111_111_111_222_333_444));
+    assert_eq!(update.modified_nanos, Some(1_555_555_555_666_777_888));
+    // Nothing else is touched. A time change that also rewrote the mode or the
+    // owner would be setting things the tracee did not ask about.
+    assert_eq!((update.mode, update.uid, update.gid), (None, None, None));
+    assert!(!f.overlay.poisoned);
+}
+
+/// A one-sided request stays one-sided.
+///
+/// `UTIME_OMIT` is how a caller spells "leave this one alone", and the decode
+/// turns it into `None`. Substituting a value here -- the object's current time,
+/// or the clock -- would be changing something the program asked not to change,
+/// and `MetadataUpdate` has a `None` precisely so it does not have to be.
+#[test]
+fn a_one_sided_set_times_leaves_the_other_time_unnamed() {
+    let metadata = Metadata::default();
+    let mut f = with_times(&[(b"seed.txt", b"seed\n")], &metadata);
+    f.run(&FsOp::SetTimes {
+        dir: DirRef::Cwd,
+        path: bytes(b"seed.txt"),
+        accessed_nanos: None,
+        modified_nanos: Some(1_555_555_555_666_777_888),
+        follow: true,
+    });
+    let requests = metadata.lock().unwrap().clone();
+    let (_, update) = requests
+        .iter()
+        .find(|(_, update)| update.modified_nanos.is_some())
+        .expect("the modification time was requested");
+    assert_eq!(update.accessed_nanos, None);
+}
+
+/// An absent target is `NotFound`, not a silently created one.
+///
+/// `touch` creates through `open(O_CREAT)` and only then sets times; a
+/// `SetTimes` whose target does not exist is the program asking about something
+/// that is not there, and POSIX's answer is `ENOENT`.
+#[test]
+fn a_set_times_on_an_absent_target_is_not_found() {
+    let mut f = Fixture::new(&[(b"seed.txt", b"seed\n")]);
+    let e = f
+        .overlay
+        .resolve(
+            &f.process,
+            &FsOp::SetTimes {
+                dir: DirRef::Cwd,
+                path: bytes(b"absent.txt"),
+                accessed_nanos: Some(1),
+                modified_nanos: Some(2),
+                follow: true,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::NotFound);
+}
+
+/// A base-only *directory* is refused at `resolve`, before any journal record
+/// exists.
+///
+/// The same discipline the `Fchownat` arm keeps and for the same reason:
+/// `copy_up` rejects a base-only directory, and `prepare` appends and flushes
+/// the intent before `copy_up` runs -- so reaching that failure would leave a
+/// durable record of a time change that never happened, with the session
+/// poisoned and neither `Commit` nor `Abort` written.
+#[test]
+fn a_set_times_on_a_base_only_directory_is_refused_before_anything_is_journalled() {
+    let mut f = Fixture::new(&[(b"d/seed.txt", b"seed\n")]);
+    let before = f.log.lock().unwrap().records.len();
+    let e = f
+        .overlay
+        .resolve(
+            &f.process,
+            &FsOp::SetTimes {
+                dir: DirRef::Cwd,
+                path: bytes(b"d"),
+                accessed_nanos: Some(1),
+                modified_nanos: Some(2),
+                follow: true,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::UnsupportedCapability);
+    assert_eq!(
+        f.log.lock().unwrap().records.len(),
+        before,
+        "a refusal at resolve must journal nothing"
+    );
+    assert!(!f.overlay.poisoned);
+}
+
+/// `fstat` answers from the descriptor's logical object, and leaves the bytes to
+/// the caller's ABI.
+///
+/// The two halves are asserted together because either alone would be a wrong
+/// answer: `resolve` must report success with **no** memory write of its own --
+/// the engine does not know what a `struct stat` looks like -- and it must leave
+/// the metadata in `routed_stat` for the caller that does. A resolution that
+/// reported success and left `routed_stat` empty would have the caller write
+/// nothing into the tracee's buffer and report success anyway.
+#[test]
+fn an_fstat_on_a_bound_descriptor_answers_from_the_logical_object() {
+    let mut f = Fixture::new(&[(b"seed.txt", b"seed\n")]);
+    let fd = TracedFd(4096);
+    let stat = f
+        .overlay
+        .lookup(&StoragePath::new(StorageAnchor::Root, b"seed.txt".to_vec()).unwrap())
+        .unwrap()
+        .0;
+    f.process.fds.insert(
+        fd,
+        FdState {
+            object: stat.object_id,
+            logical_path: Some(bytes(b"seed.txt")),
+            directory: false,
+            flags: OpenFlags {
+                read: true,
+                ..OpenFlags::default()
+            },
+            offset: 0,
+        },
+    );
+    let action = f.overlay.resolve(&f.process, &FsOp::Fstat { fd }).unwrap();
+    assert_eq!(
+        action,
+        ResolvedAction::Emulate(EmulatedResult {
+            outcome: OperationOutcome::Success { return_value: 0 },
+            memory_writes: vec![],
+        })
+    );
+    let answered = f.overlay.routed_stat().unwrap().expect("metadata resolved");
+    assert_eq!(answered.kind, ObjectKind::File);
+    assert_eq!(answered.len, 5);
+    assert_eq!(answered.object_id, stat.object_id);
+}
+
+/// A write-only descriptor still answers, and that is deliberate.
+///
+/// POSIX's `fstat` reports on any open descriptor; only `read` requires the
+/// descriptor to have been opened readable. Inheriting `resolve_routed_read`'s
+/// access check here would refuse `touch`'s own descriptor, which is opened
+/// `O_WRONLY|O_CREAT` -- the exact call this routing exists for.
+#[test]
+fn an_fstat_answers_on_a_descriptor_that_was_opened_write_only() {
+    let mut f = Fixture::new(&[(b"seed.txt", b"seed\n")]);
+    let fd = TracedFd(4096);
+    let stat = f
+        .overlay
+        .lookup(&StoragePath::new(StorageAnchor::Root, b"seed.txt".to_vec()).unwrap())
+        .unwrap()
+        .0;
+    f.process.fds.insert(
+        fd,
+        FdState {
+            object: stat.object_id,
+            logical_path: Some(bytes(b"seed.txt")),
+            directory: false,
+            flags: OpenFlags {
+                write: true,
+                ..OpenFlags::default()
+            },
+            offset: 0,
+        },
+    );
+    assert!(matches!(
+        f.overlay.resolve(&f.process, &FsOp::Fstat { fd }).unwrap(),
+        ResolvedAction::Emulate(_)
+    ));
+    assert!(f.overlay.routed_stat().unwrap().is_some());
+}
+
+/// A descriptor umbra never issued is `EBADF` to the tracee, not a dead run.
+///
+/// The same rule `resolve_routed_read` and `resolve_routed_close` keep, reached
+/// through the same `routed_binding`: the number is not umbra's, and the kernel's
+/// own answer for a number it does not own is the honest one. It must be a
+/// `Deny` rather than an `Err` -- an `fstat` on a stale descriptor is an ordinary
+/// program bug and must not stop the run.
+#[test]
+fn an_fstat_on_a_descriptor_umbra_never_issued_is_denied_rather_than_fatal() {
+    let mut f = Fixture::new(&[(b"seed.txt", b"seed\n")]);
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &FsOp::Fstat { fd: TracedFd(4096) })
+            .unwrap(),
+        ResolvedAction::Deny(Errno(9))
+    );
+    assert!(f.overlay.routed_stat().unwrap().is_none());
+    assert!(!f.overlay.poisoned);
+}
+
+/// `routed_stat` describes the resolution that produced it and no other.
+///
+/// It is cleared at the head of every `resolve` beside `routed_descriptor`, so a
+/// later operation cannot pick up an earlier `fstat`'s metadata. Without this a
+/// caller reading it after the wrong operation would write a stale `struct stat`
+/// into a tracee that asked about something else entirely.
+#[test]
+fn routed_stat_does_not_survive_into_the_next_resolution() {
+    let mut f = Fixture::new(&[(b"seed.txt", b"seed\n")]);
+    let fd = TracedFd(4096);
+    let stat = f
+        .overlay
+        .lookup(&StoragePath::new(StorageAnchor::Root, b"seed.txt".to_vec()).unwrap())
+        .unwrap()
+        .0;
+    f.process.fds.insert(
+        fd,
+        FdState {
+            object: stat.object_id,
+            logical_path: Some(bytes(b"seed.txt")),
+            directory: false,
+            flags: OpenFlags {
+                read: true,
+                ..OpenFlags::default()
+            },
+            offset: 0,
+        },
+    );
+    f.overlay.resolve(&f.process, &FsOp::Fstat { fd }).unwrap();
+    assert!(f.overlay.routed_stat().unwrap().is_some());
+    f.overlay
+        .resolve(
+            &f.process,
+            &FsOp::Stat {
+                dir: DirRef::Cwd,
+                path: bytes(b"seed.txt"),
+                follow: true,
+            },
+        )
+        .unwrap();
+    assert!(
+        f.overlay.routed_stat().unwrap().is_none(),
+        "an unrelated resolution inherited the previous fstat's metadata"
+    );
+}
+
+/// The `mkdir` homework, pinned rather than reasoned about.
+///
+/// The design gate carried one uncertainty to the implementer: adding bare
+/// `mkdir`(136) to the stub list and the operand table is the whole fix on a
+/// *rewrite-backed* registry, but under the userspace registry there is no
+/// physical path to rewrite, so the overlay has to **emulate**. (The gate's
+/// premise was itself half wrong: the operand row is inert for `Mkdir` on
+/// *every* registry, because `path_operands` is read only on a rewrite.) The
+/// answer is
+/// that `resolve` has always answered `Emulate` for `Mkdir` unconditionally --
+/// the `Symlink | Mkdir | Unlink` arm returns `success()`, which is
+/// `ResolvedAction::Emulate`, and it is reached before the `routed()` guard that
+/// refuses a rewrite has any say. So no overlay addition was needed, and this is
+/// the test that says so rather than a comment claiming it.
+#[test]
+fn mkdir_resolves_to_an_emulated_answer_with_no_rewrite_to_depend_on() {
+    let mut f = Fixture::new(&[(b"seed.txt", b"seed\n")]);
+    let action = f
+        .overlay
+        .resolve(
+            &f.process,
+            &FsOp::Mkdir {
+                dir: DirRef::Cwd,
+                path: bytes(b"made"),
+                mode: 0o777,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        action,
+        ResolvedAction::Emulate(EmulatedResult {
+            outcome: OperationOutcome::Success { return_value: 0 },
+            memory_writes: vec![],
+        }),
+        "a rewrite here would be unserviceable on a backend with no kernel path"
+    );
+}
+
+/// A backend that cannot set times refuses **to the tracee**, at `resolve`,
+/// with nothing journalled.
+///
+/// Three of the four storage backends refuse a timestamp `SetMetadata`
+/// outright, and `LocalStorage` -- the one this fixture is built on -- is one of
+/// them. Without the capability gate the refusal would arrive from inside
+/// `prepare`, after the `SetTimes` intent had been appended and flushed: a
+/// durable record of a change that never happened, a poisoned session and a
+/// stopped run, where POSIX has an errno. This is the case that pins the gate,
+/// and it reads the journal to pin the *placement* rather than only the answer.
+#[test]
+fn a_set_times_on_a_backend_without_timestamp_fidelity_denies_without_journalling() {
+    let mut f = Fixture::new(&[(b"seed.txt", b"seed\n")]);
+    assert!(
+        !f.overlay
+            .storage_capabilities()
+            .features
+            .contains(capabilities::STORAGE_TIMESTAMP_FIDELITY_V1),
+        "this fixture is only discriminating while its backend refuses timestamps"
+    );
+    let before = f.log.lock().unwrap().records.len();
+    assert_eq!(
+        f.overlay
+            .resolve(
+                &f.process,
+                &FsOp::SetTimes {
+                    dir: DirRef::Cwd,
+                    path: bytes(b"seed.txt"),
+                    accessed_nanos: Some(1),
+                    modified_nanos: Some(2),
+                    follow: true,
+                },
+            )
+            .unwrap(),
+        ResolvedAction::Deny(Errno(45)),
+    );
+    assert_eq!(
+        f.log.lock().unwrap().records.len(),
+        before,
+        "a denial at resolve must journal nothing"
+    );
+    assert!(!f.overlay.poisoned);
 }

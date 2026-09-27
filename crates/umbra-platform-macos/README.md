@@ -199,9 +199,37 @@ continuing with an inert one.
 | `readlinkat` | 473 | `readlinkat` | x0 dirfd, x1 path, x2 buffer, x3 length | `FsOp::ReadLink` |
 | `symlink` | 57 | `symlink` | x0 target, x1 link name | `FsOp::Symlink` |
 | `readlink` | 58 | `readlink` | x0 path, x1 buffer, x2 length | `FsOp::ReadLink` |
+| `mkdir` | 136 | `mkdir` | x0 path, x1 mode | `FsOp::Mkdir`, anchored at the cwd |
+| `fstat` | 339 | `fstat` | x0 descriptor, x1 buffer | `FsOp::Fstat` |
+| `fstat` | 189 | `__fstat` | same layout | `FsOp::Fstat` |
+| `setattrlistat` | 524 | `setattrlistat` | x0 dirfd, x1 path, x2 attrlist, x3 buffer, x4 size, x5 options | `FsOp::SetTimes` |
 
-Stub names are the ones that actually carry the `svc`, checked per host rather
-than assumed. Several have no `__`-prefixed form; `unlinkat`'s public wrapper
+The bare forms are there for the reason `symlink` and `readlink` are: they are
+what the utility actually issues. `/bin/mkdir` issues `mkdir`(136) and nothing
+else, and `utimensat` carries no `svc` at all — it builds an `attrlist` and
+tail-calls `setattrlistat`, which is why that row exists and no `utimensat` row
+does. `fstat` is the first **descriptor-relative** call here: it names no path,
+so it is absent from `abi::path_operands` by design, and the supervisor applies
+the descriptor fence to it before resolving so libSystem's own `fstat` on a
+kernel descriptor passes through.
+
+`setattrlistat` accepts exactly the attrlist shape libc's `utimensat` emits —
+`bitmapcount` 5, `commonattr` limited to `ATTR_CMN_MODTIME|ATTR_CMN_ACCTIME`,
+one `timespec` per set bit in **ascending bitmap order** so modtime precedes
+acctime, `options` limited to `FSOPT_NOFOLLOW|FSOPT_UTIMES_NULL` — and refuses
+every other shape whole, because the bitmap dictates the buffer's layout and an
+unmodelled bit is a different buffer rather than a flag that could be dropped.
+
+**This table and the tracer read one source.** `abi::TRACED_STUBS` carries every
+stub name with the syscall its `svc` issues and what `intercept()` must do with
+it; `install()` plants the breakpoints from it and `intercept()` matches
+exhaustively on its `Delivery`. There were two lists once, and they drifted:
+four stub rows were added to one and not the other, so every breakpoint they
+planted fell through to the interceptor's refusal and stopped the run. Stub
+names are the ones that actually carry the `svc`, and the number beside each is
+**verified against the resolved symbol on every launch** rather than trusted —
+`install()` reads the `movz x16, #imm` preceding the `svc` and refuses to plant
+a breakpoint if it disagrees. Several have no `__`-prefixed form; `unlinkat`'s public wrapper
 carries its own `svc` instead of tail-calling `__unlinkat`, so both are
 installed. `fstatat` and `fstatat64` are **one symbol reaching 470**, while
 `__fstatat` is a separate stub reaching 469 — libc's `fstatat()` does not reach
@@ -272,7 +300,9 @@ runs. Reads are answered from that metadata. Three ABI pieces make that work:
   returns the number of bytes copied.
 - **No-follow stat.** `abi::encode_stat` writes Darwin's `struct stat` (the
   144-byte `__DARWIN_INODE64` layout; offsets read from the host's `sys/stat.h`
-  through `offsetof`) at the buffer `abi::stat_buffer` reads from x2. A logical
+  through `offsetof`) at the buffer `abi::stat_buffer` reads — from x2 for the
+  `fstatat` family, x1 for `fstat`/`__fstat`, which differ only by the leading
+  dirfd/path pair the at-form carries. A logical
   symlink is reported as `S_IFLNK` with its target length, so a no-follow stat
   never exposes the empty placeholder as a regular file. Object kinds and modes
   the layout cannot represent fail explicitly rather than guessing.

@@ -114,6 +114,31 @@ pub trait SyscallAbi {
         Ok(None)
     }
 
+    /// Encode logical metadata as this ABI's native `stat` image.
+    ///
+    /// The namespace resolves *what* the answer is and only the ABI knows what
+    /// it looks like in memory, so the two halves meet here. It is a pure
+    /// function of the metadata -- no registers, no tracee memory, no stop --
+    /// which is what lets the caller hold it until after the namespace has
+    /// resolved the operation.
+    ///
+    /// The encoding must describe the **logical** object: a logical symlink is
+    /// reported as a symlink with its target's length, never as the placeholder
+    /// file a shadow stores for it. A kind or mode this ABI's layout cannot
+    /// represent must fail rather than be approximated.
+    ///
+    /// The default refuses, so a backend with no native stat layout cannot be
+    /// mistaken for one that has it -- a consumer that needs an image and gets
+    /// this refusal fails with its own diagnosis instead of writing zeroes into
+    /// a tracee's buffer.
+    fn encode_stat(&self, _stat: &umbra_core::BlobStat) -> Result<Vec<u8>> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "abi.encode_stat",
+            "this ABI has no native stat layout",
+        ))
+    }
+
     /// Apply an already prepared rewrite to registers for this ABI.
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()>;
 

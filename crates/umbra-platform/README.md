@@ -29,6 +29,7 @@ pub trait SyscallAbi {
         memory: &mut dyn TraceMemory,
     ) -> Result<Option<FsOp>>;
     fn io_buffer(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>>;
+    fn encode_stat(&self, stat: &BlobStat) -> Result<Vec<u8>>;
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()>;
     fn emulate_result(&self, regs: &mut RegisterSet, result: &EmulatedResult) -> Result<()>;
 }
@@ -167,6 +168,24 @@ registers the caller already holds.
 Its default answers `None`, which is correct for every path operation and for a
 backend that services no data transfer. A consumer needing a buffer and getting
 `None` fails with its own diagnosis rather than reading address zero.
+
+`fstat` is the one call whose buffer is an *output* rather than a transfer, and
+it is reported through the same seam: its length is not a caller-supplied count
+but the fixed width of the layout the kernel would have written, so a partial
+write would leave the tail of the tracee's `struct stat` stale. A null or
+overflowing address is refused there with `EFAULT` carried **inside** the error,
+for the caller to bind as a tracee-visible refusal rather than raise --
+`fstat(fd, NULL)` is an ordinary program bug and must not stop a run.
+
+`SyscallAbi::encode_stat` is the other half of answering it. The namespace
+resolves *what* the metadata is and only the ABI knows what it looks like in
+memory, so the two meet at the caller: a pure function of the metadata, no
+registers and no stopped task, which is what lets the caller hold it until after
+resolution. It must describe the **logical** object -- a logical symlink is a
+symlink with its target's length, never the placeholder a shadow stores for it
+-- and must fail rather than approximate a kind or mode its layout cannot
+represent. Its default refuses, so a backend with no native stat layout cannot
+be mistaken for one that has it.
 
 `LaunchPolicy` carries two fields a backend must honour together or refuse:
 `interpose`, which loads umbra's userspace-routing library into the target image

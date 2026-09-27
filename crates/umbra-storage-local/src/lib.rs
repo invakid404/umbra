@@ -491,8 +491,19 @@ impl LocalStorage {
 /// `umbra-storage-nfs-userspace` hardened its own SETATTR the same way and for
 /// the same reason: a caller that gets an error back has to be able to read it
 /// as "nothing happened". Timestamps are refused whole rather than dropped
-/// silently -- this backend has no caller for them, and a discarded write is the
-/// one outcome worse than an honest refusal.
+/// silently, because a discarded write is the one outcome worse than an honest
+/// refusal.
+///
+/// **There is a caller for them now**, and this refusal is unchanged rather than
+/// merely un-revisited. `utimensat` reaches the overlay as `FsOp::SetTimes`, so
+/// a `touch` on an existing file wants exactly this update. What stops it
+/// arriving here is [`umbra_core::capabilities::STORAGE_TIMESTAMP_FIDELITY_V1`]:
+/// this backend does not advertise it, the overlay checks for it at `resolve`,
+/// and the tracee is answered `ENOTSUP` before any journal record exists.
+/// Reaching this line from `prepare` instead would stop the run with a flushed
+/// intent behind it. Implementing timestamps here -- `utimensat(2)` on the
+/// physical path -- and advertising the name is the way to support it; leaving
+/// the refusal while advertising the name is the one combination that is wrong.
 fn check_update(update: &MetadataUpdate) -> Result<()> {
     if update.accessed_nanos.is_some() || update.modified_nanos.is_some() {
         return Err(unsupported("set_metadata: timestamps"));

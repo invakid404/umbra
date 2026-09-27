@@ -96,6 +96,27 @@ pub trait NamespaceSession: NamespaceResolver {
             "provider does not support userspace-routed operations",
         ))
     }
+    /// The metadata the last [`NamespaceResolver::resolve`] produced for a
+    /// routed `Fstat`, or `None` when it resolved something else.
+    ///
+    /// The companion to `routed_descriptor`, and read the same way: after
+    /// `resolve`, by the caller that owns the tracee. It exists because the
+    /// namespace resolves *what* the answer is while only the caller's ABI knows
+    /// what a native `stat` image looks like, and [`umbra_core::EmulatedResult`]
+    /// carries bytes -- so the typed answer has to leave the namespace beside
+    /// the action rather than inside it.
+    ///
+    /// Defaulted to a refusal rather than to `None` for `set_routed_request`'s
+    /// reason: a provider that answered `None` would have its caller write an
+    /// untouched `struct stat` into the tracee and report success, which is a
+    /// wrong answer rather than a refusal.
+    fn routed_stat(&self) -> Result<Option<umbra_core::BlobStat>> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.routed_stat",
+            "provider does not support userspace-routed operations",
+        ))
+    }
     /// Inject native stat layout and the current syscall's output-buffer binding.
     fn set_stat_encoder(&mut self, _encoder: Box<dyn StatEncoder>) -> Result<()> {
         Err(umbra_core::UmbraError::new(
@@ -278,6 +299,14 @@ pub fn dispatch(operation: &FsOp) -> Dispatch {
         // An unchanged-ID request still materialises: whether the ownership
         // actually differs is not known until the object is in the shadow.
         | FsOp::Fchownat { .. }
+        // And a time change materialises for the same reason a chown does: the
+        // base is immutable, so the only object whose times can move is the
+        // shadow's, which means the target has to be in the shadow first. An
+        // all-`None` request is still classified here rather than short-circuited
+        // to a read -- `dispatch` answers from the operation's *kind*, and a
+        // classification that depended on the payload would make the journal
+        // record for one `SetTimes` differ from another's.
+        | FsOp::SetTimes { .. }
         | FsOp::Write { .. } => Dispatch::Materialise,
         FsOp::MmapFile {
             protection, flags, ..

@@ -613,14 +613,27 @@ fn an_open_run_claims_no_fencing_and_no_physical_path_and_a_qualified_flush() {
         assert!(!capabilities.xattrs);
         assert!(!capabilities.atomic_replace);
         assert!(!capabilities.atomic_swap);
-        // `ownership-fidelity-v1` is the one name an open run claims, and it is
-        // an M1 claim, not an M2/M3 one: `SetMetadata` is `Support::Supported`
-        // in the capability table and the dispatch maps `update.uid`/`gid` onto
-        // `FATTR4_OWNER`/`FATTR4_OWNER_GROUP`. Pinned as the whole set, so a
-        // future advertisement cannot slip in beside it unremarked.
+        // The two names an open run claims, both M1 claims rather than M2/M3
+        // ones, and both corroborated by the same two places: `SetMetadata` is
+        // `Support::Supported` in the capability table, and the dispatch's
+        // `attr_values` maps `update.uid`/`gid` onto
+        // `FATTR4_OWNER`/`FATTR4_OWNER_GROUP` and
+        // `update.accessed_nanos`/`modified_nanos` onto
+        // `FATTR4_TIME_ACCESS_SET`/`FATTR4_TIME_MODIFY_SET`.
+        //
+        // `timestamp-fidelity-v1` is the newer of the two and it arrived here
+        // the way this assertion is designed to make one arrive: pinned as the
+        // *whole* set, so an advertisement cannot slip in beside the other
+        // unremarked. It is remarked. The overlay requires the name before it
+        // issues a timestamp `SetMetadata` at all, so what this node claims is
+        // what decides whether a tracee's `utimensat` is served or refused --
+        // and the three backends that refuse timestamps must never carry it.
         assert_eq!(
             capabilities.features.iter().collect::<Vec<_>>(),
-            vec![umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1],
+            vec![
+                umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1,
+                umbra_core::capabilities::STORAGE_TIMESTAMP_FIDELITY_V1,
+            ],
             "{backend:?}"
         );
 
@@ -635,7 +648,8 @@ fn an_open_run_claims_no_fencing_and_no_physical_path_and_a_qualified_flush() {
         // A flush over an empty scope is a barrier with nothing outstanding: it
         // certifies completeness, which is exactly what it may claim. The receipt
         // is bound to this run and this writer, and is never `None` — the overlay
-        // rejects a `None` receipt outright (umbra-overlay engine.rs:2618).
+        // rejects a `None` receipt outright, in `Overlay::commit` and
+        // `Overlay::abort` alike (`receipt.durability == Durability::None`).
         let run_id = storage.admission().expect("a run is open").admitted().run();
         let receipt = storage
             .flush(&umbra_core::FlushRequest {
@@ -710,7 +724,7 @@ fn durability_is_claimed_only_where_the_boundary_was_qualified_for_this_run() {
             .expect("a barrier over nothing outstanding is a receipt");
         assert_eq!(receipt.durability, expected, "{backend:?}");
         // Degrading to `Local` stays contract-safe: the overlay rejects only
-        // `None` (umbra-overlay engine.rs:2618).
+        // `None`, in `Overlay::commit` and `Overlay::abort`.
         assert_ne!(receipt.durability, Durability::None, "{backend:?}");
 
         storage.close_run().expect("close_run");

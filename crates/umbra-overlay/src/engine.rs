@@ -641,6 +641,10 @@ pub struct Overlay {
     routed_open: Option<(TracedFd, OpenFlags, BytePath)>,
     /// What the last routed `Open` bound, for the caller's descriptor table.
     routed_descriptor: Option<(TracedFd, FdState)>,
+    /// The metadata the last routed `Fstat` resolved to, for the caller's ABI to
+    /// encode. Cleared at the head of every `resolve` beside the two above, so
+    /// it can never describe an earlier operation.
+    routed_stat: Option<BlobStat>,
     /// Set by `whiteouted()` whenever a marker hid a component during the current
     /// `resolve`. Reset at the top of every `resolve`, read only inside that same
     /// call, through `hidden_or`. It is the difference between "the namespace
@@ -679,6 +683,7 @@ impl Overlay {
             routed_request: None,
             routed_open: None,
             routed_descriptor: None,
+            routed_stat: None,
             whiteout_hit: false,
         }
     }
@@ -2031,6 +2036,83 @@ impl Overlay {
         Ok(action)
     }
 
+    /// Resolve a routed `fstat`: answer from the descriptor's logical object.
+    ///
+    /// The metadata is read here, during `resolve`, for `resolve_routed_read`'s
+    /// reason: the answer *is* the resolution, `Dispatch::ReadThrough` already
+    /// classifies it so `prepare` records no intent, and there is nothing to
+    /// journal.
+    ///
+    /// **The bytes are not produced here, and that is the boundary this engine
+    /// is built on.** What a `struct stat` looks like in a tracee's memory is
+    /// the ABI's knowledge, not the namespace's -- the same split
+    /// `StatEncoder` and `DirectoryEncoder` name. So the resolution answers
+    /// `Success { 0 }` with no memory write and leaves the metadata for
+    /// [`NamespaceResolver::routed_stat`], which the caller reads after
+    /// `resolve` exactly as it reads `routed_descriptor` after a routed `Open`.
+    /// A caller that ignores it writes nothing into the tracee's buffer and
+    /// hands back an untouched `struct stat`; `syscall_entry` is the one caller,
+    /// and it fails rather than doing that.
+    ///
+    /// Unlike a routed `read` this does **not** require the descriptor to have
+    /// been opened readable: POSIX's `fstat` answers on any open descriptor, and
+    /// a write-only one is open.
+    fn resolve_routed_fstat(
+        &mut self,
+        context: &ProcessContext,
+        operation: &FsOp,
+        fd: TracedFd,
+    ) -> Result<ResolvedAction> {
+        let (_, path) = match self.routed_binding(context, fd)? {
+            Ok(binding) => binding,
+            Err(denied) => return Ok(denied),
+        };
+        let (stat, _) = self.lookup(&path)?;
+        // MUTATION PROBE -- fstat routing. Compiled out of every build that does
+        // not ask for it, so no product binary contains this branch.
+        //
+        // It answers the descriptor with `EBADF`, which is *exactly* what the
+        // tracee received before this arm existed: the number is not a kernel
+        // object, so an unrouted `fstat` reached the kernel and was refused.
+        //
+        // This is the **one** of the three probes whose "restores the previous
+        // behaviour" claim is true, and the reason is worth naming because the
+        // other two had to have theirs corrected: this probe answers a
+        // tracee-visible `Deny`, so the tracee sees an errno and the run lives
+        // on. The `mkdir` and `setattrlistat` probes refuse at the *decode*,
+        // and a decode error stops the run -- a third state that neither ships
+        // nor shipped. Restoring a prior behaviour and breaking a route are
+        // different mutations, and only a `Deny` can do the first.
+        // Measured, before routing: `touch <absent>` created the file and then
+        // exited 1 with `touch: <path>: Bad file descriptor`. A test that passes
+        // with this enabled is a test that never depended on the emulated
+        // answer, and the discriminator is that the file is still created --
+        // this breaks the reply and nothing else.
+        #[cfg(feature = "mutation-probe-fstat")]
+        {
+            let _ = (stat, operation);
+            Ok(ResolvedAction::Deny(Errno(9)))
+        }
+        #[cfg(not(feature = "mutation-probe-fstat"))]
+        {
+            self.routed_stat = Some(stat);
+            let action = ResolvedAction::Emulate(EmulatedResult {
+                outcome: OperationOutcome::Success { return_value: 0 },
+                memory_writes: vec![],
+            });
+            self.planned = Some(Plan {
+                action: action.clone(),
+                operation: operation.clone(),
+                path,
+                destination: None,
+                mutation: false,
+                directory_next: None,
+                routed_write: None,
+            });
+            Ok(action)
+        }
+    }
+
     fn rewrite(
         &self,
         operation: &FsOp,
@@ -2224,6 +2306,7 @@ impl NamespaceResolver for Overlay {
         let routed = self.routed_request.take();
         self.routed_open = None;
         self.routed_descriptor = None;
+        self.routed_stat = None;
         if let FsOp::ReadDir { fd, max_bytes } = operation {
             return self.resolve_directory(context, operation, *fd, *max_bytes);
         }
@@ -2239,6 +2322,7 @@ impl NamespaceResolver for Overlay {
                 return self.resolve_routed_write(context, operation, *fd, *length, *offset, routed)
             }
             FsOp::Close { fd } => return self.resolve_routed_close(context, operation, *fd),
+            FsOp::Fstat { fd } => return self.resolve_routed_fstat(context, operation, *fd),
             _ => {}
         }
         let (dir, name, create_parents) = match operation {
@@ -2249,6 +2333,7 @@ impl NamespaceResolver for Overlay {
             | FsOp::Access { dir, path, .. }
             | FsOp::Fchownat { dir, path, .. }
             | FsOp::Unlink { dir, path, .. }
+            | FsOp::SetTimes { dir, path, .. }
             | FsOp::ReadLink { dir, path } => (*dir, path, false),
             FsOp::Symlink {
                 link_dir,
@@ -2275,6 +2360,9 @@ impl NamespaceResolver for Overlay {
             // explicitly, so neither may inherit the nofollow default below.
             FsOp::Access { flags, .. } => flags.follow,
             FsOp::Fchownat { flags, .. } => flags.follow,
+            // Following is the POSIX default here too, and `FSOPT_NOFOLLOW` is
+            // what `AT_SYMLINK_NOFOLLOW` became by the time the decode saw it.
+            FsOp::SetTimes { follow, .. } => *follow,
             _ => false,
         };
         // Hoisted above path resolution so the traversal-failure path can consult
@@ -2488,6 +2576,55 @@ impl NamespaceResolver for Overlay {
                     }
                 }
             }
+            // The same shape as the `Fchownat` arm above, and refused here for
+            // the same reason: `prepare` appends and flushes the `SetTimes`
+            // intent before `copy_up` runs, so a copy-up that cannot succeed
+            // must be found *now*, while no durable record of a time change
+            // that never happened exists. `copy_up` rejects a base-only
+            // directory, and this condition mirrors its own; `prepare` keeps its
+            // call as the backstop.
+            //
+            // Unlike the chown arm there is no privilege question to answer.
+            // `SetMetadata` carries the times explicitly, both of them or
+            // neither, so nothing is inherited from the copy and there is no
+            // unchanged-ID sentinel whose honesty depends on ownership having
+            // carried. A shadow object needs no copy-up at all.
+            FsOp::SetTimes { .. } => {
+                let (stat, shadow) = existing
+                    .as_ref()
+                    .ok_or_else(|| error(ErrorKind::NotFound, "set-times target absent"))?;
+                if !shadow && !matches!(stat.kind, ObjectKind::File | ObjectKind::LogicalSymlink) {
+                    return Err(unsupported(
+                        "directory set-times requires recursive copy-up",
+                    ));
+                }
+                // **A backend that cannot set times is refused here, to the
+                // tracee, and the placement is the whole point.** Three of the
+                // four storage backends refuse a timestamp `SetMetadata`
+                // outright -- deliberately, and each says so in its own
+                // `check_update` -- so `prepare` would reach that refusal as an
+                // `UnsupportedCapability` **after** appending and flushing the
+                // `SetTimes` intent. That is a durable record of a time change
+                // that never happened, with the session poisoned and neither
+                // `Commit` nor `Abort` written: a stopped run where POSIX has an
+                // errno. The same discipline the two guards above keep.
+                //
+                // `ENOTSUP` is 45 on Darwin and 95 on Linux, so unlike
+                // `Errno::ENOENT` it is not ABI-stable. Naming it is safe for
+                // the same reason the routed arm below names it: `FsOp::SetTimes`
+                // is produced by one decoder, `umbra-platform-macos`'s, because
+                // `setattrlistat`(524) is the only syscall that reaches it. A
+                // second platform decoding a `utimensat` must supply this value
+                // rather than inherit it.
+                if !self
+                    .storage
+                    .capabilities()
+                    .features
+                    .contains(capabilities::STORAGE_TIMESTAMP_FIDELITY_V1)
+                {
+                    return Ok(ResolvedAction::Deny(Errno(45)));
+                }
+            }
             FsOp::Rename { to_dir, to, .. } => {
                 let (stat, _) = existing
                     .as_ref()
@@ -2518,7 +2655,15 @@ impl NamespaceResolver for Overlay {
             }
         }
         let action = match operation {
-            FsOp::Symlink { .. } | FsOp::Mkdir { .. } | FsOp::Unlink { .. } => success(),
+            // `SetTimes` joins these three, and the reason is the one that makes
+            // a routed run work at all: there is no kernel object behind a
+            // userspace-backed shadow, so the answer cannot be a rewrite. The
+            // effect is `prepare`'s `SetMetadata`, and the tracee's answer is the
+            // zero POSIX specifies for a successful `utimensat`.
+            FsOp::Symlink { .. }
+            | FsOp::Mkdir { .. }
+            | FsOp::Unlink { .. }
+            | FsOp::SetTimes { .. } => success(),
             FsOp::ReadLink { .. } => {
                 let (stat, shadow) = existing.as_ref().expect("validated existence");
                 let target = self.target(&path, stat, *shadow)?;
@@ -2657,12 +2802,16 @@ impl NamespaceResolver for Overlay {
             // is honoured by `umbra-platform-macos` and by nothing else. A second
             // routed platform must supply this value rather than inherit it.
             //
-            // Routing these operations properly is a larger slice: `Stat` and
-            // `Access` would have to be answered the way `ReadLink` and the
-            // logical-symlink `Stat` already are, through an ABI encoder. The
-            // design gate ratified "standard utilities are not claimed; the slice
-            // claims the toy program only", and this keeps that promise while
-            // making the limit visible instead of fatal.
+            // Routing these operations properly means answering them the way
+            // `ReadLink` and the logical-symlink `Stat` already are, through an
+            // ABI encoder. `Fstat` has since been routed exactly that way --
+            // `resolve_routed_fstat` plus `routed_stat`, which is why `touch`
+            // reports an honest exit code -- and it deliberately did **not**
+            // widen this arm: `Fstat` names a descriptor, so it never reaches
+            // the path resolution above, and `Stat` and `Access` on a shadow
+            // object are still refused here. Routing those is a further slice,
+            // and until it happens this keeps the limit visible instead of
+            // fatal.
             _ if self.routed()?
                 && (mutation || existing.as_ref().is_some_and(|(_, shadow)| *shadow)) =>
             {
@@ -2804,11 +2953,20 @@ fn replay_must_poison(intent: &JournalIntent) -> bool {
         //
         // - `Unlink` records a plan and performs nothing (#66); the removal
         //   belongs to `commit` alone.
-        // - `Chown` and the non-creating `Open` arms (`CopyUp`, `Truncate`,
-        //   `Write`) reach `copy_up`, which deliberately keeps its own object
-        //   and its ancestors off `Pending.rollback`: copy-up is not a creation
-        //   (#53/#55), and counting it would poison a run on the first write
-        //   into any not-yet-shadowed base subdirectory.
+        // - `Chown`, `SetTimes` and the non-creating `Open` arms (`CopyUp`,
+        //   `Truncate`, `Write`) reach `copy_up`, which deliberately keeps its
+        //   own object and its ancestors off `Pending.rollback`: copy-up is not
+        //   a creation (#53/#55), and counting it would poison a run on the
+        //   first write into any not-yet-shadowed base subdirectory.
+        //   `SetTimes` does one thing more than `Chown` -- it issues the
+        //   `SetMetadata` itself, because `resolve` answered `Emulate` and there
+        //   is no kernel call behind it -- and that changes nothing here: a
+        //   metadata update creates no object, so a `prepare` that stopped
+        //   before it, during it or after it leaves nothing this function would
+        //   have to name an undo for. What it can leave is the copy-up residue
+        //   already covered above, plus times that did or did not move; neither
+        //   is a created object, and a reopen resolves both by reading the
+        //   shadow.
         //
         // "Nothing was created" is a *positive* property of those arms rather
         // than an inference from a missing record. It is still not sufficient on
@@ -2840,6 +2998,7 @@ fn replay_must_poison(intent: &JournalIntent) -> bool {
         // `reconcilable_on_reopen`.
         JournalIntent::Unlink { .. }
         | JournalIntent::Chown { .. }
+        | JournalIntent::SetTimes { .. }
         | JournalIntent::CopyUp { .. }
         | JournalIntent::Truncate { .. }
         | JournalIntent::Write { .. } => false,
@@ -2925,6 +3084,10 @@ impl NamespaceSession for Overlay {
     fn routed_descriptor(&self) -> Result<Option<(TracedFd, FdState)>> {
         self.config()?;
         Ok(self.routed_descriptor.clone())
+    }
+    fn routed_stat(&self) -> Result<Option<BlobStat>> {
+        self.config()?;
+        Ok(self.routed_stat.clone())
     }
     fn set_readlink_buffer(&mut self, address: u64, len: u32) -> Result<()> {
         self.idle()?;
@@ -3438,6 +3601,61 @@ impl NamespaceSession for Overlay {
                 // otherwise the immutable base would be mutated in place.
                 FsOp::Fchownat { .. } => {
                     self.copy_up(&plan.path)?;
+                }
+                // Same first step as the chown above and for the same reason,
+                // then the effect itself -- because unlike a chown there is no
+                // kernel call behind this one. `resolve` answered `Emulate`, so
+                // if the times are not set here they are not set at all, and the
+                // tracee would have been told a successful `utimensat` that did
+                // nothing. That is the silent wrong answer this engine refuses,
+                // which is why the storage request is made here rather than left
+                // to a rewrite that does not exist.
+                //
+                // Ordered after the copy-up: a base-only object has no shadow
+                // path to set metadata on until `copy_up` has made one. And
+                // after the `Prepare` record, which the closure above this match
+                // has already appended and flushed -- the durable intent lands
+                // before the effect, the rule every arm here keeps.
+                //
+                // Nothing is queued for rollback. `copy_up` records nothing (see
+                // `Pending.rollback`), and a metadata change creates no object,
+                // so there is no undo for this arm to lose -- which is the
+                // classification `replay_must_poison` restates for
+                // `JournalIntent::SetTimes`.
+                FsOp::SetTimes {
+                    accessed_nanos,
+                    modified_nanos,
+                    ..
+                } => {
+                    self.copy_up(&plan.path)?;
+                    let context = self.context()?;
+                    match self.storage.execute(&StorageRequest {
+                        context,
+                        operation: StorageOperation::SetMetadata {
+                            path: plan.path.clone(),
+                            update: MetadataUpdate {
+                                mode: None,
+                                uid: None,
+                                gid: None,
+                                accessed_nanos: *accessed_nanos,
+                                modified_nanos: *modified_nanos,
+                            },
+                        },
+                    })? {
+                        StorageResponse::MetadataSet(_) => {}
+                        // Not tolerated the way `carry_ownership` tolerates a
+                        // refusal, and the difference is whose request it is. A
+                        // carried owner is umbra's own fidelity improvement on
+                        // top of an operation that already succeeded; this *is*
+                        // the operation the tracee asked for, and a backend that
+                        // will not perform it has not performed it.
+                        _ => {
+                            return Err(error(
+                                ErrorKind::ProtocolMismatch,
+                                "storage answered a set_metadata with something else",
+                            ))
+                        }
+                    }
                 }
                 FsOp::Rename { .. } => {
                     let destination = plan.destination.as_ref().unwrap();
@@ -4310,6 +4528,21 @@ impl Overlay {
                 path,
                 uid: *uid,
                 gid: *gid,
+                copy_up: matches!(existing, Some((_, false))),
+            },
+            // `object` and `copy_up` carry the chown arm's meaning exactly: both
+            // are read before `prepare` copies up, so for a base-only target
+            // this is the base identity and the shadow object the times land on
+            // may have a different one. `path` is what stays resolvable.
+            FsOp::SetTimes {
+                accessed_nanos,
+                modified_nanos,
+                ..
+            } => JournalIntent::SetTimes {
+                object,
+                path,
+                accessed_nanos: *accessed_nanos,
+                modified_nanos: *modified_nanos,
                 copy_up: matches!(existing, Some((_, false))),
             },
             _ => return Err(unsupported("journal intent for this operation")),

@@ -335,11 +335,36 @@ jobs:
             -o "$fixture_dir/umbra-userspace-edges"
           echo "UMBRA_USERSPACE_TOY_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
           echo "UMBRA_EDGES_PATH=$fixture_dir/umbra-userspace-edges" >> "$GITHUB_ENV"
+          # The standard-utilities matrix reads `UMBRA_TEST_FIXTURE_PATH` as a
+          # *provisioning signal* and never launches what it points at: it is
+          # the suite's existing marker for "this host has workspace binaries
+          # built and debugger permission granted", which is what a traced
+          # launch of an Apple binary needs. Pointed at the toy this step
+          # already produced rather than inventing a second switch.
+          #
+          # Without this line the matrix took its gate and reported `ok` while
+          # testing nothing, in a job whose name claims the opposite. It is a
+          # hard failure now rather than a skip -- the test reads the variable
+          # through the file's `input()` helper, which asserts under
+          # `UMBRA_INTEGRATION_REQUIRED`, set for this whole job.
+          echo "UMBRA_TEST_FIXTURE_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
 
-      # Three invocations, because the mutation probes are cargo features and
-      # every one of them rebuilds `target/debug/umbra` in place. The order
-      # matters: the baseline runs against an unmutated binary, and each probe
-      # run is preceded by the build that puts its probe in.
+      # Six invocations, because the mutation probes are cargo features and no
+      # two may be enabled at once. The order matters: the baseline runs against
+      # unmutated binaries, and each probe run is preceded by the build that
+      # puts its probe in.
+      #
+      # **Two crates carry probes, and which one decides the build command.**
+      # A, B and C are features of `umbra-overlay`, forwarded through
+      # `umbra-supervisor` to `umbra-cli`, so they go into `target/debug/umbra`.
+      # D and E are features of `umbra-platform-macos`, which is a provider
+      # *executable* the registry names rather than a library `umbra` links, so
+      # they go into `target/debug/umbra-platform-macos` and
+      # `cargo build -p umbra-cli --features mutation-probe-mkdir` does not
+      # exist. Because they are different binaries, a probe on one does **not**
+      # clear a probe on the other: Proof 5 restores `umbra` explicitly before
+      # mutating the provider, or it would run with two probes live and prove
+      # nothing about either.
       #
       # Each one selects `--test userspace_run` and carries `--test-threads=1`,
       # and both are load-bearing rather than stylistic. The selector keeps this
@@ -386,9 +411,44 @@ jobs:
           cargo test -p umbra-storage-nfs-userspace --features transport-raw \
             --test userspace_run -- --nocapture --test-threads=1
 
-      - name: Restore an unmutated binary
+      - name: Proof 4 -- mutation probe C, fstat answers EBADF
+        env:
+          UMBRA_MUTATION_PROBE: fstat
+        run: |
+          cargo build -p umbra-cli --features mutation-probe-fstat
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw \
+            --test userspace_run -- --nocapture --test-threads=1
+
+      - name: Proof 5 -- mutation probe D, the mkdir decode arm removed
+        env:
+          UMBRA_MUTATION_PROBE: mkdir
+        run: |
+          # Clear probe C from `umbra` first. This probe is on a different
+          # binary, so building it does not rebuild `umbra`, and leaving the
+          # previous feature in place would put two probes in one run.
+          cargo build -p umbra-cli
+          cargo build -p umbra-platform-macos --features mutation-probe-mkdir
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw \
+            --test userspace_run -- --nocapture --test-threads=1
+
+      - name: Proof 6 -- mutation probe E, setattrlistat refused
+        env:
+          UMBRA_MUTATION_PROBE: setattrlistat
+        run: |
+          # Same crate as probe D, so this feature swap rebuilds the provider
+          # and clears the previous probe on its own. `umbra` is already clean.
+          cargo build -p umbra-platform-macos --features mutation-probe-setattrlistat
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw \
+            --test userspace_run -- --nocapture --test-threads=1
+
+      - name: Restore unmutated binaries
         if: always()
-        run: cargo build -p umbra-cli
+        run: |
+          # Both, because probes live on two crates. Restoring only `umbra`
+          # would leave a mutated provider executable in `target/debug` for
+          # whatever runs on this persistent runner next.
+          cargo build -p umbra-cli
+          cargo build -p umbra-platform-macos
 
       - name: Capture diagnostics on failure
         if: failure()

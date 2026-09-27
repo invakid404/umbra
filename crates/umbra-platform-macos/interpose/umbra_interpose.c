@@ -117,18 +117,55 @@
  *    tracer instead, and works. Measured: `openat(AT_FDCWD, ...)` returns a
  *    virtual descriptor and writes through it.
  *
- *    What is genuinely refused is the **descriptor-relative** set: `lseek`,
- *    `fstat`, `dup`, `dup2`, `fcntl`, `ftruncate`, `fsync`, `pread`, `pwrite`,
+ *    `fstat` used to be named in the refused list below and is not any more.
+ *    It is still not interposed here; it is routed through the tracer, on the
+ *    `fstat`(339) and `__fstat`(189) libc stubs. That is the distinction the
+ *    paragraph above draws, reaching a descriptor-relative call for the first
+ *    time rather than a path one -- so the list lost a member, not its meaning.
+ *    Why the removal is described instead of simply made: a doc comment still
+ *    naming `fstat` as refused would be a false invariant in the one place a
+ *    reader has nothing but the comment to check it against.
+ *
+ *    Routing it needs the descriptor fence *more* than interposing it would,
+ *    not less: every `fstat` in the process reaches a breakpoint, including
+ *    libsystem's own on kernel descriptors, so the supervisor applies the same
+ *    floor test this file applies to `read`/`write`/`close` before the call is
+ *    resolved at all. Below the floor it passes through to the kernel
+ *    untouched. Measured: XPC bundle resolution `fstat`s fd 3 during startup
+ *    and `cat` `fstat`s fd 1.
+ *
+ *    What is genuinely refused is the rest of the **descriptor-relative** set:
+ *    `lseek`, `dup`, `dup2`, `fcntl`, `ftruncate`, `fsync`, `pread`, `pwrite`,
  *    `readv`, `writev`, `mmap`, the directory-reading calls, and `openat` with a
  *    virtual dirfd. A virtual descriptor is not a kernel object, so these reach
  *    the kernel, which does not know the number, and receive EBADF. That is a
  *    refusal, not a wrong answer, and it is why the descriptor fence above is
  *    load-bearing rather than tidy.
+ *
+ *    The list lost a member, and it also changed **which of the remaining
+ *    members a program can reach** -- which is a separate consequence and is
+ *    not implied by the first. A program that previously bailed at the refused
+ *    `fstat` now gets an answer and proceeds to whatever it calls next, so a
+ *    refusal one call further on becomes reachable for the first time.
+ *    Measured, on `/bin/cat`: its locale open is routed, so the descriptor is
+ *    virtual; `_Read_RuneMagi` `fstat`s it -- previously refused, now answered
+ *    -- and then `mmap`s it, which it never used to reach. With that `mmap`
+ *    refused EBADF, `cat` still exits 0 with correct bytes and still exits 1
+ *    with its own `No such file or directory` on an absent operand, so the
+ *    mapping refusal stays fail-closed and the utility does not regress. The
+ *    general shape is what matters: routing one member of a refused set moves
+ *    the failure point rather than removing it, and the next member has to be
+ *    checked rather than assumed unreached.
  * 2. A program that reaches the syscall layer directly -- its own `svc`, or a
  *    libc entry point that is not interposed -- is not routed by this file at
  *    all. Nothing here can prevent that, and nothing here claims to: what stops
  *    such a call writing the host is the kernel-enforced Seatbelt profile umbra
- *    installs before the target runs, never this library.
+ *    installs before the target runs, never this library. That is unchanged by
+ *    the three calls the tracer newly routes -- `mkdir`(136), `fstat`(339)/
+ *    `__fstat`(189) and `setattrlistat`(524), the last being how `utimensat`
+ *    reaches the kernel: each is breakpointed at its libc stub, so a program
+ *    that issues the `svc` itself bypasses all three exactly as it bypasses
+ *    `open`, and Seatbelt is what refuses it.
  * 3. Writable shared file mappings are unreachable in principle. A store to a
  *    resident page is not a call of any kind.
  * 4. Unlinking or renaming a file that is open is not representable: umbra maps
@@ -137,6 +174,41 @@
  * 5. Calls made before umbra arms this library are not routed -- dyld's image
  *    loading and every library initializer. See ARMING above and the note over
  *    `umbra_open`.
+ * 6. Directory reads are refused in every form: `getattrlistbulk`(461), which
+ *    is what `ls` actually uses, `__getdirentries64`(344), `fchdir`(13) on a
+ *    virtual dirfd, and `close` at the tracer layer. Measured: `ls` lists the
+ *    right names through fts's `readdir` fallback and still exits 1 for every
+ *    errno the bulk call can return, and with the dirfd `close` also refused it
+ *    dies on SIGTRAP. So there is no honest partial `ls`, and none is claimed.
+ *    `ls -l` additionally needs `fstat` on a virtual *dirfd* -- which routing
+ *    `fstat` does not supply, because a routed `open` of a directory is refused
+ *    before a dirfd is ever issued -- and `listxattr`(240).
+ * 7. `touch -t` and `-r` take the same path as plain `touch` and are expected
+ *    to work, but nothing tests them, so they are claimed as unverified rather
+ *    than as supported.
+ * 8. `touch` on a file that **already exists** is served on the
+ *    `nfs-userspace` registry only. It reaches the kernel as
+ *    `setattrlistat`(524), which umbra routes on every registry -- but only
+ *    `umbra-storage-nfs-userspace` can apply a timestamp, mapping it onto
+ *    NFSv4's `FATTR4_TIME_ACCESS_SET`/`FATTR4_TIME_MODIFY_SET`.
+ *    `umbra-storage-local`, `umbra-storage-nfs` and `umbra-storage-tar` refuse
+ *    a timestamp update outright, each in its own `check_update`.
+ *
+ *    So on `--local-dev` and on kernel-`nfs`, `touch <existing>` is refused to
+ *    the tracee with `ENOTSUP` and **the run survives** -- measured: exit 1,
+ *    `touch: <path>: Operation not supported`, host untouched, nothing
+ *    journalled. That is the point of the refusal rather than an accident of
+ *    it: the check is `STORAGE_TIMESTAMP_FIDELITY_V1` at `resolve`, before any
+ *    journal record exists, because reaching the backend's refusal from inside
+ *    `prepare` would flush an intent for a change that never happened and stop
+ *    the run. `touch` on a file that does not exist creates it on every
+ *    registry; only the existing-file case is conditional.
+ *
+ *    Recorded here rather than only in the capability's own doc comment
+ *    because this is the list a reader consults to learn what does not work,
+ *    and a per-registry limitation on the canonical case of a shipped utility
+ *    belongs in it. Implementing `utimensat(2)` in the three refusing backends
+ *    and advertising the name is what removes this item.
  *
  * Adding an interposed function here is not sufficient to support it. umbra must
  * be able to represent the operation too, and the refusals above stay honest
@@ -257,7 +329,24 @@ static long umbra_finish(long value, int failed) {
     return value;
 }
 
-/* Whether this descriptor is one umbra issued. See VIRTUAL DESCRIPTORS. */
+/*
+ * Whether this descriptor is one umbra issued. See VIRTUAL DESCRIPTORS.
+ *
+ * **This predicate has a twin in Rust and they must agree.** `fstat` is routed
+ * through the tracer rather than through this file -- libsystem calls its own
+ * entry point, so there is nothing here to interpose -- and every `fstat` in
+ * the process therefore reaches a breakpoint, including libsystem's own on
+ * kernel descriptors. The supervisor applies this same test before resolving
+ * one, in `Supervisor::syscall_entry`, against the same constant: umbra's
+ * `descriptor_floor` is `DESCRIPTOR_FENCE`, which is also the `RLIMIT_NOFILE`
+ * written into `umbra_control.floor` below. So the *value* cannot drift -- there
+ * is one constant and one assignment in the whole tree -- but the *comparison*
+ * is written twice, in two languages.
+ *
+ * `abi.rs`'s `the_interposers_descriptor_test_is_the_one_the_supervisor_applies`
+ * pins this function's text so a change here fails a test that names the Rust
+ * twin. Change one, change both.
+ */
 static int umbra_owns(int fd) {
     return umbra_active() && fd >= 0 &&
            (uint64_t)fd >= umbra_control.floor;

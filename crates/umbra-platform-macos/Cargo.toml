@@ -6,6 +6,28 @@ license.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Mutation probes for the two syscall decode arms this crate owns, on the same
+# terms as `umbra-overlay`'s: each BREAKS one arm on purpose so a test can prove
+# an end-to-end case depends on it, both are compile-time only so no product
+# binary carries a door, and they are separate features because they must be
+# provable separately.
+#
+# This crate is a provider *executable*, so a probe is enabled when that binary
+# is built (`cargo build -p umbra-platform-macos --features ...`) rather than
+# forwarded from `umbra-cli`. The registry a test writes names the built
+# executable, so the mutated provider is what the run loads.
+#
+# Never enable either in anything but a mutation test.
+#
+# `mkdir`(136) decodes to nothing classifiable, so it reaches the
+# "unclassified Darwin syscall" refusal it reached before #114 was fixed.
+mutation-probe-mkdir = []
+# `setattrlistat`(524) is refused outright, so `touch` on an existing file fails
+# where `touch` on an absent one still succeeds -- which is the discriminator no
+# other probe reproduces.
+mutation-probe-setattrlistat = []
+
 [dependencies]
 umbra-core = { path = "../umbra-core" }
 umbra-platform = { path = "../umbra-platform" }

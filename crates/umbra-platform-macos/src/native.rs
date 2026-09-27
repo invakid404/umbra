@@ -545,40 +545,11 @@ impl Session {
         };
         // Shared cache addresses are system-wide on this native host. Verify every
         // remote instruction against local code before planting any breakpoint.
-        for name in [
-            "__open",
-            "__open_nocancel",
-            "__openat",
-            "__openat_nocancel",
-            "__execve",
-            "__posix_spawn",
-            "__fork",
-            "__wait4",
-            "__wait4_nocancel",
-            // Dirfd-relative filesystem calls. Names are the stubs that
-            // actually carry the `svc`, verified per host below; several have
-            // no `__`-prefixed form, and `unlinkat`'s public wrapper carries
-            // its own `svc` rather than tail-calling `__unlinkat`, so both are
-            // installed. `fstatat`/`fstatat64` is one symbol reaching 470,
-            // while `__fstatat` is a separate stub reaching 469.
-            // symlink and readlink have no `__`-prefixed form; the public
-            // symbols are the stubs carrying the `svc`.
-            "symlink",
-            "readlink",
-            "__renameat",
-            "__renameatx_np",
-            "__unlinkat",
-            "unlinkat",
-            "linkat",
-            "symlinkat",
-            "mkdirat",
-            "fchmodat",
-            "fchownat",
-            "__fstatat",
-            "fstatat",
-            "readlinkat",
-            "faccessat",
-        ] {
+        //
+        // The names come from `abi::TRACED_STUBS`, which `intercept()` also
+        // reads to decide what to do when one of these breakpoints fires. One
+        // table, two gates -- see that table for why it exists.
+        for (name, number, _) in abi::TRACED_STUBS {
             let name_c = cstr(name.as_bytes())?;
             let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name_c.as_ptr()) };
             if ptr.is_null() {
@@ -591,14 +562,41 @@ impl Session {
             let result = me.read(start, &mut code);
             std::mem::forget(me);
             result?;
-            let offset = code
-                .as_chunks::<4>()
-                .0
+            let words = code.as_chunks::<4>().0;
+            let offset = words
                 .iter()
                 .position(|b| *b == [1, 16, 0, 212])
-                .ok_or_else(|| error("symbol", format!("no svc in {name}")))?
-                * 4;
-            self.breakpoint(start + offset as u64, false)?;
+                .ok_or_else(|| error("symbol", format!("no svc in {name}")))?;
+            // **Verify the table's number against this host before planting the
+            // breakpoint.** The stub's `svc` is preceded by a `movz x16, #imm`
+            // that sets the syscall number, and that immediate -- not this
+            // table -- is what the kernel will act on. `intercept()` dispatches
+            // on the number, so a row whose number is wrong for this libc plants
+            // a breakpoint whose firing is dispatched as something else, or
+            // refused outright. Checking it here turns that into a launch
+            // failure naming the symbol, rather than a run that dies at an
+            // arbitrary later instruction.
+            //
+            // The *last* `movz x16` before the `svc` is the operative one:
+            // `__fork` carries its `svc` at +16 and `unlinkat` at +48, with
+            // setup instructions in between.
+            let carried = words[..offset]
+                .iter()
+                .rev()
+                .find_map(|word| {
+                    let instruction = u32::from_le_bytes(*word);
+                    // `movz x16, #imm16, lsl #0`: sf=1 opc=10 100101 hw=00, Rd=16.
+                    (instruction & 0xffe0_001f == 0xd280_0010)
+                        .then(|| u64::from((instruction >> 5) & 0xffff))
+                })
+                .ok_or_else(|| error("symbol", format!("no syscall number in {name}")))?;
+            if carried != *number {
+                return Err(error(
+                    "symbol",
+                    format!("{name} issues syscall {carried}, not the {number} umbra traces it as"),
+                ));
+            }
+            self.breakpoint(start + offset as u64 * 4, false)?;
         }
         let main = main_image_base(&self.loaded_images()?)?;
         self.install_image(main)?;
@@ -1749,20 +1747,34 @@ impl MacosTraceBackend {
     fn intercept(&mut self, index: usize, mut regs: RegisterSet) -> Result<()> {
         let number = get(&regs, 16)?;
         let pc = get(&regs, PC)?;
-        match number {
+        // **The disposition comes from `abi::TRACED_STUBS`, not from a list
+        // written here.** This match used to carry its own set of syscall
+        // numbers, which made it a second admission gate over the same decision
+        // as `install()`'s stub list -- and the two drifted, exactly as #116's
+        // `admit_run` lesson says a re-derived admission set does. It is now
+        // exhaustive over `abi::Delivery`, so a stub row added to that table is
+        // routed without touching this function, and a row whose disposition
+        // nobody chose does not compile.
+        //
+        // `INTERPOSE_TRAP` keeps its own arm because it is not a libc stub: its
+        // sites are breakpointed by `install_image` on the interposer's own
+        // text, which is a different mechanism. Reaching here with it means the
+        // breakpoint that fired was planted there, because no other image is
+        // scanned. That is the containment: a trap number issued from anywhere
+        // else was never breakpointed, so the kernel sees it and refuses it.
+        // The trap is delivered on the namespace path deliberately: it *is* a
+        // filesystem operation, it is answered by the same decode / resolve /
+        // prepare / emulate / observe / commit sequence, and `resume` already
+        // synthesises the exit stop for an entry whose PC moved past the `svc`.
+        let delivery = if number == abi::INTERPOSE_TRAP {
+            Some(abi::Delivery::Namespace)
+        } else {
+            abi::delivery(number)
+        };
+        match delivery {
             // Filesystem calls the caller decodes, rewrites and observes, plus
-            // umbra's own routing trap. The trap is delivered on this path
-            // deliberately: it *is* a filesystem operation, it is answered by the
-            // same decode / resolve / prepare / emulate / observe / commit
-            // sequence, and `resume` already synthesises the exit stop for an
-            // entry whose PC moved past the `svc`.
-            //
-            // Reaching here with `abi::INTERPOSE_TRAP` means the breakpoint that
-            // fired was planted by `install_image` on the interposer's own text,
-            // because no other image is scanned. That is the containment: a trap
-            // number issued from anywhere else was never breakpointed, so the
-            // kernel sees it and refuses it.
-            5 | 57 | 58 | 398 | 463..=475 | 488 | abi::INTERPOSE_TRAP => {
+            // umbra's own routing trap.
+            Some(abi::Delivery::Namespace) => {
                 let s = &mut self.sessions[index];
                 s.entry = Some(pc);
                 self.events.push_back(TraceEvent::SyscallEntry {
@@ -1771,7 +1783,7 @@ impl MacosTraceBackend {
                     registers: regs,
                 });
             }
-            2 => {
+            Some(abi::Delivery::Fork) => {
                 let s = &mut self.sessions[index];
                 s.single_thread()?;
                 let mut restore = s
@@ -1784,7 +1796,7 @@ impl MacosTraceBackend {
                 restore.insert(pc + 4, original);
                 s.return_stop(ReturnKind::Fork { restore })?;
             }
-            7 | 400 => {
+            Some(abi::Delivery::Wait) => {
                 let wanted = get(&regs, 0)? as i32;
                 let children = self
                     .sessions
@@ -1824,7 +1836,7 @@ impl MacosTraceBackend {
                     WaitPlan::Native => s.return_stop(ReturnKind::Wait)?,
                 }
             }
-            59 | 244 => {
+            Some(abi::Delivery::Exec) => {
                 let slot = abi::path_slot(number)?;
                 let old = abi::read_path(&mut &*self.sessions[index].task, get(&regs, slot)?)?;
                 if !old.is_absolute() {
@@ -1860,7 +1872,14 @@ impl MacosTraceBackend {
                     s.return_stop(ReturnKind::Exec)?;
                 }
             }
-            _ => return Err(unsupported(format!("intercepted raw syscall {number}"))),
+            // A breakpoint fired for a number no row in `abi::TRACED_STUBS`
+            // issues, and that is umbra's own wiring fault rather than anything
+            // the tracee did: every breakpoint on this path was planted from
+            // that table or on the interposer's text. Refusing stops the run
+            // with a diagnosis naming the number, which is the right outcome --
+            // guessing a disposition would resume or refuse a call nobody chose
+            // to intercept.
+            None => return Err(unsupported(format!("intercepted raw syscall {number}"))),
         }
         Ok(())
     }

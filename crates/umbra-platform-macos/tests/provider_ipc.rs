@@ -247,61 +247,80 @@ fn open_libc_provider_ipc() {
                     )
                     .unwrap()
                     .unwrap();
-                let FsOp::Open {
-                    ref path, flags, ..
-                } = op
-                else {
-                    panic!("unexpected operation");
-                };
-                assert!(path.is_absolute(), "relative paths are not qualified");
-                if flags.write || flags.append || flags.create || flags.truncate {
-                    let physical = root.join(
-                        Path::new(std::ffi::OsStr::from_bytes(path.as_bytes()))
-                            .strip_prefix("/")
-                            .unwrap(),
-                    );
-                    std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
-                    // The IPC protocol has no allocator. Borrow stopped-thread stack
-                    // memory below Darwin's 128-byte red zone only for this syscall,
-                    // then restore it at SyscallExit before any user code executes.
-                    let physical = byte_path(&physical);
-                    let len = physical.as_bytes().len() + 1;
-                    let address = (abi::get(&registers, 31)
-                        .unwrap()
-                        .checked_sub(128 + len as u64)
-                        .unwrap())
-                        & !15;
-                    let mut saved = vec![0; len];
-                    Memory {
-                        client: &mut client,
-                        task,
-                        reads: &mut reads,
-                    }
-                    .read(address, &mut saved)
-                    .unwrap();
-                    let plan = abi::prepare_path(&registers, address, &physical, op).unwrap();
-                    for write in &plan.memory_writes {
+                // `fstat` joined the breakpointed stub list, and libSystem
+                // issues it on a *kernel* descriptor before `main` in every
+                // process, so this driver now sees one before it sees an open.
+                // Let it through to the kernel unmodified: there is no
+                // namespace here and the descriptor is real, which is the same
+                // disposition the supervisor's fence reaches for a sub-floor
+                // descriptor.
+                //
+                // Named rather than folded into a wildcard, and the panic kept:
+                // this driver rewrites write-intent opens and nothing else, and
+                // an operation it has no plan for should stop the case loudly.
+                // The sibling driver in `tests/fixtures.rs` carries the same
+                // arm for the same reason -- there are three decode loops in
+                // this crate's tests and `sandbox_launch.rs` was already
+                // tolerant, so these two are the pair that had to learn it.
+                if matches!(op, FsOp::Fstat { .. }) {
+                    thread
+                } else {
+                    let FsOp::Open {
+                        ref path, flags, ..
+                    } = op
+                    else {
+                        panic!("unexpected operation {op:?}");
+                    };
+                    assert!(path.is_absolute(), "relative paths are not qualified");
+                    if flags.write || flags.append || flags.create || flags.truncate {
+                        let physical = root.join(
+                            Path::new(std::ffi::OsStr::from_bytes(path.as_bytes()))
+                                .strip_prefix("/")
+                                .unwrap(),
+                        );
+                        std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
+                        // The IPC protocol has no allocator. Borrow stopped-thread stack
+                        // memory below Darwin's 128-byte red zone only for this syscall,
+                        // then restore it at SyscallExit before any user code executes.
+                        let physical = byte_path(&physical);
+                        let len = physical.as_bytes().len() + 1;
+                        let address = (abi::get(&registers, 31)
+                            .unwrap()
+                            .checked_sub(128 + len as u64)
+                            .unwrap())
+                            & !15;
+                        let mut saved = vec![0; len];
+                        Memory {
+                            client: &mut client,
+                            task,
+                            reads: &mut reads,
+                        }
+                        .read(address, &mut saved)
+                        .unwrap();
+                        let plan = abi::prepare_path(&registers, address, &physical, op).unwrap();
+                        for write in &plan.memory_writes {
+                            unit(
+                                &mut client,
+                                Request::WriteMemory {
+                                    task,
+                                    address: write.address,
+                                    bytes: write.bytes.clone(),
+                                },
+                            );
+                        }
+                        DarwinArm64Abi.apply_rewrite(&mut registers, &plan).unwrap();
                         unit(
                             &mut client,
-                            Request::WriteMemory {
-                                task,
-                                address: write.address,
-                                bytes: write.bytes.clone(),
+                            Request::SetRegisters {
+                                thread,
+                                regs: registers,
                             },
                         );
+                        assert!(saved_scratch.replace((task, address, saved)).is_none());
+                        opens += 1;
                     }
-                    DarwinArm64Abi.apply_rewrite(&mut registers, &plan).unwrap();
-                    unit(
-                        &mut client,
-                        Request::SetRegisters {
-                            thread,
-                            regs: registers,
-                        },
-                    );
-                    assert!(saved_scratch.replace((task, address, saved)).is_none());
-                    opens += 1;
+                    thread
                 }
-                thread
             }
             TraceEvent::SyscallExit { thread, .. } => {
                 if let Some((task, address, bytes)) = saved_scratch.take() {

@@ -63,6 +63,44 @@ fn error(kind: ErrorKind, operation: &str, context: impl Into<String>) -> UmbraE
     UmbraError::new(kind, operation, context)
 }
 
+/// Whether a descriptor is one umbra issued, rather than one the kernel did.
+///
+/// **This is the Rust twin of `umbra_owns` in `umbra_interpose.c`, and it is
+/// named after it deliberately** so the correspondence is nominal rather than
+/// only semantic. The C applies the test before interposing `read`, `write` and
+/// `close`; this applies it before resolving an `fstat`, which reaches umbra
+/// through the tracer instead because libsystem calls its own entry point and
+/// there is nothing to interpose. Term for term:
+///
+/// ```text
+/// C:     umbra_active()   &&  fd >= 0   &&  (uint64_t)fd >= umbra_control.floor
+/// Rust:  floor.is_some()  &&  fd.0 >= 0 &&  (fd.0 as u32)  >= floor
+/// ```
+///
+/// The *value* cannot drift: `descriptor_floor` is `DESCRIPTOR_FENCE`, which is
+/// also the `RLIMIT_NOFILE` written into `umbra_control.floor`, and there is one
+/// constant and one assignment in the tree. The *comparison* is written twice,
+/// in two languages, and what links them is
+/// `umbra_platform_macos::abi::tests::the_interposers_descriptor_test_is_the_one_the_supervisor_applies`,
+/// which pins the C's text and names this function.
+///
+/// **That pairing is a change-detector, not a proof of agreement**, and the
+/// table above is the only thing asserting the two predicates mean the same:
+/// edit the C and this function consistently wrong and both tests pass. The
+/// cited test's own doc comment sets out the three parts and their limits.
+///
+/// `floor` is `None` on a rewrite-backed run, which has no virtual descriptors
+/// at all: every descriptor is the kernel's, so nothing is owned and every
+/// `fstat` passes through exactly as it did before the call was breakpointed.
+///
+/// Negative descriptors are excluded rather than wrapped. `fd` is a signed
+/// `int` and `-1` is what a failed `open` returns; casting it to `u32` would
+/// make it `0xffff_ffff`, which is above any plausible floor and would have
+/// umbra answer for a descriptor that does not exist.
+fn umbra_owns_descriptor(floor: Option<u32>, fd: umbra_core::TracedFd) -> bool {
+    matches!(floor, Some(floor) if fd.0 >= 0 && (fd.0 as u32) >= floor)
+}
+
 impl Supervisor {
     /// Launch a fully prepared command under tracing and take ownership of its tree.
     ///
@@ -269,6 +307,73 @@ impl Supervisor {
             umbra_overlay::Dispatch::Materialise | umbra_overlay::Dispatch::Whiteout
         );
         let context = self.process(task)?.context.clone();
+        // **The descriptor fence, applied to the one descriptor-relative call
+        // the tracer carries rather than the interposer.**
+        //
+        // `read`, `write` and `close` reach umbra through the interposer, which
+        // applies this test in C before it ever traps: below the floor is a
+        // kernel descriptor and goes to libc unchanged, at or above it is
+        // umbra's (`umbra_interpose.c`, VIRTUAL DESCRIPTORS). `fstat` has no
+        // interposed entry point -- libsystem calls its own -- so it is
+        // breakpointed at the libc stub instead, and *every* `fstat` in the
+        // process traps here, including libsystem's own on kernel descriptors.
+        //
+        // Measured: XPC bundle resolution and `_os_feature_table_once` `fstat`
+        // fd 3 during startup, and `cat` `fstat`s fd 1. Resolving those through
+        // the namespace would answer `EBADF` for descriptors the kernel owns and
+        // is perfectly able to answer -- turning a working program into a broken
+        // one, which is the opposite of what routing this call is for.
+        //
+        // So the same test is applied here, against the same constant: the run's
+        // `descriptor_floor`, which is `DESCRIPTOR_FENCE` and is also the
+        // tracee's `RLIMIT_NOFILE`. No second allocator and no second number
+        // space -- this reads the one the fence already established. A
+        // rewrite-backed run has no floor and therefore no virtual descriptors
+        // at all, so every `fstat` on one passes through, which is exactly what
+        // it did before this call was breakpointed.
+        //
+        // **This is the twin of `umbra_owns` in `umbra_interpose.c`**, and the
+        // two must agree. The value cannot drift -- one `DESCRIPTOR_FENCE`, one
+        // assignment tree-wide -- but the comparison is written twice, in two
+        // languages, and nothing the compiler does links them. What links them
+        // is `abi.rs`'s
+        // `the_interposers_descriptor_test_is_the_one_the_supervisor_applies`,
+        // which pins the C's text and names this site. Change one, change both.
+        //
+        // The predicate is `umbra_owns_descriptor`, named after its twin so the
+        // correspondence is nominal rather than only semantic, and tested over
+        // both branches -- which matters because only one of them is reachable
+        // on a registry that can run without a live NFSv4 fixture.
+        if let FsOp::Fstat { fd } = &operation {
+            let floor = self.budget.as_ref().and_then(|b| b.descriptor_floor);
+            if !umbra_owns_descriptor(floor, *fd) {
+                return self.resume_thread(thread);
+            }
+        }
+        // **The `fstat` output buffer, bound once and here.** An `fstat` this
+        // far in will be answered by umbra, so the `struct stat` has to be
+        // written into the tracee -- and where it goes is the tracee's own
+        // argument, which the tracee can get wrong.
+        //
+        // `fstat(vfd, NULL)` is an ordinary program bug and Darwin answers it
+        // `EFAULT`. Binding it through `io_binding` carries that errno as a
+        // *value* instead of an error, so the refusal is answered to the tracee
+        // below rather than stopping the run -- the rule `routing_for`'s doc
+        // comment states, reached from a second entry point. Measured before
+        // that rule existed: `read(fd, NULL, 4)` ended the run.
+        //
+        // Bound *before* `set_routed_request` so a refusal can skip `resolve`
+        // without stranding a routing binding the namespace consumes on
+        // resolution, and bound once so the seam below needs no second call --
+        // the ABI is a subprocess behind IPC and `fstat` is issued by every
+        // locale open in every process.
+        let stat_buffer = match &operation {
+            FsOp::Fstat { .. } => Self::io_binding(&*self.platform.abi, &registers)?,
+            _ => None,
+        };
+        if let Some(Err(errno)) = stat_buffer {
+            return self.deny_to_tracee(thread, &mut registers, errno);
+        }
         // Routed runs only. On a rewrite-backed run `descriptor_floor` is `None`
         // and none of this executes, so that path reaches `resolve` exactly as it
         // did before.
@@ -316,50 +421,58 @@ impl Supervisor {
         // it needs no journaled preparation and no operation slot: answer the
         // tracee here, before minting an OperationId.
         //
-        // **Five things reach it**, and the list is kept current because it is
-        // the only place they are enumerated together:
+        // **Six things reach it**, and the list is kept current because it is
+        // the only place they are enumerated together. Every one names the
+        // `umbra-overlay` *function* that produces it, never a line: this block
+        // carried twelve line citations that were all correct on master and all
+        // wrong the moment this change grew `engine.rs`, and one of them landed
+        // on a different `Deny` -- which reads as a confirmation and is not.
+        // A function name survives an insertion above it; see the note on that
+        // remedy's limits over `citations_in_this_file_name_items_not_lines`.
         //
-        // 1. A whiteout-hidden non-mutating path -> `ENOENT` (`hidden_or`,
-        //    `engine.rs:786`).
-        // 2. A routed run whose *name does not resolve* -> `ENOENT`
-        //    (`hidden_or:804` for a path operation, `routed_binding:1787` for a
-        //    descriptor whose name stopped resolving). Narrower than it reads:
-        //    this is name resolution only, never a `NotFound` the `Storage`
-        //    raised for an object the journal says it committed -- that one
-        //    reaches the `Err(e)` arm and stops the run, which is the whole
-        //    point of deciding it in the engine rather than here.
-        // 3. `EBADF` on a routed run -- a descriptor umbra never issued, one
-        //    carrying no logical path, a directory, or one opened without the
-        //    access the operation needs (`engine.rs:1767`, `:1770`, `:1815`,
-        //    `:1820`, `:1931`).
+        // 1. A whiteout-hidden non-mutating path -> `ENOENT`, from
+        //    `Overlay::hidden_or`.
+        // 2. A routed run whose *name does not resolve* -> `ENOENT`, from
+        //    `Overlay::hidden_or` for a path operation and
+        //    `Overlay::routed_binding` for a descriptor whose name stopped
+        //    resolving. Narrower than it reads: this is name resolution only,
+        //    never a `NotFound` the `Storage` raised for an object the journal
+        //    says it committed -- that one reaches the `Err(e)` arm and stops
+        //    the run, which is the whole point of deciding it in the engine
+        //    rather than here.
+        // 3. `EBADF` on a routed run -- a descriptor umbra never issued or one
+        //    carrying no logical path (`Overlay::routed_binding`), a directory
+        //    or one opened without the access the operation needs
+        //    (`resolve_routed_read`, `resolve_routed_write`), or one an `fstat`
+        //    named that neither of those resolves (`resolve_routed_fstat`).
         // 4. A routing input the tracee could not supply, carried as a value
         //    through `RoutedInput` rather than as an error: `EFAULT` for a bad
-        //    transfer buffer (`:1827`, `:1937`) and `EMFILE` for an exhausted
-        //    fenced descriptor range (`:2598`).
+        //    transfer buffer (`resolve_routed_read`, `resolve_routed_write`)
+        //    and `EMFILE` for an exhausted fenced descriptor range (the routed
+        //    `FsOp::Open` arm of `Overlay::resolve`).
         // 5. `ENOTSUP` for an intercepted path operation on a routed run that
         //    `rewrite` would have had to name a shadow path for -- `fstatat`,
         //    `faccessat`, `renameat` and the rest on an object this run created
-        //    or copied up (`:2669`). Without it those stopped the run.
+        //    or copied up. The `_ if self.routed()?` fallthrough of
+        //    `Overlay::resolve`'s action match. Without it those stopped the run.
+        // 6. `ENOTSUP` for an `FsOp::SetTimes` whose storage cannot set times --
+        //    the `STORAGE_TIMESTAMP_FIDELITY_V1` check in `Overlay::resolve`'s
+        //    validation match. **Added by the same change that added this
+        //    line**, and it belongs here for the reason the header gives: three
+        //    of the four backends refuse a timestamp update, and reaching that
+        //    refusal from inside `prepare` would flush an intent for a change
+        //    that never happened and stop the run.
+        //
+        // A seventh tracee-visible refusal exists and deliberately does *not*
+        // reach this point: a bad `fstat` output pointer is bound and answered
+        // above, before `set_routed_request`, because skipping `resolve` after
+        // binding a routing request would strand it. It answers through the
+        // same `deny_to_tracee` and is named here so the enumeration is whole.
         //
         // On a rewrite-backed run every other `NotFound` still resumes the
         // tracee's own syscall in the arm above.
         if let ResolvedAction::Deny(errno) = action {
-            let result = EmulatedResult {
-                outcome: OperationOutcome::Failure(errno),
-                memory_writes: vec![],
-            };
-            // The backend must skip the trapped syscall, not merely rewrite its
-            // return registers. On Darwin arm64 the entry stop is the `svc` itself
-            // and `emulate_result` steps PC past it; a backend that cannot do this
-            // (the Linux stub's `emulate_result` returns an error) fails closed
-            // here rather than resuming the call it was told to refuse.
-            self.platform.abi.emulate_result(&mut registers, &result)?;
-            self.service_renewal()?;
-            return self
-                .platform
-                .control
-                .set_registers(thread, &registers)
-                .and_then(|()| self.resume_thread(thread));
+            return self.deny_to_tracee(thread, &mut registers, errno);
         }
         let id = OperationId(Uuid::new_v4());
         self.service_renewal()?;
@@ -384,7 +497,11 @@ impl Supervisor {
             // path, in the ordinary order, and `self.operations` is drained there
             // like every other intercepted call's.
             ResolvedAction::Emulate(result) => {
-                for write in &result.memory_writes {
+                for write in self
+                    .routed_stat_write(&operation, stat_buffer)?
+                    .iter()
+                    .chain(&result.memory_writes)
+                {
                     self.service_renewal()?;
                     self.platform
                         .control
@@ -603,6 +720,113 @@ impl Supervisor {
         // safe to name here; see `Overlay::routed_binding` for the same argument
         // about `EBADF`.
         Ok(Err(umbra_core::Errno(24)))
+    }
+
+    /// Answer the stopped tracee with an errno and resume it, executing nothing.
+    ///
+    /// The backend must **skip** the trapped syscall, not merely rewrite its
+    /// return registers. On Darwin arm64 the entry stop is the `svc` itself and
+    /// `emulate_result` steps PC past it; a backend that cannot do this (the
+    /// Linux stub's `emulate_result` returns an error) fails closed here rather
+    /// than resuming the call it was told to refuse.
+    ///
+    /// One function rather than two copies, because there are two places a
+    /// refusal is decided: `resolve` answering `Deny`, and the entry path
+    /// finding that a binding the *tracee's own request* made impossible -- a
+    /// null `struct stat` pointer -- must be answered rather than raised. Both
+    /// reach the tracee the same way, and a second copy of this sequence is the
+    /// shape that produced the `intercept()`/`install()` drift.
+    fn deny_to_tracee(
+        &mut self,
+        thread: ThreadId,
+        registers: &mut umbra_core::RegisterSet,
+        errno: umbra_core::Errno,
+    ) -> Result<()> {
+        let result = EmulatedResult {
+            outcome: OperationOutcome::Failure(errno),
+            memory_writes: vec![],
+        };
+        self.platform.abi.emulate_result(registers, &result)?;
+        self.service_renewal()?;
+        self.platform
+            .control
+            .set_registers(thread, registers)
+            .and_then(|()| self.resume_thread(thread))
+    }
+
+    /// The `struct stat` image a routed `fstat` must leave in the tracee, if
+    /// this operation is one.
+    ///
+    /// **Two halves of one answer, and neither side can produce it alone.** The
+    /// namespace resolved the descriptor to a logical object and knows its
+    /// metadata; only the ABI knows what that metadata looks like in a tracee's
+    /// memory. `EmulatedResult` carries bytes, so the join has to happen on this
+    /// side of the namespace boundary -- which is also why `FsOp::Fstat`'s
+    /// resolution deliberately returns no memory write of its own.
+    ///
+    /// It is the same shape as `record_routed_effect`: a supervisor-side step
+    /// that completes a routed operation using something the namespace exposed
+    /// beside the action rather than inside it.
+    ///
+    /// Every *remaining* failure is an `Err` rather than a skipped write, and
+    /// the word remaining is load-bearing: the one failure the **tracee** can
+    /// cause -- a bad output pointer -- was already bound as an errno and
+    /// answered before `resolve` ran, so nothing that reaches here is the
+    /// program's fault. What is left is umbra's own wiring: a resolution that
+    /// answered `Emulate` for an `fstat` and then produced no metadata, an ABI
+    /// with no stat layout, or an entry naming no output buffer. Each would
+    /// leave the tracee's `struct stat` holding whatever was there before while
+    /// the call reported success -- a wrong answer rather than a refusal.
+    fn routed_stat_write(
+        &mut self,
+        operation: &FsOp,
+        buffer: Option<umbra_core::RoutedInput<umbra_core::IoBuffer>>,
+    ) -> Result<Option<umbra_core::MemoryWrite>> {
+        if !matches!(operation, FsOp::Fstat { .. }) {
+            return Ok(None);
+        }
+        let stat = self.namespace.routed_stat()?.ok_or_else(|| {
+            error(
+                ErrorKind::ProtocolMismatch,
+                "supervisor.routed_stat",
+                "the namespace emulated an fstat without resolving its metadata",
+            )
+        })?;
+        let bytes = self.platform.abi.encode_stat(&stat)?;
+        let buffer = match buffer {
+            Some(Ok(buffer)) => buffer,
+            // Answered to the tracee before `resolve`; an `Emulate` cannot be
+            // reached with one outstanding.
+            Some(Err(errno)) => {
+                return Err(error(
+                    ErrorKind::InvalidState,
+                    "supervisor.routed_stat",
+                    format!("a refused stat buffer ({errno:?}) reached the emulated answer"),
+                ))
+            }
+            None => {
+                return Err(error(
+                    ErrorKind::ProtocolMismatch,
+                    "supervisor.routed_stat",
+                    "the ABI decoded an fstat but reports no output buffer for it",
+                ))
+            }
+        };
+        // The encoding and the buffer are produced by the same ABI from the same
+        // entry, so a disagreement is umbra's own wiring rather than anything the
+        // tracee did -- and writing the shorter of the two would leave a partly
+        // stale `struct stat` behind.
+        if bytes.len() != buffer.length as usize {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "supervisor.routed_stat",
+                "the ABI's stat encoding and its output buffer disagree in length",
+            ));
+        }
+        Ok(Some(umbra_core::MemoryWrite {
+            address: buffer.address,
+            bytes,
+        }))
     }
 
     /// Record what this routed operation's observed success must do to the
@@ -1012,6 +1236,117 @@ mod tests {
         s.state.lifecycle = RunLifecycle::Running;
         s
     }
+    /// This file cites **items**, not lines, and this is what keeps it that way.
+    ///
+    /// The `Deny` taxonomy above carried twelve citations into
+    /// `umbra-overlay`'s `engine.rs`. All twelve were correct when they were
+    /// written and all twelve were wrong once this slice grew that file, and
+    /// one of them landed on a *different* `Deny` -- which reads as a
+    /// confirmation and is not. It happened in the same round that diagnosed
+    /// the class elsewhere and abandoned line ranges for it, which is why a
+    /// comment saying "name items here" was demonstrably not enough.
+    ///
+    /// **What this covers:** the reintroduction of a line-number citation
+    /// anywhere in `events.rs`. That is one file -- the one where the defect
+    /// occurred, twice.
+    ///
+    /// **What it does not cover, stated because the round-1 report overclaimed
+    /// the remedy:**
+    ///
+    /// * **Renames.** A citation naming `routed_binding` breaks silently if
+    ///   that function is renamed, exactly as a line range breaks on an
+    ///   insertion. Naming makes the citation survive edits *above* it, not
+    ///   edits *to* it. Nothing here checks that a named item exists;
+    ///   `include_str!` across a crate boundary would, at the cost of a
+    ///   build-time relative path between crates, which was judged the worse
+    ///   trade.
+    /// * **Other files.** Several in this slice still carry line citations
+    ///   deliberately -- `run_fixtures.rs` quotes two stale ranges while
+    ///   explaining why ranges were abandoned -- so a blanket ban is not
+    ///   expressible as one test.
+    /// * **Prose.** The largest stale-documentation class this slice produced
+    ///   was claims *about behaviour*, not citations. No citation policy
+    ///   reaches those; `memoria check` does, and cannot run in a jj workspace
+    ///   with no colocated `.git`.
+    #[test]
+    fn citations_in_this_file_name_items_not_lines() {
+        // Assembled rather than written out, so this test's own message cannot
+        // match the pattern it bans.
+        let marker = format!("{}{}", ".rs", ':');
+        let source = include_str!("events.rs");
+        let offenders: Vec<&str> = source
+            .lines()
+            .filter(|line| {
+                line.match_indices(&marker).any(|(at, _)| {
+                    line[at + marker.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit())
+                })
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "this file cites a source line by number, which goes stale the next \
+             time the cited file grows and gives no signal when it does. Name the \
+             function, type or test instead. Offending line(s):\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Both branches of the descriptor fence, including the one no registry
+    /// runnable without a live NFSv4 fixture can reach.
+    ///
+    /// The routed arm -- `floor.is_some()` and `fd >= floor` -- is only taken on
+    /// a run whose storage advertises userspace routing, so a rewrite-backed
+    /// fixture matrix exercises the *other* arm and nothing else. That asymmetry
+    /// is why this is a unit test of the predicate rather than a claim resting
+    /// on the end-to-end matrices: as shipped in round 0 the fence was not
+    /// merely untested but unreachable, and being able to point at which branch
+    /// is proven by what matters more than the total.
+    ///
+    /// `umbra_owns_descriptor` is the twin of `umbra_owns` in
+    /// `umbra_interpose.c`; the C side is pinned by a test in
+    /// `umbra-platform-macos`. The cases below are the four the C's three
+    /// conjuncts produce, plus the negative-descriptor case that a `u32` cast
+    /// would get wrong.
+    #[test]
+    fn the_descriptor_fence_owns_exactly_the_fenced_range() {
+        // No fence: a rewrite-backed run has no virtual descriptors, so umbra
+        // owns nothing and every `fstat` resumes to the kernel.
+        for fd in [-1, 0, 1, 3, 4095, 4096, 8192, i32::MAX] {
+            assert!(
+                !umbra_owns_descriptor(None, TracedFd(fd)),
+                "an unfenced run must own no descriptor, but claimed {fd}"
+            );
+        }
+        // Fenced: below the floor is the kernel's, at or above it is umbra's.
+        // 3 is not arbitrary -- libSystem's pre-`main` `fstat` is on fd 3, and
+        // `cat` stats fd 1. Answering either from the namespace would break a
+        // working program.
+        for fd in [0, 1, 2, 3, 4094, 4095] {
+            assert!(
+                !umbra_owns_descriptor(Some(4096), TracedFd(fd)),
+                "a kernel descriptor must pass through, but umbra claimed {fd}"
+            );
+        }
+        for fd in [4096, 4097, 8191, 8192, i32::MAX] {
+            assert!(
+                umbra_owns_descriptor(Some(4096), TracedFd(fd)),
+                "a fenced descriptor must be umbra's, but it disclaimed {fd}"
+            );
+        }
+        // A negative descriptor is never umbra's, however high the `u32` cast
+        // would put it. `-1` casts to `0xffff_ffff`, which is above every
+        // plausible floor.
+        for fd in [-1, -2, i32::MIN] {
+            assert!(
+                !umbra_owns_descriptor(Some(4096), TracedFd(fd)),
+                "a negative descriptor must never be umbra's, but it claimed {fd}"
+            );
+        }
+    }
+
     /// A routed budget with a deliberately tiny fence, so the range can be
     /// exhausted in a test rather than only in principle.
     fn routed_budget(fence: u32) -> RunBudget {

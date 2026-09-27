@@ -131,7 +131,13 @@ ABI memory callbacks and before resuming), and process one syscall at a
 time: decode through the negotiated ABI, resolve through the namespace, prepare
 (which journals intent and performs copy-up or creation), ask the platform to
 prepare the physical rewrite, apply it, then resume to the matching exit, observe
-the outcome and commit or abort. A kernel errno is an observed outcome, not an
+the outcome and commit or abort. Not every operation reaches the kernel: when the
+namespace answers `resolve` with a refusal for the tracee, `deny_to_tracee`
+emulates that errno into the return register and resumes, so no intent is
+journalled, no rewrite is prepared and the syscall never executes. Both of its
+call sites share that one implementation, and the refusals that reach it are
+enumerated over it in `src/events.rs`. A kernel errno is an observed outcome, not
+an
 interception failure: it is aborted as `AbortReason::KernelRefused(errno)`, which
 the namespace reconciles instead of poisoning, so the tracee is resumed and the
 errno already sitting in its return register stands

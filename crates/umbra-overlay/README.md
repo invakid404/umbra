@@ -204,8 +204,21 @@ new resolutions are blocked while a transaction is pending.
   the first operation to route a routinely-failing syscall into it — an
   unprivileged tracee chowning to another uid gets `EPERM`, which most programs
   shrug off and which used to end the whole run. `FsOp::Chmod`, `FsOp::Fchmod`
-  and `FsOp::Link` remain unimplemented at `resolve`; ownership is the only
-  metadata mutation wired through today.
+  and `FsOp::Link` remain unimplemented at `resolve`.
+- `FsOp::SetTimes` is the **second** metadata mutation wired through, and it is
+  modelled on the chown above: `resolve` refuses an absent target, a base-only
+  directory and a backend that cannot set times; `prepare` copies up and then
+  issues the `SetMetadata` itself, because `resolve` answered `Emulate` and there
+  is no kernel call behind it; `JournalIntent::SetTimes` carries the
+  pre-materialisation `object` and the `path` that stays resolvable, exactly as
+  `Chown` does, and `replay_must_poison` classifies it reconcilable for the same
+  reason — the arm creates no object. It is reached from `utimensat`, which on
+  Darwin carries no syscall of its own and arrives as `setattrlistat`(524).
+  The backend check is `STORAGE_TIMESTAMP_FIDELITY_V1` and it is made at
+  `resolve`, before any journal record exists: three of the four storage
+  backends refuse a timestamp update, and reaching that refusal from inside
+  `prepare` would flush an intent for a change that never happened and stop the
+  run.
 - Rename materializes a regular-file or logical-symlink source, creates shadow destination parents,
   and returns source/destination kernel rewrites for one native shadow rename.
   On observed success the source whiteout is set and destination whiteout cleared.

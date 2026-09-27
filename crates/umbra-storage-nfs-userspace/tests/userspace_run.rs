@@ -1,5 +1,6 @@
-//! `umbra run` over the userspace NFSv4 client, end to end, and the two
-//! mutation probes that prove the routing is load-bearing.
+//! `umbra run` over the userspace NFSv4 client, end to end -- the toy program,
+//! the three standard utilities, and the five mutation probes that prove the
+//! routing is load-bearing.
 //!
 //! # What these cases assert, and why here
 //!
@@ -18,10 +19,12 @@
 //!
 //! # Running them
 //!
-//! Three separate invocations, because the probes are compile-time:
+//! **Six separate invocations**, because the probes are compile-time and no two
+//! may be enabled at once. Always rebuild the unmutated binaries afterwards.
 //!
 //! ```text
-//! # end to end: the toy must exit 0
+//! # end to end: the toy must exit 0, and the utility matrix must pass
+//! cargo build --workspace --bins
 //! cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run
 //!
 //! # probe A -- read routing broken; the toy must exit 8
@@ -33,13 +36,46 @@
 //! cargo build -p umbra-cli --features mutation-probe-write
 //! UMBRA_MUTATION_PROBE=write cargo test -p umbra-storage-nfs-userspace \
 //!     --features transport-raw --test userspace_run
+//!
+//! # probe C -- fstat answers EBADF; `touch <absent>` must fail with its
+//! #            empty file still in the export
+//! cargo build -p umbra-cli --features mutation-probe-fstat
+//! UMBRA_MUTATION_PROBE=fstat cargo test -p umbra-storage-nfs-userspace \
+//!     --features transport-raw --test userspace_run
+//!
+//! # probe D -- the mkdir(136) decode arm removed; the directory must appear
+//! #            nowhere while `touch <absent>` still exits 0
+//! # NOTE the crate: this probe is NOT on umbra-cli.
+//! cargo build -p umbra-platform-macos --features mutation-probe-mkdir
+//! UMBRA_MUTATION_PROBE=mkdir cargo test -p umbra-storage-nfs-userspace \
+//!     --features transport-raw --test userspace_run
+//!
+//! # probe E -- setattrlistat refused; `touch <existing>` must fail while
+//! #            `touch <absent>` still exits 0
+//! cargo build -p umbra-platform-macos --features mutation-probe-setattrlistat
+//! UMBRA_MUTATION_PROBE=setattrlistat cargo test -p umbra-storage-nfs-userspace \
+//!     --features transport-raw --test userspace_run
 //! ```
 //!
+//! **The probes are not all on the same crate, and the build command differs
+//! because of it.** A and B and C are features of `umbra-overlay`, forwarded
+//! through `umbra-supervisor` to `umbra-cli`, so they go into the `umbra`
+//! binary. D and E are features of `umbra-platform-macos`, which is a provider
+//! *executable* the registry names rather than a library `umbra` links -- so
+//! they go into that binary, and `cargo build -p umbra-cli --features
+//! mutation-probe-mkdir` is not merely useless, it does not exist as a feature
+//! there. Each probe's `#[test]` doc names the crate to build.
+//!
 //! `UMBRA_MUTATION_PROBE` selects which case runs; it does **not** enable a
-//! probe. The probes are cargo features on `umbra-overlay`, so the `umbra`
-//! binary either contains one or does not, and a mismatch between the variable
-//! and the binary fails the case rather than passing it: each probe asserts an
-//! exact exit code *and* a store state that only that probe produces.
+//! probe. A mismatch between the variable and the binaries fails the case
+//! rather than passing it, and each probe carries its own reason why: A and B
+//! assert an exact exit code from the toy, which only that mutation produces;
+//! C, D and E assert that the utility they target exits **nonzero** -- Apple's
+//! binaries exit 1 on any failure, so an exact code is not available -- paired
+//! with a positive assertion that a *different* utility still succeeds and
+//! still reaches the store. That pair is what makes them non-vacuous: probe D
+//! originally had only the negative half and passed against a tree whose
+//! tracer died before `main` for an unrelated reason.
 #![cfg(all(
     feature = "transport-raw",
     target_os = "macos",
@@ -1281,4 +1317,554 @@ fn a_path_operation_on_an_untouched_base_object_still_succeeds() {
         run.stderr
     );
     assert_eq!(run.child_exit(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Standard utilities over the userspace client.
+//
+// `crates/umbra-cli/tests/run_fixtures.rs` already has a `local_utility_matrix`
+// and an `nfs_utility_matrix`, and both are rewrite-backed: the shadow is a host
+// path, so a case can read it with `std::fs`. This is the third matrix, on the
+// **userspace** registry, and it lives here rather than beside those two for the
+// reason this file's header states -- nothing is mounted, so "the object is in
+// the store" can only honestly be checked by speaking NFSv4 to the server, which
+// needs `transport-raw` and therefore this crate.
+//
+// The cases are `/bin/mkdir`, `/usr/bin/touch` and `/bin/cat`: Apple's own
+// binaries, not a fixture this repository compiled. `/bin/ls` is deliberately
+// absent and is not claimed -- directory reads are unrouted in every form (see
+// LIMITS item 6 in `umbra_interpose.c`), and a partial `ls` lists correct names
+// while exiting 1, which is a dishonest exit code rather than a cheap `ls`.
+//
+// **What is not asserted: printed stdout.** The provider transport points the
+// tracee's stdout at `/dev/null`, so a filter's output is not observable from
+// here -- and pinning it empty would pin that limitation rather than any
+// behaviour. `cat`'s proof is the pair of legs `run_fixtures.rs` established:
+// the present operand exits 0 with the host untouched, and the absent one makes
+// `cat` name itself, its operand and the verdict on stderr, which no program
+// that did not run can compose.
+// ---------------------------------------------------------------------------
+
+/// What one standard utility must leave behind after one routed `umbra run`.
+enum Utility {
+    /// A directory at the operand, in the store, with the host untouched.
+    Directory,
+    /// An empty regular file at the operand, in the store, host untouched.
+    ///
+    /// Exit zero is the `fstat` proof and is the reason this case exists.
+    /// Measured before `fstat`(339) was routed: `touch <absent>` *did* create
+    /// the file and then exited **1** with `touch: <path>: Bad file
+    /// descriptor`, because its `fstat` on the virtual descriptor reached a
+    /// kernel that does not know the number. Creating the file was never the
+    /// hard part; reporting honestly that it had been created was.
+    EmptyFile,
+    /// The seeded file, copied up with its bytes intact and its modification
+    /// time moved into this run's window.
+    ///
+    /// **The bound is a sanity check, not the discriminator, and saying so is
+    /// the point.** Copy-up does not carry the base object's times, so a shadow
+    /// copy made by copy-up alone would also carry a time inside the window --
+    /// this case cannot tell that apart from a time `setattrlistat` set. What
+    /// can, and does, is `mutation_probe_setattrlistat_makes_touch_on_an_\
+    /// existing_file_fail`: with the decode refused, this exact case exits
+    /// nonzero while the `EmptyFile` case still passes.
+    TimesAdvanced,
+    /// The utility read an operand that exists, exited zero, and left the host
+    /// workspace byte-identical.
+    ReadOnly,
+    /// The operand does not exist, so the utility fails and names it on stderr.
+    Diagnoses,
+}
+
+/// One `umbra run` of one standard utility against a fresh, seeded workspace.
+///
+/// A run is a single launch, so the utilities cannot be chained: each case gets
+/// its own workspace, its own state directory and its own run.
+fn utility_run(
+    scratch: &Path,
+    host: &str,
+    port: u16,
+    index: usize,
+    program: &str,
+    relative: &str,
+) -> (Run, PathBuf) {
+    let workspace = scratch.join(format!("utility-{index}"));
+    let state = scratch.join(format!("utility-state-{index}"));
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed\n").unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let operand = workspace.join(relative);
+    let registry = registry(scratch, host, port);
+
+    let output = Command::new(binaries().join("umbra"))
+        .args(["run", "--registry"])
+        .arg(&registry)
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("--experimental")
+        .arg("--")
+        .arg(program)
+        .arg(&operand)
+        .stdin(Stdio::null())
+        .output()
+        .expect("umbra run");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let run_id = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("umbra: run ")
+                .and_then(|line| line.strip_suffix(" prepared"))
+        })
+        .unwrap_or_else(|| panic!("no prepared run id in:\n{stderr}"));
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(run_id).unwrap()),
+        status: output.status.code(),
+        stderr,
+        destination: operand.clone(),
+        state,
+        workspace,
+        registry,
+    };
+    (run, operand)
+}
+
+/// One object's attributes in the export, through the client, with nothing
+/// mounted. `None` means the name does not exist.
+///
+/// The sibling of `read_through_client`, split out rather than folded into it
+/// because that function asserts the object is a regular file before it reads:
+/// a `mkdir` case has to be able to ask what kind of object is there, and a
+/// `touch` case has to read a time, neither of which is a byte of content.
+fn attributes_through_client(
+    host: &str,
+    port: u16,
+    components: &[Vec<u8>],
+) -> Option<umbra_storage_nfs_userspace::transport::Attributes> {
+    let mut config = RawTransportConfig::loopback(port);
+    config.host = host.to_owned();
+    config.limits.default_deadline = Deadline { millis: 10_000 };
+    let deadline = config.limits.default_deadline;
+    let mut transport = LibnfsRawTransport::connect(config).expect("connect to the fixture");
+    let mut handle = transport
+        .root_filehandle(deadline)
+        .expect("PUTROOTFH; GETFH");
+    let mut attributes = None;
+    for component in components {
+        let name = ComponentName::new(component.clone()).expect("component");
+        let (next, found) = transport
+            .lookup(&handle, &name, AttrMask::STAT, deadline)
+            .ok()?;
+        handle = next;
+        attributes = Some(found);
+    }
+    Some(attributes.expect("at least one component"))
+}
+
+/// The components of one run's shadow object for an arbitrary operand.
+fn utility_shadow(run: &Run, operand: &Path) -> Vec<Vec<u8>> {
+    let mut components = vec![
+        EXPORT.to_vec(),
+        RUN_PARENT.to_vec(),
+        run.run_id.0.to_string().into_bytes(),
+        b"root".to_vec(),
+    ];
+    components.extend(
+        operand
+            .as_os_str()
+            .as_bytes()
+            .split(|byte| *byte == b'/')
+            .filter(|part| !part.is_empty())
+            .map(<[u8]>::to_vec),
+    );
+    components
+}
+
+/// Seconds since the epoch, for bounding a modification time against the window
+/// the run actually occupied.
+fn epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs() as i64
+}
+
+/// The matrix itself. Returns the cases so each probe can name the one it breaks.
+const UTILITY_CASES: &[(&str, &str, Utility)] = &[
+    ("/bin/mkdir", "bar", Utility::Directory),
+    ("/usr/bin/touch", "foo", Utility::EmptyFile),
+    ("/usr/bin/touch", "seed.txt", Utility::TimesAdvanced),
+    ("/bin/cat", "seed.txt", Utility::ReadOnly),
+    ("/bin/cat", "absent.txt", Utility::Diagnoses),
+];
+
+/// Run one case and assert everything it claims. `before` is the epoch second
+/// read immediately ahead of the launch.
+fn assert_utility_case(
+    host: &str,
+    port: u16,
+    run: &Run,
+    operand: &Path,
+    case: &str,
+    expect: &Utility,
+    before: i64,
+) {
+    let shadow = utility_shadow(run, operand);
+    match expect {
+        Utility::Directory | Utility::EmptyFile | Utility::TimesAdvanced | Utility::ReadOnly => {
+            assert_eq!(
+                run.status,
+                Some(0),
+                "{case}: umbra run failed (child {:?}):\n{}",
+                run.stderr
+                    .lines()
+                    .find(|line| line.contains("finished:"))
+                    .unwrap_or("<no status line>"),
+                run.stderr
+            );
+        }
+        Utility::Diagnoses => {
+            assert_ne!(run.status, Some(0), "{case}: {}", run.stderr);
+            let reported = format!(
+                "{}: {}: No such file or directory",
+                Path::new("/bin/cat").file_name().unwrap().to_string_lossy(),
+                operand.display()
+            );
+            assert!(
+                run.stderr.contains(&reported),
+                "{case}: expected {reported:?} on the tracee's stderr:\n{}",
+                run.stderr
+            );
+        }
+    }
+    match expect {
+        Utility::Directory => {
+            let found = attributes_through_client(host, port, &shadow)
+                .unwrap_or_else(|| panic!("{case}: the operand is not in the export"));
+            assert_eq!(
+                found.file_type,
+                Some(Nfs4Type::Directory),
+                "{case}: the store holds {:?}, not a directory",
+                found.file_type
+            );
+        }
+        Utility::EmptyFile => {
+            let stored = read_through_client(host, port, &shadow)
+                .unwrap_or_else(|| panic!("{case}: the operand is not in the export"));
+            assert!(
+                stored.is_empty(),
+                "{case}: touch left {} bytes in the export",
+                stored.len()
+            );
+        }
+        Utility::TimesAdvanced => {
+            let stored = read_through_client(host, port, &shadow)
+                .unwrap_or_else(|| panic!("{case}: the operand is not in the export"));
+            assert_eq!(stored, b"seed\n", "{case}: the copy-up lost the bytes");
+            let found = attributes_through_client(host, port, &shadow)
+                .unwrap_or_else(|| panic!("{case}: the operand is not in the export"));
+            let modified = found
+                .time_modify
+                .unwrap_or_else(|| panic!("{case}: the server returned no TIME_MODIFY"));
+            // A second of slack on the lower bound only, for a server whose
+            // clock is a tick behind this process's. The upper bound is read
+            // after the run, so no slack is owed there.
+            assert!(
+                modified.seconds >= before - 1 && modified.seconds <= epoch_seconds() + 1,
+                "{case}: the shadow's mtime {} is outside this run's window [{before}, {}]",
+                modified.seconds,
+                epoch_seconds()
+            );
+        }
+        Utility::ReadOnly | Utility::Diagnoses => {}
+    }
+    // The host, in both the places the operation could have escaped to.
+    if !matches!(expect, Utility::TimesAdvanced) {
+        assert!(
+            !operand.exists() || matches!(expect, Utility::ReadOnly),
+            "{case}: the host operand {} was created",
+            operand.display()
+        );
+    }
+    assert_workspace_pristine(run);
+    assert_host_write_root_empty(run);
+    assert!(
+        journal_records_completion(run) || !matches!(run.status, Some(0)),
+        "{case}: a successful run with no RunCompleted record"
+    );
+}
+
+#[test]
+fn standard_utilities_run_over_the_userspace_client() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    // The same provisioning switch the rewrite-backed matrices use -- the
+    // `UMBRA_TEST_FIXTURE_PATH` gate at the head of `run_fixtures.rs`'s
+    // `utilities()`: it is the suite's existing signal for "this host has
+    // workspace binaries built and debugger permission granted", which is
+    // exactly what a real traced launch of an Apple binary needs. A second
+    // switch is not invented for it. The endpoint gate below is this file's own
+    // and is not a second provisioning switch either -- without a live server
+    // there is no userspace registry to point at.
+    //
+    // **Read as a signal, not a path.** This case never launches what the
+    // variable points at; the programs it runs are Apple's own. The userspace
+    // job points it at the toy it already builds, which is why that is not a
+    // category error.
+    //
+    // **Through `input()` rather than a bare `var_os`, and that is the fix for
+    // a real failure.** A bare check skips silently. This case shipped that
+    // way, the CI job that could run it never set the variable, and the job
+    // reported `ok` while proving nothing -- under a job name that claims the
+    // utilities work over the userspace client. `input()` asserts when
+    // `UMBRA_INTEGRATION_REQUIRED` is set, which that job sets for the whole
+    // run, so an unwired proof is now a red job rather than a quiet pass. A
+    // developer without the fixture still gets a skip.
+    let Some(_signal) = input("UMBRA_TEST_FIXTURE_PATH") else {
+        return;
+    };
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let paths: Vec<&Path> = vec![scratch.path()];
+    assert_no_nfs_mount(&host, port, &paths, "before the utility matrix");
+    for (index, (program, relative, expect)) in UTILITY_CASES.iter().enumerate() {
+        let case = format!("{program} <workspace>/{relative}");
+        let before = epoch_seconds();
+        let (run, operand) = utility_run(scratch.path(), &host, port, index, program, relative);
+        assert_utility_case(&host, port, &run, &operand, &case, expect, before);
+        eprintln!("PASS userspace {case}: store holds it, host untouched");
+    }
+    assert_no_nfs_mount(&host, port, &paths, "after the utility matrix");
+}
+
+/// Every probe this file defines is actually wired into the job that can run
+/// it.
+///
+/// **This is the guard for the failure that produced it.** All five probes and
+/// the utility matrix were written, merged and reported green while the
+/// `Userspace-routed run over the live NFSv4 client` job ran none of them: it
+/// carried #116's three proof steps and never set `UMBRA_MUTATION_PROBE` to
+/// `fstat`, `mkdir` or `setattrlistat`, nor rebuilt `umbra-platform-macos` with
+/// the two features that live there. Each probe dutifully skipped and reported
+/// `ok`. The job name says the utilities are proven over the userspace client;
+/// nothing had run.
+///
+/// The matrix's own gate is hard-failed under `UMBRA_INTEGRATION_REQUIRED` now,
+/// which closes that half. A probe cannot be hard-failed the same way -- five
+/// probes across six invocations means four or five legitimately skip every
+/// time -- so the property is checked here instead: for each probe, the
+/// workflow must both select it and build the crate that carries it.
+///
+/// **What this does not cover**, said plainly because overclaiming a remedy is
+/// how the last two rounds went wrong: it reads the workflow as text. It does
+/// not prove the job runs, that the runner exists, that the steps are ordered
+/// so no two probes are live at once, or that a step's `cargo test` selector
+/// reaches this file. It proves that a probe named here is named there too,
+/// which is exactly the link that was missing.
+#[test]
+fn every_mutation_probe_is_wired_into_the_userspace_job() {
+    let workflow = include_str!("../../../.github/workflows/ci.yml");
+    let job = workflow
+        .split_once("native-userspace-routing:")
+        .expect("the userspace-routing job is defined in ci.yml")
+        .1;
+    // The crate whose cargo feature carries each probe. `read`/`write`/`fstat`
+    // are `umbra-overlay` features reaching `target/debug/umbra` through
+    // `umbra-cli`; `mkdir`/`setattrlistat` are `umbra-platform-macos`
+    // features reaching that provider executable, which `umbra-cli` does not
+    // link and so cannot forward.
+    for (probe, package) in [
+        ("read", "umbra-cli"),
+        ("write", "umbra-cli"),
+        ("fstat", "umbra-cli"),
+        ("mkdir", "umbra-platform-macos"),
+        ("setattrlistat", "umbra-platform-macos"),
+    ] {
+        assert!(
+            job.contains(&format!("UMBRA_MUTATION_PROBE: {probe}")),
+            "probe {probe} is defined in this file but the userspace job never              selects it, so it skips and reports ok"
+        );
+        assert!(
+            job.contains(&format!(
+                "cargo build -p {package} --features mutation-probe-{probe}"
+            )),
+            "probe {probe} is selected by the userspace job but the job never              builds {package} with it, so the run is unmutated and the case              fails for the wrong reason"
+        );
+    }
+    // The matrix needs no probe; it needs its provisioning signal.
+    assert!(
+        job.contains("UMBRA_TEST_FIXTURE_PATH="),
+        "the userspace job does not set UMBRA_TEST_FIXTURE_PATH, so          `standard_utilities_run_over_the_userspace_client` cannot run there"
+    );
+    // Both mutated binaries must be restored: this runner is persistent.
+    let restore = job
+        .split_once("Restore unmutated binaries")
+        .expect("the job restores unmutated binaries")
+        .1;
+    for package in ["umbra-cli", "umbra-platform-macos"] {
+        assert!(
+            restore.contains(&format!("cargo build -p {package}
+")),
+            "the restore step does not rebuild an unmutated {package}, leaving a              probe in target/debug for whatever runs on this runner next"
+        );
+    }
+}
+
+/// Probe C -- `fstat` on a virtual descriptor answers `EBADF`.
+///
+/// Its discriminator is a *pair*, and no other probe here can produce it:
+/// `touch <absent>` exits nonzero **and the empty file is still in the export**.
+/// The creation never depended on the reply; only the honest exit code did.
+#[test]
+fn mutation_probe_fstat_makes_touch_fail_while_still_creating_the_file() {
+    if declared_probe().as_deref() != Some("fstat") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=fstat with a binary built with \
+                   --features mutation-probe-fstat"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let (run, operand) = utility_run(scratch.path(), &host, port, 0, "/usr/bin/touch", "foo");
+    assert_ne!(
+        run.status,
+        Some(0),
+        "breaking fstat routing did not make touch fail:\n{}",
+        run.stderr
+    );
+    let stored = read_through_client(host.as_str(), port, &utility_shadow(&run, &operand))
+        .expect("the probe breaks the fstat reply, not the create");
+    assert!(
+        stored.is_empty(),
+        "the probe changed what reached the store, so it is not isolated to the \
+         fstat reply: {} bytes",
+        stored.len()
+    );
+    assert!(!operand.exists());
+    assert_host_write_root_empty(&run);
+}
+
+/// Probe D -- the `mkdir`(136) decode arm is removed.
+///
+/// Its negative half is that the directory exists **nowhere**: not on the host,
+/// and not in the export. With the arm gone, 136 reaches the decoder's
+/// "unclassified Darwin syscall" refusal, which `syscall_entry` propagates and
+/// which stops the run -- so nothing is ever captured. (That is *not* the
+/// pre-#114 `RefusedByEnforcement` behaviour, and this doc used to say it was:
+/// before the arm existed, 136 was not breakpointed at all, so it never reached
+/// the decoder. The probe creates a third state.)
+///
+/// **The positive half is load-bearing and was added in round 1.** With only
+/// the negative assertions, this case passed against a tree whose *second*
+/// admission gate never learned 136/189/339/524: `/bin/mkdir` died before
+/// `main` on `intercepted raw syscall 339`, which satisfies "exits nonzero" and
+/// "nothing anywhere" without saying a word about the decode arm. A probe that
+/// passes for a cause outside its own mutation certifies exactly what it cannot
+/// detect, which inverts the discipline the probes exist for. So this case now
+/// also requires `touch <absent>` to still exit 0 with its empty file in the
+/// export, in the same probe binary — which no common cause upstream of the
+/// decode arm can satisfy. Probes C and E already had such a half; D did not,
+/// and it was the only one that could pass vacuously.
+#[test]
+fn mutation_probe_mkdir_makes_the_directory_appear_nowhere() {
+    if declared_probe().as_deref() != Some("mkdir") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=mkdir with umbra-platform-macos built \
+                   with --features mutation-probe-mkdir"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let (run, operand) = utility_run(scratch.path(), &host, port, 0, "/bin/mkdir", "bar");
+    assert_ne!(
+        run.status,
+        Some(0),
+        "removing the mkdir decode arm did not make mkdir fail:\n{}",
+        run.stderr
+    );
+    assert!(
+        attributes_through_client(&host, port, &utility_shadow(&run, &operand)).is_none(),
+        "a refused mkdir was captured in the export"
+    );
+    assert!(!operand.exists(), "a refused mkdir reached the host");
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+
+    // The positive half. Everything above is satisfied by any failure that
+    // stops `/bin/mkdir` for any reason; this is the assertion that is not.
+    let (touched, file) = utility_run(scratch.path(), &host, port, 1, "/usr/bin/touch", "foo");
+    assert_eq!(
+        touched.status,
+        Some(0),
+        "the probe broke more than the mkdir decode arm, so this case proves \
+         nothing about it:\n{}",
+        touched.stderr
+    );
+    let stored = read_through_client(host.as_str(), port, &utility_shadow(&touched, &file))
+        .expect("the create path is untouched by this probe");
+    assert!(stored.is_empty());
+}
+
+/// Probe E -- `setattrlistat`(524) is refused at the decode.
+///
+/// Its discriminator is the pair no other probe reproduces: `touch <existing>`
+/// fails while `touch <absent>` still succeeds and still leaves its empty file
+/// in the export, because the create path never reaches this syscall at all.
+/// Both halves are asserted here rather than one, so a probe that broke `touch`
+/// outright could not satisfy it.
+///
+/// **How it fails is not how an unrouted `setattrlistat` failed**, and the
+/// assertion is written for what the probe does rather than for what it might
+/// be imagined to restore. Refusing at the decode stops the *run*: measured on
+/// `--local-dev`, the mutated binary emits `UnsupportedCapability during macos:
+/// mutation probe: setattrlistat is refused` with no tracee message and no
+/// child status, where the unmutated one answers the tracee `Operation not
+/// supported` and finishes. `assert_ne!(status, Some(0))` covers both, which is
+/// why it is written that way and not against a child exit code.
+#[test]
+fn mutation_probe_setattrlistat_makes_touch_on_an_existing_file_fail() {
+    if declared_probe().as_deref() != Some("setattrlistat") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=setattrlistat with umbra-platform-macos \
+                   built with --features mutation-probe-setattrlistat"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let (existing, _) = utility_run(scratch.path(), &host, port, 0, "/usr/bin/touch", "seed.txt");
+    assert_ne!(
+        existing.status,
+        Some(0),
+        "refusing setattrlistat did not make touch-on-existing fail:\n{}",
+        existing.stderr
+    );
+    assert_workspace_pristine(&existing);
+    assert_host_write_root_empty(&existing);
+
+    let (absent, operand) = utility_run(scratch.path(), &host, port, 1, "/usr/bin/touch", "foo");
+    assert_eq!(
+        absent.status,
+        Some(0),
+        "the probe also broke touch's create path, so it is not isolated to \
+         setattrlistat:\n{}",
+        absent.stderr
+    );
+    let stored = read_through_client(host.as_str(), port, &utility_shadow(&absent, &operand))
+        .expect("the create path is untouched by this probe");
+    assert!(stored.is_empty());
 }
