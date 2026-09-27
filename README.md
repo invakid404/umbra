@@ -71,12 +71,24 @@ with bounded outage recovery. Its suites run against an isolated NFS-Ganesha
 container from user space, with no mount anywhere. An open run advertises
 `Durability::Remote` — the matched-verifier `COMMIT` barrier its `flush`
 certifies over already-committed writes, with strict remote persistence still
-refused — and no fencing, and nothing has yet switched the CLI matrix over to
-it, so the opt-out stays.
-Fork pull requests cannot run the qualification job, and its checkout does
-not persist job credentials. A labeled runner must be provisioned before this
-check can supply a CI signal; a queued qualification job is not enforcement
-evidence.
+refused — and no fencing.
+
+`umbra run` can now use it. Because that backend has no kernel-visible path for
+a run, a supervised command over it cannot have its file operations serviced by
+rewriting a syscall's path operand, so umbra loads an interposer into the tracee
+and services `open`, `read`, `write` and `close` itself, through the overlay and
+that client. A third CI job proves it against the same Ganesha container on the
+macOS runner: an end-to-end create/write/close/reopen/read/compare, and two
+mutation probes that break one routing direction each and must make the fixture
+fail with different exit codes. What the routed path does **not** claim, and why,
+is enumerated in that crate's README. The `UMBRA_TEST_SKIP_NFS_MATRIX` opt-out
+above is unaffected: it is about the mounted `storage-nfs` adapter, which the
+routed path does not replace.
+
+Fork pull requests cannot run either self-hosted job -- the `m1-transport-raw`
+qualification job or the `native-userspace-routing` routing job -- and neither
+checkout persists job credentials. A labeled runner must be provisioned before
+those checks can supply a CI signal; a queued job is not enforcement evidence.
 
 If you're contributing, [the Memoria guide](docs/memoria.md) explains how we keep
 READMEs connected to the code they describe. It covers the review flow and the

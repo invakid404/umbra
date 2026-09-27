@@ -10,6 +10,21 @@ publish = false
 name = "umbra"
 path = "src/main.rs"
 
+[features]
+# Forwarded to `umbra-overlay` through `umbra-supervisor`; see that manifest.
+# Building the `umbra` binary with one of these is how
+# `crates/umbra-storage-nfs-userspace/tests/userspace_run.rs` gets a supervisor
+# whose routing is broken in exactly one direction. The tests live there, not
+# here, because the read-back has to go through the userspace NFS client.
+mutation-probe-read = [
+    "umbra-supervisor/mutation-probe-read",
+    "umbra-overlay/mutation-probe-read",
+]
+mutation-probe-write = [
+    "umbra-supervisor/mutation-probe-write",
+    "umbra-overlay/mutation-probe-write",
+]
+
 [dependencies]
 clap.workspace = true
 uuid.workspace = true

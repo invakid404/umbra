@@ -20,6 +20,20 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# `tests/userspace_run.rs` drives the real `umbra` binary against the live
+# fixture and then checks the result three independent ways: through the raw
+# client (this crate), through the run's journal (these two), and against the
+# host. None of them is reachable from the crate's own surface alone.
+umbra-journal = { path = "../umbra-journal" }
+umbra-journal-file = { path = "../umbra-journal-file" }
+tempfile.workspace = true
+# `userspace_run.rs` asserts, executably, that no NFS mount covers the run --
+# the addendum's guard against the whole end-to-end proof being an illusion.
+# `getmntinfo` is the only way to ask that without parsing `mount(8)`.
+libc = "=0.2.189"
+uuid.workspace = true
+
 [build-dependencies]
 # Not optional: a build script cannot be conditionally compiled on a feature,
 # so bindgen is always available and `build.rs` returns early when the

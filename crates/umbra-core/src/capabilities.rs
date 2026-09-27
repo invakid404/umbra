@@ -93,3 +93,42 @@ pub const STORAGE_OWNERSHIP_FIDELITY_V1: &str = "ownership-fidelity-v1";
 /// (NFS), does not advertise it. Advertise only after qualifying it against a
 /// live store, never from configuration alone.
 pub const STORAGE_PARENT_IDENTITY_V1: &str = "storage-parent-identity-v1";
+
+/// Storage is a **userspace** NFSv4.0 client: it speaks the protocol itself and
+/// requires no kernel mount of the export.
+///
+/// The peer of [`STORAGE_MOUNTED_NFSV4_V1`] rather than a replacement for it. The
+/// two name the same product mode — an NFSv4 run whose remote durability is not
+/// strictly qualified — reached by different clients, which is why
+/// `RunPersistence::NfsClientFsync` accepts either. They are separate names
+/// because they are separate claims: `mounted-nfsv4-v1` asserts a validated
+/// kernel mount, and a userspace client has none to validate. Advertise only
+/// after a live probe has read the configured export back, never from
+/// configuration alone.
+pub const STORAGE_USERSPACE_NFSV4_V1: &str = "userspace-nfsv4-v1";
+
+/// Storage exposes **no** kernel-visible path for a run, so the tracee's
+/// filesystem operations cannot be serviced by rewriting a syscall's path
+/// operand. A run over such a backend routes them through the interposer umbra
+/// loads into the tracee instead.
+///
+/// This is the negative peer of [`STORAGE_OPEN_REWRITE_V1`] and the two are
+/// mutually exclusive in practice: a backend advertising this one answers
+/// `RuntimeDirectoryBinding::physical_path` with `None` for every anchor, which
+/// is what `run` checks. The declared name only *admits* such a run — the run
+/// binding's own absent physical paths are the evidence, and `run` refuses a
+/// binding whose kernel-path shape disagrees with the declaration rather than
+/// switching modes silently.
+pub const STORAGE_USERSPACE_ROUTING_V1: &str = "experimental-userspace-routing-v1";
+
+/// Platform can load umbra's userspace-routing interposer into the tracee before
+/// its first instruction and service the requests it traps.
+///
+/// Required only for a run over a storage backend advertising
+/// [`STORAGE_USERSPACE_ROUTING_V1`]. It asserts three things together, because a
+/// backend that has any two of them still cannot route: the interposer is loaded
+/// into the target image (and only that image), the descriptor range the kernel
+/// may allocate to the tracee is fenced below the range the interposer's virtual
+/// descriptors use, and the interposer's trap instruction — and no other site —
+/// is intercepted.
+pub const PLATFORM_INTERPOSE_V1: &str = "experimental-userspace-interpose-v1";

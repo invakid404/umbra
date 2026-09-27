@@ -215,6 +215,31 @@ pub struct RunBinding {
     pub control: RuntimeDirectoryBinding,
     /// Supported behavior advertised by the provider; qualification is required.
     pub capabilities: StorageCapabilities,
+    /// The writer identity this backend has **already** admitted for the run,
+    /// when it admits at open time rather than at
+    /// [`acquire_writer`](crate::storage::StorageOperation).
+    ///
+    /// Backends differ here, and the difference is real rather than incidental.
+    /// `local`, `nfs` and `tar` take writer authority in `acquire_writer` and
+    /// record whatever identity the *caller* names, so they answer `None`: there
+    /// is nothing admitted yet for a binding to report.
+    /// `nfs-userspace` admits in `open_run`, before it publishes any binding at
+    /// all, because one-session-one-Umbra is the property that makes a binding
+    /// safe to hand out -- and admission writes the writer identity into a
+    /// durable marker on the server. By the time a caller could name a writer,
+    /// the marker already names one.
+    ///
+    /// So a caller that receives `Some` must acquire under **that** identity: it
+    /// is the one in the durable marker, and asking for a different one is asking
+    /// the backend to report an admission that writer never obtained. `run` and
+    /// `resume` do exactly this -- they mint an identity only when the binding
+    /// reports none.
+    ///
+    /// `#[serde(default)]` so an older provider that does not send the field
+    /// decodes as `None`, which is also the correct answer for every backend that
+    /// admits late.
+    #[serde(default)]
+    pub admitted_writer: Option<WriterId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

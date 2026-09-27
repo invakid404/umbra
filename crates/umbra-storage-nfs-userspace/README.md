@@ -556,8 +556,9 @@ Options are the JSON encoding of that struct, carried as descriptor option bytes
 `provider.json` is an installation template; `tests/provider_template.rs` checks it
 decodes as a storage descriptor for id `nfs-userspace` and that its options
 validate. A userspace client has no kernel-visible run root, so this provider
-supplies opaque session-bound handles and no `physical_path`, and `umbra run`
-cannot select it.
+supplies opaque session-bound handles and no `physical_path`. `umbra run` selects
+it through the **routed** path described below, not by rewriting syscall
+operands: there is no path for an operand to be rewritten *to*.
 
 `open_run` establishes a client incarnation, resolves or creates the run's
 anchors over the bound transport, acquires product admission, and only then
@@ -616,6 +617,131 @@ journal is touched*, so a request that will be refused consumes no operation id
 and leaves no record behind. `Operations::preflight` holds the rules and
 `Operations::execute` re-runs them, because a direct caller reaches that seam
 without a provider in front of it.
+
+## Running a supervised command over this provider
+
+`umbra run --registry <registry.json>` works against this backend. It reaches a
+different mechanism from every other storage backend's, and the difference is
+forced rather than chosen: a supervised run ordinarily services the tracee's file
+operations by **rewriting** the path operand of an intercepted syscall to a
+kernel-visible shadow path, and this backend has none. So the tracee's `open`,
+`read`, `write` and `close` are **routed** instead — umbra services them itself,
+through the overlay and this client.
+
+### How a routed run is wired
+
+* The storage descriptor must declare `userspace-nfsv4-v1` and
+  `experimental-userspace-routing-v1`. Both are earned by `connect`'s live probe
+  against the configured export; a build without `transport-raw`, or a provider
+  built over the fake, advertises neither.
+* The platform descriptor must declare `experimental-userspace-interpose-v1`
+  alongside its usual two names. `experimental-open-rewrite-v1` is **not**
+  required and must not be declared: it claims kernel-visible rewrite targets.
+* `umbra run --state-dir <PATH>` names a host directory holding two things a
+  routed run cannot keep in its store: umbra's own journal, and the single
+  directory the enforcement profile grants the tracee. **`umbra resume` must be
+  given the same value** — see *Single-host* below.
+* `timeout_ms` in the registry must leave renewal headroom under the 30 s writer
+  lease. The supervisor refuses anything at or above 15 s before the run starts;
+  12 s is a good value for a live server.
+
+At launch the platform loads umbra's interposer into the target image, lowers the
+tracee's `RLIMIT_NOFILE` — soft *and* hard — to 4096, and breakpoints the
+interposer's trap instruction. The interposer replaces libc's `open`, `read`,
+`write` and `close`; umbra answers each one through the overlay's ordinary
+resolve / prepare / emulate / observe / commit sequence, so a routed write is a
+journaled transaction exactly like a rewritten one. Descriptors umbra issues are
+at or above 4096, which the kernel's own range can no longer reach.
+
+### Unsupported operations
+
+Every entry here is a **refusal**, never a plausible wrong answer. Read this
+before assuming an operation is covered; adding one to the interposer is not
+sufficient, because umbra must be able to represent it too.
+
+| Operation | Disposition |
+| --- | --- |
+| **A syscall the tracee issues from memory it wrote itself** | **Not mediated, and not mediable by this architecture.** Measured: a process can allocate memory, write `svc #0x80` into it, flip the page to `r-x` with no entitlement, and execute it. umbra breakpoints `svc` sites in the main image and in its own interposer, so an instruction at neither site is never trapped — under interposition and under syscall-breakpoint tracing alike. What fail-closes host writes is the **kernel-enforced Seatbelt profile** installed before the target's first instruction, not the interception. Closing this needs kernel-assisted whole-process syscall filtering, which is outside the accepted setup. |
+| Writable shared file mappings (`mmap` `MAP_SHARED` with `PROT_WRITE`) | **Permanently unsupported by any syscall- or call-level interception.** A store to a resident page is not a call of any kind. Needs a pager. |
+| `unlink` | **A routed run cannot delete a file at all against a server that does not report atomic `change_info4` for REMOVE, and it does not refuse — it stops.** Measured against the Ganesha fixture, with the descriptor open *and* after closing it: `LeaseLost during namespace.remove: authority: object identity unproven: BLOCKED_RECOVERABLE: the REMOVE of <name> succeeded, but the server did not report atomic change info`, the run left recovery-required, and the writer release withheld. This is **this provider's own authority layer**, pre-existing and unrelated to routing — the same refusal a non-routed caller of `unlink` meets. It is listed here because the slice's own docs previously said "unlink or rename *while open*" and pointed at `engine.rs::routed_binding`, which implied unlink-while-closed worked and named a mechanism that is never reached. |
+| `rename`, and any other path operation, on an object **this run created or copied up** | Refused with **`ENOTSUP`** (`Errno(45)`), visibly, and the run survives. `rewrite` needs a kernel path this backend does not have, so `resolve` answers the tracee instead — see the row below. |
+| A descriptor whose **name stops resolving** while it is open | `ENOENT`. A routed descriptor is bound to a logical *path* and re-resolved on every operation, so an object that loses its name has nothing left to route to; closing that needs handle-based `Storage` operations the surface does not have. Not reachable against this fixture, because `unlink` stops the run first (above). |
+| **Every other intercepted path operation on an object this run created or copied up** — `fstatat`, `faccessat`, `renameat`, `linkat`, `fchownat` | Refused with **`ENOTSUP`** (`Errno(45)` — Darwin's value; routing exists on Darwin only). `rewrite` would have to name a kernel path this backend does not have, so `resolve` answers the tracee instead of stopping the run. The same operation on an object the run did *not* touch still rewrites to the read-only base's host path and works. This is a visible refusal, not a supported operation: `create a file then stat it` is what `cp`, `install` and both the Rust and Go standard libraries do, and on a routed run it fails. Routing these properly means answering `Stat`/`Access` through an ABI encoder the way `ReadLink` already is — a larger slice than the toy this one claims. |
+| `openat` | **Routed, via the syscall path** -- not in the `EBADF` class. `__openat` is still breakpointed and syscall 463 is still admitted, so it resolves through the same routed-`Open` arm the interposer's `open` reaches, and returns a virtual descriptor. Measured: exit 0, host destination absent. Only `openat` with a *virtual* dirfd is refused, and it is refused by the case below. |
+| `lseek`, `fstat`, `dup`, `dup2`, `fcntl`, `ftruncate`, `fsync`, `pread`, `pwrite`, `readv`, `writev`, and `openat` with a virtual dirfd | Not interposed and not rewritable: these are **descriptor-relative**, and a routed descriptor is not a kernel object. They reach the kernel, which does not know the number, and receive `EBADF`. The `RLIMIT_NOFILE` fence is what makes that a refusal rather than an operation on someone else's descriptor. |
+| Directory reads (`getdirentries`, `getattrlistbulk`) | Not routed. A routed `open` of a directory is refused outright rather than handing back a descriptor nothing could use. |
+| `open` with `O_APPEND` | Refused. Honouring it means writing at the object's end atomically with respect to other writers, and `Storage` has no append-at-end operation; stat-then-write is right for one writer and silently wrong for two. |
+| `exec` of a new image | Not claimed. The interposer activates only in the image umbra named at launch, so an exec'd image routes nothing and its file operations meet the sandbox instead. |
+| Calls made before umbra **arms** the interposer | Not routed — and the window is dyld's image loading **and every library initializer**, not just dyld's own loads. There has been no constructor since round 1: the library ships inert and umbra arms it by writing its control block *after* planting breakpoints, so everything an initializer does runs with the interposer dormant. Reads in that window reach the host; writes are refused by the Seatbelt profile, so it fails **closed** — but a program that writes from an initializer works on every other backend and fails here. The window is strictly larger than a rewrite-backed run's, which plants its breakpoints at the dyld image-notifier stop, before any initializer. Measured both ways in `umbra-platform-macos/README.md`; `impl.md` §1.5 carries the arming order. |
+| More than 4096 concurrent routed descriptors | **`EMFILE`**, visibly, and the run survives. umbra allocates from `[4096, 8192)` — the same size as the kernel's fenced range — so the limit the tracee is told through `getrlimit` is the limit it gets on each side, and `ProcessContext::fds` is bounded. An earlier shape scanned to `i32::MAX`, which made both halves false: measured, a tracee held 400 routed descriptors with no refusal, and the practical ceiling was the run deadline rather than the fence. |
+| A **forked** child of a routed run | **Supported, and measured both ways.** The child is mediated from its first instruction: `fork` copies the armed interposer, so umbra finds its load address in the child's own image list and does not re-arm — re-running the address search resumed the child to a `main` it had already passed, leaving it unmediated until its first routed call took `SIGSYS`, which is the defect CodeRabbit found on PR #116. A routed descriptor also survives the fork *with its offset*, so a child's write continues the parent's in the store. `exec` is different and unchanged: the new image is loaded and armed from scratch. Covered by `a_forked_child_of_a_routed_tracee_is_mediated_and_the_run_finishes` and `a_routed_descriptor_survives_a_fork_and_the_child_s_write_reaches_the_store`. |
+| **Standard utilities** (`cat`, `ls`, `touch`, `mkdir`) | **Not claimed by this slice.** `cat` needs `fstat`; `ls` needs directory reads; `mkdir` reaches no interposed function. |
+
+### Single-host: a routed run's journal is not in its store
+
+`JournalControlBinding` carries a `PhysicalPath`, and this backend has none, so a
+routed run's journal lives under `--state-dir` on the host that created it. Two
+consequences, neither of them silent:
+
+1. **A routed run cannot be reopened on another host.** Reopening needs the store
+   *and* the log, and the log is on this host's disk. Nothing in this slice moves
+   it. Fixing it means widening `JournalControlBinding` beyond a `PhysicalPath`
+   plus a journal backend that writes through `Storage`.
+2. **A reopen that cannot find the log refuses.** It does not report that the run
+   needs no recovery. This is not politeness: a writer `journal.open` against an
+   existing-but-empty directory establishes a *fresh* log, a fresh log has nothing
+   pending, `Overlay::bind` therefore does not poison, and `requires_recovery()`
+   would answer `false` — for a run that may have crashed mid-transaction. `run`
+   mints a nonce, writes it to the store's `control/journal-id`, and writes it
+   **into the log itself**, as the log's own first record; `resume` requires the
+   log to open with that identity. Missing or mismatched is a structured refusal
+   naming the missing evidence.
+
+   The in-log half is what makes the check mean anything, and it is the half that
+   was missing: an earlier shape compared the store's copy against a `journal-id`
+   file sitting *beside* the log, and removing the log alone left that sidecar
+   matching, so the reopen created a fresh log and reported "requires no
+   reconciliation", exit 0.
+
+   **Scope, precisely.** This closes the *vanished* log: one whose first record is
+   not this run's identity, or which has no records at all. It does **not** close
+   a log silently truncated to a shorter but still-valid prefix — catching that
+   needs the run's reached sequence persisted where the log cannot forge it, which
+   is durability-barrier work this slice does not do. A *torn* tail is caught
+   separately, by `JournalTailRecovery`, and `resume` refuses that too.
+
+Do not "fix" that refusal by creating the directory, seeding a nonce, relaxing the
+comparison, or giving the sealing record a fresh operation id. Each one turns a
+missing-evidence refusal back into a clean verdict.
+
+### Proving it
+
+`tests/userspace_run.rs` (feature `transport-raw`, macOS arm64, gated on
+`UMBRA_NFS_RAW_FIXTURE`) drives the real `umbra` binary against a live server and
+checks the result three independent ways — through the raw client, through the
+run's journal, and against the host. Two **mutation probes**, cargo features on
+`umbra-overlay` so no product build contains them, break one routing direction
+each and must make the fixture fail with *different* exit codes:
+
+```sh
+# end to end: the toy must exit 0
+cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run
+
+# probe A -- read routing corrupted; the toy's compare must reject (exit 8),
+# and the export must still hold the correct bytes
+cargo build -p umbra-cli --features mutation-probe-read
+UMBRA_MUTATION_PROBE=read cargo test -p umbra-storage-nfs-userspace \
+    --features transport-raw --test userspace_run
+
+# probe B -- write routing dropped but reported successful; the read-back must
+# come up short (exit 7), and the export object must be absent or zero-length
+cargo build -p umbra-cli --features mutation-probe-write
+UMBRA_MUTATION_PROBE=write cargo test -p umbra-storage-nfs-userspace \
+    --features transport-raw --test userspace_run
+```
+
+`cargo build -p umbra-cli --features ...` overwrites `target/<profile>/umbra`, so
+rebuild without the feature before running the baseline again.
 
 ## Golden fixtures
 

@@ -299,6 +299,17 @@ pub struct NfsUserspaceStorage {
     /// [`StorageHandle`](umbra_core::StorageHandle) so a token from a closed run
     /// cannot be replayed against the next one.
     serial: u64,
+    /// Whether [`Self::connect`] reached this configuration's export over a live
+    /// NFSv4.0 transport and read the run parent back.
+    ///
+    /// The gate on [`capabilities::STORAGE_USERSPACE_NFSV4_V1`] and
+    /// [`capabilities::STORAGE_USERSPACE_ROUTING_V1`], and it is a *measurement*,
+    /// not a configuration flag: `with_facades` leaves it false, so a provider
+    /// built over [`crate::fake::FakeTransport`] advertises neither name however
+    /// complete its answers are. This mirrors `umbra-storage-nfs`, which gates
+    /// `mounted-nfsv4-v1` on its own `validated` for the same reason -- a
+    /// declared capability is a claim, and only a live probe qualifies it.
+    validated: bool,
     /// Why this provider may no longer act on the open run, once that is settled.
     ///
     /// **R1-002.** Losing writer authority is sticky. A failed renewal, a release
@@ -443,11 +454,51 @@ impl std::fmt::Debug for NfsUserspaceStorage {
 }
 
 impl NfsUserspaceStorage {
-    /// Validate configuration without opening a connection.
+    /// Build the shipped provider: validate configuration, bind a live NFSv4.0
+    /// transport, and qualify it against the configured export.
     ///
-    /// No transport is bound here. Binding a live NFS transport is `raw_rpc`'s
-    /// work and is not authorised at this gate.
+    /// This closed `m1_integrate`'s deferred seam. It used to leave
+    /// `transport: None`, which made every `open_run` and `execute` answer
+    /// [`ErrorKind::StorageUnavailable`] -- "no transport facade is bound to this
+    /// provider" -- so the shipped executable could not run a run at all.
+    ///
+    /// # What earns the capability, and what does not
+    ///
+    /// Binding a socket is not qualification. [`Self::probe_export`] reads the
+    /// export root filehandle and walks `export/` and `run_parent/`, requiring
+    /// each to be a directory on the server, and only that sets
+    /// [`Self::validated`]. [`Self::capabilities`] then advertises
+    /// [`capabilities::STORAGE_USERSPACE_NFSV4_V1`] and
+    /// [`capabilities::STORAGE_USERSPACE_ROUTING_V1`], and advertises neither
+    /// otherwise. The precedent is exact: `umbra-storage-nfs` gates
+    /// `mounted-nfsv4-v1` on its own `validated` flag rather than on
+    /// configuration.
+    ///
+    /// # A build without `transport-raw` has nothing to bind
+    ///
+    /// The feature is off by default so an ordinary workspace build needs no
+    /// native toolchain and no libnfs checkout. Such a build keeps
+    /// `transport: None` and `validated: false`: it connects, reports its
+    /// configuration, and refuses every run for the reason it always did. It
+    /// does **not** advertise a capability it cannot meet, which is what keeps
+    /// the "declared name is a claim, qualification is measurement" rule true for
+    /// a provider whose transport was compiled out.
     pub fn connect(config: NfsUserspaceConfig) -> Result<Self> {
+        let mut provider = Self::unbound(config)?;
+        provider.bind_live_transport()?;
+        Ok(provider)
+    }
+
+    /// The configured-but-unbound provider `connect` starts from.
+    ///
+    /// Also what the three "unbound provider" unit tests below build. They used
+    /// to call `connect`, which was correct while `connect` bound nothing -- and
+    /// became a live TCP attempt the moment it did, so under `--features
+    /// transport-raw` they failed against a port with no server. `connect` is
+    /// now the composition of this and [`Self::bind_live_transport`], and the
+    /// unbound *state* those tests describe is this constructor's, not
+    /// `connect`'s.
+    fn unbound(config: NfsUserspaceConfig) -> Result<Self> {
         config.validate()?;
         let instance = NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state = ProtocolState::new(client_identity(&config, instance));
@@ -462,12 +513,95 @@ impl NfsUserspaceStorage {
             writer_id: writer_id(&config_for_writer, instance),
             session: None,
             serial: 0,
+            validated: false,
             authority_loss: None,
             recovery_blocked: None,
             stable_write_failure: None,
             unsettled: Vec::new(),
             ledger: RunLedger::default(),
         })
+    }
+
+    /// Bind `LibnfsRawTransport` and qualify it. Feature-gated: see [`Self::connect`].
+    #[cfg(feature = "transport-raw")]
+    fn bind_live_transport(&mut self) -> Result<()> {
+        use crate::transport::raw::{LibnfsRawTransport, RawTransportConfig};
+
+        let host = String::from_utf8(self.config.host.clone())
+            .map_err(|_| config_error("host must be valid UTF-8 for the raw transport"))?;
+        let mut raw = RawTransportConfig::loopback(self.config.port);
+        raw.host = host;
+        // The per-COMPOUND deadline is the configured one, so an operator tuning
+        // `deadline` tunes the transport rather than discovering a second,
+        // hidden bound. The inflight and reply bounds stay at the conservative
+        // `loopback` defaults: nothing in this provider pipelines.
+        raw.limits.default_deadline = self.config.deadline;
+        let mut transport: Box<dyn RawTransport> =
+            Box::new(LibnfsRawTransport::connect(raw).map_err(|error| {
+                crate::error::FacadeError::Transport(error).to_umbra("connect")
+            })?);
+        transport
+            .wire_profile()
+            .check()
+            .map_err(|error| crate::error::FacadeError::Transport(error).to_umbra("connect"))?;
+        Self::probe_export(&mut *transport, &self.config)?;
+        self.transport = Some(transport);
+        self.replay = Some(Box::new(crate::replay::InProcessReplayLog::default()));
+        self.validated = true;
+        Ok(())
+    }
+
+    /// A build with the transport compiled out binds nothing and qualifies nothing.
+    #[cfg(not(feature = "transport-raw"))]
+    fn bind_live_transport(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Prove this configuration names a reachable export and run parent.
+    ///
+    /// Read-only and bounded: `PUTROOTFH; GETFH` and one `LOOKUP` per configured
+    /// component. It creates nothing, takes no admission and opens no run -- a
+    /// probe that mutated would make connecting to a server a side effect.
+    ///
+    /// Each component must come back a directory. A server that answers
+    /// `NFS4ERR_NOENT` for `run_parent` is a misconfiguration this reports at
+    /// connect time, rather than at the first `open_run` after a lease has
+    /// already been taken elsewhere.
+    #[cfg(feature = "transport-raw")]
+    fn probe_export(transport: &mut dyn RawTransport, config: &NfsUserspaceConfig) -> Result<()> {
+        use crate::transport::{AttrMask, ComponentName, Nfs4Type};
+
+        let deadline = config.deadline;
+        let mut current = transport
+            .root_filehandle(deadline)
+            .map_err(|error| error.to_umbra("connect.probe"))?;
+        for relative in [&config.export, &config.run_parent] {
+            for component in relative
+                .as_bytes()
+                .split(|byte| *byte == b'/')
+                .filter(|part| !part.is_empty())
+            {
+                let name = ComponentName::new(component.to_vec()).map_err(|error| {
+                    crate::error::FacadeError::Transport(error).to_umbra("connect.probe")
+                })?;
+                let (handle, attrs) = transport
+                    .lookup(&current, &name, AttrMask::STAT, deadline)
+                    .map_err(|error| error.to_umbra("connect.probe"))?;
+                if attrs.file_type != Some(Nfs4Type::Directory) {
+                    return Err(UmbraError::new(
+                        ErrorKind::StorageUnavailable,
+                        "connect.probe",
+                        format!(
+                            "{} is not a directory on the server, so this configuration \
+                             names no run parent",
+                            String::from_utf8_lossy(component)
+                        ),
+                    ));
+                }
+                current = handle;
+            }
+        }
+        Ok(())
     }
 
     /// Build a provider over supplied facades, real or fake.
@@ -497,6 +631,7 @@ impl NfsUserspaceStorage {
             writer_id: writer_id(&config_for_writer, instance),
             session: None,
             serial: 0,
+            validated: false,
             authority_loss: None,
             recovery_blocked: None,
             stable_write_failure: None,
@@ -508,6 +643,30 @@ impl NfsUserspaceStorage {
     /// The configuration this provider was built with.
     pub fn config(&self) -> &NfsUserspaceConfig {
         &self.config
+    }
+
+    /// The capability names this provider's live probe earned.
+    ///
+    /// Read by both arms of [`Storage::capabilities`] so an open run cannot
+    /// advertise a different set from the one the handshake qualified, and
+    /// derived from [`Self::validated`] alone so there is exactly one gate.
+    /// Empty whenever no live transport was bound, including every
+    /// [`Self::with_facades`] build and every build without `transport-raw`.
+    ///
+    /// The two names travel together because the same measurement establishes
+    /// both: the probe proved a reachable NFSv4.0 export
+    /// ([`capabilities::STORAGE_USERSPACE_NFSV4_V1`]) *and* proved it was
+    /// reached without a mount, which is precisely the property
+    /// [`capabilities::STORAGE_USERSPACE_ROUTING_V1`] names. Splitting the gate
+    /// would let a future edit advertise routing over a backend that never
+    /// answered.
+    fn probed_features(&self) -> std::collections::BTreeSet<String> {
+        let mut features = std::collections::BTreeSet::new();
+        if self.validated {
+            features.insert(umbra_core::capabilities::STORAGE_USERSPACE_NFSV4_V1.to_owned());
+            features.insert(umbra_core::capabilities::STORAGE_USERSPACE_ROUTING_V1.to_owned());
+        }
+        features
     }
 
     /// The wire profile in use. Always NFSv4.0 / TCP / AUTH_SYS.
@@ -1330,9 +1489,13 @@ impl Storage for NfsUserspaceStorage {
     /// already been shaped around the claim.
     fn capabilities(&self) -> StorageCapabilities {
         match &self.operations {
-            Some(operations) => operations.capabilities(),
+            Some(operations) => {
+                let mut capabilities = operations.capabilities();
+                capabilities.features.extend(self.probed_features());
+                capabilities
+            }
             None => StorageCapabilities {
-                features: Default::default(),
+                features: self.probed_features(),
                 durability: Durability::None,
                 strict_remote_persistence: false,
                 fencing: Fencing::ReadOnly,
@@ -1512,10 +1675,32 @@ impl Storage for NfsUserspaceStorage {
         };
         operations.qualify_boundary(qualified);
 
-        let binding = operations.binding();
+        let mut binding = operations.binding();
+        // Report the identity the durable marker now holds.
+        //
+        // This provider admits in `open_run`, before any binding exists, so by
+        // the time a caller could name a writer the marker already names one --
+        // and `acquire_writer` refuses to hand this session's lease to a
+        // different name, because doing so would report an admission that writer
+        // never obtained. Publishing the identity here is what lets a caller
+        // acquire under it instead of guessing; `RunBinding::admitted_writer`
+        // states the rule, and `run`/`resume` follow it.
+        binding.admitted_writer = Some(session.lease().writer_id.clone());
         self.serial = self.serial.saturating_add(1);
         self.operations = Some(operations);
         self.session = Some(session);
+        // The binding's capabilities are **this provider's own answer for this
+        // run**, taken from the one place that produces it rather than from a
+        // second expression that could drift from it.
+        //
+        // `Operations::binding` fills them from `Operations::capabilities`, which
+        // does not know about `probed_features` -- so the binding advertised a
+        // strictly smaller set than `Storage::capabilities` did, and a consumer
+        // that adopts the binding (every `umbra-storage::provider::Proxy` does)
+        // silently disagreed with the provider it fronts for the life of the run.
+        // Reading the value back through the trait, after the surface is
+        // installed, makes the two the same expression.
+        binding.capabilities = <Self as Storage>::capabilities(self);
         Ok(binding)
     }
 
@@ -2133,7 +2318,7 @@ mod tests {
 
     #[test]
     fn an_unwired_provider_advertises_nothing_and_names_what_is_missing() {
-        let mut storage = NfsUserspaceStorage::connect(config()).unwrap();
+        let mut storage = NfsUserspaceStorage::unbound(config()).unwrap();
         let capabilities = storage.capabilities();
         assert_eq!(capabilities.durability, Durability::None);
         assert_eq!(capabilities.fencing, Fencing::ReadOnly);
@@ -2221,7 +2406,7 @@ mod tests {
 
     #[test]
     fn takeover_is_refused_before_the_gate_is_reached() {
-        let mut storage = NfsUserspaceStorage::connect(config()).unwrap();
+        let mut storage = NfsUserspaceStorage::unbound(config()).unwrap();
         let request = AcquireWriterRequest {
             run_id: RunId(Uuid::nil()),
             writer_id: umbra_core::WriterId("writer".into()),
@@ -2250,7 +2435,7 @@ mod tests {
 
     #[test]
     fn an_unbound_provider_says_so_rather_than_pretending() {
-        let mut storage = NfsUserspaceStorage::connect(config()).unwrap();
+        let mut storage = NfsUserspaceStorage::unbound(config()).unwrap();
         assert_eq!(
             storage.transport().err().unwrap().kind,
             ErrorKind::StorageUnavailable

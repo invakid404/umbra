@@ -84,9 +84,17 @@ The staged order is fixed, and each stage's failure decides what may be released
    so first, but declaring it does not admit the run.
 2. Inventory the approved workspace and derive the run's `ImmutableBaseContract`.
 3. Connect storage, `open_run(CreateNew)`, then `acquire_writer` with
-   `TakeoverPolicy::Refuse`. There is no stale-writer takeover.
+   `TakeoverPolicy::Refuse`. There is no stale-writer takeover. The writer
+   identity is the backend's when the backend already has one:
+   `RunBinding::admitted_writer` reports the identity a backend that admits in
+   `open_run` has already written into a durable marker, and acquiring under a
+   different name is asking it to report an admission that writer never
+   obtained. An identity is minted here only when the binding reports none.
 4. Open the journal against the run's `control/` binding with the same run,
    writer identity and epoch, rejecting a non-fresh recovery state for CreateNew.
+   A **routed** run -- storage with no kernel-visible path -- instead journals
+   under `RunSpec::state_root`, and mints a nonce into both the store's
+   `control/journal-id` and a file beside the log. See *Routed runs*.
 5. Bind the namespace over those already-open sessions, handing it the lease so
    one owner renews, releases and mutates.
 6. Render enforcement from the run's own root, re-verify the workspace inventory,
@@ -173,12 +181,12 @@ carry runs against a real filesystem through a real syscall pair.
 Deleting that file un-pins `Overlay::abort`'s rule, because the double no longer
 carries a copy of it.
 
-Only write-mode `Open` and `Fchownat` are reachable end to end today, which is why
-the double still carries the rest: `Overlay::resolve` refuses `Chmod` and `Write`
-outright, and it emulates a logical symlink rather than letting the kernel execute
-one, so the supervisor's `syscall_exit` never reaches a real refusal of that op.
-What those tests pin is the supervisor's behaviour when the namespace refuses, not
-that the op refuses today.
+Write-mode `Open` and `Fchownat` are the operands that reach a *kernel refusal*
+end to end, which is why the double still carries the rest: `Overlay::resolve`
+refuses `Chmod` and `Write` outright, and it emulates a logical symlink rather
+than letting the kernel execute one, so the supervisor's `syscall_exit` never
+reaches a real refusal of that op. What those tests pin is the supervisor's
+behaviour when the namespace refuses, not that the op refuses today.
 
 A `Deny`, reached only for
 a whiteout-hidden non-mutating path, is answered here without
@@ -186,9 +194,21 @@ minting an operation: the supervisor asks the platform to emulate its errno, whi
 steps the tracee past the trapped syscall so the still-present base object stays
 hidden ([#49](https://github.com/invakid404/umbra/issues/49)). A backend whose
 `emulate_result` cannot skip the trap, such as the Linux stub, fails closed
-instead. The remaining `Emulate` actions (`ReadLink`, a logical-symlink `Stat`)
-still fail closed as a separate wiring gap, because rewriting return registers
-alone would execute the very call the namespace refused. The loop ends when every
+instead.
+
+**`Emulate` is now executed rather than refused**, and that is not only the
+routed `Open` it was wired for. The entry path asks the platform to install the
+emulated result and skip the trapped syscall, so `Symlink`, `Mkdir`, `Unlink`, a
+same-path `rename`, `ReadLink` and a logical-symlink `Stat` are all answered on
+any backend. This closed a defect rather than widening a surface: the refusal it
+replaced fired *after* `prepare` had already applied the namespace change, so
+every intercepted `mkdir` left a created directory and a dangling `Prepare`
+behind and then abandoned the run into recovery. `prepare` performed the
+operation, so reporting success is reporting what happened.
+`kernel_refusal.rs::an_emulated_mkdir_is_answered_to_the_tracee_rather_than_killing_the_run`
+and its `unlink` sibling pin it on a plain `local` run with no routing at all.
+A backend that cannot skip the trap still fails closed, because rewriting return
+registers alone would execute the very call the namespace answered. The loop ends when every
 process has exited, not when the root
 does. Fork preserves every inherited descriptor; only Exec drops close-on-exec
 entries. An Exit for an uncaptured task poisons the run without reducing its live
@@ -197,6 +217,48 @@ process count, and duplicate exits do not count twice.
 `Supervisor::new` and `with_namespace` take `Option<Box<dyn Agent>>`; a raw
 command run has no adapter. Construction still performs no I/O and starts in
 `RunLifecycle::Created`.
+
+## Routed runs
+
+A run whose storage exposes no kernel-visible path cannot have its tracee's file
+operations serviced by rewriting a syscall's path operand, because there is no
+path to rewrite it to. `run` detects that from the binding -- `root.physical_path
+is None` -- and cross-checks it against the storage descriptor's declared
+`experimental-userspace-routing-v1`, refusing rather than choosing a side when
+the two disagree. `validate` requires `experimental-userspace-interpose-v1` from
+the platform for such a run and `experimental-open-rewrite-v1` from storage for
+every other.
+
+Three things change for a routed run and nothing else does:
+
+1. **The launch** sets `LaunchPolicy::interpose` and `descriptor_limit`, so the
+   platform loads umbra's interposer into the target image and fences the
+   kernel's own descriptor range below umbra's. `RunBudget::descriptor_floor`
+   carries the same value to the event loop, which binds `RoutedRequest` per
+   operation and maintains `ProcessContext::fds` on observed success. With
+   `None`, none of that executes and the loop is what it was.
+2. **The journal** lives at `<state_root>/<run-id>/journal`, not in the store.
+3. **The enforcement profile's one write allowance** names
+   `<state_root>/<run-id>/host`, an empty per-run quarantine directory rather
+   than the store, which is not on this host. It is strictly narrower than the
+   store-root grant a kernel-path run receives, and anything appearing under it
+   is an operation that escaped routing -- which the fixture suite asserts
+   against.
+
+**A routed run is single-host, and the refusal that keeps that honest is not
+optional.** A writer `journal.open` against an existing-but-empty directory
+establishes a *fresh* log; a fresh log has nothing pending, so `Overlay::bind`
+does not poison and `requires_recovery()` would answer `false` for a run that may
+have crashed mid-transaction. `run` therefore mints a journal-instance nonce into
+the store *and* beside the log, and `resume` requires them to match before it
+opens anything. Missing or mismatched is a structured refusal naming the missing
+evidence -- a third outcome beside `recovery_required: true` and `false`, and the
+reason `false` always means "classified, and no reconciliation is required".
+
+Reopening on another host is therefore refused rather than attempted: it needs
+the store *and* the log, and the log is on the host that created the run. Moving
+it into the store needs `JournalControlBinding` to carry something other than a
+`PhysicalPath`.
 
 ## Sandbox
 

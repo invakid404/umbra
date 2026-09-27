@@ -112,13 +112,15 @@ fn registry_file(path: &Path, storage_root: &Path, bins: &(PathBuf, PathBuf)) {
     // with `--local-dev`. `resume` requires it exactly as `run` does, so an empty
     // capability set here would be refused -- which is the enforcement working.
     let storage = format!(
-        r#""storage":{{"id":"local","role":"storage","protocol_version":2,"executable":[{}],"capabilities":["{}"],"options":[{}]}}"#,
+        r#""storage":{{"id":"local","role":"storage","protocol_version":{},"executable":[{}],"capabilities":["{}"],"options":[{}]}}"#,
+        umbra_core::provider::PROTOCOL_VERSION,
         bytes_array(bins.0.as_os_str().as_bytes()),
         umbra_core::capabilities::STORAGE_LOCAL_DEVELOPMENT_V1,
         bytes_array(&options),
     );
     let journal = format!(
-        r#""journal":{{"id":"file","role":"journal","protocol_version":2,"executable":[{}],"capabilities":[],"options":[]}}"#,
+        r#""journal":{{"id":"file","role":"journal","protocol_version":{},"executable":[{}],"capabilities":[],"options":[]}}"#,
+        umbra_core::provider::PROTOCOL_VERSION,
         bytes_array(bins.1.as_os_str().as_bytes()),
     );
     let body = format!(r#"{{"timeout_ms":5000,"providers":{{{storage},{journal}}}}}"#);

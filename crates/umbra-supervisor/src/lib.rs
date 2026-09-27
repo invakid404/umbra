@@ -303,6 +303,17 @@ pub struct RunBudget {
     pub architecture: umbra_core::Architecture,
     /// Abi.
     pub abi: String,
+    /// Lowest descriptor number this run's interposer may be issued, and the
+    /// `RLIMIT_NOFILE` ceiling the kernel's own allocation was fenced to.
+    ///
+    /// `Some` exactly when the run is *routed* -- storage with no kernel-visible
+    /// path, whose tracee operations umbra services itself -- because the two are
+    /// set together by `run` from the same evidence. It is therefore also the
+    /// switch that keeps a rewrite-backed run's event loop byte-identical to what
+    /// it was: with `None` the supervisor binds no routing, allocates no
+    /// descriptor and touches `ProcessContext::fds` exactly as often as before,
+    /// which is never.
+    pub descriptor_floor: Option<u32>,
 }
 
 /// Contracts only: no backend-kind enum, concrete backend import, or provider I/O.
@@ -317,9 +328,35 @@ pub struct Supervisor {
     root_status: Option<ExitStatus>,
     renew_at: Option<Instant>,
     operations: BTreeMap<ThreadId, OperationId>,
+    /// What a routed operation's *observed success* must do to the issuing
+    /// process's descriptor table, recorded at the entry that planned it.
+    ///
+    /// Applied at the exit, never at the entry, and that ordering is the contract
+    /// [`ProcessContext`] already states: the logical context is "updated only
+    /// after observed success". A descriptor inserted at the entry would exist for
+    /// an open that the exit reported failed, and a position advanced there would
+    /// move for a write that did not happen.
+    routed: BTreeMap<ThreadId, RoutedEffect>,
     /// Set once an interception, provider or authority failure makes further
     /// resumes unsafe. Nothing is resumed after this, in any code path.
     poisoned: bool,
+}
+
+/// The descriptor-table effect one routed operation has once it has succeeded.
+///
+/// Three variants because routing services exactly three descriptor operations,
+/// and each one owns a different half of the table's state. There is deliberately
+/// no variant for "nothing to do": an operation with no effect records no entry,
+/// so the map's contents are the set of pending effects rather than a log.
+#[derive(Clone, Debug)]
+enum RoutedEffect {
+    /// A routed `open` succeeded: bind the descriptor the namespace resolved.
+    Opened(umbra_core::TracedFd, umbra_core::FdState),
+    /// A routed `read` or `write` succeeded: advance the position by the byte
+    /// count the *outcome* reported, never by the count the call requested.
+    Advanced(umbra_core::TracedFd),
+    /// A routed `close` succeeded: release the binding.
+    Closed(umbra_core::TracedFd),
 }
 
 /// Returned ownership does not imply providers were closed or a clean shutdown.
@@ -375,6 +412,7 @@ impl Supervisor {
             root_status: None,
             renew_at: None,
             operations: BTreeMap::new(),
+            routed: BTreeMap::new(),
             poisoned: false,
         }
     }

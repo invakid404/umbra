@@ -69,6 +69,9 @@ fn fixture_argv(
             policy: LaunchPolicy {
                 persistence: PersistencePolicy::LocalDevelopment,
                 inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                // Not a routed launch: no interposer, no descriptor fence.
+                interpose: false,
+                descriptor_limit: None,
             },
             // Direct tracer coverage, deliberately without enforcement: these
             // cases measure interception, not the sandbox boundary. `umbra run`
@@ -542,6 +545,9 @@ fn overlay_fixture(
             policy: LaunchPolicy {
                 persistence: PersistencePolicy::LocalDevelopment,
                 inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                // Not a routed launch: no interposer, no descriptor fence.
+                interpose: false,
+                descriptor_limit: None,
             },
         })
         .unwrap();
@@ -772,6 +778,7 @@ fn overlay_fixture(
                                             logical_path: Some(path),
                                             directory: true,
                                             flags: *flags,
+                                            offset: 0,
                                         },
                                     );
                                 }

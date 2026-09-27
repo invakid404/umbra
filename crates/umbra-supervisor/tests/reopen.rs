@@ -202,6 +202,10 @@ fn spec(
     bins: (PathBuf, PathBuf),
 ) -> ResumeSpec {
     ResumeSpec {
+        // These reopens are all over `umbra-storage-local`, which binds kernel
+        // paths, so the journal stays in the store's own `control/` and this is
+        // never read.
+        state_root: std::path::PathBuf::from("/nonexistent/umbra-state"),
         registry: registry(storage_root, bins),
         run_id,
         workspace,

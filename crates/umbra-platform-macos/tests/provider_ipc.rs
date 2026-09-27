@@ -122,6 +122,9 @@ fn open_libc_provider_ipc() {
         policy: LaunchPolicy {
             persistence: PersistencePolicy::LocalDevelopment,
             inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+            // Not a routed launch: no interposer, no descriptor fence.
+            interpose: false,
+            descriptor_limit: None,
         },
         // The contract path always installs enforcement. The overbroad profile
         // below is refused because it grants the filesystem root.

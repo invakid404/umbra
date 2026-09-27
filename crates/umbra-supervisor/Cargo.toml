@@ -6,6 +6,12 @@ license.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Forwarded to `umbra-overlay`; see its manifest for what each probe breaks and
+# why they are compile-time only. Nothing in this crate reads them.
+mutation-probe-read = ["umbra-overlay/mutation-probe-read"]
+mutation-probe-write = ["umbra-overlay/mutation-probe-write"]
+
 [dependencies]
 tracing.workspace = true
 # Run and operation identities are allocated here, so the generator is a direct

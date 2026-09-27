@@ -5,6 +5,112 @@ use umbra_platform::{SyscallAbi, TraceMemory};
 pub const MAX_PATH: usize = 4096;
 pub const PC: usize = 32;
 pub const CPSR: usize = 33;
+
+/// The reserved x16 value umbra's userspace-routing interposer traps with.
+///
+/// **This is a wire format, shared with `interpose/umbra_interpose.c`**, which
+/// carries the same literal; `interpose_trap_number_matches_the_interposer`
+/// asserts the two agree by reading the C source. Far above every Darwin BSD
+/// syscall number and not a Mach trap (those are negative), so nothing the
+/// kernel implements can collide with it in either direction.
+///
+/// It is reachable only from an instruction inside the interposer image: the
+/// backend scans that one extra image for `svc` sites and no other, so a trap
+/// number arriving from anywhere else was never breakpointed and never reaches
+/// this decoder. That containment is a property of where the breakpoints are
+/// planted, not of this constant, and `install_image` is where it lives.
+pub const INTERPOSE_TRAP: u64 = 0x554d_4252;
+
+/// Operation code in x0 of an [`INTERPOSE_TRAP`]. Mirrors the C header.
+const INTERPOSE_OPEN: u64 = 1;
+/// Operation code in x0 of an [`INTERPOSE_TRAP`]. Mirrors the C header.
+const INTERPOSE_READ: u64 = 2;
+/// Operation code in x0 of an [`INTERPOSE_TRAP`]. Mirrors the C header.
+const INTERPOSE_WRITE: u64 = 3;
+/// Operation code in x0 of an [`INTERPOSE_TRAP`]. Mirrors the C header.
+const INTERPOSE_CLOSE: u64 = 4;
+
+/// Decode Darwin `O_*` bits into the contract's flag set.
+///
+/// Shared by the `open`/`openat` syscall arms and the interposer's OPEN trap,
+/// which carries the tracee's flags register verbatim, so the two cannot drift
+/// into disagreeing about what `O_CREAT|O_WRONLY|O_TRUNC` means.
+fn open_flags(native: u64) -> OpenFlags {
+    OpenFlags {
+        read: native & 3 != 1,
+        write: native & 3 != 0,
+        append: native & 8 != 0,
+        create: native & 0x200 != 0,
+        exclusive: native & 0x800 != 0,
+        truncate: native & 0x400 != 0,
+        directory: native & 0x100000 != 0,
+        no_follow: native & 0x100 != 0,
+        close_on_exec: native & 0x1000000 != 0,
+    }
+}
+
+/// The byte count a routed transfer is serviced for.
+///
+/// Clamped to [`MAX_IO_BYTES`] rather than refused, and the two callers
+/// ([`DarwinArm64Abi::decode_entry`] and [`DarwinArm64Abi::io_buffer`]) must
+/// clamp identically or the operation would name more bytes than the buffer
+/// binding covers. A short `read` or `write` is a POSIX-legal answer, so
+/// clamping is honest; refusing an oversized request would fail a program that
+/// merely offered a large buffer.
+fn transfer_length(requested: u64) -> u64 {
+    requested.min(MAX_IO_BYTES as u64)
+}
+
+/// Decode one interposer trap into the contract operation it names.
+///
+/// The operands are in registers, exactly as a syscall's would be, so this needs
+/// no request block in tracee memory and no second read of it: x1..x3 carry
+/// everything but the `open` path, which is read through the same
+/// [`read_path`] the `open` syscall arm uses.
+///
+/// `offset: None` on both transfers means "at the descriptor's current
+/// position", which is the whole of what the interposer promises: it interposes
+/// `read` and `write` and not `pread`/`pwrite`/`lseek`, so a routed transfer is
+/// always positional-by-descriptor. The position itself lives in
+/// [`FdState::offset`] and is umbra's, never the interposer's.
+fn decode_interpose(regs: &RegisterSet, memory: &mut dyn TraceMemory) -> Result<FsOp> {
+    let operation = get(regs, 0)?;
+    Ok(match operation {
+        INTERPOSE_OPEN => FsOp::Open {
+            // Always `Cwd`: the interposer replaces `open`, which has no dirfd
+            // operand, and does not replace `openat`. A relative path is
+            // resolved against the process context's logical cwd by the overlay,
+            // which is the same resolver an unrouted `open` would have reached.
+            dir: DirRef::Cwd,
+            path: read_path(memory, get(regs, 1)?)?,
+            flags: open_flags(get(regs, 2)?),
+            mode: get(regs, 3)? as u32,
+        },
+        INTERPOSE_READ => FsOp::Read {
+            fd: TracedFd(get(regs, 1)? as i32),
+            length: transfer_length(get(regs, 3)?),
+            offset: None,
+        },
+        INTERPOSE_WRITE => FsOp::Write {
+            fd: TracedFd(get(regs, 1)? as i32),
+            length: transfer_length(get(regs, 3)?),
+            offset: None,
+        },
+        INTERPOSE_CLOSE => FsOp::Close {
+            fd: TracedFd(get(regs, 1)? as i32),
+        },
+        // Not a wildcard for convenience: an unknown code means the loaded
+        // library and this decoder disagree about the wire format, which is a
+        // mismatch to refuse rather than guess at. The build compiles the C from
+        // source in the same `cargo build`, so reaching here means something
+        // other than that library issued the trap.
+        _ => {
+            return Err(unsupported(format!(
+                "unknown umbra interposer operation {operation}"
+            )))
+        }
+    })
+}
 pub fn validate(regs: &RegisterSet) -> Result<()> {
     if regs.architecture() != &Architecture::Aarch64 || regs.as_bytes().len() != 272 {
         return Err(unsupported(
@@ -279,6 +385,7 @@ impl SyscallAbi for DarwinArm64Abi {
     ) -> Result<Option<FsOp>> {
         let number = get(regs, 16)?;
         let op = match number {
+            INTERPOSE_TRAP => decode_interpose(regs, memory)?,
             5 | 398 | 463 | 464 => {
                 let slot = path_slot(number)?;
                 let native = get(regs, slot + 1)?;
@@ -290,17 +397,7 @@ impl SyscallAbi for DarwinArm64Abi {
                         DirRef::Fd(TracedFd(fd))
                     },
                     path: read_path(memory, get(regs, slot)?)?,
-                    flags: OpenFlags {
-                        read: native & 3 != 1,
-                        write: native & 3 != 0,
-                        append: native & 8 != 0,
-                        create: native & 0x200 != 0,
-                        exclusive: native & 0x800 != 0,
-                        truncate: native & 0x400 != 0,
-                        directory: native & 0x100000 != 0,
-                        no_follow: native & 0x100 != 0,
-                        close_on_exec: native & 0x1000000 != 0,
-                    },
+                    flags: open_flags(native),
                     mode: get(regs, slot + 2)? as u32,
                 }
             }
@@ -436,6 +533,34 @@ impl SyscallAbi for DarwinArm64Abi {
         };
         Ok(Some(op))
     }
+    fn io_buffer(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>> {
+        if get(regs, 16)? != INTERPOSE_TRAP {
+            // Every other intercepted call on this ABI names paths, not data
+            // buffers. `read`/`write` are not breakpointed syscalls here: the
+            // only data transfer umbra services is the interposer's.
+            return Ok(None);
+        }
+        if !matches!(get(regs, 0)?, INTERPOSE_READ | INTERPOSE_WRITE) {
+            return Ok(None);
+        }
+        let address = get(regs, 2)?;
+        let length = transfer_length(get(regs, 3)?);
+        // A zero-length transfer has no buffer to bind and is answered without
+        // one; anything that would run off the end of the address space is a
+        // malformed request rather than a short read.
+        if length == 0 {
+            return Ok(None);
+        }
+        if address == 0 || address.checked_add(length).is_none() {
+            return Err(
+                error("io_buffer", "null or overflowing transfer buffer").with_errno(Errno(14))
+            );
+        }
+        Ok(Some(IoBuffer {
+            address,
+            length: length as u32,
+        }))
+    }
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()> {
         validate(regs)?;
         if rewrite.arguments.iter().any(|a| a.index > 7)
@@ -482,6 +607,61 @@ pub fn outcome(regs: &RegisterSet) -> Result<OperationOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The C source of the interposer, so the wire format below is checked
+    /// against the other side of it rather than against a second copy of this
+    /// side. `build.rs` compiles this same file into the shipped dylib.
+    const INTERPOSER_C: &str = include_str!("../interpose/umbra_interpose.c");
+
+    /// One `#define NAME <literal>` from the interposer's header block.
+    fn defined(name: &str) -> u64 {
+        let line = INTERPOSER_C
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("#define {name} ")))
+            .unwrap_or_else(|| panic!("{name} is not defined in umbra_interpose.c"));
+        let literal = line
+            .split_whitespace()
+            .next()
+            .expect("a #define has a value")
+            .trim_end_matches("ULL");
+        match literal.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16),
+            None => literal.parse(),
+        }
+        .unwrap_or_else(|e| panic!("{name} = {literal:?} is not a number: {e}"))
+    }
+
+    /// The trap number and the four operation codes are a **wire format** shared
+    /// with `interpose/umbra_interpose.c`, and nothing but this test makes the two
+    /// copies agree.
+    ///
+    /// It is the test `INTERPOSE_TRAP`'s doc comment has always named. It did not
+    /// exist -- CodeRabbit found the dangling reference on PR #116 (item 1) -- so
+    /// the claim was the only thing holding the two sides together. A drift here
+    /// is silent and total: the interposer traps with an x16 the decoder does not
+    /// recognise, so every routed call falls through to a syscall number the
+    /// kernel answers `ENOSYS` while posting `SIGSYS`.
+    #[test]
+    fn interpose_trap_number_matches_the_interposer() {
+        assert_eq!(
+            INTERPOSE_TRAP,
+            defined("UMBRA_TRAP_NUMBER"),
+            "the reserved x16 trap value disagrees with the interposer's"
+        );
+        for (name, ours) in [
+            ("UMBRA_OP_OPEN", INTERPOSE_OPEN),
+            ("UMBRA_OP_READ", INTERPOSE_READ),
+            ("UMBRA_OP_WRITE", INTERPOSE_WRITE),
+            ("UMBRA_OP_CLOSE", INTERPOSE_CLOSE),
+        ] {
+            assert_eq!(
+                ours,
+                defined(name),
+                "{name} disagrees with the interposer's"
+            );
+        }
+    }
+
     struct Memory {
         base: u64,
         data: Vec<u8>,

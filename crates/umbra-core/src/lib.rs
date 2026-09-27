@@ -752,7 +752,87 @@ pub struct FdState {
     pub directory: bool,
     /// Flags.
     pub flags: OpenFlags,
+    /// Current file position, in bytes from the start of the object.
+    ///
+    /// [`FsOp::Read`] and [`FsOp::Write`] carry `offset: Option<u64>`, where
+    /// `None` means "at the descriptor's current position" -- so without this
+    /// field there is no position to mean, and a positionless write could not be
+    /// placed at all. Advanced only after an operation's outcome has been
+    /// observed successful, like every other field of a [`ProcessContext`]:
+    /// a refused write must not move the position POSIX says it did not move.
+    pub offset: u64,
 }
+
+/// A tracee memory buffer an intercepted data transfer names.
+///
+/// Runtime-only, exactly like [`PhysicalPath`] and [`MemoryWrite::address`]: it
+/// is an address in one stopped task at one moment, never an object identity,
+/// and it must not reach a manifest or a journal payload. It exists because
+/// [`FsOp`] is deliberately ABI-independent -- `FsOp::Read` carries how *many*
+/// bytes, never *where* they go -- so the address has to travel beside the
+/// operation rather than inside it, and only the ABI can read it out of the
+/// registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoBuffer {
+    /// Address in the stopped task's address space.
+    pub address: u64,
+    /// Byte count the transfer names. Never larger than [`MAX_IO_BYTES`].
+    pub length: u32,
+}
+
+/// The runtime details a *routed* operation needs and its [`FsOp`] cannot carry.
+///
+/// A routed operation is one umbra services itself, through the run's storage,
+/// because the backend exposes no kernel-visible path to rewrite a syscall
+/// operand to. Three things are then needed that an ABI-independent operation
+/// deliberately has no room for, and all three are supplied together so the
+/// namespace consumes one binding per resolution rather than three:
+///
+/// * the descriptor number to answer an `Open` with, which is the caller's to
+///   allocate because the caller owns [`ProcessContext::fds`] and knows the
+///   fence the kernel's own range was limited to;
+/// * where a `Read`'s bytes go, which only the ABI can read out of the
+///   registers; and
+/// * the bytes a `Write` must persist, because [`FsOp::Write`] carries how many
+///   there are and never which they are.
+///
+/// Bound before `resolve` and **consumed by it**, including by a resolution that
+/// fails, on the same terms as `set_readlink_buffer`: a binding that survived a
+/// failed resolve would be applied to the next, unrelated operation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutedRequest {
+    /// Descriptor to answer a routed `Open` with, at or above the tracee's
+    /// `RLIMIT_NOFILE` fence so it cannot be a number the kernel also issued.
+    pub descriptor: Option<RoutedInput<TracedFd>>,
+    /// Tracee buffer a routed `Read` fills.
+    pub read_buffer: Option<RoutedInput<IoBuffer>>,
+    /// Bytes a routed `Write` persists.
+    ///
+    /// **Exactly as many as the operation names**, and the namespace enforces
+    /// that equality rather than treating it as an upper bound: a binding
+    /// shorter than the operation means the caller read the wrong buffer, which
+    /// is a wiring fault and not a short write. Shortening for a backend whose
+    /// per-run I/O bound is smaller happens *after* that check, inside the
+    /// namespace, and is what makes the answer a POSIX-legal short write.
+    pub write_bytes: Option<RoutedInput<Vec<u8>>>,
+}
+
+/// One routing input, or the errno POSIX gives when the caller cannot supply it.
+///
+/// **The refusal has to travel *inside* the binding, and that is the whole
+/// reason this type exists.** The binding is built before `resolve`, and
+/// `resolve` is the only thing that can produce a tracee-visible
+/// [`ResolvedAction::Deny`] -- so a caller that returned an error instead would
+/// stop the entire run over an ordinary program bug. Measured, before this
+/// existed: `read(fd, NULL, 4)` on a routed descriptor killed the run, where
+/// Darwin answers `EFAULT`; and exhausting the fenced descriptor range did the
+/// same where POSIX says `EMFILE`.
+///
+/// So the caller reports what it could not do, and `resolve` turns it into the
+/// answer the program expects. An input that is genuinely absent stays `None`;
+/// this is for one the caller *tried* to produce and the tracee's own request
+/// made impossible.
+pub type RoutedInput<T> = std::result::Result<T, Errno>;
 
 /// Logical namespace context cloned on fork and updated only after observed success.
 /// Native mappings, breakpoint inventory, and scratch allocations remain runtime
@@ -892,6 +972,42 @@ pub struct LaunchPolicy {
     pub persistence: PersistencePolicy,
     /// The platform must validate these and close/sanitize all other inherited FDs.
     pub inherited_fds: Vec<TracedFd>,
+    /// Load umbra's userspace-routing interposer into the target image before its
+    /// first instruction, and intercept the requests it traps.
+    ///
+    /// Required for a run whose storage exposes no kernel-visible path, where a
+    /// syscall path rewrite has no target to name. A platform that cannot do this
+    /// must refuse the launch rather than start an unrouted tracee: a tracee
+    /// whose file operations are neither rewritten nor routed would read and
+    /// write the host, which enforcement would then refuse -- late, and only for
+    /// writes.
+    pub interpose: bool,
+    /// Ceiling on the descriptor numbers the kernel may allocate to the tracee
+    /// and every descendant, applied as `RLIMIT_NOFILE` -- **soft and hard** --
+    /// before the final exec.
+    ///
+    /// This is what makes an interposer's virtual descriptors safe for the whole
+    /// tracee lifetime rather than only at the instant one is allocated. POSIX
+    /// requires `open` to return the lowest free number, so "this number is free
+    /// now" is not an invariant: a later real `open` can legitimately be handed
+    /// it. Fencing the kernel's range instead makes the two ranges disjoint by
+    /// construction -- the kernel never returns a number at or above the limit,
+    /// and the interposer allocates only at or above it.
+    ///
+    /// **Lowering the hard limit is the load-bearing half.** With only the soft
+    /// limit lowered the tracee can raise it back and walk into the virtual
+    /// range; with the hard limit lowered too, raising it answers `EPERM` and a
+    /// soft limit above it answers `EINVAL`. The bound survives `fork` and
+    /// `exec`.
+    ///
+    /// The cost is stated rather than hidden: the tracee may hold at most this
+    /// many descriptors, `getrlimit` and `sysconf(_SC_OPEN_MAX)` report it, and a
+    /// program wanting more is refused `EMFILE` -- an honest POSIX answer. It
+    /// also fails *closed* for everything the interposer does not implement: a
+    /// virtual descriptor is not a kernel object, so `lseek`, `fstat`, `dup`,
+    /// `fcntl`, `mmap`, `fsync` and `ftruncate` on one receive `EBADF` from the
+    /// kernel rather than a plausible wrong answer.
+    pub descriptor_limit: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

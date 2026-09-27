@@ -271,3 +271,133 @@ jobs:
           cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures -- --nocapture --test-threads=1
           cargo test -p umbra-cli --test run_fixtures --test resume_cli -- --nocapture --test-threads=1
           cargo test -p umbra-supervisor --test reopen -- --nocapture --test-threads=1
+
+  native-userspace-routing:
+    name: Userspace-routed run over the live NFSv4 client
+    # Fork PR code must never run on this persistent, privileged runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # The same runner as `native-qualification`: it provides debugger
+    # permission, which a supervised launch needs, and Docker for the fixture.
+    # A routed run needs both halves and neither is available elsewhere -- the
+    # Linux transport-raw job has the server but no tracer, and the macOS
+    # qualification job has the tracer but no server.
+    runs-on: [self-hosted, macOS, ARM64, umbra-integration]
+    timeout-minutes: 30
+    env:
+      # A missing fixture is a failure here, not a skip. These are the slice's
+      # mandatory proofs: an end-to-end run, and two mutations that must break
+      # it in different directions.
+      UMBRA_INTEGRATION_REQUIRED: "1"
+      LIBNFS_PIN: 18c5c73ee88bb7dc8da0d55dc95164bb77e49dc6
+      UMBRA_LIBNFS_SRC: ${{ github.workspace }}/third_party/libnfs
+      UMBRA_NFS_RAW_FIXTURE: 127.0.0.1:12105
+      UMBRA_NFS_FIXTURE_CONTAINER: umbra-m1-transport-raw-ganesha
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify libnfs.pin matches workflow constant
+        run: |
+          pinned=$(grep -v '^\s*#' crates/umbra-storage-nfs-userspace/libnfs.pin | tr -d '[:space:]')
+          if [ "$pinned" != "$LIBNFS_PIN" ]; then
+            echo "libnfs.pin says $pinned but this workflow expects $LIBNFS_PIN" >&2
+            exit 1
+          fi
+
+      - name: Fetch pinned libnfs source
+        run: |
+          if [ ! -d third_party/libnfs ]; then
+            mkdir -p third_party
+            git clone --filter=blob:none https://github.com/sahlberg/libnfs third_party/libnfs
+          fi
+          git -C third_party/libnfs fetch --depth 1 origin "$LIBNFS_PIN" || true
+          git -C third_party/libnfs -c advice.detachedHead=false checkout "$LIBNFS_PIN"
+
+      - name: Build and start the NFS-Ganesha fixture
+        run: |
+          docker compose \
+            -f experiments/nfs-raw/docker-compose.yml \
+            up -d --build --wait --wait-timeout 180
+          docker ps --filter name=$UMBRA_NFS_FIXTURE_CONTAINER
+
+      - name: Build the toy and edge fixtures
+        run: |
+          test "$(uname -m)" = arm64
+          fixture_dir=$(mktemp -d)
+          clang -arch arm64 -O1 experiments/fixtures/umbra-userspace-toy.c \
+            -o "$fixture_dir/umbra-userspace-toy"
+          # The edge fixture carries the round-1 regressions: a routed ENOENT, a
+          # routed EFAULT, a transfer past the backend's per-call bound, an
+          # O_TRUNC of a non-empty object, and a file-touching library
+          # initializer. Each was a dead run or a wrong errno.
+          clang -arch arm64 -O1 experiments/fixtures/umbra-userspace-edges.c \
+            -o "$fixture_dir/umbra-userspace-edges"
+          echo "UMBRA_USERSPACE_TOY_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
+          echo "UMBRA_EDGES_PATH=$fixture_dir/umbra-userspace-edges" >> "$GITHUB_ENV"
+
+      # Three invocations, because the mutation probes are cargo features and
+      # every one of them rebuilds `target/debug/umbra` in place. The order
+      # matters: the baseline runs against an unmutated binary, and each probe
+      # run is preceded by the build that puts its probe in.
+      #
+      # Each one selects `--test userspace_run` and carries `--test-threads=1`,
+      # and both are load-bearing rather than stylistic. The selector keeps this
+      # gate off the crate's unit suite, which contains a **pre-existing** flaky
+      # case -- `transport::raw::c_boundary::r3_004_...` compares a global arena
+      # count against a baseline taken earlier in the same test, which races its
+      # sibling `c_boundary` tests and failed 1 run in 4 under round-2 review.
+      # That file is byte-identical to master and the Linux `transport-raw` job
+      # already runs it single-threaded; this job must not start failing on a
+      # defect this change did not introduce. The thread limit is what the live
+      # cases themselves need: they drive one `umbra run` at a time against one
+      # shared Ganesha export and one `target/debug/umbra`.
+      #
+      # If a future edit widens the selector to `--tests` or `--lib`, it must
+      # keep `--test-threads=1` **and** add
+      # `--skip the_namespace_mutations_the_hotfix_added_run_end_to_end`.
+      # That case asks REMOVE for atomic `change_info4`, which Ganesha's VFS
+      # FSAL cannot supply, so it fails against this fixture on `master` too --
+      # reproduced byte-identical at `master@155601be`. The Linux
+      # `transport-raw` job above already skips it by name for exactly this
+      # reason (see its comment); this job stays green only because
+      # `--test userspace_run` never reaches it. Widening the selector without
+      # the skip reddens the job on a fixture gap this change did not cause.
+      - name: Proof 1 -- end to end, the toy must exit 0
+        run: |
+          cargo build --workspace --bins
+          cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw \
+            --test userspace_run -- --nocapture --test-threads=1
+
+      - name: Proof 2 -- mutation probe A, read routing broken
+        env:
+          UMBRA_MUTATION_PROBE: read
+        run: |
+          cargo build -p umbra-cli --features mutation-probe-read
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw \
+            --test userspace_run -- --nocapture --test-threads=1
+
+      - name: Proof 3 -- mutation probe B, write routing broken
+        env:
+          UMBRA_MUTATION_PROBE: write
+        run: |
+          cargo build -p umbra-cli --features mutation-probe-write
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw \
+            --test userspace_run -- --nocapture --test-threads=1
+
+      - name: Restore an unmutated binary
+        if: always()
+        run: cargo build -p umbra-cli
+
+      - name: Capture diagnostics on failure
+        if: failure()
+        run: |
+          docker logs "$UMBRA_NFS_FIXTURE_CONTAINER" 2>&1 | tail -200 || true
+
+      - name: Tear down the fixture
+        if: always()
+        run: |
+          docker compose \
+            -f experiments/nfs-raw/docker-compose.yml \
+            down -v

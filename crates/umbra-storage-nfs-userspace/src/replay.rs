@@ -267,6 +267,29 @@ pub trait ReplayLog: Send {
         -> VerifierMatch;
 }
 
+/// The in-process replay buffer a live provider binds in
+/// [`connect`](crate::storage::NfsUserspaceStorage::connect).
+///
+/// **Not a stand-in for something durable, and the name it aliases is the reason
+/// this alias exists.** The `ReplayLog` seam is the *in-process* half of the
+/// failure model: a bounded intent buffer that applies backpressure before
+/// dispatch and keeps write-verifier accounting for the calls this session has
+/// in flight. Nothing about it is supposed to survive the process. The durable
+/// half lives on the server, in `.provider/retries/`, written by
+/// [`crate::journal`] before a mutation is dispatched, and a mutation that
+/// cannot write one is refused there rather than here.
+///
+/// So [`crate::fake::FakeReplayLog`] is a complete implementation of this
+/// contract, not a shape fake like [`crate::fake::FakeTransport`] beside it: it
+/// holds records in memory because that is what the contract describes, and it
+/// marks the [`RetainedError`](crate::error::RetainedError) values it produces
+/// **non-durable**, which is the honest answer and the conservative one. Aliasing
+/// it under a production name is deliberate — duplicating the same map-backed
+/// logic under a second type would give two implementations to keep in step and
+/// no new behaviour. Do not "upgrade" this to something that claims durable
+/// retention: the record that makes a retry safe is the server-side one.
+pub type InProcessReplayLog = crate::fake::FakeReplayLog;
+
 #[cfg(test)]
 mod tests {
     use super::*;

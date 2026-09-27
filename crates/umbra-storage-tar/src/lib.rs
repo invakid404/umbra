@@ -344,6 +344,9 @@ impl Storage for TarStorage {
             physical_path: None,
         };
         let result = RunBinding {
+            // This backend takes writer authority in `acquire_writer`, under the
+            // identity the caller names there, so nothing is admitted yet.
+            admitted_writer: None,
             run_id: request.run_id,
             root: binding(),
             control: binding(),

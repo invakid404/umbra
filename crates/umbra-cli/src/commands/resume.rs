@@ -29,6 +29,11 @@ pub struct ResumeArgs {
     /// than silently reopened against a different base.
     #[arg(long, default_value = ".", value_name = "PATH")]
     pub workspace: PathBuf,
+    /// The same `--state-dir` the run was created with. A reopen that cannot
+    /// find this run's journal evidence *refuses*; it never reports that a run
+    /// whose log it could not find needs no recovery.
+    #[arg(long, value_name = "PATH")]
+    pub state_dir: Option<PathBuf>,
     /// Use explicitly configured local development storage instead of the
     /// default validated NFSv4 mount. Local storage is not remote durability.
     #[arg(long, conflicts_with = "strict_remote")]
@@ -86,6 +91,10 @@ pub fn handle(args: ResumeArgs, storage: &StorageArgs) -> Result<()> {
         run_id: RunId(args.run.run_id),
         workspace,
         persistence: args.persistence(),
+        state_root: args
+            .state_dir
+            .clone()
+            .unwrap_or_else(super::default_state_root),
     };
     report(umbra_supervisor::resume(spec)?)
 }

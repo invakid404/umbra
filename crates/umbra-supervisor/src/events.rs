@@ -21,8 +21,8 @@ use umbra_platform::{TraceControl, TraceMemory};
 use uuid::Uuid;
 
 use crate::{
-    ChildCaptureState, ProcessLifecycle, ProcessState, RunBudget, RunLifecycle, StopReason,
-    Supervisor, ThreadState,
+    ChildCaptureState, ProcessLifecycle, ProcessState, RoutedEffect, RunBudget, RunLifecycle,
+    StopReason, Supervisor, ThreadState,
 };
 
 /// Adapter binding the ABI decoder to one stopped task for the length of a decode.
@@ -269,10 +269,40 @@ impl Supervisor {
             umbra_overlay::Dispatch::Materialise | umbra_overlay::Dispatch::Whiteout
         );
         let context = self.process(task)?.context.clone();
+        // Routed runs only. On a rewrite-backed run `descriptor_floor` is `None`
+        // and none of this executes, so that path reaches `resolve` exactly as it
+        // did before.
+        let routed = self
+            .budget
+            .as_ref()
+            .and_then(|b| b.descriptor_floor)
+            .is_some();
+        if routed {
+            let routing = self.routing_for(task, thread, &operation, &registers, &context)?;
+            self.service_renewal()?;
+            self.namespace.set_routed_request(routing)?;
+        }
         self.service_renewal()?;
         let action = match self.namespace.resolve(&context, &operation) {
             Ok(action) => action,
-            Err(e) if e.kind == ErrorKind::NotFound && !mutation => {
+            // **A routed operation must never be resumed.** The fallback below
+            // resumes the tracee's own syscall; for a routed operation that
+            // syscall is umbra's reserved trap, which Darwin's `nosys` answers
+            // with `ENOSYS` (78) while posting `SIGSYS`. Measured: a tracee
+            // opening an absent path exited **78**, where POSIX says `ENOENT`
+            // (2) -- the most common file-operation failure there is, and one
+            // programs branch on.
+            //
+            // The routed answer is produced by `resolve` itself, as
+            // `Deny(ENOENT)`, and arrives on the `Ok` path below. **This used to
+            // be an arm here matching `NotFound` on a routed run, and that was
+            // too wide:** it also caught a `NotFound` raised by `Storage` for an
+            // object the overlay's own journal says it committed, and reported a
+            // namespace/store disagreement to the program as an ordinary missing
+            // file. The engine now decides where it knows -- `hidden_or` and
+            // `routed_binding` -- so a `Storage` `NotFound` still reaches the arm
+            // below and still stops the run.
+            Err(e) if e.kind == ErrorKind::NotFound && !mutation && !routed => {
                 // The namespace says nothing exists at this logical path. The base
                 // layer is the host filesystem itself, so letting the unmodified
                 // read run produces exactly the outcome the namespace predicts.
@@ -284,9 +314,35 @@ impl Supervisor {
         };
         // A denial executes no syscall, touches no storage and mutates nothing, so
         // it needs no journaled preparation and no operation slot: answer the
-        // tracee here, before minting an OperationId. This is only reachable for a
-        // whiteout-hidden non-mutating path; every other NotFound still resumes the
-        // tracee's own syscall in the resolve arm above.
+        // tracee here, before minting an OperationId.
+        //
+        // **Five things reach it**, and the list is kept current because it is
+        // the only place they are enumerated together:
+        //
+        // 1. A whiteout-hidden non-mutating path -> `ENOENT` (`hidden_or`,
+        //    `engine.rs:786`).
+        // 2. A routed run whose *name does not resolve* -> `ENOENT`
+        //    (`hidden_or:804` for a path operation, `routed_binding:1787` for a
+        //    descriptor whose name stopped resolving). Narrower than it reads:
+        //    this is name resolution only, never a `NotFound` the `Storage`
+        //    raised for an object the journal says it committed -- that one
+        //    reaches the `Err(e)` arm and stops the run, which is the whole
+        //    point of deciding it in the engine rather than here.
+        // 3. `EBADF` on a routed run -- a descriptor umbra never issued, one
+        //    carrying no logical path, a directory, or one opened without the
+        //    access the operation needs (`engine.rs:1767`, `:1770`, `:1815`,
+        //    `:1820`, `:1931`).
+        // 4. A routing input the tracee could not supply, carried as a value
+        //    through `RoutedInput` rather than as an error: `EFAULT` for a bad
+        //    transfer buffer (`:1827`, `:1937`) and `EMFILE` for an exhausted
+        //    fenced descriptor range (`:2598`).
+        // 5. `ENOTSUP` for an intercepted path operation on a routed run that
+        //    `rewrite` would have had to name a shadow path for -- `fstatat`,
+        //    `faccessat`, `renameat` and the rest on an object this run created
+        //    or copied up (`:2669`). Without it those stopped the run.
+        //
+        // On a rewrite-backed run every other `NotFound` still resumes the
+        // tracee's own syscall in the arm above.
         if let ResolvedAction::Deny(errno) = action {
             let result = EmulatedResult {
                 outcome: OperationOutcome::Failure(errno),
@@ -315,17 +371,311 @@ impl Supervisor {
                 self.resume_thread(thread)
             }
             ResolvedAction::AllowBaseRead => self.resume_thread(thread),
-            // Emulation still requires the platform to skip the original trap.
-            // Rewriting return registers alone would resume the very syscall the
-            // namespace refused, so this fails closed. The emulated-result paths
-            // (`ReadLink`, logical-symlink `Stat`) are a separate wiring gap, not
-            // #49; `Deny` is handled above and never reaches here.
-            ResolvedAction::Deny(_) | ResolvedAction::Emulate(_) => Err(error(
-                ErrorKind::UnsupportedCapability,
+            // Emulation requires the platform to skip the original trap. Rewriting
+            // return registers alone would resume the very syscall the namespace
+            // answered, so a backend whose `emulate_result` cannot step past the
+            // trap (the Linux stub) fails here rather than running it.
+            //
+            // The exit is not synthesised here and does not need to be: the macOS
+            // backend's `resume` observes that the PC has moved past the entry it
+            // recorded and emits the matching `SyscallExit` itself, carrying the
+            // outcome out of the registers this call just set. So the transaction
+            // this entry opened is observed and committed by the ordinary exit
+            // path, in the ordinary order, and `self.operations` is drained there
+            // like every other intercepted call's.
+            ResolvedAction::Emulate(result) => {
+                for write in &result.memory_writes {
+                    self.service_renewal()?;
+                    self.platform
+                        .control
+                        .write_memory(task, write.address, &write.bytes)?;
+                }
+                self.platform.abi.emulate_result(&mut registers, result)?;
+                self.service_renewal()?;
+                self.platform.control.set_registers(thread, &registers)?;
+                self.record_routed_effect(thread, &operation)?;
+                self.resume_thread(thread)
+            }
+            // `Deny` is answered above, before an operation ID is minted, and
+            // never reaches here.
+            ResolvedAction::Deny(_) => Err(error(
+                ErrorKind::InvalidState,
                 "supervisor.syscall_entry",
-                "safe syscall emulation is not implemented for this action",
+                "a denial reached the prepared-action dispatch",
             )),
         }
+    }
+
+    /// Build the routing binding for one entry on a routed run.
+    ///
+    /// Three operations need one and the rest need an empty binding rather than
+    /// no call: `set_routed_request` consumes on resolution, so leaving a stale
+    /// binding in place for the next operation is the failure mode this avoids.
+    ///
+    /// **A refusal the tracee caused is bound, not returned.** This runs before
+    /// `resolve`, and `resolve` is the only thing that can produce an answer the
+    /// tracee sees -- so returning `Err` for a bad pointer or a full descriptor
+    /// range stopped the whole run over an ordinary program bug. Measured, before
+    /// this: `read(fd, NULL, 4)` ended the run where Darwin answers `EFAULT`.
+    /// `Err` is now reserved for a failure of *interception* rather than of the
+    /// request.
+    fn routing_for(
+        &mut self,
+        task: TaskId,
+        thread: ThreadId,
+        operation: &FsOp,
+        registers: &umbra_core::RegisterSet,
+        context: &ProcessContext,
+    ) -> Result<umbra_core::RoutedRequest> {
+        let mut routing = umbra_core::RoutedRequest::default();
+        match operation {
+            FsOp::Open { .. } => routing.descriptor = Some(self.allocate_descriptor(context)?),
+            // `None` is a zero-length read, which the namespace answers without a
+            // buffer; `Some(Err(..))` is the tracee's own bad pointer.
+            FsOp::Read { .. } => {
+                routing.read_buffer = Self::io_binding(&*self.platform.abi, registers)?
+            }
+            FsOp::Write { length, .. } => {
+                // The bytes, read out of the stopped tracee. `FsOp::Write` carries
+                // their count and never their content, and the namespace is what
+                // persists them, so this is the one place they cross.
+                let buffer = match Self::io_binding(&*self.platform.abi, registers)? {
+                    Some(Err(errno)) => {
+                        routing.write_bytes = Some(Err(errno));
+                        return Ok(routing);
+                    }
+                    Some(Ok(buffer)) => buffer,
+                    None => {
+                        // A zero-length write. The namespace still needs a binding
+                        // whose length matches the operation, which for zero bytes
+                        // is an empty one rather than an absent one.
+                        if *length == 0 {
+                            routing.write_bytes = Some(Ok(Vec::new()));
+                            return Ok(routing);
+                        }
+                        return Err(error(
+                            ErrorKind::ProtocolMismatch,
+                            "supervisor.routing",
+                            "the ABI reported no source buffer for a nonempty routed write",
+                        ));
+                    }
+                };
+                if buffer.length as u64 != *length {
+                    return Err(error(
+                        ErrorKind::ProtocolMismatch,
+                        "supervisor.routing",
+                        "the ABI's write buffer length disagrees with the decoded operation",
+                    ));
+                }
+                let mut bytes = vec![0u8; buffer.length as usize];
+                self.service_renewal()?;
+                let read = self
+                    .platform
+                    .control
+                    .read_memory(task, buffer.address, &mut bytes);
+                routing.write_bytes = Some(match read {
+                    Ok(()) => Ok(bytes),
+                    Err(e) => Err(self.address_fault_or(thread, e)?),
+                });
+            }
+            _ => {}
+        }
+        Ok(routing)
+    }
+
+    /// Decide whether a failed read of the tracee's own transfer buffer was the
+    /// tracee's bad pointer or umbra's broken tracer, and answer only the first.
+    ///
+    /// A source buffer umbra cannot read *is* the tracee's bad pointer, and
+    /// `EFAULT` is what the kernel would have answered for the same `write` --
+    /// but only when the tracer is otherwise healthy. An earlier shape mapped
+    /// **every** failure of that read to `EFAULT`, so a provider-IPC failure, a
+    /// dead debugger port or an expired session deadline during it was reported
+    /// to the program as a bad pointer and the run carried on to die one syscall
+    /// later somewhere else. That is the diagnosis-destroying misattribution
+    /// this slice fixed in the other direction for `ENOSYS`.
+    ///
+    /// So the tracer is probed before the errno is believed: reading the
+    /// stopped thread's registers needs the same provider connection, the same
+    /// debugger port and the same unexpired deadline, and names no tracee
+    /// address at all. If that succeeds, the failure was specific to the address
+    /// the tracee supplied; if it does not, the original error propagates and
+    /// stops the run. One extra round trip, on the failure path only.
+    ///
+    /// A kind other than `Io` propagates too: the memory proxy answers
+    /// `ProtocolMismatch` for a malformed request, which is umbra's own wiring
+    /// rather than anything the program did.
+    fn address_fault_or(
+        &mut self,
+        thread: ThreadId,
+        error: UmbraError,
+    ) -> Result<umbra_core::Errno> {
+        if error.kind != ErrorKind::Io {
+            return Err(error);
+        }
+        match self.platform.control.registers(thread) {
+            Ok(_) => Ok(umbra_core::Errno(14)),
+            Err(_) => Err(error),
+        }
+    }
+
+    /// The ABI's buffer binding for this entry, with a tracee-caused refusal
+    /// carried as a value.
+    ///
+    /// `io_buffer` already knows the POSIX answer for a null or overflowing
+    /// transfer buffer -- it attaches `Errno(14)` to the error it returns. This
+    /// separates that from a genuine interception failure, which carries no
+    /// errno and still stops the run.
+    fn io_binding(
+        abi: &dyn umbra_platform::SyscallAbi,
+        registers: &umbra_core::RegisterSet,
+    ) -> Result<Option<umbra_core::RoutedInput<umbra_core::IoBuffer>>> {
+        match abi.io_buffer(registers) {
+            Ok(Some(buffer)) => Ok(Some(Ok(buffer))),
+            Ok(None) => Ok(None),
+            Err(e) => match e.errno {
+                Some(errno) => Ok(Some(Err(errno))),
+                None => Err(e),
+            },
+        }
+    }
+
+    /// The descriptor number a routed `open` will be answered with.
+    ///
+    /// The lowest free number in `[floor, floor + floor)`, which is POSIX's own
+    /// rule applied to umbra's half of the descriptor space. Free is decided
+    /// against this process's own bindings only, and that is sufficient rather
+    /// than approximate: the fence lowered the tracee's `RLIMIT_NOFILE` -- soft
+    /// and hard -- to exactly this floor before the target exec'd, so the kernel
+    /// cannot issue a number at or above it to this process or any descendant,
+    /// and the tracee cannot raise the boundary back.
+    ///
+    /// Exhausting the range is **bound as `EMFILE`**, not returned as an error.
+    /// That is the honest POSIX answer to "no descriptor is available", and it
+    /// reaches the tracee because `resolve` turns a bound refusal into a
+    /// `Deny` -- an earlier shape returned `Err` here and stopped the whole run.
+    /// `Err` from this function means the run has no descriptor fence at all,
+    /// which is a wiring fault rather than a request the tracee made.
+    fn allocate_descriptor(
+        &self,
+        context: &ProcessContext,
+    ) -> Result<umbra_core::RoutedInput<umbra_core::TracedFd>> {
+        let floor = self
+            .budget
+            .as_ref()
+            .and_then(|budget| budget.descriptor_floor)
+            .ok_or_else(|| {
+                error(
+                    ErrorKind::InvalidState,
+                    "supervisor.routing",
+                    "a routed open needs this run's descriptor fence",
+                )
+            })?;
+        // **Bounded, and the bound is the one the tracee was told about.**
+        //
+        // `DESCRIPTOR_FENCE` is a single constant used twice: as the tracee's
+        // `RLIMIT_NOFILE` and as this floor. So `[floor, floor + floor)` makes
+        // umbra's range exactly as large as the kernel's, which is what lets the
+        // advertised limit mean something: the tracee can hold at most
+        // `descriptor_limit` kernel descriptors *and* at most `descriptor_limit`
+        // routed ones, and `ProcessContext::fds` is bounded by the second.
+        //
+        // It used to scan to `i32::MAX`, which made two claims false at once.
+        // The tracee was told `getrlimit = 4096` while umbra would hand out far
+        // more -- an advertised limit that was not the enforced one -- and the
+        // `EMFILE` refusal was unreachable: measured, a tracee held **400**
+        // routed descriptors with no refusal and the practical ceiling was the
+        // run deadline, not the fence. Capping here makes the refusal reachable
+        // and the map bounded.
+        let ceiling = i64::from(floor) * 2;
+        let mut candidate = i64::from(floor);
+        // A descriptor is an `i32`; the fence keeps this range far below that
+        // ceiling, and the assertion is that nothing widened it.
+        debug_assert!(ceiling <= i64::from(i32::MAX));
+        while candidate < ceiling {
+            let fd = umbra_core::TracedFd(candidate as i32);
+            if !context.fds.contains_key(&fd) {
+                return Ok(Ok(fd));
+            }
+            candidate += 1;
+        }
+        // `EMFILE` is 24 on Darwin and on Linux alike, which is what makes it
+        // safe to name here; see `Overlay::routed_binding` for the same argument
+        // about `EBADF`.
+        Ok(Err(umbra_core::Errno(24)))
+    }
+
+    /// Record what this routed operation's observed success must do to the
+    /// issuing process's descriptor table. Applied at the exit, never here.
+    fn record_routed_effect(&mut self, thread: ThreadId, operation: &FsOp) -> Result<()> {
+        if self
+            .budget
+            .as_ref()
+            .and_then(|b| b.descriptor_floor)
+            .is_none()
+        {
+            return Ok(());
+        }
+        let effect = match operation {
+            FsOp::Open { .. } => match self.namespace.routed_descriptor()? {
+                Some((fd, state)) => RoutedEffect::Opened(fd, state),
+                // An `Open` the namespace answered without binding a descriptor:
+                // a logical-symlink stat or another emulated answer on a run that
+                // also routes. Nothing to record.
+                None => return Ok(()),
+            },
+            FsOp::Read { fd, .. } | FsOp::Write { fd, .. } => RoutedEffect::Advanced(*fd),
+            FsOp::Close { fd } => RoutedEffect::Closed(*fd),
+            _ => return Ok(()),
+        };
+        self.routed.insert(thread, effect);
+        Ok(())
+    }
+
+    /// Apply a routed operation's descriptor effect, after its success.
+    fn apply_routed_effect(
+        &mut self,
+        task: TaskId,
+        thread: ThreadId,
+        outcome: &OperationOutcome,
+    ) -> Result<()> {
+        let Some(effect) = self.routed.remove(&thread) else {
+            return Ok(());
+        };
+        let OperationOutcome::Success { return_value } = outcome else {
+            // A refused routed operation changes nothing: no descriptor was
+            // issued, no position moved, no binding was released.
+            return Ok(());
+        };
+        let context = &mut self.process_mut(task)?.context;
+        match effect {
+            RoutedEffect::Opened(fd, state) => {
+                if *return_value != fd.0 as u64 {
+                    return Err(error(
+                        ErrorKind::ProtocolMismatch,
+                        "supervisor.routing",
+                        "the observed open result is not the descriptor the namespace bound",
+                    ));
+                }
+                context.fds.insert(fd, state);
+            }
+            RoutedEffect::Advanced(fd) => {
+                let state = context.fds.get_mut(&fd).ok_or_else(|| {
+                    error(
+                        ErrorKind::InvalidState,
+                        "supervisor.routing",
+                        "a routed transfer succeeded on a descriptor that is no longer bound",
+                    )
+                })?;
+                // The observed count, not the requested one. A short transfer
+                // moves the position by what actually moved.
+                state.offset = state.offset.saturating_add(*return_value);
+            }
+            RoutedEffect::Closed(fd) => {
+                context.fds.remove(&fd);
+            }
+        }
+        Ok(())
     }
 
     fn apply_rewrite(
@@ -382,6 +732,10 @@ impl Supervisor {
         match outcome {
             OperationOutcome::Success { .. } => {
                 self.namespace.commit(id)?;
+                // After the commit, deliberately: the descriptor table must not
+                // record a binding for a transaction that failed to commit, and a
+                // failed commit stops the run before the tracee sees either.
+                self.apply_routed_effect(task, thread, &outcome)?;
             }
             // A kernel errno is an observed syscall outcome, not an interception
             // failure: reconcile the transaction and let the tracee see it.
@@ -396,6 +750,7 @@ impl Supervisor {
             OperationOutcome::Failure(errno) => {
                 self.namespace
                     .abort(id, &AbortReason::KernelRefused(errno))?;
+                self.apply_routed_effect(task, thread, &outcome)?;
             }
         }
         self.resume_thread(thread)
@@ -657,6 +1012,94 @@ mod tests {
         s.state.lifecycle = RunLifecycle::Running;
         s
     }
+    /// A routed budget with a deliberately tiny fence, so the range can be
+    /// exhausted in a test rather than only in principle.
+    fn routed_budget(fence: u32) -> RunBudget {
+        RunBudget {
+            renew_after: Duration::from_secs(1),
+            cwd: BytePath::new(b"/".to_vec()).unwrap(),
+            architecture: Architecture::Aarch64,
+            abi: "test-abi".to_owned(),
+            descriptor_floor: Some(fence),
+        }
+    }
+
+    fn bound_fd(path: &[u8]) -> FdState {
+        FdState {
+            object: ObjectId(Uuid::new_v4()),
+            logical_path: Some(BytePath::new(path.to_vec()).unwrap()),
+            directory: false,
+            flags: OpenFlags::default(),
+            offset: 0,
+        }
+    }
+
+    /// Routed descriptors come from `[floor, floor + floor)` and nowhere else.
+    ///
+    /// The upper bound is what makes the fence mean anything. Without it the
+    /// allocator scanned to `i32::MAX`, so the tracee was told
+    /// `getrlimit = <floor>` while umbra would hand out far more, and the map it
+    /// keeps per open grew unbounded.
+    #[test]
+    fn a_routed_descriptor_comes_from_the_fenced_range() {
+        let mut s = supervisor();
+        s.budget = Some(routed_budget(8));
+        let mut context = s.process(task(1)).unwrap().context.clone();
+        assert_eq!(
+            s.allocate_descriptor(&context).unwrap(),
+            Ok(TracedFd(8)),
+            "the first routed descriptor is the floor itself"
+        );
+        // Never below the floor, however empty the table is: below it is the
+        // kernel's range, and handing one out would be a wrong-object read.
+        context.fds.insert(TracedFd(8), bound_fd(b"/held"));
+        assert_eq!(s.allocate_descriptor(&context).unwrap(), Ok(TracedFd(9)));
+    }
+
+    /// Exhausting the range answers `EMFILE`, and the run survives it.
+    ///
+    /// `EMFILE` was converted from a run-stopping `Err` into a bound refusal in
+    /// round 1, but the range it guarded was unbounded, so nothing could reach
+    /// it: measured, a tracee held **400** routed descriptors with no refusal at
+    /// all. With the range capped the refusal is reachable, which is what makes
+    /// it worth having.
+    #[test]
+    fn exhausting_the_routed_range_answers_emfile_rather_than_stopping_the_run() {
+        let mut s = supervisor();
+        s.budget = Some(routed_budget(8));
+        {
+            let context = &mut s.process_mut(task(1)).unwrap().context;
+            // The whole of `[8, 16)`.
+            for number in 8..16 {
+                context.fds.insert(TracedFd(number), bound_fd(b"/held"));
+            }
+        }
+        let context = s.process(task(1)).unwrap().context.clone();
+        assert_eq!(
+            s.allocate_descriptor(&context).unwrap(),
+            // 24 is `EMFILE` on Darwin and on Linux alike.
+            Err(Errno(24)),
+            "a full routed range must refuse rather than issue a number outside it"
+        );
+
+        // And releasing one makes exactly that number available again.
+        let mut context = context;
+        context.fds.remove(&TracedFd(11));
+        assert_eq!(s.allocate_descriptor(&context).unwrap(), Ok(TracedFd(11)));
+    }
+
+    /// A run that routes nothing has no fence, and asking for a descriptor is a
+    /// wiring fault rather than a refusal the tracee should see.
+    #[test]
+    fn allocating_a_routed_descriptor_without_a_fence_is_an_error_not_an_errno() {
+        let s = supervisor();
+        let context = s.process(task(1)).unwrap().context.clone();
+        assert_eq!(
+            s.allocate_descriptor(&context).unwrap_err().kind,
+            ErrorKind::InvalidState
+        );
+    }
+
     #[test]
     fn fork_keeps_cloexec_dirfd_until_child_exec() {
         let mut s = supervisor();
@@ -670,6 +1113,7 @@ mod tests {
                     close_on_exec: true,
                     ..OpenFlags::default()
                 },
+                offset: 0,
             },
         );
         s.handle_event(TraceEvent::Child {

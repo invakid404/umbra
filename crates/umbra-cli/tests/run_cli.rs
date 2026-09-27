@@ -36,7 +36,8 @@ fn registry_with_agent(path: &std::path::Path, capabilities: &str, agent: bool) 
     let executable = executable.join(",");
     let descriptor = |id: &str, role: &str, caps: &str| {
         format!(
-            r#""{role}":{{"id":"{id}","role":"{role}","protocol_version":2,"executable":[{executable}],"capabilities":[{caps}],"options":[]}}"#
+            r#""{role}":{{"id":"{id}","role":"{role}","protocol_version":{version},"executable":[{executable}],"capabilities":[{caps}],"options":[]}}"#,
+            version = umbra_core::provider::PROTOCOL_VERSION
         )
     };
     let mut roles = vec![
@@ -338,7 +339,8 @@ fn registry_naming_a_missing_storage_executable(path: &std::path::Path) {
     };
     let descriptor = |id: &str, role: &str, exe: &str, caps: &str| {
         format!(
-            r#""{role}":{{"id":"{id}","role":"{role}","protocol_version":2,"executable":[{}],"capabilities":[{caps}],"options":[]}}"#,
+            r#""{role}":{{"id":"{id}","role":"{role}","protocol_version":{},"executable":[{}],"capabilities":[{caps}],"options":[]}}"#,
+            umbra_core::provider::PROTOCOL_VERSION,
             executable(exe)
         )
     };

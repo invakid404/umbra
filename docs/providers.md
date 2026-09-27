@@ -107,6 +107,11 @@ agent behavior. The Rust macOS tracer and NFS/local storage are implemented;
 the Linux tracer, file journal and agent adapters remain stubs. Environment-gated
 fixture and mounted-NFS tests require explicit executed verdicts for qualification.
 
-The common transport is version 2. Installation descriptors must set
-`protocol_version` to 2; version 1 peers are refused during handshake rather than
-at decoding the required sandbox launch policy or rewrite messages.
+The common transport is version 3. Installation descriptors must set
+`protocol_version` to 3; an older peer is refused during handshake rather than at
+decoding a message it does not know. Version 2 added the required sandbox launch
+policy and the rewrite messages; version 3 added the platform's `IoBuffer`
+request and the `interpose` and `descriptor_limit` fields of the launch policy,
+both of which a version-2 provider would deserialize as absent -- launching a
+tracee that is neither interposed nor descriptor-fenced, which is exactly the
+silently-wrong start the version exists to prevent.

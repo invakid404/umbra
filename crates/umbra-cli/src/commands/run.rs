@@ -24,6 +24,11 @@ pub struct RunArgs {
     /// Host directory approved as this run's workspace.
     #[arg(long, default_value = ".", value_name = "PATH")]
     pub workspace: PathBuf,
+    /// Where a routed run keeps its journal and its one host write allowance.
+    /// See `commands::default_state_root`; `umbra resume` must be given the same
+    /// value. Ignored by storage that exposes kernel-visible run paths.
+    #[arg(long, value_name = "PATH")]
+    pub state_dir: Option<PathBuf>,
     /// Acknowledge the bounded experimental tracing mode. Required; it disables
     /// no enforcement and grants no unsupported behavior.
     #[arg(long)]

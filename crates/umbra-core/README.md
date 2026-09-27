@@ -78,12 +78,19 @@ all — no recorded undo runs, and the abort poisons unconditionally. See
 [#64](https://github.com/invakid404/umbra/issues/64) →
 [#69](https://github.com/invakid404/umbra/issues/69) for the arc. The variant is
 appended, so already-encoded values still decode; a peer built without it cannot
-decode the new name, and `provider::PROTOCOL_VERSION` is unchanged because both
-ends ship together in-tree.
+decode the new name. That enum's own growth did not move
+`provider::PROTOCOL_VERSION`, because both ends ship together in-tree; the
+version does move for a change to the *transport's* request or launch shapes,
+which is what took it to 3 below.
 
 `provider` contains runtime registry descriptors, JSON encoding and bounded private
-Unix transport primitives. Common protocol version 2 requires current installation
-descriptors and rejects older peers before sandbox/rewrite request decoding.
+Unix transport primitives. Common protocol version 3 requires current installation
+descriptors and rejects older peers before sandbox/rewrite request decoding. Version
+2 added the sandbox launch policy and the rewrite messages; version 3 adds the
+platform's `IoBuffer` request and the two `LaunchPolicy` fields below. Both are
+wire-visible, so the number moves with them rather than after them: a version-2
+platform provider handed a version-3 `Launch` would deserialize a policy with
+neither field and launch a tracee that is neither interposed nor descriptor-fenced.
 Role-specific schemas, proxies and dispatch belong in the
 five trait crates. Runtime executable paths/options never belong in checkpoint identity.
 `provider::accept_connection` exposes the same identity/role/version/capability
@@ -103,3 +110,31 @@ Derived operation IDs are reproducible for a fixed seed and `(salt, index)` pair
 and distinct across pairs for that seed. They are opaque 128-bit values; consumers
 must not rely on UUID version or variant bits. Transport retries reuse the
 already-built request context.
+
+## Userspace routing
+
+Three types exist for a run whose storage has no kernel-visible path, where the
+tracee's file operations are serviced by umbra rather than by rewriting a
+syscall's path operand.
+
+`IoBuffer` is a tracee memory buffer a routed data transfer names. It is
+runtime-only in exactly the sense `PhysicalPath` and `MemoryWrite::address`
+already are: an address in one stopped task at one moment, never an object
+identity, and never a manifest or journal payload. It exists because `FsOp` is
+deliberately ABI-independent, so the address has to travel beside the operation.
+
+`RoutedRequest` carries the three things such an operation needs and its `FsOp`
+cannot: the descriptor to answer an `Open` with, the buffer a `Read` fills, and
+the bytes a `Write` persists. `FdState` gained the `offset` those transfers move,
+because `FsOp::Read`/`Write` carry `offset: Option<u64>` where `None` means "at
+the descriptor's current position" -- and without the field there was no position
+to mean.
+
+`LaunchPolicy::interpose` and `LaunchPolicy::descriptor_limit` are set together
+or not at all. The second is what makes the first safe for the tracee's whole
+lifetime rather than only at the instant a descriptor is allocated: POSIX
+requires `open` to return the lowest free number, so "this number is free now" is
+not an invariant, and fencing `RLIMIT_NOFILE` -- soft *and* hard -- instead makes
+the kernel's range and umbra's disjoint by construction. Lowering the hard limit
+is the load-bearing half; with only the soft limit lowered the tracee raises it
+back.

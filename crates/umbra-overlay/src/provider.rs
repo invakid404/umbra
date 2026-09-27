@@ -542,8 +542,9 @@ mod tests {
     /// stays green while breaking every out-of-tree peer. The golden literals below
     /// are the defence against that, and they are the only bytes of this protocol
     /// pinned anywhere in the repo. `PROTOCOL_VERSION` is not a second line of
-    /// defence here: it is frozen at 2 across this change, so a peer built against
-    /// an older crate still handshakes and then fails to decode.
+    /// defence here: it moves for a change to the *transport's* own message
+    /// shapes rather than for a namespace payload, so a peer built against an
+    /// older crate can still handshake and then fail to decode.
     ///
     /// Update a literal only alongside a deliberate wire-format decision.
     #[test]
