@@ -1416,6 +1416,137 @@ fn readdir_uses_injected_encoding_and_advances_only_after_commit() {
     }
 }
 
+/// An encoder that refuses, with or without an errno, so the engine's handling
+/// of each can be pinned.
+struct RefusingDirectoryEncoder(Option<Errno>);
+impl DirectoryEncoder for RefusingDirectoryEncoder {
+    fn encode(
+        &mut self,
+        _: &ProcessContext,
+        _: &FsOp,
+        _: &[DirectoryEntry],
+    ) -> Result<EncodedDirectory> {
+        let e = error(ErrorKind::InvalidInput, "test encoder refusal");
+        Err(match self.0 {
+            Some(errno) => e.with_errno(errno),
+            None => e,
+        })
+    }
+}
+
+/// **The tracee's output bound is answered, and the descriptor is decided before
+/// it** — both measured against the kernel's own precedence.
+///
+/// Three review rounds hardened one of a `getattrlistbulk`'s two tracee-supplied
+/// inputs and never enumerated the other. `max_bytes` reached an errno-less
+/// `Err` here, which ends the run, and it did so *ahead* of the descriptor
+/// check, so a stale descriptor with a zero-length buffer never got as far as
+/// `EBADF`. Measured on this host: the kernel answers `EBADF` for an unbound
+/// descriptor with a zero buffer and `EINVAL` for a valid one, i.e. it decides
+/// the descriptor first. Both orders are now the kernel's.
+///
+/// The upper bound is unrepresentable rather than untested — `directory_bytes`
+/// clamps x3 to `MAX_IO_BYTES` before the operation exists — so what is asserted
+/// is the zero case, which is the reachable one.
+#[test]
+fn a_directory_read_decides_the_descriptor_before_the_output_bound_and_answers_both() {
+    let mut f = Fixture::new(&[(b"a", b"a")]);
+    let object = f.overlay.lookup(&root(b"").unwrap()).unwrap().0.object_id;
+    f.process.fds.insert(
+        TracedFd(3),
+        FdState {
+            object,
+            logical_path: Some(bytes(b"/")),
+            directory: true,
+            flags: OpenFlags::default(),
+            offset: 0,
+        },
+    );
+    f.overlay
+        .set_directory_encoder(Box::new(TestDirectoryEncoder))
+        .unwrap();
+    // A descriptor umbra never issued, with the worst possible bound: the
+    // descriptor wins, exactly as it does for `fstat`, `fchdir` and `close`.
+    assert_eq!(
+        f.overlay
+            .resolve(
+                &f.process,
+                &FsOp::ReadDir {
+                    fd: TracedFd(9),
+                    max_bytes: 0
+                }
+            )
+            .unwrap(),
+        ResolvedAction::Deny(Errno(9))
+    );
+    // A descriptor umbra did issue, same bound: `EINVAL`, answered to the
+    // program rather than raised at it.
+    assert_eq!(
+        f.overlay
+            .resolve(
+                &f.process,
+                &FsOp::ReadDir {
+                    fd: TracedFd(3),
+                    max_bytes: 0
+                }
+            )
+            .unwrap(),
+        ResolvedAction::Deny(Errno(22))
+    );
+}
+
+/// **An encoder refusal carrying an errno becomes a `Deny`; one without stays
+/// fatal.** The errno is the marker that says whose fault it was.
+///
+/// This is the seam that makes `dirents::encode`'s `ERANGE` reach a program at
+/// all: the supervisor's `resolve` arm is `Err(e) => return Err(e)`, so it does
+/// **not** unwrap errnos from a resolution failure, and an errno attached to an
+/// encoder error is inert unless this engine turns it into a `Deny` first. A
+/// too-small output buffer is the tracee's own argument and is answered; an
+/// encoder contradicting itself is not, and still stops the run.
+///
+/// Neither path may leave a `Plan` behind — the dangling-`Prepare` rule the
+/// routed-open refusals state — so the absence of one is asserted rather than
+/// assumed.
+#[test]
+fn an_encoder_refusal_is_answered_when_it_carries_an_errno_and_fatal_when_it_does_not() {
+    for (errno, expected) in [
+        (Some(Errno(34)), Some(ResolvedAction::Deny(Errno(34)))),
+        (None, None),
+    ] {
+        let mut f = Fixture::new(&[(b"a", b"a")]);
+        let object = f.overlay.lookup(&root(b"").unwrap()).unwrap().0.object_id;
+        f.process.fds.insert(
+            TracedFd(3),
+            FdState {
+                object,
+                logical_path: Some(bytes(b"/")),
+                directory: true,
+                flags: OpenFlags::default(),
+                offset: 0,
+            },
+        );
+        f.overlay
+            .set_directory_encoder(Box::new(RefusingDirectoryEncoder(errno)))
+            .unwrap();
+        let resolved = f.overlay.resolve(
+            &f.process,
+            &FsOp::ReadDir {
+                fd: TracedFd(3),
+                max_bytes: 4096,
+            },
+        );
+        match expected {
+            Some(action) => assert_eq!(resolved.unwrap(), action),
+            None => assert!(resolved.is_err(), "an errno-less refusal must stay fatal"),
+        }
+        assert!(
+            f.overlay.planned.is_none(),
+            "a refused directory read must leave no plan to journal"
+        );
+    }
+}
+
 #[test]
 fn copy_up_spans_multiple_bounded_io_chunks_and_creates_directories() {
     let data: Vec<_> = (0..MAX_IO_BYTES + 31).map(|n| (n % 251) as u8).collect();

@@ -29,6 +29,7 @@ pub trait SyscallAbi {
         memory: &mut dyn TraceMemory,
     ) -> Result<Option<FsOp>>;
     fn io_buffer(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>>;
+    fn directory_request(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>>;
     fn encode_stat(&self, stat: &BlobStat) -> Result<Vec<u8>>;
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()>;
     fn emulate_result(&self, regs: &mut RegisterSet, result: &EmulatedResult) -> Result<()>;
@@ -176,6 +177,19 @@ write would leave the tail of the tracee's `struct stat` stale. A null or
 overflowing address is refused there with `EFAULT` carried **inside** the error,
 for the caller to bind as a tracee-visible refusal rather than raise --
 `fstat(fd, NULL)` is an ordinary program bug and must not stop a run.
+
+`getattrlistbulk` is the one call with **two** caller-supplied blocks -- an
+output buffer *and* an input attribute list -- so it needs a second accessor.
+`SyscallAbi::directory_request` reports where the `attrlist` block is, in the
+same shape and for the same reason as `io_buffer`: it takes no `TraceMemory`, so
+it adds no callback loop, and the block's contents are read and judged by the
+caller **after** the descriptor fence rather than during decode. That ordering is
+the point of the seam existing at all. Validating the attribute set inside
+`decode_entry` put the refusal *before* the fence, where it fired for descriptors
+umbra does not own on registries umbra does not route, and stopped runs that
+worked before. Its default **refuses** rather than answering `None`, following
+`encode_stat`: an ABI that decodes a directory read without modelling its request
+cannot silently skip the check.
 
 `SyscallAbi::encode_stat` is the other half of answering it. The namespace
 resolves *what* the metadata is and only the ABI knows what it looks like in

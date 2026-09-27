@@ -556,36 +556,62 @@ fn utilities(nfs: bool) {
     // absent: the success leg pins that the read succeeded, the failure leg pins
     // that the program ran at all. Neither pins which resolver answered; the
     // touch case does that.
-    let cases: &[(&str, &str, Expect)] = &[
-        ("/usr/bin/touch", "touched", Expect::Captured(b"")),
+    // Program, **leading flags**, path operand relative to the workspace (empty
+    // naming the workspace itself), and what the run must leave behind.
+    let cases: &[(&str, &[&str], &str, Expect)] = &[
+        ("/usr/bin/touch", &[], "touched", Expect::Captured(b"")),
         // `touch` on an operand that already exists, which is the other half of
         // the utility and takes a different syscall: `setattrlistat`(524)
         // rather than `open`+`fstat`. Refused here because this matrix is
         // rewrite-backed; served on `nfs-userspace`, where
         // `standard_utilities_run_over_the_userspace_client` asserts the times
         // actually move.
-        ("/usr/bin/touch", "seed.txt", Expect::RefusedByBackend),
+        ("/usr/bin/touch", &[], "seed.txt", Expect::RefusedByBackend),
         // Was `RefusedByEnforcement` until bare `mkdir`(136) joined the stub
         // list and the operand table (#114). One row, which is the whole
         // observable difference that fix makes on a rewrite-backed registry:
         // the directory is now captured in the shadow instead of happening
         // nowhere, and the host is untouched either way.
-        ("/bin/mkdir", "made", Expect::CapturedDirectory),
+        ("/bin/mkdir", &[], "made", Expect::CapturedDirectory),
         // Bare `unlink`(10), in neither list. It replaces `mkdir` as this
         // matrix's `RefusedByEnforcement` case: the operand exists on the host,
         // the sandbox refuses the removal, and the file is still there
         // afterwards.
-        ("/bin/rm", "seed.txt", Expect::RefusedByEnforcement),
-        ("/bin/cat", "seed.txt", Expect::ReadOnly),
-        ("/bin/cat", "absent.txt", Expect::Diagnoses),
-        ("/bin/ls", "", Expect::ReadOnly),
-        ("/bin/ls", "absent", Expect::Diagnoses),
+        ("/bin/rm", &[], "seed.txt", Expect::RefusedByEnforcement),
+        ("/bin/cat", &[], "seed.txt", Expect::ReadOnly),
+        ("/bin/cat", &[], "absent.txt", Expect::Diagnoses),
+        ("/bin/ls", &[], "", Expect::ReadOnly),
+        ("/bin/ls", &[], "absent", Expect::Diagnoses),
+        // **The metadata-requesting `ls` modes, and this row exists because its
+        // absence hid a regression.** `ls -l` makes `fts` ask the kernel for a
+        // much wider `getattrlistbulk` attribute set than plain `ls` does
+        // (`common=0x82079e0b file=0x0000022d` against `0x8200000b`/`0x1`). On a
+        // rewrite-backed registry that call is on a *kernel* descriptor and must
+        // reach the kernel untouched -- and it did, until #121 breakpointed 461
+        // and refused the unserved set inside the ABI decode, which runs before
+        // the descriptor fence. `ls -l`, `-t`, `-i`, `-p`, `-S`, `-F`, `-s` and
+        // `-n` went from exit 0 to a stopped run, on registries that route
+        // nothing, and **every gate stayed green** because this matrix carried
+        // no flag variant on any registry.
+        //
+        // `-l` is the widest of the eight and the one a person is most likely to
+        // type; `-t` is here because it takes a different route to the same
+        // place (sorting by time needs the metadata `-l` prints). Two is enough:
+        // the trigger is not a flag list, it is "any mode that makes `fts` ask
+        // for metadata", and both of these do.
+        ("/bin/ls", &["-l"], "", Expect::ReadOnly),
+        ("/bin/ls", &["-t"], "", Expect::ReadOnly),
     ];
-    for (index, (program, relative, expect)) in cases.iter().enumerate() {
-        let case = if relative.is_empty() {
-            format!("{program} <workspace>")
+    for (index, (program, flags, relative, expect)) in cases.iter().enumerate() {
+        let spelled = if flags.is_empty() {
+            program.to_string()
         } else {
-            format!("{program} {relative}")
+            format!("{program} {}", flags.join(" "))
+        };
+        let case = if relative.is_empty() {
+            format!("{spelled} <workspace>")
+        } else {
+            format!("{spelled} {relative}")
         };
         let workspace = scratch.join(format!("utility-{index}"));
         std::fs::create_dir(&workspace).unwrap();
@@ -609,6 +635,7 @@ fn utilities(nfs: bool) {
         let output = command
             .arg("--")
             .arg(program)
+            .args(*flags)
             .arg(&operand)
             .stdin(Stdio::null())
             .output()

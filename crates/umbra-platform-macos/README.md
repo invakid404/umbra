@@ -203,6 +203,10 @@ continuing with an inert one.
 | `fstat` | 339 | `fstat` | x0 descriptor, x1 buffer | `FsOp::Fstat` |
 | `fstat` | 189 | `__fstat` | same layout | `FsOp::Fstat` |
 | `setattrlistat` | 524 | `setattrlistat` | x0 dirfd, x1 path, x2 attrlist, x3 buffer, x4 size, x5 options | `FsOp::SetTimes` |
+| `getattrlistbulk` | 461 | `getattrlistbulk` | x0 descriptor, x1 attrlist, x2 buffer, x3 size, x4 options | `FsOp::ReadDir` |
+| `fchdir` | 13 | `fchdir` | x0 descriptor | `FsOp::Fchdir` |
+| `close` | 6 | `close` | x0 descriptor | `FsOp::Close` |
+| `close_nocancel` | 399 | `__close_nocancel` | same layout | `FsOp::Close` |
 
 The bare forms are there for the reason `symlink` and `readlink` are: they are
 what the utility actually issues. `/bin/mkdir` issues `mkdir`(136) and nothing
@@ -212,6 +216,18 @@ does. `fstat` is the first **descriptor-relative** call here: it names no path,
 so it is absent from `abi::path_operands` by design, and the supervisor applies
 the descriptor fence to it before resolving so libSystem's own `fstat` on a
 kernel descriptor passes through.
+
+The last four rows are the directory read, and they are descriptor-relative for
+the same reason — all four are absent from `path_operands` and all four take the
+fence. They are a set rather than a list: `/bin/ls` imports **no** directory
+symbol at all, so every one of them comes from `fts` inside `libsystem_c`, where
+`DYLD_INTERPOSE` cannot reach and the interposer's `close` never sees them. `fts`
+saves its working directory with a bare `open(".")`, `fchdir`s to it, reads with
+`getattrlistbulk`, and releases the descriptor through `__close_nocancel` — so
+routing three of the four leaves `ls` failing on the fourth. `close`(6) is both
+interposed *and* breakpointed, which is not a duplication: the interposer catches
+the calls an image makes through its own stubs, and the stub row catches
+`libsystem_c`'s internal ones.
 
 `setattrlistat` accepts exactly the attrlist shape libc's `utimensat` emits —
 `bitmapcount` 5, `commonattr` limited to `ATTR_CMN_MODTIME|ATTR_CMN_ACCTIME`,

@@ -168,14 +168,28 @@ pub const CONTRACT_SURFACE: &[CapabilityRow] = &[
         ],
         support: Support::Supported,
     },
+    // **Only the syscalls that actually reach this provider are named.**
+    //
+    // This row used to list `opendir, readdir, closedir`, `getdents64`,
+    // `getdirentries, getdirentries64` and `getattrlistbulk` together, and at
+    // the time **none of the six reached the provider**: there was no decode, no
+    // `TRACED_STUBS` row and no directory encoder anywhere in the tree. The
+    // `List` contract operation was genuinely supported and the syscall column
+    // was a list of calls a reader could not reach, which is the one place a
+    // reader has nothing but this table to check the claim against.
+    //
+    // `getattrlistbulk`(461) is now routed and served, measured end to end
+    // against a live NFSv4 fixture, so it stays and the other five go. They are
+    // not merely unimplemented -- they are deliberately not claimed:
+    // `getdirentries`(196)/(344) are reachable only through the fallback a
+    // *failed* `getattrlistbulk` triggers, which serving 461 means never
+    // entering, and routing them would be a second directory wire format for no
+    // measured caller. `opendir`/`readdir`/`closedir` are that same fallback's
+    // entry points and are absent from `/bin/ls`'s measured path entirely.
+    // `getdents64` is Linux's, and this backend routes on Darwin only.
     CapabilityRow {
         operation: "List",
-        syscalls: &[
-            "opendir, readdir, closedir",
-            "getdents64",
-            "getdirentries, getdirentries64",
-            "getattrlistbulk (bounded attribute subset)",
-        ],
+        syscalls: &["getattrlistbulk (bounded attribute subset)"],
         support: Support::Supported,
     },
     CapabilityRow {

@@ -26,6 +26,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod dirents;
+
 pub use umbra_core::{
     BytePath, EmulatedResult, FsOp, IoBuffer, LaunchSpec, PlatformCapabilities, PreparedRewrite,
     ProcessHandle, QuiescedTree, RegisterSet, Result, ResumeCommand, TaskId, TerminationPolicy,
@@ -136,6 +138,49 @@ pub trait SyscallAbi {
             umbra_core::ErrorKind::UnsupportedCapability,
             "abi.encode_stat",
             "this ABI has no native stat layout",
+        ))
+    }
+
+    /// Where the stopped syscall's *attribute request* block lives, for a call
+    /// whose reply layout the caller declares rather than the kernel fixing.
+    ///
+    /// **This exists so the refusal it feeds can happen after the descriptor
+    /// fence, and that ordering was bought with a measured regression.**
+    /// `getattrlistbulk` carries a `struct attrlist` whose bitmap *is* the
+    /// layout of the reply, so a set the ABI cannot encode has to be refused --
+    /// but refusing it inside [`SyscallAbi::decode_entry`] refuses it for every
+    /// descriptor in the process, including ones umbra does not own, on runs
+    /// that have no virtual descriptors at all. Reporting the block's location
+    /// instead lets the caller apply its own descriptor test first and read the
+    /// block only for a descriptor it owns.
+    ///
+    /// Like [`SyscallAbi::io_buffer`] this takes no [`TraceMemory`]: the address
+    /// is in the registers, so answering costs no round trip to the stopped
+    /// task. The caller reads and interprets the block itself.
+    ///
+    /// **The default refuses, and it used to report nothing.** That mattered,
+    /// because this is a validation path: the caller maps "no block" to "nothing
+    /// to check" and serves the request, so an ABI that decoded a directory read
+    /// and did not implement this would hand the tracee umbra's own record
+    /// layout for whatever bitmap it actually asked for -- a silently wrong
+    /// buffer, arrived at by omission.
+    ///
+    /// The permissive default was justified as "the honest answer for an ABI
+    /// whose intercepted calls all have kernel-fixed reply layouts". An ABI that
+    /// produces `FsOp::ReadDir` is by construction not such an ABI, so the
+    /// justification did not cover the one case that could reach it.
+    ///
+    /// This is [`SyscallAbi::encode_stat`]'s reasoning applied to the same
+    /// shape: a backend with no attribute-request model cannot be mistaken for
+    /// one that has it, and a consumer that needs the block and gets this
+    /// refusal fails with its own diagnosis instead of encoding a layout nobody
+    /// asked for. It costs an ABI that services no directory reads nothing --
+    /// the caller only asks for a `ReadDir`, which such an ABI never produces.
+    fn directory_request(&self, _regs: &RegisterSet) -> Result<Option<IoBuffer>> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "abi.directory_request",
+            "this ABI has no attribute-request block, so it cannot service a directory read",
         ))
     }
 

@@ -151,6 +151,38 @@ fn fixture_argv(
                     // operation it has no plan for should still stop the case
                     // loudly rather than be silently resumed.
                     FsOp::Fstat { .. } => {}
+                    // The same disposition as `fstat` above, for the same
+                    // reason and one stub list later.
+                    //
+                    // `close`(6) and `__close_nocancel`(399) joined the
+                    // breakpointed stubs so a *virtual* dirfd could be released
+                    // -- `fts` closes its directory descriptor through 399,
+                    // which is neither interposed nor previously breakpointed.
+                    // The consequence here is the one `TRACED_STUBS`' own doc
+                    // comment warns about: **routing one member of a refused set
+                    // makes the next member reachable for the first time.**
+                    // Every `close` in the process now traps, and dyld closes
+                    // kernel descriptors before `main` in every case this file
+                    // runs -- measured, fd 3, in all nine that failed when this
+                    // arm was missing.
+                    //
+                    // There is no namespace in this harness and the descriptor
+                    // is a real kernel one, so letting the kernel answer is the
+                    // honest result -- identical to what the supervisor's
+                    // descriptor fence does for a sub-floor descriptor.
+                    //
+                    // **`ReadDir`(461) and `Fchdir`(13) joined the same stub
+                    // list and deliberately have no arm.** They cannot reach
+                    // here: `umbra-test-child.c` issues no directory read and no
+                    // `fchdir` (measured -- zero occurrences of
+                    // `getattrlistbulk`, `fchdir`, `opendir`, `readdir` or
+                    // `fts_` in its source), and neither is issued by libSystem
+                    // before `main` the way `fstat` and `close` are. If one ever
+                    // does arrive, the panic below is the right outcome: this
+                    // driver has no plan for a directory read, and inventing an
+                    // empty arm for it now would be the wildcard this comment
+                    // exists to refuse.
+                    FsOp::Close { .. } => {}
                     other => panic!("unexpected operation {other:?}"),
                 }
                 Some(thread)

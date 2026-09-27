@@ -33,6 +33,9 @@ mutation-probe-fstat = [
     "umbra-supervisor/mutation-probe-fstat",
     "umbra-overlay/mutation-probe-fstat",
 ]
+# `readdir` has no `umbra-overlay` half: the encoder it breaks is a
+# `umbra-supervisor` type, so there is nothing to forward past that crate.
+mutation-probe-readdir = ["umbra-supervisor/mutation-probe-readdir"]
 
 [dependencies]
 clap.workspace = true

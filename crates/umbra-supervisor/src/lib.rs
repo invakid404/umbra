@@ -32,6 +32,8 @@ use umbra_storage::Storage;
 
 /// Approved workspace inventory and the read-only base built from it.
 pub mod base;
+/// The production directory encoder and its per-syscall buffer binding.
+pub mod directory;
 mod events;
 /// Staged composition of one command run.
 pub mod run;
@@ -337,6 +339,14 @@ pub struct Supervisor {
     /// an open that the exit reported failed, and a position advanced there would
     /// move for a write that did not happen.
     routed: BTreeMap<ThreadId, RoutedEffect>,
+    /// The output buffer of the directory read currently stopped at its entry,
+    /// shared with the `DirectoryEncoder` injected into the namespace.
+    ///
+    /// `FsOp::ReadDir` says how many bytes may move and never where they go --
+    /// that is the ABI's knowledge and the overlay has none of it -- so the
+    /// address travels beside the operation exactly as a routed request's
+    /// runtime details do.
+    directory: crate::directory::DirectoryBuffer,
     /// Set once an interception, provider or authority failure makes further
     /// resumes unsafe. Nothing is resumed after this, in any code path.
     poisoned: bool,
@@ -344,10 +354,10 @@ pub struct Supervisor {
 
 /// The descriptor-table effect one routed operation has once it has succeeded.
 ///
-/// Three variants because routing services exactly three descriptor operations,
-/// and each one owns a different half of the table's state. There is deliberately
-/// no variant for "nothing to do": an operation with no effect records no entry,
-/// so the map's contents are the set of pending effects rather than a log.
+/// One variant per piece of logical process state routing services, and each one
+/// owns a different half of it. There is deliberately no variant for "nothing to
+/// do": an operation with no effect records no entry, so the map's contents are
+/// the set of pending effects rather than a log.
 #[derive(Clone, Debug)]
 enum RoutedEffect {
     /// A routed `open` succeeded: bind the descriptor the namespace resolved.
@@ -357,6 +367,14 @@ enum RoutedEffect {
     Advanced(umbra_core::TracedFd),
     /// A routed `close` succeeded: release the binding.
     Closed(umbra_core::TracedFd),
+    /// A routed `fchdir` succeeded: move the logical working directory to the
+    /// descriptor's own logical path.
+    ///
+    /// The descriptor rather than the path, so the path is read out of
+    /// `ProcessContext::fds` at the moment the move is applied. Recording the
+    /// path at the entry would let a `close` between the entry and the exit
+    /// leave this holding a name the process no longer has open.
+    ChangedCwd(umbra_core::TracedFd),
 }
 
 /// Returned ownership does not imply providers were closed or a clean shutdown.
@@ -413,6 +431,7 @@ impl Supervisor {
             renew_at: None,
             operations: BTreeMap::new(),
             routed: BTreeMap::new(),
+            directory: crate::directory::DirectoryBuffer::default(),
             poisoned: false,
         }
     }

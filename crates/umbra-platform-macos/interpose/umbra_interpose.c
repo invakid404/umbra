@@ -136,9 +136,10 @@
  *
  *    What is genuinely refused is the rest of the **descriptor-relative** set:
  *    `lseek`, `dup`, `dup2`, `fcntl`, `ftruncate`, `fsync`, `pread`, `pwrite`,
- *    `readv`, `writev`, `mmap`, the directory-reading calls, and `openat` with a
- *    virtual dirfd. A virtual descriptor is not a kernel object, so these reach
- *    the kernel, which does not know the number, and receive EBADF. That is a
+ *    `readv`, `writev`, `mmap`, the directory-reading calls entry 6 below does
+ *    not claim, and `openat` with a virtual dirfd. A virtual descriptor is not
+ *    a kernel object, so these reach the kernel, which does not know the
+ *    number, and receive EBADF. That is a
  *    refusal, not a wrong answer, and it is why the descriptor fence above is
  *    load-bearing rather than tidy.
  *
@@ -161,10 +162,11 @@
  *    all. Nothing here can prevent that, and nothing here claims to: what stops
  *    such a call writing the host is the kernel-enforced Seatbelt profile umbra
  *    installs before the target runs, never this library. That is unchanged by
- *    the three calls the tracer newly routes -- `mkdir`(136), `fstat`(339)/
- *    `__fstat`(189) and `setattrlistat`(524), the last being how `utimensat`
- *    reaches the kernel: each is breakpointed at its libc stub, so a program
- *    that issues the `svc` itself bypasses all three exactly as it bypasses
+ *    the calls the tracer routes -- `mkdir`(136), `fstat`(339)/`__fstat`(189),
+ *    `setattrlistat`(524) (which is how `utimensat` reaches the kernel), and
+ *    the four directory-read calls of entry 6 below, one of which (`close`) this
+ *    file also interposes. Each is breakpointed at its libc stub, so a program that
+ *    issues the `svc` itself bypasses every one of them exactly as it bypasses
  *    `open`, and Seatbelt is what refuses it.
  * 3. Writable shared file mappings are unreachable in principle. A store to a
  *    resident page is not a call of any kind.
@@ -174,15 +176,50 @@
  * 5. Calls made before umbra arms this library are not routed -- dyld's image
  *    loading and every library initializer. See ARMING above and the note over
  *    `umbra_open`.
- * 6. Directory reads are refused in every form: `getattrlistbulk`(461), which
- *    is what `ls` actually uses, `__getdirentries64`(344), `fchdir`(13) on a
- *    virtual dirfd, and `close` at the tracer layer. Measured: `ls` lists the
- *    right names through fts's `readdir` fallback and still exits 1 for every
- *    errno the bulk call can return, and with the dirfd `close` also refused it
- *    dies on SIGTRAP. So there is no honest partial `ls`, and none is claimed.
- *    `ls -l` additionally needs `fstat` on a virtual *dirfd* -- which routing
- *    `fstat` does not supply, because a routed `open` of a directory is refused
- *    before a dirfd is ever issued -- and `listxattr`(240).
+ * 6. Directory reads on a virtual descriptor are **routed**, and it takes four
+ *    calls: `getattrlistbulk`(461), which is what `ls` actually uses,
+ *    `fchdir`(13), and both `close`(6) and `__close_nocancel`(399). All four
+ *    are in `TRACED_STUBS`; three of them are *only* there, and `close`(6) is
+ *    **both breakpointed and interposed by this file**. That pair is not a
+ *    double route and it is the newly interesting fact here: `umbra_close`
+ *    traps for a descriptor above the fence and calls the real `close` below
+ *    it, and *that* call lands on the breakpoint and is passed straight back
+ *    out by the supervisor's floor test. The two layers cover different
+ *    callers -- this file rebinds the executable's call sites, and the
+ *    breakpoint catches the intra-library calls `DYLD_INTERPOSE` cannot reach,
+ *    which is how `fts` releases its dirfd (through `__close_nocancel`, which
+ *    this file does not interpose at all). A routed `open` of a directory is no
+ *    longer refused, and `ls` lists the shadow's merged entries and exits 0 --
+ *    measured end to end against a live NFSv4 fixture.
+ *
+ *    **This entry previously attributed the dirfd `close` refusal to "the
+ *    tracer layer", and that named the wrong layer for the wrong symbol.**
+ *    `close`(6) was interposed and *only* interposed -- it is one of the four
+ *    functions below -- and was never in `TRACED_STUBS` (it is now, which is
+ *    what the paragraph above is about); what fts actually closes the dirfd with is
+ *    `__close_nocancel`(399), which was neither interposed nor breakpointed.
+ *    Both are in `TRACED_STUBS` now, and that is the honest statement of where
+ *    they are handled. The rest of that entry described a state master could no
+ *    longer reach either: it claimed `ls` lists names through fts's `readdir`
+ *    fallback and exits 1 at every errno, dying on SIGTRAP with the dirfd close
+ *    refused, when in fact the run *stopped* at the routed directory `open`
+ *    long before `getattrlistbulk` was reached.
+ *
+ *    What stays unclaimed is the rest of the directory surface:
+ *    `__getdirentries64`(344) and `getdirentries`(196) are reachable only
+ *    through the fallback a *failed* `getattrlistbulk` triggers, which serving
+ *    461 means never entering; `opendir`/`readdir`/`closedir` are that
+ *    fallback's entry points; and `ls -l` needs `listxattr`(240) plus a wider
+ *    `getattrlistbulk` attribute set, which is refused by name because the
+ *    bitmap is the reply layout. That refusal is `ENOTSUP` answered **to the
+ *    tracee**, and it is evaluated *after* the supervisor's descriptor floor
+ *    test, never before: the kernel serves the wider set perfectly well, so a
+ *    descriptor umbra does not own must reach it untouched. Refusing earlier
+ *    regressed `ls -l` on the rewrite-backed registries from exit 0 to a
+ *    stopped run. `ls -l`'s `fstat` on a virtual *dirfd* is now
+ *    supplied -- routing `fstat` did not use to reach it, because a routed
+ *    `open` of a directory was refused before a dirfd was ever issued, and that
+ *    is no longer true -- but `listxattr` is not, so `-l` stays unclaimed.
  * 7. `touch -t` and `-r` take the same path as plain `touch` and are expected
  *    to work, but nothing tests them, so they are claimed as unverified rather
  *    than as supported.

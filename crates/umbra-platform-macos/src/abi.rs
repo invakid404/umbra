@@ -1,7 +1,7 @@
 //! Pure ABI core: 34 little-endian u64 slots, x0..x30, sp, pc, cpsr.
 use crate::{error, unsupported};
 use umbra_core::*;
-use umbra_platform::{SyscallAbi, TraceMemory};
+use umbra_platform::{dirents, SyscallAbi, TraceMemory};
 pub const MAX_PATH: usize = 4096;
 pub const PC: usize = 32;
 pub const CPSR: usize = 33;
@@ -277,6 +277,21 @@ pub enum Delivery {
 /// * There is no `__mkdir`. `/bin/mkdir` issues the bare form and nothing else,
 ///   which is why it was refused by enforcement rather than routed
 ///   ([#114](https://github.com/invakid404/umbra/issues/114)).
+/// * The four directory-read rows were added together because `ls` needs all
+///   four and no fewer, and each was measured on this host rather than assumed
+///   reachable. `getattrlistbulk`(461) is the directory read `fts` actually
+///   issues -- `__getdirentries64`(344) is **never called** on the normal path,
+///   only inside the fallback a failed 461 triggers. `fchdir`(13) is needed not
+///   because `ls` moves the working directory (measured: it does not -- see
+///   `13` in `decode_entry`) but because once the opens are routed its operand
+///   is a *virtual* descriptor, which the kernel would answer `EBADF`.
+///   `__close_nocancel`(399) is how `fts` closes the dirfd, and it is neither
+///   interposed nor previously breakpointed; `close`(6) joins it so the same
+///   descriptor cannot be released through one path and leak through the other.
+///   `close` is *also* interposed, which is not a conflict: `umbra_close`
+///   traps for a descriptor above the fence and calls the real `close` below
+///   it, and that call lands on this breakpoint and is passed through by the
+///   supervisor's floor test, exactly as every libsystem `fstat` already is.
 /// * `utimensat` and `futimens` carry **no `svc` at all** -- both scan clean --
 ///   because they are wrappers that build an `attrlist` and tail-call
 ///   `setattrlistat`(524). Neither is a stub candidate; that one is.
@@ -314,6 +329,10 @@ pub const TRACED_STUBS: &[(&str, u64, Delivery)] = &[
     ("fstat", 339, Delivery::Namespace),
     ("__fstat", 189, Delivery::Namespace),
     ("setattrlistat", 524, Delivery::Namespace),
+    ("getattrlistbulk", 461, Delivery::Namespace),
+    ("fchdir", 13, Delivery::Namespace),
+    ("__close_nocancel", 399, Delivery::Namespace),
+    ("close", 6, Delivery::Namespace),
 ];
 
 /// What `intercept()` must do with a breakpointed syscall number, or `None` for
@@ -356,11 +375,12 @@ pub fn path_operands(number: u64) -> Result<&'static [(PathOperand, usize)]> {
         // symlinkat: x0 holds literal target bytes the tracee will read back,
         // never a pathname operand to physicalize. Link dirfd x1, name x2.
         474 => &[(PathOperand::Path, 2)],
-        // fstat(339) and __fstat(189) are intercepted and decoded, and are
-        // deliberately absent: they name a descriptor and no path, so there is
-        // no operand to physicalize. A caller that reached here for one is
-        // asking the wrong question, and the refusal says so rather than
-        // inventing slot zero.
+        // `fstat`(339), `__fstat`(189), `getattrlistbulk`(461), `fchdir`(13),
+        // `close`(6) and `__close_nocancel`(399) are intercepted and decoded,
+        // and are deliberately absent: every one of them names a descriptor and
+        // no path, so there is no operand to physicalize. A caller that reached
+        // here for one is asking the wrong question, and the refusal says so
+        // rather than inventing slot zero.
         _ => return Err(unsupported(format!("path syscall {number}"))),
     })
 }
@@ -471,16 +491,80 @@ pub fn stat_buffer(regs: &RegisterSet) -> Result<u64> {
     }
 }
 
+/// **THE TRACEE-SUPPLIED INPUTS OF A `getattrlistbulk`(461), AND WHERE EACH ONE
+/// ENDS.**
+///
+/// Three review rounds each hardened this path on a different axis and each left
+/// a new instance of one defect: *a tracee-supplied value reaching an `Err` with
+/// no errno*. The first pass enumerated **constructors**, the second enumerated
+/// the **exits of one function**, and neither reached the two live holes,
+/// because both were on a third axis nobody had walked -- the **inputs**. This
+/// is that walk, and it is written here because this function reads the input
+/// that had never been on it.
+///
+/// A `getattrlistbulk(fd, attrlist, buffer, size, options)` gives the tracee six
+/// values umbra must survive. For each: every path it reaches, and the
+/// disposition it terminates in.
+///
+/// | # | input | where it goes | terminates in |
+/// |---|---|---|---|
+/// | 1 | `fd` (x0) | the supervisor's descriptor floor; then `Overlay::routed_binding`; then the directory-kind check | resumed to the kernel below the floor; `Deny(EBADF)` unbound or pathless; `Deny(ENOENT)` if the name stopped resolving; `Deny(ENOTDIR)` on a non-directory |
+/// | 2 | `attrlist` **pointer** (x1) | [`DarwinArm64Abi::directory_request`]'s null/overflow guard; then the supervisor's read of the block | `EFAULT` for null or overflowing; an unmapped-but-plausible address faults the read and ends the run -- the pre-existing tree-wide class of [#126], shared with `fstat`/`open`/`read` and tracked rather than fixed here |
+/// | 3 | `attrlist` **contents** (memory) | `dirents::RequestedAttributes::decode` | `ENOTSUP`, swept by `every_attribute_request_refusal_carries_a_bindable_errno`; `reserved` is a measured don't-care and refuses nothing |
+/// | 4 | `buffer` **pointer** (x2) | [`DarwinArm64Abi::io_buffer`]'s null/overflow guard; then the write of the reply | `EFAULT` for null or overflowing; unmapped is [#126] again |
+/// | 5 | **`size` (x3)** | [`directory_bytes`] clamps it; `io_buffer` refuses zero; `Overlay::resolve_directory`'s bound check; `dirents::encode`'s capacity arm | `EINVAL` for zero, from whichever of the two reaches it first; `ERANGE` when no whole record fits; the clamp makes "too large" unrepresentable |
+/// | 6 | `options` (x4) | [`DarwinArm64Abi::directory_request`] | `ENOTSUP` |
+///
+/// **Every row ends in an errno the supervisor can bind, or in [#126].** Two did
+/// not until the pass that wrote this table: row 5 reached an errno-less `Err`
+/// in *both* of the last two places it goes, and both ended the run -- one for a
+/// zero-length buffer on an unbound descriptor, the other for any buffer too
+/// small to hold the first record, which a single long filename can force.
+///
+/// **The rule this table encodes, for whoever adds the next check:** a value in
+/// this table may only be refused with an errno attached, and inside
+/// `umbra-overlay` that errno must become `ResolvedAction::Deny` before it
+/// leaves `resolve` -- the supervisor does not unwrap errnos from a `resolve`
+/// failure. An errno-less `Err` is reserved for umbra contradicting itself.
+///
+/// [#126]: https://github.com/invakid404/umbra/issues/126
+///
+/// Output buffer address and byte bound for `getattrlistbulk`(461): the buffer
+/// is in x2 and its size, a `size_t`, in x3.
+///
+/// The length is **clamped, not refused**, for `transfer_length`'s reason: a
+/// caller that offered a larger buffer than umbra will fill has not made an
+/// error, and `getattrlistbulk` is explicitly a partial-progress call -- it
+/// returns the entries that fit and is called again for the rest, which
+/// `resolve_directory`'s paging is built to answer. Refusing an oversized offer
+/// would fail a program that did nothing wrong.
+///
+/// [`decode_entry`](DarwinArm64Abi::decode_entry) and
+/// [`io_buffer`](DarwinArm64Abi::io_buffer) must clamp identically or the
+/// operation would name more bytes than the buffer binding covers, which is the
+/// rule `transfer_length` states one call over; both read this function.
+fn directory_bytes(regs: &RegisterSet) -> Result<u32> {
+    Ok(get(regs, 3)?.min(MAX_IO_BYTES as u64) as u32)
+}
+
 /// `ATTR_CMN_MODTIME` / `ATTR_CMN_ACCTIME` from `sys/attr.h`.
 const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
 const ATTR_CMN_ACCTIME: u32 = 0x0000_1000;
-/// `ATTR_BIT_MAP_COUNT` -- the only `bitmapcount` a caller may declare.
-const ATTR_BIT_MAP_COUNT: u16 = 5;
+/// `ATTR_BIT_MAP_COUNT` and the width of `struct attrlist` come from
+/// [`dirents`], which publishes them for the directory-read path.
+///
+/// **Aliased rather than re-declared**, because this file had its own private
+/// copies of both and `setattrlistat`(524) still read them while the new 461
+/// path read `dirents`'s: two names for one fact, in one file, which is the
+/// parallel-constant shape `TRACED_STUBS` exists to end one altitude down. They
+/// are pinned by `sys/attr.h` today, so nothing was wrong -- the drift mode is a
+/// future ABI with a different `bitmapcount`, where 524 would have kept reading
+/// a 24-byte window.
+use dirents::ATTR_BIT_MAP_COUNT;
 /// `FSOPT_NOFOLLOW` / `FSOPT_UTIMES_NULL` from `sys/attr.h`.
 const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
 const FSOPT_UTIMES_NULL: u32 = 0x0000_0400;
-/// Bytes of `struct attrlist`: `u_short` + `u_int16_t` + five `attrgroup_t`.
-const ATTRLIST_BYTES: usize = 24;
+use dirents::ATTRLIST_BYTES;
 /// Bytes of one arm64 `struct timespec` in an attribute buffer.
 const TIMESPEC_BYTES: usize = 16;
 
@@ -925,6 +1009,90 @@ impl SyscallAbi for DarwinArm64Abi {
                     },
                 }
             }
+            // `getattrlistbulk`(461) -- the directory read `/bin/ls` issues.
+            //
+            // Measured on this host under `lldb`, not read out of a header:
+            // `/bin/ls` imports none of `opendir`/`readdir`/`getdirentries`, so
+            // every directory syscall comes from `fts` inside
+            // `libsystem_c.dylib`, and `fts` issues **this** call -- twice per
+            // directory, the second answering zero for end-of-directory --
+            // with `__getdirentries64`(344) at zero hits. Interposing cannot
+            // reach it: `DYLD_INTERPOSE` rebinds the *caller's* stubs and
+            // `fts`'s calls are intra-library. That is why it is here.
+            //
+            // **The attrlist decides the reply's layout, so it is validated
+            // rather than noted.** `getattrlistbulk` is an attribute-bitmap
+            // call exactly as `setattrlistat`(524) is: a bit umbra does not
+            // model is not a flag it could drop, it is a different buffer. The
+            // one shape `fts` emits is the one shape
+            // `dirents::RequestedAttributes::decode` accepts.
+            //
+            // **That refusal is deliberately NOT made here**, and the reason is
+            // a measured regression this placement caused. `decode_entry` runs
+            // *before* the supervisor's descriptor-floor test, so refusing an
+            // attribute set here refused it for **every** descriptor in the
+            // process -- kernel descriptors included, on rewrite-backed runs
+            // that have no floor and no virtual descriptors at all. Measured
+            // side by side against master: `ls -l`, `-t`, `-i`, `-p`, `-S`,
+            // `-F`, `-s` and `-n` exited 0 on `--local-dev` before this slice
+            // and stopped the run after it. The refusal now lives behind
+            // `directory_request`, which the supervisor consults *after* the
+            // fence.
+            //
+            // Nor could an errno have fixed it, and that was measured too: the
+            // kernel **serves** the wider set (`common=0x82079e0b
+            // file=0x0000022d` returns 4 records, errno 0). It is umbra that
+            // cannot encode it, not the kernel that cannot answer it -- so on a
+            // descriptor umbra does not own the only correct answer is to get
+            // out of the way entirely.
+            //
+            // The output buffer is *not* carried on the operation, for the
+            // reason `io_buffer` states: `FsOp` says how many bytes may move,
+            // never where they go. The attribute request is not carried either,
+            // for the same reason and one more: it decides whether the reply can
+            // be encoded at all, and that question belongs after the fence.
+            461 => FsOp::ReadDir {
+                fd: TracedFd(get(regs, 0)? as i32),
+                max_bytes: directory_bytes(regs)?,
+            },
+            // `fchdir`(13).
+            //
+            // **`ls` does not use this to move anywhere, and that was measured
+            // rather than assumed.** `fts` uses the BSD save-and-restore idiom:
+            // `open(".")`, then `fchdir` back to that same saved descriptor
+            // around the work. Every `fchdir` operand `/bin/ls` issues -- two
+            // for an absolute operand, three for a relative one -- names the
+            // directory the process is **already in**; `fts` opens the
+            // directory it is about to read as a separate descriptor and never
+            // chdirs into it, and `chdir`(12) and `getcwd`(326) are never
+            // called at all. So the working directory does not move during an
+            // `ls`, and the engine's update is an identity.
+            //
+            // It is routed anyway, and must be: once the opens are routed those
+            // descriptors are *virtual*, and an `fchdir` on one reaches a kernel
+            // that does not know the number and answers `EBADF` -- which `fts`
+            // reports as `fts_read:` and exits 1 on. Routing it is about the
+            // descriptor, not the directory.
+            13 => FsOp::Fchdir {
+                fd: TracedFd(get(regs, 0)? as i32),
+            },
+            // `close`(6) and `__close_nocancel`(399).
+            //
+            // `close` reaches umbra through the interposer as well, and that is
+            // not a duplicate route but the other half of one: the interposer
+            // rebinds the *executable's* call sites, so a virtual descriptor
+            // closed from inside `libsystem_c` -- which is how `fts` releases
+            // its dirfd, through `__close_nocancel` -- never reaches it.
+            // Measured: 8 `__close_nocancel` and 3 `close` in one `ls`, with
+            // the dirfd among the former. Both numbers decode to the same
+            // operation because both stubs are the same call.
+            //
+            // The supervisor applies the descriptor floor before resolving, so
+            // a kernel descriptor closed anywhere in the process passes through
+            // untouched, exactly as every libsystem `fstat` already does.
+            6 | 399 => FsOp::Close {
+                fd: TracedFd(get(regs, 0)? as i32),
+            },
             // Positively classified process-control calls handled by the backend.
             1 | 2 | 7 | 20 | 59 | 244 | 400 => return Ok(None),
             _ => return Err(unsupported(format!("unclassified Darwin syscall {number}"))),
@@ -964,6 +1132,32 @@ impl SyscallAbi for DarwinArm64Abi {
                 length: STAT_BYTES as u32,
             }));
         }
+        // `getattrlistbulk`(461). Unlike `fstat`'s, this buffer's length is the
+        // caller's own `size_t` rather than the fixed width of a layout, so it
+        // is reported as the clamped count `decode_entry` put on the operation
+        // -- the two read `directory_bytes` so they cannot disagree.
+        //
+        // **The same null/overflow guard as `fstat`'s above, and a zero-length
+        // one beside it.** `getattrlistbulk(fd, &al, NULL, n, o)` is an ordinary
+        // program bug that Darwin answers `EFAULT`, so the errno travels inside
+        // the error for the caller to bind as a tracee-visible refusal rather
+        // than stopping the run. A zero-length buffer is the other shape a
+        // caller can get wrong here and `fstat` cannot: it has no room for even
+        // an end-of-directory answer, Darwin answers it `EINVAL`, and umbra must
+        // not let it reach `resolve_directory`, whose bound check is an `Err`
+        // that would end the run over a tracee's bad argument.
+        if get(regs, 16)? == 461 {
+            let address = get(regs, 2)?;
+            let length = directory_bytes(regs)?;
+            if length == 0 {
+                return Err(error("io_buffer", "empty directory buffer").with_errno(Errno(22)));
+            }
+            if address == 0 || address.checked_add(u64::from(length)).is_none() {
+                return Err(error("io_buffer", "null or overflowing directory buffer")
+                    .with_errno(Errno(14)));
+            }
+            return Ok(Some(IoBuffer { address, length }));
+        }
         if get(regs, 16)? != INTERPOSE_TRAP {
             // Every other intercepted call on this ABI names paths, not data
             // buffers. `read`/`write` are not breakpointed syscalls here: the
@@ -990,6 +1184,60 @@ impl SyscallAbi for DarwinArm64Abi {
         Ok(Some(IoBuffer {
             address,
             length: length as u32,
+        }))
+    }
+    fn directory_request(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>> {
+        // `getattrlistbulk`(461) keeps its `struct attrlist` in x1. The block is
+        // fixed-width -- five `attrgroup_t` behind a `bitmapcount` and its
+        // reserved half-word -- so unlike the output buffer its length is not
+        // the caller's to choose.
+        //
+        // **The guard below covers a null or overflowing pointer, and not every
+        // bad one.** It used to claim a caller that named a bad pointer is
+        // "answered `EFAULT` here rather than faulting the supervisor's read",
+        // and that overstated it: measured, an unmapped but non-null,
+        // non-overflowing address (`0x10`, `0x1000`) *does* fault the read and
+        // end the run. That is a **pre-existing tree-wide class** rather than
+        // anything this path introduced -- `fstat`, `open` and `read` all end
+        // the run on the same wild pointer, measured on the same build -- and it
+        // is tracked separately rather than fixed here. What this guard does is
+        // catch the two shapes that are cheap to catch from the register alone.
+        //
+        // The `options` word is in x4 and is checked *here* rather than reported,
+        // because it is the half of the request that lives in a register: the
+        // caller reads the attribute bitmaps out of the block this reports and
+        // has no business decoding a register slot to find the rest. Both halves
+        // are nonetheless refused at the same moment -- after the caller's
+        // descriptor test -- because both only matter for a descriptor umbra
+        // owns.
+        if get(regs, 16)? != 461 {
+            return Ok(None);
+        }
+        let options = get(regs, 4)? as u32;
+        if options != dirents::SERVED_OPTIONS {
+            return Err(error(
+                "directory_request",
+                format!(
+                    "getattrlistbulk options {options:#x}; umbra serves only \
+                     FSOPT_PACK_INVAL_ATTRS ({:#x})",
+                    dirents::SERVED_OPTIONS
+                ),
+            )
+            .with_errno(Errno(45)));
+        }
+        let address = get(regs, 1)?;
+        if address == 0
+            || address
+                .checked_add(dirents::ATTRLIST_BYTES as u64)
+                .is_none()
+        {
+            return Err(
+                error("directory_request", "null or overflowing attrlist").with_errno(Errno(14))
+            );
+        }
+        Ok(Some(IoBuffer {
+            address,
+            length: dirents::ATTRLIST_BYTES as u32,
         }))
     }
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()> {
@@ -2126,8 +2374,9 @@ mod tests {
         assert_eq!(
             normalised, "return umbra_active() && fd >= 0 && (uint64_t)fd >= umbra_control.floor;",
             "`umbra_owns` changed. Its twin is `umbra_owns_descriptor` in \
-             umbra-supervisor/src/events.rs, which gates the `FsOp::Fstat` \
-             descriptor fence and must express the same test against the same \
+             umbra-supervisor/src/events.rs, which gates the `FsOp::Fstat | \
+             ReadDir | Fchdir | Close` descriptor fence and must express the \
+             same test against the same \
              `descriptor_floor`. Change one, change both -- a virtual descriptor \
              the supervisor resumes instead of resolving is answered `EBADF` by a \
              kernel that does not own the number, and a kernel descriptor it \
@@ -2254,8 +2503,13 @@ mod tests {
             assert_eq!(delivery(number), Some(expected), "syscall {number}");
         }
         // And every filesystem call this slice routes is on the other side of
-        // that line, including the three it added.
-        for number in [5u64, 57, 58, 136, 189, 339, 398, 463, 470, 475, 488, 524] {
+        // that line, including the four it added.
+        for number in [
+            5u64, 57, 58, 136, 189, 339, 398, 463, 470, 475, 488, 524,
+            // The four this slice added: the directory read, the working
+            // directory move, and the two forms of `close`.
+            461, 13, 399, 6,
+        ] {
             assert_eq!(
                 delivery(number),
                 Some(Delivery::Namespace),
@@ -2265,6 +2519,196 @@ mod tests {
         // A number no stub issues has no disposition at all, which is what makes
         // `intercept()`'s refusal reachable rather than dead.
         assert_eq!(delivery(999), None);
+    }
+
+    /// An `attrlist` in tracee memory, at `ABS`, for a `getattrlistbulk` test.
+    fn attrlist_memory(commonattr: u32, fileattr: u32) -> Memory {
+        let mut data = vec![0u8; 256];
+        let at = (ABS - 4096) as usize;
+        data[at..at + 2].copy_from_slice(&dirents::ATTR_BIT_MAP_COUNT.to_le_bytes());
+        data[at + 4..at + 8].copy_from_slice(&commonattr.to_le_bytes());
+        data[at + 16..at + 20].copy_from_slice(&fileattr.to_le_bytes());
+        Memory {
+            base: 4096,
+            data,
+            reads: 0,
+        }
+    }
+
+    /// The four directory-read numbers decode to the operations they name.
+    ///
+    /// Pinned as literal numbers because that is what `intercept()` dispatches
+    /// on and what `install()` verifies against the host's own `movz x16`.
+    #[test]
+    fn the_directory_read_syscalls_decode_their_declared_operands() {
+        let mut memory = attrlist_memory(dirents::SERVED_COMMONATTR, dirents::SERVED_FILEATTR);
+        // getattrlistbulk(fd, attrlist, buffer, size, options).
+        let regs = entry(
+            461,
+            [7, ABS, 8192, 32768, u64::from(dirents::SERVED_OPTIONS)],
+        );
+        assert_eq!(
+            DarwinArm64Abi.decode_entry(&regs, &mut memory).unwrap(),
+            Some(FsOp::ReadDir {
+                fd: TracedFd(7),
+                max_bytes: 32768,
+            })
+        );
+        // The buffer binding is the caller's own pointer and the same clamped
+        // length the operation carries -- not a fixed width, which is the one
+        // way this differs from `fstat`'s.
+        assert_eq!(
+            DarwinArm64Abi.io_buffer(&regs).unwrap(),
+            Some(IoBuffer {
+                address: 8192,
+                length: 32768,
+            })
+        );
+        // An oversized offer is clamped rather than refused, and both readings
+        // of the register agree.
+        let large = entry(
+            461,
+            [7, ABS, 8192, u64::MAX, u64::from(dirents::SERVED_OPTIONS)],
+        );
+        assert_eq!(
+            DarwinArm64Abi.decode_entry(&large, &mut memory).unwrap(),
+            Some(FsOp::ReadDir {
+                fd: TracedFd(7),
+                max_bytes: MAX_IO_BYTES as u32,
+            })
+        );
+        assert_eq!(
+            DarwinArm64Abi.io_buffer(&large).unwrap().unwrap().length,
+            MAX_IO_BYTES as u32
+        );
+        // fchdir(fd), and the two close forms, all name a descriptor and no
+        // path. `close`(6) and `__close_nocancel`(399) are the same call.
+        let mut plain = strings();
+        assert_eq!(
+            DarwinArm64Abi
+                .decode_entry(&entry(13, [4, 0, 0, 0, 0]), &mut plain)
+                .unwrap(),
+            Some(FsOp::Fchdir { fd: TracedFd(4) })
+        );
+        for number in [6u64, 399] {
+            assert_eq!(
+                DarwinArm64Abi
+                    .decode_entry(&entry(number, [4, 0, 0, 0, 0]), &mut plain)
+                    .unwrap(),
+                Some(FsOp::Close { fd: TracedFd(4) }),
+                "syscall {number}"
+            );
+        }
+        // None of the three reads tracee memory: their operands are registers.
+        assert_eq!(plain.reads, 0);
+    }
+
+    /// **The 461 decode neither reads tracee memory nor fails on an attribute
+    /// set umbra cannot encode, and that is a regression guard rather than a
+    /// convenience.**
+    ///
+    /// `decode_entry` runs *before* the supervisor's descriptor-floor test, so
+    /// anything it refuses is refused for every descriptor in the process --
+    /// including ones umbra does not own, on runs with no virtual descriptors at
+    /// all. This slice first validated the attrlist here, and `ls -l`, `-t`,
+    /// `-i`, `-p`, `-S`, `-F`, `-s` and `-n` went from exit 0 on `--local-dev`
+    /// to a stopped run. The wide set below is the one `fts` really sends when
+    /// it wants metadata; decoding it must succeed, because whether umbra can
+    /// *serve* it is a question for after the fence.
+    ///
+    /// The memory-read count is asserted for the same reason and is the sharper
+    /// half: a decode that reads the tracee cannot be free of the tracee's
+    /// arguments, and the only way this arm can fail is by reading something.
+    #[test]
+    fn the_461_decode_is_free_of_the_attribute_set_and_of_tracee_memory() {
+        let served = u64::from(dirents::SERVED_OPTIONS);
+        let mut memory = attrlist_memory(0x8207_9e0b, 0x0000_022d);
+        assert_eq!(
+            DarwinArm64Abi
+                .decode_entry(&entry(461, [7, ABS, 8192, 32768, served]), &mut memory)
+                .unwrap(),
+            Some(FsOp::ReadDir {
+                fd: TracedFd(7),
+                max_bytes: 32768,
+            })
+        );
+        assert_eq!(memory.reads, 0, "the 461 decode read tracee memory");
+    }
+
+    /// The attribute request is reported for the caller to read *after* its own
+    /// descriptor test, and the half of it that lives in a register is refused
+    /// here with a tracee-visible errno.
+    ///
+    /// The bitmaps are in the stopped task's memory and are checked by
+    /// `dirents::RequestedAttributes::decode` in the supervisor; `options` is in
+    /// x4 and is checked here. Both halves are consulted only for a descriptor
+    /// that passed the fence, and both refusals carry an errno so the caller can
+    /// answer the program rather than end the run.
+    ///
+    /// **That second clause was false when it was first written**, and it was
+    /// false in the test that exists to pin it: the bitmap half had two refusal
+    /// arms and only one carried an errno, so a `bitmapcount` or `reserved` the
+    /// decode did not expect ended the run for a request the kernel serves.
+    /// `dirents`'s `every_attribute_request_refusal_carries_a_bindable_errno`
+    /// now sweeps that half rather than trusting this sentence, and
+    /// `events.rs`'s `every_exit_of_the_directory_request_check_is_answered_or_\
+    /// deliberately_fatal` drives both halves through the supervisor.
+    #[test]
+    fn the_directory_request_block_is_reported_and_its_register_half_refused() {
+        let served = u64::from(dirents::SERVED_OPTIONS);
+        // Where the attrlist is: x1, fixed width, no memory read to say so.
+        assert_eq!(
+            DarwinArm64Abi
+                .directory_request(&entry(461, [7, ABS, 8192, 32768, served]))
+                .unwrap(),
+            Some(IoBuffer {
+                address: ABS,
+                length: dirents::ATTRLIST_BYTES as u32,
+            })
+        );
+        // Not a directory read at all: nothing to report.
+        assert_eq!(
+            DarwinArm64Abi
+                .directory_request(&entry(339, [7, 0, 0, 0, 0]))
+                .unwrap(),
+            None
+        );
+        // Without `FSOPT_PACK_INVAL_ATTRS` the kernel packs a different buffer,
+        // so accepting its absence would encode the wrong one.
+        let bad_options = DarwinArm64Abi
+            .directory_request(&entry(461, [7, ABS, 8192, 32768, 0]))
+            .unwrap_err();
+        assert_eq!(bad_options.errno, Some(Errno(45)));
+        // A null or overflowing attrlist pointer is the tracee's own bug and is
+        // answered `EFAULT`, never faulted into the supervisor's read.
+        for address in [0u64, u64::MAX] {
+            let e = DarwinArm64Abi
+                .directory_request(&entry(461, [7, address, 8192, 32768, served]))
+                .unwrap_err();
+            assert_eq!(e.errno, Some(Errno(14)), "attrlist at {address:#x}");
+        }
+    }
+
+    /// A null, overflowing or empty directory buffer is an errno the tracee can
+    /// be answered with, never a fault that stops the run.
+    ///
+    /// The same rule as the `fstat` guard below it, and it exists for the same
+    /// measured reason: `routing_for`'s doc comment records that returning `Err`
+    /// for a bad pointer *"stopped the whole run over an ordinary program bug"*.
+    /// The empty case is the one `fstat` cannot have, because its buffer width
+    /// is fixed -- and it matters, because a zero bound reaches
+    /// `resolve_directory`'s own bound check, which is an `Err` that ends the
+    /// run rather than an answer.
+    #[test]
+    fn a_bad_directory_buffer_is_answered_as_an_errno() {
+        let served = u64::from(dirents::SERVED_OPTIONS);
+        for (buffer, length, errno) in [(0u64, 32768u64, 14), (u64::MAX, 32768, 14), (8192, 0, 22)]
+        {
+            let e = DarwinArm64Abi
+                .io_buffer(&entry(461, [7, ABS, buffer, length, served]))
+                .unwrap_err();
+            assert_eq!(e.errno, Some(Errno(errno)), "buffer {buffer} len {length}");
+        }
     }
 
     /// A bad `struct stat` pointer is an errno the tracee can be answered with,

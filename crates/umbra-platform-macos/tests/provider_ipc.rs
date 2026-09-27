@@ -262,7 +262,22 @@ fn open_libc_provider_ipc() {
                 // arm for the same reason -- there are three decode loops in
                 // this crate's tests and `sandbox_launch.rs` was already
                 // tolerant, so these two are the pair that had to learn it.
-                if matches!(op, FsOp::Fstat { .. }) {
+                //
+                // **`Close` joined it one slice later, and the pair had to learn
+                // it again.** `close`(6) and `__close_nocancel`(399) became
+                // breakpointed stubs so a virtual dirfd could be released, and
+                // dyld closes kernel descriptors before `main` -- so both
+                // drivers started seeing a `Close` they had no arm for. That is
+                // `TRACED_STUBS`' own warning firing: routing one member of a
+                // refused set makes the next reachable for the first time. The
+                // disposition is `fstat`'s exactly -- real descriptor, no
+                // namespace, let the kernel answer.
+                //
+                // `ReadDir`(461) and `Fchdir`(13) joined the same list and are
+                // deliberately absent here too: neither is issued by this
+                // crate's fixture child or by libSystem before `main`, and the
+                // panic is the right outcome if one ever arrives.
+                if matches!(op, FsOp::Fstat { .. } | FsOp::Close { .. }) {
                     thread
                 } else {
                     let FsOp::Open {

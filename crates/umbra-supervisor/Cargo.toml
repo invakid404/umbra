@@ -12,6 +12,13 @@ publish = false
 mutation-probe-read = ["umbra-overlay/mutation-probe-read"]
 mutation-probe-write = ["umbra-overlay/mutation-probe-write"]
 mutation-probe-fstat = ["umbra-overlay/mutation-probe-fstat"]
+# **The one probe that lives in this crate rather than being forwarded.** The
+# production `DirectoryEncoder` is here -- see `directory.rs` for why it cannot
+# be in the ABI backend -- so the probe that corrupts a directory reply is here
+# with it. It reverses each entry's name: every length, offset and alignment in
+# the reply stays valid, so what breaks is the *content* and nothing else, and a
+# test that passes with it enabled is a test that never read the names back.
+mutation-probe-readdir = []
 
 [dependencies]
 tracing.workspace = true

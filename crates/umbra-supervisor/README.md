@@ -8,7 +8,15 @@ run's durable journal state directly before reopening it. The suites that spawn
 the real provider executables skip when those are absent, and fail instead under
 `UMBRA_INTEGRATION_REQUIRED` (`tests/reopen.rs:38-67`).
 This crate owns `src/lib.rs`, `src/run.rs`, `src/events.rs`, `src/base.rs`,
-`src/sandbox.rs` and its manifest. It links no backend and selects none: storage,
+`src/sandbox.rs`, `src/directory.rs` and its manifest. `directory.rs` holds the
+`DirectoryEncoder` the overlay requires for `FsOp::ReadDir`: the engine resolves
+the merged entries and this side turns them into the native records the tracee's
+`getattrlistbulk` reply expects, using the wire format in `umbra_platform::dirents`
+so the encoder and the macOS backend read one source rather than two copies of
+the layout. It is injected in `launch_prepared`, which is the single path every
+launched run takes, and gated on the run being routed and on the negotiated ABI —
+a rewrite-backed run never reaches the encoder and never gets one.
+It links no backend and selects none: storage,
 journal, platform and agent arrive as contracts, and backend choice stays in
 registry descriptors.
 

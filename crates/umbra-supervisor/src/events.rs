@@ -120,6 +120,31 @@ impl Supervisor {
             ));
         }
         self.state.lifecycle = RunLifecycle::Starting;
+        // **The production directory encoder, injected here and nowhere else.**
+        //
+        // `Engine::resolve_directory` refuses without one, so a routed run whose
+        // tracee reads a directory depends on this call having happened. It is
+        // on `launch_prepared` rather than beside each `standard_namespace`
+        // because this is the single path every launched run takes -- one site
+        // cannot drift from another the way `install()`'s symbol list drifted
+        // from `intercept()`'s number list ([#116]), which is the defect this
+        // whole slice is a second instance of.
+        //
+        // Gated on the run being *routed* and on the ABI the encoder's wire
+        // format was measured against. A rewrite-backed run's directory
+        // descriptors are kernel descriptors that never reach the namespace, so
+        // injecting there would add an encoder nothing calls; a future ABI would
+        // get Darwin's `getattrlistbulk` records, which is worse than getting
+        // the refusal.
+        //
+        // [#116]: https://github.com/invakid404/umbra/issues/116
+        if budget.descriptor_floor.is_some()
+            && budget.abi == umbra_platform::dirents::DARWIN_ARM64_ABI
+        {
+            self.namespace.set_directory_encoder(Box::new(
+                crate::directory::AbiDirectoryEncoder::new(self.directory.clone()),
+            ))?;
+        }
         let process = self.platform.control.launch(spec)?;
         self.renew_at = Some(Instant::now() + budget.renew_after);
         self.budget = Some(budget);
@@ -344,7 +369,39 @@ impl Supervisor {
         // correspondence is nominal rather than only semantic, and tested over
         // both branches -- which matters because only one of them is reachable
         // on a registry that can run without a live NFSv4 fixture.
-        if let FsOp::Fstat { fd } = &operation {
+        //
+        // **The set grew from one call to four and the test is unchanged.**
+        // `fstat` was the first call breakpointed at a libc stub rather than
+        // interposed; `getattrlistbulk`, `fchdir` and the two `close` forms
+        // joined it for the same reason -- `fts` issues all of them from inside
+        // `libsystem_c`, where `DYLD_INTERPOSE` cannot reach. Every one of them
+        // therefore traps for *every* descriptor in the process, umbra's and the
+        // kernel's alike, and every one of them must pass the kernel's through
+        // untouched.
+        //
+        // This is also what keeps `/bin/ls` working on the rewrite-backed
+        // registries, where it already worked before this slice: those runs have
+        // no `descriptor_floor`, so `umbra_owns_descriptor` is false for every
+        // descriptor and all four calls resume into the kernel exactly as they
+        // did when they were not breakpointed at all.
+        //
+        // **That sentence was false when it was first written, and what made it
+        // false is worth keeping rather than quietly deleting.** It was true of
+        // three calls. `getattrlistbulk` also carries an *attribute request*,
+        // and this slice first refused an unserved one inside `decode_entry` --
+        // which runs before this test. So the refusal fired for every descriptor
+        // in the process, on runs with no floor at all, and `ls -l`/`-t`/`-i`/
+        // `-p`/`-S`/`-F`/`-s`/`-n` went from exit 0 on `--local-dev` to a
+        // stopped run. The invariant now holds for all four because the
+        // attribute refusal moved *below* this test, to
+        // `unserved_directory_request`. Anything later that can refuse a
+        // breakpointed call before this point breaks it again, and the way to
+        // tell is that the four calls have no other gate: this is it.
+        if let FsOp::Fstat { fd }
+        | FsOp::ReadDir { fd, .. }
+        | FsOp::Fchdir { fd }
+        | FsOp::Close { fd } = &operation
+        {
             let floor = self.budget.as_ref().and_then(|b| b.descriptor_floor);
             if !umbra_owns_descriptor(floor, *fd) {
                 return self.resume_thread(thread);
@@ -373,6 +430,76 @@ impl Supervisor {
         };
         if let Some(Err(errno)) = stat_buffer {
             return self.deny_to_tracee(thread, &mut registers, errno);
+        }
+        // **The directory output buffer, bound here for `fstat`'s reasons and
+        // published rather than carried.** `FsOp::ReadDir` names a byte bound
+        // and no address, so the address has to travel beside it; the encoder
+        // the namespace calls during `resolve` reads it from the cell this sets.
+        //
+        // Cleared on every other operation, not merely overwritten on the next
+        // directory read: a binding left behind is one a later `ReadDir` could
+        // answer from after this call was refused, writing one directory's
+        // entries into another call's buffer. That is the rule
+        // `routing_for` states for `set_routed_request` and
+        // `set_readlink_buffer`, reached from a third entry point.
+        match &operation {
+            FsOp::ReadDir { fd, .. } if !context.fds.contains_key(fd) => {
+                // **A descriptor umbra never issued is `EBADF` before it is
+                // anything else, and that is the kernel's own precedence.**
+                //
+                // The attribute check runs at the syscall entry and
+                // `routed_binding`'s `EBADF` inside `resolve`, so without this
+                // an unserved request on a stale descriptor answered `ENOTSUP` —
+                // telling a program probing a dead descriptor "Operation not
+                // supported" when the kernel, and umbra's own `fstat`,
+                // `fchdir` and `close`, all say "Bad file descriptor". Skipping
+                // the validation here lets `resolve` answer, which is where the
+                // other three already answer it.
+                //
+                // Reading `context.fds` here is the descriptor allocator's own
+                // idiom (`allocate_descriptor`), not a new channel.
+                self.directory.clear()?
+            }
+            FsOp::ReadDir { .. } => match Self::io_binding(&*self.platform.abi, &registers)? {
+                Some(Ok(buffer)) => {
+                    // **The attribute request, refused here and not one function
+                    // earlier, and that placement is the whole of finding F1.**
+                    //
+                    // `getattrlistbulk` declares the layout of its own reply in
+                    // an `attrlist` block, so a set umbra cannot encode has to be
+                    // refused -- but this slice first refused it inside
+                    // `decode_entry`, which runs *before* the descriptor test
+                    // above. Measured side by side against master: `ls -l`,
+                    // `-t`, `-i`, `-p`, `-S`, `-F`, `-s` and `-n` exited 0 on
+                    // `--local-dev` and stopped the run afterwards, on kernel
+                    // descriptors, on runs with no `descriptor_floor` at all.
+                    //
+                    // Being *after* the fence is what makes the refusal correct
+                    // rather than merely survivable, and an errno alone would not
+                    // have done it: measured, the kernel **serves** the wider set
+                    // (`common=0x82079e0b file=0x0000022d` returns records,
+                    // errno 0). On a descriptor umbra does not own the only right
+                    // answer is to get out of the way, which the fence now does.
+                    // On one umbra *does* own, `ENOTSUP` is umbra's own answer
+                    // and is bound to the tracee rather than ending the run.
+                    if let Some(errno) = self.unserved_directory_request(task, &registers)? {
+                        return self.deny_to_tracee(thread, &mut registers, errno);
+                    }
+                    self.directory.set(buffer)?
+                }
+                // The tracee's own null, overflowing or empty buffer. Answered
+                // to it as an errno rather than raised, exactly as
+                // `fstat(vfd, NULL)` is.
+                Some(Err(errno)) => return self.deny_to_tracee(thread, &mut registers, errno),
+                None => {
+                    return Err(error(
+                        ErrorKind::ProtocolMismatch,
+                        "supervisor.directory",
+                        "the ABI reported no output buffer for a directory read",
+                    ))
+                }
+            },
+            _ => self.directory.clear()?,
         }
         // Routed runs only. On a rewrite-backed run `descriptor_floor` is `None`
         // and none of this executes, so that path reaches `resolve` exactly as it
@@ -421,7 +548,7 @@ impl Supervisor {
         // it needs no journaled preparation and no operation slot: answer the
         // tracee here, before minting an OperationId.
         //
-        // **Six things reach it**, and the list is kept current because it is
+        // **Eight things reach it**, and the list is kept current because it is
         // the only place they are enumerated together. Every one names the
         // `umbra-overlay` *function* that produces it, never a line: this block
         // carried twelve line citations that were all correct on master and all
@@ -443,8 +570,14 @@ impl Supervisor {
         // 3. `EBADF` on a routed run -- a descriptor umbra never issued or one
         //    carrying no logical path (`Overlay::routed_binding`), a directory
         //    or one opened without the access the operation needs
-        //    (`resolve_routed_read`, `resolve_routed_write`), or one an `fstat`
-        //    named that neither of those resolves (`resolve_routed_fstat`).
+        //    (`resolve_routed_read`, `resolve_routed_write`), or one an `fstat`,
+        //    an `fchdir` or a directory read named that none of those resolves
+        //    (`resolve_routed_fstat`, `resolve_routed_fchdir`,
+        //    `resolve_directory`). The last two are this slice's, and
+        //    `resolve_directory` reached `routed_binding` only after review:
+        //    it resolved the descriptor itself and raised `StaleHandle`, which
+        //    is an `Err` that stopped the run where its three siblings answered
+        //    the tracee.
         // 4. A routing input the tracee could not supply, carried as a value
         //    through `RoutedInput` rather than as an error: `EFAULT` for a bad
         //    transfer buffer (`resolve_routed_read`, `resolve_routed_write`)
@@ -455,7 +588,19 @@ impl Supervisor {
         //    `faccessat`, `renameat` and the rest on an object this run created
         //    or copied up. The `_ if self.routed()?` fallthrough of
         //    `Overlay::resolve`'s action match. Without it those stopped the run.
-        // 6. `ENOTSUP` for an `FsOp::SetTimes` whose storage cannot set times --
+        // 6. `ENOTDIR` for a descriptor-relative call that needs a directory and
+        //    did not get one -- `fchdir` onto a non-directory
+        //    (`resolve_routed_fchdir`) and a directory read on one
+        //    (`resolve_directory`). A **seventh errno class**, added by this
+        //    slice; before it, the only descriptor refusals were `EBADF` and
+        //    `ENOENT`.
+        // 7. `ENOTSUP` for a directory read whose caller asked for an attribute
+        //    set this ABI cannot encode -- `Supervisor::unserved_directory_request`
+        //    here, not the engine. It is the one entry on this list the
+        //    *namespace* never sees, and the one that must be evaluated after
+        //    the descriptor floor test rather than before it: the kernel serves
+        //    the wider set, so a descriptor umbra does not own has to reach it.
+        // 8. `ENOTSUP` for an `FsOp::SetTimes` whose storage cannot set times --
         //    the `STORAGE_TIMESTAMP_FIDELITY_V1` check in `Overlay::resolve`'s
         //    validation match. **Added by the same change that added this
         //    line**, and it belongs here for the reason the header gives: three
@@ -657,6 +802,115 @@ impl Supervisor {
         }
     }
 
+    /// `Some(errno)` if the stopped directory read asks for an attribute set
+    /// this ABI cannot encode, having read the request block out of the tracee.
+    ///
+    /// Split across the two layers that own the two halves: the ABI answers
+    /// where the block is and checks the part of the request that lives in a
+    /// register, and this reads the block and checks the attribute bitmaps
+    /// against the one shape the encoder produces. Both are consulted only for a
+    /// descriptor that passed the fence above, which is the ordering F1 was.
+    ///
+    /// A refusal carries its errno as a *value*, exactly as `io_binding` does
+    /// and for the same reason: asking for attributes umbra does not model is
+    /// something an ordinary program does, not a failure of interception.
+    ///
+    /// **Every exit, and which of them may end the run.** This enumeration
+    /// exists because the pass that added this function gave an errno to one of
+    /// the validation's two refusal arms and not the other, and nothing here
+    /// said what the set of exits was. Fixing the arm the reviewer found would
+    /// have left the next one to be found the same way.
+    ///
+    /// 1. The ABI reports no block. **Ends the run** -- and that is a wiring
+    ///    fault, not a tracee's. The default `directory_request` refuses rather
+    ///    than reporting `None` for exactly this reason, so an ABI that decodes
+    ///    461 without modelling the request cannot reach here silently; this arm
+    ///    survives for an ABI that returns `Ok(None)` for a `ReadDir` anyway,
+    ///    which is the same wiring fault `io_binding`'s `None` is already a
+    ///    `ProtocolMismatch` for.
+    /// 2. The ABI refuses **with** an errno -- a bad `attrlist` pointer
+    ///    (`EFAULT`) or an unserved `options` word (`ENOTSUP`). Answered.
+    /// 3. The ABI refuses **without** one -- a register read that failed, i.e.
+    ///    interception itself broke. **Ends the run**, correctly.
+    /// 4. The block is the wrong width. **Ends the run**: a provider
+    ///    contradicting its own ABI's fixed-width struct, and the bound is
+    ///    checked *before* the read so a bad width cannot make this copy an
+    ///    arbitrary span out of the tracee.
+    /// 5. Reading the block faults. **Ends the run.** This is the pre-existing
+    ///    tree-wide unmapped-pointer class -- `fstat`, `open` and `read` all do
+    ///    the same, measured -- tracked as its own issue rather than fixed here.
+    /// 6. The bitmaps are unserved. Answered `ENOTSUP`; the sweep
+    ///    `every_attribute_request_refusal_carries_a_bindable_errno` is what
+    ///    keeps this arm from becoming (3).
+    /// 7. Served. `Ok(None)`, and the read proceeds.
+    ///
+    /// So the run-ending exits are exactly: no block, a broken register read, a
+    /// provider lying about the width, and a faulting read. **None of them is
+    /// reachable by a tracee's choice of attribute list** -- which is the
+    /// property the defect broke and the sweep test now pins.
+    ///
+    /// **That claim is about this check, and it was once written about the
+    /// request, which is a different and false thing.** A `getattrlistbulk`
+    /// request carries more tracee-supplied values than the attribute list, and
+    /// the one this function never sees is the output buffer's size: it reaches
+    /// `Overlay::resolve_directory`'s bound check and `dirents::encode`'s
+    /// capacity arm, both **downstream of here**, and both ended the run until
+    /// the pass that corrected this sentence. An enumeration scoped to one
+    /// function cannot speak for a request that outlives it.
+    ///
+    /// The enumeration that does speak for the whole request is the input table
+    /// over `umbra_platform_macos::abi`'s `directory_bytes`, which walks all six
+    /// tracee-supplied values of a 461 to their dispositions. This list and that
+    /// table are the two halves: exits here, inputs there.
+    fn unserved_directory_request(
+        &mut self,
+        task: TaskId,
+        registers: &umbra_core::RegisterSet,
+    ) -> Result<Option<umbra_core::Errno>> {
+        let block = match self.platform.abi.directory_request(registers) {
+            Ok(Some(block)) => block,
+            // Exit 1. **A hard failure, matching `io_binding`'s `None` on this
+            // same operation**, which is already a `ProtocolMismatch`. Two
+            // optional methods answering for one syscall, one treated as a
+            // wiring fault and the other as "nothing to check", is how a
+            // validation gets skipped silently -- and skipping this one serves
+            // umbra's own record layout for whatever bitmap the tracee actually
+            // asked for.
+            Ok(None) => {
+                return Err(error(
+                    ErrorKind::ProtocolMismatch,
+                    "supervisor.directory",
+                    "the ABI reported no attribute request block for a directory read",
+                ))
+            }
+            Err(e) => {
+                return match e.errno {
+                    Some(errno) => Ok(Some(errno)),
+                    None => Err(e),
+                }
+            }
+        };
+        if block.length as usize != umbra_platform::dirents::ATTRLIST_BYTES {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "supervisor.directory",
+                "the ABI reported an attribute request block of the wrong width",
+            ));
+        }
+        let mut attrlist = [0u8; umbra_platform::dirents::ATTRLIST_BYTES];
+        self.service_renewal()?;
+        self.platform
+            .control
+            .read_memory(task, block.address, &mut attrlist)?;
+        match umbra_platform::dirents::RequestedAttributes::decode(&attrlist) {
+            Ok(_) => Ok(None),
+            Err(e) => match e.errno {
+                Some(errno) => Ok(Some(errno)),
+                None => Err(e),
+            },
+        }
+    }
+
     /// The descriptor number a routed `open` will be answered with.
     ///
     /// The lowest free number in `[floor, floor + floor)`, which is POSIX's own
@@ -850,6 +1104,7 @@ impl Supervisor {
             },
             FsOp::Read { fd, .. } | FsOp::Write { fd, .. } => RoutedEffect::Advanced(*fd),
             FsOp::Close { fd } => RoutedEffect::Closed(*fd),
+            FsOp::Fchdir { fd } => RoutedEffect::ChangedCwd(*fd),
             _ => return Ok(()),
         };
         self.routed.insert(thread, effect);
@@ -897,6 +1152,52 @@ impl Supervisor {
             }
             RoutedEffect::Closed(fd) => {
                 context.fds.remove(&fd);
+            }
+            // **The one thing that has ever moved `ProcessContext::cwd` after
+            // launch.** It was populated once, from `command.cwd`, and read for
+            // `DirRef::Cwd` resolution; `FsOp::Chdir`/`Fchdir`/`GetCwd` were
+            // classified by `dispatch` and had no handler anywhere, so the
+            // logical working directory could not move at all.
+            //
+            // The path comes from the descriptor's own binding, resolved now
+            // rather than at the entry, and an absolute one is required: `cwd`
+            // is what relative resolution is anchored against, so a relative
+            // value here would anchor against itself.
+            //
+            // **Measured, and worth stating because it bounds what this buys:**
+            // `/bin/ls` never moves anywhere. `fts` `fchdir`s only back to
+            // descriptors it opened on the directory it was already in, and
+            // calls neither `chdir`(12) nor `getcwd`(326) -- so for `ls` this
+            // arm is an identity. It is here because `fchdir` had to be *routed*
+            // for its virtual descriptor's sake, and a routed call that reported
+            // success while silently declining to do the thing it names would be
+            // a worse answer than the refusal it replaced.
+            //
+            // `Chdir` and `GetCwd` stay declared and inert: nothing decodes
+            // 12 or 326, no measured caller on this path issues either, and a
+            // handler for a call that cannot arrive is prose describing a path
+            // nothing walks.
+            RoutedEffect::ChangedCwd(fd) => {
+                let state = context.fds.get(&fd).ok_or_else(|| {
+                    error(
+                        ErrorKind::InvalidState,
+                        "supervisor.routing",
+                        "a routed fchdir succeeded on a descriptor that is no longer bound",
+                    )
+                })?;
+                let logical = state
+                    .logical_path
+                    .clone()
+                    .filter(|p| p.is_absolute())
+                    .ok_or_else(|| {
+                        error(
+                            ErrorKind::InvalidState,
+                            "supervisor.routing",
+                            "a routed fchdir succeeded on a descriptor with no absolute \
+                             logical path to make the working directory",
+                        )
+                    })?;
+                context.cwd = logical;
             }
         }
         Ok(())
@@ -1236,6 +1537,173 @@ mod tests {
         s.state.lifecycle = RunLifecycle::Running;
         s
     }
+    /// A platform double whose `directory_request` and tracee memory are the
+    /// test's to choose, so `unserved_directory_request` can be driven over
+    /// every exit it has.
+    ///
+    /// The shipped `Fake` cannot do this: its `read_memory` panics by design, to
+    /// prove a renewal precedes it. This one serves bytes.
+    struct DirectoryFake {
+        block: Option<IoBuffer>,
+        refusal: Option<UmbraError>,
+        attrlist: [u8; umbra_platform::dirents::ATTRLIST_BYTES],
+    }
+    impl DirectoryFake {
+        fn serving() -> Self {
+            let mut attrlist = [0u8; umbra_platform::dirents::ATTRLIST_BYTES];
+            attrlist[0..2]
+                .copy_from_slice(&umbra_platform::dirents::ATTR_BIT_MAP_COUNT.to_le_bytes());
+            attrlist[4..8]
+                .copy_from_slice(&umbra_platform::dirents::SERVED_COMMONATTR.to_le_bytes());
+            attrlist[16..20]
+                .copy_from_slice(&umbra_platform::dirents::SERVED_FILEATTR.to_le_bytes());
+            Self {
+                block: Some(IoBuffer {
+                    address: 4096,
+                    length: umbra_platform::dirents::ATTRLIST_BYTES as u32,
+                }),
+                refusal: None,
+                attrlist,
+            }
+        }
+        fn into_session(self) -> PlatformSession {
+            PlatformSession {
+                control: Box::new(DirectoryControl {
+                    attrlist: self.attrlist,
+                }),
+                abi: Box::new(self),
+            }
+        }
+    }
+    struct DirectoryControl {
+        attrlist: [u8; umbra_platform::dirents::ATTRLIST_BYTES],
+    }
+    impl TraceBackend for DirectoryControl {
+        fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
+            unreachable!()
+        }
+        fn next_event(&mut self) -> Result<TraceEvent> {
+            unreachable!()
+        }
+        fn read_memory(&mut self, _: TaskId, _: u64, out: &mut [u8]) -> Result<()> {
+            out.copy_from_slice(&self.attrlist[..out.len()]);
+            Ok(())
+        }
+        fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
+            unreachable!()
+        }
+        fn set_registers(&mut self, _: ThreadId, _: &RegisterSet) -> Result<()> {
+            unreachable!()
+        }
+        fn resume(&mut self, _: ResumeCommand) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl TraceControl for DirectoryControl {
+        fn capabilities(&self) -> PlatformCapabilities {
+            PlatformCapabilities::default()
+        }
+        fn quiesce(&mut self, _: ProcessHandle) -> Result<QuiescedTree> {
+            unreachable!()
+        }
+        fn terminate(&mut self, _: ProcessHandle, _: TerminationPolicy) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl SyscallAbi for DirectoryFake {
+        fn decode_entry(&self, _: &RegisterSet, _: &mut dyn TraceMemory) -> Result<Option<FsOp>> {
+            unreachable!()
+        }
+        fn directory_request(&self, _: &RegisterSet) -> Result<Option<IoBuffer>> {
+            match &self.refusal {
+                Some(e) => Err(e.clone()),
+                None => Ok(self.block),
+            }
+        }
+        fn apply_rewrite(&self, _: &mut RegisterSet, _: &PreparedRewrite) -> Result<()> {
+            unreachable!()
+        }
+        fn emulate_result(&self, _: &mut RegisterSet, _: &EmulatedResult) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    /// **Every exit of `unserved_directory_request`, driven.**
+    ///
+    /// There was no supervisor-level coverage of this function at all -- no ABI
+    /// double in the tree produced a directory read -- which is why its two
+    /// refusal arms could disagree about carrying an errno and only a live
+    /// routed run with a malformed header would have shown it.
+    ///
+    /// The distinction under test is not "refused or served" but **"answered to
+    /// the tracee or fatal to the run"**, because that is the one the defect got
+    /// wrong: `Ok(Some(errno))` is answered, `Err` ends the run.
+    #[test]
+    fn every_exit_of_the_directory_request_check_is_answered_or_deliberately_fatal() {
+        let registers = RegisterSet::new(umbra_core::Architecture::Aarch64, vec![0; 272]).unwrap();
+        let drive = |fake: DirectoryFake| {
+            let mut s = supervisor();
+            s.platform = fake.into_session();
+            s.unserved_directory_request(task(1), &registers)
+        };
+
+        // 7. Served: no refusal, the read proceeds.
+        assert_eq!(drive(DirectoryFake::serving()).unwrap(), None);
+
+        // 6. Unserved bitmaps -> answered. The attribute-set arm.
+        let mut wide = DirectoryFake::serving();
+        wide.attrlist[4..8].copy_from_slice(
+            &(umbra_platform::dirents::SERVED_COMMONATTR | 0x0002_0000).to_le_bytes(),
+        );
+        assert_eq!(drive(wide).unwrap(), Some(Errno(45)));
+
+        // 6. The header arm, which is the defect this test exists for. A
+        // `bitmapcount` umbra does not model is answered, never fatal.
+        let mut counted = DirectoryFake::serving();
+        counted.attrlist[0..2].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(drive(counted).unwrap(), Some(Errno(45)));
+
+        // And `reserved` is a don't-care: garbage there must not refuse at all,
+        // because the kernel serves it and a program can leave it uninitialised.
+        let mut reserved = DirectoryFake::serving();
+        reserved.attrlist[2..4].copy_from_slice(&0x1234u16.to_le_bytes());
+        assert_eq!(drive(reserved).unwrap(), None);
+
+        // 2. The ABI refuses with an errno -> answered.
+        let mut refused = DirectoryFake::serving();
+        refused.refusal = Some(
+            UmbraError::new(ErrorKind::UnsupportedCapability, "abi", "options")
+                .with_errno(Errno(45)),
+        );
+        assert_eq!(drive(refused).unwrap(), Some(Errno(45)));
+
+        // 3. The ABI refuses without one -> fatal, correctly: interception broke.
+        let mut broke = DirectoryFake::serving();
+        broke.refusal = Some(UmbraError::new(
+            ErrorKind::Io,
+            "abi",
+            "register read failed",
+        ));
+        assert!(drive(broke).is_err());
+
+        // 1. No block at all -> fatal. A wiring fault, not a tracee's.
+        let mut absent = DirectoryFake::serving();
+        absent.block = None;
+        assert!(drive(absent).is_err());
+
+        // 4. A block of the wrong width -> fatal, and refused *before* the read,
+        // so a provider cannot make the supervisor copy an arbitrary span.
+        let mut wrong = DirectoryFake::serving();
+        wrong.block = Some(IoBuffer {
+            address: 4096,
+            length: 8,
+        });
+        assert!(drive(wrong).is_err());
+    }
+
     /// This file cites **items**, not lines, and this is what keeps it that way.
     ///
     /// The `Deny` taxonomy above carried twelve citations into

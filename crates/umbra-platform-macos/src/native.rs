@@ -2243,7 +2243,7 @@ impl TraceControl for MacosTraceBackend {
             // installer handoff by tests/sandbox_launch.rs, which also proves an
             // unrewritten write outside the run root is denied by the kernel.
             capabilities: [
-                "darwin-arm64-abi-v1".to_owned(),
+                umbra_platform::dirents::DARWIN_ARM64_ABI.to_owned(),
                 umbra_core::capabilities::PLATFORM_SANDBOXED_LAUNCH_V1.to_owned(),
                 umbra_core::capabilities::PLATFORM_SYSCALL_REWRITE_V1.to_owned(),
                 // The three halves the name asserts are all present in this

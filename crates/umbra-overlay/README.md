@@ -57,8 +57,16 @@ new resolutions are blocked while a transaction is pending.
   `FsOp` has no buffer address or native directory layout, so this boundary must be
   supplied by the caller's ABI adapter. The overlay checks output bounds and whole
   entry progress, retains a snapshot per task/exec-generation/fd/object, and
-  advances only after observed success and commit. Without an encoder, callers
-  can use typed `list`; native ReadDir fails with `UnsupportedCapability`.
+  advances only after observed success and commit. **The snapshot is evicted when
+  that descriptor is closed**, in `commit` rather than at resolve, because a
+  *refused* close leaves the enumeration mid-flight and evicting there would
+  restart a partial read and re-serve entries the tracee already had. Eviction is
+  not optional bookkeeping: descriptor numbers are reused, so a snapshot that
+  outlived its descriptor was inherited by the next one to take that number —
+  a completed enumeration leaves an *empty* remainder, so the second read of a
+  directory in one process returned zero entries and end-of-directory. Without an
+  encoder, callers can use typed `list`; native ReadDir fails with
+  `UnsupportedCapability`.
 - Create/mkdir creates shadow parents through `Storage::create`. Exclusive create
   checks the merged namespace; the prepared open clears create/exclusive flags
   because creation has already happened through Storage.
@@ -264,16 +272,28 @@ Refusals rather than wrong answers, in every case the engine cannot represent:
 - A routed `Open` with `O_APPEND` is refused: honouring it needs an atomic
   append-at-end storage operation, and stat-then-write is right for one writer
   and silently wrong for two.
-- A routed `Open` of a directory is refused: directory reads are not routed, so
-  the descriptor would answer nothing.
+- A routed `Open` of a *writable* directory is refused: the descriptor could not
+  keep the contract it would be handing out. A **read-only** directory open is
+  served -- `getattrlistbulk` is routed and answered from the merged view, with
+  `fchdir` and both `close` forms beside it -- and a directory read on a
+  descriptor that is not bound, or that is not a directory, answers
+  `Deny(EBADF)`/`Deny(ENOTDIR)` rather than stopping the run.
+- A directory read whose caller asks for an attribute set this ABI cannot encode
+  is refused with `ENOTSUP`, and **only after the caller's descriptor test**: the
+  attribute bitmap is the layout of the reply, but a descriptor umbra does not
+  own is none of umbra's business, and refusing before that test regressed
+  `ls -l` on the rewrite-backed registries from exit 0 to a stopped run.
 - A descriptor is bound to a logical *path* and re-resolved on every operation,
   so `unlink` or `rename` of an open file is not representable. This is the
   handle-based-`Storage` gap `docs/design/syscall-matrix.md` records.
 
-`umbra-overlay` carries two cargo features, `mutation-probe-read` and
-`mutation-probe-write`, which break one routing direction each so a test can
-prove an end-to-end fixture depends on it. They are compile-time only: no
-product build contains either branch. Never enable one outside a mutation test.
+`umbra-overlay` carries three cargo features, `mutation-probe-read`,
+`mutation-probe-write` and `mutation-probe-fstat`. The first two break one
+routing direction each; `mutation-probe-fstat` answers a virtual descriptor
+`EBADF` instead of the emulated metadata, which is what the tracee received
+before that call was routed. Each exists so a test can prove an end-to-end
+fixture depends on the thing it breaks. They are compile-time only: no product
+build contains any of these branches. Never enable one outside a mutation test.
 
 ## Journal and whiteouts
 

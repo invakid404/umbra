@@ -333,7 +333,16 @@ jobs:
           # initializer. Each was a dead run or a wrong errno.
           clang -arch arm64 -O1 experiments/fixtures/umbra-userspace-edges.c \
             -o "$fixture_dir/umbra-userspace-edges"
+          # The listing fixture reads a directory through `fts` with the flags
+          # plain `/bin/ls` passes and writes the names it got into the routed
+          # workspace. It is how the directory-read proofs assert on *entries*:
+          # a traced tracee inherits the provider's `Stdio::null()` standard
+          # output, so `ls`'s own listing is unreadable by any harness, and an
+          # exit code cannot tell a correct listing from an empty one.
+          clang -arch arm64 -O1 experiments/fixtures/umbra-userspace-listing.c \
+            -o "$fixture_dir/umbra-userspace-listing"
           echo "UMBRA_USERSPACE_TOY_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
+          echo "UMBRA_USERSPACE_LISTING_PATH=$fixture_dir/umbra-userspace-listing" >> "$GITHUB_ENV"
           echo "UMBRA_EDGES_PATH=$fixture_dir/umbra-userspace-edges" >> "$GITHUB_ENV"
           # The standard-utilities matrix reads `UMBRA_TEST_FIXTURE_PATH` as a
           # *provisioning signal* and never launches what it points at: it is
@@ -438,6 +447,19 @@ jobs:
           # Same crate as probe D, so this feature swap rebuilds the provider
           # and clears the previous probe on its own. `umbra` is already clean.
           cargo build -p umbra-platform-macos --features mutation-probe-setattrlistat
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw \
+            --test userspace_run -- --nocapture --test-threads=1
+
+      - name: Proof 7 -- mutation probe F, directory reply names corrupted
+        env:
+          UMBRA_MUTATION_PROBE: readdir
+        run: |
+          # Clear probe E from the provider first, for Proof 5's reason in the
+          # other direction: this probe is on `umbra`, so building it does not
+          # rebuild `umbra-platform-macos`, and leaving the previous feature in
+          # place would put two probes in one run.
+          cargo build -p umbra-platform-macos
+          cargo build -p umbra-cli --features mutation-probe-readdir
           cargo test -p umbra-storage-nfs-userspace --features transport-raw \
             --test userspace_run -- --nocapture --test-threads=1
 
