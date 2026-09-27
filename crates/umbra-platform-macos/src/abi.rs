@@ -193,6 +193,143 @@ fn at_flags(raw: u64, allowed: u32) -> Result<u32> {
     }
     Ok(flags)
 }
+/// What the tracer does with a breakpointed stub's syscall when it fires.
+///
+/// The variants are the dispositions `NativeTracer::intercept` implements, and
+/// the match over them there is **exhaustive by design**: adding a variant is a
+/// compile error at the one site obliged to say what to do with it.
+///
+/// **Exhaustiveness proves that nobody forgot to choose, not that anybody chose
+/// correctly**, and the distinction is the whole remaining risk.
+/// `("mkdir", 136, Delivery::Fork)` type-checks, compiles and runs; at runtime
+/// the tracee's `mkdir` would take the fork arm, snapshot every breakpoint and
+/// have its return value read as a child pid. That is corruption of the tracing
+/// model rather than a refusal, and it is the same *shape* as the defect this
+/// table exists to end.
+///
+/// The compiler closes one half. The other half is
+/// `every_traced_stub_carries_the_delivery_its_number_implies`, which derives
+/// the expected disposition from `decode_entry` for **every** row rather than
+/// from a list written beside the table -- a list beside a table being exactly
+/// what went wrong before.
+///
+/// **That mechanism also rests on this enum not being `#[non_exhaustive]`**, and
+/// it is worth saying so in the same terms `umbra-overlay`'s
+/// `replay_must_poison` says it of `JournalIntent`: this type is `pub`, so
+/// `#[non_exhaustive]` is a natural future addition for a public enum, and
+/// adding it would force a wildcard arm in `intercept` and destroy the
+/// compile-time half *silently* -- the code would keep building, and every
+/// future variant would inherit whatever that wildcard said. Adding the
+/// attribute is therefore a decision about `intercept`, not only about this
+/// enum, and the two must be revisited together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// Pushed as a `TraceEvent::SyscallEntry` for the caller to decode, resolve,
+    /// answer and observe. Every filesystem call is this.
+    Namespace,
+    /// `fork`. The backend single-threads the session and takes a return stop.
+    Fork,
+    /// `wait4` and its `_nocancel` twin. The backend plans the wait itself.
+    Wait,
+    /// `execve` and `posix_spawn`. The backend rewrites the image path to a
+    /// resigned twin before letting the call through.
+    Exec,
+}
+
+/// **Every libc stub umbra breakpoints, and the syscall its `svc` issues.**
+///
+/// This table exists because there are **two** gates on one decision and they
+/// used to be written twice. `install()` decided which instructions get a
+/// breakpoint from a list of symbol names; `intercept()` decided which
+/// breakpointed numbers become a `SyscallEntry` from a separate list of
+/// numbers. Four stub rows were added to the first and not the second, so every
+/// breakpoint they planted fell through to `intercept()`'s refusal and stopped
+/// the run -- including `fstat`(339), which `_os_feature_table_once` issues on a
+/// kernel descriptor before `main` in every process. Both lists were correct in
+/// isolation; the pair was not.
+///
+/// That is the shape [#116](https://github.com/invakid404/umbra/issues/116)
+/// named for `admit_run`: **a re-derived admission set drifts clause by
+/// clause.** The remedy is not a third list to check the other two against. It
+/// is that there is now one list, both gates read it, and `intercept()` matches
+/// exhaustively on [`Delivery`] -- so a stub row whose disposition nobody chose
+/// cannot compile, and a row added here is routed without touching `intercept`
+/// at all.
+///
+/// The number is **verified against the host on every launch**, not trusted:
+/// `install()` scans each resolved stub for the `movz x16, #imm` that precedes
+/// its `svc` and refuses to plant a breakpoint if it disagrees with this table.
+/// A stale row fails the launch with a diagnosis instead of failing a run later.
+///
+/// Notes on the symbols, all measured on this host with `dlsym` + an `svc`
+/// scan rather than read out of a header:
+///
+/// * Several have no `__`-prefixed form, so the public symbol is the stub
+///   carrying the `svc`: `symlink`, `readlink`, `mkdir`, `setattrlistat` and
+///   every `*at` form but `__unlinkat`, `__fstatat`, `__renameat` and
+///   `__renameatx_np`.
+/// * `unlinkat`'s public wrapper carries its own `svc` (at +48) rather than
+///   tail-calling `__unlinkat`, so **both** are installed and both reach 472.
+/// * `fstatat`/`fstatat64` is one symbol reaching 470; `__fstatat` is a separate
+///   stub reaching 469. `fstat`/`fstat64` is likewise one symbol reaching 339 --
+///   they resolve to the *same address*, so listing `fstat64` would plant a
+///   second breakpoint on one instruction -- and `__fstat` is separate at 189.
+/// * There is no `__mkdir`. `/bin/mkdir` issues the bare form and nothing else,
+///   which is why it was refused by enforcement rather than routed
+///   ([#114](https://github.com/invakid404/umbra/issues/114)).
+/// * `utimensat` and `futimens` carry **no `svc` at all** -- both scan clean --
+///   because they are wrappers that build an `attrlist` and tail-call
+///   `setattrlistat`(524). Neither is a stub candidate; that one is.
+///
+/// [`INTERPOSE_TRAP`] is deliberately **not** here. It is not a libc stub and
+/// has no symbol to resolve: its sites are breakpointed by `install_image` on
+/// the interposer's own text, which is a different mechanism with a different
+/// containment argument, and `intercept()` gives it its own arm for that reason.
+pub const TRACED_STUBS: &[(&str, u64, Delivery)] = &[
+    ("__open", 5, Delivery::Namespace),
+    ("__open_nocancel", 398, Delivery::Namespace),
+    ("__openat", 463, Delivery::Namespace),
+    ("__openat_nocancel", 464, Delivery::Namespace),
+    ("__execve", 59, Delivery::Exec),
+    ("__posix_spawn", 244, Delivery::Exec),
+    ("__fork", 2, Delivery::Fork),
+    ("__wait4", 7, Delivery::Wait),
+    ("__wait4_nocancel", 400, Delivery::Wait),
+    ("symlink", 57, Delivery::Namespace),
+    ("readlink", 58, Delivery::Namespace),
+    ("__renameat", 465, Delivery::Namespace),
+    ("__renameatx_np", 488, Delivery::Namespace),
+    ("__unlinkat", 472, Delivery::Namespace),
+    ("unlinkat", 472, Delivery::Namespace),
+    ("linkat", 471, Delivery::Namespace),
+    ("symlinkat", 474, Delivery::Namespace),
+    ("mkdirat", 475, Delivery::Namespace),
+    ("fchmodat", 467, Delivery::Namespace),
+    ("fchownat", 468, Delivery::Namespace),
+    ("__fstatat", 469, Delivery::Namespace),
+    ("fstatat", 470, Delivery::Namespace),
+    ("readlinkat", 473, Delivery::Namespace),
+    ("faccessat", 466, Delivery::Namespace),
+    ("mkdir", 136, Delivery::Namespace),
+    ("fstat", 339, Delivery::Namespace),
+    ("__fstat", 189, Delivery::Namespace),
+    ("setattrlistat", 524, Delivery::Namespace),
+];
+
+/// What `intercept()` must do with a breakpointed syscall number, or `None` for
+/// a number no stub in [`TRACED_STUBS`] issues.
+///
+/// `None` is the honest answer rather than a default disposition: a breakpoint
+/// fired for a number this table does not know is umbra's own wiring fault, and
+/// guessing a disposition for it would resume or refuse a call nobody chose to
+/// intercept.
+pub fn delivery(number: u64) -> Option<Delivery> {
+    TRACED_STUBS
+        .iter()
+        .find(|(_, traced, _)| *traced == number)
+        .map(|(_, _, delivery)| *delivery)
+}
+
 /// Register slot for each path operand a syscall takes, slot N being xN.
 ///
 /// Non-path arguments — dirfds included — keep their original registers: a
@@ -201,14 +338,16 @@ fn at_flags(raw: u64, allowed: u32) -> Result<u32> {
 pub fn path_operands(number: u64) -> Result<&'static [(PathOperand, usize)]> {
     Ok(match number {
         // open, open_nocancel, execve: path in x0. readlink: path in x0, with
-        // the output buffer in x1 and its length in x2.
-        5 | 398 | 59 | 58 => &[(PathOperand::Path, 0)],
+        // the output buffer in x1 and its length in x2. mkdir(136): path in x0,
+        // mode in x1 -- the bare form, whose `mkdirat` sibling is in the at-form
+        // row below.
+        5 | 398 | 59 | 58 | 136 => &[(PathOperand::Path, 0)],
         // symlink: x0 holds literal target bytes, x1 the link name.
         57 => &[(PathOperand::Path, 1)],
         // openat, openat_nocancel, posix_spawn: path in x1. unlinkat,
         // mkdirat, faccessat, fchmodat, fchownat, fstatat, fstatat64,
-        // readlinkat: dirfd x0, path x1.
-        463 | 464 | 244 | 466 | 467 | 468 | 469 | 470 | 472 | 473 | 475 => {
+        // readlinkat, setattrlistat: dirfd x0, path x1.
+        463 | 464 | 244 | 466 | 467 | 468 | 469 | 470 | 472 | 473 | 475 | 524 => {
             &[(PathOperand::Path, 1)]
         }
         // renameat, renameatx_np, linkat: source dirfd x0, source x1,
@@ -217,6 +356,11 @@ pub fn path_operands(number: u64) -> Result<&'static [(PathOperand, usize)]> {
         // symlinkat: x0 holds literal target bytes the tracee will read back,
         // never a pathname operand to physicalize. Link dirfd x1, name x2.
         474 => &[(PathOperand::Path, 2)],
+        // fstat(339) and __fstat(189) are intercepted and decoded, and are
+        // deliberately absent: they name a descriptor and no path, so there is
+        // no operand to physicalize. A caller that reached here for one is
+        // asking the wrong question, and the refusal says so rather than
+        // inventing slot zero.
         _ => return Err(unsupported(format!("path syscall {number}"))),
     })
 }
@@ -314,12 +458,203 @@ pub fn readlink_buffer(regs: &RegisterSet) -> Result<(u64, u32)> {
     Ok((get(regs, slot)?, len as u32))
 }
 /// Output buffer address for a stat-family syscall: `fstatat` and `fstatat64`
-/// keep it in x2.
+/// keep it in x2, `fstat`(339) and `__fstat`(189) in x1.
+///
+/// The two families differ only by the leading dirfd/path pair the at-form
+/// carries, so the slot moves by one and nothing else does -- both write the
+/// same [`STAT_BYTES`] image.
 pub fn stat_buffer(regs: &RegisterSet) -> Result<u64> {
     match get(regs, 16)? {
         469 | 470 => get(regs, 2),
+        189 | 339 => get(regs, 1),
         number => Err(unsupported(format!("stat buffer for syscall {number}"))),
     }
+}
+
+/// `ATTR_CMN_MODTIME` / `ATTR_CMN_ACCTIME` from `sys/attr.h`.
+const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+const ATTR_CMN_ACCTIME: u32 = 0x0000_1000;
+/// `ATTR_BIT_MAP_COUNT` -- the only `bitmapcount` a caller may declare.
+const ATTR_BIT_MAP_COUNT: u16 = 5;
+/// `FSOPT_NOFOLLOW` / `FSOPT_UTIMES_NULL` from `sys/attr.h`.
+const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
+const FSOPT_UTIMES_NULL: u32 = 0x0000_0400;
+/// Bytes of `struct attrlist`: `u_short` + `u_int16_t` + five `attrgroup_t`.
+const ATTRLIST_BYTES: usize = 24;
+/// Bytes of one arm64 `struct timespec` in an attribute buffer.
+const TIMESPEC_BYTES: usize = 16;
+
+/// Decode the one `setattrlistat`(524) shape libc's `utimensat` emits.
+///
+/// **This is a shape refusal, not a flag refusal, and the distinction is the
+/// point.** `setattrlist`-family calls carry a caller-declared attribute
+/// bitmap, and the *layout of the buffer that follows is dictated by that
+/// bitmap*: a bit umbra does not model is not a flag it could drop, it is a
+/// different buffer. So anything outside the modtime/acctime pair is refused
+/// whole, the discipline [`at_flags`] already applies to unmodelled `*at` bits.
+///
+/// Measured on macOS 26.5.1 arm64, by breaking on the stub and reading the
+/// tracee's memory back -- every claim below is an observation, not a reading
+/// of the header:
+///
+/// * `bitmapcount` is always `ATTR_BIT_MAP_COUNT` (5) and `reserved` zero.
+/// * `commonattr` is `ATTR_CMN_MODTIME | ATTR_CMN_ACCTIME` (`0x1400`) for a
+///   two-time request, and `ATTR_CMN_MODTIME` alone (`0x400`) when the caller
+///   passed `UTIME_OMIT` for the access time. `volattr`/`dirattr`/`fileattr`/
+///   `forkattr` are zero.
+/// * The buffer holds one `timespec` per set bit, **in ascending bit order** --
+///   so modtime (`0x400`) precedes acctime (`0x1000`), which is the reverse of
+///   the `times[2]` array the caller wrote. Confirmed by passing two
+///   distinguishable times and reading which came back first.
+/// * `options` is `0` for explicit times, `FSOPT_UTIMES_NULL` when the caller
+///   passed `NULL` or `UTIME_NOW`, and `FSOPT_NOFOLLOW` for
+///   `AT_SYMLINK_NOFOLLOW`. **`FSOPT_UTIMES_NULL` needs no special handling
+///   here**: libc has already resolved "now" into the buffer, so the decoded
+///   times are the ones the caller means either way. It is accepted rather
+///   than refused, and it is accepted rather than *ignored* -- the bit changes
+///   the kernel's permission rule, not the value, and umbra's own resolution
+///   answers permission from the namespace.
+///
+/// `/usr/bin/touch <existing>` emits exactly the first form with
+/// `FSOPT_UTIMES_NULL` set.
+fn setattrlist_times(
+    regs: &RegisterSet,
+    memory: &mut dyn TraceMemory,
+) -> Result<(Option<i128>, Option<i128>, bool)> {
+    // MUTATION PROBE -- `setattrlistat` routing. Compiled out of every build
+    // that does not ask for it, so no product binary contains this branch.
+    //
+    // It refuses the call at the decode, and **what that produces is a stopped
+    // run**, not the pre-slice behaviour. This comment used to say the refusal
+    // is "where the number landed before this arm existed", which was false for
+    // both of probe D's reasons: before the arm existed, `setattrlistat` was
+    // not in `TRACED_STUBS`, so 524 was never breakpointed and never reached
+    // this decoder; and a decode error is propagated by `syscall_entry` with
+    // `?`, which has no resume fallback. Measured with the shipped probe
+    // binary on `--local-dev`:
+    //
+    //   unmutated:  `touch: <path>: Operation not supported`, child exit 1,
+    //               `ProcessFailed during run.child` -- the tracee was refused
+    //               and the RUN SURVIVED.
+    //   mutated:    `UnsupportedCapability during macos: mutation probe:
+    //               setattrlistat is refused` -- no tracee message, no child
+    //               status, the RUN ABORTED.
+    //
+    // Before the arm existed it was a third thing again: 524 reached the kernel
+    // and Seatbelt refused it, with the run surviving. So the probe creates a
+    // state that neither ships nor shipped. It is still a valid mutation -- the
+    // abort is caused by this arm and nothing else -- but the justification has
+    // to describe what it does rather than what it is imagined to restore, or a
+    // reader cannot check it. (Probe D's comment was corrected for exactly this
+    // in round 1 and this one was not swept with it, which is the same
+    // lexical-not-mechanism miss the correction was about.)
+    //
+    // The discriminator is a *pair*: `touch <existing>` fails while
+    // `touch <absent>` still succeeds and still leaves its empty file in the
+    // shadow, because the create path never reaches this syscall at all. No
+    // other probe here produces that pair.
+    //
+    // The refusal is placed inside this function rather than around the decode
+    // arm so that nothing else in this file goes dead when the probe is on: a
+    // probe that changed which warnings the crate emits would be a probe that
+    // changed more than the one thing it claims to.
+    #[cfg(feature = "mutation-probe-setattrlistat")]
+    {
+        // Decoded first and *then* refused, deliberately: the probe removes the
+        // answer and not the reading of it, so a case that passes under it
+        // cannot have passed because the attrlist stopped being parsed. It also
+        // keeps every helper and constant below live, so enabling the probe
+        // changes no warning this crate emits.
+        setattrlist_times_inner(regs, memory)?;
+        Err(unsupported("mutation probe: setattrlistat is refused"))
+    }
+    #[cfg(not(feature = "mutation-probe-setattrlistat"))]
+    {
+        setattrlist_times_inner(regs, memory)
+    }
+}
+
+fn setattrlist_times_inner(
+    regs: &RegisterSet,
+    memory: &mut dyn TraceMemory,
+) -> Result<(Option<i128>, Option<i128>, bool)> {
+    let options = get(regs, 5)? as u32;
+    if options & !(FSOPT_NOFOLLOW | FSOPT_UTIMES_NULL) != 0 {
+        return Err(unsupported(format!("setattrlistat options {options:#x}")));
+    }
+    let mut list = [0u8; ATTRLIST_BYTES];
+    memory.read(get(regs, 2)?, &mut list)?;
+    let word = |offset: usize| u32::from_le_bytes(list[offset..offset + 4].try_into().unwrap());
+    let half = |offset: usize| u16::from_le_bytes(list[offset..offset + 2].try_into().unwrap());
+    let common = word(4);
+    // Every field of the declared shape is checked, not only the one that is
+    // read: a nonzero `volattr` or `forkattr` means the buffer this decode is
+    // about to walk has entries in it that this decode does not know are there.
+    // `common == 0` is refused with the rest, and it is the one member of this
+    // list that is not obviously malformed. libc never emits it: two
+    // `UTIME_OMIT`s make `utimensat` a no-op that issues no syscall at all. If
+    // it arrived anyway it would decode to a `SetTimes` naming neither time,
+    // which the overlay would carry all the way to a `SetMetadata` that every
+    // storage backend refuses as "update names nothing" -- from inside
+    // `prepare`, with the intent already flushed. Refusing it here costs a shape
+    // no caller produces and removes a way for one to stop a run.
+    if half(0) != ATTR_BIT_MAP_COUNT
+        || half(2) != 0
+        || common == 0
+        || common & !(ATTR_CMN_MODTIME | ATTR_CMN_ACCTIME) != 0
+        || word(8) | word(12) | word(16) | word(20) != 0
+    {
+        return Err(unsupported(format!(
+            "setattrlistat attrlist shape bitmapcount={} common={common:#x}              vol={:#x} dir={:#x} file={:#x} fork={:#x}",
+            half(0),
+            word(8),
+            word(12),
+            word(16),
+            word(20),
+        )));
+    }
+    let wanted = [ATTR_CMN_MODTIME, ATTR_CMN_ACCTIME]
+        .iter()
+        .filter(|bit| common & **bit != 0)
+        .count();
+    let size = get(regs, 4)?;
+    // The caller's own byte count has to agree with the bitmap before a single
+    // entry is read. A buffer shorter than the bitmap declares would be read
+    // past its end; a longer one means the two halves of the request disagree,
+    // and guessing which is authoritative is exactly the silent wrong answer
+    // this file refuses elsewhere.
+    if size != (wanted * TIMESPEC_BYTES) as u64 {
+        return Err(unsupported(format!(
+            "setattrlistat buffer is {size} bytes for {wanted} attribute(s)"
+        )));
+    }
+    let mut buffer = vec![0u8; wanted * TIMESPEC_BYTES];
+    if !buffer.is_empty() {
+        memory.read(get(regs, 3)?, &mut buffer)?;
+    }
+    let mut entries = buffer.as_chunks::<TIMESPEC_BYTES>().0.iter();
+    let mut take = |bit: u32| -> Result<Option<i128>> {
+        if common & bit == 0 {
+            return Ok(None);
+        }
+        let entry = entries.next().expect("one entry per set bit, just sized");
+        let seconds = i64::from_le_bytes(entry[..8].try_into().unwrap());
+        let nanos = i64::from_le_bytes(entry[8..].try_into().unwrap());
+        // `tv_nsec` outside one second is not a time this decode can normalise
+        // without inventing a second's worth of meaning. Darwin answers
+        // `EINVAL`; refusing is umbra's equivalent and keeps the refusal
+        // visible.
+        if !(0..1_000_000_000).contains(&nanos) {
+            return Err(unsupported(format!("setattrlistat tv_nsec {nanos}")));
+        }
+        Ok(Some(
+            i128::from(seconds) * 1_000_000_000 + i128::from(nanos),
+        ))
+    };
+    // Ascending bit order, which is the order the buffer is packed in.
+    let modified = take(ATTR_CMN_MODTIME)?;
+    let accessed = take(ATTR_CMN_ACCTIME)?;
+    Ok((accessed, modified, options & FSOPT_NOFOLLOW == 0))
 }
 /// Size of Darwin's `struct stat`, the `__DARWIN_INODE64` layout an arm64
 /// `fstatat` writes. Offsets below were read from the host's `sys/stat.h`
@@ -460,6 +795,69 @@ impl SyscallAbi for DarwinArm64Abi {
                 path: read_path(memory, get(regs, 1)?)?,
                 mode: get(regs, 2)? as u32,
             },
+            // Bare `mkdir`(136): no dirfd, so the name is anchored at the
+            // process cwd exactly as `symlink`'s link name is. `/bin/mkdir`
+            // issues this and no other filesystem call -- measured; the `stat`,
+            // `umask` and `chmod` its `nm -u` lists belong to `-m` and `-p`.
+            //
+            // MUTATION PROBE -- the `mkdir` decode arm. Compiled out of every
+            // build that does not ask for it, so no product binary contains this
+            // branch.
+            //
+            // With it enabled the number falls through to the "unclassified
+            // Darwin syscall" refusal below, and **what that produces is a
+            // stopped run**, not the pre-#114 behaviour. This comment used to
+            // claim the opposite -- that the operand "reaches the kernel
+            // unrewritten and Seatbelt refuses the call" -- and that was false
+            // twice over: before this arm existed, `mkdir` was not in
+            // `TRACED_STUBS`, so 136 was never breakpointed and never reached
+            // this decoder at all; and a decode error is propagated by
+            // `syscall_entry` with `?`, which has no resume fallback. The probe
+            // therefore creates a third state that neither ships nor shipped,
+            // and saying so is the point: a probe whose justification describes
+            // a mechanism the code does not have cannot be checked by a reader.
+            //
+            // The probe still discriminates, and the test says how: `mkdir`
+            // exits nonzero with the directory nowhere -- not on the host, not
+            // in the store -- **and** `touch <absent>` still exits 0 with its
+            // file in the store, in the same probe binary. That positive half
+            // is what stops the case passing for an unrelated common cause; it
+            // was added after the shipped tree's own `intercept()` defect was
+            // found to satisfy every assertion the probe originally made.
+            #[cfg(not(feature = "mutation-probe-mkdir"))]
+            136 => FsOp::Mkdir {
+                dir: DirRef::Cwd,
+                path: read_path(memory, get(regs, 0)?)?,
+                mode: get(regs, 1)? as u32,
+            },
+            // `fstat`(339) and `__fstat`(189): a descriptor and an output
+            // buffer, and no path operand at all. The descriptor's logical
+            // anchor belongs to the namespace, so nothing is resolved here; the
+            // buffer is reported through `io_buffer` rather than carried on the
+            // operation, for the reason that method states.
+            //
+            // Both numbers decode identically because both stubs are the same
+            // call: `fstat64` resolves to the `fstat` symbol, and `__fstat` is a
+            // separate stub reaching 189. The `fstatat`/`__fstatat` pair above
+            // has the same shape and the same reason.
+            189 | 339 => FsOp::Fstat {
+                fd: TracedFd(get(regs, 0)? as i32),
+            },
+            // `setattrlistat`(524). libc's `utimensat` carries no `svc`: it
+            // builds an `attrlist` and tail-calls this, so this is the only
+            // place a time change can be intercepted. `setattrlist_times`
+            // refuses any attrlist shape outside the modtime/acctime pair that
+            // wrapper emits.
+            524 => {
+                let (accessed_nanos, modified_nanos, follow) = setattrlist_times(regs, memory)?;
+                FsOp::SetTimes {
+                    dir: dir_ref(get(regs, 0)?),
+                    path: read_path(memory, get(regs, 1)?)?,
+                    accessed_nanos,
+                    modified_nanos,
+                    follow,
+                }
+            }
             467 => {
                 let flags = at_flags(get(regs, 3)?, AT_SYMLINK_NOFOLLOW)?;
                 FsOp::Chmod {
@@ -533,11 +931,44 @@ impl SyscallAbi for DarwinArm64Abi {
         };
         Ok(Some(op))
     }
+    fn encode_stat(&self, stat: &BlobStat) -> Result<Vec<u8>> {
+        // The free function is the implementation and stays public: the dirfd
+        // integration fixture injects its own `StatEncoder` over it, and the
+        // unit tests below check the layout offset by offset.
+        encode_stat(stat)
+    }
     fn io_buffer(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>> {
+        // `fstat` is the one breakpointed syscall on this ABI that names an
+        // output buffer of its own. Its length is not a caller-supplied count
+        // but the fixed width of the layout the kernel would have written, so it
+        // is reported as that: a caller writing fewer bytes would leave the
+        // tail of the tracee's `struct stat` holding whatever was there before.
+        //
+        // **The same null/overflow guard the interposer branch below applies,
+        // and for the same measured reason.** `fstat(fd, NULL)` is an ordinary
+        // program bug, and Darwin answers it `EFAULT` -- so the errno travels
+        // *inside* the error, for the caller to bind as a tracee-visible
+        // refusal, exactly as `read(fd, NULL, 4)` does. Without it the bad
+        // pointer reached `write_memory`, which failed, which stopped the whole
+        // run: the defect `routing_for`'s doc comment records as measured and
+        // fixed, one syscall over.
+        if matches!(get(regs, 16)?, 189 | 339) {
+            let address = stat_buffer(regs)?;
+            if address == 0 || address.checked_add(STAT_BYTES as u64).is_none() {
+                return Err(
+                    error("io_buffer", "null or overflowing stat buffer").with_errno(Errno(14))
+                );
+            }
+            return Ok(Some(IoBuffer {
+                address,
+                length: STAT_BYTES as u32,
+            }));
+        }
         if get(regs, 16)? != INTERPOSE_TRAP {
             // Every other intercepted call on this ABI names paths, not data
             // buffers. `read`/`write` are not breakpointed syscalls here: the
-            // only data transfer umbra services is the interposer's.
+            // only data transfer umbra services besides `fstat`'s reply is the
+            // interposer's.
             return Ok(None);
         }
         if !matches!(get(regs, 0)?, INTERPOSE_READ | INTERPOSE_WRITE) {
@@ -1344,5 +1775,557 @@ mod tests {
         assert_eq!(get(&r, PC).unwrap(), 4);
         set(&mut r, 16, 999).unwrap();
         assert!(DarwinArm64Abi.decode_entry(&r, &mut m).is_err());
+    }
+
+    /// A `setattrlistat` entry over a memory image, with the attrlist and the
+    /// attribute buffer laid out the way libc's `utimensat` lays them out.
+    ///
+    /// Offsets are fixed and distinct so a decode that read the wrong operand
+    /// slot reads the wrong bytes rather than plausible ones.
+    fn setattrlistat_entry(
+        common: u32,
+        times: &[(i64, i64)],
+        options: u64,
+        bitmapcount: u16,
+        volattr: u32,
+        size_override: Option<u64>,
+    ) -> (RegisterSet, Memory) {
+        const PATH: u64 = 4096;
+        const LIST: u64 = 4096 + 64;
+        const BUFFER: u64 = 4096 + 128;
+        let mut data = vec![0u8; 256];
+        data[..12].copy_from_slice(b"/w/seed.txt\0");
+        let list = 64;
+        data[list..list + 2].copy_from_slice(&bitmapcount.to_le_bytes());
+        data[list + 4..list + 8].copy_from_slice(&common.to_le_bytes());
+        data[list + 8..list + 12].copy_from_slice(&volattr.to_le_bytes());
+        for (index, (seconds, nanos)) in times.iter().enumerate() {
+            let at = 128 + index * TIMESPEC_BYTES;
+            data[at..at + 8].copy_from_slice(&seconds.to_le_bytes());
+            data[at + 8..at + 16].copy_from_slice(&nanos.to_le_bytes());
+        }
+        let mut regs = entry(
+            524,
+            [
+                CWD,
+                PATH,
+                LIST,
+                BUFFER,
+                size_override.unwrap_or((times.len() * TIMESPEC_BYTES) as u64),
+            ],
+        );
+        set(&mut regs, 5, options).unwrap();
+        (
+            regs,
+            Memory {
+                base: 4096,
+                data,
+                reads: 0,
+            },
+        )
+    }
+
+    /// Bare `mkdir`(136) is the whole of `/bin/mkdir`'s filesystem footprint, so
+    /// it has to decode to the same operation `mkdirat` does -- anchored at the
+    /// process cwd, because it carries no dirfd -- and its operand has to be
+    /// rewritable. Neither was true before
+    /// [#114](https://github.com/invakid404/umbra/issues/114): the number
+    /// reached the "unclassified Darwin syscall" refusal.
+    #[test]
+    fn bare_mkdir_decodes_to_a_cwd_anchored_mkdir_with_a_rewritable_operand() {
+        let mut memory = strings();
+        let decoded = DarwinArm64Abi
+            .decode_entry(&entry(136, [ABS, 0o755, 0, 0, 0]), &mut memory)
+            .unwrap();
+        assert_eq!(
+            decoded,
+            Some(FsOp::Mkdir {
+                dir: DirRef::Cwd,
+                path: BytePath::new(b"/abs/one".to_vec()).unwrap(),
+                mode: 0o755,
+            })
+        );
+        // The operand row. It is a fact about the syscall's shape, and on the
+        // `Mkdir` path it is **inert**: `path_operands` is consulted only when
+        // an action is a `Rewrite`, and `Overlay::resolve` answers `Mkdir` with
+        // `Emulate` on every backend -- see
+        // `mkdir_resolves_to_an_emulated_answer_with_no_rewrite_to_depend_on`.
+        // Asserted anyway, because a wrong slot here would be a latent trap for
+        // the first caller that does take a rewrite, and because #114 named
+        // this table as half the fix.
+        assert_eq!(path_operands(136).unwrap(), &[(PathOperand::Path, 0)]);
+        // The at-form sibling keeps its own slot; one is not the other's alias.
+        assert_eq!(path_operands(475).unwrap(), &[(PathOperand::Path, 1)]);
+    }
+
+    /// `fstat` is the first descriptor-relative call the tracer carries, and the
+    /// three things that makes true are asserted together because a decode that
+    /// got any one of them wrong would write a `struct stat` somewhere the tracee
+    /// did not ask for: it names a descriptor and no path, its output buffer is
+    /// in x1 rather than the at-form's x2, and that buffer is exactly one
+    /// `struct stat` wide.
+    #[test]
+    fn fstat_decodes_to_a_descriptor_operation_and_names_its_own_output_buffer() {
+        for number in [189u64, 339] {
+            let mut memory = strings();
+            let regs = entry(number, [7, 8192, 0, 0, 0]);
+            assert_eq!(
+                DarwinArm64Abi.decode_entry(&regs, &mut memory).unwrap(),
+                Some(FsOp::Fstat { fd: TracedFd(7) }),
+                "syscall {number}"
+            );
+            assert_eq!(memory.reads, 0, "syscall {number} read tracee memory");
+            assert_eq!(stat_buffer(&regs).unwrap(), 8192, "syscall {number}");
+            assert_eq!(
+                DarwinArm64Abi.io_buffer(&regs).unwrap(),
+                Some(IoBuffer {
+                    address: 8192,
+                    length: STAT_BYTES as u32,
+                }),
+                "syscall {number}"
+            );
+            // No path operand exists, so asking for one is refused rather than
+            // answered with slot zero.
+            assert!(path_operands(number).is_err(), "syscall {number}");
+        }
+        // The at-form's buffer slot is unchanged by the addition.
+        assert_eq!(stat_buffer(&entry(470, [0, 0, 4242, 0, 0])).unwrap(), 4242);
+    }
+
+    /// The exact shape libc's `utimensat` emits, measured on macOS 26.5.1 arm64
+    /// by breaking on the stub and reading the tracee's memory back.
+    ///
+    /// The ordering claim is the one worth a test of its own: the attribute
+    /// buffer is packed in ascending *bitmap* order, so the modification time
+    /// comes first, which is the reverse of the `times[2]` array the caller
+    /// wrote. Reading them the other way round would silently swap a file's
+    /// access and modification times, which no later layer could detect.
+    #[test]
+    fn setattrlistat_decodes_the_attrlist_shape_utimensat_emits() {
+        // Two times, distinguishable, in bitmap order: modtime then acctime.
+        let (regs, mut memory) = setattrlistat_entry(
+            ATTR_CMN_MODTIME | ATTR_CMN_ACCTIME,
+            &[(1_555_555_555, 666_777_888), (1_111_111_111, 222_333_444)],
+            u64::from(FSOPT_UTIMES_NULL),
+            ATTR_BIT_MAP_COUNT,
+            0,
+            None,
+        );
+        assert_eq!(
+            DarwinArm64Abi.decode_entry(&regs, &mut memory).unwrap(),
+            Some(FsOp::SetTimes {
+                dir: DirRef::Cwd,
+                path: BytePath::new(b"/w/seed.txt".to_vec()).unwrap(),
+                accessed_nanos: Some(1_111_111_111_222_333_444),
+                modified_nanos: Some(1_555_555_555_666_777_888),
+                follow: true,
+            })
+        );
+        // `UTIME_OMIT` for the access time drops the bit and shortens the
+        // buffer; the one entry left is the modification time.
+        let (regs, mut memory) = setattrlistat_entry(
+            ATTR_CMN_MODTIME,
+            &[(1_555_555_555, 666_777_888)],
+            0,
+            ATTR_BIT_MAP_COUNT,
+            0,
+            None,
+        );
+        assert_eq!(
+            DarwinArm64Abi.decode_entry(&regs, &mut memory).unwrap(),
+            Some(FsOp::SetTimes {
+                dir: DirRef::Cwd,
+                path: BytePath::new(b"/w/seed.txt".to_vec()).unwrap(),
+                accessed_nanos: None,
+                modified_nanos: Some(1_555_555_555_666_777_888),
+                follow: true,
+            })
+        );
+        // `FSOPT_NOFOLLOW` is `AT_SYMLINK_NOFOLLOW` by the time it arrives here.
+        let (regs, mut memory) = setattrlistat_entry(
+            ATTR_CMN_MODTIME,
+            &[(1, 2)],
+            u64::from(FSOPT_NOFOLLOW),
+            ATTR_BIT_MAP_COUNT,
+            0,
+            None,
+        );
+        assert_eq!(
+            DarwinArm64Abi.decode_entry(&regs, &mut memory).unwrap(),
+            Some(FsOp::SetTimes {
+                dir: DirRef::Cwd,
+                path: BytePath::new(b"/w/seed.txt".to_vec()).unwrap(),
+                accessed_nanos: None,
+                modified_nanos: Some(1_000_000_002),
+                follow: false,
+            })
+        );
+        // The operand is rewritable at the at-form's slot.
+        assert_eq!(path_operands(524).unwrap(), &[(PathOperand::Path, 1)]);
+    }
+
+    /// Every attrlist shape outside that pair is refused **whole**.
+    ///
+    /// This is a shape refusal rather than a flag refusal, and that is why each
+    /// of these must fail rather than be narrowed to what is understood: the
+    /// bitmap dictates the layout of the buffer that follows, so an unmodelled
+    /// bit is not a flag that could be dropped -- it is a different buffer, and
+    /// walking it as if it were this one reads the wrong sixteen bytes as a
+    /// time. `at_flags` applies the same rule to unmodelled `*at` bits.
+    #[test]
+    fn setattrlistat_refuses_every_attrlist_shape_outside_the_modtime_acctime_pair() {
+        let refused: &[(&str, (RegisterSet, Memory))] = &[
+            (
+                "an unmodelled common attribute",
+                setattrlistat_entry(
+                    ATTR_CMN_MODTIME | 0x0000_0200,
+                    &[(1, 2), (3, 4)],
+                    0,
+                    ATTR_BIT_MAP_COUNT,
+                    0,
+                    None,
+                ),
+            ),
+            (
+                "a volume attribute the buffer walk knows nothing about",
+                setattrlistat_entry(
+                    ATTR_CMN_MODTIME,
+                    &[(1, 2)],
+                    0,
+                    ATTR_BIT_MAP_COUNT,
+                    0x0000_0001,
+                    None,
+                ),
+            ),
+            (
+                "a bitmapcount that is not ATTR_BIT_MAP_COUNT",
+                setattrlistat_entry(ATTR_CMN_MODTIME, &[(1, 2)], 0, 3, 0, None),
+            ),
+            (
+                "a buffer shorter than the bitmap declares",
+                setattrlistat_entry(
+                    ATTR_CMN_MODTIME | ATTR_CMN_ACCTIME,
+                    &[(1, 2), (3, 4)],
+                    0,
+                    ATTR_BIT_MAP_COUNT,
+                    0,
+                    Some(TIMESPEC_BYTES as u64),
+                ),
+            ),
+            (
+                "a buffer longer than the bitmap declares",
+                setattrlistat_entry(
+                    ATTR_CMN_MODTIME,
+                    &[(1, 2)],
+                    0,
+                    ATTR_BIT_MAP_COUNT,
+                    0,
+                    Some(2 * TIMESPEC_BYTES as u64),
+                ),
+            ),
+            (
+                "an option bit outside NOFOLLOW|UTIMES_NULL",
+                setattrlistat_entry(
+                    ATTR_CMN_MODTIME,
+                    &[(1, 2)],
+                    0x0000_0002,
+                    ATTR_BIT_MAP_COUNT,
+                    0,
+                    None,
+                ),
+            ),
+            (
+                "an attrlist naming no attribute at all",
+                setattrlistat_entry(0, &[], 0, ATTR_BIT_MAP_COUNT, 0, None),
+            ),
+            (
+                "a tv_nsec outside one second",
+                setattrlistat_entry(
+                    ATTR_CMN_MODTIME,
+                    &[(1, 1_000_000_000)],
+                    0,
+                    ATTR_BIT_MAP_COUNT,
+                    0,
+                    None,
+                ),
+            ),
+        ];
+        for (why, (regs, memory)) in refused {
+            let mut memory = Memory {
+                base: memory.base,
+                data: memory.data.clone(),
+                reads: 0,
+            };
+            assert!(
+                DarwinArm64Abi.decode_entry(regs, &mut memory).is_err(),
+                "{why} was accepted"
+            );
+        }
+    }
+
+    /// The interposer's descriptor test and the supervisor's are twins, and
+    /// this is the only thing that links them.
+    ///
+    /// `fstat` is routed through the tracer, not the interposer, so every
+    /// `fstat` in the process reaches a breakpoint -- libsystem's own on kernel
+    /// descriptors included. `Supervisor::syscall_entry` therefore applies the
+    /// interposer's own floor test before resolving one, and the two
+    /// expressions live in two languages with nothing between them. The *value*
+    /// cannot drift: there is one `DESCRIPTOR_FENCE` and one assignment in the
+    /// tree, and both read it. The *comparison* can.
+    ///
+    /// So this pins the C's text. It is deliberately a text assertion rather
+    /// than a behavioural one: the C cannot be called from here, and what is
+    /// being guarded is precisely that someone edits one copy of a predicate
+    /// without the other. A change to `umbra_owns` fails here, with a message
+    /// naming the Rust site to change with it.
+    ///
+    /// **What the pair is, stated exactly, because "pinned" invites a stronger
+    /// reading than holds.** It is three things, not one proof:
+    ///
+    /// 1. *A change-detector on the C side* -- this test. A whitespace-
+    ///    normalised exact-text assertion on the whole body of `umbra_owns`, in
+    ///    the file that is actually compiled into the shipped dylib. Any token
+    ///    change fails it.
+    /// 2. *A behaviour test on the Rust side* --
+    ///    `the_descriptor_fence_owns_exactly_the_fenced_range` in
+    ///    `umbra-supervisor`, covering the unfenced branch, both fenced
+    ///    branches and negative descriptors.
+    /// 3. *A human-judged equivalence between them*, recorded as the term-for-
+    ///    term table in `umbra_owns_descriptor`'s doc comment.
+    ///
+    /// **It is not a proof that the two implementations agree.** Edit both
+    /// consistently wrong -- change the C's `>=` to `>` and update this literal
+    /// to match, and change the Rust the same way -- and both tests pass. Only
+    /// (3) stands between that and a shipped fence off by one, and (3) is prose.
+    ///
+    /// The coupling is also **one-directional**: a C edit fails a test whose
+    /// message names the Rust function, while a Rust edit fails a test none of
+    /// whose messages mention the C. And this assertion fires on cosmetic edits
+    /// -- reformatting, renaming the parameter, adding a cast -- which trains a
+    /// reader to update the literal rather than re-check the Rust. The message
+    /// below is written against that habit and cannot fully defeat it.
+    ///
+    /// Given the C cannot be called from Rust without a harness this is close
+    /// to the best available, and it is recorded here at what it is worth
+    /// rather than at what it looks like.
+    ///
+    /// The Rust twin is `umbra_owns_descriptor` in
+    /// `umbra-supervisor/src/events.rs`, named after this function so the
+    /// correspondence is nominal rather than only semantic.
+    #[test]
+    fn the_interposers_descriptor_test_is_the_one_the_supervisor_applies() {
+        let body = INTERPOSER_C
+            .split_once("static int umbra_owns(int fd) {")
+            .expect("umbra_owns is defined in umbra_interpose.c")
+            .1
+            .split_once('}')
+            .expect("umbra_owns has a body")
+            .0;
+        let normalised = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            normalised, "return umbra_active() && fd >= 0 && (uint64_t)fd >= umbra_control.floor;",
+            "`umbra_owns` changed. Its twin is `umbra_owns_descriptor` in \
+             umbra-supervisor/src/events.rs, which gates the `FsOp::Fstat` \
+             descriptor fence and must express the same test against the same \
+             `descriptor_floor`. Change one, change both -- a virtual descriptor \
+             the supervisor resumes instead of resolving is answered `EBADF` by a \
+             kernel that does not own the number, and a kernel descriptor it \
+             resolves instead of resuming is answered `EBADF` by umbra, which does \
+             not."
+        );
+    }
+
+    /// **The test that would have caught the `intercept()`/`install()` drift.**
+    ///
+    /// Four stub rows were added to the breakpointed list and the second
+    /// admission gate was not extended, so every breakpoint they planted fell
+    /// through to `intercept()`'s refusal and stopped the run -- including
+    /// `fstat`(339), which libSystem issues before `main` in every process.
+    /// Both lists were individually correct; nothing checked the pair.
+    ///
+    /// The structural half of the fix is that there is now one table and
+    /// `intercept()` matches exhaustively on [`Delivery`], so that particular
+    /// drift cannot recompile. This is the half the compiler cannot do: a stub
+    /// row can still be marked `Namespace` while no decoder arm classifies its
+    /// number, which would deliver a `SyscallEntry` the caller then refuses.
+    /// `decode_entry`'s own `unclassified Darwin syscall` arm is the thing that
+    /// would fire, so this asserts it does not, for every row.
+    ///
+    /// Operands are deliberately garbage: a decode may well fail on them, and
+    /// that is fine. What may not happen is falling off the end of the
+    /// classification, which is a different error and the only one checked.
+    #[test]
+    fn every_traced_stub_is_classified_by_the_decoder() {
+        for (symbol, number, delivery) in TRACED_STUBS {
+            if *delivery != Delivery::Namespace {
+                // Handled by the backend itself; `decode_entry` never sees it,
+                // except for the two it positively classifies as non-filesystem.
+                continue;
+            }
+            let mut memory = strings();
+            let outcome =
+                DarwinArm64Abi.decode_entry(&entry(*number, [ABS, ABS, ABS, 0, 0]), &mut memory);
+            if let Err(e) = outcome {
+                assert!(
+                    !format!("{e}").contains("unclassified"),
+                    "{symbol}({number}) is breakpointed and delivered to the namespace, \
+                     but the decoder does not classify it: {e}"
+                );
+            }
+        }
+    }
+
+    /// **Every** row's `Delivery` against the one the decoder implies, derived
+    /// from the table rather than from a list written beside it.
+    ///
+    /// The compiler proves nobody forgot to classify a variant. Nothing proves
+    /// anybody classified a *row* correctly -- `("fchownat", 468,
+    /// Delivery::Fork)` type-checks, and at runtime a tracee's `fchownat` would
+    /// take the fork arm and have its return value read as a child pid.
+    ///
+    /// The property that decides it needs no second list. `decode_entry`
+    /// answers `Ok(None)` for exactly the syscalls the backend handles itself
+    /// -- its `1 | 2 | 7 | 20 | 59 | 244 | 400` arm -- and answers something
+    /// else for every filesystem call. So over `TRACED_STUBS`:
+    ///
+    /// > a row is `Delivery::Namespace` **if and only if** `decode_entry` does
+    /// > not answer `Ok(None)` for its number.
+    ///
+    /// Both directions matter and both are checked. A `Namespace` row whose
+    /// number the backend handles would deliver a fork to the caller to decode;
+    /// a process-control row whose number is a filesystem call would take a
+    /// path operation into `intercept`'s fork, wait or exec machinery.
+    ///
+    /// Operands are deliberately garbage: a `Namespace` decode may well fail on
+    /// them, and an `Err` is "not `Ok(None)`" just as much as an `Ok(Some(..))`
+    /// is. What is being asked is which side of the classification the number
+    /// falls on, not whether these particular registers decode.
+    #[test]
+    fn every_traced_stub_carries_the_delivery_its_number_implies() {
+        for (symbol, number, delivery) in TRACED_STUBS {
+            let mut memory = strings();
+            let classified =
+                DarwinArm64Abi.decode_entry(&entry(*number, [ABS, ABS, ABS, 0, 0]), &mut memory);
+            let backend_handles = matches!(classified, Ok(None));
+            let expected = if backend_handles {
+                // The backend handles it, so `Namespace` would be wrong. Which
+                // of Fork/Wait/Exec is right is what the spot-check below pins.
+                assert_ne!(
+                    *delivery,
+                    Delivery::Namespace,
+                    "{symbol}({number}) is delivered to the namespace, but the decoder \
+                     positively classifies it as a process-control call the backend \
+                     handles itself"
+                );
+                continue;
+            } else {
+                Delivery::Namespace
+            };
+            assert_eq!(
+                *delivery, expected,
+                "{symbol}({number}) is not delivered to the namespace, but the decoder \
+                 classifies it as a filesystem call -- `intercept` would take it into \
+                 fork, wait or exec machinery"
+            );
+        }
+    }
+
+    /// A spot-check of the five process-control numbers and the filesystem ones
+    /// this slice cares about, against values measured on this host.
+    ///
+    /// Independent of the biconditional above rather than redundant with it:
+    /// that one derives the expected disposition from `decode_entry`, so it
+    /// cannot catch the two moving together. This one pins literal numbers to
+    /// literal dispositions, which is the thing a reader can check against
+    /// `nm`/`dlsym` output by hand.
+    ///
+    /// Pinned against the syscall numbers rather than the symbols, because the
+    /// numbers are what `intercept()` dispatches on.
+    #[test]
+    fn process_control_stubs_are_not_delivered_to_the_namespace() {
+        for (number, expected) in [
+            (2u64, Delivery::Fork),
+            (7, Delivery::Wait),
+            (400, Delivery::Wait),
+            (59, Delivery::Exec),
+            (244, Delivery::Exec),
+        ] {
+            assert_eq!(delivery(number), Some(expected), "syscall {number}");
+        }
+        // And every filesystem call this slice routes is on the other side of
+        // that line, including the three it added.
+        for number in [5u64, 57, 58, 136, 189, 339, 398, 463, 470, 475, 488, 524] {
+            assert_eq!(
+                delivery(number),
+                Some(Delivery::Namespace),
+                "syscall {number}"
+            );
+        }
+        // A number no stub issues has no disposition at all, which is what makes
+        // `intercept()`'s refusal reachable rather than dead.
+        assert_eq!(delivery(999), None);
+    }
+
+    /// A bad `struct stat` pointer is an errno the tracee can be answered with,
+    /// not a fault that stops the run.
+    ///
+    /// The regression this pins is specific and was measured once already, for
+    /// `read`: `routing_for`'s doc comment records that returning `Err` for a
+    /// bad pointer *"stopped the whole run over an ordinary program bug"*. The
+    /// `fstat` branch of `io_buffer` initially skipped the guard its immediate
+    /// neighbour applies, so `fstat(vfd, NULL)` reached `write_memory` at
+    /// address zero and killed the run where Darwin answers `EFAULT`.
+    ///
+    /// `Errno(14)` travelling *inside* the error is the mechanism: the caller
+    /// binds it through `io_binding` and answers the tracee with it. An error
+    /// carrying no errno would stop the run, which is why the assertion is on
+    /// the errno and not merely on `is_err`.
+    #[test]
+    fn a_null_or_overflowing_fstat_buffer_is_an_errno_rather_than_a_dead_run() {
+        for number in [189u64, 339] {
+            let null = DarwinArm64Abi
+                .io_buffer(&entry(number, [7, 0, 0, 0, 0]))
+                .expect_err("a null stat buffer must be refused");
+            assert_eq!(null.errno, Some(Errno(14)), "syscall {number}");
+
+            let overflow = DarwinArm64Abi
+                .io_buffer(&entry(number, [7, u64::MAX, 0, 0, 0]))
+                .expect_err("an overflowing stat buffer must be refused");
+            assert_eq!(overflow.errno, Some(Errno(14)), "syscall {number}");
+
+            // The ordinary case still binds, so the guard refuses only what it
+            // is for.
+            assert_eq!(
+                DarwinArm64Abi
+                    .io_buffer(&entry(number, [7, 8192, 0, 0, 0]))
+                    .unwrap(),
+                Some(IoBuffer {
+                    address: 8192,
+                    length: STAT_BYTES as u32,
+                }),
+                "syscall {number}"
+            );
+        }
+    }
+
+    /// The ABI's own stat encoding is what a routed `fstat` answers with, so the
+    /// trait method and the free function have to be the same encoding rather
+    /// than two that happen to agree today.
+    #[test]
+    fn the_abi_encodes_a_stat_through_the_same_layout_the_free_function_does() {
+        let stat = BlobStat {
+            object_id: ObjectId(uuid::Uuid::from_u128(9)),
+            kind: ObjectKind::File,
+            len: 4096,
+            link_count: 1,
+            mode: 0o644,
+            uid: 501,
+            gid: 20,
+            modified_nanos: 1_555_555_555_666_777_888,
+        };
+        let through_trait = DarwinArm64Abi.encode_stat(&stat).unwrap();
+        assert_eq!(through_trait, encode_stat(&stat).unwrap());
+        assert_eq!(through_trait.len(), STAT_BYTES);
     }
 }

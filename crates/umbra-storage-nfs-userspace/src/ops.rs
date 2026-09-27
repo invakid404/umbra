@@ -308,20 +308,33 @@ impl Operations {
     /// verifier, and the barrier says nothing about fencing, an atomic snapshot,
     /// or continuous persistence.
     ///
-    /// `STORAGE_OWNERSHIP_FIDELITY_V1` is advertised only here, on an *open* run,
-    /// and not on the unbound capabilities in `storage.rs`, for the same reason
-    /// the limits are zero there: without a bound transport there is nothing
-    /// qualified to claim. The claim itself is corroborated by the capability
-    /// table in `capability.rs`, where `SetMetadata` is `Support::Supported`, and
-    /// by `namespace::dispatch`, which maps `update.uid`/`gid` onto
-    /// `FATTR4_OWNER`/`FATTR4_OWNER_GROUP` and has a test reading them back.
-    /// Advertising a name the table marked `Deferred` would be exactly the drift
-    /// this crate's doc comment makes load-bearing.
+    /// `STORAGE_OWNERSHIP_FIDELITY_V1` and `STORAGE_TIMESTAMP_FIDELITY_V1` are
+    /// advertised only here, on an *open* run, and not on the unbound
+    /// capabilities in `storage.rs`, for the same reason the limits are zero
+    /// there: without a bound transport there is nothing qualified to claim.
+    /// Both claims are corroborated by the same two places -- the capability
+    /// table in `capability.rs`, where `SetMetadata` is `Support::Supported`,
+    /// and `namespace::dispatch`, whose `attr_values` maps `update.uid`/`gid`
+    /// onto `FATTR4_OWNER`/`FATTR4_OWNER_GROUP` and `update.accessed_nanos`/
+    /// `modified_nanos` onto `FATTR4_TIME_ACCESS_SET`/`FATTR4_TIME_MODIFY_SET`,
+    /// each with a test reading them back. Advertising a name the table marked
+    /// `Deferred` would be exactly the drift this crate's doc comment makes
+    /// load-bearing.
+    ///
+    /// The timestamp name is what the three refusing backends deliberately do
+    /// **not** advertise, which is how a `utimensat` the tracee issued is
+    /// refused to the tracee rather than stopping the run on a backend that
+    /// cannot apply it. `nfs_time` is the other half of the claim: a time this
+    /// node cannot represent is refused before the SETATTR is dispatched, never
+    /// dropped from it.
     pub fn capabilities(&self) -> StorageCapabilities {
         StorageCapabilities {
-            features: [umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned()]
-                .into_iter()
-                .collect(),
+            features: [
+                umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1.to_owned(),
+                umbra_core::capabilities::STORAGE_TIMESTAMP_FIDELITY_V1.to_owned(),
+            ]
+            .into_iter()
+            .collect(),
             durability: self.durability(),
             strict_remote_persistence: false,
             fencing: Fencing::ReadOnly,
@@ -1383,14 +1396,21 @@ mod tests {
         assert!(!binding.capabilities.hard_links);
         assert!(!binding.capabilities.atomic_swap);
         assert!(!binding.capabilities.kernel_shadow);
-        // The one name this node has qualified, and the whole set rather than
+        // The two names this node has qualified, and the whole set rather than
         // just its size: `SetMetadata` is `Support::Supported` in
-        // `capability.rs`'s table and `namespace::dispatch` maps `update.uid`
-        // and `update.gid` onto `FATTR4_OWNER`/`FATTR4_OWNER_GROUP`, which is
-        // what `ownership-fidelity-v1` claims. Nothing else is claimed.
+        // `capability.rs`'s table and `namespace::dispatch`'s `attr_values`
+        // maps `update.uid`/`gid` onto `FATTR4_OWNER`/`FATTR4_OWNER_GROUP` and
+        // `update.accessed_nanos`/`modified_nanos` onto
+        // `FATTR4_TIME_ACCESS_SET`/`FATTR4_TIME_MODIFY_SET`, which is what
+        // `ownership-fidelity-v1` and `timestamp-fidelity-v1` claim
+        // respectively. Nothing else is claimed. Sorted, because `features` is
+        // a `BTreeSet`.
         assert_eq!(
             binding.capabilities.features.iter().collect::<Vec<_>>(),
-            vec![umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1],
+            vec![
+                umbra_core::capabilities::STORAGE_OWNERSHIP_FIDELITY_V1,
+                umbra_core::capabilities::STORAGE_TIMESTAMP_FIDELITY_V1,
+            ],
         );
     }
 

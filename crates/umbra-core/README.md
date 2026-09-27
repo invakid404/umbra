@@ -34,6 +34,15 @@ applied and a refusal reported, never that every chown succeeds, so a consumer
 requires the name to decide whether to attempt an ownership carry and still
 handles `ErrorKind::Denied` on the attempt. Adding it changed no struct and no
 `PROTOCOL_VERSION`, which is the property the `features` set exists to give.
+`capabilities::STORAGE_TIMESTAMP_FIDELITY_V1` is its sibling and reads the same
+way: a time the backend can represent is applied and anything else is refused
+whole, never that every time is settable. `umbra-storage-local`,
+`umbra-storage-nfs` and `umbra-storage-tar` refuse timestamps outright and do not
+advertise it. A consumer requires it to decide whether to *try*: without it a
+`utimensat` is refused to the tracee at `resolve`, before any journal record
+exists, rather than reaching a backend that answers `UnsupportedCapability` from
+inside `prepare` where the durable intent is already flushed and the only outcome
+left is a stopped run.
 `FinishRunRequest`,
 `FinishRunReceipt` and `FailedRunRequest` describe the namespace run lifecycle,
 which `capabilities::NAMESPACE_RUN_LIFECYCLE_V1` names for the handshake,

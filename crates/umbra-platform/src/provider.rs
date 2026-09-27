@@ -84,6 +84,8 @@ pub enum Request {
     },
     /// Io buffer.
     IoBuffer(RegisterSet),
+    /// Encode stat.
+    EncodeStat(umbra_core::BlobStat),
 }
 /// Owned method results, including buffers copied only after response validation.
 #[derive(Serialize, Deserialize)]
@@ -106,6 +108,12 @@ pub enum Response {
     Decoded(Option<FsOp>),
     /// Io buffer.
     IoBuffer(Option<umbra_core::IoBuffer>),
+    /// Encoded stat.
+    ///
+    /// Distinct from [`Response::Bytes`], which is a memory read's reply: these
+    /// bytes are an ABI encoding of metadata and were never in the tracee, and
+    /// a shared variant would let one answer the other's request.
+    EncodedStat(Vec<u8>),
     /// Prepared.
     Prepared(PreparedRewrite),
 }
@@ -318,6 +326,17 @@ impl SyscallAbi for Abi {
             _ => Err(protocol_error("platform.io_buffer response")),
         }
     }
+    fn encode_stat(&self, stat: &umbra_core::BlobStat) -> Result<Vec<u8>> {
+        // A plain call for the same reason `io_buffer` is one: the encoding is a
+        // pure function of the metadata and touches no stopped task.
+        match call(&self.client, &Request::EncodeStat(stat.clone()))? {
+            Response::EncodedStat(bytes) if !bytes.is_empty() && bytes.len() <= MAX_IO_BYTES => {
+                Ok(bytes)
+            }
+            Response::EncodedStat(_) => Err(protocol_error("platform.encode_stat length")),
+            _ => Err(protocol_error("platform.encode_stat response")),
+        }
+    }
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()> {
         match call(
             &self.client,
@@ -508,6 +527,9 @@ fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> R
                         .map(Response::Decoded)
                 }
                 Request::IoBuffer(regs) => platform.abi.io_buffer(&regs).map(Response::IoBuffer),
+                Request::EncodeStat(stat) => {
+                    platform.abi.encode_stat(&stat).map(Response::EncodedStat)
+                }
                 Request::Rewrite { mut regs, rewrite } => platform
                     .abi
                     .apply_rewrite(&mut regs, &rewrite)

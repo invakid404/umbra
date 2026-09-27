@@ -36,6 +36,15 @@ fn parent(path: &StoragePath) -> Result<StoragePath> {
 /// learning a backend identity. `modified_nanos` is refused with the rest even
 /// though `BlobStat` has a field for it: a uniform surface is worth more than
 /// one backend accepting one field the other two do not.
+///
+/// The surface is no longer uniform across *four* backends --
+/// `umbra-storage-nfs-userspace` applies both times and advertises
+/// [`umbra_core::capabilities::STORAGE_TIMESTAMP_FIDELITY_V1`] for it -- and
+/// that is what makes this refusal safe to keep now that `utimensat` has a
+/// caller: a consumer requires the name before it tries, so the operation is
+/// refused to the tracee rather than reaching this line from a transaction that
+/// has already flushed its intent. Do not advertise the name here without
+/// implementing the update.
 fn check_update(update: &MetadataUpdate) -> Result<()> {
     if update.accessed_nanos.is_some() || update.modified_nanos.is_some() {
         return Err(unsupported());

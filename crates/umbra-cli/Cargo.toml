@@ -24,6 +24,15 @@ mutation-probe-write = [
     "umbra-supervisor/mutation-probe-write",
     "umbra-overlay/mutation-probe-write",
 ]
+# The `fstat` probe lives in `umbra-overlay` beside the other two. Its sibling
+# probes for `mkdir` and `setattrlistat` are features of
+# `umbra-platform-macos`, which is a provider *executable* rather than a library
+# this binary links, so they are enabled when that binary is built and are not
+# forwarded from here.
+mutation-probe-fstat = [
+    "umbra-supervisor/mutation-probe-fstat",
+    "umbra-overlay/mutation-probe-fstat",
+]
 
 [dependencies]
 clap.workspace = true

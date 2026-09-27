@@ -103,35 +103,55 @@ fn fixture_argv(
                     .decode_entry(&registers, &mut Memory(&mut tracer, task))
                     .unwrap()
                     .unwrap();
-                let FsOp::Open {
-                    ref path, flags, ..
-                } = op
-                else {
-                    panic!("unexpected operation")
-                };
-                assert!(path.is_absolute(), "relative paths are not qualified");
-                // Only rewrite write-intent opens to the shadow root; leave
-                // read-only opens (library/dyld loads, runtime resource reads)
-                // pointing at the host so the tracee can actually start.
-                let write_intent = flags.write || flags.append || flags.create || flags.truncate;
-                if write_intent {
-                    let physical = root.join(
-                        Path::new(std::ffi::OsStr::from_bytes(path.as_bytes()))
-                            .strip_prefix("/")
-                            .unwrap(),
-                    );
-                    std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
-                    let plan = tracer
-                        .prepare_rewrite(thread, &byte_path(&physical), op)
-                        .unwrap();
-                    for write in &plan.memory_writes {
-                        tracer
-                            .write_memory(task, write.address, &write.bytes)
-                            .unwrap();
+                match op {
+                    FsOp::Open {
+                        ref path, flags, ..
+                    } => {
+                        assert!(path.is_absolute(), "relative paths are not qualified");
+                        // Only rewrite write-intent opens to the shadow root; leave
+                        // read-only opens (library/dyld loads, runtime resource reads)
+                        // pointing at the host so the tracee can actually start.
+                        let write_intent =
+                            flags.write || flags.append || flags.create || flags.truncate;
+                        if write_intent {
+                            let physical = root.join(
+                                Path::new(std::ffi::OsStr::from_bytes(path.as_bytes()))
+                                    .strip_prefix("/")
+                                    .unwrap(),
+                            );
+                            std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
+                            let plan = tracer
+                                .prepare_rewrite(thread, &byte_path(&physical), op)
+                                .unwrap();
+                            for write in &plan.memory_writes {
+                                tracer
+                                    .write_memory(task, write.address, &write.bytes)
+                                    .unwrap();
+                            }
+                            DarwinArm64Abi.apply_rewrite(&mut registers, &plan).unwrap();
+                            tracer.set_registers(thread, &registers).unwrap();
+                            opens += 1;
+                        }
                     }
-                    DarwinArm64Abi.apply_rewrite(&mut registers, &plan).unwrap();
-                    tracer.set_registers(thread, &registers).unwrap();
-                    opens += 1;
+                    // Let through to the kernel unmodified, which is what this
+                    // harness has always done for a read-only open.
+                    //
+                    // **This arm is why the panic below is still meaningful.**
+                    // `fstat` joined the breakpointed stub list, and libSystem
+                    // issues it on a *kernel* descriptor before `main` in every
+                    // process -- `_os_feature_table_once` on fd 3 -- so every
+                    // case here now sees one before it sees an open. There is no
+                    // namespace in this harness and the descriptor is real, so
+                    // letting the kernel answer is the honest result, and it is
+                    // the same disposition the supervisor's descriptor fence
+                    // reaches for a sub-floor descriptor.
+                    //
+                    // Named rather than folded into a wildcard: this driver
+                    // rewrites write-intent opens and nothing else, and an
+                    // operation it has no plan for should still stop the case
+                    // loudly rather than be silently resumed.
+                    FsOp::Fstat { .. } => {}
+                    other => panic!("unexpected operation {other:?}"),
                 }
                 Some(thread)
             }
@@ -398,7 +418,23 @@ fn operands(op: &FsOp) -> Vec<(DirRef, &BytePath)> {
         | FsOp::ReadLink { dir, path }
         | FsOp::Mkdir { dir, path, .. }
         | FsOp::Chmod { dir, path, .. }
-        | FsOp::Fchownat { dir, path, .. } => vec![(*dir, path)],
+        | FsOp::Fchownat { dir, path, .. }
+        // `SetTimes` carries exactly this shape and was missing, so
+        // `case_traffic` answered `false` for it and the driver below resumed
+        // the syscall **unrewritten** -- the kernel would have applied the times
+        // to the host path, or Seatbelt refused, and either way the case would
+        // have passed or failed for a reason that has nothing to do with the
+        // overlay. Latent when it was introduced (no case issues `utimensat`)
+        // and named rather than left to be discovered, because a harness that
+        // silently stops mediating an operation class it appears to mediate is
+        // worse than one that never claimed to.
+        //
+        // The wildcard below is what made it silent. It is kept, because the
+        // descriptor-relative operations genuinely name no path operand and
+        // adding them here would be wrong -- but every *path-carrying* variant
+        // must be listed, and that is the rule a future `FsOp` addition has to
+        // check against rather than a shape this match happens to have today.
+        | FsOp::SetTimes { dir, path, .. } => vec![(*dir, path)],
         FsOp::Rename {
             from_dir,
             from,

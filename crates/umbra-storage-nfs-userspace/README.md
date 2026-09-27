@@ -572,11 +572,18 @@ verifier-compare probe succeeded against the run's own `.provider` — and
 `Durability::Local` otherwise, including on a read-only run, on a transport that
 declares nothing, and when the probe did not succeed. `Fencing::ReadOnly` stays: no independent
 termination verifier exists, and the barrier says nothing about fencing. The
-binding advertises exactly one `features` name,
-`ownership-fidelity-v1`: `SetMetadata` is `Support::Supported` in the capability
-table, and `NamespaceMutation::SetAttributes` maps `update.uid` and `update.gid`
-onto `FATTR4_OWNER` and `FATTR4_OWNER_GROUP` as stringified numeric ids, which is
-what that name claims. It is advertised on an *open* run only, never on the
+binding advertises exactly two `features` names,
+`ownership-fidelity-v1` and `timestamp-fidelity-v1`, both corroborated by the
+same two places: `SetMetadata` is `Support::Supported` in the capability table,
+and `NamespaceMutation::SetAttributes` maps `update.uid`/`update.gid` onto
+`FATTR4_OWNER`/`FATTR4_OWNER_GROUP` as stringified numeric ids and
+`update.accessed_nanos`/`update.modified_nanos` onto
+`FATTR4_TIME_ACCESS_SET`/`FATTR4_TIME_MODIFY_SET`, which is what those two names
+claim. The timestamp name is the one **this** provider carries and the other
+three storage backends deliberately do not: they refuse a timestamp update
+outright, so the overlay requires the name before it issues one at all, and a
+`utimensat` on a backend without it is refused to the tracee at `resolve`
+instead of stopping the run from inside `prepare`. It is advertised on an *open* run only, never on the
 unbound capabilities, for the same reason the limits are zero there: without a
 bound transport there is nothing qualified to claim.
 
@@ -666,16 +673,41 @@ sufficient, because umbra must be able to represent it too.
 | `unlink` | **A routed run cannot delete a file at all against a server that does not report atomic `change_info4` for REMOVE, and it does not refuse — it stops.** Measured against the Ganesha fixture, with the descriptor open *and* after closing it: `LeaseLost during namespace.remove: authority: object identity unproven: BLOCKED_RECOVERABLE: the REMOVE of <name> succeeded, but the server did not report atomic change info`, the run left recovery-required, and the writer release withheld. This is **this provider's own authority layer**, pre-existing and unrelated to routing — the same refusal a non-routed caller of `unlink` meets. It is listed here because the slice's own docs previously said "unlink or rename *while open*" and pointed at `engine.rs::routed_binding`, which implied unlink-while-closed worked and named a mechanism that is never reached. |
 | `rename`, and any other path operation, on an object **this run created or copied up** | Refused with **`ENOTSUP`** (`Errno(45)`), visibly, and the run survives. `rewrite` needs a kernel path this backend does not have, so `resolve` answers the tracee instead — see the row below. |
 | A descriptor whose **name stops resolving** while it is open | `ENOENT`. A routed descriptor is bound to a logical *path* and re-resolved on every operation, so an object that loses its name has nothing left to route to; closing that needs handle-based `Storage` operations the surface does not have. Not reachable against this fixture, because `unlink` stops the run first (above). |
-| **Every other intercepted path operation on an object this run created or copied up** — `fstatat`, `faccessat`, `renameat`, `linkat`, `fchownat` | Refused with **`ENOTSUP`** (`Errno(45)` — Darwin's value; routing exists on Darwin only). `rewrite` would have to name a kernel path this backend does not have, so `resolve` answers the tracee instead of stopping the run. The same operation on an object the run did *not* touch still rewrites to the read-only base's host path and works. This is a visible refusal, not a supported operation: `create a file then stat it` is what `cp`, `install` and both the Rust and Go standard libraries do, and on a routed run it fails. Routing these properly means answering `Stat`/`Access` through an ABI encoder the way `ReadLink` already is — a larger slice than the toy this one claims. |
+| **Every other intercepted path operation on an object this run created or copied up** — `fstatat`, `faccessat`, `renameat`, `linkat`, `fchownat` | Refused with **`ENOTSUP`** (`Errno(45)` — Darwin's value; routing exists on Darwin only). `rewrite` would have to name a kernel path this backend does not have, so `resolve` answers the tracee instead of stopping the run. The same operation on an object the run did *not* touch still rewrites to the read-only base's host path and works. This is a visible refusal, not a supported operation: `create a file then stat it` is what `cp`, `install` and both the Rust and Go standard libraries do, and on a routed run it fails. Routing these properly means answering `Stat`/`Access` through an ABI encoder the way `ReadLink` already is. `Fstat` has since been routed exactly that way — the engine resolves the metadata, the ABI encodes it — and deliberately did **not** widen this row: an `fstat` names a descriptor, so it never reaches path resolution, and `Stat`/`Access` on a shadow object are still refused here. |
 | `openat` | **Routed, via the syscall path** -- not in the `EBADF` class. `__openat` is still breakpointed and syscall 463 is still admitted, so it resolves through the same routed-`Open` arm the interposer's `open` reaches, and returns a virtual descriptor. Measured: exit 0, host destination absent. Only `openat` with a *virtual* dirfd is refused, and it is refused by the case below. |
-| `lseek`, `fstat`, `dup`, `dup2`, `fcntl`, `ftruncate`, `fsync`, `pread`, `pwrite`, `readv`, `writev`, and `openat` with a virtual dirfd | Not interposed and not rewritable: these are **descriptor-relative**, and a routed descriptor is not a kernel object. They reach the kernel, which does not know the number, and receive `EBADF`. The `RLIMIT_NOFILE` fence is what makes that a refusal rather than an operation on someone else's descriptor. |
+| `fstat` | **Routed, via the syscall path** -- no longer in the `EBADF` class below, and listed separately because it is the first *descriptor-relative* call to leave it. `fstat`(339)/`__fstat`(189) are breakpointed libc stubs, resolved against the descriptor's logical object and answered with an emulated `struct stat`. Every `fstat` in the process traps, including libSystem's own on kernel descriptors, so the supervisor applies the descriptor fence before resolving: below the floor the call passes through to the kernel untouched. `touch` needs this -- without it the file was created and the utility still exited 1 with `Bad file descriptor`. |
+| `lseek`, `dup`, `dup2`, `fcntl`, `ftruncate`, `fsync`, `pread`, `pwrite`, `readv`, `writev`, and `openat` with a virtual dirfd | Not interposed and not rewritable: these are **descriptor-relative**, and a routed descriptor is not a kernel object. They reach the kernel, which does not know the number, and receive `EBADF`. The `RLIMIT_NOFILE` fence is what makes that a refusal rather than an operation on someone else's descriptor. |
 | Directory reads (`getdirentries`, `getattrlistbulk`) | Not routed. A routed `open` of a directory is refused outright rather than handing back a descriptor nothing could use. |
 | `open` with `O_APPEND` | Refused. Honouring it means writing at the object's end atomically with respect to other writers, and `Storage` has no append-at-end operation; stat-then-write is right for one writer and silently wrong for two. |
 | `exec` of a new image | Not claimed. The interposer activates only in the image umbra named at launch, so an exec'd image routes nothing and its file operations meet the sandbox instead. |
 | Calls made before umbra **arms** the interposer | Not routed — and the window is dyld's image loading **and every library initializer**, not just dyld's own loads. There has been no constructor since round 1: the library ships inert and umbra arms it by writing its control block *after* planting breakpoints, so everything an initializer does runs with the interposer dormant. Reads in that window reach the host; writes are refused by the Seatbelt profile, so it fails **closed** — but a program that writes from an initializer works on every other backend and fails here. The window is strictly larger than a rewrite-backed run's, which plants its breakpoints at the dyld image-notifier stop, before any initializer. Measured both ways in `umbra-platform-macos/README.md`; `impl.md` §1.5 carries the arming order. |
 | More than 4096 concurrent routed descriptors | **`EMFILE`**, visibly, and the run survives. umbra allocates from `[4096, 8192)` — the same size as the kernel's fenced range — so the limit the tracee is told through `getrlimit` is the limit it gets on each side, and `ProcessContext::fds` is bounded. An earlier shape scanned to `i32::MAX`, which made both halves false: measured, a tracee held 400 routed descriptors with no refusal, and the practical ceiling was the run deadline rather than the fence. |
 | A **forked** child of a routed run | **Supported, and measured both ways.** The child is mediated from its first instruction: `fork` copies the armed interposer, so umbra finds its load address in the child's own image list and does not re-arm — re-running the address search resumed the child to a `main` it had already passed, leaving it unmediated until its first routed call took `SIGSYS`, which is the defect CodeRabbit found on PR #116. A routed descriptor also survives the fork *with its offset*, so a child's write continues the parent's in the store. `exec` is different and unchanged: the new image is loaded and armed from scratch. Covered by `a_forked_child_of_a_routed_tracee_is_mediated_and_the_run_finishes` and `a_routed_descriptor_survives_a_fork_and_the_child_s_write_reaches_the_store`. |
-| **Standard utilities** (`cat`, `ls`, `touch`, `mkdir`) | **Not claimed by this slice.** `cat` needs `fstat`; `ls` needs directory reads; `mkdir` reaches no interposed function. |
+| **`ls`, and every directory read** | **Not claimed.** `ls` reads directories with `getattrlistbulk`(461), which is unrouted, and also needs `fchdir`(13) on a virtual dirfd — a virtual-cwd model umbra does not have — and a second directory wire format. Measured: `fts` falls back to `readdir` and the *names print correctly*, but `ls` exits 1 for every one of the eight errnos `getattrlistbulk` can return, and with the dirfd `close` also refused it dies on `SIGTRAP`. There is no cheap `ls`, only a broken one. |
+| **`touch`, `cat` and `mkdir`** | **Claimed and shipped**, on the tracer rather than the interposer. `cat` needed nothing new — its `fstat` on stdout is a kernel descriptor below the fence, and it tolerates what happens on its virtual one. That is now *one answer and one refusal* rather than two refusals: its locale descriptor is virtual, the `fstat` on it is answered where it used to be refused, and `_Read_RuneMagi` then reaches an `mmap` on that descriptor which it never used to reach. Measured: the `mmap` is refused `EBADF`, `cat` exits 0 with correct bytes, and exits 1 with its own `No such file or directory` on an absent operand. `mkdir` needed bare `mkdir`(136). `touch` needed `fstat`(339) for the create path and `setattrlistat`(524) — which is how `utimensat` reaches the kernel — for the existing-file path. **`touch` on an existing file is served on this registry only**: it is the one backend that applies a timestamp, and the other three refuse it with `ENOTSUP` at `resolve` while the run survives. |
+
+**What the shipped claim above rests on.** Routing for all three utilities is
+proven **by execution against a live NFS-Ganesha fixture**, not inferred. The
+end-to-end case is `standard_utilities_run_over_the_userspace_client` in
+`tests/userspace_run.rs`: five cases -- `mkdir` into the shadow, `touch` on an
+absent and on an existing operand, `cat` on a present and on an absent one -- each
+asserting the store holds the result *read back through this client* and the host
+workspace is untouched. Three mutation probes cover the three syscalls this slice
+routed, and each was run with its negative control: against an **unmutated** binary
+every probe **fails**, so a passing probe means the mutation was detected rather
+than that the case was skipped.
+
+What that does *not* extend to: the rewrite-backed matrices in `run_fixtures.rs`
+(`--local-dev` and the kernel-mount `nfs` adapter) cannot substitute for the above,
+and one asymmetry shows why rather than leaving it as an assertion -- with the new
+stub rows removed, `touch` on an absent operand still exits 0 on `--local-dev`,
+because its descriptor there is a real kernel one, so that matrix cannot
+discriminate the `fstat` case even in principle. The suite needs this crate's
+`transport-raw` feature, a vendored `third_party/libnfs` at the pinned commit and a
+live fixture at `UMBRA_NFS_RAW_FIXTURE`; without all three it does not run, and its
+provisioning gate is a hard failure under `UMBRA_INTEGRATION_REQUIRED` rather than a
+silent skip, because a skip that reports success is how these proofs sat inert once
+already.
 
 ### Single-host: a routed run's journal is not in its store
 

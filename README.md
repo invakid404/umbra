@@ -77,13 +77,17 @@ refused — and no fencing.
 a run, a supervised command over it cannot have its file operations serviced by
 rewriting a syscall's path operand, so umbra loads an interposer into the tracee
 and services `open`, `read`, `write` and `close` itself, through the overlay and
-that client. A third CI job proves it against the same Ganesha container on the
-macOS runner: an end-to-end create/write/close/reopen/read/compare, and two
-mutation probes that break one routing direction each and must make the fixture
-fail with different exit codes. What the routed path does **not** claim, and why,
-is enumerated in that crate's README. The `UMBRA_TEST_SKIP_NFS_MATRIX` opt-out
-above is unaffected: it is about the mounted `storage-nfs` adapter, which the
-routed path does not replace.
+that client. `touch`, `cat` and `mkdir` work over it too, routed through the
+tracer rather than the interposer. A third CI job proves all of it against the
+same Ganesha container on the macOS runner: an end-to-end
+create/write/close/reopen/read/compare for the toy, the three standard utilities
+against the store read back through the client, and five mutation probes that
+break one routing direction each and must make the case fail. The two oldest
+probes assert distinct exit codes; the three utility probes assert distinct
+observable pairs instead, because Apple's utilities all exit 1. What the routed
+path does **not** claim, and why, is enumerated in that crate's README. The
+`UMBRA_TEST_SKIP_NFS_MATRIX` opt-out above is unaffected: it is about the mounted
+`storage-nfs` adapter, which the routed path does not replace.
 
 Fork pull requests cannot run either self-hosted job -- the `m1-transport-raw`
 qualification job or the `native-userspace-routing` routing job -- and neither

@@ -209,6 +209,27 @@ pub enum JournalIntent {
         /// assume `object` still locates what was chowned.
         copy_up: bool,
     },
+    /// Set times.
+    ///
+    /// Carries a path for exactly [`JournalIntent::Chown`]'s reason, and the
+    /// shape is deliberately its twin: a time change may materialise its target
+    /// as part of itself, and a copied-up file receives a new identity, so
+    /// `object` is the pre-materialisation identity and `path` is what stays
+    /// resolvable either way.
+    SetTimes {
+        /// Object. The pre-materialisation identity when `copy_up` is set.
+        object: ObjectId,
+        /// Path interpreted according to the enclosing operation and path type.
+        path: BytePath,
+        /// Accessed nanos. `None` left the access time unchanged.
+        accessed_nanos: Option<i128>,
+        /// Modified nanos. `None` left the modification time unchanged.
+        modified_nanos: Option<i128>,
+        /// This operation copied the object up from the immutable base before
+        /// changing its times, so a reader must resolve `path` rather than
+        /// assume `object` still locates what was touched.
+        copy_up: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -545,7 +566,7 @@ mod tests {
     fn every_journal_intent_encodes_to_the_bytes_the_log_already_holds() {
         let object = ObjectId(Uuid::from_u128(0x2323));
         let p = |b: &[u8]| BytePath::new(b.to_vec()).unwrap();
-        let cases: [(JournalIntent, &[u8]); 10] = [
+        let cases: [(JournalIntent, &[u8]); 11] = [
             (
                 JournalIntent::CopyUp { object, path: p(b"/c") },
                 br#"{"CopyUp":{"object":"00000000-0000-0000-0000-000000002323","path":[47,99]}}"#,
@@ -589,6 +610,18 @@ mod tests {
                 JournalIntent::Chown { object, path: p(b"/o"), uid: Some(1000), gid: None, copy_up: true },
                 br#"{"Chown":{"object":"00000000-0000-0000-0000-000000002323","path":[47,111],"uid":1000,"gid":null,"copy_up":true}}"#,
             ),
+            (
+                // One time set and one left alone, which is a shape the decoder
+                // really produces: `touch -a -t` emits `ATTR_CMN_ACCTIME` alone.
+                // The absent one is `null`, as `Chown`'s `gid` is.
+                //
+                // The times are `i128` -- the only 128-bit integers in this enum
+                // -- and `serde_json` renders them as bare numbers. The width
+                // that pinning cannot see from this case is pinned by
+                // `a_set_times_intent_keeps_its_full_128_bit_width_on_the_wire`.
+                JournalIntent::SetTimes { object, path: p(b"/t"), accessed_nanos: Some(1_111_111_111_222_333_444), modified_nanos: None, copy_up: true },
+                br#"{"SetTimes":{"object":"00000000-0000-0000-0000-000000002323","path":[47,116],"accessed_nanos":1111111111222333444,"modified_nanos":null,"copy_up":true}}"#,
+            ),
         ];
         for (intent, golden) in cases {
             let encoded = encode(&intent).unwrap();
@@ -599,6 +632,43 @@ mod tests {
             );
             assert_eq!(&decode::<JournalIntent>(golden).unwrap(), &intent);
         }
+    }
+
+    /// A `SetTimes` intent keeps its full 128-bit width on the wire.
+    ///
+    /// The byte-pinning above uses a realistic timestamp, and that is the case
+    /// it should document -- but a realistic timestamp fits in an `i64`, so
+    /// narrowing `accessed_nanos`/`modified_nanos` to `i64` would leave that
+    /// golden case encoding identically and the drift would be invisible.
+    ///
+    /// These are the only 128-bit integers in `JournalIntent`, and the width is
+    /// not decorative: the decoder builds them as `seconds * 1_000_000_000 +
+    /// nanos` from an `i64` `tv_sec`, so the representable range genuinely
+    /// exceeds `u64::MAX`. A journal written by a build that could represent
+    /// such a value, read back by one that could not, is silent truncation of a
+    /// durable record -- which is the class the golden tests in this file exist
+    /// for.
+    ///
+    /// Both bounds are exercised: a positive value one past `u64::MAX`, and a
+    /// negative one, because these are signed and a pre-epoch time is
+    /// representable. The expected bytes were taken from `encode`'s own output,
+    /// not written by hand.
+    #[test]
+    fn a_set_times_intent_keeps_its_full_128_bit_width_on_the_wire() {
+        let intent = JournalIntent::SetTimes {
+            object: ObjectId(Uuid::from_u128(0x2323)),
+            path: BytePath::new(b"/t".to_vec()).unwrap(),
+            accessed_nanos: Some(i128::from(u64::MAX) + 1),
+            modified_nanos: Some(-1),
+            copy_up: false,
+        };
+        let golden = br#"{"SetTimes":{"object":"00000000-0000-0000-0000-000000002323","path":[47,116],"accessed_nanos":18446744073709551616,"modified_nanos":-1,"copy_up":false}}"#;
+        assert_eq!(
+            std::str::from_utf8(&encode(&intent).unwrap()).unwrap(),
+            std::str::from_utf8(golden).unwrap(),
+            "a set-times value beyond `u64::MAX` no longer survives encoding"
+        );
+        assert_eq!(&decode::<JournalIntent>(golden).unwrap(), &intent);
     }
 
     /// Every `JournalLifecycle` variant, byte-pinned, for the same reason.
@@ -755,15 +825,30 @@ mod tests {
             JournalIntent::Chmod { object, mode: 0 },
             JournalIntent::Chown {
                 object,
-                path,
+                path: path.clone(),
                 uid: None,
                 gid: None,
+                copy_up: false,
+            },
+            JournalIntent::SetTimes {
+                object,
+                path,
+                accessed_nanos: None,
+                modified_nanos: None,
                 copy_up: false,
             },
         ];
         // Not a guard -- see the note above. The number is here so a diff that
         // adds a variant without adding it below is visible in review.
-        assert_eq!(intents.len(), 10);
+        //
+        // **The note above was right, and this is the diff that proved it.**
+        // It says "an eleventh variant leaves it green and the length
+        // assertion's message can never fire". `SetTimes` was that eleventh
+        // variant: it was added, this array was not, and every test in this file
+        // stayed green until a reviewer read the enum against the array by eye.
+        // The count moved 10 -> 11 by hand, exactly as the note predicts a
+        // twelfth would have to, and nothing here has become a guard.
+        assert_eq!(intents.len(), 11);
         for intent in &intents {
             let bytes = encode(intent).unwrap();
             assert_eq!(&decode::<JournalIntent>(&bytes).unwrap(), intent);

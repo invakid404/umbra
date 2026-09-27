@@ -198,9 +198,17 @@ impl NfsStorage {
 ///
 /// The same refusal `umbra-storage-local` and `umbra-storage-tar` make, in the
 /// same words, so a consumer reads one contract across all three rather than
-/// learning a backend identity. Timestamps are refused whole: `utimensat` would
-/// be a fourth syscall on this boundary with no caller behind it, and a silently
+/// learning a backend identity. Timestamps are refused whole, because a silently
 /// discarded write is the one outcome worse than an honest refusal.
+///
+/// **There is a caller for them now** -- `utimensat` reaches the overlay as
+/// `FsOp::SetTimes` -- so the old justification, that a `utimensat(2)` here
+/// would be a fourth syscall on this boundary with nothing behind it, no longer
+/// holds. The refusal does, and what makes it safe is
+/// [`umbra_core::capabilities::STORAGE_TIMESTAMP_FIDELITY_V1`]: this backend
+/// does not advertise it, so the overlay refuses the operation to the tracee at
+/// `resolve` rather than reaching this line from `prepare` with a flushed intent
+/// behind it. See `umbra-storage-local`'s `check_update` for the same note.
 fn check_update(update: &MetadataUpdate) -> Result<()> {
     if update.accessed_nanos.is_some() || update.modified_nanos.is_some() {
         return Err(unsupported("set_metadata: timestamps"));

@@ -394,6 +394,16 @@ enum Expect {
     /// The path operand is captured in the run's shadow with exactly these
     /// bytes, and is never created on the host.
     Captured(&'static [u8]),
+    /// The path operand is captured in the run's shadow **as a directory**, and
+    /// is never created on the host.
+    ///
+    /// A separate variant rather than `Captured(b"")` because a directory has no
+    /// bytes to read: `std::fs::read` on one fails, so the empty-file case and
+    /// the directory case cannot share an assertion without one of them being
+    /// checked for the wrong thing. The distinction is also the point of the
+    /// case that uses it -- `mkdir` must leave a directory, and an empty *file*
+    /// at that path would be a wrong answer this has to catch.
+    CapturedDirectory,
     /// The utility reads an operand that exists, exits zero, and leaves the host
     /// workspace byte-identical. Exiting zero says the operand was found, not
     /// that the overlay is what found it: this operand exists on the host too,
@@ -424,25 +434,105 @@ enum Expect {
     /// by this case: the operand is absent on the host too, so an unrewritten
     /// open composes the same diagnostic.
     Diagnoses,
-    /// The utility's path syscall is outside the tracer's intercepted set.
-    /// `umbra-platform-macos/src/native.rs:464-495` lists the libc stubs that get
-    /// a breakpoint and `abi.rs:95-115` the syscall numbers whose operands are
-    /// rewritten: `mkdirat` is in both, bare `mkdir(2)` is in neither. The
-    /// operand therefore reaches the kernel unrewritten and the unconditional
-    /// sandbox refuses it, so the child fails and the operation happens
-    /// *nowhere*: not on the host, not in the shadow. Enforcement, not
-    /// rewriting, is what contains this case.
+    /// The utility's path syscall is outside the tracer's intercepted set, so
+    /// the operand reaches the kernel unrewritten and the unconditional sandbox
+    /// refuses it. The child fails and the operation happens *nowhere*: not on
+    /// the host, not in the shadow. Enforcement, not rewriting, contains it.
+    ///
+    /// `umbra_platform_macos::abi::TRACED_STUBS` is the list of libc stubs that
+    /// get a breakpoint, and `abi::path_operands` the syscall numbers whose
+    /// operands are rewritten. Bare `mkdir(2)` is now in both
+    /// ([#114](https://github.com/invakid404/umbra/issues/114)); it used to be
+    /// named here as the example of a call in neither.
+    ///
+    /// **Those are item names, not line ranges, and the change is deliberate.**
+    /// This comment carried `native.rs:464-495` / `abi.rs:95-115`, sixty-odd PRs
+    /// out of date. Correcting them to the ranges `prep_workspace` verified
+    /// against master produced citations that were stale again *within the same
+    /// change*, because adding the stub rows moved both blocks. A line range is
+    /// the wrong artifact for a cross-file citation: it is invalidated by edits
+    /// that have nothing to do with what it points at, and nothing in the build
+    /// checks it. A named item moves with its definition and `cargo doc`
+    /// resolves it.
+    ///
+    /// What still holds is the variant, not that example. The two lists are
+    /// finite and deliberately narrow -- only what a shipped utility was
+    /// measured to need is in them -- so the bare non-`at` forms nothing has
+    /// needed yet are outside both: `unlink`(10), `link`(9), `chmod`(15),
+    /// `chown`(16), `rename`(128), `rmdir`(137), `utimes`(138),
+    /// `stat`(188)/`stat64`(338), `lstat`(190), `access`(33), `truncate`(200)
+    /// and `getattrlist`(220).
+    ///
+    /// So the variant is kept, and kept **exercised** rather than merely
+    /// described: `/bin/rm` reaches the kernel with a bare `unlink`(10), so it
+    /// takes the place `mkdir` vacated. A variant whose last case had been
+    /// routed would be prose claiming a path nothing walks, which is the same
+    /// failure as the stale citations above one layer up.
+    ///
+    /// `rm`'s footprint is **not** "`unlink` and nothing else" -- an earlier
+    /// version of this comment claimed that, and it was wrong. Re-measured
+    /// under lldb, post-`main`: two `ioctl`s from `isatty`, six locale opens
+    /// each followed by an `fstat`, then `lstat`(190), `access`(33) and
+    /// `unlink`(10). The first two of those are *also* bare non-`at` forms from
+    /// the inventory above, and they are also refused -- `lstat` and `access`
+    /// on an absent-from-both-tables number reach the kernel unrewritten and
+    /// read the host, which for this case is harmless because the operand is
+    /// on the host anyway. What makes the case discriminating is the `unlink`:
+    /// it is the only *mutation*, and the sandbox is what stops it.
+    ///
+    /// `rm` also does not prompt, and not for the reason first given: BSD `rm`
+    /// proceeds because stdin is not a tty (`Stdio::null()`), not because the
+    /// seed is mode 0644.
     RefusedByEnforcement,
+    /// The utility's syscall **is** routed, and umbra refuses it to the tracee
+    /// because this run's storage cannot serve it. The run survives.
+    ///
+    /// Distinct from [`Expect::RefusedByEnforcement`] in the thing that matters:
+    /// there, the operand escapes umbra entirely and Seatbelt contains it; here
+    /// umbra decodes the call, resolves it, and answers an errno. The two are
+    /// told apart by the message the utility prints -- `Operation not
+    /// supported` against `Operation not permitted` -- which is asserted,
+    /// because otherwise a regression that turned one into the other would go
+    /// unnoticed.
+    ///
+    /// **This is the case that makes the timestamp asymmetry executable rather
+    /// than merely documented.** `touch <existing>` reaches the kernel as
+    /// `setattrlistat`(524), which umbra routes on every registry -- but only
+    /// `umbra-storage-nfs-userspace` can apply a timestamp. Both matrices in
+    /// this file are rewrite-backed, so both answer `ENOTSUP`. The important
+    /// half is what does *not* happen: no journal record, no copy-up, no
+    /// poisoned session. Reaching the backend's refusal from inside `prepare`
+    /// would flush an intent for a change that never happened and stop the run,
+    /// which is strictly worse than the pre-routing behaviour, and this case is
+    /// what would catch that regression.
+    RefusedByBackend,
 }
 
-/// `mkdir` + `touch` + `cat` + `ls` under `umbra run`, on one backend.
+/// `mkdir` + `touch` + `cat` + `rm` + `ls` under `umbra run`, on one backend.
 ///
-/// These are absolute paths: `PATH` is never searched
-/// (`umbra-supervisor/src/run.rs:364-370`).
+/// These are absolute paths: `PATH` is never searched -- `run.validate` refuses
+/// a command that is not an absolute executable path.
+///
+/// **What this matrix cannot prove, stated here because it was once claimed to.**
+/// Both backends it runs against are *rewrite-backed*, so a routed `open` is
+/// rewritten to a real host path and the descriptor the tracee gets back is a
+/// **kernel** descriptor, below the fence. `fstat` on it is therefore resumed
+/// untouched and umbra's `fstat` routing is inert here: the `touch <absent>`
+/// case exits 0 with or without it. The audit specified that rc-0 as "the
+/// `fstat` proof"; it is not one on this registry, and the premise behind it
+/// ("`touch` exits 1 without `fstat` routed") holds only where the descriptor
+/// is virtual -- the `nfs-userspace` registry.
+///
+/// So the `fstat` proof lives in
+/// `umbra-storage-nfs-userspace/tests/userspace_run.rs` and needs a live NFSv4
+/// fixture. What *this* matrix proves about the slice is the `mkdir` route (the
+/// shadow directory is attributable to it and nothing else) and the timestamp
+/// refusal (`Expect::RefusedByBackend`), both of which are registry-independent.
 fn utilities(nfs: bool) {
     // The C fixture is not launched here. Its path is the signal the suite
     // already uses for "this host has workspace binaries built and debugger
-    // permission granted" (`run_fixtures.rs:13-23`, `ci.yml:265-268`), which is
+    // permission granted" (this file's own `input()` helper, and the fixture
+    // build in `ci.yml`'s `native-qualification` job), which is
     // exactly what a real traced launch needs, so these cases inherit it rather
     // than inventing a second provisioning switch.
     if input("UMBRA_TEST_FIXTURE_PATH").is_none() {
@@ -468,7 +558,24 @@ fn utilities(nfs: bool) {
     // touch case does that.
     let cases: &[(&str, &str, Expect)] = &[
         ("/usr/bin/touch", "touched", Expect::Captured(b"")),
-        ("/bin/mkdir", "made", Expect::RefusedByEnforcement),
+        // `touch` on an operand that already exists, which is the other half of
+        // the utility and takes a different syscall: `setattrlistat`(524)
+        // rather than `open`+`fstat`. Refused here because this matrix is
+        // rewrite-backed; served on `nfs-userspace`, where
+        // `standard_utilities_run_over_the_userspace_client` asserts the times
+        // actually move.
+        ("/usr/bin/touch", "seed.txt", Expect::RefusedByBackend),
+        // Was `RefusedByEnforcement` until bare `mkdir`(136) joined the stub
+        // list and the operand table (#114). One row, which is the whole
+        // observable difference that fix makes on a rewrite-backed registry:
+        // the directory is now captured in the shadow instead of happening
+        // nowhere, and the host is untouched either way.
+        ("/bin/mkdir", "made", Expect::CapturedDirectory),
+        // Bare `unlink`(10), in neither list. It replaces `mkdir` as this
+        // matrix's `RefusedByEnforcement` case: the operand exists on the host,
+        // the sandbox refuses the removal, and the file is still there
+        // afterwards.
+        ("/bin/rm", "seed.txt", Expect::RefusedByEnforcement),
         ("/bin/cat", "seed.txt", Expect::ReadOnly),
         ("/bin/cat", "absent.txt", Expect::Diagnoses),
         ("/bin/ls", "", Expect::ReadOnly),
@@ -518,12 +625,12 @@ fn utilities(nfs: bool) {
             elapsed.as_secs_f64()
         );
         match expect {
-            Expect::Captured(_) | Expect::ReadOnly => assert!(
+            Expect::Captured(_) | Expect::CapturedDirectory | Expect::ReadOnly => assert!(
                 output.status.success(),
                 "{case} after {:.3}s: {stderr}",
                 elapsed.as_secs_f64()
             ),
-            Expect::RefusedByEnforcement | Expect::Diagnoses => {
+            Expect::RefusedByEnforcement | Expect::RefusedByBackend | Expect::Diagnoses => {
                 // The child's failure surfaces as umbra's own structured
                 // failure rather than as a silent success. These cases cannot
                 // separate the taxonomy from passthrough — both utilities exit
@@ -546,9 +653,40 @@ fn utilities(nfs: bool) {
                 assert!(!operand.exists(), "host operand created for {case}");
                 assert_eq!(std::fs::read(&shadow).unwrap(), *expected, "{case}");
             }
-            Expect::RefusedByEnforcement => {
+            Expect::CapturedDirectory => {
                 assert!(!operand.exists(), "host operand created for {case}");
+                let metadata = std::fs::metadata(&shadow)
+                    .unwrap_or_else(|e| panic!("{case}: {}: {e}", shadow.display()));
+                assert!(
+                    metadata.is_dir(),
+                    "{case}: the shadow holds {:?}, not a directory",
+                    metadata.file_type()
+                );
+            }
+            Expect::RefusedByEnforcement => {
+                // "The operation happened nowhere", asserted in both places it
+                // could have happened. The workspace check is the stronger half
+                // and subsumes the operand-was-not-created form this used to
+                // carry: it pins every name in the workspace *and* the seed's
+                // bytes, so it catches a removal as well as a creation.
                 assert!(!shadow.exists(), "{case} captured a refused operation");
+                assert_workspace_pristine(&workspace, &case);
+                // Seatbelt's refusal, told apart from umbra's own by the
+                // message. A regression that routed `unlink` would change this
+                // line, and a regression that stopped routing `setattrlistat`
+                // would change the other one.
+                assert!(
+                    stderr.contains("Operation not permitted"),
+                    "{case}: expected the sandbox's refusal on the tracee's stderr: {stderr}"
+                );
+            }
+            Expect::RefusedByBackend => {
+                assert!(!shadow.exists(), "{case} materialised a refused operation");
+                assert_workspace_pristine(&workspace, &case);
+                assert!(
+                    stderr.contains("Operation not supported"),
+                    "{case}: expected umbra's own ENOTSUP on the tracee's stderr: {stderr}"
+                );
             }
             Expect::ReadOnly => assert_workspace_pristine(&workspace, &case),
             Expect::Diagnoses => {
@@ -726,10 +864,17 @@ fn crash_case(crash: Crash) {
     let _cleanup = RunDirectory(run_dir.clone());
     match crash {
         Crash::Exit(code) => {
-            // The nonzero-status arm of `run`'s root-status match
-            // (`umbra-supervisor/src/run.rs:794-798`, under the match at
-            // `:792`): a clean teardown around a nonzero root status is a run
-            // result, not a malfunction.
+            // The `Some(status)` arm of `run`'s `match outcome.root_status`,
+            // which builds `ErrorKind::ProcessFailed` under `"run.child"`: a
+            // clean teardown around a nonzero root status is a run result, not
+            // a malfunction.
+            //
+            // Named rather than cited by line, like its `Crash::Signal` sibling
+            // below. The range this carried (`run.rs:794-798`) was already
+            // stale on master -- it lands on journal-provider construction --
+            // and the round-1 sweep converted the sibling four lines away while
+            // leaving this one, which is the lexical-not-mechanism failure the
+            // sweep was for.
             assert!(stderr.contains("ProcessFailed"), "{case}: {stderr}");
             assert!(stderr.contains("run.child"), "{case}: {stderr}");
             assert!(
@@ -743,10 +888,15 @@ fn crash_case(crash: Crash) {
         }
         Crash::Signal(_) => {
             // A fatal signal never reaches that branch. The macOS backend
-            // refuses the stop it cannot resume from
-            // (`umbra-platform-macos/src/native.rs:1440-1443`), so the event
-            // loop fails and `run` reports the platform's error
-            // (`umbra-supervisor/src/run.rs:769-772`) instead of a root status.
+            // refuses the stop it cannot resume from -- the `tracee stop` /
+            // `fatal signal/exception` error at the end of `NativeTracer::stop`
+            // -- so the event loop fails and `run` returns that error instead of
+            // reaching its `match outcome.root_status`.
+            //
+            // Named rather than cited by line for the reason the
+            // `RefusedByEnforcement` comment above gives: both ranges this
+            // sentence used to carry were stale, and one of them was already
+            // stale on master.
             assert!(stderr.contains("tracee stop"), "{case}: {stderr}");
             assert!(
                 stderr.contains("fatal signal/exception"),
