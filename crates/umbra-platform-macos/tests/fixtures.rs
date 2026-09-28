@@ -27,10 +27,59 @@ fn fixture(case: &str, expected: &[u8]) {
         vec![bytes(vendor), case.as_bytes().to_vec(), bytes(host)]
     })
 }
+/// Serializes every fixture launch in this binary, from the process snapshot
+/// `StrayFixtureChildren` takes to the moment its cleanup finishes.
+///
+/// **Why a lock and not a tighter filter.** The stray reaper identifies a child
+/// it never had a handle on by diffing two process snapshots, and that is only
+/// sound if nothing else in this binary starts a fixture child in between. It is
+/// not sound by itself: a matching child created *after* the before-snapshot by a
+/// concurrently running test is indistinguishable from the stray one, and killing
+/// it would fail an unrelated test non-deterministically. `cargo test` runs a
+/// harness's tests on several threads unless told otherwise, so that is the
+/// default configuration, not an exotic one. Trading a leaked process for a flaky
+/// test is a bad trade, so the snapshot window is made exclusive instead.
+///
+/// **A process-level lock is deliberately not used.** The hazard is threads
+/// within one test binary; `cargo` runs each test *target*'s executable in
+/// sequence rather than concurrently, and this repository's CI additionally
+/// passes `--test-threads=1`. Nothing in this workspace supports two fixture test
+/// processes running at once — the tracer takes a debugger connection and a shared
+/// resigned-twin cache, neither of which is contended for here — so an
+/// interprocess lock would add a failure mode without removing one. If that ever
+/// changes, this is the place that has to change with it.
+///
+/// Poisoning is absorbed rather than propagated: `mt_write` and `mt_spawn` panic
+/// **by design** on every run, so a poisoned mutex is the normal state after them
+/// and must not turn the other cases into secondary failures.
+static FIXTURE_LAUNCH: Mutex<()> = Mutex::new(());
+
+fn fixture_launch_lock() -> std::sync::MutexGuard<'static, ()> {
+    FIXTURE_LAUNCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// `argv` builds the launch argv from the absolute vendor executable and the
 /// logical output path. `harness_verdict` is false for cases whose child prints
 /// `CAPTURED <case>` itself; every assertion below still gates the test result.
+///
+/// Takes the launch lock and delegates. Callers that need the lock held across
+/// more than one launch — or across a launch *and* their own stray cleanup, which
+/// is what `mt_fixture` needs — hold it themselves and call
+/// [`fixture_argv_locked`] instead; taking it twice on one thread would deadlock.
 fn fixture_argv(
+    case: &str,
+    expected: &[u8],
+    harness_verdict: bool,
+    argv: impl FnOnce(&Path, &Path) -> Vec<Vec<u8>>,
+) {
+    let _serial = fixture_launch_lock();
+    fixture_argv_locked(case, expected, harness_verdict, argv)
+}
+
+/// The body of [`fixture_argv`], for callers already holding the launch lock.
+fn fixture_argv_locked(
     case: &str,
     expected: &[u8],
     harness_verdict: bool,
@@ -284,6 +333,498 @@ fn argv0_check() {
             bytes(vendor),
         ]
     })
+}
+
+// ---------------------------------------------------------------------------
+// Multithreaded cases, on the dispatch paths `single_thread()` does not gate.
+//
+// `single_thread()` (native.rs:498) is called from exactly two places --
+// `Delivery::Fork` (:1922) and `WaitPlan::Park` (:1967). Four arms are ungated,
+// and they do **not** all touch the slots. Per arm, read off `native.rs` rather
+// than generalised -- a generalisation is what put a false claim in this
+// crate's README on the first pass:
+//
+//   | arm            | gated | `Session::entry` | `Session::pending`          |
+//   |----------------|-------|------------------|-----------------------------|
+//   | `Namespace`    | no    | set (:1913)      | one hop later, via `resume`  |
+//   | `Fork`         | YES   | --               | `return_stop` (:1931)       |
+//   | `Wait`+`Poll`  | no    | --               | -- (neither slot)           |
+//   | `Wait`+`Park`  | YES   | --               | -- (sets `s.waiting` only)  |
+//   | `Wait`+`Native`| no    | --               | `return_stop` (:1970)       |
+//   | `Exec`         | no    | --               | `return_stop` (:2002/:2008) |
+//
+// `Delivery::Namespace` does not call `return_stop` itself: it only records the
+// entry PC and emits the event. The return gate is planted one hop later, when
+// the caller resumes the thread -- `resume()` takes `s.entry` and calls
+// `s.return_stop(ReturnKind::Syscall)` (native.rs:2387). `mt_write` reaches the
+// window through that hop, not from `intercept`.
+//
+// So a multithreaded tracee doing ordinary file I/O or a `posix_spawn` is not
+// refused: it is unmediated in the window between a return gate being planted
+// and the return arriving. These two cases drive that window on purpose.
+//
+// **`WaitPlan::Native` is a third ungated `return_stop` caller and slice 0 does
+// not measure it.** Stated rather than left to be inferred from the two cases
+// below. It writes `pending` exactly as `Exec` does, so it is expected to
+// collide the same way `mt_spawn` does, but "expected" is not "measured" and no
+// fixture here drives it. A case for it belongs with the follow-up issue.
+// ---------------------------------------------------------------------------
+
+/// A second destination alongside the one `fixture_argv` owns.
+///
+/// `fixture_argv` is one-destination-per-case, and so is `matrix()` in
+/// `umbra-cli/tests/run_fixtures.rs`; reshaping either is not what these cases
+/// need. What they need is a second file with a different name and different
+/// bytes, written by a different thread, and that can be an extra argv operand
+/// the case builds for itself -- the `--dirfd-rename` shape, which already
+/// hands the child a root of its own rather than a single output path.
+///
+/// Deliberately **not** inside the directory `fixture_argv` creates and removes.
+/// A host-side leak there would surface as a failed `remove_dir` naming a
+/// directory rather than as an assertion naming the defect, and this is the one
+/// assertion the whole slice turns on.
+///
+/// It owns its own teardown through `Drop`, which is what makes the teardown
+/// panic-safe: `mt_write`'s assertion and the tracer's own `debug_assert!` both
+/// unwind past the end of this function, so anything cleaned up by statements
+/// after the assertion is not cleaned up on the runs that matter.
+/// **Nothing is removed that this test did not create, and the type is what
+/// enforces it.** The value is constructed only after both absence checks have
+/// passed, so arming cleanup and proving the outputs are absent are the same
+/// event; and the directory is carried as an `Option` that is `Some` only when
+/// exclusive creation succeeded. A test destructor that deletes a path it did not
+/// make is worse than the leak this machinery exists to close, so the ownership is
+/// tracked rather than assumed.
+struct Second {
+    /// `Some` only when `create_dir` — not `create_dir_all` — established that
+    /// this test made the directory. A directory that already existed belongs to
+    /// something else and is left alone however the run ends.
+    owned_directory: Option<PathBuf>,
+    /// The logical path handed to the tracee, which is also the host path a
+    /// rewrite that never happened would write to.
+    host: PathBuf,
+    /// Where a rewritten open must land instead.
+    shadow: PathBuf,
+}
+impl Drop for Second {
+    /// Best-effort and infallible: this runs while a panic is already unwinding,
+    /// so a failure here must not replace the assertion that is being reported.
+    ///
+    /// The escaped host file is removed rather than left as evidence, and the
+    /// assertion message carries its bytes instead — a leaked file in `TMPDIR` is
+    /// residue that accumulates across developer runs, while the bytes in the
+    /// failure output are the part anybody reads.
+    fn drop(&mut self) {
+        // The two output paths this test is answerable for, and nothing else.
+        // Both were proven absent before this value existed, so removing them
+        // cannot remove somebody else's file.
+        let _ = std::fs::remove_file(&self.host);
+        let _ = std::fs::remove_file(&self.shadow);
+        if let Some(directory) = &self.owned_directory {
+            // `remove_dir`, never `remove_dir_all`: with the output above gone a
+            // directory this test created is empty, and anything still in it is
+            // something this test did not put there. The call refusing a
+            // non-empty directory *is* the check.
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
+}
+
+/// Every process whose executable has the fixture's file name, by pid.
+///
+/// **Why a process scan rather than a handle.** `mt_spawn`'s tracee
+/// `posix_spawn`s a child that the tracer has not attached yet — the return gate
+/// has not fired — so no session, no watchdog and no `Drop` in the backend owns
+/// it, and the harness never receives its pid either. It is created
+/// `POSIX_SPAWN_START_SUSPENDED`, survives the tracee being killed, gets
+/// reparented away from this process so `waitpid` cannot see it, and holds the
+/// inherited descriptors 0/1/2 open until something kills it. Measured on every
+/// `mt-spawn` run; both reviews of this change reaped such children by hand.
+///
+/// So the only way to own it is to notice it: snapshot before the run, snapshot
+/// after, and kill the difference.
+///
+/// **The diff alone is not enough to make that safe, and it is worth being exact
+/// about why.** It excludes processes that already existed when the before
+/// snapshot was taken — it does *not* distinguish a child this run leaked from a
+/// child some other test started afterwards. Both appear only in the "after" set.
+/// What makes the difference attributable is `FIXTURE_LAUNCH`, which every
+/// fixture entrypoint holds from before its snapshot until after this cleanup, so
+/// no other launch in this binary can occur inside the window. The exclusivity is
+/// the correctness argument; the diff is only the mechanism.
+///
+/// Matching is on the executable's file name because the tracer launches a
+/// *resigned twin* out of its cache, at a path the harness does not know, which
+/// keeps the vendor binary's name.
+fn fixture_named_processes() -> Option<BTreeMap<i32, PathBuf>> {
+    let name = Path::new(&std::env::var_os("UMBRA_TEST_FIXTURE_PATH")?)
+        .file_name()?
+        .to_owned();
+    // **Units, because getting them wrong is not hypothetical — it shipped.** Both
+    // of `proc_listallpids`' arguments and one of its results are counted
+    // differently, and an earlier revision of this function divided the result by
+    // `size_of::<i32>()` as if it were bytes:
+    //
+    //   * `buffersize` is in **bytes**;
+    //   * the return is a **pid count** — libproc's wrapper divides the kernel's
+    //     byte count by `sizeof(int)` before returning it.
+    //
+    // Measured on this host to settle it rather than reasoning from the header: the
+    // null call answered 1094, the filled call answered 1075, the buffer held 1074
+    // positive pids and `ps` saw 1077. Dividing again kept 268 — about a quarter —
+    // so both snapshots were silently truncated and could disagree arbitrarily,
+    // which is the reaper missing strays or diffing two inconsistent views.
+    //
+    // SAFETY, both calls: the documented two-call form. A null buffer with size 0
+    // asks how many pids there are; the second call is handed a buffer and its true
+    // length in bytes.
+    const ATTEMPTS: usize = 4;
+    let mut capacity = match unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) } {
+        count if count > 0 => count as usize * 2,
+        // Cannot enumerate, so cannot attribute anything. `None`, never an empty
+        // map: an empty "before" would make every matching process look new.
+        _ => return None,
+    };
+    for _ in 0..ATTEMPTS {
+        let mut pids = vec![0i32; capacity];
+        let size = (std::mem::size_of::<i32>() * pids.len()) as i32;
+        let written =
+            unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, size) };
+        if written <= 0 {
+            return None;
+        }
+        let written = written as usize;
+        // A reply that exactly fills the buffer may have been cut off by it, and a
+        // truncated snapshot is the dangerous kind of wrong: a process missing from
+        // "before" but present in "after" is diffed as a stray and killed. Grow and
+        // ask again rather than accept a list that might be short.
+        if written >= pids.len() {
+            capacity *= 2;
+            continue;
+        }
+        // `min` with the buffer length as well, so a reply larger than the buffer
+        // can never index past it even if the guard above is ever relaxed.
+        pids.truncate(written.min(pids.len()));
+        return Some(fixture_processes_named(&pids, &name));
+    }
+    // Never converged, so completeness is unproven. Refuse rather than guess.
+    None
+}
+
+/// Resolve each pid's executable and keep the ones whose file name matches.
+fn fixture_processes_named(pids: &[i32], name: &std::ffi::OsString) -> BTreeMap<i32, PathBuf> {
+    let mut found = BTreeMap::new();
+    for pid in pids.iter().copied().filter(|pid| *pid > 0) {
+        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: owned buffer with its true length; the call writes at most that
+        // many bytes and reports how many. A process this test cannot inspect
+        // answers <= 0 and is skipped.
+        let bytes = unsafe {
+            libc::proc_pidpath(
+                pid,
+                buffer.as_mut_ptr() as *mut libc::c_void,
+                buffer.len() as u32,
+            )
+        };
+        if bytes <= 0 {
+            continue;
+        }
+        // `proc_pidpath` reports a **byte** length, unlike `proc_listallpids`
+        // above, and it excludes the terminating NUL. Same convention as
+        // `native.rs`'s own `image_path`.
+        buffer.truncate(bytes as usize);
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&buffer));
+        if path.file_name() == Some(name.as_os_str()) {
+            found.insert(pid, path);
+        }
+    }
+    found
+}
+
+/// Run-scoped ownership of the fixture children nothing else owns.
+///
+/// Constructed before the traced run and dropped after it, including while a
+/// panic unwinds, which is the only path that matters: on `mt-spawn` the tracer's
+/// `debug_assert!` fires *inside* `next_event`, so every statement after the
+/// harness's own assertions is skipped.
+///
+/// Correct only while `FIXTURE_LAUNCH` is held across the whole window — see
+/// [`fixture_named_processes`] for why the snapshot diff does not stand on its own.
+///
+/// This fixes the **harness**, and only the harness. The leak it cleans up is a
+/// property of master's error window — any error between the spawn's `svc` and
+/// `finish_return` reaches it, measured 10/10 including the release runs where
+/// the assertion is compiled out — and that defect is filed separately. Reaping
+/// here does not close it and must not be read as closing it; what it closes is
+/// this test suite accumulating suspended processes across repeated runs.
+struct StrayFixtureChildren {
+    case: String,
+    /// `None` when the process list could not be enumerated completely, which
+    /// disables reaping entirely — see `Drop`.
+    before: Option<BTreeMap<i32, PathBuf>>,
+}
+impl Drop for StrayFixtureChildren {
+    fn drop(&mut self) {
+        // **Uncertainty means reap nothing.** A snapshot that could be incomplete
+        // is worse than no snapshot: a process missing from `before` but present
+        // now is indistinguishable from a stray, and killing it is the failure mode
+        // this guard exists to avoid. Both sides must be known-complete.
+        let (Some(before), Some(after)) = (self.before.as_ref(), fixture_named_processes()) else {
+            eprintln!(
+                "REAP SKIPPED {}: the process list could not be enumerated completely,                  so nothing was killed",
+                self.case
+            );
+            return;
+        };
+        for (pid, path) in after {
+            if before.contains_key(&pid) {
+                continue;
+            }
+            // SIGKILL rather than SIGTERM: the child is held suspended before its
+            // first instruction, so it has no handler and will never run one.
+            // SAFETY: a pid this scan just observed; a stale pid answers ESRCH.
+            let killed = unsafe { libc::kill(pid, libc::SIGKILL) } == 0;
+            // Never silent. A reaped child is a defect of the run that produced
+            // it, and the count is what the follow-up issue is about.
+            eprintln!(
+                "REAPED {}: stray fixture child pid {pid} ({}){}",
+                self.case,
+                path.display(),
+                if killed { "" } else { " — kill failed" }
+            );
+        }
+    }
+}
+
+/// Drive one multithreaded case and check both destinations.
+///
+/// `first` is asserted by `fixture_argv`, which owns that destination, the
+/// host-absence check on it and the tracer event loop. `second` is asserted here.
+/// Both differ in name and in bytes, so a rewrite that reached the wrong thread
+/// shows up three ways: wrong content in a shadow file, a shadow file that is
+/// not there at all, or bytes on the host under the unrewritten name.
+///
+/// **The journal is not an oracle for any of that.** `JournalRecord` carries no
+/// task or thread field, so a cross-thread mix-up still journals
+/// `Prepare`/`ObservedResult`/`Commit` triples that pair correctly by
+/// `OperationId`. Tracee-visible entry names and bytes are the only witness,
+/// which is the #121/#117 pattern.
+///
+/// `harness_verdict` is false and `CAPTURED` is printed here instead, after the
+/// second destination has been checked too. A verdict printed while an assertion
+/// is still outstanding is lesson 23's skip-as-pass wearing a different hat.
+fn mt_fixture(case: &str, option: &str, first: &[u8], second: &[u8]) {
+    let Some(root) = std::env::var_os("UMBRA_TEST_REDIRECT_ROOT")
+        .filter(|_| std::env::var_os("UMBRA_TEST_FIXTURE_PATH").is_some())
+    else {
+        // `fixture_argv` owns the `SKIP` line and the `UMBRA_INTEGRATION_REQUIRED`
+        // assertion that makes a skip fatal in CI; reach it rather than
+        // re-deciding here what a missing environment means.
+        return fixture_argv(case, first, false, |vendor, host| {
+            vec![bytes(vendor), option.as_bytes().to_vec(), bytes(host)]
+        });
+    };
+    // Declared first so it is dropped **last**, and acquired before *setup* rather
+    // than just before the launch: the exclusive `create_dir` below is what proves
+    // this test owns the directory, and a concurrent case observing or creating the
+    // same path would make that proof worthless. One region covers setup, the
+    // before-snapshot, the traced run and the stray cleanup. `fixture_argv_locked`
+    // is called below rather than `fixture_argv` because taking this same lock
+    // twice on one thread would deadlock.
+    let _serial = fixture_launch_lock();
+    let root = support::redirect_root(root);
+    let directory = std::env::temp_dir().join(format!(
+        "umbra-rust-fixture-{}-{case}-b",
+        std::process::id()
+    ));
+    // `create_dir`, not `create_dir_all`: success means this test made the
+    // directory and may remove it, `AlreadyExists` means something else owns it and
+    // it must survive the run. Process ids are recycled, so a directory left by an
+    // older binary at this path is a real possibility rather than a hypothetical.
+    let owned_directory = match std::fs::create_dir(&directory) {
+        Ok(()) => Some(directory.clone()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+        Err(e) => panic!("second destination directory {}: {e}", directory.display()),
+    };
+    let host = directory.join("output");
+    let shadow = root.join(host.strip_prefix("/").unwrap());
+    // Both checks precede the construction below, so cleanup is armed only for
+    // paths just proven absent. A failure here leaves an empty directory behind
+    // rather than deleting a file the test cannot account for.
+    assert!(!host.exists(), "second host output already exists");
+    assert!(!shadow.exists(), "second shadow output already exists");
+    let extra = Second {
+        owned_directory,
+        host,
+        shadow,
+    };
+    // Dropped in reverse declaration order after the run, and on an unwinding
+    // panic too, which is the case that actually happens here: strays are reaped
+    // first, then the destinations are cleared, then the lock is released.
+    let _strays = StrayFixtureChildren {
+        case: case.to_owned(),
+        before: fixture_named_processes(),
+    };
+    let operand = bytes(&extra.host);
+    fixture_argv_locked(case, first, false, |vendor, host| {
+        vec![
+            bytes(vendor),
+            option.as_bytes().to_vec(),
+            bytes(host),
+            operand,
+        ]
+    });
+    // Read before asserting: `Second::drop` removes this file, so the bytes have
+    // to travel in the failure message rather than being left on disk.
+    let escaped = std::fs::read(&extra.host).ok();
+    assert!(
+        escaped.is_none(),
+        "MISSED {case}: the second thread's output reached the host at {}, holding {:?}",
+        extra.host.display(),
+        escaped.as_deref().map(String::from_utf8_lossy)
+    );
+    assert_eq!(
+        std::fs::read(&extra.shadow).unwrap(),
+        second,
+        "MISSED {case}: second destination content"
+    );
+    eprintln!("CAPTURED {case}");
+}
+
+/// Two threads opening and writing distinct files inside one window, entirely on
+/// the ungated `Delivery::Namespace` path.
+///
+/// **Measured against master (`e44d0db8`), three runs out of three:**
+///
+/// ```text
+/// MISSED mt-write: the second thread's output reached the host at
+/// /var/folders/.../umbra-rust-fixture-<pid>-mt-write-b/output
+/// ```
+///
+/// The host file holds `two\n`, and no shadow file was ever created for it. The
+/// event stream names exactly one worker thread: the other issues its `open`,
+/// `write` and `close` without producing a single `SyscallEntry`. It is not
+/// misattributed, it is **not intercepted at all**, so the rewrite never happens
+/// and the tracee's own path is what reaches the kernel.
+///
+/// The mechanism is `return_stop` (native.rs:539-...), and it is not the
+/// single-slot overwrite its comment describes. To let the stopped thread execute
+/// the `svc` it sits on, `return_stop` *releases the entry breakpoint* --
+/// `remove_breakpoint(pc)`, a `z0` -- plants the return gate at `pc + 4`, and
+/// resumes. `install_breakpoint(pending.entry, ..)` in `finish_return` is what
+/// puts it back. Between those two points the stub carries no breakpoint **for
+/// the whole process**, because a debugserver `Z0` is per-process and
+/// `continue_run` resumes every thread. A sibling thread reaching the same stub
+/// inside that window walks straight through it.
+///
+/// **Why this case and `mt_spawn` fail differently, in one sentence.** Both of
+/// this case's threads call `open`, so they share *one stub at one address*, and
+/// the `z0` window on that address un-arms it for the sibling -- an escape.
+/// `mt_spawn`'s two threads use *different* stubs (`__posix_spawn` and
+/// `__open_nocancel`), so neither un-arms the other and the collision lands on
+/// the shared `pending` slot instead -- an assertion. That is exactly why
+/// per-thread slots close one and not the other.
+///
+/// So making `Session::pending` and `Session::entry` per-thread does **not**
+/// close this: the hole is in the shared breakpoint registry, not in the slot.
+/// Closing it needs the entry site to stay armed while another thread could
+/// reach it. Three shapes, not two: single-step the trapping thread over the
+/// `svc`; hold the siblings stopped over the Mach task port this backend
+/// already owns (`task_threads` + `thread_suspend`, no new RSP surface); or
+/// per-thread RSP resume (`vCont`).
+///
+/// **On failure the evidence is in the message, not on disk.** `Second::drop` runs
+/// on the unwinding path and removes the escaped host file, plus the directory
+/// holding it when this test created that directory; what survives is the
+/// assertion's own text, which carries the bytes it found -- `holding
+/// Some("two\n")`. That is the deliberate trade: a leaked file accumulates across
+/// developer runs, while the failure output is the part anybody reads. Two earlier
+/// revisions of this comment were wrong about this -- one describing the opposite
+/// before the guard existed, one before the guard tracked what it owned.
+#[test]
+#[ignore = "slice 0 measurement: fails on master by design; the unmediated \
+            entry-breakpoint window it names is not closed by per-thread slots \
+            alone. Run with `--ignored`; un-ignore in the PR that fixes it."]
+fn mt_write() {
+    mt_fixture("mt-write", "--mt-write", b"one\n", b"two\n")
+}
+
+/// A `posix_spawn` with an unrelated namespace call in flight on another thread:
+/// the ungated `Delivery::Exec` path, which is where the audit measured Node and
+/// Tokio's process creation.
+///
+/// **Measured against master (`e44d0db8`), three runs out of three:**
+///
+/// ```text
+/// thread 'mt_spawn' panicked at crates/umbra-platform-macos/src/native.rs:571:9:
+/// a second intercepted syscall entered while one was still in flight: this
+/// session's pending entry breakpoint, return gate and exec candidate would all
+/// be overwritten
+/// ```
+///
+/// This is the `debug_assert!` `return_stop`'s comment planted for this arc,
+/// reached exactly the way it predicts: the spawn's `ReturnKind::Spawn` is in
+/// flight on one thread while the other's `open` return opens a second
+/// transaction on the same slot. It is a `debug_assert!`, so **the backend** takes
+/// the overwrite in a release build -- losing the spawn's gate, its entry
+/// breakpoint, and the pid pointer the child would have been attached by.
+///
+/// **The run does not fail silently in release, though, and saying it did was
+/// wrong.** For *this* case what ends it is the path decode refusing the
+/// overwritten operand -- `Io during path: null or overflowing pointer` (`EFAULT`),
+/// 5 of 5 enforced release runs. Measured: 10 enforced `umbra run` executions of
+/// this case, 5 of them release, exited non-zero every time.
+///
+/// The supervisor also holds a second tripwire that ships -- `syscall_entry`
+/// refuses a second entry for a thread whose operation is still awaiting its exit
+/// (`umbra-supervisor/src/events.rs`, `operations: BTreeMap<ThreadId,
+/// OperationId>`) with a real `Err(InvalidState)`, not an assertion -- and it is
+/// keyed by thread, which says that layer already models per-thread operations
+/// correctly while this backend's slots do not. That asymmetry is the part worth
+/// keeping. **It is not what makes this case non-silent**: it is a
+/// contention-dependent race that fired in 0 of 10 runs of `mt_spawn`, and an
+/// earlier revision of this comment wrongly leaned on it.
+///
+/// Unlike `mt_write`, this one *is* the slot. Per-thread slots are **expected**
+/// to close it and that expectation is **not verified**: slice 1 is not
+/// implemented, so unlike every other claim in this comment it is a prediction,
+/// not a measurement. It is recorded as such so the next reader does not inherit
+/// it as a result.
+///
+/// The case does not reap its child. A blocking wait over a live child is
+/// `WaitPlan::Park`, which `single_thread()` does gate, so reaping would refuse
+/// the run before the spawn had been measured; the harness's own loop sees the
+/// child exit instead.
+///
+/// **One measured side effect, and the harness now contains it.** The tripwire
+/// fires after the `posix_spawn` syscall has already run, so the child exists, is
+/// held by `POSIX_SPAWN_START_SUSPENDED`, and has not been attached to any session
+/// yet -- nothing in the backend owns it, so neither `Session::drop` nor the
+/// watchdog kills it, and it survives the panic still holding the inherited
+/// descriptors 0/1/2.
+///
+/// `StrayFixtureChildren` reaps it: this test runs under a guard whose `Drop`
+/// snapshots the fixture's processes before the run and kills whatever appeared
+/// by the time it unwinds, printing a `REAPED` line naming the pid. What makes
+/// "whatever appeared" attributable to *this* run is `FIXTURE_LAUNCH`, held across
+/// the whole window so no other launch in this binary can occur inside it. So a
+/// developer running this repeatedly no longer accumulates suspended processes or
+/// keeps a captured pipe open.
+///
+/// **That fixes the harness and not the defect.** The leak is a property of
+/// master's **error window**, not of the tripwire, and it is measured rather than
+/// argued: under an enforced `umbra run` -- which does not go through this harness
+/// at all -- the case leaked exactly one suspended orphan in 10 of 10 runs,
+/// including the 5 release runs where the `debug_assert!` is compiled out and the
+/// run instead fails on an unrelated `Io during path` refusal. Any error between
+/// the spawn's `svc` and `finish_return` reaches it. Reaping here does not close
+/// that, and a `REAPED` line is evidence of it rather than of its absence.
+#[test]
+#[ignore = "slice 0 measurement: fails on master by design, on the \
+            `debug_assert!` at native.rs:571. Run with `--ignored`; un-ignore \
+            in the PR that fixes it."]
+fn mt_spawn() {
+    mt_fixture("mt-spawn", "--mt-spawn", b"libc\n", b"two\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +1097,10 @@ fn overlay_fixture(
         eprintln!("SKIP {case}: set UMBRA_TEST_FIXTURE_PATH and UMBRA_TEST_REDIRECT_ROOT");
         return;
     };
+    // This entrypoint launches a tracee too, so it belongs inside the same
+    // serialized region -- otherwise a concurrent `mt_fixture` would see this
+    // case's child appear after its before-snapshot and reap it.
+    let _serial = fixture_launch_lock();
     let fixture = PathBuf::from(fixture);
     let host_root = Path::new(std::ffi::OsStr::from_bytes(root));
     assert!(

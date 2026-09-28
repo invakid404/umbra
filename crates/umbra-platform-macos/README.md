@@ -457,7 +457,8 @@ passed, so qualification requires the `CAPTURED <case>` stderr verdict.
 These are direct tracer tests: they exercise interception without enforcement,
 and are lower-level than the integrated `umbra run` matrix, which drives the
 original seven cases through storage, journal, namespace and an installed sandbox.
-All eleven direct tracer cases are enabled. Fixture cases:
+Eleven of the thirteen direct tracer cases are enabled; the two multithreaded
+cases are `#[ignore]`d measurements that fail on purpose (below). Fixture cases:
 
 | Case | State |
 |---|---|
@@ -472,6 +473,89 @@ All eleven direct tracer cases are enabled. Fixture cases:
 | `wnohang-wait`      | **CAPTURED** — the wait decisions above |
 | `dirfd-rename`      | **CAPTURED** — the dirfd family above |
 | `symlink-cycle`     | **CAPTURED** — the logical symlinks above |
+| `mt-write`          | **FAILS — `#[ignore]`d**, open defect (below) |
+| `mt-spawn`          | **FAILS — `#[ignore]`d**, open defect (below) |
+
+### The two multithreaded cases are open defects, not coverage
+
+`mt-write` and `mt-spawn` are the measurement that sized the multithreaded-tracee
+arc. They run on the two dispatch paths `single_thread()` does **not** gate:
+`Delivery::Namespace` and `Delivery::Exec`. They are `#[ignore]`d because they
+fail against the tracer as it stands, and the failures are the finding. Run them
+with `cargo test -p umbra-platform-macos --test fixtures -- --ignored`.
+
+`single_thread()` (`native.rs`) is called from two places only, `Delivery::Fork`
+and `WaitPlan::Park`. Four dispatch arms are ungated, and they do **not** all
+touch the two single-element slots — stated per arm, because the generalisation
+that they do was wrong and stood in this README for one revision:
+
+| ungated arm | `Session::entry` | `Session::pending` |
+|---|---|---|
+| `Delivery::Namespace` | set at the entry | one hop later, when the caller resumes the thread |
+| `Delivery::Exec` | — | `return_stop` |
+| `WaitPlan::Native` | — | `return_stop` |
+| `WaitPlan::Poll` | — | — (**neither**: it rewrites `x0`/`CPSR`/`PC` and continues) |
+
+`Delivery::Namespace` does not call `return_stop` itself — it records the entry
+PC and emits the event; `resume()` takes that PC and plants the return gate
+(`return_stop(ReturnKind::Syscall)`). A multithreaded tracee doing ordinary file
+I/O or a `posix_spawn` is therefore **not refused; it is unmediated**.
+
+**`WaitPlan::Native` is a third ungated slot writer and is not measured.** It
+writes `pending` exactly as `Exec` does, so it is expected to collide the way
+`mt-spawn` does; no fixture drives it, and no claim here rests on it.
+
+`mt-spawn` fires the `debug_assert!` in `return_stop` that master planted as this
+arc's tripwire: a second intercepted syscall enters while one is still in flight.
+A release build compiles that assertion out, so the *backend* takes the overwrite
+silently — but the run does not end silently. For **this** case what ends it is the
+path decode refusing the overwritten operand: `Io during path: null or overflowing
+pointer` (`EFAULT`), measured in 5 of 5 enforced release runs, each exiting non-zero.
+Per-thread slots in the backend are expected to close this case; that expectation is
+not yet verified, because slice 1 is not implemented.
+
+(The supervisor also holds an independent per-`ThreadId` guard in
+`umbra-supervisor/src/events.rs` that returns a real `Err(InvalidState)` in release
+when a second entry arrives for a thread whose operation is still awaiting its exit.
+It is worth knowing about — it is why that layer is not single-slot — but it is a
+contention-dependent race, and on `mt-spawn` it fired in **0 of 10** runs. It is not
+what makes this case non-silent, and the paragraph above used to say it was.)
+
+`mt-write` is a second, distinct defect that per-thread slots do **not** close.
+To let the stopped thread execute the `svc` it is sitting on, `return_stop`
+releases the entry breakpoint (`z0`), plants the return gate at `pc + 4`, and
+resumes; `finish_return` puts the entry breakpoint back. A debugserver `Z0` is
+per-process and `continue_run` resumes every thread, so for the whole of that
+window the stub carries no breakpoint for anyone. Measured, three runs of three:
+the sibling thread's `open`, `write` and `close` produce no `SyscallEntry` at
+all, the rewrite never happens, and the tracee's own path reaches the kernel.
+
+The two cases fail differently for one reason: `mt-write`'s threads share **one
+stub at one address**, so the `z0` window un-arms it for the sibling; `mt-spawn`'s
+threads use **different** stubs, so the collision lands on the shared slot
+instead.
+
+**What that costs depends on the harness, and the difference is measured.** In
+this crate's direct-tracer harness the escaped write lands **on the host**,
+because `fixture_argv` launches `UnsandboxedExperiment` with `interpose: false`
+and no descriptor fence — it measures interception, not the boundary. Under a
+real enforced `umbra run` it does not: 20 enforced runs, 10 of them release,
+exited 1 every time with no host file ever created, because the rendered Seatbelt
+profile grants `file-write*` to exactly one subpath (the run's own root inside the
+store) and the escaped write is denied `EPERM`. So on the shipped path this is an
+**availability and correctness** defect, not a namespace escape.
+
+Closing it needs the entry site to stay armed while another thread could reach
+it. Three shapes: single-step the trapping thread over the `svc`; hold the
+siblings stopped over the Mach task port this backend already holds
+(`task_threads` + `thread_suspend`, no new RSP surface); or per-thread RSP resume
+(`vCont`).
+
+These cases assert tracee-visible entry names and bytes, in two destinations
+that differ in both. The journal cannot serve as the oracle: `JournalRecord`
+carries no task or thread field, so cross-thread corruption still journals
+`Prepare`/`ObservedResult`/`Commit` triples that pair correctly by
+`OperationId`.
 
 `wnohang-wait` polls through the public `wait4`, both stubs resolved with
 `dlsym(RTLD_DEFAULT, …)`, and raw `svc #0x80` naming numbers 7 and 400, because
@@ -513,6 +597,11 @@ equals the vendor path passed as its operand and differs from the running image
 reported by `_NSGetExecutablePath`. The shadow bytes the harness then asserts
 are written only after that check passes, so a redirect failure still fails the
 test.
+
+`mt-write` and `mt-spawn` also opt out of the harness verdict, for a different
+reason: their second destination is checked after `fixture_argv` returns, so the
+`CAPTURED` line is printed by the test function once *both* destinations agree.
+Neither reaches it today.
 
 Software breakpoint ownership is per debugserver connection: successful
 `Z0` installs populate that session's registry, and successful `z0`

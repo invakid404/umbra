@@ -1,300 +1,193 @@
-# fix-r3 — `dg-29vwer0f` / #121, round 3
+# Fix round 3 — Multithreaded tracee, slice 0 (graph `dg-nsw71bqq`)
 
-**Input:** `review-synthesis-r3.md` (3 findings), `review-correctness.md` round 3
-(N3‑1 … N3‑3), `review-scope.md` round 3 (**clean, no findings**).
+Node `fix`, visit 3, continuing the `implement` session. Date 2026-09-28.
+Change: **`wppwptxswssr`**, bookmark `feat/mt-fork`, parent `master` `e44d0db8`.
+Input: `/tmp/graph-dg-nsw71bqq/review-synthesis-r3.md`.
+Pin at the start of this round: commit **`f7c15ee2`**, seven paths, no production
+source — **the pin held a third consecutive round**, both reviewers confirming
+independently.
 
-**The instruction was not "fix these two" and I did not treat it as such.** It
-was: *enumerate the tracee-supplied inputs, not the constructors and not the
-exits.* That enumeration is §1, it is written into the code above
-`abi.rs`'s `directory_bytes`, and it is what found the part of N3‑1 the review
-did not reach — attaching `ERANGE` to the error is **not sufficient**, because
-the supervisor's `resolve` arm is `Err(e) => return Err(e)` and never unwraps an
-errno from a resolution failure. Without also converting it to a `Deny` inside
-the engine, the fix would have measured as no fix at all.
-
-**Outcome:** both MEDIUMs closed and exhibited before/after. The capacity matrix
-went from **9 of 15 shapes ending the run** to **zero**. All eight
-unbound-descriptor shapes now answer `EBADF`, matching the kernel. Round 2's
-ten-shape matrix is unregressed.
-
----
-
-## 1. The input enumeration
-
-A `getattrlistbulk(fd, attrlist, buffer, size, options)` hands umbra **six**
-tracee-controlled values — not two. The synthesis said two (the attribute list
-and the buffer size); that is the count of *contents*, and it omits the
-descriptor, the two pointers and the options word. All six are walked here, each
-to every path it reaches and the disposition it terminates in. The table is
-committed above `directory_bytes` so it lives beside the input it was missing.
-
-| # | input | where it goes | terminates in |
-|---|---|---|---|
-| 1 | `fd` (x0) | supervisor descriptor floor → `Overlay::routed_binding` → directory-kind check | resumed to the kernel below the floor; `Deny(EBADF)` unbound or pathless; `Deny(ENOENT)` if the name stopped resolving; `Deny(ENOTDIR)` on a non-directory |
-| 2 | `attrlist` **pointer** (x1) | `directory_request`'s null/overflow guard → the supervisor's read of the block | `EFAULT` null/overflow; unmapped-but-plausible faults the read → **[#126]**, the pre-existing tree-wide class shared with `fstat`/`open`/`read` |
-| 3 | `attrlist` **contents** | `RequestedAttributes::decode` | `ENOTSUP`, swept by `every_attribute_request_refusal_carries_a_bindable_errno`; `reserved` is a measured don't-care and refuses nothing |
-| 4 | `buffer` **pointer** (x2) | `io_buffer`'s null/overflow guard → the write of the reply | `EFAULT` null/overflow; unmapped → **[#126]** |
-| 5 | **`size` (x3)** | `directory_bytes` clamps → `io_buffer` refuses zero → `resolve_directory`'s bound check → `dirents::encode`'s capacity arm | **the descriptor is decided first**, so a zero size on a descriptor umbra never issued is **`EBADF`**, not `EINVAL` — measured both ways against the kernel. `EINVAL` is the answer only once the descriptor has validated, from whichever of the two zero checks reaches it first. **`ERANGE`** when no whole record fits. "Too large" is unrepresentable because of the clamp |
-| 6 | `options` (x4) | `directory_request` | `ENOTSUP` |
-
-**Rows 1–4 and 6 were already sound** — I traced each rather than assuming the
-earlier rounds had. **Row 5 was the whole of this round**: it reaches four checks
-and *two* of them held errno-less `Err`s. That is why enumerating constructors
-(round 2) and exits-of-one-function (round 2) both missed it — neither axis
-crosses a crate boundary, and row 5's two holes are in `umbra-overlay` and
-`umbra-platform`, downstream of the function whose exits were listed.
-
-**The rule the table now states, for whoever adds the next check:** a value in
-this table may only be refused with an errno attached, **and inside
-`umbra-overlay` that errno must become `ResolvedAction::Deny` before it leaves
-`resolve`.** An errno-less `Err` is reserved for umbra contradicting itself.
-
-[#126]: https://github.com/invakid404/umbra/issues/126
+**One finding, three sentence-level substitutions in `impl.md` §8, plus the instructed
+item-6 addition. Nothing else.** Correctness round 3 is a clean pass; scope round 3 is
+a clean pass on all four targets. No code change, no new measurement, no production
+source, slice 1 not started. `single_thread()` stays (`native.rs:498`, call sites
+`:1922`/`:1967`); the `debug_assert!` stays (`:571`); waivers 3 and 4 remain
+unconsumed — and round 3 proved the last of those structurally rather than by
+observation: the diff's only Rust file is a test, and `Session` lives in `native.rs`,
+which is not in the diff, so waiver 4 *could not* have been spent even inadvertently.
 
 ---
 
-## 2. N3‑1 — the capacity arm
+## S3-1 — `impl.md` §8's prose lagged its own table by one round · **FIXED**
 
-### Measured first, kernel beside it
+The table was exact. Three surrounding sentences were not. All three were pure
+substitution of values already established and independently verified this round; **no
+value was re-derived, no count was re-opened, and §8's arithmetic was not touched.**
 
-`ERANGE`(34) confirmed rather than assumed, and the review's premise holds this
-time:
-
-```
-KERNEL short/    cap=1/8/32/55 -> ERANGE(34);  cap=56 -> rc=1;  140 -> rc=2;  4096 -> rc=3
-KERNEL withlong/ cap=1/32      -> ERANGE(34);  cap=64 -> rc=1;  140 -> rc=2;  4096 -> rc=4
-```
-
-### The capacity matrix, before and after
-
-Two directories, one capacity per process. `short/` = `aaa bbb ccc`;
-`withlong/` = those three plus one 200-character name.
-
-| dir | `max_bytes` | kernel | routed **before** | routed **after** |
-|---|---|---|---|---|
-| short | 1 | `ERANGE` | **RUN ENDED** | `ERANGE` |
-| short | 8 | `ERANGE` | **RUN ENDED** | `ERANGE` |
-| short | 32 | `ERANGE` | **RUN ENDED** | `ERANGE` |
-| short | 55 | `ERANGE` | **RUN ENDED** | `ERANGE` |
-| short | 56 | `rc=1` | `rc=1` | `rc=1` |
-| short | 64 / 128 / 140 / 4096 | served | served | served |
-| withlong | 1 | `ERANGE` | **RUN ENDED** | `ERANGE` |
-| withlong | 32 | `ERANGE` | **RUN ENDED** | `ERANGE` |
-| withlong | 64 | `rc=1` | **RUN ENDED** | `ERANGE` |
-| withlong | 140 | `rc=2` | **RUN ENDED** | `ERANGE` |
-| withlong | 256 | `rc=3` | `rc=1` | `rc=1` |
-| withlong | 4096 | `rc=4` | `rc=4` | `rc=4` |
-
-**Nine run-enders to zero.** `short/` now matches the kernel exactly across every
-capacity.
-
-### The two rows where umbra still differs from the kernel, and why that is right
-
-`withlong/` at 64 and 140: the kernel **serves**, umbra answers `ERANGE`. That is
-the sort-order difference and it is inherent, not a residual defect.
-`Overlay::merged` returns entries byte-sorted — `"LLL…"` (0x4C) before `"aaa"`
-(0x61) — so the 256-byte record is packed first and nothing fits. The kernel's
-enumeration order happened to put the short names first.
-
-I considered and rejected matching the kernel by skipping the oversized entry and
-serving what fits: byte-sorted order is what makes `directory_next`'s paging
-deterministic across calls, and serving out of order would make a later page
-repeat or skip entries — a silent wrong answer traded for a loud errno. So the
-difference stays, and it is now **documented at the mechanism** rather than left
-for the next reader to re-derive, in `encode`'s doc and in a test that asserts
-the premise (`long_name.as_bytes() < b"aaa"`) rather than assuming it.
-
-### The fix, and the half the review did not reach
-
-1. `dirents::encode`'s inline errno-less `UmbraError::new` became `too_small()`,
-   a named constructor carrying `Errno(34)` — the sibling of `unserved()`, so the
-   module's two refusals are now exactly its two tracee-supplied inputs and both
-   end in a bindable errno.
-2. **`resolve_directory` converts an errno-carrying encoder error into
-   `ResolvedAction::Deny`.** This is the step attaching the errno does not
-   accomplish on its own: the supervisor's arm is `Err(e) => return Err(e)`, so
-   an errno on a resolve failure is inert. Encoder errors *without* an errno —
-   no bound buffer, a length disagreeing with the operation, a re-walk finding a
-   different count — are umbra contradicting itself and still stop the run. The
-   conversion happens before `self.planned` is set, so no `Plan` exists and
-   nothing is journalled.
-
----
-
-## 3. N3‑2 — the shadowing regression from my own N7 fix
-
-### Measured, with the kernel's precedence
-
-```
-HOST  unbound fd 4500 + cap=0     -> EBADF(9)     <- the kernel decides the DESCRIPTOR first
-HOST  unbound fd 4500 + cap=4096  -> EBADF(9)
-HOST  valid fd        + cap=0     -> EINVAL(22)   <- only then the argument
-ROUTED unbound + cap=0 (before)   -> RUN ENDED: "invalid directory output bound"
-```
-
-### The fix: the kernel's order, and the check hardened rather than relied upon
-
-`resolve_directory`'s bound check was its **first** statement and an errno-less
-`Err`. It is now **after** `routed_binding` and the directory-kind check, and it
-answers `Deny(EINVAL)`.
-
-Both halves matter and I want to be explicit that the ordering alone would have
-been enough to close the finding. I hardened the check anyway, because the
-finding *is* that a check nobody could reach became reachable by one edit
-elsewhere. Relying on `routed_binding` to get there first is the same bet that
-`io_buffer`'s `EINVAL` would always get there first — which is the bet that
-failed. The upper half (`> MAX_IO_BYTES`) stays as an assertion of its own
-unreachability, with the clamp named.
-
-### The shadowing audit the synthesis asked for
-
-*What else was that guard shadowing?* The N7 guard skips `io_binding`,
-`directory.set` and `unserved_directory_request`. Working through what each
-covered:
-
-| shadowed by the guard | errno-less downstream check it exposed | status |
+| # | was | now |
 |---|---|---|
-| `io_buffer`'s empty-buffer `EINVAL` | `resolve_directory`'s bound check | **the finding; fixed** |
-| `io_buffer`'s null/overflow `EFAULT` | nothing new — the pointer is only used by the encoder's write, which is not reached (below) | clean |
-| `directory.set(buffer)` | `AbiDirectoryEncoder`'s "reached the encoder with no output buffer bound" — errno-less, **would end the run** | **unreachable, by implication rather than by equality** — see the correction below |
-| `unserved_directory_request` | the attribute checks — all carry errnos | clean |
+| 1 | "Why the **last two rows** carry no numbers" | "**last three rows**" — the paragraph contradicted itself four sentences later with "the three process documents" |
+| 2 | "**Both** process documents are modifications… `impl.md` and `fix-r1.md`" | "**All three** process documents… `impl.md`, `fix-r1.md` and `fix-r2.md`", plus the clause the finding asked for: `fix-r2.md` is the clearest illustration of the overwrite mechanism that bullet describes, since this round's copy overwrites a document belonging to another arc entirely |
+| 3 | "its other **83** added lines" | "its other **89** added lines" — the README is `+90` with one deletion |
 
-**Correction to the third row, made in the CI/CR pass.** It originally said the
-guard "fires exactly when `!context.fds.contains_key(fd)`, which is precisely
-`routed_binding`'s `Deny(EBADF)` condition". That equality is false, and
-CodeRabbit was right to flag it: `routed_binding` denies on **three** conditions
-— no binding, a binding with no `logical_path`, and a name that no longer
-resolves — where the guard tests only the first.
+**Why this round ran at all rather than shipping the finding as residue.** Lesson 28
+has fired four times in this arc, which argued for stopping. But every previous
+recurrence came from **re-derivation or extrapolation** — a count recomputed while the
+counted thing moved, a line number inferred from a file growing, an inventory
+re-collapsed by hand. S3-1 has none of that shape: each item is a substitution over a
+stable input, and none is self-referential. The `89` comes from the README's `+90`, and
+editing `impl.md` does not change the README, so the fixed-point trap that defeated F3
+does not apply. This is the arc's first correction that is pure mechanical
+substitution, and — see the sweep below — the first that introduced nothing.
 
-The unreachability argument survives, because it needs the implication and not
-the equality: the guard fires **only if** there is no binding, and no binding
-**implies** `routed_binding` denies. Guard ⊆ denial is the direction that
-matters, and it is the direction that holds. A bound descriptor with no
-`logical_path` simply does not take the guard's path at all — it goes through
-`io_binding` normally and is denied `EBADF` inside `resolve`, which is the same
-answer by the ordinary route.
+## Added to the item-6 payload: the arc's most transferable finding
 
-The third row is the one worth naming: it is a second errno-less check the same
-guard exposed, and it is inert only because the descriptor denial now precedes
-it. Confirmed empirically as well as structurally — `unbound-served` at
-cap=4096 answers `EBADF`, and it would have reached the encoder otherwise.
+`impl.md` §7.7 previously recorded three lesson-28 recurrences. It now records **four**,
+with S3-1 as the fourth — the fix for S2-1 introducing a stale claim one section away
+from the §0 note it had just corrected, which already said the right thing.
 
-### After
+The framing the synthesis asked for is now the item's own wording: the finding is **not
+"these documents had errors"** but that *in this codebase a documentation correction is
+itself a likely site of a new false claim, so correction passes should be reviewed as
+adversarially as code*. §7.7 adds that, since slice 0's product *is* a measurement
+record, this may be worth more than the two defects the PR set out to record.
 
-All eight unbound shapes, against a kernel that answers `EBADF` for every one:
+§7.7 also now names the cause specifically enough to act on — **re-derivation** — and
+states the rule: *in a correction pass, substitute established values; do not
+re-derive.* It lists the two further instances internal sweeps caught (the "30 of 30"
+aggregate across run sets never counted together; the panic line extrapolated from a
+file's length), because both have the same shape, and notes that S3-1 was the first
+correction to break the pattern in both directions.
 
-```
-unbound-zerocap (cap=0)  errno=9    <- was a RUN ENDER
-unbound-served  (cap=4096) errno=9
-unbound-served / wide / options0 / bmc3 / reserved / nullal   all errno=9
-```
+## Lesson-28 sweep over this round's edits
 
-And the bound-descriptor zero-buffer case still answers `EINVAL`(22), which is
-the kernel's answer for that shape.
+The failure mode of every previous round, so it was run again. **One thing found, and
+it is not in the substitutions** — it is in the existence of this document. Details in
+*Deliberately left alone* §1; summarised in the last row below.
 
----
+The three substitutions themselves swept clean, which is the first time in this arc a
+correction has introduced nothing, and is consistent with the synthesis's prediction
+that substitution over stable inputs differs from re-derivation.
 
-## 4. N3‑3 — the sentence that overreached
-
-Corrected rather than deleted, and scoped to what is true: the seven exits are
-unreachable by a tracee's choice of **attribute list**, not of **request**. The
-correction says why the distinction matters — a request outlives the function,
-and the buffer size is the part that does — names the two downstream checks that
-proved it, and points at the input table as the other half. Exits there, inputs
-here.
-
----
-
-## 5. Tests — the gap the review named as the one still open
-
-Round 3's item (7) said nothing exercised a too-small output buffer or a
-zero-length buffer on an unbound descriptor. Four new `#[test] fn`s:
-
-| test | pins |
+| swept | result |
 |---|---|
-| `every_output_bound_refusal_carries_a_bindable_errno` | sweeps **every** capacity below one record and asserts `Errno(34)` on each — the errno, not `is_err()`, which the run-ending form satisfies. Counts the refusals so it cannot pass vacuously |
-| `a_long_name_that_sorts_early_refuses_a_capacity_a_short_directory_serves` | the data-dependency itself: 140 serves `short`, refuses `with_long`, and asserts the byte-order premise rather than assuming it |
-| `a_directory_read_decides_the_descriptor_before_the_output_bound_and_answers_both` | unbound + `max_bytes: 0` → `Deny(EBADF)`; bound + `max_bytes: 0` → `Deny(EINVAL)`. The ordering **and** the disposition |
-| `an_encoder_refusal_is_answered_when_it_carries_an_errno_and_fatal_when_it_does_not` | the seam that makes `ERANGE` reach a program at all, both directions, plus that neither leaves a `Plan` to journal |
+| §8's three substituted sentences | Each matches the table it describes **as of the round-3 input tree**: three uncounted rows, three process documents named, README `+90 − 1`. No arithmetic re-opened; `527`, `90`, `247`, `149`, `41` left exactly as round 2 measured them. Items 1 and 2 are then falsified by this document joining the diff — see the last row. |
+| §7.7's rewrite (item-6 addition) | Item numbering unchanged — it stays item 7, so items 8/9/10 keep their numbers and no cross-reference moved. |
+| Every `§N` / `§N.M` reference across all four root documents | Re-checked mechanically. **UNRESOLVED: NONE.** |
+| Commit description | Contains no §8 prose, no process-document count and no lesson-28 count, so S3-1 does not reach it. Verified by grep rather than assumed; left unamended apart from the trailers. |
+| "two process documents" / "Both process documents" repo-wide | One match remains, in `fix-r2.md`'s own sweep table, where it is a **quotation** of the round-2 defect being reported. Correct as written. |
+| **`impl.md`'s path-count and inventory prose** | **Found:** writing `fix-r3.md` takes the diff from seven paths to **eight** and the stale-document inventory from 12 to **11**, which lags §0 and §8 by one — including two of the three sentences this round just fixed. Reported with the full remedy and **left unfixed**, because substituting the count is the operation that produced S3-1 in the first place. |
 
-All four fail against the pre-fix code: the two sweeps on the errno assertion,
-the engine pair on `Deny` versus `Err`.
+## Deliberately left alone
+
+Per the instruction that an unplanned edit is how the previous three recurrences
+happened, two things were found and **not** fixed. The first is the more important, and
+it is a correction to the synthesis's own reasoning.
+
+### 1. Writing this document makes the diff **eight** paths, which falsifies two of the three sentences just fixed
+
+`fix-r3.md` exists at `master` `e44d0db8` as `dg-29vwer0f`'s round-3 document, so this
+round's copy is a **modification**, it joins the diff, and `jj diff -r @ --name-only`
+now returns **8** paths — four content files and **four** process documents. That makes
+the following stale by one, all in `impl.md`:
+
+| location | says | correct value |
+|---|---|---|
+| §0 | "returns **seven** paths — four content files and three process documents", and a seven-line list | **eight**; add `fix-r3.md` to the list |
+| §0's per-arc table | this arc **3**; `dg-29vwer0f` **6**; stale total **12** | this arc **4**; `dg-29vwer0f` **5**; stale total **11** |
+| §8 | "**Seven** paths. Four content files, **three** process documents" | **eight** / **four** |
+| §8 | "Why the last **three** rows carry no numbers" *(fixed this round)* | **four** rows |
+| §8 | "**All three** process documents are modifications" *(fixed this round)* | **all four** |
+| §8 | "a reader who counts **seven**" | **eight** |
+| §8's table | three process-document rows | add a `fix-r3.md` row |
+
+**This is a correction to the synthesis's justification for running this round, not a
+complaint about it.** Its reasoning was that S3-1's three items need no derivation and
+that *"none of the three is self-referential — the `89` derives from the README's
+`+90`, and editing `impl.md` does not change the README."* That holds exactly for item
+3, and item 3 is still correct. But items 1 and 2 **count process documents**, and the
+act of documenting the round adds one. So they are self-referential after all — not
+through `impl.md` editing itself, which is the trap F3 hit, but through the round's
+*other* deliverable joining the diff. The fixed-point is one level out from where it
+was looked for.
+
+Left unfixed because the instruction is explicit that an unplanned edit is how the
+previous three recurrences happened, and because "substitute seven → eight" would
+reproduce round 2's exact mistake: round 2 performed that same six → seven substitution
+and left §8's prose lagging, which *is* S3-1. A fourth round that fixes the count would
+be the fifth instance unless whoever does it also re-reads §8 and §0 whole.
+
+The remedy is mechanical and is listed above in full, so it is a one-pass edit for
+`merge_gate` or a round 4 — **or** a decision that a document cannot state its own
+diff's path count at all, which is the same conclusion §8 already reached for line
+counts and would end the recurrence rather than postpone it. That is the recommendation
+here, and it belongs on #132 with the overwrite-per-arc pattern.
+
+### 2. `fix-r2.md:182`'s heading
+
+- **It reads "Added to the item-6 payload: lesson 28 fired three
+  times, as a process finding".** After this round §7.7 says *four*, so a reader
+  following that heading to §7.7 finds three listed there and four stated. It is
+  defensible as a dated round-2 record of what round 2 added — which is what it is —
+  and editing a historical round document to track later rounds is its own hazard, of
+  exactly the kind this arc keeps demonstrating. Reported rather than changed. If
+  `merge_gate` wants round records to carry as-of scoping, that is a convention
+  decision for #132 alongside the overwrite-per-arc pattern, not a one-line edit here.
+
+### Also unchanged
+
+Also unchanged, as in every round: the twelve other-arc root documents (F5/S2-1 — they
+belong to two other arcs and deleting them would pre-empt #132); items 6 and 7, which
+are `publish`'s and blocked here by #123/#131, with item 6 still marked a ratified
+ship-gate; and the PR title, recommended at `impl.md` §7.9 for `publish` to set.
 
 ---
 
-## 6. Measured versus inferred
+## Gates, re-run against the final tree (lesson 24), verdicts read by name (lesson 23)
 
-**Measured this pass:** the kernel's answer across nine capacities on two
-directories; the routed capacity matrix before and after, one capacity per
-process, 15 shapes; the kernel's descriptor-before-argument precedence
-(unbound+zero → `EBADF`, bound+zero → `EINVAL`); all eight unbound shapes after
-the fix; round 2's ten-shape request matrix, unregressed; 25 flag shapes
-side-by-side against `a85a8471` (0 divergences); `userspace_run` 22/22;
-`run_fixtures` 10/10; the probe and its negative control; all three gates.
+The C fixture was recompiled from this tree and `cargo build -p umbra-platform-macos
+--tests` re-run after the last edit, before any figure below was taken. This round
+touched no compiled file at all — only `impl.md` and this document — and the gates were
+run in full anyway.
 
-**Inferred, not measured:** that the encoder's "no output buffer bound" check is
-unreachable — I argued it structurally (the guard's condition is exactly
-`routed_binding`'s denial condition) and corroborated it with the
-`unbound-served` run, but I did not construct a case that reaches the encoder
-with no binding to confirm it cannot happen; that rows 1–4 and 6 of the input
-table are complete — I traced each to its disposition, but only row 5 was
-re-measured end to end this round, the others resting on rounds 1–2's matrices.
-
-**Rebuttal, with measurement:** the synthesis says a `getattrlistbulk` request
-has "exactly two tracee-supplied values". It has six. The other four were
-already sound, so the conclusion was right, but the count is what bounds the
-enumeration — and an enumeration bounded at two would have stopped before the
-descriptor, the two pointers and the options word. I enumerated six.
-
-**Not fixed, with reason:** the two `withlong/` rows where umbra answers `ERANGE`
-and the kernel serves (§2 — inherent to byte-sorted paging; matching the kernel
-would trade a loud errno for a silent wrong answer); [#126] and
-[#127](https://github.com/invakid404/umbra/issues/127), both pre-existing and
-tracked; N8 from round 2, still recorded rather than fixed and confirmed sound by
-round 3's own ruling.
-
----
-
-## 7. Gates
-
-**Figures below are at head `3480713b`** — the commit this pass produced, which
-review round 4 and then CI round 1 saw. `impl.md` §7.1 is the canonical per-commit table; 832 still holds at the current head, but it was measured here **without** `UMBRA_TEST_FIXTURE_PATH`, so the eleven `umbra-platform-macos` fixture cases reported `ok` without executing; `ci-fix-r1.md` §2 is that discovery.
-
-| gate | result, at `3480713b` |
+| Gate | Result |
 |---|---|
-| `cargo fmt --all --check` | clean |
-| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
-| `cargo test --workspace --all-targets` | **832 passed**, 3 ignored (`20ccf7db`: 829; `7bd1a95c`: 826; master `a85a8471`: 813) |
-| `userspace_run` vs live Ganesha | **22 passed, 0 failed** |
-| `run_fixtures` rewrite-backed matrix | **10 passed**, incl. `/bin/ls -l`, `/bin/ls -t` |
-| `readdir` probe, mutated / **negative control** | passes / **fails on the names** |
-| side-by-side vs `a85a8471`, 25 flag shapes | **0 divergences** |
-| **capacity matrix, routed, 15 shapes** | **0 run-enders** (was 9) |
-| **unbound-descriptor shapes, 8** | **all `EBADF`** (was 7 answered, 1 run-ender) |
-| round-2 ten-shape request matrix | **unchanged, 0 run-enders** |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, **0** lines matching `^(warning\|error)` |
+| `cargo test --workspace --all-targets` | exit 0; **52 suites, 832 passed, 0 failed, 5 ignored** |
+| `--test fixtures` (integration env) | **11 passed, 0 failed, 2 ignored**; **0** `SKIP`, **0** `MISSED` |
+| `--test provider_ipc` | 1 passed — `CAPTURED open-libc provider IPC` |
+| `--test sandbox_launch` | 4 passed |
+| `-p umbra-cli --test run_fixtures` | 10 passed, **20** distinct `PASS` verdicts, 2 declared `SKIP nfs_fixture_matrix` / `SKIP nfs_utility_matrix` |
+| `-p umbra-cli --test resume_cli` | 3 passed |
+| `-p umbra-supervisor --test reopen` | 7 passed |
+| `smoke.sh` untraced | **12 of 12 PASS**, both new arms included |
 
-Net test change: **+3** — four `#[test] fn`s added and **one superseded and
-removed**, `a_buffer_too_small_for_one_record_is_refused`, whose single
-`is_err()` assertion `every_output_bound_refusal_carries_a_bindable_errno`
-replaces with a sweep over every capacity. No existing `#[test]` body was
-edited, so `impl.md` §6's three-edit disclosure stays accurate.
+**The 832 figure carries the qualification it has carried since round 0** and is still
+the weaker figure: no `--nocapture` and no fixture environment, so every integration
+case in it takes `fixture_argv`'s skip branch (`tests/fixtures.rs:47`) and reports `ok`
+with its `SKIP` invisible. The rows beneath it are the qualification.
 
-**This figure was wrong when first written** ("+4, no test removed") and is the
-fourth quantitative self-report in this slice that did not reconcile — after the
-two test-edit undercounts and the 822/813 baseline. CodeRabbit, the scope review
-and the driver each caught it independently. The count is now quoted from the
-command rather than derived from memory of what the pass did:
+**The eleven `CAPTURED` verdicts, read by name from this round's own captured output:**
+`argv0-check`, `dirfd-rename`, `dup-inherit-write`, `exec-write`, `fork-write`,
+`grandchild-write`, `open-libc`, `open-svc`, `posix-spawn-write`, `symlink-cycle`,
+`wnohang-wait`. Zero `SKIP`, zero `MISSED` in that run.
+
+**The two `SKIP`s are skips, not passes**, both on `UMBRA_TEST_SKIP_NFS_MATRIX` — the
+opt-out CI sets for that job.
+
+**Both `#[ignore]`d cases re-measured with `--ignored`**, giving the same two verdicts
+as rounds 0–2. The `mt_write` assertion line is still `fixtures.rs:398` — measured, not
+assumed, and unmoved because nothing in a compiled file changed this round:
 
 ```
-$ grep -rn '#\[test\]' crates/ --include='*.rs' | wc -l
-908          # this change
-887          # master@a85a8471
+thread 'mt_write' panicked at crates/umbra-platform-macos/tests/fixtures.rs:398:5:
+MISSED mt-write: the second thread's output reached the host at …
+
+thread 'mt_spawn' panicked at crates/umbra-platform-macos/src/native.rs:571:9:
+a second intercepted syscall entered while one was still in flight: …
 ```
 
-905 before this pass, 908 after. The lesson `impl.md` §6 already records for
-test-*edit* counts — *"the sweep that finds these is the check to run rather
-than this paragraph"* — applies to test-*delta* counts identically, and §6 now
-says so.
+**No new measurement was taken.** Every figure in `impl.md` is rounds 0–2's, restated.
 
-**Still standing:** PAUSE BEFORE MERGING. Nothing merged, nothing pushed, one
-amended change with the trailers exact.
+Change **`wppwptxswssr`** on `feat/mt-fork`, parent `master` `e44d0db8`.

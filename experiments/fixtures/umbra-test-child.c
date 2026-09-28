@@ -6,7 +6,9 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <pthread.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <signal.h>
@@ -681,6 +683,175 @@ static int argv0_check(const char *argv0, const char *expected, const char *path
     return 0;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Multithreaded cases, on the dispatch paths `single_thread()` does not gate.
+ *
+ * `single_thread()` refuses only `Delivery::Fork` and `WaitPlan::Park`. Four
+ * arms are ungated -- `Namespace`, `Exec`, `Wait`+`Native` and `Wait`+`Poll` --
+ * and they do not all touch the slots: `Namespace` records the entry PC (the
+ * return gate is planted one hop later, when the caller resumes), `Exec` and
+ * `Wait`+`Native` write `pending`, and `Wait`+`Poll` writes neither. The two
+ * cases here drive `Namespace` and `Exec`, so they reach the transaction-slot
+ * model without going anywhere near the fork refusal.
+ *
+ * `Wait`+`Native` is a third ungated slot writer and is deliberately NOT
+ * measured here; the per-arm table in
+ * crates/umbra-platform-macos/tests/fixtures.rs says so in the one place that
+ * has to stay reconciled with this comment and with the crate README.
+ *
+ * Raw `open`/`write`/`close` throughout, never stdio: open issue #127 records
+ * that a buffered stdio write reaches a routed descriptor as zero bytes with
+ * exit 0, which would let a corrupted run read as a clean one.
+ *
+ * Each case writes two destinations that differ in name *and* in bytes. That is
+ * the oracle: a rewrite applied to the wrong thread lands the wrong content in
+ * a shadow file, leaves one absent, or writes the unrewritten name on the host.
+ * The journal cannot serve here -- it carries no thread identity, so
+ * cross-thread corruption still journals internally consistent transactions.
+ * ------------------------------------------------------------------------- */
+
+/* Bound on the rendezvous spin below. Reached only if the other thread never
+ * arrives, in which case falling through is better than spinning until the
+ * tracer's session deadline kills the run. Under a debugger the whole process
+ * stops together, so a stopped peer costs no iterations at all. */
+#define MT_SPIN_BOUND 100000000u
+
+/* Participants every rendezvous below waits for: the two threads whose traced
+ * calls are meant to overlap. */
+#define MT_PARTICIPANTS 2
+
+static atomic_int mt_gate;
+/* Sticky: set by whichever participant gives up first, read by the others. Once
+ * the rendezvous has failed it stays failed, so no participant can arrive late
+ * and proceed alone while another has already abandoned. */
+static atomic_int mt_rendezvous_failed;
+
+/* Hold both threads until both are here, then release them together, so the two
+ * traced calls under measurement enter within a few instructions of each other
+ * and the window the single-slot model has to survive is as narrow as this
+ * fixture can make it.
+ *
+ * An atomic spin rather than a mutex, a condition variable or a pipe: those all
+ * issue syscalls of their own, and one of them landing between the barrier and
+ * the call being measured is exactly the interleaving this case is trying to
+ * produce, not an ingredient of it. This issues none.
+ *
+ * **Returns 0 only when both participants actually arrived, and that return value
+ * is load-bearing.** The spin is bounded so a starved thread cannot ride to the
+ * tracer's session deadline, but "the bound was reached" and "the threads raced"
+ * are opposite outcomes: if the bound runs out, the operation under measurement
+ * must NOT be performed. Performing it anyway would produce a run that wrote both
+ * destinations without the threads ever overlapping, and that reads as a clean
+ * measurement rather than as a skipped one -- a silent-failure path inside the
+ * instrument, which is the one place this fixture can least afford one. Every
+ * caller checks the return value, reports through `error_line`, and skips its
+ * measured call. */
+static int mt_rendezvous(void)
+{
+    atomic_fetch_add(&mt_gate, 1);
+    for (unsigned i = 0; i < MT_SPIN_BOUND; i++) {
+        if (atomic_load(&mt_rendezvous_failed) != 0)
+            return error_line("rendezvous abandoned by another thread", ETIMEDOUT);
+        if (atomic_load(&mt_gate) >= MT_PARTICIPANTS)
+            return 0;
+    }
+    atomic_store(&mt_rendezvous_failed, 1);
+    return error_line("rendezvous bound reached before both threads arrived",
+                      ETIMEDOUT);
+}
+
+struct mt_job {
+    const char *path;
+    const char *data;
+    size_t length;
+    /* Non-zero until the write succeeds, so a thread that never ran -- or one
+     * whose rendezvous timed out, which skips the write entirely -- is not
+     * mistaken for one that ran cleanly. */
+    int result;
+};
+
+static void *mt_write_thread(void *raw)
+{
+    struct mt_job *job = raw;
+    /* Leaves `result` at its non-zero initial value and performs no write, so a
+     * failed rendezvous cannot be read as a measurement. */
+    if (mt_rendezvous() != 0)
+        return NULL;
+    job->result = write_case(job->path, job->data, job->length);
+    return NULL;
+}
+
+/* Two threads, two destinations, one traced stub: both threads enter `open`
+ * inside the same window, so the tracer has two in-flight namespace
+ * transactions to keep apart on one `pending` slot and one `entry` slot. */
+static int mt_write(const char *first, const char *second)
+{
+    struct mt_job jobs[2] = {
+        {first, "one\n", sizeof("one\n") - 1, 1},
+        {second, "two\n", sizeof("two\n") - 1, 1},
+    };
+    pthread_t threads[2];
+    int started = 0;
+    int result = 0;
+    for (int i = 0; i < 2; i++) {
+        int error = pthread_create(&threads[i], NULL, mt_write_thread, &jobs[i]);
+        if (error != 0) {
+            result = error_line("pthread_create", error);
+            break;
+        }
+        started++;
+    }
+    for (int i = 0; i < started; i++) {
+        int error = pthread_join(threads[i], NULL);
+        if (error != 0)
+            result = error_line("pthread_join", error);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (jobs[i].result != 0)
+            result = 1;
+    }
+    return result;
+}
+
+/* A `posix_spawn` with an unrelated traced call in flight on another thread.
+ * `Delivery::Exec` is the path the audit measured Node and Tokio onto, and it
+ * is ungated, so this is a shipped path rather than a hypothetical one.
+ *
+ * **No `wait4`, deliberately.** A blocking wait over a live child is
+ * `WaitPlan::Park`, which `single_thread()` *does* gate, so reaping the spawned
+ * child here would refuse the run before the spawn path had been measured at
+ * all. The child is left to the tracer's own event loop, which sees it exit. */
+static int mt_spawn(const char *first, const char *second)
+{
+    char executable[PATH_MAX];
+    if (self_path(executable) != 0)
+        return 1;
+    struct mt_job job = {second, "two\n", sizeof("two\n") - 1, 1};
+    pthread_t writer;
+    int error = pthread_create(&writer, NULL, mt_write_thread, &job);
+    if (error != 0)
+        return error_line("pthread_create", error);
+    char *args[] = {executable, "open-libc", (char *)first, NULL};
+    pid_t pid;
+    int result = 0;
+    /* The spawn is the measured call, so a failed rendezvous skips it: without
+     * the writer thread's `open` overlapping it, the spawn would run alone and
+     * succeed, which is not the measurement this case exists to take. */
+    if (mt_rendezvous() != 0) {
+        result = 1;
+    } else {
+        int spawned = posix_spawn(&pid, executable, NULL, NULL, args, environ);
+        if (spawned != 0)
+            result = error_line("posix_spawn", spawned);
+    }
+    error = pthread_join(writer, NULL);
+    if (error != 0)
+        result = error_line("pthread_join", error);
+    if (job.result != 0)
+        result = 1;
+    return result;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3)
@@ -707,6 +878,18 @@ int main(int argc, char **argv)
             return error_line("usage: umbra-test-child --wnohang-wait <path>",
                               EINVAL);
         return wnohang_wait(path);
+    }
+    if (strcmp(command, "--mt-write") == 0) {
+        if (argc != 4)
+            return error_line("usage: umbra-test-child --mt-write <path> "
+                              "<second-path>", EINVAL);
+        return mt_write(path, argv[3]);
+    }
+    if (strcmp(command, "--mt-spawn") == 0) {
+        if (argc != 4)
+            return error_line("usage: umbra-test-child --mt-spawn <path> "
+                              "<second-path>", EINVAL);
+        return mt_spawn(path, argv[3]);
     }
     if (strcmp(command, "--argv0-check") == 0) {
         if (argc != 4)
