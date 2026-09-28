@@ -407,6 +407,40 @@ impl Supervisor {
                 return self.resume_thread(thread);
             }
         }
+        // **`chdir`(12) has no descriptor to gate on, so it is gated on the run.**
+        //
+        // The four calls above pass a *kernel* descriptor straight through
+        // because umbra has no answer for one. `chdir` names a path and binds
+        // nothing, so that test has nothing to ask; the equivalent question is
+        // whether this run routes at all, and the same `descriptor_floor` is
+        // what answers it -- `Some` exactly for a routed run, by `RunBudget`'s
+        // own definition.
+        //
+        // A rewrite-backed run resumes it, and that is deliberate rather than an
+        // oversight. Those runs have a kernel-visible path for every object, so
+        // the tracee's own `chdir` moves the kernel working directory to a real
+        // directory and keeps working exactly as it did before this call was
+        // breakpointed -- which is the invariant the comment above spends its
+        // length on, now restated for a fifth call. Emulating it there would be
+        // strictly worse: umbra would report success while the kernel's working
+        // directory stayed put, and every relative path the tracee hands to a
+        // call umbra does *not* intercept would resolve against the old one.
+        //
+        // **The limit this leaves is real and is not claimed anywhere as fixed.**
+        // A rewrite-backed run's `ProcessContext::cwd` still does not follow the
+        // tracee's `chdir`, so a relative operand umbra *does* intercept still
+        // resolves against the launch directory there. Closing that needs a
+        // second mechanism -- the effect below is recorded only for a routed run
+        // -- and it is out of this slice rather than half-done inside it.
+        if matches!(&operation, FsOp::Chdir { .. })
+            && self
+                .budget
+                .as_ref()
+                .and_then(|b| b.descriptor_floor)
+                .is_none()
+        {
+            return self.resume_thread(thread);
+        }
         // **The `fstat` output buffer, bound once and here.** An `fstat` this
         // far in will be answered by umbra, so the `struct stat` has to be
         // written into the tracee -- and where it goes is the tracee's own
@@ -1105,6 +1139,34 @@ impl Supervisor {
             FsOp::Read { fd, .. } | FsOp::Write { fd, .. } => RoutedEffect::Advanced(*fd),
             FsOp::Close { fd } => RoutedEffect::Closed(*fd),
             FsOp::Fchdir { fd } => RoutedEffect::ChangedCwd(*fd),
+            FsOp::Chdir { .. } => match self.namespace.routed_cwd()? {
+                Some(logical) => RoutedEffect::MovedCwd(logical),
+                // **A `Chdir` the namespace is about to report successful while
+                // naming no directory is refused here, not tolerated.**
+                //
+                // This used to return `Ok(())`, on the reasoning that
+                // `Overlay::resolve_routed_chdir` sets the `Emulate` action and
+                // the resolved path together, so the combination cannot arise.
+                // That reasoning is true of *that* resolver and is not enforced
+                // at *this* seam -- and this seam is a trait, so the resolver on
+                // the other side of it is not necessarily that one. A provider
+                // that answered `None` here would have the tracee told its
+                // `chdir` worked while `ProcessContext::cwd` stayed where it
+                // was: the split anchor the whole of P0 exists to close,
+                // arriving silently and by the one route P0 does not cover.
+                //
+                // `Opened` above cross-checks the namespace's answer against the
+                // observed result rather than trusting it; this is the same
+                // check for the same reason, and its absence was the asymmetry.
+                None => {
+                    return Err(error(
+                        ErrorKind::ProtocolMismatch,
+                        "supervisor.routing",
+                        "the namespace emulated a chdir without resolving a working \
+                         directory for it",
+                    ))
+                }
+            },
             _ => return Ok(()),
         };
         self.routed.insert(thread, effect);
@@ -1153,11 +1215,20 @@ impl Supervisor {
             RoutedEffect::Closed(fd) => {
                 context.fds.remove(&fd);
             }
-            // **The one thing that has ever moved `ProcessContext::cwd` after
-            // launch.** It was populated once, from `command.cwd`, and read for
-            // `DirRef::Cwd` resolution; `FsOp::Chdir`/`Fchdir`/`GetCwd` were
-            // classified by `dispatch` and had no handler anywhere, so the
-            // logical working directory could not move at all.
+            // **One of the two things that move `ProcessContext::cwd` after
+            // launch; `MovedCwd` below is the other.** This one was the first:
+            // the field was populated once, from `command.cwd`, and read for
+            // `DirRef::Cwd` resolution, while `FsOp::Chdir`/`Fchdir`/`GetCwd`
+            // were classified by `dispatch` and had no handler anywhere, so the
+            // logical working directory could not move at all. Routing
+            // `fchdir` made this arm the only mover; routing `chdir`(12) added
+            // the second. `GetCwd` is still inert and moves nothing.
+            //
+            // **The two differ only in where the path comes from**, and the
+            // difference is forced by what each call is handed -- a descriptor
+            // that is already bound here, against a path operand that only the
+            // namespace can resolve. Everything after that is the same, checks
+            // included, which is why they are written to read as a pair.
             //
             // The path comes from the descriptor's own binding, resolved now
             // rather than at the entry, and an absolute one is required: `cwd`
@@ -1173,10 +1244,23 @@ impl Supervisor {
             // success while silently declining to do the thing it names would be
             // a worse answer than the refusal it replaced.
             //
-            // `Chdir` and `GetCwd` stay declared and inert: nothing decodes
-            // 12 or 326, no measured caller on this path issues either, and a
-            // handler for a call that cannot arrive is prose describing a path
-            // nothing walks.
+            // **`Chdir` is no longer inert; `GetCwd` still is.** 12 is decoded
+            // and routed now -- see the arm below -- because it is the call the
+            // measurements found actually moving a real program's working
+            // directory: `git status --short` issues one and forks nothing at
+            // all, and `bash -c 'cd ... && ...'` issues one too. Leaving it
+            // undecoded meant the kernel moved the host working directory while
+            // this field stayed at the launch directory, and every later
+            // relative path resolved against the wrong anchor.
+            //
+            // `GetCwd`(326) stays declared and inert, deliberately and by
+            // ratified decision: nothing decodes 326, no measured caller on this
+            // path issues it, and a handler for a call that cannot arrive is
+            // prose describing a path nothing walks. What a tracee that called
+            // it *would* get is the kernel's answer, which on a routed run names
+            // no directory the run's namespace knows -- so the honest reading of
+            // this line is that `getcwd` is unserved rather than that it agrees
+            // with the field below.
             RoutedEffect::ChangedCwd(fd) => {
                 let state = context.fds.get(&fd).ok_or_else(|| {
                     error(
@@ -1197,6 +1281,24 @@ impl Supervisor {
                              logical path to make the working directory",
                         )
                     })?;
+                context.cwd = logical;
+            }
+            // The `chdir` twin of the arm above, and the checks are the same
+            // ones for the same reason -- only the source of the path differs.
+            // The namespace resolved this operand through symlink expansion and
+            // the logical-root containment check and handed the answer over at
+            // `resolve`; what is left here is to refuse a value that cannot be a
+            // working directory, because `cwd` is what relative resolution
+            // anchors against and a relative one would anchor against itself.
+            RoutedEffect::MovedCwd(logical) => {
+                if !logical.is_absolute() {
+                    return Err(error(
+                        ErrorKind::InvalidState,
+                        "supervisor.routing",
+                        "a routed chdir succeeded with a working directory that is not \
+                         an absolute logical path",
+                    ));
+                }
                 context.cwd = logical;
             }
         }

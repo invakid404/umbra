@@ -105,6 +105,25 @@ The M1 mechanisms named in the tracker spec are all present:
     Absorbing `SIGSYS` here is the exact defect the gate exists to refuse;
     failing on `SIGCHLD` took `fork`/`wait4` runs out over an ordinary event.
 
+12. **Interposer retargeting across `exec`**: the routed image is the one this
+    session is *currently running*, not the one named at launch, and
+    `Session::retarget_interposer` is what moves it — called at the exec stop and
+    from `attach_child`, which covers the `posix_spawn` half. `exec` swaps the
+    image and zeroes `__DATA,__umbra_arm`, so unlike the forked child of item 10
+    the new image is mapped **inert** and is armed from scratch; `install` takes
+    its fresh-image branch and `arm_interposer`'s zero-block precondition holds
+    by construction. Before this, the requirement was pinned to the launch
+    target, so a child that exec'd any other binary was **half**-mediated: its
+    `open` was still routed through the breakpointed stubs and returned a virtual
+    descriptor, while `write` — interposed only, never breakpointed — reached
+    libc with a number the kernel does not own and answered `EBADF`. It is
+    deliberately **not** called for a freshly attached root, which is what keeps
+    the sandbox installer's inserted copy dormant. See
+    `userspace_run.rs::a_forked_child_that_execs_a_different_binary_is_mediated_in_the_new_image`
+    and, for the failed-`execve` case that must not leave a later `fork` pointed
+    at an image the tracee never ran,
+    `a_failed_exec_does_not_leave_a_later_fork_pointed_at_an_image_the_tracee_never_ran`.
+
 ## What interception does not cover
 
 Stated here rather than implied, because two of these are architectural and a
@@ -200,6 +219,7 @@ continuing with an inert one.
 | `symlink` | 57 | `symlink` | x0 target, x1 link name | `FsOp::Symlink` |
 | `readlink` | 58 | `readlink` | x0 path, x1 buffer, x2 length | `FsOp::ReadLink` |
 | `mkdir` | 136 | `mkdir` | x0 path, x1 mode | `FsOp::Mkdir`, anchored at the cwd |
+| `chdir` | 12 | `chdir` | x0 path | `FsOp::Chdir`, anchored at the cwd |
 | `fstat` | 339 | `fstat` | x0 descriptor, x1 buffer | `FsOp::Fstat` |
 | `fstat` | 189 | `__fstat` | same layout | `FsOp::Fstat` |
 | `setattrlistat` | 524 | `setattrlistat` | x0 dirfd, x1 path, x2 attrlist, x3 buffer, x4 size, x5 options | `FsOp::SetTimes` |

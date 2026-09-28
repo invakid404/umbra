@@ -155,7 +155,28 @@ enum ReturnKind {
         pid_pointer: u64,
         twin: PathBuf,
     },
-    Exec,
+    /// An `execve` in flight, carrying the resigned image it was rewritten to
+    /// name -- as a *candidate*, not as a commitment.
+    ///
+    /// **The candidate is here rather than assigned to `Session::twin` at the
+    /// entry, and that is the whole point of the field.** A successful `execve`
+    /// never returns, so the only stop that can adopt it is the exec stop, which
+    /// takes it out of the pending value. A *failed* `execve` does return, and
+    /// this arm of `finish_return` is that return by construction -- so dropping
+    /// the pending value is exactly the right thing, and `twin` keeps naming the
+    /// image the session is still running.
+    ///
+    /// Assigning at the entry left `twin` naming an image the tracee never
+    /// reached. That was harmless until the interposer requirement began
+    /// following `twin`: after that, the next `fork` handed `attach_child` the
+    /// wrong image, `install()` found no match, and the child was left with an
+    /// *armed* control block -- inherited through `fork` -- and no breakpoint on
+    /// any trap site. Its first routed call then issued `svc #0x80` with
+    /// `x16 = UMBRA_TRAP_NUMBER` that nothing covered, and the run died on an
+    /// undecoded `SIGSYS`. That is the #116 shape, reached from a new direction.
+    Exec {
+        twin: PathBuf,
+    },
 }
 /// SDK `sys/wait.h` spells `WNOHANG` as mask value 1 — the least significant
 /// bit, bit index 0 — not `1 << 1`.
@@ -220,11 +241,30 @@ struct Session {
     registers: Vec<(usize, usize)>,
     scratch: Vec<(u64, usize, usize)>,
     initial: bool,
-    /// The routing interposer this run loads, and the one image it routes in.
+    /// The routing interposer this run loads, and **the image this session is
+    /// now running**.
     ///
-    /// `(published dylib, target image, descriptor floor)`. Both path halves are
-    /// needed because `install` runs once per exec and the requirement is *not*
-    /// uniform across them: `DYLD_INSERT_LIBRARIES` loads the dylib into the
+    /// `(published dylib, current image, descriptor floor)`. The second element
+    /// is per-session state that follows this session's `exec`s: it is seeded
+    /// from the backend's launch-time value and reassigned by
+    /// [`Self::retarget_interposer`] at every exec stop and for every attached
+    /// child, from that session's own twin.
+    ///
+    /// **It used to be the launch target, assigned once and never reassigned,
+    /// and that was the exec gap.** `exec` replaces the address space, so the
+    /// interposer arrives in the new image mapped and inert -- dyld re-loads it,
+    /// because `DYLD_INSERT_LIBRARIES` rides in `envp` and survives the exec,
+    /// and re-runs its constructor, which leaves `__DATA,__umbra_arm` back at
+    /// zeroes. umbra must re-arm it. Comparing against a fixed launch target
+    /// meant it re-armed only when the exec'd image *was* that target, so a
+    /// child that exec'd anything else took the "this run routes nothing" arm
+    /// below: no trap sites breakpointed, no control block written, and its
+    /// file operations passing through to libc silently. Every tool call a shell
+    /// makes execs a different binary, so that was the common case rather than
+    /// the exotic one.
+    ///
+    /// Both path halves are still needed because `install` runs once per exec
+    /// and the requirement is *not* uniform across them: `DYLD_INSERT_LIBRARIES` loads the dylib into the
     /// sandbox installer as well as the target, and the installer is stopped and
     /// installed before dyld has mapped anything at all.
     ///
@@ -462,7 +502,78 @@ impl Session {
         }
         Ok(())
     }
+    /// Point this session's interposer requirement at the image it is now
+    /// running, so `install` arms the library where it was actually loaded.
+    ///
+    /// Called from exactly two places, and they are the two ways a session comes
+    /// to be running an image umbra did not name at launch: the exec stop, after
+    /// `intercept` has already set `twin` to the resigned image the tracee is
+    /// execing, and `attach_child`, which is handed the same value for a fork
+    /// and the spawned twin for a `posix_spawn`.
+    ///
+    /// **Not called for a freshly attached root**, which is what keeps the
+    /// sandbox installer inert. The installer is a `sandbox-exec` twin with the
+    /// interposer loaded into it by `DYLD_INSERT_LIBRARIES`, and it is stopped
+    /// and installed before dyld has mapped anything at all; retargeting it to
+    /// its own image would make `install` match, look for a library that is not
+    /// mapped yet, and fail the launch in trusted bootstrap code. Its copy stays
+    /// dormant because nothing arms it, which is the mechanism since round 1.
+    ///
+    /// Canonicalized because the comparison is against `image_path`, which
+    /// answers from `proc_pidpath` and is already fully resolved. A `None`
+    /// interposer -- a run that routes nothing -- has nothing to retarget and
+    /// says so by doing nothing.
+    fn retarget_interposer(&mut self, image: &Path) -> Result<()> {
+        let Some((_, current, _)) = self.interposer.as_mut() else {
+            return Ok(());
+        };
+        *current = std::fs::canonicalize(image).map_err(|e| {
+            error(
+                "interposer",
+                format!("resolving the image this session now runs: {e}"),
+            )
+        })?;
+        Ok(())
+    }
     fn return_stop(&mut self, kind: ReturnKind) -> Result<()> {
+        // **One intercepted syscall in flight per session, asserted where it can
+        // be violated rather than left implicit.**
+        //
+        // `pending` is a single slot and the assignment below is unconditional,
+        // so a second `return_stop` before the first is consumed overwrites it.
+        // Three things ride on that slot and all three are lost by such an
+        // overwrite, not only the newest: `entry_breakpoint`, which `finish_return`
+        // hands back to `install_breakpoint` -- the site was already released
+        // with `z0` a few lines down, so losing the value means it is never
+        // re-armed and that stub stops being intercepted for the rest of the
+        // run; `gate`, so the first return gate stays registered and is never
+        // retired; and, since the R1 fix, the `Exec` candidate image -- losing which leaves `twin` naming the previous
+        // image, `install()` matching nothing, and the exec'd image
+        // half-mediated with its stubs breakpointed and its interposer inert.
+        //
+        // **An assertion rather than a refusal, deliberately.** This is a
+        // pre-existing invariant of the single `Pending` slot, not something the
+        // exec candidate introduced -- the breakpoint corruption above predates
+        // it and is worse than the lost candidate. A run that reaches this state
+        // is already broken by other means, so repairing one symptom of it (by
+        // moving the candidate to a field of its own) would hide the violation
+        // rather than surface it. What is wanted is to catch the violation at
+        // the point it happens, which is here.
+        //
+        // The only way to reach it is a multithreaded tracee -- `continue_run`
+        // resumes every thread, and `single_thread()` gates `Delivery::Fork` and
+        // `WaitPlan::Park` but **not** `Delivery::Exec` or a plain `Namespace`
+        // call -- and multithreaded tracees are the ratified next arc, which will
+        // have to revisit this slot wholesale. This is the tripwire that arc
+        // wants, and it is live in every `cargo test` run because the test
+        // profile is a debug profile. In release it costs nothing and changes
+        // nothing, which is why it is not a behaviour change to a shipped path.
+        debug_assert!(
+            self.pending.is_none(),
+            "a second intercepted syscall entered while one was still in flight: \
+             this session's pending entry breakpoint, return gate and exec \
+             candidate would all be overwritten"
+        );
         let regs = self.regs()?;
         let pc = get(&regs, PC)?;
         let gate = pc + 4;
@@ -500,8 +611,14 @@ impl Session {
         // dyld's own loading was never intercepted anyway -- and leaves the
         // tracee stopped before any initializer, which is still before the
         // target's first instruction.
+        // The gate is "is the image this session is running the one whose
+        // interposer umbra is responsible for arming", and `current` is
+        // maintained to answer exactly that -- see `Session::interposer` and
+        // `retarget_interposer`. The comparison itself is unchanged; what moved
+        // is that the right-hand side now follows the session's execs instead of
+        // naming the launch target forever.
         let interposer = match self.interposer.clone() {
-            Some((dylib, target, floor)) if image_path(self.id.0.native_id as i32)? == target => {
+            Some((dylib, current, floor)) if image_path(self.id.0.native_id as i32)? == current => {
                 // **A forked child is the one case that must not run to `main`.**
                 //
                 // `fork` copies the whole address space, so a child of a routed
@@ -1649,6 +1766,13 @@ impl MacosTraceBackend {
             return Err(error("child", "invalid child PID"));
         }
         self.generation += 1;
+        // The child's own image, kept back from the move so the interposer
+        // requirement can be pointed at it below. For a `fork` it is the
+        // parent's -- the address space is a copy, so the running image is the
+        // same one -- and for a `posix_spawn` it is the twin the spawn was
+        // rewritten to name, which is a different binary whenever the tracee
+        // asked for one.
+        let image = twin.clone();
         let mut child = Session::attach(
             pid,
             self.generation,
@@ -1659,6 +1783,7 @@ impl MacosTraceBackend {
             self.watchdog.as_ref().unwrap(),
             self.interposer.clone(),
         )?;
+        child.retarget_interposer(&image)?;
         // The parent supplied memory repairs, not breakpoints owned by this RSP.
         debug_assert!(child.breaks.is_empty());
         if let Some(restore) = restore {
@@ -1738,7 +1863,16 @@ impl MacosTraceBackend {
                 }
                 self.sessions[index].continue_run()?;
             }
-            ReturnKind::Exec => {
+            // **This arm is the failed-exec return, by construction**: a
+            // successful `execve` never comes back here, it stops with reason
+            // `exec`. So the candidate image is dropped rather than adopted, and
+            // `twin` still names what this session is running -- which is what
+            // the next `fork` hands `attach_child`.
+            //
+            // The candidate is bound and discarded rather than ignored with
+            // `..`, so that a later edit adding a use for it has to decide what
+            // a *failed* exec means for it rather than inheriting an answer.
+            ReturnKind::Exec { twin: _candidate } => {
                 self.sessions[index].continue_run()?;
             }
         }
@@ -1867,9 +2001,11 @@ impl MacosTraceBackend {
                     s.set_regs(&regs)?;
                     s.return_stop(ReturnKind::Spawn { pid_pointer, twin })?;
                 } else {
-                    s.twin = twin;
+                    // Not `s.twin = twin` -- see `ReturnKind::Exec`. The image
+                    // this session runs may not move until an exec has actually
+                    // happened, and at this entry it has not.
                     s.set_regs(&regs)?;
-                    s.return_stop(ReturnKind::Exec)?;
+                    s.return_stop(ReturnKind::Exec { twin })?;
                 }
             }
             // A breakpoint fired for a number no row in `abi::TRACED_STUBS`
@@ -1924,7 +2060,27 @@ impl MacosTraceBackend {
         s.stopped = true;
         s.thread = tid(thread, s.id.0.generation);
         if fields.get("reason") == Some(&"exec") {
-            s.pending = None;
+            // **The exec happened, so this is where the candidate is adopted.**
+            // `intercept` recorded the resigned image on the pending value
+            // rather than writing it into `twin`, precisely so a *failed*
+            // `execve` -- which returns to `finish_return` instead of stopping
+            // here -- leaves `twin` naming the image still running.
+            //
+            // `None`, or a pending value of another kind, leaves `twin` alone.
+            // An exec stop with nothing pending means the exec was not one umbra
+            // intercepted, and umbra has no resigned image of its own to name for
+            // it; keeping the previous value is what this did before the
+            // candidate existed.
+            let adopted = match s.pending.take() {
+                Some(Pending {
+                    kind: ReturnKind::Exec { twin },
+                    ..
+                }) => Some(twin),
+                _ => None,
+            };
+            if let Some(twin) = adopted {
+                s.twin = twin;
+            }
             s.scratch.clear();
             s.entry = None;
             s.exec_generation += 1;
@@ -1945,6 +2101,15 @@ impl MacosTraceBackend {
                 let _ = s.rsp.request(&format!("z0,{address:x},4"))?;
             }
             s.breaks.clear();
+            // **Before `install`, and that order is forced.** `twin` was set
+            // from the pending candidate a few lines above, at the first moment
+            // the exec is known to have happened; this is the stop where that
+            // image is the one running, so it is where the interposer
+            // requirement follows it. Do it after `install` and `install` would
+            // have already decided, from the previous image's name, that this
+            // run routes nothing here.
+            let image = s.twin.clone();
+            s.retarget_interposer(&image)?;
             // Resolve the new image.
             s.install()?;
             self.events.push_back(TraceEvent::Exec {

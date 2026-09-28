@@ -89,12 +89,29 @@
  *
  * DORMANCY
  * --------
- * DYLD_INSERT_LIBRARIES applies to every image in the exec chain, and umbra's
- * supervised launch runs `sandbox-exec` first, which then execs the target. So
- * this library is loaded twice: once into the installer, once into the target.
- * It must route in the target only, and it does, for free: umbra arms only the
- * image it meant to route, so the installer's copy is never armed and its file
- * operations reach libc exactly as they did before.
+ * DYLD_INSERT_LIBRARIES applies to every image in the exec chain, so this
+ * library is loaded into more images than umbra means to route -- always the
+ * `sandbox-exec` installer that umbra's supervised launch runs before the
+ * target, and then into whatever the tracee execs afterwards. It must route
+ * only where umbra says, and it does, for free: this file ships inert and
+ * nothing here decides whether it is live. umbra arms an image by writing the
+ * control block below, so an image umbra did not arm reaches libc exactly as it
+ * did before.
+ *
+ * **The set of armed images is not "the one image named at launch".** It was,
+ * and this section used to describe that two-image world -- installer and
+ * target -- as if it were the whole story. It is not: `exec` replaces the
+ * address space, dyld re-loads this library into the new image and re-runs its
+ * (absent) constructor, and the control block comes back zeroed, so umbra
+ * re-arms it there. The requirement umbra matches against is per-session and
+ * follows that session's execs and its attached children, which is what makes a
+ * shell's tool calls routed rather than silently inert. A *forked* child is the
+ * opposite case and is not re-armed: `fork` copies an already-armed block, and
+ * re-arming would fail the zero-check below by design.
+ *
+ * None of that changes anything in this file, which is the point of it being
+ * here: dormancy is still decided entirely by whether the control block was
+ * written, and this library still never asks which image it is in.
  *
  * VIRTUAL DESCRIPTORS
  * -------------------
@@ -163,9 +180,11 @@
  *    such a call writing the host is the kernel-enforced Seatbelt profile umbra
  *    installs before the target runs, never this library. That is unchanged by
  *    the calls the tracer routes -- `mkdir`(136), `fstat`(339)/`__fstat`(189),
- *    `setattrlistat`(524) (which is how `utimensat` reaches the kernel), and
- *    the four directory-read calls of entry 6 below, one of which (`close`) this
- *    file also interposes. Each is breakpointed at its libc stub, so a program that
+ *    `setattrlistat`(524) (which is how `utimensat` reaches the kernel),
+ *    `chdir`(12), and the four directory-read calls of entry 6 below, one of
+ *    which (`close`) this file also interposes. `abi::TRACED_STUBS` is the
+ *    authoritative list; this one names the shape and will go stale again if it
+ *    is read as membership. Each is breakpointed at its libc stub, so a program that
  *    issues the `svc` itself bypasses every one of them exactly as it bypasses
  *    `open`, and Seatbelt is what refuses it.
  * 3. Writable shared file mappings are unreachable in principle. A store to a

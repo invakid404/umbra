@@ -1,91 +1,132 @@
-# publish — `dg-29vwer0f` / #121
+# Publish — PR #129
 
-**PR: https://github.com/invakid404/umbra/pull/128**
+Graph `dg-egt6apy1`, node `publish`, visit 1. Date 2026-09-28.
 
-| | |
-|---|---|
-| Number | **128** |
-| State | `OPEN`, `MERGEABLE` |
-| Base → head | `master` ← `feat/ls-userspace` |
-| Head SHA | **`e6618397a94e465a8f37a4bf42ba275d23eb2992`** |
-| Parent | `a85a8471` (#120) — **one change above master** |
-| Title | `feat(tracer): serve directory reads on a virtual descriptor so ls works over the userspace client (#121)` |
+**PR: https://github.com/invakid404/umbra/pull/129**
 
-## 1. The #123 preflight fired, on this PR's own publish
+* Branch `feat/fork-lifecycle` → `master`
+* **No head SHA is recorded here, deliberately — see "the fixed-point problem"
+  below.** Read it from the PR: `gh pr view 129 --json headRefOid`.
+* jj change **`puyyxvmvmnpkwlmnnusmrqrvqkzsypnz`** (the stable handle; the
+  working-copy commit re-timestamped ten times across this slice — lesson 26)
+* Parent: master `7c3ecc8f`
+* Both attribution trailers verbatim on the change; PR body ends with the Claude
+  Code attribution and the session link, matching PR #128's convention.
 
-The ratified guard ran first, and it refused:
+**Nothing merged. `merge_gate` is next and needs the human.**
+
+---
+
+## #123 preflight
+
+The 3-line `git rev-parse` preflight **fails from the workspace root**, and that
+is expected rather than a defect:
 
 ```
-publish: /Users/inva/Coding/umbra-worktrees/ls-userspace has no .git (jj workspace?);
-         memoria and gh cannot run here
+$ cd ~/Coding/umbra-worktrees/fork-lifecycle
+$ git rev-parse --show-toplevel >/dev/null 2>&1 || { echo 'no .git'; exit 1; }
+no .git
 ```
 
-That is #123 exactly, in the path it was written for. Both `memoria` and `gh pr
-create` were therefore run from a **throwaway git worktree** of the anchor repo
-(lesson 5+9) rather than from the jj workspace. The guard is workflow-only, as
-ratified: **nothing #123-shaped is in the repo diff** — verified by five
-independent sweeps across four review rounds.
+A `jj workspace add` workspace carries no `.git`; only the colocated checkout at
+`~/Coding/umbra` has one. This was flagged at `prep_workspace` rather than
+discovered here. The preflight **passes** in the throwaway git worktree where
+git-dependent tooling actually runs:
 
-## 2. memoria
+```
+$ cd /tmp/graph-dg-egt6apy1/memoria-wt
+PREFLIGHT PASS: /private/tmp/graph-dg-egt6apy1/memoria-wt
+```
 
-`memoria check` initially failed `input_changed`: seven READMEs owned files this
-slice touched. Each was reviewed against its packet and acked in dependency
-order, re-cutting the packet after every ack (lesson 17).
+**Recommendation for the #123 preflight itself:** as written it cannot
+distinguish "not a repository" from "a jj workspace whose git is elsewhere",
+which are different conditions with different remedies. Worth a follow-up issue
+after the human approves.
 
-| README | result | what changed |
+## memoria — six READMEs reviewed, not blind-acked
+
+`memoria check` reported six pending. Its own guidance forbids acknowledging
+drift (*"edit the README rather than acknowledging the drift"*), so each was
+cross-checked against the code in its ownership boundary.
+
+| README | result | why |
 |---|---|---|
-| `README.md` | updated | The userspace-routing paragraph was stale four ways: `ls` joins `touch`/`cat`/`mkdir` (four utilities, not three), six mutation probes not five, and the new probe asserts on **entry names** rather than an exit code. |
-| `crates/umbra-platform/README.md` | updated | `SyscallAbi::directory_request` added to the trait block, plus why the seam exists: `getattrlistbulk` is the one call with two caller-supplied blocks, and its contents are judged **after** the descriptor fence. |
-| `crates/umbra-platform-macos/README.md` | updated | Four rows added to the installed-stub table (461, 13, 6, 399) and why they are a **set**: routing three of the four leaves `ls` failing on the fourth. |
-| `crates/umbra-supervisor/README.md` | updated | The owned-module list omitted the new `src/directory.rs`; added with what it holds and where it is injected. |
-| `crates/umbra-overlay/README.md` | updated | The false "directory reads are not routed" refusal (corrected during review) plus the snapshot **eviction on close** the `ReadDir` bullet did not describe. |
-| `crates/umbra-storage-nfs-userspace/README.md` | updated | The `ls` rows rewritten during implementation. |
-| `crates/umbra-cli/README.md` | **no-update** | Its only diff is one forwarded cargo feature; the README documents the command surface and dependency policy and enumerates no probe features, so nothing is falsified. |
+| `umbra-platform-macos` | **updated** | Two genuine drifts. Its traced-stub table was **missing the `chdir`(12) row** while the same section claims the table and `abi::TRACED_STUBS` *"read one source"* — a false invariant of exactly the parallel-list class the README itself recounts having suffered. Added the row beside `mkdir`(136) (both bare, cwd-anchored), which keeps the later *"the last four rows are the directory read"* sentence true. Also added item 12, the interposer's `exec` lifecycle, beside item 10's `fork` half |
+| `umbra-storage-nfs-userspace` | **updated** | Already corrected in the implementation: the self-contradicting `exec` row replaced, and the combined `chdir`/`getcwd` row **split** so the shipped half and the inert half cannot drift into one claim |
+| `umbra-supervisor` | no-update | Describes neither the effect enum nor logical cwd movement, so the `MovedCwd` addition falsifies no prose here |
+| `umbra-overlay` | no-update | Names `routed_descriptor` only for the `Open` readback and never enumerated that family — `routed_stat` predates this change and is likewise unmentioned — so adding `routed_cwd` leaves its scoped claim true |
+| `umbra-core` | no-update | The `lib.rs` change is the doc-comment fix removing `fstat` from the `EBADF` list; this README carries no such list |
+| root `README.md` | **updated, acked last** | See ordering below |
 
-Final state on the pushed commit: **`memoria check` exit 0 — `OK: 23 README(s)
-current, imports rendered, no coverage or structure errors`**, worktree clean.
+Final state: `memoria check` → **`OK: 23 README(s) current, imports rendered, no
+coverage or structure errors.`**
 
-## 3. Verification carried into the PR
+Note on that check's output: it prints 14 `no link or import path from the root
+README reaches this README` advisories. Those are **pre-existing and present at
+master**, which also reports `OK` — they are advisory within a passing check, not
+errors this change introduced.
 
-All re-run by the driver, not taken from a worker report.
+## Lesson 17's re-ack ordering, made concrete
 
-**These figures are at head `e6618397`**, which is the head this document
-published and which CI round 1 tested. That head has since been superseded twice
-— `6a18b98f` (CI/CR fix round 1) and `52fba1e1` (memoria re-ack) — and **832
-still holds at the current head**, because neither pass added or removed a test.
-`impl.md` §7.1 is the canonical per-commit table for every figure in this slice.
+The root README's inputs are **this graph's own root-level process documents**.
+Verified from its review packet — `publish.md`, `ci-round1.md` and `done.md` are
+all inputs:
 
-One condition worth carrying, discovered after this document was written: the
-`832` below was measured **without** `UMBRA_TEST_FIXTURE_PATH`, so the eleven
-`umbra-platform-macos` fixture cases reported `ok` without executing. The count
-is the same either way; the run behind it was not. From `6a18b98f` onward the
-env is set. `ci-fix-r1.md` §2 has the measurement.
+```
+publish.md    referenced-as-input: True
+ci-round1.md  referenced-as-input: True
+done.md       referenced-as-input: True
+```
 
-| gate | result, at `e6618397` |
-|---|---|
-| `cargo fmt --all --check` | clean |
-| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
-| `cargo test --workspace --all-targets` | **832 passed**, 0 failed, 3 ignored (master `a85a8471`, measured: **813**) |
-| `userspace_run` vs live Ganesha | 22 passed, 0 failed |
-| `run_fixtures` rewrite-backed matrix | 10 passed, incl. `/bin/ls -l` and `-t` |
-| side-by-side vs `a85a8471` | 0 divergences |
-| `attrlist` header shapes, routed | 0 run-enders |
-| capacity matrix, routed | 0 run-enders; answers match the kernel |
-| unbound-descriptor shapes | all answer `EBADF` |
-| `readdir` probe / negative control | passes / fails on the names |
+So the root README had to be acked **after** `publish.md` existed, or writing this
+file would immediately re-pend it. That is what "re-ack ordering" means here, and
+it explains the predecessor graph's `chore(memoria): re-acknowledge …` commits.
 
-## 4. Attribution
+**Carried forward for the remaining nodes:** `wait_and_verify_ci` writes
+`ci-round<visit>.md` and `done` writes `done.md`. **Each of those re-pends the
+root README and needs a re-ack plus a push**, or CI's memoria gate will fail on a
+state that is otherwise correct.
 
-- Commit: `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` and
-  `Claude-Session: …session_01WVMBHbmtYQj4zTrKzUhddF` — **one each, byte-exact**,
-  verified after every amend.
-- PR body ends with the Claude Code line and the session link.
+## The fixed-point problem, and why this file records no head SHA
 
-## 5. State
+Recording the final pushed SHA *in this file* is not possible, and the reason is
+structural rather than clumsiness.
 
-Nothing merged. Nothing else pushed. The bookmark points at the head SHA above.
-`PAUSE BEFORE MERGING` stands — `merge_gate` is where the human decides.
+`publish.md` is an input to the root README (verified above). So writing it
+re-pends the root README; acking that re-pends nothing but does change
+`memoria.lock`; and amending the change to carry the new lock **moves the commit**.
+Any SHA this file names is therefore stale the moment the file is committed.
+Observed exactly that way: the branch went `cf89a75e` → `791aad2c` → `9f292308`,
+each step a correction of the SHA the previous step had just invalidated.
 
-Next: `wait_and_verify_ci`. Note for it — **read the log, not the status**
-(the #120 lesson): the routing job's proofs are what matter, and CI has never
-before run `Proof 7` or the two new `/bin/ls` flag rows.
+The fix is to stop naming the moving value. This file pins the **change id**
+`puyyxvmvmnpk…`, which is stable across every amend, and points at the PR for the
+head SHA. Lesson 26 already said to pin by change id in jj; this is the sharper
+form of it — **a document that is an input to a gated document cannot record its
+own commit's identity.**
+
+Recorded because the obvious alternative is worse: leaving a stale SHA in place
+is exactly the provenance defect (`S-F2`, `R6`) that the scope review caught twice
+in this slice, and it would have been self-inflicted here.
+
+## Predecessor artifacts preserved
+
+Nine inherited root documents (`impl.md`, `fix-r3.md`,
+`review-synthesis-r3.md`/`-r4.md`, `ci-round1.md`/`-2.md`,
+`ci-fix-r1.md`/`-r2.md`, `publish.md`) were copied to
+`graph-audits/inherited-from-master-7c3ecc8f/` **before** this graph overwrote
+them — closing the scope review's N2 finding in practice rather than only
+recording it.
+
+That surfaced something for `merge_gate`: after the merge the repo root will hold
+a **mixed set** of process documents, some from this graph and some left stale
+from its predecessor (`review-synthesis-r4.md`, the `ci-*.md` files). A
+pre-existing wart of the root-document convention, not introduced here.
+
+## One post-review edit, disclosed
+
+The `umbra-platform-macos/README.md` edit above landed **after** the three review
+rounds certified the tree. It is prose-only in a file whose code the reviews
+already cleared, and it *removes* a false invariant rather than adding a claim —
+but it was not reviewed, and `merge_gate` should say so rather than imply the
+whole diff carries three rounds of sign-off. CI and CodeRabbit see it.

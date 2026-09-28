@@ -656,6 +656,21 @@ pub struct Overlay {
     /// encode. Cleared at the head of every `resolve` beside the two above, so
     /// it can never describe an earlier operation.
     routed_stat: Option<BlobStat>,
+    /// The absolute logical directory the last routed `Chdir` resolved to, for
+    /// the caller to make this process's working directory.
+    ///
+    /// The third member of the `routed_descriptor` / `routed_stat` family, read
+    /// the same way and for the same reason: the namespace resolves *which*
+    /// directory the operand names, and only the caller owns
+    /// [`umbra_core::ProcessContext`] to put it in. `fchdir`'s sibling effect
+    /// needs no channel like this because its answer is already in the caller's
+    /// hands -- the descriptor's own binding carries a `logical_path` -- while a
+    /// `chdir` operand has been through symlink expansion and whiteout
+    /// traversal that only this engine performed.
+    ///
+    /// Cleared at the head of every `resolve` beside the three above, so it can
+    /// never describe an earlier operation.
+    routed_cwd: Option<BytePath>,
     /// Set by `whiteouted()` whenever a marker hid a component during the current
     /// `resolve`. Reset at the top of every `resolve`, read only inside that same
     /// call, through `hidden_or`. It is the difference between "the namespace
@@ -695,6 +710,7 @@ impl Overlay {
             routed_open: None,
             routed_descriptor: None,
             routed_stat: None,
+            routed_cwd: None,
             whiteout_hit: false,
         }
     }
@@ -2126,6 +2142,69 @@ impl Overlay {
         Ok(action)
     }
 
+    /// Resolve a routed `chdir`: make the named directory this process's logical
+    /// working directory.
+    ///
+    /// The sibling of [`Self::resolve_routed_fchdir`], and it answers the same
+    /// question from the other end. `fchdir` is handed a descriptor whose
+    /// binding already carries the logical path it names; `chdir` is handed a
+    /// path operand, which has to go through the same resolution every other
+    /// path operation does -- symlink expansion, whiteout traversal, the
+    /// logical-root containment check -- before there is a directory to move to.
+    /// So this one resolves and then reports its answer through
+    /// [`Self::routed_cwd`], because the working directory belongs to the
+    /// caller's `ProcessContext` and not to this engine.
+    ///
+    /// **The path it reports is absolute and logical, never physical.** That is
+    /// what `cwd` has to be: it is the anchor relative resolution is measured
+    /// against, so a relative value would anchor against itself, and a physical
+    /// one would put a host path where the next `DirRef::Cwd` expects a name in
+    /// the run's own namespace. `logical()` is the same conversion a routed
+    /// `Open` binding uses, so the two agree by construction.
+    ///
+    /// Two refusals, both answered *to the tracee* rather than stopping the run,
+    /// because both are things an ordinary program gets wrong: a name that does
+    /// not resolve is `ENOENT` through `hidden_or`, exactly as an `open` of an
+    /// absent path is, and a name that resolves to something that is not a
+    /// directory is `ENOTDIR`. 20 is `ENOTDIR` on macOS/BSD and on Linux alike,
+    /// which is why `resolve_routed_fchdir` spells it as a literal too.
+    fn resolve_routed_chdir(
+        &mut self,
+        context: &ProcessContext,
+        operation: &FsOp,
+        dir: DirRef,
+        name: &BytePath,
+    ) -> Result<ResolvedAction> {
+        // `create_parents` is false and `follow_final` is true: `chdir` creates
+        // nothing, and POSIX follows a symlink named as its operand.
+        let path = match self.resolve_path_follow(context, dir, name, false, true) {
+            Ok(path) => path,
+            Err(e) => return self.hidden_or(e, false),
+        };
+        let Some((stat, _)) = absent(self.lookup(&path))? else {
+            return self.hidden_or(error(ErrorKind::NotFound, "chdir target absent"), false);
+        };
+        if stat.kind != ObjectKind::Directory {
+            return Ok(ResolvedAction::Deny(Errno(20)));
+        }
+        let action = ResolvedAction::Emulate(EmulatedResult {
+            outcome: OperationOutcome::Success { return_value: 0 },
+            memory_writes: vec![],
+        });
+        self.routed_cwd = Some(logical(&path)?);
+        self.planned = Some(Plan {
+            action: action.clone(),
+            operation: operation.clone(),
+            path,
+            destination: None,
+            mutation: false,
+            directory_next: None,
+            routed_write: None,
+            directory_closed: None,
+        });
+        Ok(action)
+    }
+
     /// Resolve a routed `fstat`: answer from the descriptor's logical object.
     ///
     /// The metadata is read here, during `resolve`, for `resolve_routed_read`'s
@@ -2398,6 +2477,7 @@ impl NamespaceResolver for Overlay {
         self.routed_open = None;
         self.routed_descriptor = None;
         self.routed_stat = None;
+        self.routed_cwd = None;
         if let FsOp::ReadDir { fd, max_bytes } = operation {
             return self.resolve_directory(context, operation, *fd, *max_bytes);
         }
@@ -2415,6 +2495,9 @@ impl NamespaceResolver for Overlay {
             FsOp::Close { fd } => return self.resolve_routed_close(context, operation, *fd),
             FsOp::Fstat { fd } => return self.resolve_routed_fstat(context, operation, *fd),
             FsOp::Fchdir { fd } => return self.resolve_routed_fchdir(context, operation, *fd),
+            FsOp::Chdir { dir, path } => {
+                return self.resolve_routed_chdir(context, operation, *dir, path)
+            }
             _ => {}
         }
         let (dir, name, create_parents) = match operation {
@@ -3194,6 +3277,10 @@ impl NamespaceSession for Overlay {
     fn routed_stat(&self) -> Result<Option<BlobStat>> {
         self.config()?;
         Ok(self.routed_stat.clone())
+    }
+    fn routed_cwd(&self) -> Result<Option<BytePath>> {
+        self.config()?;
+        Ok(self.routed_cwd.clone())
     }
     fn set_readlink_buffer(&mut self, address: u64, len: u32) -> Result<()> {
         self.idle()?;

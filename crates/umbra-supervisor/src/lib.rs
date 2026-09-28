@@ -375,6 +375,23 @@ enum RoutedEffect {
     /// path at the entry would let a `close` between the entry and the exit
     /// leave this holding a name the process no longer has open.
     ChangedCwd(umbra_core::TracedFd),
+    /// A routed `chdir` succeeded: move the logical working directory to the
+    /// absolute logical path the namespace resolved its operand to.
+    ///
+    /// The path rather than a descriptor, which is the one way this differs from
+    /// [`Self::ChangedCwd`] and is forced by what the two calls are given.
+    /// `fchdir` names something already in `ProcessContext::fds`, so the path can
+    /// be looked up at the moment the move is applied and cannot go stale in the
+    /// caller's hands. `chdir` names a path operand and binds nothing, so there
+    /// is no later place to read the answer from -- the resolution happened in
+    /// the namespace, which is where symlink expansion, whiteout traversal and
+    /// the logical-root containment check live, and it is carried here rather
+    /// than redone.
+    ///
+    /// It is an absolute *logical* path for `ChangedCwd`'s reason, checked the
+    /// same way where it is applied: `cwd` is the anchor relative resolution is
+    /// measured against, so a relative value would anchor against itself.
+    MovedCwd(umbra_core::BytePath),
 }
 
 /// Returned ownership does not imply providers were closed or a clean shutdown.
