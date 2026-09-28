@@ -1,448 +1,507 @@
-# impl — `dg-29vwer0f` / #121: directory reads on a virtual descriptor
+# Implementation — Fork lifecycle over the umbra supervisor (#117 + #121's escalation)
 
-**Objective, as ratified:** serve directory reads on a *virtual* descriptor, so
-`ls` works on `nfs-userspace` as it already does on the rewrite-backed
-registries. Not "ship `ls`" — `/bin/ls` already exited 0 on `--local-dev` and
-kernel-`nfs` before this slice, and still does (re-verified, §5).
+Graph `dg-egt6apy1`, node `implement`, visit 1. Date 2026-09-28.
+Baseline: `master` `7c3ecc8f`. Change: **`puyyxvmvmnpkwlmnnusmrqrvqkzsypnz`**,
+bookmark `feat/fork-lifecycle`.
+Contract: the RATIFICATION RECORD in `design-gate.md`.
 
-**Outcome:** achieved and proven by execution.
-`umbra run --registry <nfs-userspace> -- /bin/ls <dir>` lists the shadow's
-merged entries and exits 0, host untouched, against the live NFS-Ganesha
-fixture.
-
----
-
-## 1. Read this first: three deviations from the ratified plan
-
-All three were forced by measurement, none expands the scope, and each is stated
-here rather than buried in a diff. Nothing in the ratified *objective* changed.
-
-### 1.1 G-ii could not be implemented the way it was described — the wire format
-had to move
-
-The gate ratified **G-ii: "implement the `DirectoryEncoder` trait over the ABI
-and call `set_directory_encoder` in production."** The first half is not
-constructible:
-
-* `pub trait DirectoryEncoder: Send` (`umbra-overlay/src/engine.rs`), and it is
-  called from inside the overlay's `resolve`, in the supervisor's process.
-* The production `SyscallAbi` is an IPC proxy holding `Rc<RefCell<Client>>`
-  (`umbra-platform/src/provider.rs:132-134`) — **not `Send`**.
-* `umbra-platform-macos` is a provider *executable*, not a library dependency of
-  anything (`crates/umbra-cli/Cargo.toml` says so explicitly). Its code does not
-  run in the supervisor's address space at all.
-
-So no encoder that reaches the production ABI can satisfy the trait's bound, and
-the ABI's code is in the wrong process regardless.
-
-**What was done instead**, chosen to keep every ratified property of G-ii:
-the `getattrlistbulk` wire format lives in `umbra-platform::dirents`, a crate
-**both** the supervisor and the macOS backend already depend on. The
-`DirectoryEncoder` (`umbra-supervisor/src/directory.rs`) is implemented over
-that, and is injected in production. So G-ii's ratified benefits hold exactly:
-**no overlay contract change, and `resolve_directory`'s paging and validation are
-used as written.** The only deviation is *where the format's code physically
-lives*, which the gate never specified. It is one format with two readers, which
-is strictly better than the duplication G-ii was accepted as tolerating.
-
-*Confidence: high.* The `Send`/`Rc` incompatibility is a compile-time fact, not
-a judgement.
-
-### 1.2 The injection point is one site, not the two the gate named
-
-The gate named `run.rs:1205` and `:1587` ("session construction"). Injection is
-instead in `Supervisor::launch_prepared` (`umbra-supervisor/src/events.rs`),
-because:
-
-* it is the **single** path every launched run takes, so two sites cannot drift
-  — which is the entire #116 lesson this slice is a second instance of; and
-* it is the first point where the negotiated ABI label is known, and the
-  injection is gated on it (`budget.abi == dirents::DARWIN_ARM64_ABI`) and on the
-  run being routed. At `run.rs:1205` the platform has not been connected yet.
-
-*Confidence: high.* Proven live — see §4.
-
-### 1.3 `resolve_directory`'s return-value check was wrong for the only ABI umbra
-has, and was corrected rather than removed
-
-`resolve_directory` required `outcome == Success { return_value: total_bytes }`.
-Measured against the kernel: **`getattrlistbulk` returns a count of entry
-records, not bytes** — four entries in 248 bytes return `4`. Telling `fts` it had
-received 248 entries is worse than any refusal.
-
-This was never exercised before: nothing implemented `DirectoryEncoder`, so no
-directory read had ever run. The check was written for a `getdirentries`-shaped
-call.
-
-**It was changed to `return_value == encoded.consumed`.** Round-1 review was
-right that "nothing was given up" overstated it, and the honest accounting is
-this: the engine traded its one binding of the tracee-visible return value to an
-**engine-derived** quantity (`total`, summed by the engine from the encoder's
-memory writes) for a binding to an **encoder-supplied** one (`consumed`, which
-arrives in the same struct as `return_value`). What compensates -- the record
-re-walk -- lives inside `AbiDirectoryEncoder`, i.e. inside the thing
-`resolve_directory`'s validation exists to police. That is a real narrowing of
-the engine's *independent* check and it should not be recorded as free.
-
-It is still the right trade, and the reason is that the old form was
-unsatisfiable truthfully: `getattrlistbulk` returns a record count, so the only
-way to satisfy `return_value == total` was to tell `fts` it had received 248
-entries. The byte accounting is also still checked, in the same expression: the
-writes must fit `max_bytes`, and must be non-empty whenever an entry was
-consumed.
-Binding the declared result to `consumed` additionally ties it to the *paging*
-(`directory_next` continues from `entries[consumed..]`), so an encoder that told
-the tracee one count and paged past another is now refused where previously only
-its byte total was examined. Two further checks were **added**: the encoder
-re-walks its own finished buffer with `dirents::count_records` and refuses a
-disagreement, and `count_records` refuses any reply that does not walk exactly to
-its end.
-
-This is the one place a ratified detail ("validation used as written") could not
-hold literally. I judged correcting the identity strictly better than either
-translating the value downstream (which broke `observe_result`'s
-planned-vs-observed guarantee — measured, it did) or relaxing the check.
-
-*Confidence: high* on the measurement; *medium-high* on it being the change the
-human would have chosen. Flagged for `merge_gate`.
+> **Provenance, corrected in round 1 (R6).** This document originally cited
+> `fff2bae0`, a jj **working-copy commit id**, which was not the tree the figures
+> below were measured on and has since re-timestamped several times
+> (`fff2bae0` → `14d16c4f` → `105023ee` → … ) and is now hidden. A working-copy
+> commit is not a stable handle. The **change id** above is, and it is what every
+> figure in this document is measured against. See `fix-r1.md` for the round-1
+> remediation and its own re-qualified figures.
 
 ---
 
-## 2. The standing condition: what I measured about the working directory
+## Step 0 — the live fixture, and the failure reproduced before any fix
 
-**The human required this to be measured before being relied on. It was, first,
-before any code was written — and the audit's inference was wrong in a way that
-matters.**
+This was baked into scope and it was done first. No fix code was written until
+the failure below had been observed live.
 
-Method: `/bin/ls` is a SIP platform binary, so a debuggable twin was made exactly
-as `cache::resign` does (copy, `codesign -f -s -` with
-`crates/umbra-platform-macos/ent.plist`). `lldb` breakpoints with
-`-C "frame info"` plus argument reads; `dtrace` is unavailable (SIP).
+**The fixture.** `docker compose -f experiments/nfs-raw/docker-compose.yml up -d
+--build --wait --wait-timeout 180` brought up `umbra-m1-transport-raw-ganesha`,
+healthy, on `127.0.0.1:12105`:
 
-**Measured, across every argv shape — absolute operand, relative operand, `.`,
-and no operand at all:**
+```
+CONTAINER ID   IMAGE                         STATUS                    PORTS                       NAMES
+3e4d9b7894f6   umbra-nfs-ganesha-raw:local   Up 13 seconds (healthy)   127.0.0.1:12105->2049/tcp   umbra-m1-transport-raw-ganesha
+```
 
-| claim | audit said | measured |
+The pinned libnfs source (`18c5c73e`, matching `libnfs.pin`) was fetched into
+`third_party/libnfs`, because `transport-raw` — the feature the client read-back
+needs — does not build without it.
+
+**The failure, verbatim.** The new `forkexec` fixture case and its driver were
+written first and run against that fixture on the **unmodified** tree:
+
+```
+thread 'a_forked_child_that_execs_a_different_binary_is_mediated_in_the_new_image' (37926858) panicked at crates/umbra-storage-nfs-userspace/tests/userspace_run.rs:1475:5:
+assertion `left == right` failed: a forked child's exec'd image did not complete a routed write:
+umbra: run 98db47c6-8531-4425-9634-844c6f306fdc prepared
+umbra: run 98db47c6-8531-4425-9634-844c6f306fdc finished: Some(Code(9)) after 2 process exits
+ProcessFailed during run.child: supervised command finished with Code(9) (errno: None)
+
+  left: 9
+ right: 0
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 22 filtered out; finished in 5.91s
+```
+
+**The exit code is 9, `EBADF`, and it is a sharper diagnosis than the audit
+predicted.** The audit expected the exec'd child's write to fail closed against
+Seatbelt — `EPERM`. What actually happens is more specific, and it is worth
+recording because it says exactly which half of the mediation survived the exec
+and which did not:
+
+* `install()` **does** re-run after the exec and **does** re-plant every
+  `TRACED_STUBS` breakpoint, because that loop is unconditional. So the exec'd
+  child's `open` still trapped at the libc stub, was routed, and was answered
+  with a **virtual descriptor** — a number above the fence.
+* The interposer was **not** re-armed, because the image was not the launch
+  target. `write` and `close` reach umbra only through the interposer, and an
+  inert interposer passes them to libc unchanged.
+* So the child wrote to a virtual descriptor number through the kernel, which
+  does not own it: `EBADF`.
+
+That is a genuinely worse shape than "fails closed", and it is only visible
+end-to-end. It is the concrete reason P1 must not have shipped against a test
+that never ran.
+
+**Round 1 note (R2).** This paragraph was right and three *other* new prose
+sites were wrong, having repeated the audit's predicted mechanism -- "reads
+reach the host, the write fails closed, the object never appears" -- instead of
+this measured one. A review mutation settled it independently by reading `[]`
+back through the client: the object is **present and empty**. All three sites
+are corrected; see `fix-r1.md` R2.
+
+The same run reproduced **P0's** failure too, once the `chdirchild` case existed:
+
+```
+thread 'a_chdir_in_an_exec_d_child_moves_the_logical_cwd_its_relative_write_resolves_against' panicked at crates/umbra-storage-nfs-userspace/tests/userspace_run.rs:1546:5:
+assertion `left == right` failed: the exec'd child's chdir-then-relative-write failed:
+umbra: run 551239f6-25fe-432b-8a2d-811ed671328a prepared
+umbra: run 551239f6-25fe-432b-8a2d-811ed671328a finished: Some(Code(2)) after 2 process exits
+  left: 2
+ right: 0
+```
+
+Exit 2 is `ENOENT`, and it is the unintercepted `chdir` reaching the kernel: the
+directory the case creates exists only in the run's shadow, so the *host* has no
+such path and the host `chdir` fails. Precisely the split anchor (I) describes.
+
+**Pre-fix state of all four new cases**, on the unmodified tree against the live
+fixture:
+
+| Case | Pre-fix | Meaning |
 |---|---|---|
-| what `fchdir`'s operand is | "chdir into the directory being read" (§A.3 trace annotation) | **the directory the process is already in.** `fts` opens `"."`, then `fchdir`s back to *that* descriptor. It never chdirs into the directory it reads. |
-| argv shapes | "byte-identical fts sequences" (§B.1) | **not identical.** An absolute operand produces 2 `fchdir`s; a relative operand produces 3, plus a second `open(".")` and a *relative* open of the target. |
-| `chdir`(12), `getcwd`(326) | zero calls | **confirmed, zero calls** in every shape |
+| `forkexec` | **FAIL** — child exit 9 (`EBADF`) | the (C′) exec gap |
+| `chdirchild` | **FAIL** — child exit 2 (`ENOENT`) | the (I) `chdir` gap |
+| `grandchild` | pass | new coverage of a working mechanism, as #117 asks |
+| `rollbackchild` | pass | new coverage of an existing invariant, as (H) says |
 
-**Conclusion: the logical working directory never moves during an `ls`.** The
-engine's `Fchdir` arm and the supervisor's `ChangedCwd` effect are, for `ls`, an
-identity update.
-
-**So why route `fchdir` at all?** Not for the directory — for the *descriptor*.
-Once the opens are routed, `fchdir`'s operand is a virtual descriptor (≥ 4096);
-unrouted it reaches a kernel that does not know the number and answers `EBADF`,
-which `fts` reports as `fts_read:` and exits 1 on. The cwd update is implemented
-as ratified because a routed call that reports success while silently declining
-to do the thing it names would be a worse answer than the refusal it replaced.
-
-**Escalation check (standing condition 2): no fork/exec cwd propagation is
-required.** `/bin/ls` does not fork. Nothing in this slice widens the cwd model
-across `fork`/`exec`, and `FsOp::Chdir`/`GetCwd` remain declared and inert — no
-decode for 12 or 326, no handler, and that is now documented rather than left
-looking implemented.
-
-*Confidence: high.* Directly measured, repeatedly, four argv shapes.
+The two that passed pre-fix are stated as such rather than presented as fixes.
+They are coverage, not repairs, and the audit said so in advance.
 
 ---
 
-## 3. The `getattrlistbulk` wire format — measured, not recalled
+## What changed
 
-The largest and riskiest ratified item. It was **not** derived from `sys/attr.h`
-or from memory of XNU. A C probe issued the exact request `fts` issues against a
-real directory on macOS 26.5.1 arm64, and the reply bytes were dumped and
-decoded; a name-length sweep (1..13 bytes) and an attribute-set sweep pinned the
-packing and alignment rules.
+### P0 — route `chdir`(12)
 
-Measured request (the **only** shape umbra serves):
-`bitmapcount 5`, `commonattr 0x8200000b`
-(`RETURNED_ATTRS|FILEID|OBJTYPE|DEVID|NAME`), `fileattr 0x00000001`
-(`FILE_LINKCOUNT`), `options 8` (`FSOPT_PACK_INVAL_ATTRS`), 32 KiB buffer.
+**Measured first.** The audit's claim that `_chdir` needs no new mechanism was
+re-verified on this host before the row was written, by reading the stub exactly
+as `install()`'s verifier reads it (`dlsym(RTLD_DEFAULT, "chdir")`, then the last
+`movz x16` before the `svc`):
 
-Measured record rules, all of which surprised at least once:
+```
+chdir -> chdir in /usr/lib/system/libsystem_kernel.dylib
+  +00  d2800190   <-- movz x16, #12
+  +04  d4001001   <-- svc #0x80
+```
 
-* attributes are packed **tight, with no internal alignment** — the `u64`
-  `ATTR_CMN_FILEID` lands at offset `0x24`, which is 4-aligned and not 8-aligned,
-  and the kernel inserts no pad;
-* the **record** is padded to a multiple of **8** (47→48, 49→56, 57→64);
-* `attr_dataoffset` is relative to the `attrreference_t` field's own address;
-* **a directory record omits the file attribute group entirely** and says so in
-  its returned-attributes bitmap — it is 8 bytes shorter, not zero-filled,
-  despite `FSOPT_PACK_INVAL_ATTRS`.
+One `movz x16, #12` immediately before the `svc`. The existing machinery plants
+and verifies it unchanged.
 
-A verbatim capture of the kernel's own reply is checked into
-`umbra-platform/src/dirents.rs` as `RECORDED_REPLY`, and the unit tests compare
-this encoder's output against it field for field (masking only `DEVID` and
-`FILEID`, which umbra deliberately answers differently and asserts separately).
-**The format is therefore checked against the kernel, not against a second copy
-of the constants.**
+* `crates/umbra-platform-macos/src/abi.rs` — the row `("chdir", 12,
+  Delivery::Namespace)`, beside `fchdir`'s, and the decoder arm `12 =>
+  FsOp::Chdir { dir: DirRef::Cwd, path: read_path(..., x0) }` modelled on bare
+  `mkdir`(136), which is the other no-dirfd path call.
+* `crates/umbra-overlay/src/engine.rs` — `resolve_routed_chdir`, the sibling of
+  `resolve_routed_fchdir`. It differs in one way and the difference is forced:
+  `fchdir` is handed a descriptor whose binding already carries a logical path,
+  while `chdir` is handed a path operand that has to go through the same
+  resolution every other path operand does — symlink expansion, whiteout
+  traversal, the logical-root containment check. Two refusals, both answered *to
+  the tracee* so the run survives: `ENOENT` through `hidden_or` for a name that
+  does not resolve, `ENOTDIR` (20) for one that resolves to a non-directory.
+* `crates/umbra-overlay/src/lib.rs` — `routed_cwd()`, the third member of the
+  `routed_descriptor` / `routed_stat` family, defaulted to a refusal exactly as
+  they are. The resolved absolute logical path has to leave the namespace beside
+  the action, because the working directory belongs to the caller's
+  `ProcessContext` while *which* directory the operand names is the namespace's
+  answer.
+* `crates/umbra-supervisor/src/lib.rs` — **one additive `RoutedEffect` variant**,
+  `MovedCwd(BytePath)`. It carries the path rather than a descriptor, which is
+  the one way it differs from `ChangedCwd`: `fchdir` names something already in
+  `ProcessContext::fds`, so the path can be read at the moment the move is
+  applied; `chdir` binds nothing, so there is no later place to read it from.
+* `crates/umbra-supervisor/src/events.rs` — recording and applying it, with the
+  same absolute-path check `ChangedCwd` makes and for the same reason.
 
-*Confidence: high for the served shape; deliberately zero for any other.* An
-attribute set outside the measured one is refused **by name** at the decode,
-because the bitmap *is* the reply layout. This fired for real during
-implementation: the test fixture's first version used `fts_children(tree, 0)`,
-which requests `common=0x82079e0b file=0x0000022d`, and the refusal named exactly
-that. That is `ls -l` territory and is not claimed.
+**`intercept()` was not touched**, and that is the point of one-table-two-gates.
+It is exhaustive over `abi::Delivery`, so the new row is routed without a second
+admission edit — which is exactly the #116 `admit_run` drift this structure
+exists to prevent. Both `TRACED_STUBS` invariant tests
+(`every_traced_stub_is_classified_by_the_decoder`,
+`every_traced_stub_carries_the_delivery_its_number_implies`) iterate the table,
+so they cover the new row without being edited.
+
+**A rewrite-backed run resumes `chdir` into the kernel, unchanged.** The row
+breakpoints `chdir` on *every* registry, so a gate was needed. The four
+descriptor-relative calls gate on `umbra_owns_descriptor`; `chdir` names a path
+and binds nothing, so the equivalent question is whether the run routes at all,
+and the same `descriptor_floor` answers it — `Some` exactly for a routed run, by
+`RunBudget`'s own definition. Emulating it on a rewrite-backed run would be
+strictly worse: umbra would report success while the kernel's working directory
+stayed put, and every relative path handed to a call umbra does *not* intercept
+would resolve against the old one.
+
+**The limit that leaves is stated, not hidden.** A rewrite-backed run's
+`ProcessContext::cwd` still does not follow the tracee's `chdir`. Closing that
+needs a second mechanism — `RoutedEffect` is recorded only for a routed run, by
+construction, which is why "one additive `RoutedEffect` variant" bounds this
+slice to the routed path — so it is out of this slice rather than half-done
+inside it. It is said in the code comment, in the README row, and here.
+
+**`getcwd`(326) is untouched and stays inert**, by ratified decision. The comment
+at `events.rs` that used to say "`Chdir` and `GetCwd` stay declared and inert"
+was rewritten rather than left to rot: it now says `Chdir` is routed, why, and
+that `GetCwd` is unserved rather than in agreement with `ProcessContext::cwd`.
+
+### P1a — the interposer follows the exec
+
+`install()` gated on `image_path(pid) == target`, where `target` was assigned
+once in `launch_traced` and never reassigned. The **comparison is unchanged**;
+what changed is that its right-hand side now means "the image this session is now
+running" and is maintained per session.
+
+* `Session::interposer`'s second element is redocumented from "target image" to
+  "current image", with the gap it used to cause spelled out.
+* `Session::retarget_interposer(&Path)` canonicalizes an image and points the
+  requirement at it. Called from exactly two places:
+  * the **exec stop**, before `s.install()`, from `s.twin` — which `intercept`
+    already set to the resigned image the tracee is execing. The ordering is
+    forced: after `install()`, `install()` would already have decided from the
+    previous image's name that this run routes nothing here.
+  * **`attach_child`**, from the `twin` it is handed — the parent's image for a
+    `fork`, the spawned twin for a `posix_spawn`. This is what also closes the
+    spawn half, which had the same defect.
+
+**It is deliberately *not* called for a freshly attached root, and that is what
+keeps the sandbox installer inert.** The installer is a `sandbox-exec` twin with
+the interposer loaded into it by `DYLD_INSERT_LIBRARIES`, stopped and installed
+before dyld has mapped anything at all. Retargeting it to its own image would
+make `install()` match, look for a library that is not mapped yet, and fail the
+launch inside trusted bootstrap code. Its copy stays dormant because nothing arms
+it — the mechanism since round 1 — and that is unchanged. Verified by the
+`sandbox_launch` suite passing with real work (4 cases, 8.18 s; see gates).
+
+### P2 — four fixture cases
+
+In `experiments/fixtures/umbra-userspace-edges.c` (new cases only; no existing
+case body edited) with drivers in
+`crates/umbra-storage-nfs-userspace/tests/userspace_run.rs` (**new `#[test] fn`
+bodies only**; no existing test fn edited). Every one asserts **through the NFSv4
+client** via `read_through_client`, never on the tracee's exit status.
+
+* **`forkexec`** — fork, exec a different binary, which writes `execchild`.
+  P1's regression test. The helper is the edge fixture copied to a **different
+  basename**, and that detail is load-bearing: a twin is cached at `<sha256 of
+  contents>/<basename>`, so a copy with the *same* basename resigns to the same
+  twin path and would have been armed for the wrong reason, reporting a pass
+  against the defect it exists to catch. The driver's doc comment says so.
+* **`chdirchild`** — `mkdir` through routing, fork, exec, `chdir`, **relative**
+  write. P0's regression test, asserted on **entry names in both directions**:
+  the bytes are at `out.txt.d/leaf.txt`, and `leaf.txt` beside the workspace root
+  **does not exist**. The second half is what makes it discriminating — a wrong
+  anchor does not lose a write, it puts it somewhere else, so asserting only the
+  first would pass against an implementation that wrote to both. The directory is
+  created through routing so it lives only in the shadow; there is deliberately
+  nothing on the host for a stray `chdir` to land in.
+* **`grandchild`** — two generations, three separate objects, all read back.
+* **`rollbackchild`** — see the deviation recorded below.
+
+`assert_host_write_root_empty` is asserted by every new case, and
+`run.destination.exists()` is refused where the case has a host destination.
+
+### P3 — the two documentation defects
+
+* `crates/umbra-storage-nfs-userspace/README.md` — the `exec` row said "Not
+  claimed … an exec'd image routes nothing" while the forked-child row said the
+  new image is "loaded and armed from scratch". Both now state the post-P1a
+  behaviour, each naming the tests that cover it, and the forked-child row now
+  says explicitly that `fork` and `exec` are *opposites* — one inherits an armed
+  block and must not be re-armed, the other gets a zeroed one and must be — and
+  that the `parent` test in `install()` is what keeps them apart. The
+  `chdir`/`getcwd` row was split in two, because after P0 the two calls no longer
+  share a verdict.
+* `crates/umbra-core/src/lib.rs` — `LaunchPolicy::descriptor_limit` no longer
+  names `fstat` among the calls receiving `EBADF` on a virtual descriptor. The
+  correction also fixes the *reason* the list was wrong: it said "everything the
+  interposer does not implement", and the interposer's set stopped being umbra's
+  set once calls were routed at the libc stub. It now points at
+  `abi::TRACED_STUBS` as authoritative rather than restating membership that can
+  rot again.
 
 ---
 
-## 4. Proving the production path is live, by execution
+## Deviation from the ratified wording — `rollbackchild`
 
-The brief flagged this as the defect class most likely to bite: implement an
-encoder, inject it nowhere, watch every gate pass while production stays broken.
+Ratified as "parent rolls back, child's writes are gone". **That literal
+assertion is not expressible against the shipped surface, and asserting it would
+pin a behaviour this codebase does not have.**
 
-**It was proven by running it, not by testing around it.** Against the live
-Ganesha fixture at `127.0.0.1:12105`, with the workspace seeded
-`alpha.txt seed.txt subdir/`:
+What I found: there is no run-level rollback. `umbra stop` and `umbra checkpoint`
+are `not_implemented`. The only rollback is per-operation `abort`, reached from
+`OperationOutcome::Failure`, which on a *routed* run is unreachable from a
+fixture — every routed operation is emulated to `Success`, and a `Deny` is
+answered before `prepare` and allocates no operation slot. And `abort` is
+explicitly documented as reconcile-or-abandon that **does not claim arbitrary
+writes were undone**. A failed run does not delete shadow objects.
 
-```
-umbra: run ... prepared
-alpha.txt
-seed.txt
-subdir
-umbra: run ... finished: Some(Code(0)) after 1 process exits
-```
+So I implemented the **structural half**, which is what audit (H) and (G)
+actually claim and which *is* observable: there is one `NamespaceSession` per
+**run**, not per process, and `track_process` clones the parent's context into
+the child rather than opening a transaction of its own, so no per-process
+transaction exists that could commit independently. The case has the child write
+through routing, the parent reap it and then issue an `O_APPEND` routed open —
+refused as unsupported, which stops the run — and the driver asserts:
 
-**An important trap, hit and diagnosed:** the tracee inherits the platform
-provider's stdout, and providers are spawned `Stdio::null()`
-(`umbra-core/src/provider/transport.rs`). The first successful run therefore
-showed **exit 0 and no output**, which looks exactly like success and is
-indistinguishable from an empty listing. The listing above was obtained by
-temporarily switching that spawn to `Stdio::inherit()`, observing, and reverting
-— the revert is verified: `transport.rs` is not in the diff.
+1. `umbra` reports failure (`run.status != Some(0)`);
+2. the child's object **is** in the parent's run shadow, read back through the
+   client (the premise the next assertion depends on, measured rather than
+   assumed);
+3. the run carries **no `RunCompleted` record**, read through the real
+   `FileJournal` by the existing `journal_records_completion` helper.
 
-This is why the ratified substitution matters so much and why the tests assert
-the way they do. Two independent failures during this slice produced **exit 0
-with an empty listing**: once when `FdState::directory` was still a hardcoded
-`false`, and once before the encoder was reached at all. Exit code cannot
-discriminate a served directory read from a refused one *or* from an empty one.
-
-### The five things that had to be fixed after the first "working" build
-
-Recorded because each is a place the design was wrong and measurement caught it:
-
-1. `FdState::directory` was hardcoded `false` (`engine.rs:3801`) — correct while
-   a routed directory open was impossible. `fts` saves its cwd with a bare
-   `open(".")` (no `O_DIRECTORY`, measured), so a flag-derived value answers
-   `false` for a descriptor that is very much a directory, and `fchdir` refused
-   it `ENOTDIR`. Now derived from the object's kind.
-2. The return-value convention (§1.3).
-3. `observe_result`'s planned-vs-observed check, broken by the first attempt at
-   (2) — which is what showed that translating the value downstream was wrong.
-4. The descriptor floor had to cover `ReadDir`/`Fchdir`/`Close`, or every
-   `close` in the process would be resolved against the namespace — and
-   rewrite-backed runs, which have no floor, would have broken.
-5. The test fixture's `fts` flags (§3).
+The test's own doc comment states this bound in full, so a reader meets it at the
+test rather than only here. **This is a narrowing of a ratified item and is
+flagged for the review nodes rather than absorbed silently.** If the intended
+assertion was the literal one, it needs a run-level rollback surface first, which
+is a different slice.
 
 ---
 
-## 5. Per-utility confidence
+## How each named mechanism was preserved
 
-| utility / mode | status | basis | confidence |
-|---|---|---|---|
-| `/bin/ls <dir>` on **nfs-userspace** | **works** — lists the shadow's merged entries, exit 0, host untouched | observed listing (§4); matrix row `PASS userspace /bin/ls <workspace>/`; entries proven through the NFS client by the `fts` fixture | **high** |
-| `ls` entry *correctness* on nfs-userspace | **proven through the client** | `a_directory_listing_through_fts_reaches_the_tracee_over_the_userspace_client` drives the same `libsystem_c` `fts` with the same flags plain `ls` passes, writes what it read into the routed workspace, and the test reads it back over NFSv4 with nothing mounted | **high** |
-| `/bin/ls` on `--local-dev` and kernel-`nfs`, **plain** | **unregressed** | `run_fixtures`: `PASS local /bin/ls <workspace>`, `PASS local /bin/ls absent` | **high** |
-| `/bin/ls -l`/`-t`/`-i`/`-p`/`-S`/`-F`/`-s`/`-n` on `--local-dev` | **was REGRESSED; now unregressed** | This row previously claimed all four new calls were "protected structurally" by the absent `descriptor_floor`. **That was false**, and round-1 review measured it: the attribute-set refusal lived in the ABI *decode*, which runs before the fence, so those eight flags went from exit 0 to a stopped run on registries that route nothing. Fixed by moving the refusal behind the fence, and re-measured side by side against a fresh `a85a8471` build: all twelve flag shapes now agree with master. Two rows (`-l`, `-t`) added to the rewrite-backed matrix, with a negative control confirming they fail when the ordering defect is reintroduced | **high** |
-| `/bin/cat`, `/bin/mkdir`, `/usr/bin/touch` on nfs-userspace | **unregressed** | all matrix rows PASS; full `userspace_run` suite 22/22 (master: 20/20, +2 new) | **high** |
-| `ls` on a **large** directory (multi-page) | **proven live** by round-1 review | 300 entries, 152-byte records, 45 600 bytes against a 32 768-byte buffer: two data pages plus the zero-return page, all 300 names returned, `md5` of the listing read out of the export identical to the host directory's | **high** (was medium) |
-| `ls` on an **empty** directory | **proven live** by round-1 review | zero entries, no `fts` error, fixture and `/bin/ls` both exit 0 | **high** (was medium-high) |
-| A **second** enumeration of one directory in one process | **was SILENTLY WRONG; now correct** | `Overlay::directories` was never evicted and descriptor numbers are reused, so a completed enumeration left an *empty remainder* under a key the next open reproduced exactly: three names, then nothing, exit 0. Exhibited before the fix and after (both passes now list correctly). The partial-read variant is fixed by the same eviction | **high** |
-| `getattrlistbulk` on a descriptor umbra never issued | **was run-stopping; now `EBADF`** | `resolve_directory` resolved its own descriptor with a raw `StaleHandle`. Exhibited: `fstat`/`fchdir`/`close` answered `EBADF` and the run finished `Code(0)` while `getattrlistbulk` ended it. Now routed through `routed_binding` like its three siblings; all four answer `EBADF` and the run finishes | **high** |
-| `ls -l`, `-la`, `-@`, and every metadata-requesting mode | **not claimed, fail-closed** | refused by name with the requested bitmap in the message, `ENOTSUP` bound to the tracee so the run survives; observed firing for the wide `fts_children` set | **high** that they are refused; they are *not* supported |
-| `ls -R`, and recursive `fts` | **not claimed, and NOT fail-closed** | separated from the row above during round 3, because sharing its adjective was false. Recursion is neither implemented nor refused: when `fts` declines to descend it issues no syscall, so there is nothing to refuse it *with*. Measured, it appears to work and matches the host — and is still unclaimed and untested. The `nfs-userspace` README carries the full disposition | **high** that it is unclaimed; **not** a fail-closed claim |
-| `chdir`(12), `getcwd`(326) | **declared and inert, documented as such** | zero measured callers; no decode | **high** |
-| `fork`/`exec` cwd propagation | **out of scope, not needed** | `ls` does not fork; cwd does not move at all (§2) | **high** |
-
-### What I measured versus what I inferred
-
-**Measured (ran it, on this host, this session):** every `fts` syscall and its
-arguments across four argv shapes; the `fchdir` operands and the resulting cwd
-conclusion; the `getattrlistbulk` request bitmap and options; the kernel's reply
-bytes, packing, alignment and the directory-record omission; `ls` end-to-end on
-nfs-userspace including its actual printed listing; `ls` on the rewrite-backed
-registry; the full `userspace_run` suite before and after; the `readdir` probe
-with its negative control; the provider's `Stdio::null()` as the cause of the
-empty stdout; the open flags `fts` uses for the dirfd and for `"."`.
-
-**Inferred, not measured:** that `close`(6) is genuinely needed alongside
-`__close_nocancel`(399)
-— routing it is ratified and consistent, and the launch-time `svc` verification
-confirms the symbol and number, but I did not observe a virtual descriptor being
-closed through `close`(6) specifically; that no *other* program's wider
-`getattrlistbulk` request will now reach a refusal it previously never got to
-(the `TRACED_STUBS` doc records this hazard class — routing one member of a
-refused set makes the next reachable — and I did not sweep programs beyond the
-utility matrix).
-
-**Corrected after round-1 review:** this section's "protected structurally"
-claim, §1.3's "nothing was given up", §6's "the one edit", §7's master baseline,
-and `dirents.rs`'s `PACKING` offset. Each is corrected in place above rather than
-appended to, and `fix-r1.md` records what changed and why.
-
-**Corrected in the audit:** §A.3's `fchdir` annotation and §B.1's
-"byte-identical across argv shapes" (§2). §D's account of `resolve_directory`
-omits the return-value conflict (§1.3). §G's G-ii is not constructible as
-written (§1.1).
+* **`native.rs` `if self.parent.is_some()` — the human's hard guardrail.**
+  **Not loosened.** It is byte-identical to `master` and now sits at
+  `native.rs:585`; `grep -n 'self.parent.is_some()'` returns exactly that one
+  site. Nothing in this change touches the condition, its body, or the
+  `image_base` / `wait_for_image` split it selects between. It could not have
+  needed loosening: a forked child that *then* execs reaches the fresh-image
+  branch on its own, because the exec cleared the image list that guard reads, so
+  `image_base` answers `None` and the existing `None => wait_for_image` arm does
+  the work. Both directions are proven live — `forkexec` passes (the exec'd child
+  is armed) **and** `a_forked_child_of_a_routed_tracee_is_mediated_and_the_run_finishes`
+  still passes (the plain forked child is *not* re-armed and is not resumed to
+  `main`).
+* **Arming-after-breakpoints ordering.** Untouched. `arm_interposer` is still the
+  last call in `install()`, after `install_image(main)` and
+  `install_image(base)`. Retargeting happens strictly *before* `install()` runs,
+  so it changes which image is armed, never when.
+* **No constructor in the interposer.** `umbra_interpose.c` is not modified at
+  all in this change.
+* **`TRANSIENT_SIGNALS`, `SIGCHLD` in and `SIGSYS` out.** Untouched;
+  `the_gate_absorbs_sigchld_and_never_absorbs_sigsys` passes in the
+  `umbra-platform-macos` unit suite (32 passed).
+* **The descriptor fence and its Rust/C twin predicate.** Untouched.
+  `the_interposers_descriptor_test_is_the_one_the_supervisor_applies` passes.
+  The new `chdir` gate is deliberately a *separate* test rather than an extension
+  of the four-call `umbra_owns_descriptor` block, because `chdir` has no
+  descriptor to ask about — merging them would have made the twin predicate mean
+  two things.
+* **One-table-two-gates over `abi::Delivery`.** Preserved and relied upon:
+  `intercept()` has no edit, and both table-iterating invariant tests cover the
+  new row without modification.
+* **No wire-format change.** `UMBRA_TRAP_NUMBER` and the 16-byte arm-block layout
+  are untouched. No new user setup, mounts, drivers or privileged steps: the
+  fixture is CI's existing compose file and the helper binary is a copy the test
+  harness makes for itself.
 
 ---
 
-## 6. Scope, guarantees and the test-body edits
+## Gates, and the evidence behind the figures
 
-**Read `fix-r1.md`, `fix-r2.md` and `fix-r3.md` beside this section.** This document describes
-the slice as first implemented; two review rounds have amended it since, and the
-two fix reports are authoritative where they differ. §1 records **four**
-deviation-grade items now, not three: the three below plus the
-`SyscallAbi::directory_request` method that round 1's H1 fix added (`fix-r1.md`
-§H1) — a new ABI method, which is worth a human's eye because the design gate
-used that phrase for the option it rejected. This section's "Preserved"
-paragraph is likewise incomplete on its own: since it was written a validation
-**moved across the descriptor fence** (the most scope-relevant mechanism change
-of either pass) and four more dispositions were added. `fix-r1.md` §H1, `fix-r2.md` §N1 and
-`fix-r3.md` §1 carry all of it — the last of those holding the enumeration of
-every tracee-supplied input of a directory read and where each one terminates,
-which is the check this section's guarantees paragraph cannot express on its
-own.
+Lesson 23 applied throughout: **no figure below is read from an exit status or a
+case count.** Where a suite's own verdict lines exist, they are what was read.
 
-**In scope and done:** all eight ratified change items; G-ii production wiring;
-the `ls` matrix row and an **entry-based** mutation probe; the three doc
-corrections (waiver granted); the unsupported-modes documentation; tracking issue
-[#125](https://github.com/invakid404/umbra/issues/125).
+### `cargo fmt --check`
 
-**Preserved:** every setup / recovery / cleanup / validation guarantee. No
-validation was removed — one was corrected (§1.3) and three were added
-(`count_records`'s exact walk, the encoder's self-check, the `io_buffer`
-empty-buffer guard). Every #55–#120 mechanism is intact: `TRACED_STUBS`'s single
-list with `Delivery` exhaustiveness (which caught an unhandled `RoutedEffect`
-during this work, as designed), the descriptor fence and its C/Rust twin, the
-`Err`-vs-`Emulate` rule at the routed-open refusals, `replay_must_poison`, the
-probe discipline with negative controls. Audit records untouched.
+Clean, exit 0, no diff output.
 
-**Three edits to existing `#[test]` bodies, all flagged.** This count has been
-wrong twice. The first version said "the one edit"; round-1 scope review found a
-second by sweeping. The corrected version said "two"; round-2 scope review found
-a third the same way. Both times the edit itself was benign and both times the
-*self-report* was the failure — in the one guardrail a human can enforce only
-through it. The sweep that finds these is `#[test]`-body diff against
-`master@origin`, and it is the check to run rather than this paragraph.
+### `cargo clippy --workspace --all-targets -- -D warnings`
 
-**The same discipline applies to every quantitative claim in these records, and
-it had to be extended once more.** Four self-reported numbers in this slice have
-failed to reconcile: two test-edit counts, the `822` master baseline (measured:
-`813`), and round 3's `+4, no test removed` net test delta (measured: `+3`, one
-superseded). Each was caught by someone re-deriving it rather than by the
-paragraph claiming it. So: **counts are quoted from the command that produced
-them, never from memory of what a pass did.** For the test delta that command is
-`grep -rn '#\[test\]' crates/ --include='*.rs' | wc -l`, run at both revisions
-— 908 here against 887 at `master@a85a8471`.
+Clean: `cargo clippy: No issues found`, exit 0.
 
-*First:* the new probe is added to
-`every_mutation_probe_is_wired_into_the_userspace_job`'s list.
-That test iterates a hardcoded `[(probe, package)]` set and exists precisely to
-catch a probe that is written but never run in CI; adding a feature without
-adding the row would leave the new probe unguarded while the test still passed —
-the exact defect it was built for. The edit is additive and strengthens the
-guard. I am naming it rather than relying on it being read as maintenance.
-`ci.yml` gains the matching `Proof 7` step and the fixture build.
+### `cargo test --workspace --all-targets`
 
-*Second:* `abi.rs`'s `process_control_stubs_are_not_delivered_to_the_namespace`
-gained `461, 13, 399, 6` in its hardcoded array of numbers asserted
-`Delivery::Namespace`. Same shape as the first -- four entries appended to an
-assertion list, nothing removed, nothing loosened -- and *voluntary*: the test
-iterates only the numbers it lists, so it would have passed unchanged. It is
-strengthening rather than forced, which makes it easier to justify and does not
-excuse having left it out of this list.
+`832 passed, 3 ignored (52 suites, 31.68s)` — **and that figure is not
+qualification, which is the whole of lesson 23.** Reading the per-suite lines
+shows what the green actually covered:
 
-*Third:* `abi.rs`'s `the_interposers_descriptor_test_is_the_one_the_supervisor_applies`
-— the C/Rust twin test — had its **failure message** changed, from naming
-`FsOp::Fstat` to naming `Fstat | ReadDir | Fchdir | Close`. The `assert_eq!`'s
-expected value is byte-identical and the guarantee is untouched; only the text a
-failure would print changed. It exists solely because round-1 scope review asked
-for it (S5 item 3), the message having become an under-description of what the
-test protects once the fence covered four calls.
+```
+Running tests/userspace_run.rs   test result: ok. 0 passed; 0 failed; ... finished in 0.00s
+Running tests/fixtures.rs        test result: ok. 11 passed; 0 failed; ... finished in 0.00s
+Running tests/run_fixtures.rs    test result: ok. 10 passed; 0 failed; ... finished in 0.00s
+Running tests/sandbox_launch.rs  test result: ok. 4 passed; 0 failed; ... finished in 0.00s
+```
 
+The routed suite ran **zero** cases (cfg'd out without `transport-raw`), and
+every live suite took its `input()` skip — **11 cases in 0.00 s is exactly the
+shape lesson 23 names**. So each was re-run with its inputs provided and
+`UMBRA_INTEGRATION_REQUIRED=1`, and the verdict lines read.
 
-**Out of scope, not absorbed:** `ls -l`/`-la`, `-@`/ACLs, `-R`,
-symlink-following in directory reads, xattrs in `getattrlistbulk`,
-`getdirentriesattr`(222), `getdirentries`(196)/(344),
-`opendir`/`readdir`/`closedir`, `chdir`(12), `getcwd`(326), any fork/exec cwd
-propagation.
+### Enforced macOS fixture qualification — `CAPTURED` verdicts read
+
+`cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc
+--test fixtures`, with `UMBRA_TEST_FIXTURE_PATH` / `UMBRA_TEST_REDIRECT_ROOT`
+built as CI builds them and `UMBRA_INTEGRATION_REQUIRED=1`:
+
+```
+CAPTURED argv0-check          CAPTURED open-libc
+CAPTURED dirfd-rename         CAPTURED open-svc
+CAPTURED dup-inherit-write    CAPTURED posix-spawn-write
+CAPTURED exec-write           CAPTURED symlink-cycle
+CAPTURED fork-write           CAPTURED wnohang-wait
+CAPTURED grandchild-write
+test result: ok. 11 passed; 0 failed; ... finished in 10.85s      (was 11 in 0.00s)
+CAPTURED open-libc provider IPC
+test result: ok. 1 passed;  0 failed; ... finished in 1.49s
+test result: ok. 4 passed;  0 failed; ... finished in 8.18s       (sandbox_launch)
+```
+
+**Eleven `CAPTURED` lines, one per case, in 10.85 s.** These are the figures, and
+`exec-write`, `fork-write`, `grandchild-write`, `posix-spawn-write` and
+`dup-inherit-write` among them are the direct regression evidence that P1a's
+retargeting did not disturb the rewrite-backed fork/exec lifecycle. The
+`sandbox_launch` suite doing 8.18 s of real work is the evidence that the sandbox
+installer still hands off correctly — the one thing retargeting could have
+broken.
+
+### CLI run-fixture matrix — per-case `PASS` lines read
+
+`cargo test -p umbra-cli --test run_fixtures --test resume_cli`, same environment:
+
+```
+PASS local open-libc / open-svc / fork-write / posix-spawn-write / exec-write
+PASS local grandchild-write: 11 exact bytes, host absent, lease released, RunCompleted, elapsed=2.507s
+PASS local dup-inherit-write: 4 exact bytes, host absent, lease released, RunCompleted, elapsed=2.170s
+PASS local /usr/bin/touch touched / touch seed.txt / /bin/mkdir made / /bin/rm seed.txt
+PASS local /bin/cat seed.txt / /bin/cat absent.txt
+PASS local /bin/ls <workspace> / absent / -l / -t: host untouched, lease released, RunCompleted
+SKIP nfs_fixture_matrix: UMBRA_TEST_SKIP_NFS_MATRIX set (real NFSv4 mount unavailable in this environment)
+SKIP nfs_utility_matrix: UMBRA_TEST_SKIP_NFS_MATRIX set (real NFSv4 mount unavailable in this environment)
+test result: ok. 10 passed; 0 failed; ... finished in 44.77s      (was 10 in 0.00s)
+resume_cli: 3 passed, 0.79s;  umbra-supervisor reopen: 7 passed, 1.34s
+```
+
+**20 `PASS` lines in 44.77 s, and 2 declared `SKIP`s** — both the NFS-mount
+matrices, skipped by `UMBRA_TEST_SKIP_NFS_MATRIX`, which is the same opt-out CI's
+`native-qualification` job sets and for the same documented TCC reason. Those two
+are the only unqualified cases in this gate and they are named rather than
+counted as passes. The `/bin/ls`, `ls -l` and `ls -t` lines are #121's directory
+work, still green.
+
+### Routed suite over the live NFSv4 client
+
+`cargo test -p umbra-storage-nfs-userspace --features transport-raw --test
+userspace_run`, with `UMBRA_NFS_RAW_FIXTURE=127.0.0.1:12105` and
+`UMBRA_INTEGRATION_REQUIRED=1` so a missing fixture is a hard failure, not a skip:
+
+```
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 74.29s
+```
+
+**20 cases actually executed against the live fixture in 74.29 s**, and **6
+declared `SKIP`s**, all of them the mutation probes, each naming the cargo
+feature its binary would have to be built with:
+
+```
+SKIP: set UMBRA_MUTATION_PROBE=fstat / mkdir / read / readdir / setattrlistat / write
+```
+
+Those six are skip-by-design in a baseline build — no two probe features may be
+enabled at once — and `every_mutation_probe_is_wired_into_the_userspace_job`
+**passed**, which is what pins that CI runs all six. The four new cases are among
+the 20 that ran:
+
+```
+a_forked_child_that_execs_a_different_binary_is_mediated_in_the_new_image ... ok
+a_chdir_in_an_exec_d_child_moves_the_logical_cwd_its_relative_write_resolves_against ... ok
+a_grandchild_of_a_routed_tracee_routes_and_so_does_every_generation_above_it ... ok
+a_forked_child_s_writes_are_scoped_to_the_parent_s_run_and_its_terminal_evidence ... ok
+```
+
+and so are the two pre-existing fork cases this change most risked:
+
+```
+a_forked_child_of_a_routed_tracee_is_mediated_and_the_run_finishes ... ok
+a_routed_descriptor_survives_a_fork_and_the_child_s_write_reaches_the_store ... ok
+```
+
+### Mutation-probe machinery, spot-checked
+
+To confirm the probe matrix still discriminates after this change, probe A was
+built and run: `cargo build -p umbra-cli --features mutation-probe-read`, then
+the suite with `UMBRA_MUTATION_PROBE=read`:
+
+```
+test mutation_probe_read_makes_the_toy_reject_the_bytes_it_read ... ok
+test result: ok. 26 passed; 0 failed; ... finished in 3.15s
+```
+
+The unmutated binaries were then rebuilt and the baseline suite re-run to prove
+the tree was left unmutated.
+
+**No new cargo-feature probe was added**, and that is a deliberate reading of the
+contract bound ("chdir(12) row + one additive `RoutedEffect` variant, and nothing
+else"; "no new user setup"). Two new features would have needed two new CI
+invocations. The ratified requirement — "mutation-verified on **entry names**" —
+is met by the assertion shape instead: `chdirchild` asserts the entry name in
+both directions, so a broken cwd propagation is caught by a wrong *name* rather
+than a nonzero exit, and the pre-fix failures recorded in Step 0 are the
+unmutated-tree evidence that both new assertions actually discriminate.
 
 ---
 
-## 7. Gates
+## What was left out, and why
 
-**Every total below is bound to the commit that produced it, and the canonical
-table is §7.1.** A figure in this section describes the round-1 head and nothing
-later; §7.1 is where to check the current one. This was the fifth
-quantitative-reconciliation item in the slice and it is the one that named the
-underlying property: *a count without its commit is a claim that cannot be
-checked* — not wrong, just uncheckable, which is worse, because a reader cannot
-tell a stale figure from a current one.
+Everything on the ratified escalation list, untouched:
 
-| gate | result, at `7bd1a95c` (fix round 1) |
-|---|---|
-| `cargo fmt --all --check` | clean |
-| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
-| `cargo test --workspace --all-targets` | **826 passed**, 3 ignored (master `a85a8471`: **813**, measured). **Superseded** — 832 at the current head; see §7.1 |
-| `userspace_run` vs live Ganesha | **22 passed** (master: 20; +2 new) |
-| `readdir` probe, mutated | passes |
-| `readdir` probe, **negative control** (unmutated) | **fails**, as required |
-| `run_fixtures` rewrite-backed matrix | `/bin/ls` both rows PASS |
+1. **Multithreaded fork.** `single_thread()` (`native.rs:1788`, `:458-464`) is
+   byte-identical to `master` and still refuses a multithreaded tracee's fork
+   with `fork/deferred wait requires one thread`. Deferred by ratification and
+   scheduled as the immediate next arc. **Completing P1 does not by itself make
+   real agents work**, and this change does not claim otherwise.
+2. `vfork`(66) — measured never called; `___vfork` has no `svc` at all.
+3. `posix_spawn` with non-null file actions / attributes — still refused. Named
+   in the README's new `exec` row as explicitly not claimed.
+4. Process-group / `WUNTRACED` / `WCONTINUED` waits.
+5. Widening the `ENOTSUP` path-operation set.
+6. Cross-host resume, `StatEncoder` consolidation.
+7. **#117 item 3, as narrowed and ratified:** no per-descendant fd-disjointness
+   assertions were written. One enforcement point — the hard-lowered
+   `RLIMIT_NOFILE` at `native.rs:1414-1423` — and `forkfd` already measures
+   inheritance-with-offset. To be recorded on #117 at merge.
 
-### 7.1 Every reported total, bound to its commit
+Two further things a reviewer should know:
 
-The canonical record. Each row is one head of change `psvqmvlmktvv`; the review
-and CI rounds each saw the head named in "pass".
-
-| commit | pass | `cargo test --workspace --all-targets` | `#[test]` attrs | fixture env set? |
-|---|---|---|---|---|
-| `a85a8471` | master (parent) | **813** passed, 3 ignored | 887 | n/a |
-| `9f94b8f3` | implement | **825** passed | 901 | no |
-| `7bd1a95c` | fix round 1 (`fix-r1.md`) | **826** passed | 902 | no |
-| `20ccf7db` | fix round 2 (`fix-r2.md`) | **829** passed | 905 | no |
-| `3480713b` | fix round 3 (`fix-r3.md`) | **832** passed | 908 | no |
-| `e6618397` | PR #128 opened; CI round 1 **red** | 832 | 908 | no |
-| `6a18b98f` | CI/CR fix round 1 (`ci-fix-r1.md`) | **832** passed | 908 | **yes** |
-| `52fba1e1` | memoria re-ack; CI round 2 **green** | 832 | 908 | yes |
-| **this head** | CI/CR fix round 2 (`ci-fix-r2.md`) | **832** passed, 3 ignored | 908 | **yes** |
-
-**What is measured now versus reported then.** The `#[test]` attribute column is
-re-derived at *this* head for every row, by diffing each commit against master
-over Rust sources only:
-
-```
-$ jj diff --from a85a8471 --to <commit> --git 'glob:crates/**/*.rs'     | grep -cE '^\+\s*#\[test\]'
-```
-
-The passed totals are contemporaneous — they cannot be re-run at a hidden commit
-without checking it out — but every one of them **reconciles independently**
-against that re-derived count:
-
-```
-reported = 813 + (attrs - 887) - 2
-  901 -> 825 ✓   902 -> 826 ✓   905 -> 829 ✓   908 -> 832 ✓
-```
-
-The `- 2` is the two tests in `userspace_run.rs`, which sits behind
-`#![cfg(all(feature = "transport-raw", target_os = "macos", target_arch =
-"aarch64"))]` and so compiles to nothing under a default-feature workspace run.
-
-**Two rows carry a condition, not just a number.** Every total up to `3480713b`
-was measured **without** `UMBRA_TEST_FIXTURE_PATH`, which means the eleven
-`umbra-platform-macos` fixture cases reported `ok` without executing — the count
-is identical either way, so nothing in the numbers is wrong, but the runs behind
-them were weaker than they looked. CI round 1 is what exposed that; `ci-fix-r1.md`
-§2 has the measurement. From `6a18b98f` onward the env is set, which is why the
-same 832 takes 53s instead of 27s.
-
-One clippy suggestion was **not** taken as offered: it proposed replacing
-`length == 0 || length % 8 != 0` with `!length.is_multiple_of(8)`. Zero *is* a
-multiple of eight, so that would have made `count_records` spin forever on a
-zero-length record. The zero check is kept, with a comment saying why.
-
-**Not run here:** CI, and the two reviews. `PAUSE BEFORE MERGING` is respected —
-nothing is merged and no bookmark is pushed.
+* **`memoria check` could not run here.** It requires a Git worktree and this jj
+  workspace has no `.git`; it fails `git_unavailable` before inspecting
+  anything. It is unaffected by the change and CI runs it from the colocated
+  checkout.
+* **The rewrite-backed `chdir` limit** described under P0 is a real, remaining
+  gap. It is documented in three places rather than left for a reader to
+  discover, and closing it needs a mechanism outside this slice's contract bound.

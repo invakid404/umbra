@@ -117,6 +117,30 @@ pub trait NamespaceSession: NamespaceResolver {
             "provider does not support userspace-routed operations",
         ))
     }
+    /// The absolute logical directory the last [`NamespaceResolver::resolve`]
+    /// produced for a routed `Chdir`, or `None` when it resolved something else.
+    ///
+    /// The third member of the `routed_descriptor` / `routed_stat` family, and
+    /// read exactly as they are: after `resolve`, by the caller that owns the
+    /// tracee's [`ProcessContext`]. It exists because the working directory is
+    /// the caller's state while *which* directory a path operand names is the
+    /// namespace's answer -- the operand has been through symlink expansion,
+    /// whiteout traversal and the logical-root containment check, none of which
+    /// the caller can redo. `fchdir` needs no such channel: its answer is
+    /// already in the caller's hands, on the descriptor's own binding.
+    ///
+    /// Defaulted to a refusal rather than to `None`, for `routed_stat`'s reason:
+    /// a provider that answered `None` here would have its caller report a
+    /// successful `chdir` to the tracee while leaving the logical working
+    /// directory where it was -- a wrong answer rather than a refusal, and
+    /// precisely the split anchor that routing this call exists to close.
+    fn routed_cwd(&self) -> Result<Option<BytePath>> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "overlay.routed_cwd",
+            "provider does not support userspace-routed operations",
+        ))
+    }
     /// Inject native stat layout and the current syscall's output-buffer binding.
     fn set_stat_encoder(&mut self, _encoder: Box<dyn StatEncoder>) -> Result<()> {
         Err(umbra_core::UmbraError::new(

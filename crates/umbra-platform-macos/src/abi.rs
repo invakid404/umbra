@@ -330,6 +330,7 @@ pub const TRACED_STUBS: &[(&str, u64, Delivery)] = &[
     ("__fstat", 189, Delivery::Namespace),
     ("setattrlistat", 524, Delivery::Namespace),
     ("getattrlistbulk", 461, Delivery::Namespace),
+    ("chdir", 12, Delivery::Namespace),
     ("fchdir", 13, Delivery::Namespace),
     ("__close_nocancel", 399, Delivery::Namespace),
     ("close", 6, Delivery::Namespace),
@@ -381,6 +382,18 @@ pub fn path_operands(number: u64) -> Result<&'static [(PathOperand, usize)]> {
         // no path, so there is no operand to physicalize. A caller that reached
         // here for one is asking the wrong question, and the refusal says so
         // rather than inventing slot zero.
+        //
+        // **`chdir`(12) is absent for a different reason, and a stronger one.**
+        // It *does* name a path in x0, so a row here would be easy to write and
+        // would type-check. It is left out because a rewritten `chdir` is the
+        // defect routing it exists to close: rewriting the operand moves the
+        // *kernel's* working directory to a physical path while umbra's logical
+        // `ProcessContext::cwd` stays where it was, which is exactly the split
+        // anchor that made every later relative path resolve against the wrong
+        // directory. `chdir` is answered by emulation on a routed run and
+        // resumed untouched on one that rewrites -- see `syscall_entry` -- so
+        // `prepare_paths` is never reached for it, and this refusal keeps it
+        // that way rather than leaving a rewrite nobody may use.
         _ => return Err(unsupported(format!("path syscall {number}"))),
     })
 }
@@ -1054,6 +1067,33 @@ impl SyscallAbi for DarwinArm64Abi {
             461 => FsOp::ReadDir {
                 fd: TracedFd(get(regs, 0)? as i32),
                 max_bytes: directory_bytes(regs)?,
+            },
+            // `chdir`(12).
+            //
+            // Bare, like `mkdir`(136): no dirfd, so the name is anchored at the
+            // process working directory exactly as that one is. The stub is a
+            // direct syscall -- measured on macOS 26.5.1 arm64, `_chdir` is
+            // `movz x16, #12; svc #0x80` and nothing else, which is precisely
+            // the shape `install()`'s verifier reads -- so routing it needed no
+            // new interception mechanism, only this arm.
+            //
+            // **What it closes.** `ProcessContext::cwd` is what `DirRef::Cwd`
+            // resolution anchors against, and until this arm existed exactly one
+            // thing moved it after launch: a routed `fchdir`. `chdir` was
+            // declared as an `FsOp` and inert, so the call reached the kernel,
+            // moved the *host* working directory, and left umbra's logical copy
+            // at the launch directory -- after which every relative path in that
+            // process resolved against the wrong anchor. Measured to be reachable
+            // by the two commonest real shapes there are: `git status --short`
+            // issues one `chdir` and forks nothing at all, and `bash -c 'cd /tmp
+            // && ...'` issues one too.
+            //
+            // Per-process by construction, because the context it moves is
+            // per-process: a forked child gets its own clone of the parent's
+            // context, so a child that chdirs moves only its own anchor.
+            12 => FsOp::Chdir {
+                dir: DirRef::Cwd,
+                path: read_path(memory, get(regs, 0)?)?,
             },
             // `fchdir`(13).
             //

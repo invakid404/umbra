@@ -83,6 +83,143 @@
  *       guess -- that the child's table is empty and the write answers `EBADF` --
  *       is what this case was written to check, and it is wrong.
  *
+ *   umbra-userspace-edges forkexec <path>
+ *       `fork`, then have the **child `exec` a different binary** -- the helper
+ *       named by UMBRA_EDGE_HELPER -- which writes `execchild` to `<path>.exec`
+ *       through routing. The parent waits and then writes through routing
+ *       itself. Exits 0 when both halves worked.
+ *
+ *       This is the regression test for the exec half of the interposer's
+ *       lifecycle, and it is a *different image* on purpose. `exec` resets the
+ *       address space, so the interposer arrives in the new image mapped and
+ *       **inert**: dyld re-loads it (DYLD_INSERT_LIBRARIES rides in `envp` and
+ *       survives the exec) and its `__DATA,__umbra_arm` control block comes back
+ *       zeroed. umbra has to re-arm it. It used to re-arm only when the exec'd
+ *       image was the one image named at launch, so a child that exec'd anything
+ *       else ran with an inert interposer, silently and with no diagnostic at
+ *       all.
+ *
+ *       What that cost is narrower than "unmediated", and the narrow version is
+ *       the measured one. Only the *interposer* was un-armed: the tracer
+ *       re-plants every breakpointed libc stub after an exec regardless, so this
+ *       case's `open` was still routed and still came back a **virtual
+ *       descriptor**. `write` and `close` reach umbra through the interposer
+ *       alone, so they went to libc holding a number the kernel does not own and
+ *       were answered **EBADF**. The object was therefore **created and left
+ *       empty** in the store -- not absent, and nothing touched the host.
+ *
+ *       So the Rust side asserts the **bytes** through the NFSv4 client, not the
+ *       name: broken and fixed both leave an entry here, and only its contents
+ *       tell them apart.
+ *
+ *   umbra-userspace-edges execwrite <path>
+ *       The helper half of `forkexec`, and of nothing else: create `<path>`
+ *       through routing, write `execchild`, close. Exits 0 on success. It is a
+ *       case of this same program so the fixture stays one file; the Rust driver
+ *       copies the binary to a **different basename** before naming it in
+ *       UMBRA_EDGE_HELPER, which is what makes it a different image to umbra --
+ *       a twin is cached at `<sha256 of contents>/<basename>`, so the copy
+ *       resigns to a path the launch target's does not equal.
+ *
+ *   umbra-userspace-edges chdirchild <path>
+ *       `mkdir <path>.d` through routing, then `fork` and have the child `exec`
+ *       the helper in `chdirwrite` mode: it `chdir`s into `<path>.d` and writes
+ *       `chdirchild` to the **relative** name `leaf.txt`. Exits 0 when that
+ *       worked.
+ *
+ *       The working directory is what relative resolution anchors against, and
+ *       umbra keeps its own logical copy in `ProcessContext::cwd`. An
+ *       unintercepted `chdir`(2) reaches the kernel, moves the *host* working
+ *       directory and leaves the logical one behind, so the relative `open` that
+ *       follows resolves against the launch directory instead. The failure is
+ *       therefore a **wrong entry name** rather than a missing file, and that is
+ *       what the Rust side asserts in both directions: `<path>.d/leaf.txt` holds
+ *       the bytes, and `leaf.txt` beside the workspace root does not exist.
+ *
+ *   umbra-userspace-edges chdirwrite <path>
+ *       The helper half of `chdirchild`: `chdir(<path>.d)`, then create
+ *       `leaf.txt` -- **relative**, which is the whole point -- write
+ *       `chdirchild`, close. Exits 0 on success.
+ *
+ *   umbra-userspace-edges grandchild <path>
+ *       `fork`, and the child `fork`s again. The **grandchild** does a whole
+ *       routed create/write/close of `<path>.grand`; the child writes
+ *       `<path>.mid` after reaping it; the parent writes `<path>` after reaping
+ *       the child. Exits 0 when all three worked.
+ *
+ *       Two generations, because one generation is what `fork` already covers.
+ *       Each process is attached from its own parent's syscall return, so a
+ *       grandchild is reached only if that discovery composes -- the child must
+ *       itself be mediated closely enough for its own `fork` breakpoint to fire.
+ *
+ *   umbra-userspace-edges rollbackchild <path>
+ *       `fork`, let the child write `<path>.child` through routing and exit 0,
+ *       reap it, and then have the **parent** issue an operation the routed
+ *       namespace refuses outright: an `O_APPEND` open, which has no atomic
+ *       append-at-end storage operation behind it. That refusal stops the run.
+ *
+ *       The case therefore never returns; its verdict is the run's, not this
+ *       program's, and the Rust side reads it from the journal. What is being
+ *       asserted is that the child's write belongs to the **parent's run** --
+ *       one shadow, one journal, no per-process transaction that could commit
+ *       independently of it -- so a run that never reaches its terminal
+ *       `RunCompleted` record covers the child's writes as much as the parent's.
+ *
+ *   umbra-userspace-edges failedexec <path>
+ *       `exec` something that **cannot be exec'd** -- the image named by
+ *       UMBRA_EDGE_NOEXEC -- so the call returns instead of replacing this
+ *       image, then `fork` and have the child do a routed write. Exits 0 when
+ *       the child's write worked and the parent's did too.
+ *
+ *       The shape needed here is narrow, and both halves of it matter. umbra
+ *       resigns every image a tracee execs and rewrites the operand to name the
+ *       resigned twin, so the file must be something `codesign` accepts *with
+ *       umbra's entitlements* -- which rules out a dylib: it signs, but
+ *       `codesign -d --entitlements` does not report them back and umbra's own
+ *       `verify` refuses it before the exec is ever reached. What does work is
+ *       an ordinary arm64 executable with its **execute bits cleared**: the
+ *       content is what `codesign` cares about, so signing and verification
+ *       both pass, and `fs::copy` preserves the mode into the twin -- so the
+ *       rewritten exec names an unexecutable file too. Measured: `execv` on it
+ *       fails EACCES (13).
+ *
+ *       So umbra resigns a *new* image and records it, while the tracee never
+ *       leaves the one it already had.
+ *
+ *       The `fork` afterwards is what turns that into a dead run. umbra points
+ *       the child's interposer requirement at the image it believes the parent
+ *       runs; if that is the unexecutable twin it matches nothing, so no trap
+ *       site is breakpointed -- while the control block the child inherited
+ *       through the `fork` is **armed**. The child's first routed call then
+ *       issues `svc #0x80` with a trap number no breakpoint covers and the run
+ *       dies on an undecoded SIGSYS, which is the #116 defect shape.
+ *
+ *       The child writes `failedexec` to `<path>.child` and the parent writes to
+ *       `<path>`, and the Rust side reads both back through the NFSv4 client:
+ *       the run surviving is necessary but not sufficient, because a run that
+ *       survived while the child routed nothing would still exit 0 here.
+ *
+ *   umbra-userspace-edges chdirshapes <path>
+ *       The three `chdir` operand shapes `chdirchild` does not reach, in one
+ *       case because each is a single call and none needs a second process:
+ *
+ *         * `chdir` to a name that does not resolve -- must be **ENOENT to the
+ *           tracee**, not a stopped run. A routed run answers its own ENOENT;
+ *           resuming the trap instead would reach Darwin's `nosys` and the
+ *           tracee would see ENOSYS (78).
+ *         * `chdir` to a name that resolves to a **regular file** -- must be
+ *           ENOTDIR (20), again to the tracee.
+ *         * a **relative** operand, which is the one that exercises the
+ *           `DirRef::Cwd` anchoring branch: the name is resolved against the
+ *           working directory umbra currently holds *before* becoming the new
+ *           one. Two of them in a row, so the second can only resolve if the
+ *           first actually moved the anchor.
+ *
+ *       Exits 0 when all three behaved. The relative half then writes
+ *       `chdirshapes` to `leaf.txt`, and the Rust side reads it back at the
+ *       **entry name** two directories deep, which is the only place it can be
+ *       if both relative moves anchored where they should have.
+ *
  *   umbra-userspace-edges ctor <path>
  *       Does nothing in `main`. The point is the constructor below, which opens,
  *       reads and closes a file when UMBRA_EDGE_CTOR is set in the environment --
@@ -122,6 +259,19 @@
  *       transfer and the caller finishes it in a loop; a complete first call
  *       means there was no clamp to observe, so the case has nothing to say and
  *       must not report success.
+ *
+ *   83  a case that needs the exec helper was run without `UMBRA_EDGE_HELPER`
+ *       naming it. A hard failure rather than a skip, for 80's reason: a
+ *       `forkexec` that quietly exec'd nothing would report success while
+ *       proving nothing about the exec'd image at all.
+ *   84  a path this case has to build did not fit its buffer.
+ *   85  a case that needs the unexecutable image was run without
+ *       `UMBRA_EDGE_NOEXEC` naming it. A hard failure rather than a skip, for
+ *       83's reason.
+ *   86  the `exec` this case requires to **fail** unexpectedly succeeded, so the
+ *       state it exists to reach was never entered and it must not report a
+ *       pass. A successful exec never returns, so reaching the line after it is
+ *       itself the diagnosis.
  *
  * Build: clang -arch arm64 -O1 umbra-userspace-edges.c -o umbra-userspace-edges
  */
@@ -455,6 +605,347 @@ static int case_forkfd(const char *path) {
     return WEXITSTATUS(status);
 }
 
+/*
+ * Build `<path><suffix>` into `out`, refusing to truncate.
+ *
+ * Shared by every case below rather than repeated: a silently truncated path is
+ * a case that asserts against the wrong object, which looks exactly like a pass
+ * when the object it should have named is absent.
+ */
+static int derive(char *out, size_t size, const char *path, const char *suffix) {
+    int written = snprintf(out, size, "%s%s", path, suffix);
+    if (written <= 0 || (size_t)written >= size) {
+        return 84;
+    }
+    return 0;
+}
+
+/* The helper binary this run's driver copied to a basename of its own. */
+static const char *helper(void) { return getenv("UMBRA_EDGE_HELPER"); }
+
+/*
+ * Reap one child and report its verdict as this case's own.
+ *
+ * `_exit` codes travel up unchanged, so a child that failed names its own cause
+ * rather than being flattened into a generic "the child failed".
+ */
+static int reap(pid_t pid) {
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) {
+        return 72;
+    }
+    if (!WIFEXITED(status)) {
+        return 79;
+    }
+    return WEXITSTATUS(status);
+}
+
+/* Create `path` through routing, write `bytes`, close. Used by both helper
+ * modes, which are the halves that run in an exec'd image. */
+static int routed_write(const char *path, const char *bytes, size_t length) {
+    errno = 0;
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        return errno ? errno : 76;
+    }
+    errno = 0;
+    if (write(fd, bytes, length) != (ssize_t)length) {
+        int failure = errno ? errno : 76;
+        (void)close(fd);
+        return failure;
+    }
+    errno = 0;
+    if (close(fd) < 0) {
+        return errno ? errno : 76;
+    }
+    return 0;
+}
+
+/* The helper's `forkexec` half, and the entire content of the exec'd image's
+ * `main`: one routed create/write/close. Small on purpose -- everything this
+ * case is measuring happens before the first instruction of it runs. */
+static int case_execwrite(const char *path) {
+    return routed_write(path, "execchild", 9);
+}
+
+/*
+ * The three `chdir` shapes `chdirchild` does not reach.
+ *
+ * All in one case and in one process: each is a single call whose whole answer
+ * is its errno, so a process apiece would be ceremony rather than isolation.
+ */
+static int case_chdirshapes(const char *path) {
+    char outer[1024];
+    char inner[1024];
+    int failure = derive(outer, sizeof outer, path, ".outer");
+    if (failure) {
+        return failure;
+    }
+    failure = derive(inner, sizeof inner, path, ".outer/inner");
+    if (failure) {
+        return failure;
+    }
+
+    /* 1. A name that does not resolve. ENOENT, and the run lives. */
+    char absent[1024];
+    failure = derive(absent, sizeof absent, path, ".nowhere");
+    if (failure) {
+        return failure;
+    }
+    errno = 0;
+    if (chdir(absent) == 0) {
+        return 71;
+    }
+    if (errno != ENOENT) {
+        return errno ? errno : 81;
+    }
+
+    /* 2. A name that resolves to a regular file. ENOTDIR, and the run lives. */
+    failure = routed_write(path, "file", 4);
+    if (failure) {
+        return failure;
+    }
+    errno = 0;
+    if (chdir(path) == 0) {
+        return 71;
+    }
+    if (errno != ENOTDIR) {
+        return errno ? errno : 81;
+    }
+
+    /* 3. Two relative moves. The second can only resolve if the first moved the
+     * anchor, which is the property the absolute-operand case cannot show. */
+    if (mkdir(outer, 0755) != 0 || mkdir(inner, 0755) != 0) {
+        return errno ? errno : 76;
+    }
+    char *slash = strrchr(outer, '/');
+    if (!slash) {
+        return 84;
+    }
+    errno = 0;
+    if (chdir(slash + 1) != 0) {
+        return errno ? errno : 76;
+    }
+    errno = 0;
+    if (chdir("inner") != 0) {
+        return errno ? errno : 76;
+    }
+    return routed_write("leaf.txt", "chdirshapes", 11);
+}
+
+/*
+ * A *failed* exec must not move umbra's idea of which image this process runs.
+ *
+ * The regression test for R1. The image named by UMBRA_EDGE_NOEXEC is an
+ * ordinary arm64 executable with its execute bits cleared, so `execv` on it
+ * fails **EACCES (13)** and leaves this process running the image it already
+ * had -- and umbra must agree, because the `fork` below hands its answer to the
+ * child. See this file's `failedexec` header entry for why that shape and not a
+ * dylib: a dylib fails `execv` with ENOEXEC, but umbra's resign refuses it
+ * earlier still, so the exec operand is never rewritten and nothing is
+ * exercised.
+ */
+static int case_failedexec(const char *path) {
+    const char *image = getenv("UMBRA_EDGE_NOEXEC");
+    if (!image) {
+        return 85;
+    }
+    char child_path[1024];
+    int failure = derive(child_path, sizeof child_path, path, ".child");
+    if (failure) {
+        return failure;
+    }
+
+    char *const argv[] = {(char *)image, NULL};
+    errno = 0;
+    execv(image, argv);
+    if (errno == 0) {
+        /* A successful exec does not return, so arriving here with no errno
+         * means the call did something this case cannot reason about. */
+        return 86;
+    }
+
+    /* The exec failed, as required. Now fork: this is where a stale image note
+     * becomes a child with an armed control block and no breakpoints. */
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 72;
+    }
+    if (pid == 0) {
+        _exit(routed_write(child_path, "failedexec", 10));
+    }
+    failure = reap(pid);
+    if (failure) {
+        return failure;
+    }
+    return routed_write(path, "parent", 6);
+}
+
+/*
+ * fork, exec a *different* binary, and require the exec'd image to route.
+ *
+ * The child `exec`s rather than returning, so nothing of this image's state
+ * survives into it: the address space is replaced, and with it the interposer's
+ * control block. Whether the exec'd image routes is therefore entirely umbra's
+ * to re-establish, which is what this measures.
+ */
+static int case_forkexec(const char *path) {
+    const char *program = helper();
+    if (!program) {
+        return 83;
+    }
+    char child_path[1024];
+    int failure = derive(child_path, sizeof child_path, path, ".exec");
+    if (failure) {
+        return failure;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 72;
+    }
+    if (pid == 0) {
+        char *const argv[] = {(char *)program, (char *)"execwrite", child_path, NULL};
+        errno = 0;
+        execv(program, argv);
+        /* Only reached when the exec itself failed; a successful one never
+         * returns, so this cannot mask the exec'd image's own verdict. */
+        _exit(errno ? errno : 76);
+    }
+    failure = reap(pid);
+    if (failure) {
+        return failure;
+    }
+    /* And the parent still routes after a child exec'd out from under it. */
+    return routed_write(path, "parent", 6);
+}
+
+/*
+ * fork, exec, `chdir`, and write through a **relative** name.
+ *
+ * The directory is created through routing first, so it exists in the run's
+ * shadow rather than on the host -- there is nothing on the host for an
+ * unrouted `chdir` to land in by luck.
+ */
+static int case_chdirchild(const char *path) {
+    const char *program = helper();
+    if (!program) {
+        return 83;
+    }
+    char directory[1024];
+    int failure = derive(directory, sizeof directory, path, ".d");
+    if (failure) {
+        return failure;
+    }
+    errno = 0;
+    if (mkdir(directory, 0755) != 0) {
+        return errno ? errno : 76;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 72;
+    }
+    if (pid == 0) {
+        char *const argv[] = {(char *)program, (char *)"chdirwrite", (char *)path, NULL};
+        errno = 0;
+        execv(program, argv);
+        _exit(errno ? errno : 76);
+    }
+    return reap(pid);
+}
+
+/* The helper's `chdirchild` half: move, then write a name with no directory in
+ * it at all, so the object's location is decided entirely by the working
+ * directory umbra thinks this process has. */
+static int case_chdirwrite(const char *path) {
+    char directory[1024];
+    int failure = derive(directory, sizeof directory, path, ".d");
+    if (failure) {
+        return failure;
+    }
+    errno = 0;
+    if (chdir(directory) != 0) {
+        return errno ? errno : 76;
+    }
+    return routed_write("leaf.txt", "chdirchild", 10);
+}
+
+/*
+ * Two generations. The grandchild is the one this case is named for; the other
+ * two writes are what prove the intermediate process stayed mediated across its
+ * own fork rather than merely surviving it.
+ */
+static int case_grandchild(const char *path) {
+    char middle[1024];
+    char grand[1024];
+    int failure = derive(middle, sizeof middle, path, ".mid");
+    if (failure) {
+        return failure;
+    }
+    failure = derive(grand, sizeof grand, path, ".grand");
+    if (failure) {
+        return failure;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        return 72;
+    }
+    if (child == 0) {
+        pid_t descendant = fork();
+        if (descendant < 0) {
+            _exit(72);
+        }
+        if (descendant == 0) {
+            _exit(routed_write(grand, "grandchild", 10));
+        }
+        int inner = reap(descendant);
+        if (inner) {
+            _exit(inner);
+        }
+        _exit(routed_write(middle, "middle", 6));
+    }
+    failure = reap(child);
+    if (failure) {
+        return failure;
+    }
+    return routed_write(path, "parent", 6);
+}
+
+/*
+ * The child writes; then the parent stops the run.
+ *
+ * `O_APPEND` on a routed open is refused by the namespace as unsupported --
+ * there is no atomic append-at-end storage operation, and stat-then-write is
+ * wrong for a second writer -- and an unsupported resolution is propagated
+ * rather than answered to the tracee, so the run ends without its terminal
+ * completion record. This function does not return in a working tree; the
+ * `return 71` below is the refusal failing to fire.
+ */
+static int case_rollbackchild(const char *path) {
+    char child_path[1024];
+    int failure = derive(child_path, sizeof child_path, path, ".child");
+    if (failure) {
+        return failure;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 72;
+    }
+    if (pid == 0) {
+        _exit(routed_write(child_path, "rollbackchild", 13));
+    }
+    failure = reap(pid);
+    if (failure) {
+        return failure;
+    }
+    int fd = open(path, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd >= 0) {
+        (void)close(fd);
+    }
+    return 71;
+}
+
 static int case_bigio(const char *path) {
     char *out = malloc(UMBRA_EDGE_BIG);
     char *back = malloc(UMBRA_EDGE_BIG);
@@ -516,6 +1007,30 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "forkfd") == 0) {
         return case_forkfd(argv[2]);
+    }
+    if (strcmp(argv[1], "forkexec") == 0) {
+        return case_forkexec(argv[2]);
+    }
+    if (strcmp(argv[1], "failedexec") == 0) {
+        return case_failedexec(argv[2]);
+    }
+    if (strcmp(argv[1], "execwrite") == 0) {
+        return case_execwrite(argv[2]);
+    }
+    if (strcmp(argv[1], "chdirchild") == 0) {
+        return case_chdirchild(argv[2]);
+    }
+    if (strcmp(argv[1], "chdirwrite") == 0) {
+        return case_chdirwrite(argv[2]);
+    }
+    if (strcmp(argv[1], "chdirshapes") == 0) {
+        return case_chdirshapes(argv[2]);
+    }
+    if (strcmp(argv[1], "grandchild") == 0) {
+        return case_grandchild(argv[2]);
+    }
+    if (strcmp(argv[1], "rollbackchild") == 0) {
+        return case_rollbackchild(argv[2]);
     }
     if (strcmp(argv[1], "ctor") == 0) {
         /* Set by the constructor before `main` was entered. */

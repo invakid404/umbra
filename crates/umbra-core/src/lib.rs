@@ -1028,10 +1028,22 @@ pub struct LaunchPolicy {
     /// The cost is stated rather than hidden: the tracee may hold at most this
     /// many descriptors, `getrlimit` and `sysconf(_SC_OPEN_MAX)` report it, and a
     /// program wanting more is refused `EMFILE` -- an honest POSIX answer. It
-    /// also fails *closed* for everything the interposer does not implement: a
-    /// virtual descriptor is not a kernel object, so `lseek`, `fstat`, `dup`,
-    /// `fcntl`, `mmap`, `fsync` and `ftruncate` on one receive `EBADF` from the
-    /// kernel rather than a plausible wrong answer.
+    /// also fails *closed* for everything umbra does not implement: a virtual
+    /// descriptor is not a kernel object, so `lseek`, `dup`, `fcntl`, `mmap`,
+    /// `fsync` and `ftruncate` on one receive `EBADF` from the kernel rather
+    /// than a plausible wrong answer.
+    ///
+    /// **`fstat` is deliberately not in that list, and used to be.** It is
+    /// served: `fstat`(339) and `__fstat`(189) are breakpointed libc stubs,
+    /// resolved against the descriptor's logical object and encoded back into
+    /// the tracee. It is *not* one of the interposer's functions -- libsystem
+    /// calls its own, where `DYLD_INTERPOSE` cannot reach -- which is why the
+    /// sentence above says "everything umbra does not implement" rather than
+    /// "everything the interposer does not implement": the two sets stopped
+    /// being the same set once calls were routed at the stub. `fchdir`(13),
+    /// `chdir`(12), `getattrlistbulk`(461) and both `close` forms are served the
+    /// same way. The authoritative list is `abi::TRACED_STUBS`; this comment
+    /// names the shape, not the membership.
     pub descriptor_limit: Option<u32>,
 }
 

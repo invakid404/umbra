@@ -84,6 +84,7 @@
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -387,6 +388,64 @@ struct Run {
 fn routed_run(scratch: &Path, host: &str, port: u16) -> Run {
     let toy = toy(scratch);
     launch(scratch, host, port, &toy, &[], &[])
+}
+
+/// The edge fixture again, copied to a basename of its own, for the cases whose
+/// tracee `exec`s a **different image**.
+///
+/// The copy is what makes it different, and the mechanism is worth stating
+/// because the case is worthless without it. umbra runs every tracee as a
+/// resigned twin cached at `<sha256 of contents>/<basename>`, and the
+/// interposer used to be armed only in the one twin path umbra named at launch.
+/// A copy with the same basename resigns to *that same path* -- identical
+/// contents, identical digest, identical name -- and would have been armed for
+/// the wrong reason, reporting a pass against the defect it exists to catch. A
+/// different basename resigns to a sibling path inside the same digest folder,
+/// which is a different image to umbra and the same program to the fixture.
+fn exec_helper(scratch: &Path) -> PathBuf {
+    let source = fixture_binary(scratch, "umbra-userspace-edges", "UMBRA_EDGES_PATH");
+    let helper = scratch.join("umbra-edge-exec-helper");
+    std::fs::copy(&source, &helper).expect("copying the edge fixture to a helper basename");
+    let mut mode = std::fs::metadata(&helper).unwrap().permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(&helper, mode).unwrap();
+    helper
+}
+
+/// An image umbra will resign but the kernel will refuse to execute, for the
+/// failed-`exec` case.
+///
+/// Both properties are load-bearing and the shape that has them is narrow.
+/// umbra resigns every image a tracee execs *with its own entitlements* and
+/// verifies they read back, before rewriting the operand to name the twin -- so
+/// the file has to survive that. A dylib does not: it signs, but `codesign -d
+/// --entitlements` reports nothing, and `cache::resign` fails
+/// `missing twin entitlement` before the exec is reached, which is a different
+/// (and safe) outcome that would not exercise R1 at all. Measured, not assumed.
+///
+/// What does work is an ordinary arm64 executable with its **execute bits
+/// cleared**. `codesign` cares about the content, so signing and strict
+/// verification both pass and the entitlements read back; `fs::copy` preserves
+/// the mode into the twin, so the rewritten exec names an unexecutable file
+/// too. Measured: `execv` on it fails `EACCES`(13).
+///
+/// That pair is exactly the state R1 is about: umbra has resigned a new image
+/// and recorded it, while the tracee never left the old one.
+fn unexecutable_image(scratch: &Path) -> PathBuf {
+    let source = fixture_binary(scratch, "umbra-userspace-edges", "UMBRA_EDGES_PATH");
+    let image = scratch.join("umbra-edge-unexecutable");
+    std::fs::copy(&source, &image).expect("copying the edge fixture to an unexecutable image");
+    std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o644))
+        .expect("clearing the execute bits is what makes the exec fail");
+    image
+}
+
+/// Launch one edge case whose tracee execs [`exec_helper`], naming it through
+/// the environment so the fixture's own `argc == 3` contract is untouched.
+fn routed_exec_edge(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
+    let helper = exec_helper(scratch);
+    let entry = format!("UMBRA_EDGE_HELPER={}", helper.display());
+    routed_edge(scratch, host, port, case, &[&entry])
 }
 
 /// Launch one of the edge cases, which take a case name before the path.
@@ -1401,6 +1460,459 @@ fn a_routed_descriptor_survives_a_fork_and_the_child_s_write_reaches_the_store()
         run.stderr.contains("finished:"),
         "the run did not finish:\n{}",
         run.stderr
+    );
+    assert_host_write_root_empty(&run);
+}
+
+/// The third half of the fork story, and the one that was broken: a forked child
+/// that **`exec`s a different binary** is mediated in the new image too.
+///
+/// `exec` is not `fork`. `fork` copies the address space, so the interposer
+/// arrives in the child already armed and umbra must *not* re-arm it. `exec`
+/// replaces the address space: dyld re-loads the interposer, because
+/// `DYLD_INSERT_LIBRARIES` rides in `envp` and survives the exec, and it re-runs
+/// its constructor -- so the library arrives mapped and **inert**, with its
+/// `__DATA,__umbra_arm` control block back to zeroes. umbra has to arm it again,
+/// exactly as it arms the launch target's.
+///
+/// It used to arm only the one image named at launch. `install()` compared the
+/// running image against a `target` assigned once, at launch, and never
+/// reassigned, so a child that exec'd anything else took the "this run routes
+/// nothing" arm and no control block was written. **Silently** -- no refusal,
+/// no diagnostic, no event.
+///
+/// **What the tracee actually saw is narrower than "unmediated", and the
+/// narrow version is the measured one.** Only the *interposer* was un-armed.
+/// The tracer's own work is unconditional: `install()` re-plants every
+/// `TRACED_STUBS` breakpoint after an exec, so the exec'd child's `open` was
+/// still routed at the libc stub and still returned a **virtual descriptor**.
+/// But `write` and `close` reach umbra through the interposer and nowhere else,
+/// so they went to libc carrying a descriptor number the kernel does not own,
+/// and the kernel answered **`EBADF`**. The object was therefore **created and
+/// left empty** in the export. Nothing reached the host; Seatbelt refused
+/// nothing. An earlier draft of this comment said the opposite -- that reads
+/// reached the host and the write failed closed, so the object never appeared
+/// -- and a review mutation disproved it by reading `[]` back through the
+/// client.
+///
+/// **What each assertion below is worth, since they are not interchangeable.**
+/// The exit status is checked first because it is the most legible failure, and
+/// for *this* defect it does discriminate -- measured on the unfixed tree, the
+/// exec'd child exited 9 (`EBADF`) where a fixed one exits 0, and that is the
+/// assertion that fires first. What it cannot do is establish the claim this
+/// case is named for: a tracee's own exit tells nobody whether the bytes reached
+/// the store, only that its own calls returned what it expected. That is why the
+/// object is read back **through the client**, out of band.
+///
+/// And it is read back for its **bytes**, not its mere presence, because the
+/// broken tree leaves a name here too -- an empty one. Presence alone would
+/// pass against the defect.
+#[test]
+fn a_forked_child_that_execs_a_different_binary_is_mediated_in_the_new_image() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let run = routed_exec_edge(scratch.path(), &host, port, "forkexec");
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "a forked child's exec'd image did not complete a routed write:\n{}",
+        run.stderr
+    );
+
+    // The load-bearing assertion. The exec'd image's own write, read back out of
+    // the export by a client that shares no resolution code with the run.
+    let mut exec_object = shadow_path(&run);
+    exec_object
+        .last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".exec");
+    assert_eq!(
+        read_through_client(&host, port, &exec_object)
+            .expect("the exec'd child's object exists in the export")
+            .as_slice(),
+        b"execchild",
+        "the exec'd child's write did not reach the store"
+    );
+    // And the fork did not cost the parent its own mediation, which is the
+    // control: without it a tree that stopped routing entirely would satisfy
+    // nothing above but would also not be distinguished from one that recovered.
+    assert_eq!(
+        read_through_client(&host, port, &shadow_path(&run))
+            .expect("the parent's object exists in the export")
+            .as_slice(),
+        b"parent",
+        "the parent stopped routing after its child exec'd"
+    );
+    assert!(
+        run.stderr.contains("finished:"),
+        "the run did not finish:\n{}",
+        run.stderr
+    );
+    assert!(!run.destination.exists());
+    assert_host_write_root_empty(&run);
+}
+
+/// A **failed** `exec` must not move umbra's record of which image a session is
+/// running, because the next `fork` hands that record to the child.
+///
+/// The regression test for a defect this slice introduced and review round 1
+/// found. `intercept` used to write the resigned image into `Session::twin` at
+/// the syscall **entry**, while the tracee was still sitting on the `svc`. A
+/// successful `execve` never returns, so that was harmless for the case it was
+/// written for. A **failed** `execve` does return -- to `finish_return`'s
+/// `ReturnKind::Exec` arm, which is the failed-exec return by construction --
+/// and nothing put the old value back.
+///
+/// **Why that became fatal only with this slice.** Before the interposer
+/// requirement followed `twin`, a stale value had no consumer that cared. Now
+/// `attach_child` points the child's requirement at it. A wrong image means
+/// `install()` matches nothing and takes the "this run routes nothing" arm, so
+/// **no trap site is breakpointed** -- while the control block the child
+/// inherited through `fork` is **armed**, because `fork` copied it. The child's
+/// first routed call then issues `svc #0x80` with `UMBRA_TRAP_NUMBER` in `x16`
+/// and no breakpoint covers it: `SIGSYS`, and the run dies on an undecoded
+/// exception with no diagnosis. That is the #116 defect shape, which the
+/// ratification record names as the one thing not to reopen, reached from a
+/// direction the guardrail does not cover.
+///
+/// The trigger is an arm64 executable with its execute bits cleared: umbra's
+/// resign succeeds on it, so a new image path really does enter umbra's
+/// records, and the kernel refuses to run it, so the tracee carries on in the
+/// image it already had. See [`unexecutable_image`].
+///
+/// Both writes are read back **through the client**, because the run merely
+/// surviving is necessary and not sufficient -- a run whose child routed
+/// nothing at all would still exit 0 here.
+#[test]
+fn a_failed_exec_does_not_leave_a_later_fork_pointed_at_an_image_the_tracee_never_ran() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let image = unexecutable_image(scratch.path());
+    let entry = format!("UMBRA_EDGE_NOEXEC={}", image.display());
+    let run = routed_edge(scratch.path(), &host, port, "failedexec", &[&entry]);
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "a fork after a failed exec did not complete a routed write:\n{}",
+        run.stderr
+    );
+
+    // The load-bearing assertion: the child forked *after* the failed exec was
+    // mediated. Before the fix this run did not get here at all -- it died with
+    // an undecoded SIGSYS and `child_exit` found no status line to read.
+    let mut child_object = shadow_path(&run);
+    child_object
+        .last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".child");
+    assert_eq!(
+        read_through_client(&host, port, &child_object)
+            .expect("the child forked after a failed exec has its object in the export")
+            .as_slice(),
+        b"failedexec",
+        "the child forked after a failed exec did not route"
+    );
+    assert_eq!(
+        read_through_client(&host, port, &shadow_path(&run))
+            .expect("the parent's object exists in the export")
+            .as_slice(),
+        b"parent",
+        "the parent stopped routing after its own exec failed"
+    );
+    assert!(
+        run.stderr.contains("finished:"),
+        "the run did not finish:\n{}",
+        run.stderr
+    );
+    assert_host_write_root_empty(&run);
+}
+
+/// `chdir`(12) moves the **logical** working directory, so a relative write in
+/// an exec'd child lands where the program said rather than where it started.
+///
+/// This is #121's escalation and it is asserted on the **entry name**, in both
+/// directions, because a wrong anchor does not lose the write -- it puts it
+/// somewhere else. `ProcessContext::cwd` is what `DirRef::Cwd` resolution is
+/// anchored against, and until now exactly one thing moved it after launch: a
+/// routed `fchdir`. `chdir`(12) was declared and inert -- nothing decoded the
+/// number -- so an unintercepted `chdir` reached the kernel, moved the *host*
+/// working directory, and left umbra's logical copy at the launch directory.
+/// The relative `open` that followed then resolved against the workspace root.
+///
+/// So the failure this pins is `leaf.txt` appearing beside the workspace root
+/// instead of inside `out.txt.d`, and both halves are checked: the right name
+/// holds the bytes, and the wrong name does not exist at all. Asserting only the
+/// first would pass against an implementation that wrote to both.
+///
+/// The directory is created **through routing**, so it exists only in the run's
+/// shadow. There is deliberately nothing on the host for a stray `chdir` to land
+/// in, which is what stops the case passing for a reason it did not test.
+#[test]
+fn a_chdir_in_an_exec_d_child_moves_the_logical_cwd_its_relative_write_resolves_against() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let run = routed_exec_edge(scratch.path(), &host, port, "chdirchild");
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "the exec'd child's chdir-then-relative-write failed:\n{}",
+        run.stderr
+    );
+
+    // The right entry name: inside the directory the child moved into.
+    let mut moved = shadow_path(&run);
+    moved
+        .last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".d");
+    moved.push(b"leaf.txt".to_vec());
+    assert_eq!(
+        read_through_client(&host, port, &moved)
+            .expect("the relative write landed in the directory the child chdir'd into")
+            .as_slice(),
+        b"chdirchild",
+        "the relative write did not resolve against the moved working directory"
+    );
+
+    // The wrong entry name: beside the workspace root, where a stale logical cwd
+    // would have anchored it. This is the half that makes the assertion
+    // discriminating rather than merely satisfiable.
+    let mut stale = shadow_path(&run);
+    stale.pop();
+    stale.push(b"leaf.txt".to_vec());
+    assert!(
+        read_through_client(&host, port, &stale).is_none(),
+        "the relative write also landed at the launch directory, so the logical \
+         working directory did not move"
+    );
+    assert_host_write_root_empty(&run);
+}
+
+/// The three `chdir` operand shapes `chdirchild` does not reach: a name that
+/// does not resolve, a name that is not a directory, and a **relative** one.
+///
+/// `chdirchild` exercises exactly one shape -- an absolute operand naming a
+/// directory that exists -- which leaves the branch a real shell uses most
+/// (`cd sub`) uncovered, along with both refusals. The refusals matter for a
+/// reason particular to a routed run: umbra cannot fall back to resuming the
+/// tracee's own syscall, because for a routed operation that syscall is umbra's
+/// reserved trap, which Darwin's `nosys` answers `ENOSYS`(78) while posting
+/// `SIGSYS`. So `ENOENT` and `ENOTDIR` have to be *produced* by the namespace,
+/// and a case that never asks for them cannot tell a correct refusal from a
+/// dead run.
+///
+/// The fixture checks both errnos itself, since an errno is the whole of each
+/// answer. What it cannot check from inside the tracee is where the relative
+/// write landed, so that is asserted here, **through the client, on the entry
+/// name** -- and two relative moves are chained precisely so the assertion is
+/// not satisfiable by one: `leaf.txt` can only be two directories deep if the
+/// first `chdir` moved the anchor the second was resolved against.
+#[test]
+fn a_chdir_answers_enoent_and_enotdir_to_the_tracee_and_anchors_a_relative_operand() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let run = routed_edge(scratch.path(), &host, port, "chdirshapes", &[]);
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "a chdir refusal or a relative chdir did not behave:\n{}",
+        run.stderr
+    );
+
+    // Two directories deep, which only the chained relative moves can reach.
+    let mut nested = shadow_path(&run);
+    nested
+        .last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".outer");
+    nested.push(b"inner".to_vec());
+    nested.push(b"leaf.txt".to_vec());
+    assert_eq!(
+        read_through_client(&host, port, &nested)
+            .expect("the relative write landed two directories down")
+            .as_slice(),
+        b"chdirshapes",
+        "a relative chdir did not anchor against the working directory umbra held"
+    );
+
+    // And not at the launch directory, which is where a relative operand that
+    // was resolved against a stale anchor would have put it.
+    let mut stale = shadow_path(&run);
+    stale.pop();
+    stale.push(b"leaf.txt".to_vec());
+    assert!(
+        read_through_client(&host, port, &stale).is_none(),
+        "the relative write also landed at the launch directory"
+    );
+    assert_host_write_root_empty(&run);
+}
+
+/// Two generations deep: a grandchild of a routed tracee routes too.
+///
+/// Each process is discovered from its own parent's syscall return -- the
+/// `fork` breakpoint fires, the return gate reports the new pid, and umbra opens
+/// a fresh RSP connection to it -- so a grandchild is reachable only if that
+/// discovery *composes*. The intermediate child has to be mediated closely
+/// enough for its own `fork` breakpoint to fire, which a child that merely
+/// survived its parent's fork would not be.
+///
+/// All three writes are read back through the client, and they are three
+/// separate objects so no generation can borrow another's evidence.
+#[test]
+fn a_grandchild_of_a_routed_tracee_routes_and_so_does_every_generation_above_it() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let run = routed_edge(scratch.path(), &host, port, "grandchild", &[]);
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "a grandchild of a routed tracee did not complete a routed write:\n{}",
+        run.stderr
+    );
+    for (suffix, expected) in [
+        (&b".grand"[..], &b"grandchild"[..]),
+        (&b".mid"[..], &b"middle"[..]),
+    ] {
+        let mut object = shadow_path(&run);
+        object
+            .last_mut()
+            .expect("the shadow path has a leaf")
+            .extend_from_slice(suffix);
+        assert_eq!(
+            read_through_client(&host, port, &object)
+                .unwrap_or_else(|| panic!(
+                    "the object for {} is not in the export",
+                    String::from_utf8_lossy(suffix)
+                ))
+                .as_slice(),
+            expected,
+            "the write for {} did not reach the store",
+            String::from_utf8_lossy(suffix)
+        );
+    }
+    assert_eq!(
+        read_through_client(&host, port, &shadow_path(&run))
+            .expect("the parent's object exists in the export")
+            .as_slice(),
+        b"parent",
+        "the parent stopped routing after two generations forked below it"
+    );
+    assert_host_write_root_empty(&run);
+}
+
+/// A forked child's writes belong to the **parent's run**, so a run that never
+/// completes covers them.
+///
+/// What this can assert is bounded by what umbra actually implements, and the
+/// bound is worth stating rather than papering over. There is no run-level
+/// rollback surface: `umbra stop` and `umbra checkpoint` are
+/// `not_implemented`, and `abort` is explicitly documented as
+/// reconcile-or-abandon that **does not claim arbitrary writes were undone**. So
+/// "the child's writes are gone" is not a promise this codebase makes, and a
+/// test asserting it would be pinning a behaviour that does not exist.
+///
+/// What *is* claimed, and what this pins, is the structural half: there is one
+/// `NamespaceSession` per **run**, not per process, and `track_process` clones
+/// the parent's context into the child rather than opening a transaction of its
+/// own. So no per-process transaction exists that could commit independently of
+/// the parent's, and the run's terminal evidence speaks for every process in it.
+/// The parent stops the run after reaping the child -- an `O_APPEND` routed open,
+/// which the namespace refuses as unsupported because there is no atomic
+/// append-at-end storage operation behind it -- and the journal is then read for
+/// its `RunCompleted` record, which a failed run must not have.
+///
+/// The child's object is read back through the client as well, and its presence
+/// is the point rather than an embarrassment: it establishes that the child
+/// really did write into the parent's shadow, which is what makes the missing
+/// completion record cover it.
+#[test]
+fn a_forked_child_s_writes_are_scoped_to_the_parent_s_run_and_its_terminal_evidence() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let run = routed_edge(scratch.path(), &host, port, "rollbackchild", &[]);
+
+    // The run failed, and `umbra` says so rather than reporting a tidy exit.
+    //
+    // **Three assertions, and they carry different claims. Which one carries
+    // which is worth stating, because an earlier version of this comment got it
+    // wrong.**
+    //
+    // This first one is the weakest and proves the least: the fixture returns 71
+    // if the `O_APPEND` open unexpectedly *succeeds*, and a nonzero tracee exit
+    // is also reported as a failed run, so it holds either way. What tells those
+    // apart is the **journal** assertion at the end -- a run that merely ended
+    // with a nonzero child still reaches `finish_run` and still records
+    // `RunCompleted`, while one stopped by a refused operation does not. So the
+    // journal pins *that the refusal fired*.
+    //
+    // Neither of those is the structural claim this case exists for. That one is
+    // carried by the **middle** assertion: the child's object read back at
+    // `shadow_path(&run)` -- the *parent's* shadow -- which would answer `None`
+    // if the child had a shadow or a transaction of its own to commit into.
+    assert_ne!(
+        run.status,
+        Some(0),
+        "the refused O_APPEND open did not stop the run:\n{}",
+        run.stderr
+    );
+
+    // The child wrote into the parent's shadow. One run, one shadow: this is the
+    // premise the assertion below depends on, so it is measured rather than
+    // assumed.
+    let mut child_object = shadow_path(&run);
+    child_object
+        .last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".child");
+    assert_eq!(
+        read_through_client(&host, port, &child_object)
+            .expect("the forked child's object is in the parent run's shadow")
+            .as_slice(),
+        b"rollbackchild",
+        "the child did not write into the parent's run shadow"
+    );
+
+    // And the run carries no terminal completion record, so nothing in it --
+    // the child's writes included -- is a completed run's output.
+    assert!(
+        !journal_records_completion(&run),
+        "a run stopped by a refused operation still recorded RunCompleted"
     );
     assert_host_write_root_empty(&run);
 }

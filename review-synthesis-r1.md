@@ -1,144 +1,274 @@
-# review-synthesis — `dg-29vwer0f` / #121, round 1
+# Review synthesis — round 1
 
-**Inputs:** `review-correctness.md` (690 lines, 9 findings F1–F9) and
-`review-scope.md` (437 lines, 7 findings S1–S7), both round 1, both against
-jj change `psvqmvlm` / `9f94b8f3` (`feat/ls-userspace`), parent `a85a8471`.
+Graph `dg-egt6apy1`, node `review_synthesis`, visit 1. Date 2026-09-28.
+Inputs: `review-correctness.md` (1003 lines), `review-scope.md` (525 lines).
+Tree under review: change **`puyyxvmvmnpkwlmnnusmrqrvqkzsypnz`**, bookmark
+`feat/fork-lifecycle`, parent master `7c3ecc8f`.
 
-**VERDICT: FINDINGS PRESENT → `fix`. Not publishable.**
-
-Two independent reviews, one clean on its own axis and one not. The deciding
-facts are three confirmed HIGH defects in the correctness review, one of which
-is a **measured regression against master on registries this slice was not
-supposed to touch**, and one of which is a **silent wrong answer** — the exact
-disposition this codebase refuses on principle.
-
----
-
-## 1. The verdict in one paragraph
-
-The ratified objective is **met**: `ls` genuinely serves directory reads on a
-virtual descriptor, proven by execution and by a mutation probe whose negative
-control fails on the *names*. Scope is **clean** — nothing on the out-of-scope
-list landed as mechanism and #123 left no trace in the repo. But the slice
-regresses `ls -l`/`-t`/`-i`/`-p`/`-S`/`-F`/`-s`/`-n` on the rewrite-backed
-registries from exit 0 to a stopped run, it stops the run on any
-`getattrlistbulk` against a descriptor umbra does not own, and a second read of
-the same directory in one process returns **zero entries with exit 0**. None of
-these is caught by any gate we have, including the ones I ran myself.
+> **Identity note, and it changes how everything below should be cited.**
+> The commit id `14d16c4f` that earlier reports named is a jj *working-copy*
+> commit and has re-timestamped repeatedly since — `14d16c4f` → `105023ee` →
+> `a13a7cfb` → `9996732f` at the time of writing. The stable handle is the
+> **change id `puyyxvmvmnpk`**. `review-scope.md`'s N3 claims
+> `jj diff --from 14d16c4f --to @` is empty; re-measured, it is **not** — the
+> tree now differs by `review-correctness.md` and `review-scope.md`, because
+> both reviewers wrote into the jj working copy. That is consistent with this
+> repo's convention (master itself carries `impl.md`, `fix-r*.md`,
+> `ci-round*.md`, `publish.md`, `done.md` at the root), so it is not a defect,
+> but `publish` must expect the PR to carry the process artifacts.
 
 ---
 
-## 2. Merged findings, ranked
+## Verdict: **FINDINGS PRESENT → route to `fix`**
 
-Deduped across both reviews. Severity is mine, not either reviewer's, and is
-assigned by *what a user experiences*, not by how hard the fix looks.
+Not a clean pass. One genuine **new regression** (`R1`) in the same defect
+family the ratified guardrail exists to protect, five documentation false
+invariants, one silent-success seam, and two provenance defects in `impl.md`.
 
-| # | sev | source | finding | fix shape |
-|---|---|---|---|---|
-| **1** | **HIGH** | F1 | **Regression vs master.** The 461 attrlist is validated in `decode_entry` (`abi.rs:991`) which runs *before* the descriptor-floor test (`events.rs:387`), so `ls -l/-t/-i/-p/-S/-F/-s/-n` now **stop the run** on `--local-dev` and kernel-`nfs`, where master exited 0. Fires on descriptors umbra does not own, on registries umbra does not route. | Move the validation after the floor test, **or** carry the refusal as a bindable `ENOTSUP`(45) — what the kernel itself answers — instead of an `Err`. The second form also fixes the routed case. |
-| **2** | **HIGH** | F3 | **Silent wrong answer.** `Overlay::directories` is never evicted on close and descriptor numbers are reused, so the **second** enumeration of a directory in one process hits a cached *empty remainder* and returns zero entries, **exit 0**. `/bin/ls <dir> <dir>` reaches it. Invisible because the tracee's stdout is `Stdio::null()`. | Evict the `directories` entries in `RoutedEffect::Closed`, or key them on something a reused descriptor cannot reproduce. |
-| **3** | **HIGH** | F2 | `resolve_directory` resolves its descriptor with a raw `context.fds.get().ok_or(StaleHandle)` instead of `routed_binding`, so `getattrlistbulk` on an unbound virtual fd **stops the run** where `fstat`/`fchdir`/`close` all answer the tracee `EBADF`. | Route it through `routed_binding`, exactly as `resolve_routed_fchdir` — added by this slice, twenty lines away — already does. |
-| **4** | MED | F4 | Recursive `fts` (`ls -R`, `find`) **silently truncates** to the top directory, exit 0, no `FTS_ERR`, `errno` 0 — while `README.md:687` calls that row "Not claimed, and **fail-closed**". Out-of-scope is respected; the *disposition* is misdocumented. | Doc decision: stop claiming fail-closed, or make the descent fail loudly. |
-| **5** | MED | F1 + S-corollary | **The missing proof.** `run_fixtures`'s `/bin/ls` rows carry no flag variants, on any registry, so finding 1 is invisible to a green CI run. This is a *missing* proof, not a skipped one. | Add at least one metadata-requesting flag variant to the rewrite-backed matrix. |
-| **6** | MED | S2 | `umbra-overlay/README.md:267` still says "A routed `Open` of a directory is refused: directory reads are not routed" — **this slice made that false**, and the file is absent from the diff. | One-line correction. In-scope maintenance, not new waiver territory. |
-| **7** | MED | F1-adjacent | `events.rs:382-386`'s comment states the false invariant verbatim: "all four calls resume into the kernel exactly as they did when they were not breakpointed at all." True for three, false for 461. | Correct with the fix for finding 1. |
-| **8** | LOW | S3 | Inside the **granted waiver**, `umbra_interpose.c:182` lists `close`(6) among calls "rather than anything this file interposes" while `:189` says it *is* interposed. Self-contradiction about the waiver's own subject. | Comment-only. |
-| **9** | LOW | S1 | A **second**, undisclosed existing-`#[test]`-body edit (`abi.rs` `process_control_stubs_are_not_delivered_to_the_namespace`). The edit is fine; the self-report says "the one edit". | Correct `impl.md` §6. |
-| **10** | LOW | S4 | `impl.md` §7's baseline is wrong: it says master is 822 (+3). **Measured: master is 813, so the delta is +12.** Reconciles exactly — 14 new tests minus the 2 needing `--features transport-raw`. | Correct the figure. |
-| **11** | LOW | F6 | D1's "nothing was given up" overstates: the engine lost its only binding of the tracee-visible return value to an **engine-derived** quantity, and the compensating walk lives inside the encoder being validated. | Soften the claim in `impl.md`. |
-| **12** | LOW | F5 | `dirents.rs`'s `PACKING` comment cites offset `0x24` as 4-aligned evidence; re-measured it is `0x28` and *is* 8-aligned. The rule stated is true; the evidence offered does not demonstrate it. | Comment-only. |
-| **13** | LOW | F7 | `abi.rs:515,520` keep private `ATTR_BIT_MAP_COUNT`/`ATTRLIST_BYTES` beside `dirents`'s new public ones — one parallel-constant instance. | Use the shared constants. |
-| **14** | LOW | F8, F9 | Two stale doc enumerations: the `Deny` "six things reach it" list omits `resolve_routed_fchdir`; the README's unclaimed-modes list names `-l/-la/-@/-R` while the mechanism also refuses `-t -S -F -s -n -p -i`. | Comment-only. |
-| **15** | LOW | S5 | Three stale comments in edited files: "the three it added" (now four), "five mutation probes" (now six), the C/Rust twin test's message naming only `FsOp::Fstat`. | Comment-only. |
-| **16** | LOW | S6 | `nfs-userspace/README.md:683` cites "impl.md §1.5"; this `impl.md` has no §1.5. Pre-existing dangle, now resolving to a present file lacking the section — the more misleading failure mode. | One line. |
-| **17** | INFO | S7 | `memoria check` was not run and **cannot** be run from this workspace (`.jj`, no `.git`, exits 4). Two new source files sit inside documented ownership boundaries. | Run from a git worktree before publish — which the `publish` node already does. |
+Both reviews independently agree the *mechanism* is sound: P0, P1a, P2 and P3 do
+what they claim, the ratified bound held, and all 8 escalations are untouched.
+The findings are real but bounded, and none of them argues for redesign.
 
-**Dropped as non-findings:** none. Every item from both reviews is carried.
+**What makes this round unusually trustworthy, and worth saying before the
+findings:** both reviewers re-qualified live rather than believing `impl.md`,
+and each caught something the other could not have. Correctness confirmed
+consequences *by execution* (three separate mutations) instead of reasoning
+about them. Scope proved the no-test-edit guardrail *structurally* — zero
+deletions in both test files, so editing an existing body is impossible — which
+is stronger than any spot-check. Correctness also caught **itself** producing a
+false pass against a stale binary, and Scope disclosed a flaw that applies to
+its own artifact rather than exempting itself. That is the behaviour that makes
+the rest of their reporting credible.
 
 ---
 
-## 3. What the two reviews agreed on, and where only one looked
+## Merged findings, ranked
 
-**Agreed:** the ratified objective is met; D2 and D3 are correct and stay; the
-mutation probe genuinely discriminates; every #55–#120 mechanism is intact; the
-fd fence is preserved; nothing out of scope landed as mechanism; #123 left no
-repo trace; nothing merged or pushed.
+### R1 — MEDIUM · **must fix before publish** · new regression
+*(correctness F1; no scope counterpart)*
 
-**Only correctness looked at** the newly-reachable surface, and that is where all
-three HIGH defects live. Worth stating plainly: **a scope review cannot find
-these.** Findings 1–3 are each a *correct-looking* diff that traces cleanly to a
-ratified item. S-review passed G32 ("descriptor fence preserved") on the
-strength of `events.rs:387`'s floor test — which is genuinely there and
-genuinely correct, and which finding 1 shows is simply reached too late for one
-of the four calls.
+**A failed `execve` leaves `Session::twin` stale, and the next `fork` points the
+child's interposer requirement at the wrong image.**
 
-**Only scope looked at** the self-report's completeness (S1), the untouched-file
-sweep for claims this slice falsified (S2), and the arithmetic (S4). None of
-those is visible from a correctness posture either.
+`native.rs:1936` commits `s.twin = twin` at the syscall **entry**. A successful
+`execve` never returns, so the value is consumed correctly at the exec stop
+(`:2020`). A **failed** `execve` does return, and `finish_return`'s
+`ReturnKind::Exec` arm (`:1807-1809`) — reachable *only* on a failed exec — does
+nothing but `continue_run()`. It never restores the previous value. `s.twin` is
+then read at `:1782` and handed to `attach_child`, which under P1a now calls
+`child.retarget_interposer(&image)` at `:1727`.
 
-The two reviews are complementary rather than overlapping, and the fan-out earned
-its cost: **each found things the other structurally could not.**
+**Why this is new:** before P1a the `twin` argument had no bearing on interposer
+matching, so a stale value was harmless. P1a made it load-bearing.
+
+**Failure shape:** child's `current` names the wrong image → `image_path` does
+not match → `install()` takes `_ => None` → no interposer trap sites
+breakpointed, **but the control block is armed because `fork` copied it** →
+first routed `open` issues `svc #0x80` with `x16 = 0x554d4252` that no
+breakpoint covers → `SIGSYS`, run dies undiagnosed. **This is the #116 defect
+shape the ratification record names as the one thing not to reopen.**
+
+**Evidence quality — consequence CONFIRMED by execution, trigger PLAUSIBLE.**
+Mutation C handed `attach_child` a mismatched-but-real path and the *existing*
+plain-fork case died with `x16 = 0x554d4252` and `x9`/`x10` = `"UMBRARM1"`:
+armed block, unbreakpointed trap. What stays reasoned is only that a failed
+`execve` is *a way* to reach that state, which is plain from the three cited
+lines.
+
+**Ratified fix shape (take the smaller one):** do not commit `s.twin` at the
+exec entry — carry the candidate in the `Pending`/`ReturnKind::Exec` value and
+assign only at the exec stop, where it is already read. Restoring the previous
+value in the `ReturnKind::Exec` arm is the acceptable alternative.
+
+**Regression test is required, not optional.** R1 must ship with a case that
+fails before the fix. Note the honest constraint the reviewer recorded: a
+resign-succeeds/exec-fails binary could not be manufactured cheaply, so if a
+live trigger stays out of reach, a unit-level assertion on the twin's lifecycle
+across a failed-exec return is acceptable — but the *absence* of a test is not.
+
+### R2 — LOW-MEDIUM · must fix · **my audit's error, now in the tree**
+*(correctness F2)*
+
+Three **new** prose sites assert the refuted pre-fix mechanism — "reads reaching
+the host", "the object simply never appeared in the store", "that absence is
+what the Rust side reads back" — at `README.md:682`,
+`userspace_run.rs:1454`, `umbra-userspace-edges.c:97`. `impl.md`'s own Step 0
+contradicts them.
+
+**Provenance is mine.** The audit predicted an unmediated child whose reads
+reach the host and whose writes Seatbelt refuses. Measured reality: `install()`
+re-plants every `TRACED_STUBS` breakpoint after exec, so the child's `open` *was*
+routed and returned a virtual descriptor; only the interposer was un-armed, so
+`write` went to libc with a number the kernel does not own → **EBADF**. Mutation
+B settled it independently: the client read back `[]` — object **present and
+empty** in the export. Nothing read the host; Seatbelt refused nothing.
+
+Correct all three sites to the measured mechanism: *the object is created by the
+routed `open` and left empty because the interposed `write` was not armed.*
+
+### R3 — LOW · must fix · false invariant
+*(correctness F3)*
+
+`events.rs:1198` still heads the `ChangedCwd` arm *"the one thing that has ever
+moved `ProcessContext::cwd`"* — contradicted by `MovedCwd` at `:1264` and by its
+own block at `:1218`. Exactly the stale-half-of-a-sentence defect the dispatch
+warned about, in the one place a reader has nothing but the comment to check
+against.
+
+### R4 — LOW · must fix · false invariant in an *untouched* file
+*(correctness F4)*
+
+The interposer C header is stale: the routed-call list omits `chdir`(12)
+(`:165`), and `DORMANCY` (`:94`) describes a two-image world that P1a
+superseded. **"0 changed lines in `umbra_interpose.c`" is exactly how this went
+unnoticed** — and both reviews cited that zero as evidence of scope compliance.
+It is: the *code* is untouched. But an untouched file is not an unaffected file
+when its prose documents behaviour that moved. Worth carrying as a lesson.
+
+### R5 — LOW · should fix · silent-success seam
+*(correctness F5)*
+
+`Chdir`'s `None` arm in `record_routed_effect` is a silent-success seam across
+the provider trait: `Opened` has a cross-check, `MovedCwd` has none. A provider
+that reports success without supplying a path leaves the logical cwd unmoved
+while the tracee believes it moved.
+
+### R6 — LOW · fix in place · provenance
+*(scope S-F1 + S-F2, merged — same root cause)*
+
+Two `impl.md` provenance defects, and they are the same mistake twice:
+* **"19 PASS lines" is wrong; the actual count is 20.** The collapsed
+  `/usr/bin/touch` notation merged two distinct cases (`touch touched`,
+  `touch seed.txt`). Arithmetic traced exactly: 16 enumerated + 3 unenumerated
+  crash lines = the reported 19.
+* **`impl.md` cites change `fff2bae0`, which is not the reviewed tree** (differs
+  by 7 comment-only lines of `userspace_run.rs`, plus `impl.md` itself).
+
+Substance is untouched — Scope re-ran everything on the reviewed tree and every
+other figure reconciled, much of it exactly (832 passed / 3 ignored / 52 suites;
+all four lesson-23 qualification lines 0/11/10/4 at 0.00s; 11 CAPTURED with
+identical case names; both NFS SKIPs verbatim; routed 26 passed, 20 live, 6
+probe SKIPs). But this is precisely the *"counted rather than read"* class the
+document claims to avoid, and the provenance line must name the tree the numbers
+came from. Given N3, `impl.md` should cite the **change id**, not a working-copy
+commit id.
+
+### R7 — INFO · optional
+*(correctness F6/F7)*
+
+Only the absolute-operand `chdir` is tested; the relative / `ENOENT` / `ENOTDIR`
+paths were read and are correct, just uncovered. `rollbackchild`'s comment
+credits the journal assertion with a claim the shadow-path assertion actually
+carries. Cheap to close while R1-R6 are open; not a blocker.
 
 ---
 
-## 4. The through-line worth naming
+## Deferred to `merge_gate` — the human's call, not `fix`'s
 
-Findings 1, 2, 3 and 7 are one shape: **`resolve_directory` and the 461 decode
-path were written before anything could reach them, and this slice is the first
-thing that does.**
+### D1 — `rollbackchild` narrowing, **with a converse assertion**
+Both reviews reach the same place from different directions, and Scope's framing
+is the sharper one, so it governs.
 
-- The return-value identity was wrong for the only ABI umbra has (that is D1, and
-  it was caught and corrected).
-- The descriptor resolution never went through `routed_binding` (finding 3).
-- The entry cache was never evicted because nothing ever filled it twice
-  (finding 2).
-- The decode's placement relative to the fence never mattered because the decode
-  could not fail (finding 1).
+The ratified fixture shape said *"parent rolls back, child's writes are gone."*
+That turned out not to be expressible, and **both reviewers verified the
+inexpressibility independently** rather than accepting it: `umbra stop` and
+`checkpoint` are `not_implemented`; the only `abort` is per-operation from
+`OperationOutcome::Failure` and is unreachable on a routed run because `Deny` is
+answered before an `OperationId` is minted; and `abort` explicitly disclaims
+undoing writes.
 
-D1 was caught because the implementer had to make the check pass. The other three
-were not, because nothing forced them. The correctness review's own phrasing is
-exact: *"the half of `resolve_directory` nobody re-read."* That is the lesson for
-`fix`: **the same argument that justified D1 applies to the whole of the
-newly-reachable path, and it was applied to one line of it.**
+So the substitution is sound engineering and is **declared** in both `impl.md`
+and the test's own doc comment. Two things keep it from being `fix`'s to absorb:
+
+1. **In one particular the shipped test asserts the converse of the ratified
+   text** — it confirms the child's object *is* in the shadow, where the
+   ratified wording says those writes are *gone*.
+2. It is a **narrowing**, so the FOLD-IN POLICY's expansion trigger is not met —
+   which is exactly why it could pass unnoticed.
+
+Scope names the failure mode precisely: *absorbing it silently because it is
+well-argued.* I agree. The ratifier set the fixture shape; only the ratifier can
+change it. **Carried to `merge_gate` as a decision, not a note.**
+
+### D2 — the literal-versus-purposive reading of the contract bound
+*(scope N1)*
+
+The bound was ratified as "a `chdir`(12) `TRACED_STUBS` row + one additive
+`RoutedEffect` variant, and nothing else". The implementation also adds
+`routed_cwd()` to the overlay (`engine.rs` +87, `lib.rs` +24). Scope adjudicated
+this **required, not creep**, and the reasoning holds: the ratified P0 text
+itself says the effect "takes the absolute logical path from the resolved
+operand", and only `resolve()` produces that; both files are 0-deletion; and
+`routed_cwd()` is the third member of a family (`routed_descriptor`,
+`routed_stat`) that already existed at master.
+
+I accept that judgement and am **not** sending it to `fix`. But the bound was
+read purposively rather than literally, and that is the human's to bless at
+`merge_gate` rather than mine to wave through.
+
+### D3 — `forkexec`'s discriminator is bytes, not entry names
+The ratification required mutation verification *on entry names*. Re-derived
+rather than trusted: `chdirchild` genuinely discriminates on the entry name
+(failure is a missing entry at `userspace_run.rs:1562`). For `forkexec` the
+discriminator is **bytes** — the object is present and empty — so the ratified
+"entry names" wording is satisfied literally only by `chdirchild`. The
+verification is real and arguably stronger for this mechanism; the wording is
+what does not fit. Human should know at `merge_gate`.
 
 ---
 
-## 5. Routing decision
+## Accepted as sound — recorded so `fix` does not churn them
 
-`review_synthesis → fix`. Three HIGH defects, one of them a regression against
-master and one a silent wrong answer, are disqualifying for `publish` under any
-reading.
+* **Ratified guardrail intact.** `self.parent.is_some()` — one site,
+  byte-identical to master, verified by both reviewers and by me. P1a *never
+  needed* to loosen it: a fork+exec child reaches the fresh-image branch on its
+  own, because the exec clears the image list that guard reads.
+* **Arming states disjoint.** `arm_interposer` is reachable only with a
+  demonstrably-unarmed block; no overlap with the inherited-arming path.
+* **Lesson 20 (parallel admission) clear in code.** `intercept()` exhaustiveness
+  verified by reading; `path_operands`' exclusion of 12 shown *unreachable*
+  rather than merely documented, traced on both run kinds. The only stale list
+  is prose — R4.
+* **All 8 escalations untouched**, each checked against `git show master:`:
+  `single_thread()` and `wait_plan()` byte-identical; no `vfork` in `abi.rs`;
+  spawn refusal intact; `WaitPlan::Unsupported` 4/4; the five ENOTSUP path
+  symbols unchanged; **zero** fd-disjointness assertions.
+* **No unratified test edits, proven structurally:** 4 added `#[test]` attrs
+  across the whole diff, 0 removed, and zero deletions in both test files.
+  Edges-fixture exit codes 70-82 byte-identical, 83/84 appended, dispatch order
+  preserved.
+* **All four new cases executed live** against Ganesha — none skipped. Routed
+  suite 26 passed / 0 failed; the six SKIPs are all declared mutation probes.
+* **Bonus fix nobody asked for:** P1a also repairs `fork` *after* a successful
+  exec, where the old code still named the launch target and left the whole
+  subtree half-mediated.
 
-**For `fix`, in priority order:** findings 1, 2, 3 are code and must land.
-Finding 5 (the missing flag-variant proof) must land with finding 1 — a
-regression fixed without a proof that would have caught it leaves the same hole.
-Findings 4, 6, 7 are documentation-or-decision and should land in the same pass.
-Findings 8–16 are cheap corrections; batch them.
+## New lessons this round earned
 
-**Nothing here re-opens `design_gate`.** Both reviewers say so independently, and
-I agree: the ratified objective is met, the deviations are sound, and every
-defect is on the *implementation* of a ratified item rather than on its choice.
-`merge_gate` should still see findings 1–4 explicitly, because the human's
-standing condition 3 was "preserve every setup / recovery / cleanup / validation
-guarantee" and finding 1 breached it on registries the slice was not meant to
-touch.
+* **(24) A test run that does not rebuild the binary under test can report a
+  false pass.** `cargo test -p umbra-storage-nfs-userspace` does not rebuild
+  `umbra-cli`; correctness's first mutation run passed against a stale
+  `target/debug/umbra` and it caught itself. CI is immune because it runs
+  `cargo build --workspace --bins` first. Same family as lesson 23: a green
+  result from a tree that is not the one under test.
+* **(25) An untouched file is not an unaffected file.** `umbra_interpose.c` has
+  0 changed lines and both reviews correctly cited that as scope compliance —
+  while its header prose went stale (R4). Zero-diff proves the code did not
+  move, never that the documentation still holds.
+* **(26) In jj, pin a reviewed tree by change id, not commit id.** A
+  working-copy commit re-timestamps under you; `14d16c4f` moved three times
+  mid-review and is now hidden. Quantitative self-reports must cite the change
+  id.
 
-**Do not re-run the full audit.** The audit's premises survived; two of its
-inferences were corrected by measurement (already recorded), and nothing in
-either review contradicts its structural conclusions.
+## Instruction to `fix`
 
----
+Fix **R1 through R6** in the existing `impl` session (`reuse=impl`, worker
+`s-0gaqvxvw91`, which still holds the full implementation context). R7 is
+optional and cheap. Do **not** touch D1, D2 or D3 — they are the human's at
+`merge_gate`, and pre-empting D1 in particular would spend the ratifier's
+decision for them.
 
-## 6. For the `fix` worker, stated once
-
-- Findings 1–3 each have a fix shape proposed by the correctness reviewer. They
-  are observations, not prescriptions; measure before adopting.
-- Finding 1's second form (bindable `ENOTSUP`(45)) fixes the routed case too and
-  is what the kernel itself answers. Prefer it if it measures out.
-- Re-run the **side-by-side against master** after fixing finding 1. That is the
-  only check that proves the regression is gone, and it is not in CI.
-- Finding 2's fix is twenty lines from a correct implementation of the same
-  pattern written by this slice.
-- After any fix touching the encoder or the cache, re-run the mutation probe
-  **and its negative control**. The control failing is the proof.
-- `cargo test --workspace --all-targets` at master is **813**, not 822.
+R1 is the only one that can hurt a user: ship it with a test that fails before
+the fix. Re-qualify on the live Ganesha fixture with
+`UMBRA_INTEGRATION_REQUIRED=1`, build `--workspace --bins` first per lesson 24,
+and cite the **change id** for every figure per lesson 26.
