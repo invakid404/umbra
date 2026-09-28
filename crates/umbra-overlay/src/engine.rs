@@ -375,6 +375,17 @@ struct Plan {
     /// second field on `Overlay` would be a channel `prepare` could read out of
     /// step with the plan it is validating against.
     routed_write: Option<(u64, Vec<u8>)>,
+    /// The descriptor whose cached directory pages an observed-successful
+    /// `FsOp::Close` must drop, as a `(task, exec_generation, fd)` prefix of
+    /// [`DirectoryKey`].
+    ///
+    /// **Carried to `commit` rather than applied at `resolve` because the close
+    /// might not happen.** A refused close leaves the descriptor open and its
+    /// enumeration mid-flight, and dropping the pages there would restart a
+    /// partial read from the beginning and hand the tracee entries it had
+    /// already been given. This is the same rule `directory_next` follows one
+    /// field up, and the two are applied in the same place for that reason.
+    directory_closed: Option<(TaskId, u64, TracedFd)>,
 }
 /// What `create_symlink` created, for a caller that has to record an undo.
 ///
@@ -1908,6 +1919,7 @@ impl Overlay {
             mutation: false,
             directory_next: None,
             routed_write: None,
+            directory_closed: None,
         });
         Ok(action)
     }
@@ -1995,6 +2007,7 @@ impl Overlay {
             mutation: true,
             directory_next: None,
             routed_write: Some((offset, bytes)),
+            directory_closed: None,
         });
         Ok(action)
     }
@@ -2020,6 +2033,26 @@ impl Overlay {
             Ok(binding) => binding,
             Err(denied) => return Ok(denied),
         };
+        // **A closed descriptor takes its cached directory pages with it, and
+        // this is the only thing that makes the cache safe.**
+        //
+        // `self.directories` is keyed by descriptor *number*, and
+        // `allocate_descriptor` hands back the lowest free number -- so a closed
+        // virtual descriptor's number is reused immediately, and reopening the
+        // same directory reproduces the key exactly. Without this the second
+        // enumeration hit the first one's leftovers. Measured, before it: a
+        // program that listed a directory, closed it and listed it again got
+        // three names then **nothing**, exit 0, because a completed enumeration
+        // leaves the entry holding the *empty remainder* and `resolve_directory`
+        // prefers the cache over `merged`. `/bin/ls <dir> <dir>` reaches it, and
+        // a tracee's stdout goes to `Stdio::null()`, so it is invisible.
+        //
+        // The partial case is the same bug and is fixed by the same line: a
+        // program that reads part of a directory, closes and reopens would
+        // otherwise resume from the leftover *tail* rather than from the start.
+        // Dropping the pages sends the reopen back through `merged`, which is
+        // what a fresh `open` means.
+        let directory_closed = Some((context.task, context.exec_generation, fd));
         let action = ResolvedAction::Emulate(EmulatedResult {
             outcome: OperationOutcome::Success { return_value: 0 },
             memory_writes: vec![],
@@ -2032,6 +2065,63 @@ impl Overlay {
             mutation: false,
             directory_next: None,
             routed_write: None,
+            directory_closed,
+        });
+        Ok(action)
+    }
+
+    /// Resolve a routed `fchdir`: check the descriptor names a directory and let
+    /// the caller move the logical working directory to it.
+    ///
+    /// **The engine cannot perform the move, and that is deliberate rather than
+    /// a gap.** `ProcessContext` arrives here by shared reference and is owned by
+    /// the supervisor, which applies every context change *after* the operation's
+    /// outcome has been observed -- the rule `FdState::offset` states for a
+    /// routed transfer's position and `apply_routed_effect` enforces for every
+    /// descriptor effect. A working directory moved during `resolve` would have
+    /// moved for a call the tracee might still see refused.
+    ///
+    /// So what this produces is the permission and the target: the descriptor's
+    /// logical path is already in `ProcessContext::fds`, and the supervisor reads
+    /// it there when the emulated success is observed.
+    ///
+    /// **`ENOTDIR`, not a refusal that ends the run.** `fchdir` on a
+    /// non-directory is an ordinary program error with an ordinary POSIX answer,
+    /// and answering it as one keeps the tracee alive to handle it -- the
+    /// distinction `routing_for`'s doc comment draws between a failure of
+    /// interception and a failure of the request.
+    fn resolve_routed_fchdir(
+        &mut self,
+        context: &ProcessContext,
+        operation: &FsOp,
+        fd: TracedFd,
+    ) -> Result<ResolvedAction> {
+        let (state, path) = match self.routed_binding(context, fd)? {
+            Ok(binding) => binding,
+            Err(denied) => return Ok(denied),
+        };
+        let (stat, _) = self.lookup(&path)?;
+        if !state.directory || stat.kind != ObjectKind::Directory {
+            // `ENOTDIR` is 20 on Linux and on macOS/BSD alike, so spelling it
+            // as a literal here does not make this engine depend on a tracee
+            // ABI -- the caution the `Unlink` arm states about `ENOTEMPTY`
+            // (39 against 66) is exactly why this one is checked rather than
+            // assumed. `routed_binding`'s `EBADF` (9) is the same case.
+            return Ok(ResolvedAction::Deny(Errno(20)));
+        }
+        let action = ResolvedAction::Emulate(EmulatedResult {
+            outcome: OperationOutcome::Success { return_value: 0 },
+            memory_writes: vec![],
+        });
+        self.planned = Some(Plan {
+            action: action.clone(),
+            operation: operation.clone(),
+            path,
+            destination: None,
+            mutation: false,
+            directory_next: None,
+            routed_write: None,
+            directory_closed: None,
         });
         Ok(action)
     }
@@ -2108,6 +2198,7 @@ impl Overlay {
                 mutation: false,
                 directory_next: None,
                 routed_write: None,
+                directory_closed: None,
             });
             Ok(action)
         }
@@ -2323,6 +2414,7 @@ impl NamespaceResolver for Overlay {
             }
             FsOp::Close { fd } => return self.resolve_routed_close(context, operation, *fd),
             FsOp::Fstat { fd } => return self.resolve_routed_fstat(context, operation, *fd),
+            FsOp::Fchdir { fd } => return self.resolve_routed_fchdir(context, operation, *fd),
             _ => {}
         }
         let (dir, name, create_parents) = match operation {
@@ -2408,43 +2500,56 @@ impl NamespaceResolver for Overlay {
                 } else if flags.directory {
                     return Err(unsupported("open cannot create a directory"));
                 }
-                // Two shapes a *routed* open cannot answer honestly, refused here
-                // rather than at the first operation on the descriptor. A routed
-                // open hands back a virtual descriptor, and a virtual descriptor
-                // is only ever as capable as the operations umbra services for
-                // it, so accepting an open whose contract umbra cannot keep would
-                // hand out a descriptor that lies about what it is.
-                if self.routed()? {
-                    if flags.append {
-                        // `O_APPEND` requires every write to land at the object's
-                        // end *atomically with respect to other writers*. umbra
-                        // could stat the object and write at its length, which is
-                        // right for one writer and silently wrong for two -- and
-                        // "silently wrong under concurrency" is the class of
-                        // answer this engine refuses. Supporting it needs an
-                        // append-at-end storage operation, which the `Storage`
-                        // surface does not have.
-                        return Err(unsupported(
-                            "routed open with O_APPEND: no atomic append-at-end storage \
+                // The one shape a *routed* open still cannot answer honestly,
+                // refused here rather than at the first operation on the
+                // descriptor. A routed open hands back a virtual descriptor, and
+                // a virtual descriptor is only ever as capable as the operations
+                // umbra services for it, so accepting an open whose contract
+                // umbra cannot keep would hand out a descriptor that lies about
+                // what it is.
+                //
+                // **There were two, and the directory one is gone.** A routed
+                // open of a directory used to be refused whole, because nothing
+                // routed a directory read: the tracee would have received
+                // `EBADF` from the kernel for every call on the descriptor, so
+                // refusing the open said so at the point the program could still
+                // see why. That reasoning was sound and is now spent.
+                // `getattrlistbulk`(461) is decoded, answered from the merged
+                // view through `resolve_directory`, and encoded back into the
+                // tracee; `fchdir`(13) and the two `close` forms are routed
+                // beside it. The four calls `fts` makes on a dirfd are the four
+                // umbra services.
+                //
+                // **The refusal was narrowed, not deleted**, and the part that
+                // stayed true is refused above rather than here: a *writable*
+                // directory descriptor still has no honest answer, which
+                // `mutation && stat.kind != ObjectKind::File` catches. What is
+                // served is the read-only open `fts` issues -- measured
+                // `O_RDONLY|O_DIRECTORY|O_NONBLOCK|O_CLOEXEC`.
+                //
+                // Everything *else* on a virtual dirfd is still refused by the
+                // kernel, unchanged: `getdirentries`(196)/(344),
+                // `opendir`/`readdir`/`closedir`, `getdirentriesattr`(222) and
+                // `listxattr`(240) reach a number the kernel does not know.
+                // `TRACED_STUBS`'s own doc comment records why that matters:
+                // routing one member of a refused set makes the *next* member
+                // reachable for the first time, so the modes this does not claim
+                // are listed in `umbra-storage-nfs-userspace/README.md` rather
+                // than left to be discovered.
+                if self.routed()? && flags.append {
+                    // `O_APPEND` requires every write to land at the object's
+                    // end *atomically with respect to other writers*. umbra
+                    // could stat the object and write at its length, which is
+                    // right for one writer and silently wrong for two -- and
+                    // "silently wrong under concurrency" is the class of
+                    // answer this engine refuses. Supporting it needs an
+                    // append-at-end storage operation, which the `Storage`
+                    // surface does not have.
+                    return Err(unsupported(
+                        "routed open with O_APPEND: no atomic append-at-end storage \
                              operation exists, and stat-then-write is wrong for a second \
                              writer",
-                        ));
-                    }
-                    if flags.directory
-                        || existing
-                            .as_ref()
-                            .is_some_and(|(stat, _)| stat.kind == ObjectKind::Directory)
-                    {
-                        // Reading a directory means `getdirentries`, which the
-                        // interposer does not replace, so the only thing the
-                        // tracee could do with this descriptor is receive `EBADF`
-                        // from the kernel for every call on it. Refusing the open
-                        // says so at the point the program can still see why.
-                        return Err(unsupported(
-                            "routed open of a directory: directory reads are not routed, so \
-                             the descriptor would answer nothing",
-                        ));
-                    }
+                    ));
                 }
             }
             FsOp::Symlink { target, .. } => {
@@ -2832,6 +2937,7 @@ impl NamespaceResolver for Overlay {
             mutation,
             directory_next: None,
             routed_write: None,
+            directory_closed: None,
         });
         Ok(action)
     }
@@ -3725,7 +3831,17 @@ impl NamespaceSession for Overlay {
                     FdState {
                         object: stat.object_id,
                         logical_path: Some(logical_path),
-                        directory: false,
+                        // **What the object is, not what the caller asked for.**
+                        // This was a hardcoded `false`, which was accurate while
+                        // a routed open of a directory was refused outright: no
+                        // routed descriptor could name one. Now that directory
+                        // reads are served it has to be the truth, and the truth
+                        // is the object's kind -- `fts` opens the directory it
+                        // reads with `O_DIRECTORY` but saves its working
+                        // directory with a bare `open(".")`, measured, so a flag
+                        // would answer `false` for a descriptor that is very
+                        // much a directory and `fchdir` would refuse it.
+                        directory: stat.kind == ObjectKind::Directory,
                         flags,
                         // Always zero, including for a descriptor opened onto an
                         // object that already had content: POSIX starts every
@@ -3806,9 +3922,35 @@ impl NamespaceSession for Overlay {
                 "commit requires observed success; abort failures",
             ));
         }
+        let closed = pending.plan.directory_closed;
         if !pending.plan.mutation {
             if let Some((key, entries)) = pending.plan.directory_next.clone() {
                 self.directories.insert(key, entries);
+            }
+            // The other half of the same cache, applied in the same place and
+            // under the same guard: observed success, nothing journalled. A
+            // descriptor that really closed cannot answer another `ReadDir`, and
+            // its number is about to be reissued.
+            //
+            // **`close` is the only eviction, and a descriptor abandoned by
+            // `exec` is deliberately not one.** Its entries survive the exec,
+            // because nothing tells this engine an exec happened. They are
+            // unreachable rather than stale: [`DirectoryKey`] carries
+            // `exec_generation`, which the exec advances, so no later read can
+            // collide with them. What is left is accumulation -- an empty
+            // remainder after a completed enumeration, or a tail bounded by
+            // `MAX_DIRECTORY_ENTRIES` after a partial one -- bounded again by
+            // the run's own deadline.
+            //
+            // Evicting them would need a new overlay hook for an event this
+            // engine is not told about, which is more surface than an
+            // unreachable entry is worth. Recorded rather than fixed, so the
+            // next reader knows it was weighed: if the map ever becomes
+            // reachable by anything but `(task, generation, fd)`, this stops
+            // being an accounting note and becomes a correctness one.
+            if let Some((task, generation, fd)) = closed {
+                self.directories
+                    .retain(|(t, g, f, _), _| (*t, *g, *f) != (task, generation, fd));
             }
             self.pending = None;
             return Ok(CommitReceipt {
@@ -4380,29 +4522,67 @@ impl Overlay {
         fd: TracedFd,
         max_bytes: u32,
     ) -> Result<ResolvedAction> {
-        if max_bytes == 0 || max_bytes as usize > MAX_IO_BYTES {
-            return Err(error(
-                ErrorKind::InvalidInput,
-                "invalid directory output bound",
-            ));
+        // **Through `routed_binding`, like every other descriptor operation.**
+        //
+        // This resolved the descriptor itself, with a raw `context.fds.get` and a
+        // `StaleHandle` on miss -- and a `StaleHandle` is an `Err`, which stops
+        // the run. Measured on one unbound virtual descriptor: `fstat`, `fchdir`
+        // and `close` each answered the tracee `EBADF` and the run finished
+        // `Code(0)`, while `getattrlistbulk` ended it with `errno: None`. A
+        // program holding a stale or bogus descriptor took the whole run down,
+        // where on master the call reached the kernel and got `EBADF`.
+        //
+        // `routed_binding` is what the three siblings use and what
+        // `resolve_routed_fchdir` twenty lines up already uses: `EBADF` for a
+        // descriptor that is not bound or carries no logical path, `ENOENT` for
+        // one whose name no longer resolves, both as a `Deny` the tracee sees.
+        let (state, path) = match self.routed_binding(context, fd)? {
+            Ok(binding) => binding,
+            Err(denied) => return Ok(denied),
+        };
+        // A descriptor that is not a directory cannot answer a directory read,
+        // and `ENOTDIR` is what the kernel says so with. Refused here rather
+        // than left to `merged`, which would fail on a file path with an `Err`
+        // that ends the run -- the same asymmetry this function just stopped
+        // having for an unbound descriptor.
+        let (stat, _) = self.lookup(&path)?;
+        if !state.directory || stat.kind != ObjectKind::Directory {
+            return Ok(ResolvedAction::Deny(Errno(20)));
         }
-        let state = context
-            .fds
-            .get(&fd)
-            .ok_or_else(|| error(ErrorKind::StaleHandle, "unknown directory descriptor"))?;
+        // **The output bound, checked here rather than first, and answered
+        // rather than raised.**
+        //
+        // This was the function's opening statement and an errno-less `Err`, so
+        // it ended the run -- and it was ahead of the descriptor check, which is
+        // the wrong order as well as the wrong disposition. Measured, the kernel
+        // decides the descriptor first: an unbound descriptor with a zero-length
+        // buffer answers `EBADF`, and only a *valid* descriptor with a
+        // zero-length buffer answers `EINVAL`. Both orders are now the kernel's.
+        //
+        // **It was unreachable, then it was not, and that is the reason it is
+        // hardened rather than deleted.** `io_buffer` refuses a zero-length
+        // buffer with `EINVAL` before `resolve` is ever called, which shadowed
+        // this check completely -- until the guard that skips the buffer binding
+        // for an unbound descriptor removed the shadow and exposed it. A check
+        // that is unreachable today is one edit away from being the next
+        // run-ender, so this one now answers the tracee on its own account
+        // instead of relying on something upstream to get there first.
+        //
+        // The upper half is genuinely unreachable and stays as an assertion of
+        // that: `directory_bytes` clamps x3 to `MAX_IO_BYTES` before the
+        // operation is built, so a larger bound cannot be expressed. `EINVAL` is
+        // 22 on Darwin and Linux alike, which is what makes naming it here safe
+        // -- the argument `routed_binding` makes about `EBADF`.
+        if max_bytes == 0 || max_bytes as usize > MAX_IO_BYTES {
+            return Ok(ResolvedAction::Deny(Errno(22)));
+        }
         let key = (context.task, context.exec_generation, fd, state.object);
-        let path = self.resolve_path(
-            context,
-            DirRef::Fd(fd),
-            &BytePath::new(b".".to_vec())?,
-            false,
-        )?;
         let entries = if let Some(entries) = self.directories.get(&key) {
             entries.clone()
         } else {
             self.merged(&path)?
         };
-        let encoded = self
+        let encoded = match self
             .directory_encoder
             .as_mut()
             .ok_or_else(|| {
@@ -4410,7 +4590,37 @@ impl Overlay {
                     "ReadDir requires injected native directory encoder; typed list is available",
                 )
             })?
-            .encode(context, operation, &entries)?;
+            .encode(context, operation, &entries)
+        {
+            Ok(encoded) => encoded,
+            // **An errno on an encoder error means the tracee caused it, and the
+            // tracee gets it back.**
+            //
+            // The supervisor does *not* unwrap errnos from a `resolve` failure --
+            // its arm is `Err(e) => return Err(e)` -- so attaching one to an
+            // error is not by itself enough to answer a program. Inside this
+            // engine the idiom for a tracee-visible refusal is `Deny`, and that
+            // is what the errno has to become before it leaves. The marker is
+            // the errno itself, exactly as `io_binding` and
+            // `unserved_directory_request` use it one layer up.
+            //
+            // The split matters both ways. `dirents::encode` refuses a caller's
+            // output buffer that cannot hold one whole record -- the tracee's
+            // own `max_bytes`, which Darwin answers `ERANGE` -- and that is a
+            // `Deny`. Its other failures are the encoder contradicting itself:
+            // no bound buffer, a length disagreeing with the operation, a
+            // re-walk finding a different record count. Those carry no errno,
+            // there is no program at fault to answer, and they still stop the
+            // run.
+            //
+            // Returning here is before `self.planned` is set, so no `Plan`
+            // exists and nothing is journalled -- the rule the routed-open
+            // refusals state about a dangling `Prepare`.
+            Err(e) => match e.errno {
+                Some(errno) => return Ok(ResolvedAction::Deny(errno)),
+                None => return Err(e),
+            },
+        };
         let total = encoded
             .result
             .memory_writes
@@ -4424,9 +4634,29 @@ impl Overlay {
             || (encoded.consumed == 0 && !entries.is_empty())
             || (encoded.consumed > 0 && total == 0)
             || total > max_bytes as usize
+            // **The native return value is the count of entries, not the count
+            // of bytes, and that is measured rather than chosen.**
+            //
+            // This read `return_value: total` while nothing implemented
+            // `DirectoryEncoder` and no directory read had ever run, and it was
+            // written for a `getdirentries`-shaped call, which answers in bytes.
+            // The call the only ABI umbra has actually issues is Darwin's
+            // `getattrlistbulk`(461), which answers in *records*: measured
+            // against the kernel, four entries packed into 248 bytes return 4.
+            // Telling `fts` it had read 248 entries would be worse than any
+            // refusal.
+            //
+            // Nothing is given up by tying it to `consumed` instead. The byte
+            // accounting is still checked, immediately above -- the writes must
+            // fit `max_bytes` and must be non-empty whenever an entry was
+            // consumed -- and binding the declared result to `consumed`
+            // additionally ties it to the *paging*: `directory_next` continues
+            // from `entries[consumed..]`, so an encoder that reported one count
+            // to the tracee and paged past another would now be refused where
+            // before only its byte total was examined.
             || encoded.result.outcome
                 != (OperationOutcome::Success {
-                    return_value: total as u64,
+                    return_value: encoded.consumed as u64,
                 })
         {
             return Err(error(
@@ -4443,6 +4673,7 @@ impl Overlay {
             mutation: false,
             directory_next: Some((key, entries[encoded.consumed..].to_vec())),
             routed_write: None,
+            directory_closed: None,
         });
         Ok(action)
     }

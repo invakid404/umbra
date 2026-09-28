@@ -84,6 +84,8 @@ pub enum Request {
     },
     /// Io buffer.
     IoBuffer(RegisterSet),
+    /// Directory request block.
+    DirectoryRequest(RegisterSet),
     /// Encode stat.
     EncodeStat(umbra_core::BlobStat),
 }
@@ -108,6 +110,8 @@ pub enum Response {
     Decoded(Option<FsOp>),
     /// Io buffer.
     IoBuffer(Option<umbra_core::IoBuffer>),
+    /// Directory request block.
+    DirectoryRequest(Option<umbra_core::IoBuffer>),
     /// Encoded stat.
     ///
     /// Distinct from [`Response::Bytes`], which is a memory read's reply: these
@@ -326,6 +330,15 @@ impl SyscallAbi for Abi {
             _ => Err(protocol_error("platform.io_buffer response")),
         }
     }
+    fn directory_request(&self, regs: &RegisterSet) -> Result<Option<umbra_core::IoBuffer>> {
+        // A plain call for `io_buffer`'s reason: the block's address is in the
+        // registers, so reporting where it is needs no read of the stopped task.
+        // The *contents* are read by the caller, after its own descriptor test.
+        match call(&self.client, &Request::DirectoryRequest(regs.clone()))? {
+            Response::DirectoryRequest(binding) => Ok(binding),
+            _ => Err(protocol_error("platform.directory_request response")),
+        }
+    }
     fn encode_stat(&self, stat: &umbra_core::BlobStat) -> Result<Vec<u8>> {
         // A plain call for the same reason `io_buffer` is one: the encoding is a
         // pure function of the metadata and touches no stopped task.
@@ -527,6 +540,10 @@ fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> R
                         .map(Response::Decoded)
                 }
                 Request::IoBuffer(regs) => platform.abi.io_buffer(&regs).map(Response::IoBuffer),
+                Request::DirectoryRequest(regs) => platform
+                    .abi
+                    .directory_request(&regs)
+                    .map(Response::DirectoryRequest),
                 Request::EncodeStat(stat) => {
                     platform.abi.encode_stat(&stat).map(Response::EncodedStat)
                 }

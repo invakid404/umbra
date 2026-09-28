@@ -1,5 +1,5 @@
 //! `umbra run` over the userspace NFSv4 client, end to end -- the toy program,
-//! the three standard utilities, and the five mutation probes that prove the
+//! the three standard utilities, and the six mutation probes that prove the
 //! routing is load-bearing.
 //!
 //! # What these cases assert, and why here
@@ -165,6 +165,118 @@ fn fixture() -> Option<(String, u16)> {
 /// the environment did not provide one, so a local run needs no extra step.
 fn toy(scratch: &Path) -> PathBuf {
     fixture_binary(scratch, "umbra-userspace-toy", "UMBRA_USERSPACE_TOY_PATH")
+}
+
+/// The compiled directory-listing fixture, which reads a directory through
+/// `fts` exactly as `/bin/ls` does and writes the names it got into a file.
+fn listing_fixture(scratch: &Path) -> PathBuf {
+    fixture_binary(
+        scratch,
+        "umbra-userspace-listing",
+        "UMBRA_USERSPACE_LISTING_PATH",
+    )
+}
+
+/// Run the listing fixture over a routed workspace holding `names`, and return
+/// the run together with the host path of the file it was told to write.
+///
+/// The directory being listed is a *subdirectory*, and the output file is at the
+/// workspace root, deliberately: writing the output into the directory under
+/// enumeration would race the enumeration itself, and whether the new name
+/// appeared would depend on when the shadow observed it.
+fn listing_run(scratch: &Path, host: &str, port: u16, names: &[&str]) -> (Run, PathBuf) {
+    let workspace = scratch.join("listing-workspace");
+    let state = scratch.join("listing-state");
+    let entries = workspace.join("entries");
+    std::fs::create_dir_all(&entries).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed\n").unwrap();
+    for name in names {
+        std::fs::write(entries.join(name), b"x").unwrap();
+    }
+    let workspace = workspace.canonicalize().unwrap();
+    let entries = workspace.join("entries");
+    let destination = workspace.join("listing.txt");
+    let registry = registry(scratch, host, port);
+    let program = listing_fixture(scratch);
+
+    let output = Command::new(binaries().join("umbra"))
+        .args(["run", "--registry"])
+        .arg(&registry)
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("--experimental")
+        .arg("--")
+        .arg(&program)
+        .arg(&entries)
+        .arg(&destination)
+        .stdin(Stdio::null())
+        .output()
+        .expect("umbra run");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let run_id = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("umbra: run ")
+                .and_then(|line| line.strip_suffix(" prepared"))
+        })
+        .unwrap_or_else(|| panic!("no prepared run id in:\n{stderr}"));
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(run_id).unwrap()),
+        status: output.status.code(),
+        stderr,
+        destination: destination.clone(),
+        state,
+        workspace,
+        registry,
+    };
+    (run, destination)
+}
+
+/// The names the listing fixture wrote, read back out of the store through the
+/// userspace client, sorted so the assertion does not depend on enumeration
+/// order.
+fn listed_names(host: &str, port: u16, run: &Run, destination: &Path) -> Vec<String> {
+    let stored = read_through_client(host, port, &utility_shadow(run, destination))
+        .expect("the listing fixture's output file is not in the export");
+    let mut names: Vec<String> = String::from_utf8(stored)
+        .expect("the fixture writes names, and this fixture's names are UTF-8")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Refuse any change the listing run could have made to its host workspace.
+///
+/// `assert_workspace_pristine` cannot be reused: it pins the seeded workspace to
+/// exactly `seed.txt`, and this one legitimately seeds a directory to enumerate
+/// as well. The property is the same and is asserted at both levels -- the
+/// workspace root holds what it was seeded with and nothing the run wrote, and
+/// the enumerated directory still holds exactly the names it was given, so the
+/// run neither created the listing file on the host nor disturbed what it read.
+fn assert_listing_workspace_pristine(run: &Run, names: &[&str]) {
+    let read = |path: &Path| -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(
+        read(&run.workspace),
+        ["entries", "seed.txt"],
+        "the listing run changed its host workspace"
+    );
+    assert_eq!(
+        read(&run.workspace.join("entries")),
+        names,
+        "the listing run changed the host directory it enumerated"
+    );
 }
 
 /// One compiled C fixture from `experiments/fixtures/`.
@@ -1498,6 +1610,24 @@ const UTILITY_CASES: &[(&str, &str, Utility)] = &[
     ("/usr/bin/touch", "seed.txt", Utility::TimesAdvanced),
     ("/bin/cat", "seed.txt", Utility::ReadOnly),
     ("/bin/cat", "absent.txt", Utility::Diagnoses),
+    // `/bin/ls` on the workspace root. It carried `Expect::ReadOnly` in the
+    // rewrite-backed matrix long before this slice and passed there, because a
+    // rewrite-backed descriptor is a kernel descriptor and every directory
+    // syscall reaches the kernel. On *this* registry the descriptor is virtual,
+    // and until directory reads were routed the run did not merely fail -- it
+    // stopped, at the routed `open`, with `routed open of a directory`, for
+    // every operand shape including a plain file and an absent path (`fts` opens
+    // `"."` before it looks at the operand).
+    //
+    // **What this row proves is exit 0 and an untouched host, not the listing.**
+    // A traced tracee inherits the platform provider's standard output, which is
+    // `Stdio::null()`, so no test can read what `ls` printed. That is exactly
+    // why the design gate ratified asserting on *entries* instead of on the exit
+    // code, and the entries are proven by
+    // `a_directory_listing_through_fts_reaches_the_tracee_over_the_userspace_client`
+    // below, which drives the same `libsystem_c` `fts` code through the same
+    // routed calls and writes what it read where the client can read it back.
+    ("/bin/ls", "", Utility::ReadOnly),
 ];
 
 /// Run one case and assert everything it claims. `before` is the epoch second
@@ -1646,7 +1776,7 @@ fn standard_utilities_run_over_the_userspace_client() {
 /// Every probe this file defines is actually wired into the job that can run
 /// it.
 ///
-/// **This is the guard for the failure that produced it.** All five probes and
+/// **This is the guard for the failure that produced it.** All six probes and
 /// the utility matrix were written, merged and reported green while the
 /// `Userspace-routed run over the live NFSv4 client` job ran none of them: it
 /// carried #116's three proof steps and never set `UMBRA_MUTATION_PROBE` to
@@ -1685,6 +1815,11 @@ fn every_mutation_probe_is_wired_into_the_userspace_job() {
         ("fstat", "umbra-cli"),
         ("mkdir", "umbra-platform-macos"),
         ("setattrlistat", "umbra-platform-macos"),
+        // `readdir` breaks the production `DirectoryEncoder`, which is a
+        // `umbra-supervisor` type reaching `target/debug/umbra` through
+        // `umbra-cli` -- so it is built like the first three, not like the two
+        // provider-executable probes.
+        ("readdir", "umbra-cli"),
     ] {
         assert!(
             job.contains(&format!("UMBRA_MUTATION_PROBE: {probe}")),
@@ -1714,6 +1849,147 @@ fn every_mutation_probe_is_wired_into_the_userspace_job() {
             "the restore step does not rebuild an unmutated {package}, leaving a              probe in target/debug for whatever runs on this runner next"
         );
     }
+}
+
+/// **The entry proof: a directory read on a virtual descriptor returns the
+/// shadow's merged names, through the same `fts` that `/bin/ls` runs.**
+///
+/// This is the case the whole slice exists for, and it asserts on *names*
+/// because nothing else can. The design gate recorded the measurement: nine
+/// errnos swept through `getattrlistbulk` all leave `ls` on exit 1, and so do
+/// the shipped mutation probes, so **the exit code cannot discriminate** a
+/// served directory read from a refused one. Worse, it cannot discriminate a
+/// correct listing from an *empty* one -- a `getattrlistbulk` that answers "zero
+/// entries" means end-of-directory, and `ls` then prints nothing and exits 0.
+/// Measured, during this slice: with the encoder wired but the descriptor's
+/// object kind still reported as a non-directory, the run exited 0 having listed
+/// nothing at all.
+///
+/// **Why a fixture rather than `/bin/ls` itself.** A traced tracee inherits the
+/// platform provider's standard output, and providers are spawned with
+/// `Stdio::null()`, so no harness can read what a traced program printed.
+/// `/bin/ls` is therefore observable only by its exit status, which the
+/// paragraph above disqualifies. The fixture writes the names it read into the
+/// routed workspace instead, and this reads them back out of the export through
+/// the userspace NFSv4 client with nothing mounted.
+///
+/// **It is not a re-implementation of `ls`.** It calls `fts_open`/`fts_read`/
+/// `fts_children` with `FTS_PHYSICAL | FTS_NOSTAT` and `FTS_NAMEONLY` -- the
+/// flags plain `ls` passes -- so the consumer of umbra's encoded records is
+/// Apple's own `fts` inside `libsystem_c.dylib`, the same code `/bin/ls` runs.
+/// Calling `getattrlistbulk` directly would only check umbra's encoder against
+/// umbra's own idea of the format.
+///
+/// What it therefore proves together: the routed directory `open` is no longer
+/// refused, `getattrlistbulk`(461) is decoded and answered from the merged view,
+/// the reply is a record layout `fts` accepts, `fchdir`(13) on a virtual
+/// descriptor succeeds, `__close_nocancel`(399) releases it, and the names that
+/// come out are the shadow's.
+#[test]
+fn a_directory_listing_through_fts_reaches_the_tracee_over_the_userspace_client() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let names = ["alpha.txt", "beta.txt", "gamma.txt"];
+    let (run, destination) = listing_run(scratch.path(), &host, port, &names);
+    assert_eq!(
+        run.status,
+        Some(0),
+        "the listing fixture failed over the userspace client:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        listed_names(&host, port, &run, &destination),
+        names,
+        "the names read back through the client are not the shadow's entries"
+    );
+    // The host keeps none of it: not the listing the fixture wrote, and not the
+    // directory it read.
+    assert!(
+        !destination.exists(),
+        "the listing escaped to the host at {}",
+        destination.display()
+    );
+    assert_listing_workspace_pristine(&run, &names);
+    assert_host_write_root_empty(&run);
+}
+
+/// Probe F -- the directory reply's names are corrupted.
+///
+/// **The probe the design gate ratified in place of a distinct exit code**, and
+/// the reason it asserts the way it does is the reason that substitution was
+/// needed. Every refusal of a directory read, at every errno, leaves the tracee
+/// on exit 1, and the three shipped `umbra-cli` probes land there too; an empty
+/// listing leaves it on exit 0. So the status says nothing, and only the names
+/// can tell the difference.
+///
+/// The probe reverses each name and changes nothing else: every record length,
+/// name reference and alignment is what the encoder would have written, the
+/// reply still walks, and the tracee still exits 0. So the negative half here is
+/// not "the run broke" -- it is that the *names are wrong* while everything
+/// around them still works.
+///
+/// **The positive half is load-bearing**, for the reason probe D's doc records:
+/// a probe that passes for a cause outside its own mutation certifies exactly
+/// what it cannot detect. So this also requires the run to still exit 0 and to
+/// still have produced a file of the right shape -- one line per entry, the
+/// right number of them, each one a *permutation* of a real name. Nothing
+/// upstream of the encoding can satisfy that and still get the names wrong: a
+/// broken open, a refused `getattrlistbulk`, a dead `fchdir` or an unrouted
+/// `close` all fail to produce the file at all.
+#[test]
+fn mutation_probe_readdir_makes_the_listed_names_wrong() {
+    if declared_probe().as_deref() != Some("readdir") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=readdir with a binary built with \
+                   --features mutation-probe-readdir"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    // Deliberately not palindromes: the probe reverses each name, so a
+    // palindromic one would come back correct and weaken the assertion.
+    let names = ["alpha.txt", "beta.txt", "gamma.txt"];
+    let (run, destination) = listing_run(scratch.path(), &host, port, &names);
+    // Positive half: the probe breaks the names and nothing else.
+    assert_eq!(
+        run.status,
+        Some(0),
+        "the probe was meant to corrupt names, not to break the run:\n{}",
+        run.stderr
+    );
+    let listed = listed_names(&host, port, &run, &destination);
+    assert_eq!(
+        listed.len(),
+        names.len(),
+        "the probe changed how many entries were reported, so it is not isolated \
+         to the encoded names: {listed:?}"
+    );
+    for name in &listed {
+        let restored: String = name.chars().rev().collect();
+        assert!(
+            names.contains(&restored.as_str()),
+            "{name:?} is not a reversal of any real entry, so something other \
+             than the probe changed the reply"
+        );
+    }
+    // Negative half, and the whole point: the names are wrong.
+    assert_ne!(
+        listed, names,
+        "breaking the encoded names did not change what the client reads back, \
+         so this proof never depended on the directory encoding at all"
+    );
+    assert!(!destination.exists());
+    assert_listing_workspace_pristine(&run, &names);
+    assert_host_write_root_empty(&run);
 }
 
 /// Probe C -- `fstat` on a virtual descriptor answers `EBADF`.
