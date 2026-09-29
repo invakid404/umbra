@@ -1,546 +1,426 @@
-# Implementation — Multithreaded closure, slice 1 (graph `dg-0ved1w0e`)
+# impl — Memoria 0.4.0 → 0.7.0 upgrade + reusable GitHub Actions adoption
 
-Node `implement`, visit 1; **updated in round 1 after review**, which is recorded
-inline rather than as an appendix so no paragraph states a superseded fact. Round
-1's own account of what changed and why is `fix-r1.md`. Date 2026-09-29.
-Baseline: `master` **`d8a42def`** ("test(tracer): measure the ungated
-multithreaded paths (slice 0)", the #134 merge).
-Change: **`qqxtnynk`**, bookmark `feat/mt-closure`.
-Contract: the `RATIFICATION` section of `/tmp/graph-dg-0ved1w0e/design-gate.md`
-(human, sig-001, revision 9), with `/tmp/graph-dg-0ved1w0e/audit.md` as its
-evidence. Both were read end to end before any code was written.
+- **Graph:** `dg-t43fjdpv` · **Node:** `implement` · **Date:** 2026-09-29
+- **Workspace:** `/Users/inva/Coding/umbra-worktrees/memoria-upgrade` (jj change `zyunyyvo`, bookmark `feat/memoria-0.7`, parent `dd245580` = `master`)
+- **Authorities:** `knowledge/umbra/graph-audits/dg-t43fjdpv-{memoria-upgrade,design-gate,prep-workspace}.md`
+- **Binary:** `/tmp/graph-dg-t43fjdpv/m070/bin/memoria` → `memoria 0.7.0` (pre-built at tag `v0.7.0`, commit `1eaff8b6`). Invoked by absolute path throughout, because the `PATH` binary is `/opt/homebrew/bin/memoria` → `memoria 0.6.0` and would have shadowed any install.
 
-> **Pinned by change id, not by commit id.** A jj working-copy commit id
-> re-timestamps on every snapshot and every `jj describe`; the change id does
-> not. Every figure below was measured against `qqxtnynk`, whose commit id moved
-> on every edit of this arc. Resolve it with `jj log -r qqxtnynk`.
+Every command below was run for real; its output is quoted as produced. Deviations are in the last section.
 
-> **The files in the diff are what `jj diff -r qqxtnynk --name-only` returns.**
-> That command is the authority and this document does not restate it as a
-> count — lesson 28's remedy 3, applied to the one value this document would
-> invalidate by stating it, since this file is itself in the diff.
+**Superseded in part by `ci-fix-r1.md`.** CodeRabbit found the runner label `ubuntu-latest` unsafe for this Action, which supports Ubuntu 24.04 only; the CI-fix round regenerated the managed workflow with `--runner ubuntu-24.04`, pinned the same exact label in `memoria-auto-ack.yml`, and pinned the release-archive digest there. The transcripts below are left exactly as they were taken, so they still show `ubuntu-latest` — read them as the record of this round, not as the shipped configuration.
 
 ---
 
-## 0. Headline
+## 0. The blocker, confirmed before anything was changed
 
-**Both of #134's `#[ignore]`d fixtures now pass, and the mechanism that closes
-them is the one the human ratified: per-thread resume.** The `z0`/`Z0` sequence —
-the safety basis of the ruling — is **byte-identical to master**. Not one added or
-removed line in the diff touches the release, the gate plant, the hardware gate,
-the re-arm, or either registry primitive. Only *which threads run* changed.
+`prep_workspace` measured that memoria cannot run in a jj workspace. Re-confirmed here on the first call:
 
 ```
-mt_write   master d8a42def: MISSED, 3/3, host file holding Some("two\n")
-           qqxtnynk:        CAPTURED, 3/3
-mt_spawn   master d8a42def: panic at native.rs:571, 3/3
-           qqxtnynk:        CAPTURED, 3/3
+$ cd /Users/inva/Coding/umbra-worktrees/memoria-upgrade
+$ /tmp/graph-dg-t43fjdpv/m070/bin/memoria --root . integrations skill status --target claude
+error [git_unavailable]
+  git failed for .: not inside a Git worktree: fatal: not a git repository (or
+  any of the parent directories): .git
+  {}
+
+memoria agent status failed with exit status 4
+exit=4
 ```
 
-**One ratified premise did not survive measurement, and it is recorded here
-rather than quietly carried.** The audit's mutation probe **M2** predicted that
-reverting `pending` to a single slot, with the per-thread resume kept, would fail
-`mt_spawn` — "the slots are still load-bearing". It does not. Both fixtures pass,
-3 runs of 3. §4.
+So the publish node's *"this arc IS the upgrade, so run in place"* is wrong, exactly as `prep_workspace` recorded. The throwaway-git-worktree pattern was used instead:
+
+1. hand edits in the jj workspace,
+2. `jj describe` → the bookmark materialises as a git ref,
+3. `git worktree add --detach <tmp> <commit>` from `~/Coding/umbra`,
+4. every memoria **write** (skill upgrade, github install, review, ack) run in that worktree,
+5. generated files copied back into the jj workspace,
+6. worktree re-pointed at the amended commit and the gate re-run there, so the verified tree is the committed tree and not an intermediate one.
+
+Throwaway worktree: `<scratchpad>/gwt`.
 
 ---
 
-## 1. What was ratified, and what was built
+## 1. `memoria.toml` version 2 → 3
 
-| # | Ruling | Built |
-|---|---|---|
-| **D1** | Shape 3 only — `vCont;c:<tid>`; `z0`/`Z0` untouched; Mach sibling-hold shelved | `Session::continue_thread`, called from `return_stop` in place of the bare `c`. No `task_threads`, no `thread_suspend`, no new `unsafe`, no new dependency. §2.1 |
-| **D2** | The trapping TID is carried on `Pending` and read from there, **never** from `s.thread`; M3 ships | `Pending::thread`, read by `finish_return`. M3 ships as a source pin, and §4 states exactly why it could not ship as a live test. §2.3 |
-| **D3** | IN: per-thread slots, window fix, both fixtures. DEFERRED: `single_thread()` removal, 2-thread-parent-fork, orphan leak, writer lease | `pending`/`entry` keyed by `ThreadId`; both fixtures un-`#[ignore]`d and passing; `single_thread()` and both call sites byte-identical, pinned by a new test. Nothing from items 3/4b/5/6 was touched. §5 |
-| **D4** | Three waivers, and only those | (a) Session shape consumed exactly as enumerated; (b) `vCont` is the only new RSP surface; (c) the sibling freeze is documented in the code as watchdog-kill degradation. §2.5 |
-| **D5** | `single_thread()` at `:498`; shapes in #134's `impl.md` §3; lesson 28 fired 4× | Accepted as stated; no re-derivation. |
+```
+$ sed -i '' '1s/^version = 2$/version = 3/' memoria.toml
+$ head -1 memoria.toml
+version = 3
+```
 
-**Success criterion, as ratified:** both fixtures assert on entry names and bytes,
-never on exit code. `mt_fixture` already did — host file absent *and* shadow
-content byte-equal — so the test change is the removal of the two `#[ignore]`
-attributes and nothing else about what is asserted. The `debug_assert!` the
-ruling cites at `native.rs:571` — that is its line at `d8a42def`; in this tree it
-is the one in `return_stop`, and citing a line here would be a number this change
-invalidates — is **converted to a per-thread invariant, not deleted**.
+The `[documentation] guidance` array was **deliberately not touched**, and the reason is scope, not cost: ratified step 1 is `memoria.toml:1` and nothing else, so editing the array would have been an unratified change. It still carries the 0.6 phrase *"every nested README also declares its ownership boundary"*, in two places.
+
+An earlier revision of this record claimed editing the array "would change the guidance digest and invalidate all 23 documents, turning a 1-ack upgrade into a 23-ack one." That is measurably false and is corrected here. `review_scope` probed it twice at this change, with restore-and-reverify after each: rewriting the stale vocabulary in place, and appending an entirely new guidance rule. Both left `Reviews 23 current, 0 pending`, `memoria check` exit 0, and `memoria review --format json` with `tasks 0`. Editing the guidance block invalidates nothing; the immediate ack cost is **zero**.
+
+The one real consideration, and it is a follow-up rather than a blocker: a changed digest raises `guidance_changed` on tasks that are *already* pending, and `scripts/memoria-auto-ack.sh:125` skips any task carrying it. So a guidance edit is best paired with a re-ack sweep that refreshes `reviewed_digest`, or the next Renovate bump goes un-acked. That pairing is out of scope here and is filed as follow-up work.
 
 ---
 
-## 2. The change
+## 2. Skill packages → the four-file 0.7 structure
 
-### 2.1 The closure: `return_stop` resumes the trapping thread alone
+Status before (both targets `outdated`, and note the flag the node text asked for does not exist — `--replace-existing` is not on this command, and there is no `--apply` gate):
 
 ```
-return_stop:   z0 entry  →  plant gate  →  record Pending incl. TID
-               →  vCont;c:<tid>        ← the only line that changed
-finish_return: retire gate  →  re-arm entry  →  report the exit
-               →  the process resumes on the next unqualified `c`
+$ memoria --root . integrations skill status --target claude
+planned: status target=claude destination=<gwt>/.claude/skills/memoria
+  scope      local
+  state      outdated
+  version    installed 0.4.0 / embedded 0.7.0
+  existing   managed package version 0.4.0 for claude (record schema 2)
+  retained   <gwt>/.claude/skills/memoria.install.lock (synchronization_lock, removable_by_uninstall=false)
+exit=0
+```
+(identical for `--target codex` → `<gwt>/.agents/skills/memoria`.)
+
+```
+$ memoria --root . integrations skill upgrade --target claude
+memoria: agent upgrade: target claude scope local destination <gwt>/.claude/skills/memoria
+  writes [SKILL.md, review-details.md, saved-exports.md, integrations.md, .memoria-install.json]
+  removals [] replaced [SKILL.md, .memoria-install.json] backup none
+exit=0
+
+$ memoria --root . integrations skill upgrade --target codex
+memoria: agent upgrade: target codex scope local destination <gwt>/.agents/skills/memoria
+  writes [SKILL.md, review-details.md, saved-exports.md, integrations.md, .memoria-install.json]
+  removals [] replaced [SKILL.md, .memoria-install.json] backup none
+exit=0
 ```
 
-The window between the `z0` and the re-arm is not narrowed; it is emptied of
-anyone who could walk into it. A debugserver `Z0` is per-process, so the release
-un-arms the stub for every thread — but with every sibling stopped, there is no
-other thread running to reach it.
+`backup none` on both is the proof the audit predicted: the installed 0.4.0 files matched the managed package hash exactly, so there were no local customisations to preserve. The two `memoria.install.lock` files were `retained`, not rewritten.
 
-`continue_run` is unchanged and still sends the bare `c`. Two new siblings sit
-beside it:
+Status after, on the committed tree:
 
-- **`continue_thread(thread)`** — `vCont;c:<tid>`. One packet. Per-thread
-  addressing is not new to this backend: `g`, `p` and `P` already carry
-  `;thread:<tid>;` under `QThreadSuffixSupported`.
-- **`continue_absorbed()`** — the bare `c` when no window is open, and the
-  window owner alone when one is. This is what the two paths in `stop()` that
-  absorb a signal without opening a transaction now use. A bare `c` from either
-  of them would have released the siblings into the open window — the `mt-write`
-  escape with a signal in front of it.
-
-### 2.2 Per-thread slots
-
-`pending: BTreeMap<ThreadId, Pending>` and `entry: BTreeMap<ThreadId, u64>`.
-Every touch point the audit enumerated was converted; the complete set is in the
-diff. These are worth naming because they are decisions rather than mechanical
-rekeying:
-
-1. **The map is for what it makes expressible, not for what it answers.** A single
-   slot answers "which thread owns this window" through `Pending::thread` — M2
-   demonstrated it, with both fixtures green. Round 0's field doc justified the map
-   by that answerability, which overstates it; the corrected doc says what is
-   actually true: the map is what lets the per-thread invariant be *stated*, and it
-   becomes load-bearing at the deferred `single_thread()` removal, when a second
-   concurrent window becomes reachable.
-2. **`thread_index`** resolved a session by `s.thread == thread` — a slot every
-   stop overwrites, so with a live multithreaded tracee it matched on *the last
-   thread that stopped*. `registers`, `set_registers` and `resume` all route
-   through it. It now consults the per-thread slots first and falls back to
-   `s.thread`. Thread ids are unique machine-wide, so consulting several
-   sessions' slots cannot cross-match; the only failure it can produce is "not
-   found".
-3. **`regs`/`set_regs` take the thread.** They read `g;thread:<self.thread>;` —
-   so `registers(thread)` resolved the right session and then returned a
-   *sibling's* context under the right thread's name. This is a latent
-   aliasing bug independent of the window, and it is fixed by the same waiver.
-4. **The exec stop drains the whole map** rather than looking the window up by
-   the stopping thread. An `execve` keeps one thread and discards the rest, and
-   the survivor is reported under a thread id of the new image — so the thread
-   stopping there need not be the one that entered the `execve`. Keying on it
-   would have dropped the `ReturnKind::Exec` candidate and left the exec'd image
-   half-mediated. The `fork-write`, `exec-write`, `posix-spawn-write` and
-   `grandchild-write` fixtures all still capture.
-
-### 2.3 The TID on `Pending` (D2)
-
-`Pending` gains `thread: ThreadId`, recorded when the window opens.
-`finish_return` attributes its `SyscallExit` from it.
-
-The reason is not hypothetical. The supervisor removes its in-flight operation by
-thread (`events.rs:1351`) and a miss is **not** an error — it takes the "an exit
-for a call we never intercepted" branch (`events.rs:1352-1354`), lets the kernel
-result stand, and abandons the rewrite without a word. Closing the registry hole
-while attributing from `s.thread` would convert a loud escape into a silent one.
-
-`resume()`'s own `SyscallExit` — the "PC moved past the `svc`" path — was changed
-the same way, from `s.thread` to `command.thread`, for the same reason.
-
-### 2.4 The tripwire, converted — and a second assertion beside it
-
-`debug_assert!(self.pending.is_none(), …)` became
-`debug_assert!(!self.pending.contains_key(&thread), …)`, the per-thread conversion
-#135 sub-item 1 and D3 require. It no longer catches the between-threads collision
-`mt_spawn` measured, because that collision can no longer happen; what it catches
-now is a second window on a thread that already has one.
-
-**A second `debug_assert!(self.pending.is_empty(), …)` was added beside it in round
-1, and the reason is a false claim this document previously carried.** Round 0's
-text — here, in `README.md` and at three places in `native.rs` — credited the
-per-thread assertion with pinning the property `continue_absorbed` depends on: that
-at most one window is open **process-wide**, which is what makes
-`pending.values().next()` well-defined. It does not. Two windows on two *different*
-threads pass a per-thread check untouched, and that is exactly the state that would
-make the pick ambiguous.
-
-What establishes the property is the **freeze**: the thread `return_stop` resumes is
-the only one running, so nothing is left to reach `return_stop` and open a second
-window. That is structural. The new assertion is a tripwire over it, not its source,
-and all five sites now say so.
-
-**Additive, not a replacement, and deliberately so.** Swapping the per-thread check
-for `is_empty()` would undo the conversion that was ratified. The stronger condition
-subsumes the weaker, so only the first to fail is reported — which is the right
-order: a same-thread double-open gets the specific diagnosis, and a cross-thread one
-means the freeze itself has broken. Measured both ways. On the shipped tree the new assertion fires **0 times** across
-three full fixture runs (13 `CAPTURED` each), matching what the correctness reviewer
-measured with an equivalent probe before it existed. Under **M1** — the freeze
-deliberately broken by reverting `return_stop` to a bare `c` — it fires **3 of 3**,
-with its own message, and `mt_spawn` fails on it.
-
-**So it closed a detection gap, not only a documentation one.** Before it was added,
-M1 failed `mt_write` alone and `mt_spawn` *passed with the freeze broken*; now M1
-fails both. The correctness reviewer measured this at round 2 and it is re-verified
-here, which is the sharper justification for the additive form than either the
-ratification argument or mine.
-
-### 2.5 Waiver (c), documented in the code
-
-`continue_thread`'s doc comment carries it, as the ruling requires:
-
-> The interposer routes `read`/`write`/`close`, so a routed call that blocks now
-> blocks with its siblings held, where today's bare `c` would have let them run.
-> It does not deadlock silently: `check_deadline` kills the tree at the session
-> deadline, so the degradation is a **watchdog kill naming a timeout, not a
-> hang**.
-
-That is a real behaviour change from master's bare `c`, taken deliberately,
-because the thing on the other side of it is the unmediated window — and that one
-is silent.
+```
+  state      current
+  version    installed 0.7.0 / embedded 0.7.0
+  existing   managed package version 0.7.0 for claude (record schema 2)
+  state      current
+  version    installed 0.7.0 / embedded 0.7.0
+  existing   managed package version 0.7.0 for codex (record schema 2)
+```
 
 ---
 
-## 3. New tests
+## 3. GitHub Actions — `install`, not `upgrade`
 
-All are new `#[test]` functions. **No test function that existed at the parent was
-modified**, and that is the claim the test-surface rule is about — but it is not the
-whole truth about this change's own history: round 1 edited the absorb pin, a test
-this change itself created, to add the assertions it was missing. Both readings are
-stated because the parent-relative one alone reads as exhaustive and is not.
+The node text's command was run first, to record the failure rather than assert it:
 
-The changes to `fixtures.rs` are the two `#[ignore]` removals **plus the two
-doc-comment corrections recorded in §7** — the comments described the defect as
-open and the fix as a prediction, and both are now measurements.
+```
+$ memoria --root . integrations github upgrade --version 0.7.0 --action-ref v0.7.0
+error [github_not_installed]
+  no managed Memoria workflow at .github/workflows/memoria.yml; run `memoria integrations github install` first
+  {}
 
-| Test | What it pins |
+memoria integrations github upgrade failed with exit status 1
+exit=1
+```
+
+Status beforehand confirmed why — memoria had never written a workflow here, and it warned about the two hand-rolled siblings:
+
+```
+hint [github_sibling_workflows]
+  2 other workflow files already exist beside this destination. Memoria reads
+  none of them and can duplicate an existing documentation check.
+  workflows: ci.yml, memoria-auto-ack.yml
+
+no change: integrations github status .github/workflows/memoria.yml
+  state      absent
+  record     .github/memoria-workflows/memoria.yml.json
+  memoria    installed none / desired 0.7.0
+```
+
+The ratified command:
+
+```
+$ memoria --root . integrations github install --version 0.7.0 \
+    --action-ref 1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c \
+    --runner ubuntu-latest --apply
+memoria: integrations github install: .github/workflows/memoria.yml
+  writes [.github/workflows/memoria.yml, .github/memoria-workflows/memoria.yml.json] removals []
+applied: integrations github install .github/workflows/memoria.yml
+  state      current
+  record     .github/memoria-workflows/memoria.yml.json
+  memoria    installed 0.7.0 / desired 0.7.0
+  action ref installed 1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c / desired 1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c
+  runner     installed ubuntu-latest / desired ubuntu-latest
+  write      .github/workflows/memoria.yml
+  write      .github/memoria-workflows/memoria.yml.json
+exit=0
+```
+
+The generated file was **not edited by a single byte** — the record's `expected_workflow` field holds the complete text, so any drift forfeits memoria's management. The ratified D3 deviations ship as emitted: `on: [push, pull_request]`, no `concurrency` group, and a `uses:` SHA with no trailing `# v0.7.0` comment.
+
+```yaml
+# This workflow is managed by Memoria.
+# Change it with `memoria integrations github upgrade --apply`.
+# A manual edit makes the file modified, and Memoria then preserves it.
+name: Memoria documentation
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  memoria:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Memoria
+        id: memoria
+        uses: viktordanov/rs-memoria@1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c
+        with:
+          version: '0.7.0'
+      - run: memoria --version
+      - run: memoria check
+```
+
+Then the hand-rolled gate was deleted. Lines 71-77 of `ci.yml` (the six ratified lines plus their trailing blank, so no double blank is left behind):
+
+```diff
+@@ -68,13 +68,6 @@ jobs:
+       - name: Test contract documentation
+         run: cargo test --workspace --doc
+ 
+-      - name: Install memoria CLI
+-        run: cargo install --locked --git https://github.com/viktordanov/rs-memoria --tag v0.4.0 rs-memoria
+-        # Pinned to rs-memoria's v0.4.0 tag; bump on new releases.
+-
+-      - name: Memoria documentation gate
+-        run: memoria --root . check
+-
+   raw-transport:
+```
+
+`grep -ni 'memoria' .github/workflows/ci.yml` now returns nothing. The `rust` matrix job itself is untouched: `macos-14` + `ubuntu-latest`, `cargo fmt --check`, `cargo clippy -D warnings`, workspace tests and doctests all still run on both legs — only the documentation gate moved.
+
+---
+
+## 4. `memoria-auto-ack.yml` — the step that preserves the auto-ack mechanism
+
+This is the mandatory one. Once the lock is format 3 a 0.4.0 binary cannot read it, so leaving line 119 pinned to `v0.4.0` would have broken the Renovate auto-ack on the first bump after merge.
+
+Lines 97-119 — `dtolnay/rust-toolchain`, the whole `Swatinem/rust-cache` block including `shared-key: memoria-cli-v0.4.0` at 110, and the second `cargo install … --tag v0.4.0` at 114-119 — were replaced by the setup Action. The job is already `runs-on: ubuntu-latest`, which is what makes the Linux-only Action legal there.
+
+```diff
+-      - name: Install Rust toolchain
+-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+-
+-      # Cache the cargo registry/git/bin so the memoria CLI is not
+-      # rebuilt from source on every Renovate PR. …
+-      - name: Cache Cargo registry, git deps, and installed binaries
+-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+-        with:
+-          shared-key: memoria-cli-v0.4.0
+-          cache-directories: |
+-            ~/.cargo/bin
+-
+-      - name: Install memoria CLI
+-        run: cargo install --locked --git https://github.com/viktordanov/rs-memoria --tag v0.4.0 rs-memoria
++      # The memoria CLI comes from the first-party setup Action, which
++      # downloads a prebuilt binary instead of building from source. …
++      - name: Set up Memoria
++        uses: viktordanov/rs-memoria@1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c # v0.7.0
++        with:
++          version: '0.7.0'
+```
+
+Unlike the memoria-managed workflow, this file is umbra's own, so the SHA carries the house-style `# v0.7.0` comment.
+
+One stale comment inside the same edited mechanism was corrected: line 142 read *"while the toolchain + memoria CLI installed"* and now reads *"while the memoria CLI installed"*, because the toolchain step no longer exists.
+
+`scripts/memoria-auto-ack.sh` was **not changed**, as the audit's F-3 requires. The 0.7 contract keeps `data.tasks[].{document,status,guidance_changed,causes[].code}`, keeps `data.token` (now `mrv3.…`, still 21 bytes so the script's length comment holds), still accepts `ack --packet -` fed the default manifest artifact, and still yields exactly `['input_changed']` for a dependency bump, which is the script's allowlist.
+
+Both workflows parse:
+
+```
+$ python3 -c "import yaml; [yaml.safe_load(open(f)) for f in [...]]"
+ok .github/workflows/memoria-auto-ack.yml
+ok .github/workflows/ci.yml
+```
+
+---
+
+## 5. Root `README.md` — the crate and experiment index
+
+A `## Crate and experiment index` section was appended, one line of lead-in plus 22 links. All 22 nested READMEs are listed: the 17 new handoffs and the 5 already linked in prose at lines 17/23/25/26/66, whose prose was left exactly as it was.
+
+```
+$ ls crates/*/README.md experiments/*/README.md | wc -l
+      22
+$ # every link target resolves
+link check done      (no MISSING lines)
+```
+
+Under 0.7 this is not cosmetic. An unlinked subfolder stays inside root's scope, so without the index a bump to any of the 12 unlinked crates pends the consumer-facing root README *as well as* the crate's own. Measured on this tree after the change, matching the audit exactly:
+
+```
+Documents       23: 23 READMEs, 0 opted-in documents; 22 handoffs; 0 sources covered by more than one document
+Navigation      0 document(s) not reachable from the root
+Coverage        0 selected file(s) that no document covers
+```
+
+`handoff_absent` 17 → 0, `overlapping_sources` 63 → 0, `navigation_disconnected` 14 → 0. The predicted cost also materialised: `missing_import_hint` 9 → 26, severity `hint`, which does not fail `check`.
+
+---
+
+## 6. `docs/memoria.md` — the seven false claims
+
+All seven corrected, plus one extra instance of the same stale vocabulary (see Deviations):
+
+| Was | Now |
 |---|---|
-| `a_return_is_attributed_from_its_window_and_never_from_the_session_slot` | **M3.** `finish_return` reads `pending.thread` and contains no `s.thread`. |
-| `a_stop_absorbed_inside_a_return_window_does_not_release_the_siblings` | **M7.** `continue_absorbed` consults `pending` and calls `continue_thread`, **and** `stop()` routes through it twice and through `continue_run` never. |
-| `the_exec_stop_adopts_its_candidate_without_keying_on_the_stopping_thread` | **M8.** The exec stop drains every window instead of looking one up by key. Added in round 1. |
-| `the_fork_and_park_paths_still_refuse_a_multithreaded_tracee` | D3 item 3 stays deferred **by test**: `single_thread()` exists and guards exactly two sites. |
+| 5-7 "The nearest `README.md` above a file owns it; a nested README starts a new ownership boundary." | a document's scope is its folder and everything below it; linking or importing a tracked document in a subfolder hands that subfolder off |
+| 13 "any code change in a README's **ownership boundary**" | "in a README's **scope**" |
+| 40-41 "The existing `rust` job … on both `macos-14` and `ubuntu-latest`" | the dedicated managed workflow, `setup-memoria`, `ubuntu-latest` only, with the reason the macOS leg was dropped |
+| 47 "The job pins the CLI to a release tag." | the Action is pinned to a commit SHA and asked for an exact version; memoria owns the file via `.github/memoria-workflows/memoria.yml.json`; the auto-ack workflow uses the same ref |
+| 51-52 "Existing `review` and `explain` JSON contracts and exit codes remain compatible across both releases" | the contracts are versioned and did change — 0.6.0 envelope `schema_version: 3`, `mrv3.` token, manifest by default with `--full` for the complete export; 0.7.0 replaced the ownership model and requires `version = 3`; older artifacts are refused |
+| 59 "the packet's canonical **JSON v2** envelope" | "canonical JSON envelope (`schema_version: 3` since 0.6.0)" |
+| 85 "under ignored experiment paths, **with no owned files**" | "under ignored experiment paths; their **scopes contain no review inputs**" |
 
-All but the first are source-text pins, the device `abi.rs` already uses for the
-interposer's descriptor test, and each carries its own honest statement of what
-it is worth: it pins a *decision*, not the wiring, and a reader who satisfies it
-by renaming a variable has defeated it.
-
-**The absorb pin gained its first half in round 1, and the reason is worth
-recording.** As shipped in round 0 it asserted only that `stop()`'s two call sites
-route through `continue_absorbed` — nothing asserted that `continue_absorbed` does
-anything at all. The correctness reviewer gutted the helper to an unconditional
-bare `c`, reintroducing the exact escape it exists to prevent, and **all thirteen
-fixtures captured across five runs and all unit tests passed, including this pin
-under its own name**. The most subtle decision in the change was the one nothing
-defended, behind a test whose name claimed otherwise. Both halves are now asserted
-and both mutations were re-run against them (§4.3).
-
-> **A correction inside a correction, caught here rather than by a reviewer.**
-> The first revision of the `single_thread` pin counted three call sites and
-> failed. The third was the assertion message complaining about the count — the
-> test quoted the code it counted, and `include_str!` found its own quote. That is
-> lesson 28's generator exactly: the fixed point one level out from where it was
-> looked for. The fix is `production()`, which searches only the text above
-> `#[cfg(test)]`, and it is documented in the source at the point it bit.
+That first pass was verified with a grep whose alternation was narrower than the thing being swept for: `'ownership\|owns it\|owned files\|JSON v2\|release tag\|remain compatible'` cannot match `owned source` or `owned inputs`, and both survived at `:25` and `:101`. Round r1 widened the pattern to `-iE 'own(s|ed|ership)'`, which surfaces them immediately, and corrected both — `:25` to "the source in its scope", `:101` to "review inputs". The counts for the two sweeps are re-measured in `fix-r1.md`, not restated here.
 
 ---
 
-## 4. Measurements
+## 7. One review, one ack
 
-Fixture recipe per CI (`.github/workflows/ci.yml:264-268`): `clang -arch arm64`
-of `experiments/fixtures/umbra-test-child.c`, `UMBRA_TEST_FIXTURE_PATH` and
-`UMBRA_TEST_REDIRECT_ROOT` set, `--test-threads=1`.
-
-### 4.1 Baseline reproduced on this exact parent, before any edit
+The audit's central correction held exactly. `memoria status`, taken once every edit was in place and before the first ack:
 
 ```
-mt_write  fixtures.rs:680  MISSED mt-write: the second thread's output reached the
-                           host at …/umbra-rust-fixture-<pid>-mt-write-b/output,
-                           holding Some("two\n")
-mt_spawn  native.rs:571    a second intercepted syscall entered while one was
-                           still in flight
+Reviews         22 current, 1 pending, 0 never reviewed, 0 waiting
+Documents:
+  pending          README.md  [input_changed, document_changed]
+  current          crates/umbra-agent-claude/README.md
+  … 21 more, all current …
 ```
 
-Both exactly as #134 and the audit recorded.
-
-### 4.2 After
-
-Both `CAPTURED`, 3 runs of 3. The full direct-tracer suite is **13 `CAPTURED`,
-0 `SKIP`, 0 ignored** — the verdict is the `CAPTURED` line, not the exit status
-(lesson 23).
-
-### 4.3 Mutation probes
-
-Each mutation was applied to the shipped tree, **rebuilt** (lesson 24), run, and
-reverted.
-
-| # | Mutation | Predicted | **Measured** |
-|---|---|---|---|
-| M1 | `return_stop` resumes with a bare `c`, per-thread slots kept | `mt_write` fails | ✅ `mt_write` MISSED with the same `two\n` on the host; `mt_spawn` CAPTURED |
-| M2 | every window keyed onto one shared slot, per-thread resume kept | `mt_spawn` fails | ❌ **both pass, 3/3** — see below |
-| M3 | `finish_return` reads `s.thread` | a new test fails | ⚠️ no *runtime* test fails; the new source pin does — see below |
-| M4 | drop the re-arm in `finish_return` | `mt_write` fails | ✅ both fail |
-| M5 | `return_stop` resumes a thread that is not the trapping one | `mt_write`, or a watchdog hang | ✅ both fail through the watchdog, ≈25 s each |
-| M6 | double-`Z0` every entry address | an existing fixture fails | ✅ `mt_write`, `mt_spawn` **and** `open_libc` all fail through the watchdog |
-| M7 | gut `continue_absorbed` to an unconditional bare `c` | — (round 1; the reviewer's probe) | ⚠️ **nothing failed** as shipped in round 0 — 13/13 fixtures × 5 runs and every unit test, including the pin named after it. Fails the strengthened pin in round 1. |
-| M8 | key the exec candidate lookup on the stopping thread | — (round 1; the reviewer's probe) | ⚠️ **13/13 fixtures pass** — no fixture discriminates twin adoption at all. Fails the new drain pin in round 1. |
-
-M7 and M8 were re-run against the round-1 pins, rebuilt between each. Each fails
-**only** its own pin and leaves the other green, so neither new pin is a tautology:
+`document_changed` is the index; `input_changed` is the six files that moved inside root's scope. The other 22 documents kept their 0.6 records untouched. No batch script, no ordering.
 
 ```
-M7 → a_stop_absorbed_inside_a_return_window_does_not_release_the_siblings  FAILED
-     the_exec_stop_adopts_its_candidate_without_keying_on_the_stopping_thread  ok
-M8 → the_exec_stop_adopts_its_candidate_without_keying_on_the_stopping_thread  FAILED
-     a_stop_absorbed_inside_a_return_window_does_not_release_the_siblings  ok
+$ memoria --root . review README.md --format json > packet-root.json
+exit=0
+  schema_version: 3
+  data.kind: review_manifest      manifest_version: 2    review_revision: 49
+  data.token: mrv3.d7ef4246ab3d14a7
+  counts: {"handoffs": 22, "imports": 0, "raw_input_bytes": 498807, "scope_files": 46, "suggested_sources": 0}
+  review.mode: full_baseline      review.whole_document_pass: true
 ```
 
-**M2 falsifies the audit's own prediction, and the correction matters.** With the
-per-thread resume in place, a thread inside a window is the only thread running,
-so no sibling is left to open a second transaction — the interleaving the slot
-collision needed is gone. The per-thread `pending` is therefore **not** what keeps
-`mt_spawn` green today; the resume closes both cases. The slots remain what makes
-the invariant expressible, what `thread_index` resolves from, and what carries
-D2's TID — but a reader looking for the guard that keeps `mt_spawn` green should
-look at `return_stop`. Only the `pending` half was reverted in this probe;
-`entry` stayed per-thread, so nothing is claimed about it either way. This is
-recorded in `README.md` and in `mt_spawn`'s own doc comment, both of which
-previously carried the prediction.
+The artifact demanded a whole-document read (`unmapped_change` for `ci.yml`, `memoria-auto-ack.yml` and `docs/memoria.md`; `coverage_unrecorded/revision_not_first` for the two new `.github` files, because the last review predates handed-off-folder recording). The document was read end to end and cross-checked: the CI paragraph at 52-57 lists fmt, clippy, workspace checks, tests and doctests on macOS and Linux, all of which still run on both matrix legs; the Memoria-guide sentence at 101-103 still describes a review flow and a documentation check that runs in CI, both still true with the gate in its own workflow; all 22 index links resolve.
 
-**M3 could not be a live test, and the reason is the fix.** The mutation was run:
-`finish_return` was edited to read `s.thread`, the crate rebuilt, and both
-fixtures still passed. They cannot catch it, and no runtime test on this backend
-can, because the per-thread resume freezes every sibling for the whole of the
-window — so nothing is running that could make the two values differ. The
-equality is a *consequence of the freeze*, not a property of `finish_return`, and
-it stops holding the moment anything resumes a sibling inside a window: the
-deferred `single_thread()` removal, a `vCont` naming more than one thread, or a
-future sibling-hold. M3 therefore ships as the source pin in §3, which **does**
-fail under the mutation, and which says in its own doc comment that it makes the
-swap impossible to make silently and proves nothing else. Ratifying D2 was still
-right: it is the difference between a loud escape and a silent one the moment the
-freeze is relaxed.
+```
+$ memoria --root . ack README.md --packet packet-root.json \
+    --token mrv3.d7ef4246ab3d14a7 --result updated --reviewer claude-opus-4.7 --note "…"
+memoria: ack: README.md revision 49 -> 50 (updated)
+hint [historical_coverage]
+  Historical coverage partial: 45/47 content inputs match one inspected commit.
+  Review validity is independent of Git history.
+Recorded README.md revision 50 (updated) by claude-opus-4.7
+exit=0
+```
 
-**M8 records a gap this arc did not create and does not close.** The exec drain is
-measured *necessary* — at the exec stop the stopping thread is not the window
-owner, because an `execve` replaces the address space and its threads. But keying
-the lookup back on the stopping thread passes 13/13, because the only fixture that
-reaches an exec stop re-execs the **same** twin: the candidate it drops equals the
-value already there, so dropping it is a no-op. **No fixture in this crate
-discriminates twin adoption at all.** That is a pre-existing #117/#134 gap, not one
-this change introduced — but the per-thread rekeying created a natural-looking
-wrong edit the suite would wave through, which is why the drain now carries a
-source pin. A fixture that execs a *different* image would close it properly;
-**that is deliberately not done here** — it closes a pre-existing gap and belongs
-to its own arc, outside this ratification. Recorded as a follow-up candidate for
-`merge_gate`.
-
-Every source pin was verified to fail under its own mutation and to pass under the
-others', so none is a tautology.
+`--result updated` rather than `no-update`, because this change does edit the document. The `historical_coverage` hint is expected: the two new `.github` files have no commit history yet.
 
 ---
 
-## 5. Guardrails
+## 8. Verification, at the pre-closing-ack commit `3e41104c`
 
-Every pin in audit §L was read back against the parent mechanically.
+The worktree was re-pointed at the amended commit (`git checkout --detach --force`, then `git clean -fd`, leaving `git status --short` empty), so what follows was measured against committed bytes rather than a working state.
 
-**The `z0`/`Z0` dance is untouched.** `jj diff --git` filtered for the release,
-the gate plant, the hardware gate, the re-arm and both registry primitives
-returns **nothing** — not one added or removed line. That is the ruling's safety
-basis and it is intact by construction, not by review.
+**Read the `state inspect` figures below as commit `3e41104c` only.** They predate the closing ack that Deviation 1 describes, which rewrites `memoria.lock` — so at the published commit `File bytes`, `Revision`, and README's revision and result all move on by one cycle. What does hold at every commit from here on, including the published one, is the part that matters: `check` exit 0, `OK: 23 document(s) current`, and lock format 3. The published figures are measured and reported in `fix-r1.md`.
 
-| Mechanism | Verdict |
-|---|---|
-| `install()`'s `self.parent.is_some()` inherited test | unchanged |
-| `single_thread()` itself, and both call sites (`Delivery::Fork`, `WaitPlan::Park`) | unchanged; its line moved because code was added above it, which is why the pin matches on text and not on a line | 
-| `TRANSIENT_SIGNALS` and its SIGCHLD-in / SIGSYS-out tests | unchanged |
-| one table, two gates over `abi::TRACED_STUBS` | unchanged |
-| `ReturnKind::Exec { twin }` candidate: raised at entry, adopted at the exec stop, discarded on a failed exec | unchanged in mechanism; the raise carries the TID, which is waiver (a) |
-| `Session::allocate`'s `_M…,rw` scratch | unchanged |
-| `task_for_pid` in `Task::acquire` | unchanged |
-| exec-stop release loop before `breaks.clear()` (the closed M2 gap) | unchanged |
-| `attach_child`'s `debug_assert!(child.breaks.is_empty())` | unchanged |
-| descriptor fence (C half and Rust twin), interposer constructor prohibition | files not touched |
+```
+$ memoria --root . check
+OK: 23 document(s) current, imports rendered, no coverage or structure errors.
+$ echo $?
+0
+```
 
-**Deferred and not touched:** #135 items 3 (`single_thread()` removal), 4b
-(2-thread parent forking — explicit non-goal), 5 (suspended orphan leak — a
-property of the error window, survives this fix), 6 (lost writer lease — debug
-only, different trigger), 7 (lesson 28, process only). No new user setup, mounts,
-drivers or privileged steps. Tests stay toy C plus standard utilities.
+```
+$ memoria --root . state inspect
+State file      memoria.lock
+Format          version 3          ← was 2
+Codec           zstd-v1
+File bytes      7651
+Revision        316
+Reviews (23):
+  README.md
+    revision 50 by claude-opus-4.7 at 2026-09-29T14:51:53Z (updated)
+    files 46, imports 0, guidance c3b666d76496f9fd
+    coverage evidence: crates/umbra-agent/, … , experiments/tracer/   (22 subtrees)
+```
 
-**Verification technique, as the audit required:** armed-ness is never asserted
-with the `m` packet, which debugserver masks its own breakpoints in. No new
-breakpoint-state assertion was added; M4 and M6 exercise arming through tracee
-behaviour instead, which is stronger and needs no packet at all.
+Integrations, same tree:
+
+```
+no change: integrations github status .github/workflows/memoria.yml
+  state      current
+  memoria    installed 0.7.0 / desired 0.7.0
+  action ref installed 1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c / desired 1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c
+  runner     installed ubuntu-latest / desired ubuntu-latest
+skill claude: state current, installed 0.7.0 / embedded 0.7.0
+skill codex:  state current, installed 0.7.0 / embedded 0.7.0
+```
+
+Still open and all severity `hint`, none failing: `missing_import_hint` ×26 and `handoff_not_applied` ×4. Both are explicitly out of scope.
+
+### Final diff
+
+```
+$ jj diff --stat
+.agents/skills/memoria/.memoria-install.json |  12 +-
+.agents/skills/memoria/SKILL.md              | 226 +++++++++--------------------
+.agents/skills/memoria/integrations.md       |  22 ++
+.agents/skills/memoria/review-details.md     |  69 ++++++++
+.agents/skills/memoria/saved-exports.md      |  38 ++++
+.claude/skills/memoria/.memoria-install.json |  12 +-
+.claude/skills/memoria/SKILL.md              | 226 +++++++++--------------------
+.claude/skills/memoria/integrations.md       |  22 ++
+.claude/skills/memoria/review-details.md     |  69 ++++++++
+.claude/skills/memoria/saved-exports.md      |  38 ++++
+.github/memoria-workflows/memoria.yml.json   |  10 +
+.github/workflows/ci.yml                     |   7 -
+.github/workflows/memoria-auto-ack.yml       |  34 ++--
+.github/workflows/memoria.yml                |  22 ++
+README.md                                    |  27 +++
+docs/memoria.md                              |  47 ++++--
+memoria.lock                                 | (binary) +76 bytes
+memoria.toml                                 |   2 +-
+18 files changed, 516 insertions(+), 367 deletions(-)
+```
+
+That stat was taken before this file was written, so it is 18 paths and its `memoria.lock` delta is the first ack's. Adding `impl.md` and the closing ack's lock write makes 19 paths, and the published lock delta is **+21 bytes** (7575 → 7596), not the +76 shown above. Round r1 changes both figures again; `fix-r1.md` carries the current ones.
+
+### Proof of zero Rust
+
+```
+$ jj diff --summary | grep -c '\.rs$'
+0
+$ jj diff --summary | grep -E 'crates/|src/|tests/'
+none
+```
+
+Zero `.rs` files, therefore zero new `#[test]` functions. No new user setup, mounts, drivers or privileged steps: the two Action steps replace two `cargo install` steps on runners that already existed, and the managed workflow's only permission is `contents: read`.
 
 ---
 
-## 6. Local gates
+## Deviations from the eight ratified steps
 
-| Gate | Verdict |
-|---|---|
-| `cargo fmt --check` | clean |
-| `cargo clippy --workspace --all-targets -- -D warnings` | no issues |
-| `cargo test --workspace --all-targets -- --test-threads=1` | **exit 0**, 52 suites ok, 0 failed, 3 ignored |
-| direct tracer suite | **13 `CAPTURED`, 0 `SKIP`** — qualified by the verdict line, not the exit status |
-| `provider_ipc`, `sandbox_launch` | `CAPTURED open-libc provider IPC`; 4 passed |
-| `umbra-platform-macos --lib` | 36 passed (round 0: 35; round 1 adds the exec-drain pin) |
+1. **A second ack cycle, forced by this file.** `impl.md` is a selected input of root `README.md` — measured, not assumed:
+   ```
+   $ printf '\nprobe\n' >> impl.md && memoria --root . status
+   Reviews         22 current, 1 pending, 0 never reviewed, 0 waiting
+     pending          README.md  [input_changed]
+   $ git checkout -- impl.md && memoria --root . status
+   Reviews         23 current, 0 pending, 0 never reviewed, 0 waiting
+   ```
+   Writing the node's own record therefore pends root `README.md` again, and the node cannot both write this file and leave the gate green without re-acking after it. The change consequently ends with a second `memoria review README.md` → `memoria ack --result no-update` run against the final bytes of this file. That ack is the last write to any tracked input, so the published tree is green. Its transcript is reported in the node response rather than here: pasting it into this file would change these bytes and reopen the cycle. Step 7's "one ack" correction still stands for the upgrade itself — the second ack is bookkeeping for the artifact, not upgrade work.
+2. **`ci.yml`: seven lines deleted, not six.** The ratified text says lines 71-76. Line 77 is the blank separating the deleted block from `raw-transport:`; deleting 71-76 alone would have left two consecutive blank lines. This matches the audit's own proven end-state worktree byte for byte (`+0 -7`).
+3. **One extra line in `docs/memoria.md`.** Line 19 read *"see ownership coverage and pending reviews"* — the same deleted vocabulary as line 13, one paragraph away, and not in the list of seven. Corrected to *"see scope coverage"* rather than leaving the guide self-contradictory.
+4. **One extra comment in `memoria-auto-ack.yml`.** Line 142's *"while the toolchain + memoria CLI installed"* described the toolchain step that step 4 deletes. Corrected inside the mechanism being edited.
+5. **The `README.md` index carries a one-line lead-in** before the 22 links, so the section is not a bare heading over a naked list. Handoff detection is link-based and unaffected; the measured counters are identical to the audit's.
+6. **Reviewer string.** No convention existed to copy (`scripts/memoria-auto-ack.sh:152` uses `github-actions`, which is the bot's identity). Used `claude-opus-4.7`, matching the commit trailer.
 
-**The `CAPTURED` verdicts come from the dedicated run, not from the workspace one.**
-`cargo test --workspace` captures stderr, so a passing fixture's verdict line is
-swallowed there; the qualification above is from
-`cargo test -p umbra-platform-macos --test fixtures -- --nocapture --test-threads=1`.
-That distinction is the whole of lesson 23 in one line: the workspace gate's `ok`
-is an exit status, and an exit status is exactly what these cases are able to
-produce without running (see the coverage note below).
+Nothing else departed from the eight steps. Not touched, as required: any Rust source, any test, `scripts/memoria-auto-ack.sh`, the `[documentation] guidance` block in `memoria.toml`, the generated workflow's bytes, the five existing prose links in `README.md`, the 4 `handoff_not_applied` hints, the 26 `missing_import_hint` findings, and the historical root artifacts (`publish.md`, `ci-fix-r*.md`, `fix-r*.md`, `review-*.md`).
 
-**The 3 ignored cases are pre-existing, and round 0 named the wrong gate for them.**
-They are the NFS **fault-injection** cases in `crates/umbra-storage-nfs/tests/mounted.rs`,
-whose `#[ignore]` reasons read *"requires `UMBRA_TEST_NFS_FAULTS=1` and an idle
-export"* — a different mechanism from `UMBRA_TEST_SKIP_NFS_MATRIX`, which produces a
-runtime `SKIP` rather than an `#[ignore]`. The material claim is unchanged: they are
-pre-existing, byte-identical at the parent, in a file not in this diff, and are not
-newly ignored work.
-
-**Real provider built and verified by symbols (lesson 27), not by exit status.**
-Round 0 reported "45 raw-RPC/NFSv4 symbols" from a command it did not record, and
-the reviewer could not reproduce that figure by any defensible pattern. **The count
-is withdrawn** — lesson 27 is satisfied by the *named symbols*, not by how many
-there are, and a count whose command is lost is not a measurement. One exact
-command, reproducible, with its real output:
-
-```
-$ cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
-  warning: umbra-storage-nfs-userspace@0.1.0: libnfs raw binding: 16 functions emitted
-
-$ nm target/debug/umbra-storage-nfs-userspace \
-    | grep -E " _rpc_(connect_async|service|nfs4_compound_task)$"
-00000001001244ec T _rpc_connect_async
-0000000100128518 T _rpc_nfs4_compound_task
-0000000100123464 T _rpc_service
-```
-
-Three named symbols from the linked C library, present as external text. **The
-symbol round 0 cited as `_nfs4_compound_task` does not exist**; the binary exports
-`_rpc_nfs4_compound_task` (and `_rpc_nfs4_compound_task2`), and round 0's grep
-passed only because the cited name matched as a substring of the real one. The
-substance — the real libnfs is linked, not a stub — was and remains confirmed.
-
-> **Re-measured in round 1, because the artifact had been replaced.** The
-> `--features transport-raw` binary is overwritten by any later default-feature
-> `cargo build --workspace --bins`, which round 0 ran afterwards. The symbols above
-> were re-measured after rebuilding with the feature, not copied forward.
-
-The tracer provider, same discipline — the binary under test is the code in this
-diff and not a stale build:
-
-```
-$ nm target/debug/umbra-platform-macos | grep -oE 'Session[0-9]+continue_(thread|absorbed)'
-Session15continue_thread
-Session17continue_absorbed
-$ strings -a target/debug/umbra-platform-macos | grep -c '^vCont;c:$'
-1
-```
-
-`third_party/libnfs` was absent from this worktree and was fetched at the pinned
-commit `18c5c73e` from `libnfs.pin`, as `build.rs` instructs. That directory is
-gitignored and is **not** in the diff.
-
-**Two coverage facts that belong in the record rather than in a verdict.**
-
-- **The two newly un-ignored fixtures report `ok` in CI's main `rust` job without
-  executing.** `fixture_argv_locked` returns early with `eprintln!("SKIP …")` and
-  the test still passes when `UMBRA_TEST_FIXTURE_PATH` / `UMBRA_TEST_REDIRECT_ROOT`
-  are unset, unless `UMBRA_INTEGRATION_REQUIRED` is set — and that job sets none of
-  them. Before this change they were `#[ignore]`d there and read as *ignored*,
-  visibly not run; they now read as *passed* while skipping. Coverage holds, because
-  the gate that actually qualifies them is `native-qualification`, which sets
-  `UMBRA_INTEGRATION_REQUIRED=1` and makes a skip fatal. **A green `rust` job is not
-  evidence that these two ran**, and that is the reason every figure in this
-  document is qualified by a `CAPTURED` verdict rather than by an exit status.
-- **Waiver (c)'s hazard is exercised nowhere in the suite.** The direct fixtures run
-  `interpose: false`, so nothing routes; the routed `umbra run` matrix has no
-  multithreaded case. The sibling freeze across a *blocking routed* syscall is
-  therefore documented and reasoned about, not measured. It is also what rules out a
-  waiver-(c) deadlock as the cause of the `101` below.
-
-**One honest anomaly, undiminished.** One `cargo test --workspace --all-targets` run
-exited `101` with its output suppressed, so there is no log of what failed. The
-round-1 synthesis recorded it at **7 clean full runs against that 1** — counting
-this round's own gates and both reviewers' independent runs — and every run since
-has been clean, so the ratio only moves one way. The running total is not restated
-here, because writing it down is what invalidates it; the synthesis's figure is the
-established one and `cargo test --workspace --all-targets` is the authority on any
-later count. Reproduction was attempted directly, including the identical
-`clippy && test` chain, and failed.
-
-A **waiver-(c) deadlock is ruled out** as its cause, on the coverage fact above: the
-freeze hazard is exercised nowhere in the suite that could have produced it.
-**Beyond that, no cause is asserted.** I could not reproduce it and will not invent
-one.
-
-**Not runnable here:** `memoria check` refuses this worktree — it requires a git
-worktree and this is jj-only (`error [git_unavailable]`). `crates/umbra-platform-macos/README.md`
-was updated in the same change as the code it documents, but the documentation
-gate's ack state is CI's to judge, and this document does not claim it passed.
-
----
-
-## 7. Lesson 28 — the self-sweep
-
-This arc's corrections were swept before being handed on. The sweep caught
-several things rather than zero — they are named rather than counted, because a
-count of this arc's own corrections is precisely what remedy 4 tells this arc not
-to state, and round 0 stated one here and got it wrong.
-
-**Round 0's sweep:**
-
-1. **The `single_thread` pin counted its own message.** §3. Caught by the test
-   failing, fixed in the source, and documented at the point it bit.
-2. **"the slots are not load-bearing for either fixture"** — written into both
-   `README.md` and `mt_spawn`'s doc comment on the strength of M2. M2 reverted
-   `pending` only; `entry` stayed per-thread. Both were tightened to name the
-   `pending` half and to say explicitly that nothing is claimed about `entry`.
-3. **"only the resume kept"** in `mt_spawn`'s comment read as though `entry` had
-   been reverted too. Rewritten to describe what the probe actually did.
-4. **This document cited `native.rs:498` for `single_thread()`** — the ratified
-   location, correct at `d8a42def` and wrong in this tree, because the change
-   itself moved the line. The added source and README text was swept for the same
-   defect and carries **no** line-number citation at all; every reference there
-   names a symbol. Remedy 3 again, and the one place it was needed was the
-   document describing the change rather than the change.
-
-**Round 1's sweep, over round 0's own corrections:**
-
-- **`SYN-1` — and round 0's sweep did not catch it.** The claim that the converted
-  per-thread tripwire pinned the process-wide one-window property was *introduced
-  in round 0's correction pass* and propagated to five places across three of that
-  round's deliverables. Both reviewers found it independently, by different
-  methods. This is §J's generator running exactly to type — the fixed point one
-  level out, the author not catching it, a reviewer catching it — and it is now
-  again. The remedy applied was not only to correct the five
-  sites but to make the property **asserted** (§2.4), so the next revision of the
-  prose cannot quietly drift from the code again.
-- **`SYN-8` — a count with no command behind it.** "45 raw-RPC/NFSv4 symbols" could
-  not be reproduced by any defensible pattern. Withdrawn, not re-derived: §6 now
-  records one exact command and its real output, and the claim rests on named
-  symbols. Remedy 3, applied to a figure that should never have been a figure.
-- **`SYN-9` — a symbol name that passed only as a substring.** `_nfs4_compound_task`
-  does not exist; `_rpc_nfs4_compound_task` does. The check passed because `grep`
-  found the cited name *inside* the real one — a verification that confirmed itself.
-- **`SYN-7`, `SYN-5`, `SYN-6`** — a gate named wrongly, a summary that read as
-  exhaustive, and a count that disagreed with its own list. All corrected in place.
-- **The `101`'s run count**, caught in this round's own writing: the synthesis's
-  figure is stated as the established one and the running total is not, because
-  every gate run this document describes invalidates it.
-
-Every one of these is the same shape, and it is the shape §J named: the correction
-pass is where the new false claim gets made, and each was a claim about *this arc's
-own other deliverable*. The remedies that worked are the recorded ones —
-substitute the established value; where stating a value invalidates it, name the
-stable part and point at the tool; and where prose claims a property, make the code
-assert it so the two cannot drift.
-
-The graph objective's "lesson 28 fired seven times" is not carried forward;
-**four** is the figure, per D5, substituted rather than re-derived — as the count of
-firings *before* this arc, which is the only reading that stays stable.
-
-**This arc's own additions to it are named above and in `fix-r1.md` / `fix-r2.md`,
-and are deliberately not totalled.** Every count of them this arc has attempted has
-been wrong, in every round, including the ones written inside the fix for the
-previous wrong count. That is remedy 4 arriving as a demonstration rather than as
-advice, and the response is to stop producing the number rather than to produce a
-better one.
+Not pushed, no PR opened — that is the publish node's work.
