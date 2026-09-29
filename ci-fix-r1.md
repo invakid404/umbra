@@ -1,266 +1,204 @@
-# CI + CR fix round 1 — Multithreaded tracee, slice 0 (graph `dg-nsw71bqq`)
+# ci-fix r1 — Memoria 0.4.0 → 0.7.0 upgrade
 
-Node `fix_from_ci_cr`, visit 1, continuing the `implement` session. Date 2026-09-28.
-Change: **`wppwptxswssr`**, bookmark `feat/mt-fork`, parent `master` `e44d0db8`.
-PR: https://github.com/invakid404/umbra/pull/134. Input:
-`/tmp/graph-dg-nsw71bqq/ci-round1.md`, anchored on head `75ba048c`.
+- **Graph:** `dg-t43fjdpv` · **Node:** `fix_from_ci_cr` (round 1) · **Date:** 2026-09-29
+- **Input:** `knowledge/umbra/graph-audits/dg-t43fjdpv-ci-round1.md`
+- **PR:** https://github.com/invakid404/umbra/pull/140 · **Reviewed head:** `4f02818f9f14ed18143d0b65f017efb68ed188f1`
+- **Binary:** `/tmp/graph-dg-t43fjdpv/m070/bin/memoria` → `memoria 0.7.0`, invoked by absolute path. The `PATH` binary is 0.6.0 and was never used.
 
-**CI was green and stays out of scope.** Verified by log-read, not badge: 11 distinct
-`CAPTURED` names over 12 occurrences, 0 `MISSED`, 20 `PASS`, only the two declared
-`nfs_*_matrix` skips, 6 `PASS userspace` on the live NFSv4 job, and every figure
-matching `fix-r4.md`. Both new tests appear correctly `#[ignore]`d **with their verdicts
-in the ignore reasons**, so the defects are legible from CI output. Nothing to fix there.
+## CI was green; the review was not
 
-**Three CodeRabbit findings, all valid, all fixed. None rebutted** — I looked at each on
-its own terms and agree with all three; CR-2 in particular is the kind of finding a
-measurement PR should be grateful for.
+Every check passed, and the logs confirm the upgrade did what it was supposed to: the Action resolved at the pinned SHA, installed the **prebuilt release archive** (`memoria: release asset …/memoria-0.7.0-x86_64-unknown-linux-gnu.tar.gz`), reported `memoria 0.7.0`, and the gate printed `OK: 23 document(s) current` in 6 seconds. Zero cargo builds of memoria anywhere in the run.
 
-**Constraints held:** no production source (both code fixes are test-harness and
-fixture files), guardrails byte-identical, `single_thread()` and the `debug_assert!`
-untouched, slice 1 not started, both waivers unconsumed.
+The `CodeRabbit: SUCCESS` check reported only that the bot **ran**. Its review *state* was `CHANGES_REQUESTED`, anchored to the exact head SHA, with two Major findings. **Both are valid and both are accepted** — no rebuttals this round. I re-verified each independently rather than taking the review text or the node brief on trust; the verification commands are quoted below.
 
 ---
 
-## CR-2 — `umbra-test-child.c`, the silent-failure path inside the instrument · **FIXED**
+## CR-2 — `ubuntu-latest` → `ubuntu-24.04` · accepted
 
-Taken first because it is the most important. `mt_rendezvous` returned `void`: on
-reaching its spin bound it fell through and the caller performed the measured operation
-anyway. A rendezvous timeout therefore produced a run in which both destinations were
-written **without the threads ever overlapping** — indistinguishable, from the outside,
-from a clean measurement. A silent-failure path in the instrument, in a PR whose entire
-subject is silent-failure paths.
+The more serious of the two, and it is a latent failure rather than a present one.
 
-`mt_rendezvous` now returns `int`, and the change is three parts rather than one:
+`setup-memoria` refuses every platform and release but Ubuntu 24.04. `ubuntu-latest` resolves to 24.04 **today**, which is exactly why CI is green — the run log shows `Image: ubuntu-24.04`. The day GitHub moves that alias, **both** memoria jobs fail at setup, before either check runs. CI being green is therefore not evidence against this finding; it is the thing that hides it.
 
-- **It reports.** `0` only when `MT_PARTICIPANTS` participants actually arrived;
-  otherwise it reports through `error_line` with `ETIMEDOUT`, so the timeout is loud on
-  stderr.
-- **The failure is sticky and shared** — a new `mt_rendezvous_failed` atomic. Without
-  it, one participant could give up while the other arrived late and proceeded alone,
-  which is the same defect one thread over. Whoever gives up first sets it; everyone
-  else sees it and gives up too.
-- **Every caller skips its measured call.** `mt_write_thread` returns before
-  `write_case`, leaving `mt_job::result` at its non-zero initial value; `mt_spawn` skips
-  the `posix_spawn` entirely and sets a non-zero result. A timed-out rendezvous now
-  exits non-zero, which `fixture_argv`'s `ExitStatus::Code(0)` assertion turns into a
-  test failure.
+Ownership note: the audit flagged this in section D-2 and the ratified command still carried `--runner ubuntu-latest`, taken from the audit's own probe and never re-examined at the design gate. `ubuntu-24.04` is also memoria's default. CodeRabbit is right.
 
-**No blocking wait was added to the tracee**, as CodeRabbit explicitly warned against —
-the dispatch path under measurement is untouched, and the rendezvous still issues no
-syscall of its own between the barrier and the measured call.
-
-**Verified by forcing the path** rather than by reading the code. A scratch copy with
-`MT_PARTICIPANTS 3` (unreachable) and a shortened bound:
+### The managed half — regenerated, not hand-edited
 
 ```
-umbra-test-child: rendezvous bound reached before both threads arrived: errno=60 (Operation timed out)
-umbra-test-child: rendezvous abandoned by another thread: errno=60 (Operation timed out)
-forced-timeout exit=1
+$ memoria --root . integrations github upgrade --version 0.7.0 \
+    --action-ref 1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c --runner ubuntu-24.04
+preview: integrations github upgrade .github/workflows/memoria.yml
+  state      outdated
+  runner     installed ubuntu-latest / desired ubuntu-24.04
+  write      .github/workflows/memoria.yml
+  write      .github/memoria-workflows/memoria.yml.json
 ```
 
-and the destination directory was **empty** — neither file written. So a skipped
-measurement now reads as a failure, which was the ask. The normal path is unaffected:
-`smoke.sh` 12 of 12 `PASS`, both `mt` arms included.
-
-## CR-1 — `fixtures.rs`, run-scoped child ownership with panic-safe teardown · **FIXED**
-
-`mt_spawn` leaked one suspended, unattached child on every run. Nothing in the backend
-owns it — the tripwire fires before `finish_return` attaches it, so there is no session,
-no watchdog entry, and the harness never receives its pid — and it survives the panic
-holding the inherited descriptors 0/1/2. The panic also unwound past `fixture_argv`'s
-own cleanup, so files were left behind too. Corroborated by this arc's own history:
-reviewers reaped such children by hand after every round.
-
-Two guards, both dropped on the unwinding path, which is the only path that matters
-here:
-
-- **`StrayFixtureChildren`** — run-scoped ownership by observation, since ownership by
-  handle is not available. `proc_listallpids` + `proc_pidpath` snapshots the processes
-  whose executable file name matches the fixture's *before* the traced run; its `Drop`
-  snapshots again and `SIGKILL`s the difference, printing a `REAPED` line naming the pid
-  and path.
-
-  **Correction, from CI round 2's CR2-1: the snapshot diff does not by itself make
-  the kill attributable, and this paragraph originally claimed it did.** The diff
-  excludes processes that existed at the before-snapshot; a matching child started
-  *afterwards* by a concurrent test appears only in the "after" set and is
-  indistinguishable from the stray. What supplies the attribution is the
-  `FIXTURE_LAUNCH` lock added in CI round 2 — see `ci-fix-r2.md`. `SIGKILL` rather
-  than `SIGTERM` because the child is suspended before its first instruction and will
-  never run a handler. Matching is on file name because the tracer launches a resigned
-  twin from a cache path the harness does not know.
-- **`Second::drop`** — the second destination's directory and shadow file, plus
-  `fixture_argv`'s own host directory **when it is empty**. `remove_dir` refuses a
-  non-empty directory, so the emptiness check *is* the call: pure residue goes, a
-  directory holding an escaped host file stays as evidence. The escaped file itself is
-  removed and its bytes now travel in the assertion message instead —
-  `holding Some("two\\n")` — because a leaked file in `TMPDIR` accumulates while the
-  failure output is what anybody actually reads.
-
-**Verified with no external `pkill` in the loop**, so the guard was the only reaper:
+Applied with `--apply`:
 
 ```
-thread 'mt_spawn' panicked at crates/umbra-platform-macos/src/native.rs:571:9:
-REAPED mt-spawn: stray fixture child pid 4534 (…/twins/a2c278ac…/umbra-test-child)
-strays remaining: 0        TMPDIR residue: 0        shadow residue: 0
+applied: integrations github upgrade .github/workflows/memoria.yml
+  state      current
+  memoria    installed 0.7.0 / desired 0.7.0
+  action ref installed 1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c / desired 1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c
+  runner     installed ubuntu-24.04 / desired ubuntu-24.04
+  write      .github/workflows/memoria.yml
+  write      .github/memoria-workflows/memoria.yml.json
 ```
 
-Both cases run clean now: zero stray processes, zero `TMPDIR` residue, zero shadow
-residue, and both verdicts unchanged.
+It rewrites the workflow **and** its ownership record together, which is the whole point — neither file was touched by hand, so management is intact:
 
-### The distinction the fix preserves, deliberately
+```
+$ python3 -c "import json; r=json.load(open('.github/memoria-workflows/memoria.yml.json')); \
+              print(r['expected_workflow'] == open('.github/workflows/memoria.yml').read())"
+True
+$ grep -n 'runs-on' .github/workflows/memoria.yml
+10:    runs-on: ubuntu-24.04
+```
 
-**The underlying leak is master's, and nothing here closes it.** It is a property of the
-error window — any error between the spawn's `svc` and `finish_return` reaches it,
-measured 10/10 under enforced `umbra run` **including the 5 release runs** where the
-assertion is compiled out and the run fails on an unrelated `Io during path` refusal —
-and it is filed on that basis. CR's ask is narrower and also right: the **test harness**
-should not leak regardless of the master defect.
+**This is the first time the managed upgrade path has been exercised, and it is incidental proof that ratified Decision 1 (Shape 1) bought something real.** `integrations github upgrade` is the command that refused with `error [github_not_installed]` at the start of this arc, because umbra's gate was hand-rolled and memoria never adopts a workflow it did not write. After the `install`, the same command now works, and a runner-label change that would otherwise have been a hand edit became a one-command regeneration with the ownership record kept in sync. Shape 3 (tag bump only) would have left this a manual edit; Shape 2 (Action inside `ci.yml`) would have too.
 
-So the fix is scoped to the harness, and both documents say so in as many words.
-`fixtures.rs`'s `mt_spawn` doc comment now reads *"That fixes the harness and not the
-defect… Reaping here does not close that, and a `REAPED` line is evidence of it rather
-than of its absence."* `impl.md` §2.4 keeps the 10/10 measurement verbatim and adds that
-the enforced runs do not go through this harness at all. **The issue's description is
-unweakened** and the harness fix must not be read as resolving it.
+### The hand-rolled half
 
-## CR-3 — `fix-r4.md:46`, broken table cell · **FIXED**
+`.github/workflows/memoria-auto-ack.yml` is umbra's own file, so it is edited directly:
 
-The cell contained a code span with a bare pipe, which GFM reads as a column break.
-Replaced with "three process-document rows without figures", as suggested.
+```diff
+ jobs:
+   auto-ack:
+-    runs-on: ubuntu-latest
++    # Exact label, not `ubuntu-latest`: the setup-memoria Action below supports
++    # Ubuntu 24.04 only and refuses any other release, so the alias moving to a
++    # newer image would fail this job at setup. Change it in step with the Action.
++    runs-on: ubuntu-24.04
+```
 
-Swept the other four round documents for the same defect while there: six further
-matches, all `` `^(warning\|error)` `` where the pipe is **backslash-escaped** and
-therefore renders correctly. Left alone; CR-3's was the only genuine break.
+The comment above the Action step, which previously justified the label by saying the Action "supports Linux runners only; this job is already `runs-on: ubuntu-latest`", now states the real constraint and points at the pin.
+
+### The documentation half
+
+CR-2 also asked for `docs/memoria.md` to stop describing the Action as merely Linux-only. Accepted:
+
+```diff
+-`memoria check` on `ubuntu-latest`. A non-zero exit fails the job. The gate does
+-not run on `macos-14`: that Action supports Linux runners only, and
++`memoria check` on `ubuntu-24.04`. A non-zero exit fails the job. The runner
++label is exact on purpose: the Action supports **Ubuntu 24.04 only** and refuses
++every other platform and release, so `ubuntu-latest` would break the job the day
++GitHub moves that alias to a newer image. Pin the label, and change it in step
++with the Action. The gate therefore does not run on `macos-14` — but
+ `memoria check` hashes tracked files and reads the lock, so its result does not
+ depend on the operating system.
+```
 
 ---
 
-## Suggested replies to the CR threads
+## CR-1 — pin the release archive digest · accepted, with an asymmetry
 
-Posted by the CI/CR node once the fixes are verified, so they describe what was done.
+The Action always fetches and compares the published checksum sidecar. CodeRabbit's argument is that an attacker able to replace the archive can replace the sidecar alongside it, so the sidecar alone proves only internal consistency. The Action's own `action.yml` says as much — I read it at the pinned SHA rather than relying on the review's paraphrase:
 
-**To CR-1 (`fixtures.rs`):**
+```yaml
+  sha256:
+    description: >-
+      Optional SHA-256 digest of the release archive for the runner's architecture.
+      The published checksum sidecar is always required and always compared; this
+      input adds an independent expected value. A matrix over architectures must
+      pin one digest for each architecture.
+```
 
-> Fixed, and scoped to the harness as you framed it. The test now runs under two
-> `Drop` guards so teardown survives the panic that bypassed it: `StrayFixtureChildren`
-> snapshots the fixture's processes via `proc_listallpids`/`proc_pidpath` before the
-> traced run and `SIGKILL`s whatever appeared once it unwinds, printing a `REAPED` line
-> with the pid; `Second::drop` clears the second destination, its shadow, and
-> `fixture_argv`'s host directory when empty, with the escaped file's bytes moved into
-> the assertion message. Verified with no external `pkill`: zero strays, zero `TMPDIR`
-> residue. No blocking wait was added — the dispatch path under measurement is
-> unchanged. One thing worth flagging: the leak itself is master's, a property of the
-> error window between the spawn's `svc` and `finish_return`, measured on 10 of 10
-> enforced runs including 5 release runs where the assertion is compiled out. That is
-> tracked separately; this change stops the *harness* accumulating processes and does
-> not close the defect, and the doc comment says so.
+The premise holds here specifically, because the release is mutable, and I computed the digest myself rather than copying the suggestion:
 
-**To CR-2 (`umbra-test-child.c`):**
+```
+$ gh api repos/viktordanov/rs-memoria/releases/tags/v0.7.0 --jq '.immutable'
+false
+$ curl -sL .../v0.7.0/memoria-0.7.0-x86_64-unknown-linux-gnu.tar.gz -o m070.tar.gz
+$ shasum -a 256 m070.tar.gz
+efdbf68399c8e40e4d4e6abcf2761f92c27cd461929d47520c6797b6d6916ae7
+```
 
-> Fixed, and thank you — this was the most valuable of the three. `mt_rendezvous` now
-> returns a result: `0` only when both participants arrived, otherwise it reports via
-> `error_line` with `ETIMEDOUT`. `mt_write_thread` returns before `write_case` and
-> `mt_spawn` skips the `posix_spawn` entirely, both leaving a non-zero result, so a
-> timed-out rendezvous fails the run instead of producing an unsynchronised one that
-> reads as clean. Added beyond the suggestion: the failure is sticky and shared via an
-> atomic flag, because otherwise one participant could give up while the other arrived
-> late and proceeded alone — the same defect one thread over. Verified by forcing the
-> path with an unreachable participant count: both threads report the timeout, neither
-> destination is written, exit status 1. No blocking wait was introduced, per your
-> warning; the measured dispatch path is untouched.
+Matches the release metadata and CR's value. Applied:
 
-**To CR-3 (`fix-r4.md`):**
+```diff
+       - name: Set up Memoria
+         uses: viktordanov/rs-memoria@1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c # v0.7.0
+         with:
+           version: '0.7.0'
++          sha256: 'efdbf68399c8e40e4d4e6abcf2761f92c27cd461929d47520c6797b6d6916ae7'
+```
 
-> Fixed — the cell now reads "three process-document rows without figures". I also swept
-> the other four round documents for the same defect; the six remaining matches are
-> `^(warning\|error)` where the pipe is backslash-escaped and renders correctly, so this
-> was the only genuine break.
+One digest suffices because this runner is x86_64 only; a matrix over architectures would need one per architecture, and the comment now records that. A stale digest fails the job closed, which is the safe direction, so the pin is paired with `version` and must move with it.
+
+### Why the digest is in only one of the two workflows
+
+This is deliberate and worth stating plainly, because it otherwise reads as an oversight.
+
+`.github/workflows/memoria.yml` is generated by `memoria integrations github`, and that command exposes no digest input. Verified directly rather than assumed:
+
+```
+$ memoria integrations github upgrade --help
+Options:
+      --path --root --format --version --action-ref --runner --apply --dry-run
+$ memoria integrations github install --help | grep -iE 'sha|digest|checksum'
+      --action-ref <REF>   Action code reference: a full 40-character commit SHA or an exact vX.Y.Z tag
+```
+
+No `--sha256` on either subcommand. Adding the line by hand would make the file *modified*, memoria would stop managing it, and ratified Decision 3 — plus the CR-2 fix immediately above, which depends on the managed path still working — would be forfeited for one line. CodeRabbit scoped its suggestion to the hand-rolled file, which is the correct call.
+
+The residual exposure is bounded and asymmetric in the right direction. `memoria.yml` is a `contents: read` job with no secrets that runs `memoria --version` and `memoria check`. `memoria-auto-ack.yml` is the repo's highest-privilege job — `pull_request_target` with a write-scoped PAT — and that is the one now carrying the independent pin. If a digest input is added upstream, `integrations github upgrade` is the mechanism to adopt it, and that path is now known to work.
 
 ---
 
-## The count check, run again for this round
+## Observed behaviour, recorded not fixed — the gate runs twice
 
-Writing this document takes over `ci-fix-r1.md`, which `master` carries from
-`dg-29vwer0f`. That is the trap four review rounds were spent on, so the check was run
-again: **would a hypothetical `ci-fix-r2.md` falsify anything in §0 or §8?**
+The memoria gate ran **twice** on this PR, from runs `36591088918` and `36591029561`. Cause: the managed workflow's `on: [push, pull_request]`, which fires on both events for a branch in this repo, where `ci.yml` limits push to `master`. Both runs passed; the cost is roughly 6 seconds of duplicate work per push.
 
-**It found one survivor, introduced by round 4's own reformulation.** §0's per-arc table
-was headed *"documents at root this arc never writes"* and listed `ci-fix-r1.md` among
-`dg-29vwer0f`'s — a claim this very document falsifies. The partition was right and the
-predicate was not: "never writes" is not size-independent, because each CI round takes
-over one more path just as each review round does. The rows are now headed *"document
-families it left at root"*, and the paragraph beneath says which of those paths this arc
-has taken over is answered by `jj diff --name-only` and by nothing here. That formulation
-survives `ci-fix-r2.md`, `fix-r5.md`, and `publish.md` when the publish node writes it.
-
-Everything else holds: "exactly four content files, named" and "zero production source"
-are unchanged in kind, and §8's four per-file figures were re-quoted from `jj diff` this
-round because two of the four grew — `fixtures.rs` +403 and `umbra-test-child.c` +183,
-subtotal **717**, `README.md` +90 −1 and `smoke.sh` +41 unchanged. Those are the only
-numbers either section states, and a further round document touches no content file.
+This is **ratified Decision 3 showing up in practice**, not a regression. The generated template's trigger, its missing `concurrency` group, and its `uses:` SHA without a `# vX.Y.Z` comment were all accepted as-is precisely because hand-editing any of them forfeits the management that CR-2 has now made load-bearing. Recorded here so `merge_gate` can weigh the real cost against the alternative, which is Shape 2 and no managed upgrade path.
 
 ---
 
-## One thing found in my own working copy, not in the review
+## Verification
 
-`jj diff --name-only` showed **`memoria.lock`** in the diff — a binary artifact I never
-edited. Cause: round 1's diagnostic `memoria --root . check`, which fails here with
-`error [git_unavailable]` (this workspace has `.jj` and no `.git`, issues #123/#131),
-evidently updates the lock before failing. It has been sitting in the change since then
-and would have gone to the PR.
-
-Restored to master's bytes with `jj restore --from @-`; both sides now hash
-`0896b522…`. It mattered for two reasons beyond tidiness: it is a **documentation-gate
-artifact whose correctness cannot be verified locally**, since `memoria` is exactly the
-tool that will not run in this workspace, so shipping a silent update to it would be
-shipping an unverifiable change to the gate that checks the documentation; and it is
-neither a content file nor a process document, so its presence falsified §0 and §8's
-partition — the one thing four review rounds were spent making true. Caught by the
-path-list check rather than by any review.
-
-## Gates, re-run against the final tree (lesson 24), verdicts read by name (lesson 23)
-
-The C fixture was recompiled from this tree and the crate's tests rebuilt after the last
-edit. Unlike the previous four rounds this one changed compiled files, so the rebuild is
-load-bearing rather than ceremonial.
-
-| Gate | Result |
-|---|---|
-| `cargo fmt --all -- --check` | exit 0 (one reflow applied first, from the new `unsafe` block) |
-| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, **0** lines matching `^(warning\|error)` |
-| `cargo test --workspace --all-targets` | exit 0; **52 suites, 832 passed, 0 failed, 5 ignored** |
-| `--test fixtures` (integration env) | **11 passed, 0 failed, 2 ignored**; **0** `SKIP`, **0** `MISSED`, **0** `REAPED` |
-| `--test provider_ipc` | 1 passed — `CAPTURED open-libc provider IPC` |
-| `--test sandbox_launch` | 4 passed |
-| `-p umbra-cli --test run_fixtures` | 10 passed, **20** distinct `PASS` verdicts, 2 declared `SKIP nfs_fixture_matrix` / `SKIP nfs_utility_matrix` |
-| `-p umbra-cli --test resume_cli` | 3 passed |
-| `-p umbra-supervisor --test reopen` | 7 passed |
-| `smoke.sh` untraced | **12 of 12 PASS**, both `mt` arms included |
-| forced rendezvous timeout | reports twice, writes nothing, exit 1 |
-
-**The 832 figure keeps its standing qualification**: no `--nocapture` and no fixture
-environment, so every integration case in it takes `fixture_argv`'s skip branch and
-reports `ok` with its `SKIP` invisible. The rows beneath it are the qualification.
-
-**The eleven `CAPTURED` verdicts, read by name from this round's own captured output:**
-`argv0-check`, `dirfd-rename`, `dup-inherit-write`, `exec-write`, `fork-write`,
-`grandchild-write`, `open-libc`, `open-svc`, `posix-spawn-write`, `symlink-cycle`,
-`wnohang-wait`. **`REAPED` is 0 in that run**, which is the expected result: the eleven
-passing cases leak nothing, and only the two `#[ignore]`d ones exercise the guard.
-
-**Both `#[ignore]`d cases re-measured with `--ignored`** against this build, same two
-verdicts as every previous round — the harness changes did not move the defects:
+`memoria` still cannot run in the jj workspace — unchanged, re-confirmed:
 
 ```
-thread 'mt_write' panicked at crates/umbra-platform-macos/tests/fixtures.rs:547:5:
-MISSED mt-write: the second thread's output reached the host at …, holding Some("two\\n")
-
-thread 'mt_spawn' panicked at crates/umbra-platform-macos/src/native.rs:571:9:
-a second intercepted syscall entered while one was still in flight: …
+error [git_unavailable]
+  git failed for .: not inside a Git worktree          exit status 4
 ```
 
-The `mt_write` assertion moved to `fixtures.rs:547` as the guards were added, and now
-carries the escaped bytes. **No new measurement was taken**; every enforced-run figure
-in `impl.md` is rounds 0–2's, restated.
+Same throwaway-git-worktree pattern: edits in the jj workspace, `jj describe`/amend, `git worktree add --detach` at the amended commit, memoria run there by absolute path, regenerated files copied back, worktree re-pointed after each amend.
 
-Change **`wppwptxswssr`** on `feat/mt-fork`, parent `master` `e44d0db8`.
+All three workflows parse, and the new input parses as an input rather than as text:
+
+```
+ok .github/workflows/memoria-auto-ack.yml
+ok .github/workflows/ci.yml
+ok .github/workflows/memoria.yml
+auto-ack runs-on: ubuntu-24.04
+step with: {'version': '0.7.0', 'sha256': 'efdbf68399c8e40e4d4e6abcf2761f92c27cd461929d47520c6797b6d6916ae7'}
+```
+
+No `ubuntu-latest` remains in either memoria workflow; the only occurrences of that string are inside the two comments that explain why it is not used. `ci.yml`'s own `rust` and `raw-transport` jobs still use `ubuntu-latest` and are untouched — they build umbra with the pinned toolchain and have nothing to do with the Action.
+
+### Guardrails, re-checked
+
+- `.github/workflows/memoria.yml` and its ownership record — **regenerated by memoria, never hand-edited**; byte-identity against `expected_workflow` verified above and again at the sealed commit.
+- `memoria.toml` — unchanged, guidance block included.
+- `scripts/memoria-auto-ack.sh` — unchanged.
+- Zero Rust, zero new `#[test]`, nothing outside the already-ratified file set.
+
+### A note on the closing figures
+
+`ci-fix-r1.md` is a new root-level scope source, like `impl.md` and `fix-r1.md` before it, so writing it pends root `README.md` and the node closes with one `memoria review README.md` → `memoria ack`. That ack rewrites `memoria.lock` after these bytes are fixed.
+
+So, as in `fix-r1.md`: **this file quotes no lock byte count and no `state inspect` block**, because any such figure would be one cycle stale by the time the tree is sealed. What is asserted, and verifiable at the published commit, is the durable part — `memoria --root . check` exits 0 with `OK: 23 document(s) current, imports rendered, no coverage or structure errors`, and the lock stays format 3. That closing check runs from the git worktree against the final amended commit; its output and the pushed head SHA are reported in the node response.
+
+---
+
+## Deviations
+
+1. **One supersession note added to `impl.md`.** Its round-0 transcripts legitimately show `--runner ubuntu-latest` and `runner installed ubuntu-latest`, because that is what round 0 ran. Per the M2 lesson from review round r1, measured output is not rewritten after the fact — so the transcripts are left exactly as taken and a single note near the top flags that the shipped configuration is now `ubuntu-24.04` and points here. The alternative, editing the quoted output to match today's tree, is the precise defect r1 corrected.
+2. **Comments added beyond the one-line changes CR suggested.** The runner pin and the digest are each a line, but a bare `sha256:` hash and a bare exact runner label both look like arbitrary constants to the next maintainer, and both must be updated in step with `version`. The reasons are recorded at the point of use.
+
+Nothing else changed. Not touched: `memoria.toml`, `scripts/memoria-auto-ack.sh`, any Rust source, any test, `README.md`, `ci.yml`, and the skill packages.
+
+## Still out of scope
+
+The two follow-ups from `fix-r1.md` stand, unactioned, for `merge_gate`: `memoria.toml`'s two remaining `ownership boundary` phrases (cost measured at 0 acks), and the `knowledge/` archive gap for `dg-0ved1w0e-impl.md` and `fix-r1.md`…`fix-r5.md`. The duplicate gate run recorded above is new material for the same conversation.

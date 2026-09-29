@@ -1,4 +1,4 @@
-version = 2
+version = 3
 
 # Not documentation inputs.
 # - experiments/**: scratch playground; docs there are self-owned scratch notes.

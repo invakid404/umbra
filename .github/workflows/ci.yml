@@ -68,13 +68,6 @@ jobs:
       - name: Test contract documentation
         run: cargo test --workspace --doc
 
-      - name: Install memoria CLI
-        run: cargo install --locked --git https://github.com/viktordanov/rs-memoria --tag v0.4.0 rs-memoria
-        # Pinned to rs-memoria's v0.4.0 tag; bump on new releases.
-
-      - name: Memoria documentation gate
-        run: memoria --root . check
-
   raw-transport:
     name: Raw NFS transport (ubuntu-latest)
     # The transport-raw suite links libnfs and drives NFSv4.0 straight over TCP

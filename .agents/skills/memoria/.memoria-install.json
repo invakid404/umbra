@@ -1,12 +1,18 @@
 {
   "backup": null,
   "hashes": {
-    "SKILL.md": "8f75ba29c45161fb"
+    "SKILL.md": "6a8f283ae030a64a",
+    "integrations.md": "6537aab6fd330a70",
+    "review-details.md": "496e82358268e67c",
+    "saved-exports.md": "46b61cddc5a05f48"
   },
   "managed_paths": [
-    "SKILL.md"
+    "SKILL.md",
+    "integrations.md",
+    "review-details.md",
+    "saved-exports.md"
   ],
-  "package_version": "0.4.0",
+  "package_version": "0.7.0",
   "schema_version": 2,
   "scope": "local",
   "target": "codex"

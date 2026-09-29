@@ -103,3 +103,30 @@ READMEs connected to the code they describe. It covers the review flow and the
 documentation check that runs in CI.
 
 Provider executables can be checked through the [runtime registry](docs/providers.md).
+
+## Crate and experiment index
+
+Every crate and experiment keeps its own README; this index links all of them.
+
+- [crates/umbra-agent](crates/umbra-agent/README.md)
+- [crates/umbra-agent-claude](crates/umbra-agent-claude/README.md)
+- [crates/umbra-agent-codex](crates/umbra-agent-codex/README.md)
+- [crates/umbra-cli](crates/umbra-cli/README.md)
+- [crates/umbra-core](crates/umbra-core/README.md)
+- [crates/umbra-journal](crates/umbra-journal/README.md)
+- [crates/umbra-journal-file](crates/umbra-journal-file/README.md)
+- [crates/umbra-overlay](crates/umbra-overlay/README.md)
+- [crates/umbra-platform](crates/umbra-platform/README.md)
+- [crates/umbra-platform-linux](crates/umbra-platform-linux/README.md)
+- [crates/umbra-platform-macos](crates/umbra-platform-macos/README.md)
+- [crates/umbra-storage](crates/umbra-storage/README.md)
+- [crates/umbra-storage-local](crates/umbra-storage-local/README.md)
+- [crates/umbra-storage-nfs](crates/umbra-storage-nfs/README.md)
+- [crates/umbra-storage-nfs-userspace](crates/umbra-storage-nfs-userspace/README.md)
+- [crates/umbra-storage-tar](crates/umbra-storage-tar/README.md)
+- [crates/umbra-supervisor](crates/umbra-supervisor/README.md)
+- [experiments/fixtures](experiments/fixtures/README.md)
+- [experiments/nfs](experiments/nfs/README.md)
+- [experiments/nfs-raw](experiments/nfs-raw/README.md)
+- [experiments/seatbelt](experiments/seatbelt/README.md)
+- [experiments/tracer](experiments/tracer/README.md)
