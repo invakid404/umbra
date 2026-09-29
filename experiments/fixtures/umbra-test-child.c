@@ -728,8 +728,11 @@ static atomic_int mt_rendezvous_failed;
 
 /* Hold both threads until both are here, then release them together, so the two
  * traced calls under measurement enter within a few instructions of each other
- * and the window the single-slot model has to survive is as narrow as this
- * fixture can make it.
+ * and the window under measurement is as narrow as this fixture can make it.
+ * This originally read "the window the single-slot model has to survive"; the
+ * tracer's slots are per thread now, and the window is held shut by resuming
+ * only the trapping thread. What this barrier narrows is the overlap itself,
+ * which is what keeps the case adversarial either way.
  *
  * An atomic spin rather than a mutex, a condition variable or a pipe: those all
  * issue syscalls of their own, and one of them landing between the barrier and
@@ -782,8 +785,11 @@ static void *mt_write_thread(void *raw)
 }
 
 /* Two threads, two destinations, one traced stub: both threads enter `open`
- * inside the same window, so the tracer has two in-flight namespace
- * transactions to keep apart on one `pending` slot and one `entry` slot. */
+ * inside the same window, so the tracer has two in-flight namespace transactions
+ * to keep apart. When this case was written those were kept on one `pending`
+ * slot and one `entry` slot, which is what it was built to break; they are per
+ * thread now, and the window they race for is held shut by resuming only the
+ * trapping thread. The case is unchanged and still enters the same way. */
 static int mt_write(const char *first, const char *second)
 {
     struct mt_job jobs[2] = {

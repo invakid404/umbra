@@ -1,185 +1,226 @@
-# Fix round 4 — Multithreaded tracee, slice 0 (graph `dg-nsw71bqq`)
+# Fix — round 4 (graph `dg-0ved1w0e`, #135 multithreaded closure, slice 1)
 
-Node `fix`, visit 4, continuing the `implement` session. Date 2026-09-28.
-Change: **`wppwptxswssr`**, bookmark `feat/mt-fork`, parent `master` `e44d0db8`.
-Input: `/tmp/graph-dg-nsw71bqq/review-synthesis-r4.md`. Pin at round start: commit
-**`64e54782`** — the pin held a fourth consecutive round.
+Node `fix`, round 4. Date 2026-09-29.
+Change **`qqxtnynk`**, bookmark `feat/mt-closure`, parent `d8a42def`.
+Input: `/tmp/graph-dg-0ved1w0e/review-synthesis-r4.md`, with the current
+`review-correctness.md` and `review-scope.md` in the tree as its evidence.
 
-Two findings. No production source, guardrails byte-identical, `single_thread()` and
-the `debug_assert!` untouched, slice 1 not started, nothing added beyond this document.
+> The commit id is not stated; writing this file moves it. `jj log -r qqxtnynk` is
+> the authority. The worktree-root `review-synthesis-r*.md` files belong to other
+> arcs.
+
+**Both reviews pass. No correctness defect, no scope breach, no code problem.**
+`native.rs` is unchanged since visit 2 by blob identity and is **untouched again this
+round** — verified byte-identical to the round-3 tree. This round is one exhaustive
+documentation pass over three files, and nothing else.
 
 ---
 
-## R4-1 — P0. The counts are removed, not substituted · **FIXED**
+## 0. What the pass covered, and why it was a pass rather than a list
 
-**The severity call is right and my round-3 disclosure does not answer it.** I
-disclosed the condition in `fix-r3.md` §1 with a remedy table and left it unfixed. The
-deciding fact is that a reader of `impl.md` §8 never reaches `fix-r3.md` §1: §8 handed
-them `jj diff -r wppwptxswssr --stat` and the command contradicted the sentence three
-lines above it. A disclosure in another document does not repair a self-contradicting
-section. Ship-blocking, as filed.
+The synthesis's table was explicitly a **floor**: two independent sweeps found
+non-overlapping sets, and scope had certified the README clean on the sentences it
+checked while correctness quoted two false ones from that same README. Working the
+table item by item would have sampled the class a third time.
 
-**Both reviewers converged on the remedy and it is the one applied: remove the
-literals, keep what is stable, point at the tool.** Substituting seven → eight would
-have been the fifth round of an operation that regenerates the defect — writing this
-document would have made it nine before the round ended.
+So this was an exhaustive pass over **all of**:
 
-Kept, because neither changes when another `fix-rN.md` joins the diff:
+- `crates/umbra-platform-macos/tests/fixtures.rs`
+- `crates/umbra-platform-macos/README.md`
+- `experiments/fixtures/umbra-test-child.c`
 
-- **four content files, named** — `README.md`, `tests/fixtures.rs`, `smoke.sh`,
-  `umbra-test-child.c`, with their exact per-file line counts and the `527 / 1`
-  subtotal, all re-quoted from `jj diff` this round;
-- **zero production source in the diff.**
+for: present-tense claims about tracer behaviour; claims about what `mt_write` /
+`mt_spawn` do (fail, are ignored, panic, leave strays, poison a mutex, produce
+orphans); claims about `continue_run` resuming every thread or siblings walking
+through the window; predictions phrased as current expectations; and citations into
+`native.rs`.
 
-Removed as literals, everywhere they appeared:
+**Method**: every `native.rs` citation enumerated by grep; a trigger-phrase scan; then
+a re-sweep by regex against the repaired files to confirm the class terminated; then a
+third pass reading every remaining mention of the two cases in prose. The third pass
+is what found the largest site. Residual matches after repair are listed in §4 with
+the reason each is correct as written.
 
-| location | was | now |
+**Repair style, per the synthesis:** past tense and named symbols, not deletion. These
+comments carry the arc's reasoning and are worth keeping as history — they were wrong
+only where they read as present tense about the shipped tree. Where a sentence was
+*replaced*, the superseded wording is quoted inside the replacement so the record of
+what was believed survives beside the correction.
+
+---
+
+## 1. The one thing that must not be touched — and was not
+
+**`native.rs:571` inside the fenced `text` block headed "Measured against master
+(`e44d0db8`), three runs out of three" is a verbatim transcript of a master panic.**
+Renumbering it would falsify the evidence. Reproducing the number master printed is
+the correct behaviour.
+
+It is intact. The repair script that touched `mt_spawn`'s doc asserted the
+transcript's occurrence count before and after its edits and refused to write
+otherwise; the final tree carries the string exactly once, and both *"Measured against
+master"* blocks are present and unmodified. **The framing around them was moved to
+unmistakable past tense; the transcripts themselves were not edited at all.**
+
+The same rule was applied to `mt_write`'s `MISSED …` transcript, to the *"5 of 5
+enforced release runs"* and *"10 enforced `umbra run` executions"* figures, and to the
+*"0 of 10 runs"* supervisor-race figure — all master measurements, all left as
+measured, with only the sentences introducing them made past-tense.
+
+---
+
+## 2. Every site repaired
+
+### Named by the reviewers
+
+| site | what it claimed | repair |
 |---|---|---|
-| §0 path list | "returns **seven** paths — four content files and three process documents", seven-line block | four content files named in a block; everything else the tool lists identified as this arc's root `.md`, each a modification; no total |
-| §0 (`:47`) | "**All three** process documents are modifications… `impl.md`, `fix-r1.md`, `fix-r2.md`" | folded into the sentence above, with no enumeration and no count |
-| §0 | "The count is stated separately from the guarantee because round 1 caught…" | replaced by the reason the count is *absent*, naming the generator |
-| §0 inventory | "This arc, **3**"; "Not this arc, **12** … **two** prior arcs" | "this arc's documents are the ones in the diff"; the two prior arcs kept, which is the stable part |
-| §0 per-arc table | each row ended "— **6**" | row totals dropped; `fix-r3.md` removed from `dg-29vwer0f`'s row since this arc has taken it over |
-| §0 (`:77-78`) | "the stale `fix-*` range … is `fix-r3.md` alone now"; "the total moved **13 → 12**" | replaced with "which `fix-rN.md` paths this arc has taken over is not stable, because each round takes over one more — `jj diff --name-only` answers that and no integer here does" |
-| §0 (`:85`) | "deleting **twelve** unrelated documents belonging to two other arcs" | "deleting documents belonging to two other arcs" |
-| §8 heading claim | "**Seven paths.** Four content files, **three** process documents, zero production source." | "**Four content files, and zero production source.**" |
-| §8 table | three process-document rows without figures | dropped; the table is the four content files plus their subtotal, and the process documents are described in a following sentence |
-| §8 | "Why the **last three rows** carry no numbers" | "Why neither a path total nor a per-document line count appears above", with both explained as the same self-reference |
-| §8 | "a reader who counts **seven**" | "a reader who counts the paths and cannot tell which extras are not production code" — answered by naming the four |
-| §8 bullet | "**All three** process documents are modifications… `impl.md`, `fix-r1.md` and `fix-r2.md`" | "Every process document in the diff is a modification", with no enumeration |
-| §8 reproduce line | `--stat` only | `--stat` **and** `--name-only`, explicitly labelled the authority "not this section" |
+| `fixtures.rs` — `StrayFixtureChildren` doc | the unwinding path is *"the only path that matters: on `mt-spawn` the tracer's `debug_assert!` fires inside `next_event`"* | past tense; states the assertion **no longer fires** and that `Drop` is what keeps cleanup on the ordinary failure path |
+| `README.md` | *"Neither reaches it today."* — exactly backwards | **"Both reach it on every run"**, with the superseded claim named as the thing that changed |
+| `fixtures.rs` — `fixture_named_processes` | the orphan *"Measured on every `mt-spawn` run"* | scoped to *while that case still failed inside the spawn's error window*; says it is **not** measured on every run now, and why the reaper stays |
+| `fixtures.rs` — `mt_fixture` body | the unwinding panic *"is the case that actually happens here"* | past tense; now the ordinary failure path |
+| `fixtures.rs` — `Second` doc | *"both unwind past the end of this function… on the runs that matter"* | past tense, plus why panic-safe teardown still matters when the expected path is success |
+| `fixtures.rs` **and** `README.md` — `WaitPlan::Native` | *"expected to collide the way `mt-spawn` does"* | both repaired separately (near-duplicates, not one shared sentence): the prediction is **overtaken rather than confirmed**, and the reason it is overtaken is the reason `mt_spawn` passes |
+| `fixtures.rs` — `mt_write` doc | present-tense superseded mechanism (`continue_run` *"resumes every thread"*, a sibling *"walks straight through it"*) | explicit heading that the paragraphs describe the mechanism **as it stood at that measurement**; the mechanism kept verbatim as history; a **"What closed it"** paragraph added |
+| `fixtures.rs` — three citations | `native.rs:498` + its two call-site numbers, `:2387`, `:539` | **symbols named**: `Session::single_thread`, `Session::resume`, `Session::return_stop` |
+| `umbra-test-child.c` | *"the window **the single-slot model** has to survive"* | past framing, superseded wording quoted, rationale for the barrier restated in terms that do not depend on the slot model |
+| the harness note | *"the reaper takes its reap-nothing path"* | **mechanism corrected**: with the env unset, `mt_fixture` returns **before the guard is constructed**, so `Drop` never runs at all |
+| the harness note | *"CI is unaffected"* | **scoped to what was measured**: within one workflow run. Two workflow runs can coexist — the concurrency group is per ref — and that path is named as neither measured nor excluded |
+| `fix-r3.md` §6 | *"a section about wrong counts that contained four of them"* | count removed, no replacement; the imprecision (one of the items was a misattribution, not a count) fixed in the same sentence |
 
-That is the eleven R4-1 locations plus S4-1's three (`:47`, `:77-78`, `:85`), which my
-round-3 remedy table had missed — applied literally it would have closed seven and left
-three, and the synthesis is right that this would have been the sixth instance.
+### Found by this pass, named by neither reviewer
 
-### One location beyond the fourteen
+| site | what it claimed | why it matters |
+|---|---|---|
+| `README.md` | *"A multithreaded tracee doing ordinary file I/O or a `posix_spawn` is therefore **not refused; it is unmediated**."* | **Simply false now** — that is precisely what the change closed. The largest single site in the pass, in the README both sweeps had been over. Repaired to past tense with a sentence naming what closed it. |
+| `README.md` | *"`mt-write` is a second, distinct defect that per-thread slots do **not** close."* | present tense on a closed defect; the *slots-do-not-close-it* half is still true and measured, so it was kept and re-tensed rather than dropped |
+| `README.md` | *"The two cases **fail** differently for one reason…"* | present tense; also now records that the resume closes both and the slots only the second |
+| `README.md` | *"A release build compiles that assertion out, so the backend **takes** the overwrite silently"* | present tense; scoped to the tree the measurement was taken against, with *"not reachable now, in either profile"* |
+| `fixtures.rs` — `mt_spawn` doc | *"which says that layer already models per-thread operations correctly **while this backend's slots do not**"* | **False now.** This backend's slots *are* keyed by thread — that is what this change did. The observation is kept because the asymmetry was the argument for closing the case. |
+| `fixtures.rs` — `mt_spawn` doc | *"the spawn's `ReturnKind::Spawn` **is** in flight… **takes** the overwrite… what **ends** it is the path decode"* | a present-tense block describing a sequence no longer reachable; re-tensed, transcripts and figures untouched |
+| `fixtures.rs` — `mt_spawn` doc | *"The tripwire **fires** after the `posix_spawn` syscall has already run"* | re-tensed, with the reason the reaper stays (any error reaching that window has the same effect) |
+| `fixtures.rs` — the ungated-arms comment | *"a multithreaded tracee … **is** not refused: it **is** unmediated"* | the fixtures.rs twin of the README's largest site; repaired with an explicit *"that window is now closed"* |
+| `fixtures.rs` — the per-arm slot table | further rotted `native.rs` line numbers neither review named — every line number the per-arm table carried, plus `single_thread`'s two call-site numbers | all replaced with symbols, and the table now records that every number it once carried had rotted |
+| `umbra-test-child.c` — `mt_write`'s comment | *"the tracer **has** two in-flight namespace transactions to keep apart on one `pending` slot and one `entry` slot"* | present tense on the replaced model; re-tensed, and the case is noted as unchanged and still entering the same way |
 
-The stale-literal sweep found the same defect class in **§7.10**, which neither
-reviewer enumerated: *"the repository root currently mixes this arc's **three**
-documents with **twelve** belonging to **two** other arcs"* and *"moved the count
-**13 → 12**"*. It would have gone stale this round like the rest, and it pointed at a
-§0 that no longer states those numbers, so it was internally inconsistent as well.
-Reformulated the same way. Flagged here because it means the enumeration was
-fourteen-of-fifteen, not because I went looking for scope.
-
-## R4-2 — LOW. The generalisation now claims less · **FIXED**
-
-§7.7 said *"each of the first three recurrences came from recomputing something"*. It
-does not hold, for both reasons given: the three examples include "a line number
-inferred from a file growing", which the next sentence assigns to the internal-sweep
-instances — double-counted, and no line-number error exists among the first three — and
-**R2-1 was a causal misattribution, not a recomputation**.
-
-Corrected to claim less: re-derivation accounts for S2-1, S3-1 and the two
-internal-sweep instances, and explicitly **not** for R2-1, with a sentence saying the
-earlier revision overstated it. The rule survives, and round 4 supplies evidence for it
-from the other direction — S3-1's fix *was* pure substitution and still went stale,
-because the input was not stable. So §7.7 now carries a companion rule, which is what
-§0 and §8 implement: **where a value is invalidated by the act of stating it, do not
-state it — name the stable part and point at the tool.**
-
-Noted as the synthesis asked: the overstatement originated in the round-3 framing and I
-carried it faithfully. Recording that is more useful than assigning it.
-
-## Untouched, because it held up
-
-§7.7's count of **four** recurrences and the four it names — correctness tried
-specifically to break it and could not, so it is left exactly as written. The three
-S3-1 substitutions were correct at `f7c15ee2`; R4-1 is that they went stale one commit
-later, not that they were wrong, and nothing here re-litigates them. Items 6 and 7
-remain `publish`'s, blocked by #123/#131, with item 6 still a ratified ship-gate. The
-twelve-or-so other-arc root documents stay in place for the reasons every round has
-given.
+**That is the expected outcome and not a failure**, as the synthesis said. The pattern
+is worth noting: the sites neither reviewer found are concentrated in the *longest*
+doc comments — `mt_spawn`'s and the README's fixture section — where a false sentence
+sits many paragraphs from anything that looks like a claim about the current tree.
 
 ---
 
-## The test that matters: would a hypothetical `fix-r5.md` invalidate anything left?
+## 3. Deliberately left
 
-Run against the final tree with this document written and the change amended. Every
-count-bearing claim remaining in §0 and §8, and whether adding a fifth round document
-would falsify it:
+Per the instruction not to let round 5's scope creep, these are **improvable but not
+false**, and were left alone:
 
-| claim remaining | survives `fix-r5.md`? |
-|---|---|
-| "Exactly four content files are touched, and they are these" + the four paths | **Yes** — a new `fix-rN.md` is not a content file |
-| §8's per-file `+/−` figures and the `527 / 1` subtotal | **Yes** — they are the four content files' own counts |
-| "No production source file is in the diff" | **Yes** |
-| "Everything else … is a root-level `.md` process document of this arc — `impl.md` and one `fix-rN.md` per review round" | **Yes** — stated as a rule over rounds, not a list |
-| "Some of those paths already carry an earlier arc's document at `master`, so they appear as modifications; the later ones are new files … read off `jj diff --stat`" | **Yes** — and this replaced a claim the check itself caught: see below |
-| "The parent commit *is* `master`, so every file not in that list is byte-identical" | **Yes** |
-| §0's two prior-arc rows (`dg-egt6apy1`, `dg-29vwer0f`) | **Yes** — `fix-r5.md` is not among either arc's listed documents, and no row carries a total |
-| "which `fix-rN.md` paths this arc has taken over is not stable … the tool answers that" | **Yes** — it asserts the instability rather than a value |
-| §8's "substituting seven → eight, as round 3 correctly did for what was then true" | **Yes** — narration of what round 3 did, not a claim about the current diff |
-| §7.10's reformulated #132 item | **Yes** — no integer |
-
-**The check found three survivors, all introduced by this round's own edits, and all
-three are now fixed.** That is the check earning its keep rather than rubber-stamping:
-
-1. **§0 still enumerated two of the documents** — "Implementation documents this node
-   authored (`impl.md`, `fix-r1.md`) ship in the diff". Replaced with "`impl.md` and
-   each round's `fix-rN.md`".
-2. **"each is a modification rather than an addition" was false as of this round.**
-   `jj file show -r @- fix-r4.md` reports **absent**: `master` carries `fix-r1.md` and
-   `fix-r2.md` (both `dg-egt6apy1`'s) and `fix-r3.md` (`dg-29vwer0f`'s), but no
-   `fix-r4.md`. So this document is an **addition**, and the generalisation I wrote one
-   hour earlier — in the very edit that removed the counts — was wrong for the first
-   time at exactly this round. Both §0 and §8's bullet now say some paths are
-   modifications and some are additions, and point at `--stat`, where a modification is
-   the path that also shows deletions.
-3. **§0's per-arc table implied its rows were the arcs' complete root inventories**,
-   which cannot stay true as this arc takes over more `fix-r*.md` paths. The rows are
-   now scoped to "documents at root this arc never writes" — no `review-*`, `ci-*` or
-   `publish.md` is ever written here — with the `fix-r*.md` instability stated rather
-   than enumerated.
-
-After those three, **no remaining claim in §0 or §8 goes stale.** The only numbers left
-in either section are the four content files' line counts, and a `fix-r5.md` does not
-touch a content file. Verified by re-reading both sections whole rather than by grep
-alone; the greps agree that no `**seven**`/`**eight**`/`**three** process`/`13 → 12`/
-`twelve unrelated`/`fix-r3.md alone` remains anywhere in `impl.md`.
-
-Worth stating plainly, because it is the round's most useful result: **two of the three
-survivors were claims this round introduced while removing the literals.** The
-reformulation that ends the count problem was itself a fresh site for a false claim —
-lesson 28 at one more remove — and only a mechanical "would `fix-r5.md` break this?"
-pass over the finished text found them. A sweep for the *old* wording would have passed.
+- **`mt_write`'s and `mt_spawn`'s doc comments are long and now carry two layers**:
+  the measurement, and the correction. A reader has to hold both. Compressing them
+  would lose the arc's reasoning, which the synthesis explicitly asked to keep.
+- **`fixture_named_processes`' orphan paragraph** still explains a leak in more depth
+  than a reader of the reaper strictly needs. Accurate as repaired; not shortened.
+- **The README's fixture section and `fixtures.rs`' ungated-arms comment are
+  near-duplicates.** They were repaired *separately and consistently*, as the
+  synthesis flagged for `WaitPlan::Native`. Merging them into one source of truth is a
+  real improvement and a real risk, and it is not this round's.
+- **`#134`'s process documents** carry the same falsified sentence. **Not this arc's
+  to fix** — routed to #132 with the root-document convention item.
+- **`native.rs`'s own comments** were not swept. The synthesis scoped this pass to
+  three files and `native.rs` is under a do-not-touch. Its comments were rewritten
+  wholesale by this change and are the one body of prose in the crate that was
+  *written against the current tree*.
 
 ---
 
-## Gates, re-run against the final tree (lesson 24), verdicts read by name (lesson 23)
+## 4. Residual matches after the re-sweep, each correct as written
 
-The C fixture was recompiled from this tree and `cargo build -p umbra-platform-macos
---tests` re-run after the last edit. This round touched no compiled file — only
-`impl.md` and this document — and the gates were run in full anyway.
+The regex re-sweep leaves these, and none is a defect:
 
-| Gate | Result |
+- `fixtures.rs`, twice — *"Reaping here does not close it"*. True: reaping does not
+  close the orphan leak, which is the point of the sentence.
+- `fixtures.rs`, once — the protected `native.rs:571` master transcript (§1).
+- `umbra-test-child.c`, once — *"single-slot model has to survive"* appearing inside
+  its **own replacement**, quoted as the superseded wording. Keeping it is the repair
+  style, not a miss.
+
+---
+
+## 5. Standing constraints, re-verified after the pass
+
+| constraint | verdict |
 |---|---|
-| `cargo fmt --all -- --check` | exit 0 |
-| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, **0** lines matching `^(warning\|error)` |
-| `cargo test --workspace --all-targets` | exit 0; **52 suites, 832 passed, 0 failed, 5 ignored** |
-| `--test fixtures` (integration env) | **11 passed, 0 failed, 2 ignored**; **0** `SKIP`, **0** `MISSED` |
-| `--test provider_ipc` | 1 passed — `CAPTURED open-libc provider IPC` |
-| `--test sandbox_launch` | 4 passed |
-| `-p umbra-cli --test run_fixtures` | 10 passed, **20** distinct `PASS` verdicts, 2 declared `SKIP nfs_fixture_matrix` / `SKIP nfs_utility_matrix` |
-| `-p umbra-cli --test resume_cli` | 3 passed |
-| `-p umbra-supervisor --test reopen` | 7 passed |
-| `smoke.sh` untraced | **12 of 12 PASS**, both new arms included |
+| `native.rs` untouched | **byte-identical** to the round-3 tree (`diff -q` clean) |
+| `z0`/`Z0` byte-identical | the filter over the whole diff returns **nothing** |
+| `fixtures.rs` six-non-comment-line invariant | **6 changed lines, all removals**, all the two `#[ignore]` attributes |
+| `umbra-test-child.c` comment-only | **0** non-comment changed lines |
+| reaper components byte-identical to master | `StrayFixtureChildren`, its `Drop`, `fixture_named_processes`, `fixture_processes_named` — **all four identical**, compared by extracted body rather than by a fixed-size window |
+| `single_thread()` with both call sites | unchanged, still pinned by test |
+| deferred items 3 / 4b / 5 / 6 | absent; item 5's reaper documented, not touched |
+| no new line numbers in new text | none added; three rotted citations replaced by symbols, six more found and replaced |
+| no counts of this arc's own corrections | none supplied anywhere, including in this document |
+| attribution trailers | both intact |
 
-**The 832 figure keeps the qualification it has carried since round 0** and is still the
-weaker figure: no `--nocapture` and no fixture environment, so every integration case in
-it takes `fixture_argv`'s skip branch (`tests/fixtures.rs:47`) and reports `ok` with its
-`SKIP` invisible. The rows beneath it are the qualification.
+---
 
-**The eleven `CAPTURED` verdicts, read by name from this round's own captured output:**
-`argv0-check`, `dirfd-rename`, `dup-inherit-write`, `exec-write`, `fork-write`,
-`grandchild-write`, `open-libc`, `open-svc`, `posix-spawn-write`, `symlink-cycle`,
-`wnohang-wait`. Zero `SKIP`, zero `MISSED`. The two `SKIP`s in `run_fixtures` are skips,
-not passes, both on `UMBRA_TEST_SKIP_NFS_MATRIX`.
+## 6. The finding this round adds
 
-**Both `#[ignore]`d cases re-measured with `--ignored`**, same two verdicts as rounds
-0–3; the `mt_write` assertion is still at `fixtures.rs:398`, measured rather than
-assumed. **No new measurement was taken** — every figure in `impl.md` is rounds 0–2's,
-restated.
+The arc's transferable finding was already that false documentation is a first-class
+defect here. This round sharpens it in a way worth carrying:
 
-Change **`wppwptxswssr`** on `feat/mt-fork`, parent `master` `e44d0db8`.
+**Byte-identity certification is the instrument that cannot see this class.** Every
+site repaired above sat in text that had not moved for rounds, and was therefore
+certified safe by every previous round — mine, both reviewers', and the driver's.
+Scope put it exactly: the *"no line numbers in new text"* remedy protects **new**
+prose only, and byte-identity is *"what makes the first invisible."*
+
+**And two independent sweeps were not enough.** Correctness and scope swept the same
+README and did not overlap; scope reported it clean on what it checked while
+correctness quoted two false sentences from it. This exhaustive pass then found more
+than both — including the largest site, in that same README. The lesson is not that
+the sweeps were careless. It is that **sampling a class of defect does not terminate
+it**, and that the only sweep that ends it is one whose stopping condition is
+"exhausted the file", not "found some".
+
+The remedy that follows, and that belongs in the standing checklist beside the
+byte-identity check: **when a change closes a defect, sweep every file that documents
+that defect, exhaustively, in the same change.** Not the files the change touched —
+the files that describe what it changed. Those are disjoint sets, and this arc spent
+four rounds discovering it.
+
+---
+
+## 7. Gates
+
+| Gate | Verdict |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test --workspace --all-targets -- --test-threads=1` | **exit 0**, 52 suites ok, 0 failed, 3 ignored (the pre-existing NFS fault-injection cases) |
+| direct tracer + `provider_ipc` + `sandbox_launch` + `--lib` | exit 0; **14 `CAPTURED`, 0 `SKIP`**; 13 / 1 / 4 / 36 passed |
+
+**The C fixture was rebuilt before the suite ran.** `umbra-test-child.c` changed this
+round — comments only, but it is the tracee under test, and running the suite against
+a stale binary would qualify something other than the tree. `clang -arch arm64` per
+the CI recipe, then the suite.
+
+**Qualified by `CAPTURED` (lesson 23)** from the `--nocapture` run; the workspace run
+captures stderr and its `ok` is exactly the signal these two cases can emit without
+running.
+
+**Rebuild discipline (lesson 24) and the mtime hazard.** The `transport-raw` provider
+was rebuilt **immediately before** its symbols were read, because a default-feature
+`cargo build --workspace --bins` overwrites that path *and moves mtime backwards*:
+
+```
+$ cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
+  warning: …: libnfs raw binding: 16 functions emitted
+$ nm target/debug/umbra-storage-nfs-userspace | grep -E " _rpc_(connect_async|service|nfs4_compound_task)$"
+00000001001244ec T _rpc_connect_async
+0000000100128518 T _rpc_nfs4_compound_task
+0000000100123464 T _rpc_service
+```
+
+The tracer provider, same discipline: `Session15continue_thread`,
+`Session17continue_absorbed`, and the `vCont;c:` literal, read from a binary built
+immediately before.

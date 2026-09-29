@@ -49,9 +49,46 @@ fn fixture(case: &str, expected: &[u8]) {
 /// interprocess lock would add a failure mode without removing one. If that ever
 /// changes, this is the place that has to change with it.
 ///
-/// Poisoning is absorbed rather than propagated: `mt_write` and `mt_spawn` panic
-/// **by design** on every run, so a poisoned mutex is the normal state after them
-/// and must not turn the other cases into secondary failures.
+/// **What did change: two fixture suites at once now kill each other, and this is
+/// the notice that premise asked for.** The reaper reaches every process on the
+/// machine whose executable basename matches `UMBRA_TEST_FIXTURE_PATH`'s, so it
+/// cannot tell a *sibling suite's live tracee* from its own stray. It is built only
+/// by `mt_fixture`, and while `mt_write` and `mt_spawn` were `#[ignore]`d it
+/// therefore never ran in a default suite run; they run by default now, so it does.
+/// Measured on one host: run this suite against itself in two worktrees and the
+/// victim's tracee takes a `SIGKILL` mid-syscall and surfaces as
+/// `fatal signal/exception: T09` in whichever case happened to be live. Run the
+/// suite twice in a row and nothing is reaped at all.
+///
+/// **So do not run two fixture suites concurrently on one machine** — two
+/// worktrees, or a second terminal — and if a case fails with `T09` on a tracee
+/// you did not kill, look for the other suite before looking at the tracer.
+///
+/// **No CI path that has been measured is affected, and the measurement is what
+/// that rests on** — not an argument that CI is safe in general. `cargo`
+/// serialises test executables and sampling the process table throughout a real
+/// invocation never observed two at once; the main workspace job sets no fixture
+/// environment, so `mt_fixture` returns before this guard is ever constructed and
+/// `Drop` never runs at all; and the two macOS jobs use *different* fixture
+/// basenames, so they could not cross-kill even sharing a runner. **What that
+/// covers is concurrency within one workflow run.** Two workflow runs can coexist
+/// — the concurrency group is per ref — and that path was neither measured nor
+/// excluded, so it is named here rather than claimed.
+///
+/// **Not repaired here, deliberately.** Filtering the reap to this process's
+/// descendants would correctly spare a sibling suite's tracee — that tracee is not
+/// a descendant — but the stray this reaper exists for has been **reparented to
+/// `launchd`** by the time it is reaped, so descent would fail in exactly the case
+/// the reaper is for. Trading the reaper's job for concurrency-safety is a design
+/// decision on the suspended-orphan machinery, which is deferred to its own arc.
+///
+/// Poisoning is absorbed rather than propagated: a panicking case leaves the mutex
+/// poisoned, and that must not turn the cases after it into secondary failures.
+/// This mattered most when `mt_write` and `mt_spawn` panicked **by design** on
+/// every run and a poisoned mutex was the normal state after them; they pass now,
+/// so the absorption is a guard against an ordinary failure rather than the
+/// expected path — but a suite whose first failure silently became several would
+/// be just as misleading either way.
 static FIXTURE_LAUNCH: Mutex<()> = Mutex::new(());
 
 fn fixture_launch_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -338,36 +375,44 @@ fn argv0_check() {
 // ---------------------------------------------------------------------------
 // Multithreaded cases, on the dispatch paths `single_thread()` does not gate.
 //
-// `single_thread()` (native.rs:498) is called from exactly two places --
-// `Delivery::Fork` (:1922) and `WaitPlan::Park` (:1967). Four arms are ungated,
-// and they do **not** all touch the slots. Per arm, read off `native.rs` rather
-// than generalised -- a generalisation is what put a false claim in this
-// crate's README on the first pass:
+// `Session::single_thread` is called from exactly two places -- the
+// `Delivery::Fork` and `WaitPlan::Park` arms of `Session::intercept`. Four arms
+// are ungated, and they do **not** all touch the slots. Per arm, read off
+// `native.rs` rather than generalised -- a generalisation is what put a false
+// claim in this crate's README on the first pass. Symbols rather than line
+// numbers: this table first carried line numbers, and they had rotted by the
+// time the window it describes was closed.
 //
 //   | arm            | gated | `Session::entry` | `Session::pending`          |
 //   |----------------|-------|------------------|-----------------------------|
-//   | `Namespace`    | no    | set (:1913)      | one hop later, via `resume`  |
-//   | `Fork`         | YES   | --               | `return_stop` (:1931)       |
+//   | `Namespace`    | no    | set at the entry | one hop later, via `resume`  |
+//   | `Fork`         | YES   | --               | `return_stop`               |
 //   | `Wait`+`Poll`  | no    | --               | -- (neither slot)           |
 //   | `Wait`+`Park`  | YES   | --               | -- (sets `s.waiting` only)  |
-//   | `Wait`+`Native`| no    | --               | `return_stop` (:1970)       |
-//   | `Exec`         | no    | --               | `return_stop` (:2002/:2008) |
+//   | `Wait`+`Native`| no    | --               | `return_stop`               |
+//   | `Exec`         | no    | --               | `return_stop`               |
 //
 // `Delivery::Namespace` does not call `return_stop` itself: it only records the
 // entry PC and emits the event. The return gate is planted one hop later, when
-// the caller resumes the thread -- `resume()` takes `s.entry` and calls
-// `s.return_stop(ReturnKind::Syscall)` (native.rs:2387). `mt_write` reaches the
-// window through that hop, not from `intercept`.
+// the caller resumes the thread -- `Session::resume` takes the entry slot and
+// calls `return_stop(ReturnKind::Syscall)`. `mt_write` reached the window
+// through that hop, not from `intercept`.
 //
-// So a multithreaded tracee doing ordinary file I/O or a `posix_spawn` is not
-// refused: it is unmediated in the window between a return gate being planted
-// and the return arriving. These two cases drive that window on purpose.
+// So a multithreaded tracee doing ordinary file I/O or a `posix_spawn` was not
+// refused: it was unmediated in the window between a return gate being planted
+// and the return arriving. These two cases drive that window on purpose, and
+// **that window is now closed** -- `return_stop` resumes only the trapping
+// thread, so no sibling is running to enter it. They pass; they are kept
+// because the window is what they exist to hold shut.
 //
-// **`WaitPlan::Native` is a third ungated `return_stop` caller and slice 0 does
-// not measure it.** Stated rather than left to be inferred from the two cases
-// below. It writes `pending` exactly as `Exec` does, so it is expected to
-// collide the same way `mt_spawn` does, but "expected" is not "measured" and no
-// fixture here drives it. A case for it belongs with the follow-up issue.
+// **`WaitPlan::Native` is a third ungated `return_stop` caller and no fixture
+// here drives it.** Stated rather than left to be inferred from the two cases
+// below. It writes `pending` exactly as `Exec` does, so slice 0 recorded it as
+// *expected to collide* the way `mt_spawn` then did -- and that prediction has
+// been overtaken rather than confirmed: `mt_spawn` no longer collides, because a
+// thread inside a return window is the only thread running, and the same reason
+// covers this arm. It is still unmeasured, so nothing here rests on it, and a
+// case for it belongs with the follow-up issue.
 // ---------------------------------------------------------------------------
 
 /// A second destination alongside the one `fixture_argv` owns.
@@ -385,9 +430,13 @@ fn argv0_check() {
 /// assertion the whole slice turns on.
 ///
 /// It owns its own teardown through `Drop`, which is what makes the teardown
-/// panic-safe: `mt_write`'s assertion and the tracer's own `debug_assert!` both
-/// unwind past the end of this function, so anything cleaned up by statements
-/// after the assertion is not cleaned up on the runs that matter.
+/// panic-safe. When these cases were measurements that failed by design,
+/// `mt_write`'s assertion and the tracer's own `debug_assert!` both unwound past
+/// the end of this function, so anything cleaned up by statements after the
+/// assertion was not cleaned up on the runs that mattered. Both cases capture
+/// now, so the unwinding path is the ordinary failure path rather than the
+/// expected one -- and teardown that only works when the test passes is exactly
+/// what a failing test must not leave behind.
 /// **Nothing is removed that this test did not create, and the type is what
 /// enforces it.** The value is constructed only after both absence checks have
 /// passed, so arming cleanup and proving the outputs are absent are the same
@@ -439,7 +488,13 @@ impl Drop for Second {
 /// `POSIX_SPAWN_START_SUSPENDED`, survives the tracee being killed, gets
 /// reparented away from this process so `waitpid` cannot see it, and holds the
 /// inherited descriptors 0/1/2 open until something kills it. Measured on every
-/// `mt-spawn` run; both reviews of this change reaped such children by hand.
+/// `mt-spawn` run **while that case still failed inside the spawn's error
+/// window**; both reviews of the slice that measured it reaped such children by
+/// hand. It is not measured on every run now -- the case captures, so the window
+/// is not entered -- but the leak is a property of that error window rather than
+/// of the tripwire, it reproduces in release where the assertion is compiled
+/// out, and it is filed separately. The reaper stays because any error between
+/// the spawn's `svc` and `finish_return` still reaches it.
 ///
 /// So the only way to own it is to notice it: snapshot before the run, snapshot
 /// after, and kill the difference.
@@ -544,19 +599,25 @@ fn fixture_processes_named(pids: &[i32], name: &std::ffi::OsString) -> BTreeMap<
 /// Run-scoped ownership of the fixture children nothing else owns.
 ///
 /// Constructed before the traced run and dropped after it, including while a
-/// panic unwinds, which is the only path that matters: on `mt-spawn` the tracer's
-/// `debug_assert!` fires *inside* `next_event`, so every statement after the
-/// harness's own assertions is skipped.
+/// panic unwinds. That path was once the only one that mattered: on `mt-spawn`
+/// the tracer's `debug_assert!` fired *inside* `next_event`, so every statement
+/// after the harness's own assertions was skipped. **That assertion no longer
+/// fires** -- the tripwire is per thread now and the case captures -- so the
+/// unwinding path is the ordinary failure path rather than the expected one, and
+/// `Drop` is what keeps cleanup on it either way.
 ///
 /// Correct only while `FIXTURE_LAUNCH` is held across the whole window — see
 /// [`fixture_named_processes`] for why the snapshot diff does not stand on its own.
 ///
 /// This fixes the **harness**, and only the harness. The leak it cleans up is a
-/// property of master's error window — any error between the spawn's `svc` and
-/// `finish_return` reaches it, measured 10/10 including the release runs where
-/// the assertion is compiled out — and that defect is filed separately. Reaping
-/// here does not close it and must not be read as closing it; what it closes is
-/// this test suite accumulating suspended processes across repeated runs.
+/// property of the error window between the spawn's `svc` and `finish_return` --
+/// any error reaching that window leaks, measured 10/10 including the release
+/// runs where the assertion is compiled out — and that defect is filed
+/// separately. Closing the multithreaded window did not close it: it is not a
+/// property of the tripwire, which is why it survives a run in which nothing
+/// trips. Reaping here does not close it either and must not be read as closing
+/// it; what it closes is this test suite accumulating suspended processes across
+/// repeated runs.
 struct StrayFixtureChildren {
     case: String,
     /// `None` when the process list could not be enumerated completely, which
@@ -659,8 +720,9 @@ fn mt_fixture(case: &str, option: &str, first: &[u8], second: &[u8]) {
         shadow,
     };
     // Dropped in reverse declaration order after the run, and on an unwinding
-    // panic too, which is the case that actually happens here: strays are reaped
-    // first, then the destinations are cleared, then the lock is released.
+    // panic too -- which is what happened on every run while these cases were
+    // failing measurements, and is now the ordinary failure path: strays are
+    // reaped first, then the destinations are cleared, then the lock is released.
     let _strays = StrayFixtureChildren {
         case: case.to_owned(),
         before: fixture_named_processes(),
@@ -701,29 +763,39 @@ fn mt_fixture(case: &str, option: &str, first: &[u8], second: &[u8]) {
 /// /var/folders/.../umbra-rust-fixture-<pid>-mt-write-b/output
 /// ```
 ///
-/// The host file holds `two\n`, and no shadow file was ever created for it. The
-/// event stream names exactly one worker thread: the other issues its `open`,
-/// `write` and `close` without producing a single `SyscallEntry`. It is not
-/// misattributed, it is **not intercepted at all**, so the rewrite never happens
-/// and the tracee's own path is what reaches the kernel.
+/// In that measurement the host file held `two\n` and no shadow file was ever
+/// created for it. The event stream named exactly one worker thread: the other
+/// issued its `open`, `write` and `close` without producing a single
+/// `SyscallEntry`. It was not misattributed, it was **not intercepted at all**,
+/// so the rewrite never happened and the tracee's own path was what reached the
+/// kernel.
 ///
-/// The mechanism is `return_stop` (native.rs:539-...), and it is not the
-/// single-slot overwrite its comment describes. To let the stopped thread execute
-/// the `svc` it sits on, `return_stop` *releases the entry breakpoint* --
+/// **The paragraphs below describe the mechanism as it stood at that
+/// measurement. It has since been closed; the description is kept because it is
+/// what the case exists to hold shut.**
+///
+/// The mechanism was `Session::return_stop`, and it was not the single-slot
+/// overwrite its comment then described. To let the stopped thread execute the
+/// `svc` it sits on, `return_stop` *releases the entry breakpoint* --
 /// `remove_breakpoint(pc)`, a `z0` -- plants the return gate at `pc + 4`, and
 /// resumes. `install_breakpoint(pending.entry, ..)` in `finish_return` is what
 /// puts it back. Between those two points the stub carries no breakpoint **for
-/// the whole process**, because a debugserver `Z0` is per-process and
-/// `continue_run` resumes every thread. A sibling thread reaching the same stub
-/// inside that window walks straight through it.
+/// the whole process**, because a debugserver `Z0` is per-process — and the
+/// resume was then a bare `c`, which put **every** thread back on the road. A
+/// sibling reaching the same stub inside that window walked straight through it.
 ///
-/// **Why this case and `mt_spawn` fail differently, in one sentence.** Both of
+/// **What closed it:** that resume is now `vCont;c:<tid>`, so only the trapping
+/// thread runs and no sibling is left to reach the stub. The `z0`/`Z0` sequence
+/// above is unchanged — only which threads run changed.
+///
+/// **Why this case and `mt_spawn` failed differently, in one sentence.** Both of
 /// this case's threads call `open`, so they share *one stub at one address*, and
-/// the `z0` window on that address un-arms it for the sibling -- an escape.
+/// the `z0` window on that address un-armed it for the sibling -- an escape.
 /// `mt_spawn`'s two threads use *different* stubs (`__posix_spawn` and
-/// `__open_nocancel`), so neither un-arms the other and the collision lands on
-/// the shared `pending` slot instead -- an assertion. That is exactly why
-/// per-thread slots close one and not the other.
+/// `__open_nocancel`), so neither un-armed the other and the collision landed on
+/// the shared `pending` slot instead -- an assertion. That is why per-thread
+/// slots were expected to close one and not the other; measured, the per-thread
+/// resume closes both, and the slots are not what keeps `mt_spawn` green.
 ///
 /// So making `Session::pending` and `Session::entry` per-thread does **not**
 /// close this: the hole is in the shared breakpoint registry, not in the slot.
@@ -732,6 +804,15 @@ fn mt_fixture(case: &str, option: &str, first: &[u8], second: &[u8]) {
 /// `svc`; hold the siblings stopped over the Mach task port this backend
 /// already owns (`task_threads` + `thread_suspend`, no new RSP surface); or
 /// per-thread RSP resume (`vCont`).
+///
+/// **That paragraph was a prediction when it was written, and it has now been
+/// measured true.** The third shape was taken: `return_stop` resumes the
+/// trapping thread alone with `vCont;c:<tid>` and the siblings stay stopped for
+/// the whole of the window, so the stub cannot be reached while it is un-armed.
+/// The discrimination is direct -- with the per-thread slots kept and *only* that
+/// resume reverted to a bare `c`, this case fails again with the same escaped
+/// `two\n` on the host, while `mt_spawn` still passes. The slots did not close
+/// this one; the resume did.
 ///
 /// **On failure the evidence is in the message, not on disk.** `Second::drop` runs
 /// on the unwinding path and removes the escaped host file, plus the directory
@@ -742,9 +823,6 @@ fn mt_fixture(case: &str, option: &str, first: &[u8], second: &[u8]) {
 /// revisions of this comment were wrong about this -- one describing the opposite
 /// before the guard existed, one before the guard tracked what it owned.
 #[test]
-#[ignore = "slice 0 measurement: fails on master by design; the unmediated \
-            entry-breakpoint window it names is not closed by per-thread slots \
-            alone. Run with `--ignored`; un-ignore in the PR that fixes it."]
 fn mt_write() {
     mt_fixture("mt-write", "--mt-write", b"one\n", b"two\n")
 }
@@ -762,46 +840,67 @@ fn mt_write() {
 /// be overwritten
 /// ```
 ///
-/// This is the `debug_assert!` `return_stop`'s comment planted for this arc,
-/// reached exactly the way it predicts: the spawn's `ReturnKind::Spawn` is in
-/// flight on one thread while the other's `open` return opens a second
-/// transaction on the same slot. It is a `debug_assert!`, so **the backend** takes
+/// That was the `debug_assert!` `return_stop`'s comment planted for this arc,
+/// reached exactly the way it predicted: the spawn's `ReturnKind::Spawn` was in
+/// flight on one thread while the other's `open` return opened a second
+/// transaction on the same slot. Being a `debug_assert!`, **the backend** took
 /// the overwrite in a release build -- losing the spawn's gate, its entry
 /// breakpoint, and the pid pointer the child would have been attached by.
 ///
-/// **The run does not fail silently in release, though, and saying it did was
-/// wrong.** For *this* case what ends it is the path decode refusing the
+/// **The run did not fail silently in release, though, and saying it did was
+/// wrong.** For *this* case what ended it was the path decode refusing the
 /// overwritten operand -- `Io during path: null or overflowing pointer` (`EFAULT`),
 /// 5 of 5 enforced release runs. Measured: 10 enforced `umbra run` executions of
-/// this case, 5 of them release, exited non-zero every time.
+/// this case, 5 of them release, exited non-zero every time. **None of that is
+/// reachable now, in either profile**: the slot is per thread and no second
+/// transaction opens on it.
 ///
 /// The supervisor also holds a second tripwire that ships -- `syscall_entry`
 /// refuses a second entry for a thread whose operation is still awaiting its exit
 /// (`umbra-supervisor/src/events.rs`, `operations: BTreeMap<ThreadId,
 /// OperationId>`) with a real `Err(InvalidState)`, not an assertion -- and it is
-/// keyed by thread, which says that layer already models per-thread operations
-/// correctly while this backend's slots do not. That asymmetry is the part worth
-/// keeping. **It is not what makes this case non-silent**: it is a
+/// keyed by thread, which said that layer already modelled per-thread operations
+/// correctly while this backend's slots did not. **That asymmetry is gone**: this
+/// backend's slots are keyed by thread too, which is what the arc that closed
+/// these cases did. The observation is kept because the asymmetry was the
+/// argument for closing it. **The supervisor guard is not what makes this case
+/// non-silent**: it is a
 /// contention-dependent race that fired in 0 of 10 runs of `mt_spawn`, and an
 /// earlier revision of this comment wrongly leaned on it.
 ///
-/// Unlike `mt_write`, this one *is* the slot. Per-thread slots are **expected**
-/// to close it and that expectation is **not verified**: slice 1 is not
-/// implemented, so unlike every other claim in this comment it is a prediction,
-/// not a measurement. It is recorded as such so the next reader does not inherit
-/// it as a result.
+/// Unlike `mt_write`, this one *is* the slot -- and it is now closed twice over,
+/// which the comment that predicted it did not foresee. Per-thread slots close
+/// it: with the per-thread resume reverted to a bare `c`, this case still passes
+/// while `mt_write` fails. **But so does the per-thread resume on its own**: with
+/// every return window keyed back onto one shared slot -- the pre-#135 `pending`
+/// -- and the per-thread resume left in place, this case also still passes, 3
+/// runs of 3. The reason is that the resume removes the
+/// interleaving the slot collision needed -- a thread inside a window is the only
+/// thread running, so no sibling is left to open a second transaction, and the
+/// tripwire below never gets the chance to fire.
+///
+/// So the per-thread `pending` is **not** what keeps this case green today, and a
+/// reader looking for the guard that is should look at `return_stop`'s per-thread
+/// resume. Only that half was reverted; `entry` stayed per-thread through the
+/// probe, so nothing here claims anything about it. The slots are still what
+/// makes the invariant expressible -- the
+/// tripwire is per thread, `thread_index` resolves from them, and `Pending`
+/// carries the thread its return is attributed to -- but this case does not
+/// discriminate them, and saying it did would be the prediction this paragraph
+/// replaced, made twice.
 ///
 /// The case does not reap its child. A blocking wait over a live child is
 /// `WaitPlan::Park`, which `single_thread()` does gate, so reaping would refuse
 /// the run before the spawn had been measured; the harness's own loop sees the
 /// child exit instead.
 ///
-/// **One measured side effect, and the harness now contains it.** The tripwire
-/// fires after the `posix_spawn` syscall has already run, so the child exists, is
-/// held by `POSIX_SPAWN_START_SUSPENDED`, and has not been attached to any session
-/// yet -- nothing in the backend owns it, so neither `Session::drop` nor the
-/// watchdog kills it, and it survives the panic still holding the inherited
-/// descriptors 0/1/2.
+/// **One measured side effect, and the harness contains it.** The tripwire fired
+/// after the `posix_spawn` syscall had already run, so the child existed, was
+/// held by `POSIX_SPAWN_START_SUSPENDED`, and had not been attached to any session
+/// yet -- nothing in the backend owned it, so neither `Session::drop` nor the
+/// watchdog killed it, and it survived the panic still holding the inherited
+/// descriptors 0/1/2. The tripwire no longer fires, but **any** error reaching
+/// that window has the same effect, which is why the reaper stays.
 ///
 /// `StrayFixtureChildren` reaps it: this test runs under a guard whose `Drop`
 /// snapshots the fixture's processes before the run and kills whatever appeared
@@ -820,9 +919,6 @@ fn mt_write() {
 /// the spawn's `svc` and `finish_return` reaches it. Reaping here does not close
 /// that, and a `REAPED` line is evidence of it rather than of its absence.
 #[test]
-#[ignore = "slice 0 measurement: fails on master by design, on the \
-            `debug_assert!` at native.rs:571. Run with `--ignored`; un-ignore \
-            in the PR that fixes it."]
 fn mt_spawn() {
     mt_fixture("mt-spawn", "--mt-spawn", b"libc\n", b"two\n")
 }
