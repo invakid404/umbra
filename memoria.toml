@@ -6,7 +6,29 @@ version = 3
 # - **/.dSYM/**: macOS debug bundles that can appear under target or ad-hoc.
 # - .jj/**: jj internal state (colocated with .git; .git is already jj-invisible).
 # - Cargo.lock: dependency resolution; avoid review churn on lockfile-only updates.
-ignore = ["experiments/**", "target/**", "**/.dSYM/**", ".jj/**", "Cargo.lock"]
+# - delegation-graph process docs (impl.md, fix-r*.md, review-*.md, ci-round*.md,
+#   publish.md, merge-gate.md, done.md, audit.md, design-gate.md): per-arc records
+#   archived at knowledge/umbra/graph-audits/. Never a repo-tree input, so they
+#   don't re-pend the root README and don't collide across arcs on master (#132).
+ignore = [
+    "experiments/**",
+    "target/**",
+    "**/.dSYM/**",
+    ".jj/**",
+    "Cargo.lock",
+    "impl.md",
+    "publish.md",
+    "done.md",
+    "merge-gate.md",
+    "audit.md",
+    "design-gate.md",
+    "fix-r*.md",
+    "ci-round*.md",
+    "review-correctness*.md",
+    "review-scope*.md",
+    "review-synthesis*.md",
+    "audit-comment*.md",
+]
 include = []
 
 [documentation]
@@ -15,8 +37,8 @@ include = []
 # agents must not be forced to load those.
 guidance = [
     "Write in umbra's house style: concise, technically precise, and honest about current state. Distinguish what ships from what is a stub, prototype, or planned. Never use marketing language, superlatives, or forward-looking claims dressed as present-tense capability.",
-    "Every README states its current state near the top, and every nested README also declares its ownership boundary there; the root README leads with product and problem instead. State what the crate/module does today, what is stubbed, and what depends on unshipped work. When a claim is quantitative (LOC, test count, syscall number, matrix dimensions), quote it from source; otherwise omit the number.",
-    "Cross-check every prose claim against the code in the ownership boundary before acknowledgement. If the README describes exported names, modules, or behaviour that no longer matches source, edit the README rather than acknowledging the drift.",
+    "Every README states its current state near the top, and every nested README also declares its document scope there; the root README leads with product and problem instead. State what the crate/module does today, what is stubbed, and what depends on unshipped work. When a claim is quantitative (LOC, test count, syscall number, matrix dimensions), quote it from source; otherwise omit the number.",
+    "Cross-check every prose claim against the code in the document's scope before acknowledgement. If the README describes exported names, modules, or behaviour that no longer matches source, edit the README rather than acknowledging the drift.",
     "Root README.md is the one document written for a new consumer: lead with product, problem, quick start, and links to ARCHITECTURE.md and docs/. Nested READMEs stay inside their crate boundary; they may import short summaries from providers via `memoria render` but must not duplicate whole sections.",
     "Use GitHub-flavoured Markdown; use Mermaid for diagrams with neutral wording and default rendering (no theme/color overrides). Give each diagram one claim. Keep code fences, paths, identifiers, and quoted errors byte-exact.",
     "Prefer short sections with clear takeaways and progressive detail over long walls. Explain each term the first time it appears. Number multi-step procedures.",
