@@ -214,7 +214,36 @@ fn wait_plan(wanted: i32, x2: u64, children: bool, ready: bool) -> WaitPlan {
         (false, false) => WaitPlan::Park,
     }
 }
+/// One intercepted syscall between its entry `svc` and its return gate.
+///
+/// **The window is per thread and names its own thread.** `return_stop` releases
+/// the entry breakpoint with `z0` before letting the `svc` run, so for as long as
+/// this value lives the stub carries no breakpoint *for the whole process* -- a
+/// debugserver `Z0` is process-wide. `thread` is who is inside that window; every
+/// sibling is held stopped until `finish_return` re-arms the entry.
 struct Pending {
+    /// The thread that trapped at `entry`, recorded when the window opened.
+    ///
+    /// **This is the attribution source for the return, and [`Session::thread`]
+    /// is never it.** That slot is overwritten by *every* stop on this
+    /// connection, so a sibling stop landing inside the window would retarget
+    /// the `SyscallExit` this return emits. The caller keys its in-flight
+    /// operations by thread and removes them on the exit
+    /// (`umbra-supervisor/src/events.rs`, `self.operations.remove(&thread)`); a
+    /// miss there is not an error, it is the "an exit for a call we never
+    /// intercepted" branch, which lets the kernel result stand **and abandons
+    /// the rewrite without a word**. Closing the sibling window while attributing
+    /// from the session slot would therefore convert a loud escape into a silent
+    /// one, which is the whole reason this field exists rather than a second read
+    /// of `s.thread`.
+    ///
+    /// Today the two agree in every reachable interleaving, because the window
+    /// freezes the siblings that could have made them differ. That is an
+    /// emergent property of the freeze, not an invariant of this code, and it
+    /// stops holding the moment anything resumes a sibling inside a window --
+    /// which is exactly the class of change a reader would not expect to be
+    /// silent.
+    thread: ThreadId,
     entry: u64,
     entry_breakpoint: Breakpoint,
     gate: u64,
@@ -231,9 +260,35 @@ struct Session {
     // Only software breakpoints installed on this session's RSP connection.
     // Disabled entry sites live in Pending; inherited bytes are not ownership.
     breaks: BTreeMap<u64, Breakpoint>,
-    pending: Option<Pending>,
+    /// Open return windows, keyed by the thread inside each one.
+    ///
+    /// **At most one is ever open, and the freeze is what makes that true** --
+    /// `return_stop` resumes only the trapping thread and leaves every sibling
+    /// stopped, so no other thread is running to reach `return_stop` and open a
+    /// second. It is a structural consequence of which threads run, not of any
+    /// check. `return_stop` asserts it (see there); the assertion is a tripwire
+    /// over the freeze, not the thing that establishes it.
+    ///
+    /// **A map rather than a slot, for what it makes expressible rather than for
+    /// what it answers.** A single slot answers "which thread owns this window"
+    /// perfectly well through [`Pending::thread`], and that was measured: keyed
+    /// back onto one shared slot, `finish_return` kept attributing correctly,
+    /// `thread_index` kept resolving, and both multithreaded fixtures stayed
+    /// green. What the map buys is that the per-thread invariant can be *stated*
+    /// -- `return_stop`'s tripwire is per thread because this is -- and that the
+    /// shape stays honest for the deferred `single_thread()` removal, at which
+    /// point a second concurrent window becomes reachable and the map becomes
+    /// load-bearing rather than expressive.
+    pending: BTreeMap<ThreadId, Pending>,
     waiting: Vec<usize>,
-    entry: Option<u64>,
+    /// Entry `svc` sites stopped and reported to the caller, keyed by thread.
+    ///
+    /// A `Delivery::Namespace` entry parks here between the `SyscallEntry` this
+    /// backend emits and the `resume` the caller answers it with, so the caller
+    /// can rewrite registers in between. Per thread for the same reason as
+    /// `pending`: the caller names the thread it is answering for, and
+    /// `Session::thread` names whoever stopped last.
+    entry: BTreeMap<ThreadId, u64>,
     stopped: bool,
     done: bool,
     reaped: bool,
@@ -349,9 +404,9 @@ impl Session {
             parent,
             twin,
             breaks: BTreeMap::new(),
-            pending: None,
+            pending: BTreeMap::new(),
             waiting: vec![],
-            entry: None,
+            entry: BTreeMap::new(),
             stopped: true,
             done: false,
             reaped: false,
@@ -362,14 +417,22 @@ impl Session {
             interposer,
         })
     }
-    fn regs(&mut self) -> Result<RegisterSet> {
+    /// Read one thread's registers.
+    ///
+    /// **The thread is named by the caller, not taken from [`Self::thread`].**
+    /// That slot holds whoever stopped last on this connection, which in a
+    /// multithreaded tracee need not be the thread being asked about:
+    /// `registers`/`set_registers` are reached with a `ThreadId` the caller read
+    /// off a `SyscallEntry`, and answering them from the session slot would hand
+    /// back a sibling's context under the right thread's name.
+    fn regs(&mut self, thread: ThreadId) -> Result<RegisterSet> {
         if !self.stopped || self.done {
             return Err(error("registers", "task is not stopped"));
         }
         let raw = rsp::unhex(
             &self
                 .rsp
-                .request(&format!("g;thread:{:x};", self.thread.0.native_id))?,
+                .request(&format!("g;thread:{:x};", thread.0.native_id))?,
         )?;
         let mut regs = RegisterSet::new(Architecture::Aarch64, vec![0; 272])?;
         for (index, (offset, len)) in self.registers.iter().enumerate() {
@@ -380,7 +443,7 @@ impl Session {
                 individual = rsp::unhex(
                     &self
                         .rsp
-                        .request(&format!("p{index:x};thread:{:x};", self.thread.0.native_id))?,
+                        .request(&format!("p{index:x};thread:{:x};", thread.0.native_id))?,
                 )?;
                 if individual.len() != *len {
                     return Err(error("registers", "short register value"));
@@ -396,15 +459,15 @@ impl Session {
         }
         Ok(regs)
     }
-    fn set_regs(&mut self, regs: &RegisterSet) -> Result<()> {
-        let old = self.regs()?;
+    fn set_regs(&mut self, thread: ThreadId, regs: &RegisterSet) -> Result<()> {
+        let old = self.regs(thread)?;
         for i in 0..34 {
             let v = get(regs, i)?;
             if v != get(&old, i)? {
                 self.rsp.ok(&format!(
                     "P{i:x}={};thread:{:x};",
                     rsp::hex(&v.to_le_bytes()[..self.registers[i].1]),
-                    self.thread.0.native_id
+                    thread.0.native_id
                 ))?;
             }
         }
@@ -490,10 +553,73 @@ impl Session {
             },
         )
     }
+    /// Resume every thread. The unqualified resume, for when no return window
+    /// is open and the whole process may run.
     fn continue_run(&mut self) -> Result<()> {
         self.rsp.send("c")?;
         self.stopped = false;
         Ok(())
+    }
+    /// Resume exactly one thread and leave every sibling stopped.
+    ///
+    /// **This one line is the closure.** A debugserver `Z0` is process-wide, so
+    /// the `z0` `return_stop` issues to let the trapping thread execute the `svc`
+    /// it sits on un-arms that stub for *every* thread until `finish_return` puts
+    /// it back. A bare `c` across that gap resumes the siblings too, and a
+    /// sibling reaching the same stub inside it walks straight through and issues
+    /// the real, unrewritten call -- measured as the `mt-write` escape, where the
+    /// second worker's write reached the host filesystem and the tracee exited 0.
+    ///
+    /// `vCont;c:<tid>` resumes that one thread and nothing else: measured against
+    /// a sibling spinning on a counter, a per-thread continue of the *other*
+    /// thread advanced it not at all, where a bare `c` advanced it by billions.
+    /// The packet is new to this backend, per-thread addressing is not -- `g`,
+    /// `p` and `P` already carry `;thread:<tid>;` under `QThreadSuffixSupported`,
+    /// and debugserver advertises `vCont;c;C;s;S`.
+    ///
+    /// **The freeze is a real behaviour change, and its bound is the watchdog.**
+    /// The interposer routes `read`/`write`/`close`, so a routed call that blocks
+    /// -- a `read` on a pipe whose writer is a frozen sibling is the reachable
+    /// case -- now blocks with those siblings held, where today's bare `c` would
+    /// have let them run. It does not deadlock silently: `check_deadline` kills
+    /// the tree at the session deadline, so the degradation is a **watchdog kill
+    /// naming a timeout, not a hang**. That is the ratified trade, taken
+    /// deliberately, because the thing on the other side of it is the unmediated
+    /// window above -- and that one is silent.
+    fn continue_thread(&mut self, thread: ThreadId) -> Result<()> {
+        self.rsp
+            .send(&format!("vCont;c:{:x}", thread.0.native_id))?;
+        self.stopped = false;
+        Ok(())
+    }
+    /// Resume from a stop this backend absorbed without opening a transaction,
+    /// leaving an open return window's freeze intact.
+    ///
+    /// A transient signal can arrive while a return is in flight -- `SIGCHLD`
+    /// from a forked child is the one that actually happens, and it lands at the
+    /// return gate because `fork` and `wait4` are themselves gated syscalls.
+    /// Continuing with a bare `c` there would release the siblings into the very
+    /// window [`Self::continue_thread`] exists to keep them out of, so the resume
+    /// goes to the window's owner instead and every other thread stays where
+    /// debugserver stopped it.
+    ///
+    /// **With no window open this is the bare `c`** -- what every such stop did
+    /// before, and what they all still do for the whole of a run that never
+    /// intercepts anything.
+    ///
+    /// **`values().next()` is well-defined because at most one window is open,
+    /// and it is the freeze that makes that true.** A window freezes every
+    /// sibling, so no other thread is running to reach `return_stop` and open a
+    /// second. `return_stop` asserts the property as a tripwire over that
+    /// reasoning -- it does not create it, and an earlier revision of this
+    /// comment credited the assertion with establishing it, which was wrong.
+    /// Were two windows ever open, this resumes one and leaves the other frozen
+    /// -- a watchdog kill, never a released sibling.
+    fn continue_absorbed(&mut self) -> Result<()> {
+        match self.pending.values().next().map(|p| p.thread) {
+            Some(owner) => self.continue_thread(owner),
+            None => self.continue_run(),
+        }
     }
     fn single_thread(&mut self) -> Result<()> {
         let threads = self.rsp.request("qfThreadInfo")?;
@@ -535,46 +661,69 @@ impl Session {
         })?;
         Ok(())
     }
-    fn return_stop(&mut self, kind: ReturnKind) -> Result<()> {
-        // **One intercepted syscall in flight per session, asserted where it can
+    /// Open a return window on `thread`: release its entry breakpoint so the
+    /// `svc` it is sitting on can run, plant the return gate at `pc + 4`, and
+    /// resume that thread **alone**.
+    fn return_stop(&mut self, thread: ThreadId, kind: ReturnKind) -> Result<()> {
+        // **One intercepted syscall in flight per thread, asserted where it can
         // be violated rather than left implicit.**
         //
-        // `pending` is a single slot and the assignment below is unconditional,
-        // so a second `return_stop` before the first is consumed overwrites it.
-        // Three things ride on that slot and all three are lost by such an
-        // overwrite, not only the newest: `entry_breakpoint`, which `finish_return`
-        // hands back to `install_breakpoint` -- the site was already released
-        // with `z0` a few lines down, so losing the value means it is never
-        // re-armed and that stub stops being intercepted for the rest of the
-        // run; `gate`, so the first return gate stays registered and is never
-        // retired; and, since the R1 fix, the `Exec` candidate image -- losing which leaves `twin` naming the previous
-        // image, `install()` matching nothing, and the exec'd image
-        // half-mediated with its stubs breakpointed and its interposer inert.
+        // The slot this guards is now keyed by the thread inside the window, so
+        // the collision it was planted for -- two threads on *different* stubs
+        // sharing one session slot, which is what `mt_spawn` measured -- can no
+        // longer happen. What it still catches is a second window opened on a
+        // thread that already has one, and the three things such an overwrite
+        // loses are unchanged: `entry_breakpoint`, which `finish_return` hands
+        // back to `install_breakpoint` -- the site was already released with
+        // `z0` a few lines down, so losing the value means it is never re-armed
+        // and that stub stops being intercepted for the rest of the run;
+        // `gate`, so the first return gate stays registered and is never
+        // retired; and, since the R1 fix, the `Exec` candidate image -- losing
+        // which leaves `twin` naming the previous image, `install()` matching
+        // nothing, and the exec'd image half-mediated with its stubs
+        // breakpointed and its interposer inert.
         //
-        // **An assertion rather than a refusal, deliberately.** This is a
-        // pre-existing invariant of the single `Pending` slot, not something the
-        // exec candidate introduced -- the breakpoint corruption above predates
-        // it and is worse than the lost candidate. A run that reaches this state
-        // is already broken by other means, so repairing one symptom of it (by
-        // moving the candidate to a field of its own) would hide the violation
-        // rather than surface it. What is wanted is to catch the violation at
-        // the point it happens, which is here.
+        // **An assertion rather than a refusal, deliberately.** A run that
+        // reaches this state is already broken by other means, so repairing one
+        // symptom of it (by moving the candidate to a field of its own) would
+        // hide the violation rather than surface it. What is wanted is to catch
+        // the violation at the point it happens, which is here. It is live in
+        // every `cargo test` run because the test profile is a debug profile; in
+        // release it costs nothing and changes nothing, which is why it is not a
+        // behaviour change to a shipped path.
         //
-        // The only way to reach it is a multithreaded tracee -- `continue_run`
-        // resumes every thread, and `single_thread()` gates `Delivery::Fork` and
-        // `WaitPlan::Park` but **not** `Delivery::Exec` or a plain `Namespace`
-        // call -- and multithreaded tracees are the ratified next arc, which will
-        // have to revisit this slot wholesale. This is the tripwire that arc
-        // wants, and it is live in every `cargo test` run because the test
-        // profile is a debug profile. In release it costs nothing and changes
-        // nothing, which is why it is not a behaviour change to a shipped path.
+        // **The second assertion is a different property, and it is the one
+        // `continue_absorbed` leans on.** That helper picks a window owner with
+        // `pending.values().next()`, which is only well-defined if at most one
+        // window is open *process-wide*. The per-thread check above does not
+        // establish that -- two windows on two *different* threads pass it
+        // untouched, and that is exactly the state that would make the pick
+        // ambiguous. What establishes it is the **freeze**: the thread resumed at
+        // the end of this function is the only one running, so nothing is left to
+        // reach `return_stop` and open a second window.
+        //
+        // So the property is structural, and the assertion below is a tripwire
+        // over that structure rather than its source. It is additive on purpose:
+        // the per-thread form above is the ratified conversion of master's
+        // single-slot tripwire and names the per-thread consequence, and this one
+        // names what `continue_absorbed` needs. The stronger condition subsumes
+        // the weaker, so only the first to fail is reported -- which is the right
+        // order, because a same-thread double-open has the specific diagnosis and
+        // a cross-thread one means the freeze itself has been broken.
         debug_assert!(
-            self.pending.is_none(),
-            "a second intercepted syscall entered while one was still in flight: \
-             this session's pending entry breakpoint, return gate and exec \
-             candidate would all be overwritten"
+            !self.pending.contains_key(&thread),
+            "a second intercepted syscall entered on a thread that was still \
+             inside one: this thread's pending entry breakpoint, return gate and \
+             exec candidate would all be overwritten"
         );
-        let regs = self.regs()?;
+        debug_assert!(
+            self.pending.is_empty(),
+            "a second return window opened while another thread's was still \
+             open: only the thread inside a window runs, so reaching this means \
+             the per-thread resume let a sibling go -- and `continue_absorbed` \
+             can no longer tell which window it should be resuming"
+        );
+        let regs = self.regs(thread)?;
         let pc = get(&regs, PC)?;
         let gate = pc + 4;
         let hardware = matches!(kind, ReturnKind::Fork { .. });
@@ -585,14 +734,24 @@ impl Session {
         } else {
             self.temporary_breakpoint(gate)?;
         }
-        self.pending = Some(Pending {
-            entry: pc,
-            entry_breakpoint,
-            gate,
-            kind,
-            hardware,
-        });
-        self.continue_run()
+        self.pending.insert(
+            thread,
+            Pending {
+                thread,
+                entry: pc,
+                entry_breakpoint,
+                gate,
+                kind,
+                hardware,
+            },
+        );
+        // **The trapping thread and nothing else**, and the `z0`/`Z0` sequence
+        // above is untouched by that -- only which threads run changes. The
+        // release a few lines up un-armed the entry stub process-wide; the bare
+        // `c` that used to stand here is what let a sibling reach it unmediated.
+        // Siblings resume at the first unqualified continue after
+        // `finish_return` has re-armed the entry.
+        self.continue_thread(thread)
     }
     fn install(&mut self) -> Result<()> {
         self.wait_for_dyld()?;
@@ -864,7 +1023,9 @@ impl Session {
                 )?,
                 self.id.0.generation,
             );
-            let regs = self.regs()?;
+            // The tracee is stopped at its first instruction with one thread, so
+            // the slot just assigned is the only thread there is to read.
+            let regs = self.regs(self.thread)?;
             if get(&regs, PC)? == address {
                 self.remove_breakpoint(address)?;
                 return Ok(());
@@ -944,7 +1105,8 @@ impl Session {
                 )?,
                 self.id.0.generation,
             );
-            let regs = self.regs()?;
+            // Pre-`main` dyld startup: one thread, just named by this stop.
+            let regs = self.regs(self.thread)?;
             if get(&regs, PC)? == notify {
                 self.remove_breakpoint(notify)?;
                 return Ok(());
@@ -1270,10 +1432,30 @@ impl MacosTraceBackend {
                 UmbraError::new(ErrorKind::StaleHandle, "task", "unknown or exited task")
             })
     }
+    /// Resolve the session a caller-named thread belongs to.
+    ///
+    /// **The per-thread slots are consulted first, and `Session::thread` is only
+    /// the fallback.** That slot holds whoever stopped last, so in a
+    /// multithreaded tracee it aliases: every thread of a session that is not
+    /// the most recent to stop would fail to resolve, or -- worse for
+    /// `registers`/`set_registers`/`resume`, which all route through here --
+    /// resolve to a session whose slot happens to name it while a different
+    /// thread is the one the caller means. A thread the caller can legitimately
+    /// name is one it was told about, and being told means either an entry it
+    /// has not answered yet, a return in flight, or the stop it was just handed.
+    ///
+    /// Thread ids are unique across the machine, so consulting several sessions'
+    /// slots cannot cross-match: the only failure this can produce is "not
+    /// found", which is the refusal below.
     fn thread_index(&self, thread: ThreadId) -> Result<usize> {
         self.sessions
             .iter()
-            .position(|s| s.thread == thread && !s.done)
+            .position(|s| {
+                !s.done
+                    && (s.entry.contains_key(&thread)
+                        || s.pending.contains_key(&thread)
+                        || s.thread == thread)
+            })
             .ok_or_else(|| {
                 UmbraError::new(ErrorKind::StaleHandle, "thread", "unknown or exited thread")
             })
@@ -1725,7 +1907,7 @@ impl MacosTraceBackend {
         physical: PhysicalOperation,
     ) -> Result<PreparedRewrite> {
         let i = self.thread_index(thread)?;
-        let regs = self.sessions[i].regs()?;
+        let regs = self.sessions[i].regs(thread)?;
         let mut addresses = Vec::new();
         for rewrite in &physical.paths {
             let len = rewrite.path.0.as_bytes().len();
@@ -1806,8 +1988,14 @@ impl MacosTraceBackend {
         self.events.push_back(thread_event);
         Ok(())
     }
-    fn finish_return(&mut self, index: usize, regs: RegisterSet) -> Result<()> {
-        let pending = self.sessions[index].pending.take().unwrap();
+    /// Close the return window `thread` is inside: retire the gate, re-arm the
+    /// entry stub, and report the exit.
+    ///
+    /// `thread` names the window to close. The exit is attributed from that
+    /// window's own [`Pending::thread`] and **never** from `Session::thread` --
+    /// see that field for what reading the session slot here would cost.
+    fn finish_return(&mut self, index: usize, thread: ThreadId, regs: RegisterSet) -> Result<()> {
+        let pending = self.sessions[index].pending.remove(&thread).unwrap();
         let s = &mut self.sessions[index];
         if pending.hardware {
             s.rsp.ok(&format!("z1,{:x},4", pending.gate))?;
@@ -1822,7 +2010,7 @@ impl MacosTraceBackend {
             ReturnKind::Syscall => {
                 self.events.push_back(TraceEvent::SyscallExit {
                     task: s.id,
-                    thread: s.thread,
+                    thread: pending.thread,
                     outcome: abi::outcome(&regs)?,
                 });
             }
@@ -1878,7 +2066,9 @@ impl MacosTraceBackend {
         }
         Ok(())
     }
-    fn intercept(&mut self, index: usize, mut regs: RegisterSet) -> Result<()> {
+    /// Dispatch a breakpoint stop taken by `thread` at one of this session's
+    /// entry stubs.
+    fn intercept(&mut self, index: usize, thread: ThreadId, mut regs: RegisterSet) -> Result<()> {
         let number = get(&regs, 16)?;
         let pc = get(&regs, PC)?;
         // **The disposition comes from `abi::TRACED_STUBS`, not from a list
@@ -1910,10 +2100,10 @@ impl MacosTraceBackend {
             // umbra's own routing trap.
             Some(abi::Delivery::Namespace) => {
                 let s = &mut self.sessions[index];
-                s.entry = Some(pc);
+                s.entry.insert(thread, pc);
                 self.events.push_back(TraceEvent::SyscallEntry {
                     task: s.id,
-                    thread: s.thread,
+                    thread,
                     registers: regs,
                 });
             }
@@ -1928,7 +2118,7 @@ impl MacosTraceBackend {
                 let mut original = [0; 4];
                 s.task.read(pc + 4, &mut original)?;
                 restore.insert(pc + 4, original);
-                s.return_stop(ReturnKind::Fork { restore })?;
+                s.return_stop(thread, ReturnKind::Fork { restore })?;
             }
             Some(abi::Delivery::Wait) => {
                 let wanted = get(&regs, 0)? as i32;
@@ -1960,14 +2150,14 @@ impl MacosTraceBackend {
                         let flags = get(&regs, CPSR)?;
                         set(&mut regs, CPSR, flags & !(1 << 29))?;
                         set(&mut regs, PC, pc + 4)?;
-                        s.set_regs(&regs)?;
+                        s.set_regs(thread, &regs)?;
                         s.continue_run()?;
                     }
                     WaitPlan::Park => {
                         s.single_thread()?;
                         s.waiting = children;
                     }
-                    WaitPlan::Native => s.return_stop(ReturnKind::Wait)?,
+                    WaitPlan::Native => s.return_stop(thread, ReturnKind::Wait)?,
                 }
             }
             Some(abi::Delivery::Exec) => {
@@ -1998,14 +2188,14 @@ impl MacosTraceBackend {
                         pid_pointer = s.allocate(&[0; 4])?;
                         set(&mut regs, 0, pid_pointer)?;
                     }
-                    s.set_regs(&regs)?;
-                    s.return_stop(ReturnKind::Spawn { pid_pointer, twin })?;
+                    s.set_regs(thread, &regs)?;
+                    s.return_stop(thread, ReturnKind::Spawn { pid_pointer, twin })?;
                 } else {
                     // Not `s.twin = twin` -- see `ReturnKind::Exec`. The image
                     // this session runs may not move until an exec has actually
                     // happened, and at this entry it has not.
-                    s.set_regs(&regs)?;
-                    s.return_stop(ReturnKind::Exec { twin })?;
+                    s.set_regs(thread, &regs)?;
+                    s.return_stop(thread, ReturnKind::Exec { twin })?;
                 }
             }
             // A breakpoint fired for a number no row in `abi::TRACED_STUBS`
@@ -2059,6 +2249,12 @@ impl MacosTraceBackend {
         let s = &mut self.sessions[index];
         s.stopped = true;
         s.thread = tid(thread, s.id.0.generation);
+        // The thread this stop is about, bound once. `Session::thread` is still
+        // assigned above -- `thread_index` falls back to it for a thread that
+        // holds no slot, and the `Exec` event reports it -- but every decision
+        // below names this value rather than re-reading a field the next stop
+        // overwrites.
+        let thread = s.thread;
         if fields.get("reason") == Some(&"exec") {
             // **The exec happened, so this is where the candidate is adopted.**
             // `intercept` recorded the resigned image on the pending value
@@ -2071,18 +2267,25 @@ impl MacosTraceBackend {
             // intercepted, and umbra has no resigned image of its own to name for
             // it; keeping the previous value is what this did before the
             // candidate existed.
-            let adopted = match s.pending.take() {
-                Some(Pending {
-                    kind: ReturnKind::Exec { twin },
-                    ..
-                }) => Some(twin),
-                _ => None,
-            };
+            //
+            // **Drained whole rather than looked up by the stopping thread.** An
+            // `execve` keeps one thread and discards the rest, and the survivor
+            // is reported under a thread id belonging to the new image -- so the
+            // thread stopping here need not be the one that entered the
+            // `execve`, and keying the lookup on it would drop the candidate and
+            // leave the exec'd image half-mediated. At most one window is open,
+            // and none of them could survive the address space being replaced.
+            let adopted = std::mem::take(&mut s.pending)
+                .into_values()
+                .find_map(|p| match p.kind {
+                    ReturnKind::Exec { twin } => Some(twin),
+                    _ => None,
+                });
             if let Some(twin) = adopted {
                 s.twin = twin;
             }
             s.scratch.clear();
-            s.entry = None;
+            s.entry.clear();
             s.exec_generation += 1;
             let task = Arc::new(Task::acquire(s.id.0.native_id as i32)?);
             self.watchdog.as_ref().unwrap().add(task.clone());
@@ -2119,10 +2322,10 @@ impl MacosTraceBackend {
             });
             return Ok(());
         }
-        let regs = s.regs()?;
+        let regs = s.regs(thread)?;
         let pc = get(&regs, PC)?;
         let signal = rsp::number(&reply[1..3])? as i32;
-        if s.pending.as_ref().is_some_and(|p| p.gate == pc) {
+        if s.pending.get(&thread).is_some_and(|p| p.gate == pc) {
             // A stop *at* the return gate is only a return when the breakpoint
             // planted there is what produced it. Accepting any signal here ate
             // one: a resumed umbra routing trap reaches Darwin's `nosys`, which
@@ -2147,7 +2350,7 @@ impl MacosTraceBackend {
                 // and the gate breakpoint stays planted, so the real return is
                 // still classified by the `SIGTRAP` that produced it.
                 if TRANSIENT_SIGNALS.contains(&signal) {
-                    s.continue_run()?;
+                    s.continue_absorbed()?;
                     return Ok(());
                 }
                 return Err(error(
@@ -2158,14 +2361,16 @@ impl MacosTraceBackend {
                     ),
                 ));
             }
-            return self.finish_return(index, regs);
+            return self.finish_return(index, thread, regs);
         }
         if s.breaks.contains_key(&pc) {
-            return self.intercept(index, regs);
+            return self.intercept(index, thread, regs);
         }
-        // Continuing with `c` (no C signal) suppresses these attach transients.
+        // Continuing with no signal number suppresses these attach transients.
+        // Through `continue_absorbed` rather than `continue_run`, so absorbing a
+        // stop here cannot release the siblings into an open return window.
         if TRANSIENT_SIGNALS.contains(&signal) || (interrupted && signal == libc::SIGINT) {
-            s.continue_run()?;
+            s.continue_absorbed()?;
             return Ok(());
         }
         Err(error(
@@ -2324,7 +2529,11 @@ impl TraceBackend for MacosTraceBackend {
                         .any(|j| self.sessions[*j].done)
                     {
                         self.sessions[i].waiting.clear();
-                        self.sessions[i].return_stop(ReturnKind::Wait)?;
+                        // `WaitPlan::Park` is gated by `single_thread()`, so the
+                        // parked thread is the only thread this session has and
+                        // the slot still names it.
+                        let parked = self.sessions[i].thread;
+                        self.sessions[i].return_stop(parked, ReturnKind::Wait)?;
                     }
                     continue;
                 }
@@ -2356,11 +2565,11 @@ impl TraceBackend for MacosTraceBackend {
     }
     fn registers(&mut self, thread: ThreadId) -> Result<RegisterSet> {
         let i = self.thread_index(thread)?;
-        self.sessions[i].regs()
+        self.sessions[i].regs(thread)
     }
     fn set_registers(&mut self, thread: ThreadId, regs: &RegisterSet) -> Result<()> {
         let i = self.thread_index(thread)?;
-        self.sessions[i].set_regs(regs)
+        self.sessions[i].set_regs(thread, regs)
     }
     fn resume(&mut self, command: ResumeCommand) -> Result<()> {
         self.check_deadline()?;
@@ -2381,14 +2590,18 @@ impl TraceBackend for MacosTraceBackend {
         if command.mode == ResumeMode::SingleStep {
             return Err(unsupported("external single stepping"));
         }
-        if let Some(pc) = s.entry.take() {
-            let regs = s.regs()?;
+        if let Some(pc) = s.entry.remove(&command.thread) {
+            let regs = s.regs(command.thread)?;
             if get(&regs, PC)? == pc {
-                s.return_stop(ReturnKind::Syscall)
+                s.return_stop(command.thread, ReturnKind::Syscall)
             } else {
+                // Attributed to the thread the caller is answering for, not to
+                // whoever stopped last, for the reason [`Pending::thread`]
+                // records: the caller keys its in-flight operation by this
+                // thread and a miss on it abandons the rewrite in silence.
                 self.events.push_back(TraceEvent::SyscallExit {
                     task: s.id,
-                    thread: s.thread,
+                    thread: command.thread,
                     outcome: abi::outcome(&regs)?,
                 });
                 Ok(())
@@ -2489,7 +2702,11 @@ impl TraceControl for MacosTraceBackend {
             }
             return Err(e);
         }
-        if self.sessions.iter().any(|s| !s.done && s.pending.is_some()) {
+        if self
+            .sessions
+            .iter()
+            .any(|s| !s.done && !s.pending.is_empty())
+        {
             return Err(error(
                 "quiesce",
                 "syscall return in flight; drain next_event before retrying",
@@ -2527,6 +2744,222 @@ impl TraceControl for MacosTraceBackend {
 
 #[cfg(test)]
 mod tests {
+    /// This file's own text, for the three pins below.
+    ///
+    /// Reading the source is the same device `abi.rs` uses to pin the
+    /// interposer's descriptor test against its Rust twin, and it is worth the
+    /// same as that one: it pins a *decision*, not the wiring, and it fires on
+    /// cosmetic edits. Each pin says in its own message what a reader should do
+    /// instead of mechanically updating the literal.
+    const NATIVE_RS: &str = include_str!("native.rs");
+
+    /// The production half of this file -- everything above this module.
+    ///
+    /// **A pin that searched the whole file would find its own message.** The
+    /// assertions below quote the code they pin, so the quotes are themselves
+    /// occurrences of it; the first revision of the `single_thread` pin counted
+    /// three call sites, and the third was the sentence complaining about it.
+    fn production() -> &'static str {
+        NATIVE_RS
+            .split_once("#[cfg(test)]")
+            .expect("this module is introduced by a #[cfg(test)] attribute")
+            .0
+    }
+
+    /// The text of one method of this file, from its signature to the next item
+    /// at the same indentation.
+    fn body_of(signature: &str) -> &'static str {
+        let after = production()
+            .split_once(signature)
+            .unwrap_or_else(|| {
+                panic!("`{signature}` is no longer in native.rs; this pin needs rewriting, not deleting")
+            })
+            .1;
+        let end = ["\n    ///", "\n    fn ", "\n}"]
+            .iter()
+            .filter_map(|marker| after.find(marker))
+            .min()
+            .unwrap_or(after.len());
+        &after[..end]
+    }
+
+    /// **A completed return is attributed from its own window, never from the
+    /// session's last-stopped slot.** This is mutation probe M3.
+    ///
+    /// `Session::thread` is overwritten by every stop on the connection.
+    /// `finish_return` emits the `SyscallExit` the caller pairs with its
+    /// in-flight operation, and the caller keys those by thread and removes them
+    /// on the exit. A miss there is **not** an error: it is the "an exit for a
+    /// call we never intercepted" branch, which lets the kernel result stand and
+    /// abandons the rewrite in silence. So attributing from the session slot
+    /// would turn the loud escape this arc closed into a quiet one.
+    ///
+    /// **Why this is a source pin and not a live test, stated exactly.** The
+    /// mutation was run: `finish_return` was edited to read `s.thread`, the
+    /// crate rebuilt, and `mt_write` and `mt_spawn` both still passed. They
+    /// cannot catch it, and neither can any other test on this backend, because
+    /// the per-thread resume freezes every sibling for the whole of the window —
+    /// so nothing is running that could make the two values differ. The equality
+    /// is a *consequence of the freeze*, not a property of `finish_return`, and
+    /// it stops holding the moment anything resumes a sibling inside a window:
+    /// the deferred `single_thread()` removal, a `vCont` that names more than one
+    /// thread, or a future sibling-hold. That is the class of change this exists
+    /// to fail in front of, and it is precisely the class no runtime test on this
+    /// backend can be written for today.
+    ///
+    /// It is therefore worth exactly one thing: it makes the swap impossible to
+    /// make *silently*. It does not prove the attribution is right, and a reader
+    /// who satisfies it by renaming a variable has defeated it.
+    #[test]
+    fn a_return_is_attributed_from_its_window_and_never_from_the_session_slot() {
+        let body = body_of(
+            "fn finish_return(&mut self, index: usize, thread: ThreadId, regs: RegisterSet)",
+        );
+        assert!(
+            body.contains("thread: pending.thread"),
+            "`finish_return` must attribute its `SyscallExit` from `pending.thread`, \
+             the thread recorded when the window opened"
+        );
+        assert!(
+            !body.contains("s.thread"),
+            "`finish_return` read `Session::thread`. That slot names whoever stopped \
+             last on this connection, not the thread whose return this is. The \
+             caller removes its in-flight operation by thread and treats a miss as \
+             a call it never intercepted -- so a wrong thread here does not fail, \
+             it drops the rewrite and lets the kernel's own result stand. Read \
+             `pending.thread`; see `Pending::thread` for the full account."
+        );
+    }
+
+    /// **A stop absorbed inside a return window must not release the siblings.**
+    ///
+    /// Between `return_stop`'s `z0` and `finish_return`'s re-arm, the entry stub
+    /// carries no breakpoint for the whole process, and a sibling that reaches it
+    /// there walks straight through unmediated -- the `mt-write` escape. `stop`
+    /// absorbs two kinds of stop without opening a transaction: a transient
+    /// signal at the return gate, and a transient or attach signal anywhere else.
+    /// Both resume, and a bare `c` from either is that escape.
+    ///
+    /// Like `the_gate_absorbs_sigchld_and_never_absorbs_sigsys`, this pins the
+    /// decision and not the wiring, for the same reason: reaching the gate arm
+    /// needs an asynchronous signal delivered at one exact PC, and nothing can
+    /// make that happen on demand. `mt_write` covers the resume that *is*
+    /// schedulable -- reverting `return_stop` to a bare `c` fails it -- but
+    /// neither absorb path is reachable from a test.
+    ///
+    /// **Both halves are asserted, because the call sites alone were not enough.**
+    /// An earlier revision of this test checked only that `stop` routes through
+    /// `continue_absorbed`, and nothing checked what `continue_absorbed` does.
+    /// Measured: gutting the helper to an unconditional `self.continue_run()` --
+    /// reintroducing the exact escape it exists to prevent, on a path this suite
+    /// takes several times per run -- left all thirteen fixtures capturing and
+    /// every unit test passing, **including this one under its own name**. A pin
+    /// that cannot fail is worse than no pin, because it reads as coverage. The
+    /// helper's body is asserted below, and the mutation was re-run against it.
+    #[test]
+    fn a_stop_absorbed_inside_a_return_window_does_not_release_the_siblings() {
+        let helper = body_of("fn continue_absorbed(&mut self");
+        assert!(
+            helper.contains("self.pending"),
+            "`continue_absorbed` must consult `pending` to find out whether a \
+             return window is open; a body that does not look is a bare `c` \
+             wearing this function's name"
+        );
+        assert!(
+            helper.contains("self.continue_thread("),
+            "`continue_absorbed` must resume the open window's owner through \
+             `continue_thread`. Without it every absorbed stop releases the \
+             siblings into a stub this session has un-armed process-wide -- the \
+             `mt-write` escape with a signal in front of it, which no fixture in \
+             this crate catches."
+        );
+        let body = body_of("fn stop(&mut self");
+        assert_eq!(
+            body.matches("continue_absorbed()").count(),
+            2,
+            "`stop` absorbs a transient signal at the return gate and one away \
+             from it, and both must resume through `continue_absorbed`, which \
+             keeps an open window's freeze"
+        );
+        assert_eq!(
+            body.matches("continue_run()").count(),
+            0,
+            "`stop` resumed with an unqualified `c`. If a return window is open \
+             that releases every sibling into a stub this session has un-armed \
+             process-wide, which is the `mt-write` escape with a signal in front \
+             of it. Use `continue_absorbed`, which is the bare `c` when no window \
+             is open and the window's owner alone when one is."
+        );
+    }
+
+    /// **The exec stop drains every window; it does not look one up by the
+    /// thread that stopped.**
+    ///
+    /// An `execve` keeps one thread and discards the rest, and the survivor is
+    /// reported under a thread id belonging to the new image -- so the thread
+    /// stopping at the exec need not be the one that entered the `execve`.
+    /// Keying the `ReturnKind::Exec` candidate lookup on it would drop the
+    /// candidate, leaving `twin` naming the previous image and the exec'd image
+    /// half-mediated.
+    ///
+    /// **This is a source pin because no fixture discriminates it, and that is a
+    /// gap this arc did not create and does not close.** Measured: keying the
+    /// lookup back on the stopping thread leaves all thirteen fixtures
+    /// capturing, because the only case that reaches an exec stop re-execs the
+    /// *same* twin -- the candidate it drops is equal to the value already
+    /// there, so dropping it is a no-op. A case that execs a *different* image
+    /// would discriminate it; adding one closes a pre-existing #117/#134 gap and
+    /// belongs to its own arc, not to this ratification.
+    ///
+    /// So this asserts the shape and says plainly what it is worth: it stops the
+    /// natural-looking wrong edit that the per-thread rekeying made available,
+    /// and it proves nothing about twin adoption itself.
+    #[test]
+    fn the_exec_stop_adopts_its_candidate_without_keying_on_the_stopping_thread() {
+        let body = body_of("fn stop(&mut self");
+        assert!(
+            body.contains("std::mem::take(&mut s.pending)"),
+            "the exec stop must drain every window and scan the drained values \
+             for the `ReturnKind::Exec` candidate"
+        );
+        assert!(
+            !body.contains("s.pending.remove("),
+            "the exec stop removed a window by key. The thread that stops at an \
+             `execve` need not be the one that entered it -- the address space \
+             and its threads have been replaced -- so a keyed lookup drops the \
+             resigned-image candidate and leaves `twin` naming the image that is \
+             no longer running. Drain the map instead."
+        );
+    }
+
+    /// **`single_thread()` stays, and both of its call sites with it.**
+    ///
+    /// #135's sub-item 3 -- removing this guard from `Delivery::Fork` and
+    /// `WaitPlan::Park` -- is deferred, and the two-thread-parent-forking case
+    /// that depends on it is an explicit non-goal of this arc. Deferred by test
+    /// rather than by intention: the per-thread slots and the per-thread resume
+    /// make the guard *look* removable, and removing it widens the blast radius
+    /// to the whole fork lifecycle, where `attach_child`, the hardware gate and
+    /// the memory-restore map all assume one thread.
+    ///
+    /// Failing here is not a reason to edit this test. It is a reason to check
+    /// that the removal was ratified.
+    #[test]
+    fn the_fork_and_park_paths_still_refuse_a_multithreaded_tracee() {
+        assert!(
+            production().contains("fn single_thread(&mut self) -> Result<()> {"),
+            "`single_thread` is the guard that keeps `fork` and a blocking `wait4` \
+             off multithreaded tracees; its removal is deferred to its own arc"
+        );
+        assert_eq!(
+            production().matches("s.single_thread()?;").count(),
+            2,
+            "`single_thread` guards exactly two sites -- `Delivery::Fork` and \
+             `WaitPlan::Park` -- and both are still deferred. A third site is as \
+             much a surprise as a missing one."
+        );
+    }
+
     /// `SIGCHLD` is absorbed at a stop and `SIGSYS` is not, and the return gate
     /// reads the same list the general stop path does.
     ///

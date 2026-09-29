@@ -1,311 +1,386 @@
-# Fix round 2 — Multithreaded tracee, slice 0 (graph `dg-nsw71bqq`)
+# Fix — round 2 (graph `dg-0ved1w0e`, #135 multithreaded closure, slice 1)
 
-Node `fix`, visit 2, continuing the `implement` session. Date 2026-09-28.
-Change: **`wppwptxswssr`**, bookmark `feat/mt-fork`, parent `master` `e44d0db8`.
-Input: `/tmp/graph-dg-nsw71bqq/review-synthesis-r2.md`.
-Pin at the start of this round: commit **`f1b57a67`**, six paths — **both reviewers
-independently confirmed the tree did not move under them this round**, which is the
-no-root-writes policy from F4 working as intended.
+Node `fix`, round 2. Date 2026-09-29.
+Change **`qqxtnynk`**, bookmark `feat/mt-closure`, parent `d8a42def`.
+Input: `/tmp/graph-dg-0ved1w0e/review-synthesis-r2.md`, with the current
+`review-correctness.md` and `review-scope.md` in the tree as its evidence.
 
-**A deliberately small round, and it was kept small.** Round 1's twelve findings are
-all closed. Scope round 2 is a clean pass on all six targets; correctness round 2
-found exactly one gating item. Both reviewers judged this too small for a full round.
-So: exactly the listed edits, one lesson-28 sweep over them, gates re-run for the
-record, stop.
+> The commit id is not stated; writing this file moves it. `jj log -r qqxtnynk` is
+> the authority.
 
-**No code change, no new measurement, no production source, slice 1 not started.**
-`native.rs`, `abi.rs`, `rsp.rs`, `umbra_interpose.c`, `journal.rs`, `events.rs` and
-`run_fixtures.rs` remain byte-identical to master. `single_thread()` stays
-(`native.rs:498`, call sites `:1922`/`:1967`); the `debug_assert!` stays (`:571`).
-Waivers 3 and 4 remain unconsumed.
+**Both reviews pass and neither requires a code change.** `review_correctness` —
+PASS, merge-ready, all 11 round-1 findings closed. `review_scope` — PASS, inside the
+ratified envelope, all 6 closed. Both re-ran M7 and M8 themselves rather than
+accepting `fix-r1.md`.
+
+**This round's substance is a measurement, not an edit — and it did not come back
+the way anyone expected.**
 
 ---
 
-## Disposition
+## 0. Headline: the intermittent is not a flake, it is a mechanism, and it is
+## one-directional
 
-| id | Disposition |
+`SYN2-1` asked whether unmodified master flakes the way the branch appeared to.
+Measured, alternating, 15 runs each, full output of every run kept to its own file:
+
+**Sequentially — which is how CI runs it — master and the branch are equally stable.
+15/15 clean on each. The branch does not move master's flake rate.**
+
+Nobody had asked the next question, and it is the one that mattered:
+
+**Concurrently, master is stable and the branch is not — and the branch also breaks
+a master run happening alongside it.** The cause is fully established, reproducible
+on demand, and has nothing to do with the closure.
+
+`StrayFixtureChildren`, #134's stray reaper, enumerates **every process on the
+machine** whose executable file name equals the fixture's basename
+(`fixture_named_processes`) and `SIGKILL`s any that appeared during its window and
+was not in its `before` snapshot. It is constructed only by `mt_fixture` — that is,
+only for `mt_write` and `mt_spawn`. **Those two are `#[ignore]`d at master, so it
+never runs in a default suite run. This change un-ignores them, so it now runs in
+every default suite run** — and it cannot tell another suite's live tracee from its
+own stray, because they are the same binary at the same path.
+
+Per the synthesis's own instruction — *"if master is **stable** and the branch is
+not, **stop and report that**… it must not be written up as a disclosure"* — this is
+**escalated, not disclosed**. §2 states the decision it needs.
+
+---
+
+## 1. Disposition per finding
+
+| # | Disposition |
 |---|---|
-| **R2-1** | **Fixed** — and the identical defect was found in **two** further places the synthesis did not flag: the `mt_spawn` doc comment and the commit description |
-| **S2-1** | **Fixed** — inventory re-derived from every document's own header; all three errors corrected, and a fourth caught |
-| Cosmetic 1 | **Fixed** — `sandbox.rs` / `run.rs` crate-qualified |
-| Cosmetic 2 | **Fixed** — `native.rs:2386` → `:2387`, all five occurrences |
-| Guard figures | **Replaced** with the mechanism and the range; the load-bearing claim moved off the guard entirely |
-| §2.5 order | **Restructured** to lead with the structural argument, runs as corroboration |
-| Lesson 28 ×3 | **Added** to the item-6 payload as a process finding |
+| **SYN2-1** | **MEASURED — and ESCALATED, not disclosed.** Sequential: no difference. Concurrent: a verified, reproducible mechanism. §2, §3 |
+| SYN2-2 | **FIXED.** Count dropped entirely from `impl.md` §7 and `fix-r1.md`; no corrected number supplied. §4 |
+| SYN2-3 | **FIXED.** `impl.md` §3 now true parent-relative *and* round-relative. §4 |
+| SYN2-4 | **FIXED.** "17 mechanism pins" replaced by a pointer to audit §L; no count. §4 |
+| SYN2-5 | **RECORDED** for `publish` and `merge_gate`. §5 |
+| Lesson 28 | **Written up as a first-class synthesis of the arc's instances.** §6 |
 
 ---
 
-## R2-1 — the README attributed `mt-spawn`'s non-silence to a guard that fires 0/10 · **FIXED**
+## 2. SYN2-1 — the measurement, and the decision it needs
 
-The clause was *"the run does not end silently: the supervisor holds an independent
-per-thread guard…"*, sitting in the paragraph about `mt-spawn`. On `mt-spawn` that
-guard fired **0 of 10**. What actually ends that case in release is the path decode
-refusing the overwritten operand — `Io during path: null or overflowing pointer`
-(`EFAULT`) — which my own round-1 runs measured at **5 of 5** release runs, each
-exiting non-zero.
+### 2.1 The four configurations
 
-The README paragraph now says that, and the guard has been moved into a parenthetical
-that states what it *is* good for (it is why the supervisor layer is not single-slot)
-and explicitly disclaims the role it was given: *"It is not what makes this case
-non-silent, and the paragraph above used to say it was."*
+Every run's full output went to its own file and every figure below was read from
+those files, never off a terminal — which is the artifact the scope reviewer said it
+had lost. Each tree has its own fixture binary and its own redirect root, both built
+from byte-identical sources (`diff -q` clean). The master tree is a throwaway **git**
+worktree detached at `d8a42def`, verified unmodified: `pending` is still
+`Option<Pending>` and both MT cases still carry their `#[ignore]`.
 
-`impl.md` needed no change here and got none on this point: §2.3 already said
-"detectable" and "is timing", and §2.5's table already attributed release failures to
-`ProcessFailed` / `Io during path` without citing the guard. The synthesis's scoping
-was right.
+| configuration | runs | reaper active? | result |
+|---|---|---|---|
+| **master, sequential** | 15 | no | **15/15 clean** (11 passed each; the two MT cases are `#[ignore]`d there) |
+| **branch, sequential** | 15 | yes, but alone | **15/15 clean** (13 passed each), and **0 `REAPED` lines in all 15** |
+| **master ‖ master**, 6 pairs | 12 | no | **12/12 clean**, 0 `REAPED`, 0 failures |
+| **master ‖ branch**, 8 pairs | 16 | branch only | **master 0/8 clean; branch 8/8 clean** |
+| **branch ‖ branch**, 6 pairs | 12 | both | **5/12 clean, 7 failed** |
+| | **70** | | |
 
-**Beyond the finding, and the reason this round's sweep mattered: the same sentence was
-in two more places.** `tests/fixtures.rs`'s `mt_spawn` doc comment carried *"The run
-does not fail silently in release… The supervisor holds a second tripwire that ships"*
-followed by the 10-run figure, and the **commit description**'s `mt-spawn` bullet
-carried *"the run does not fail silently: the supervisor holds an independent
-per-`ThreadId` guard"*. Identical misattribution, identical position, all three written
-in the same round-1 pass — so a finding filed against one file was really a finding
-about one sentence copied three times. All three now name the EFAULT refusal as this
-case's mechanism and demote the guard to a parenthetical with its 0/10 rate.
+The run column sums to **70**, which is the number of log files the experiment left
+(`15 + 15 + 12 + 16 + 12`). Round 2 first wrote "forty-odd" and a later restatement
+made it "42" — that is `15 + 15 + 12`, the two sequential sets plus one concurrent
+set, with the other two concurrent sets' 28 runs dropped. The breakdown is given per
+configuration here so the total is checkable rather than asserted, which is the only
+form of a count this arc has managed to get right.
 
-## S2-1 — the stale-document note was wrong three ways · **FIXED**
+The sequential runs were **alternated** master/branch/master/branch rather than run
+as two blocks, so machine-load drift cannot produce the difference — and there was
+no difference to produce.
 
-That note is F5's entire mitigation for leaving thirteen other-arc documents in the
-tree, so being wrong inside it was worse than the thing it mitigated. Re-derived by
-reading every root document's own header rather than by pattern-matching filenames:
+### 2.2 The captured identities — the artifact this round was asked for
 
-| arc | PR | documents at `f1b57a67` |
-|---|---|---|
-| **`dg-nsw71bqq`** (this arc) | — | `impl.md`, `fix-r1.md` — **2** |
-| `dg-egt6apy1` (#117 + #121's escalation) | #129 | `fix-r2.md`, `publish.md`, `review-correctness.md`, `review-scope.md`, `review-synthesis-r1.md`, `review-synthesis-r2.md`, `review-synthesis-r3.md` — **7** |
-| `dg-29vwer0f` (#121) | #128 | `ci-round1.md`, `ci-round2.md`, `ci-fix-r1.md`, `ci-fix-r2.md`, `fix-r3.md`, `review-synthesis-r4.md` — **6** |
-
-All three of the synthesis's corrections confirmed:
-
-1. **Double-counted `fix-r1.md`.** §0 claimed it as this arc's and then listed
-   `fix-r1..r3.md` as previous-arc — it counted a file it had itself just written as
-   somebody else's. The stale `fix-*` range was `fix-r2..r3.md`.
-2. **Collapsed two prior arcs into one.** Seven documents are `dg-egt6apy1`'s; six
-   are `dg-29vwer0f`'s. The note attributed all of them to `dg-egt6apy1`.
-3. **"eight-plus" understated it.** The count was **13**.
-
-**And a fourth error, which this round's own sweep caught: the number is not stable.**
-This round's `fix-r2.md` overwrites `dg-egt6apy1`'s, so on this commit the inventory is
-**3 this arc's** and **12 stale** — 6 and 6 — and the stale `fix-*` range is
-`fix-r3.md` alone. §0 now carries the per-arc table, states the 13 → 12 movement and
-why, and §7.10 puts the instability itself on #132: *the inventory is not stable
-across rounds of the same arc.* Writing the note changes what the note describes,
-which is the same fixed-point problem §8 already has for its line counts.
-
-## Cosmetic 1 — ambiguous `sandbox.rs` / `run.rs` paths · **FIXED**
-
-Confirmed ambiguous, and both intended files are the `umbra-supervisor` ones:
+**master ‖ branch** (only the branch has a live reaper, so the kills go one way):
 
 ```
-crates/umbra-cli/src/commands/run.rs          crates/umbra-core/src/sandbox.rs
-crates/umbra-supervisor/src/run.rs            crates/umbra-supervisor/src/sandbox.rs
+master failing tests:   posix_spawn_write  8/8 runs
+                        symlink_cycle      3/8 runs
+master failure:         fatal signal/exception: T09      ← SIGKILL
+branch, same pairs:     13/13 CAPTURED, every run
+branch logs:            REAPED mt-write: stray fixture child pid …   (×11)
+                        REAPED mt-spawn: stray fixture child pid …   (×3)
 ```
 
-Every reference is now crate-qualified: `crates/umbra-supervisor/src/sandbox.rs:42-47`
-(the `occurrences != 1` hard-fail, verified at `:43`) and
-`crates/umbra-supervisor/src/run.rs:1218-1234` (the `write_root` derivation through
-`sandbox::render`, verified at `:1218`, `:1233`, `:1234`). `impl.md` §2.5 additionally
-now cites `crates/umbra-supervisor/src/sandbox.rs:18` for the `include_str!`, which is
-the fact that makes the argument one about *shipped* policy.
+The branch emitted `REAPED` lines for children **it did not create** — the same
+branch suite run sequentially produces **zero** `REAPED` lines in 15 of 15 runs. The
+pids it reaped were the master suite's live tracees, and master's failure is the
+`SIGKILL` arriving mid-syscall.
 
-## Cosmetic 2 — `native.rs:2386` should be `:2387` · **FIXED**
+**branch ‖ branch** (both reapers live, so the kills go both ways):
 
-Verified: `s.return_stop(ReturnKind::Syscall)` is at `native.rs:2387`; `:2386` is the
-`if get(&regs, PC)? == pc {` above it. Corrected in all five places that carried it —
-`impl.md` ×3 (§1's per-arm table, §1's correction note, §3), `fix-r1.md` ×2, and
-`tests/fixtures.rs`'s module header ×1.
+```
+failing tests:  mt_write   6     mt_spawn   6
+failure:        fatal signal/exception: T09   ×9
+REAPED lines:   1–3 per failing run
+```
 
-## The `events.rs:307` discrepancy — resolved as a race, and the claim moved off it
+**master ‖ master**: zero `REAPED`, zero failures, 12/12. **Concurrency alone does
+not break this suite.** The reaper does.
 
-Round 1 left two figures attributed but unreconciled: the reviewer's 5/5 in release
-against my 0/20. Round 2 resolved it by holding everything constant but the
-environment — same commit, same fixture binary (`02fb7ad8`, byte-identical across both
-rounds because the `umbra-test-child.c` diff is comment-only):
+### 2.3 What this is, stated exactly
 
-| case | condition | `InvalidState` fires |
-|---|---|---|
-| `mt-write` | idle | **1/20** |
-| `mt-write` | 10 spinners / 10 cores, loadavg 3.65 | **5/20** |
-| `mt-spawn` | idle | **0/10** — always `Io during path` |
+- **It is not a defect in the multithreaded closure.** No production tracer code is
+  involved. The failures are external `SIGKILL`s delivered by a *sibling test
+  process*, and they land on whichever tracee happens to be live — `posix_spawn_write`
+  and `symlink_cycle` when master is the victim, `mt_write` and `mt_spawn` when
+  another branch suite is.
+- **It is not new code, and #134 did not merely document the hazard — it recorded the
+  premise under which the design is safe.** `StrayFixtureChildren` shipped at master
+  with #134, its machine-wide-by-name matching is unchanged in this diff, and
+  `FIXTURE_LAUNCH`'s doc says why an interprocess lock was deliberately not taken:
+  *"cargo runs each test target's executable in sequence… Nothing in this workspace
+  supports two fixture test processes running at once… If that ever changes, this is
+  the place that has to change with it."* **The baseline experiment did not discover an
+  unknown defect — it deliberately violated a documented premise.** That is a better
+  disposition than "latent debt nobody noticed", and it is why the repair belongs where
+  #134 said it would.
+- **It is newly reachable, and this change is what makes it so.** Removing the two
+  `#[ignore]` attributes — the ratified success criterion — moves the reaper from
+  "runs only under `--ignored`" to "runs in every default suite run".
+- **CI is not affected, and that is now measured rather than reasoned.** The
+  correctness reviewer sampled the process table during the real CI invocation:
+  **max concurrent test binaries = 1 across 807 samples**, zero samples with two or
+  more — so `cargo` serialises test executables and the three `--test` flags on one
+  invocation cannot overlap. The main workspace job sets no fixture environment, so
+  the reaper takes its reap-nothing path. And the scope reviewer added a ground
+  neither the dispatch nor I had: the two macOS jobs **share** the self-hosted runner
+  label, so "different jobs" would not have settled it by itself — but the reaper
+  matches by *fixture basename*, and those jobs use `umbra-test-child` versus
+  `umbra-userspace-toy`, so no cross-kill is possible even if they overlap. Both of
+  those are the reviewers' measurements, not mine.
+- **Developers and reviewers are affected, newly.** Two suites overlapping on one
+  machine now break each other. That is exactly the situation two reviewers on one
+  host were in.
 
-It is a race on machine load. The reviewer sampled while a parallel reviewer occupied
-the same cores; I sampled a quiet machine. **Neither figure was wrong**, and my "the
-denial kills the child first" was the *usual* case rather than the only one —
-`impl.md` §2.3 now says exactly that instead of presenting two numbers and leaving the
-reader to reconcile them.
+### 2.4 The two unexplained intermittents — what I will and will not say
 
-**The load-bearing claim is now off the guard entirely, because it never needed it.**
-Release non-silence rests on two witnesses that hold every time:
+The mechanism above produces **exactly** the observed failure shape: a fixture tracee
+`SIGKILL`ed mid-run, surfacing as `fatal signal/exception: T09` through
+`next_event().unwrap()`, failing the test and exiting `101`.
 
-- the **denial** — guaranteed by the structural argument below, not by sampling;
-- the **non-zero exit** — 20 of 20 in the enforced runs measured for `impl.md`.
+- **The scope reviewer's 2 failures in 11 runs** are *consistent with* it in shape,
+  signal and count. Whether that reviewer's runs actually overlapped another suite is
+  **not established** and I have no way to establish it. **I do not assert it as the
+  cause.**
+- **The `101`** is likewise consistent — but `101` is the generic Rust test-harness
+  failure code, so it is weak evidence on its own, and that run's output was lost.
+  **I do not assert a cause for it either.**
 
-Round 2's contention runs are counted separately and not folded in: the review reports
-`InvalidState` frequency for them, not exit codes, so they corroborate the guard's
-range and nothing else. An earlier draft of this section aggregated them into a "30 of
-30" exit figure, which was wrong twice over — round 2 ran 50 runs, not 10, and their
-exit codes were never reported. Caught by this round's sweep; see the table below.
+What has changed is that the arc now has a **verified mechanism that produces this
+failure mode**, where before it had two open questions. That is worth more than
+either attribution would have been, and it is as far as the evidence goes.
 
-The guard is 1/20–5/20 on `mt-write` and 0/10 on `mt-spawn`: a contention-dependent
-extra witness. It stays in the document for the two reasons that do not depend on its
-frequency — it is why the "silent in release" sentence was wrong, and its
-per-`ThreadId` keying is the asymmetry that localises the defect and tells us slice
-1's shape is the architecturally consistent fix.
+### 2.5 The decision — the human's call, not mine
 
-## §2.5 now leads with the structural argument · **RESTRUCTURED**
+**Not a scope breach and not a correctness defect**; both reviews already pass on the
+tree as it stands, and this changes neither verdict. The question is only whether to
+publish with the hazard documented or to close it first.
 
-Round 2's correctness review judged the policy argument to outrank the run counts and
-asked that the document lead with it. It now does, as four checkable facts before any
-run is mentioned:
-
-1. `TEMPLATE` is `include_str!(".../experiments/seatbelt/umbra.sb")`
-   (`crates/umbra-supervisor/src/sandbox.rs:18`) — the argument is over the policy the
-   binary ships, not a file a deployment supplies.
-2. Exactly **one** line matches `^(allow file-write` in that template (`umbra.sb:13`),
-   beside `(deny default)` and `(allow file-read*)`, with the template's own closing
-   line disclaiming `/tmp` and `/private/var/folders` carve-outs.
-3. `render()` **hard-fails** unless the token appears exactly once
-   (`crates/umbra-supervisor/src/sandbox.rs:42-47`) — no path renders a profile with a
-   second or missing write allowance.
-4. The one allowance is `<store>/<run-id>/root`
-   (`crates/umbra-supervisor/src/run.rs:1218-1234`), and an escaped write is by
-   definition **unrewritten**, so it targets the tracee's workspace path — outside the
-   sole allowance. The run root is a fresh UUID directory created during preparation,
-   so no argv operand can name it.
-
-A `(deny default)` profile whose only write allowance is a path the escaped write
-cannot be addressing must deny that write. The 20 runs are labelled *"The
-corroborating runs"* and framed as confirming the construction behaves as read, not as
-establishing it.
-
-## Added to the item-6 payload: lesson 28 fired three times, as a process finding
-
-Now `impl.md` §7.7, recorded as process rather than code:
-
-1. the original README invariant that slice 0's own README edit corrected;
-2. **the fix for (1) introduced R2-1** — a false mechanism attribution inside the very
-   paragraph written to remove one;
-3. **the fix for F5 introduced S2-1** — a stale attribution inside the note written to
-   stop stale attributions misleading readers.
-
-Each was caught only because a reviewer swept the *corrected text* adversarially
-rather than the change as a whole. The recorded conclusion: in this codebase a
-documentation correction is itself a likely site of a new false claim, so correction
-passes should be reviewed as adversarially as code, and a fix worker should sweep its
-own corrections before handing them on. §7.7 also records the fourth instance, caught
-inside this round by that sweep (the 13 → 12 count).
-
----
-
-## Lesson-28 sweep over everything edited in this round
-
-The named failure mode of this round, so it was run deliberately over each edit rather
-than over the change as a whole. **Nine issues found; all nine fixed** — and only one
-of them is the finding the synthesis filed. The other eight were in round 1's
-corrections or in this round's own, which is precisely the pattern §7.7 records.
-
-Three of the nine are the *same* defect as R2-1 in three different places: the README
-(the filed finding), the `mt_spawn` doc comment, and the commit description. All three
-were written in the same round-1 pass, so a finding scoped to one file was really a
-finding about one sentence that had been copied three times.
-
-| swept | found |
+| option | what it costs |
 |---|---|
-| README `mt-spawn` paragraph (R2-1 fix) | **Found:** the identical misattribution in `tests/fixtures.rs`'s `mt_spawn` doc comment, which the synthesis had not flagged. Fixed. |
-| §0 stale-document note (S2-1 fix) | **Found:** the corrected count is itself unstable — writing this round's `fix-r2.md` moves it 13 → 12. Stated in §0 and put on #132 (§7.10). |
-| §7's new process item (renumbering) | **Found:** inserting it as item 7 silently invalidated four cross-references — `impl.md` §7.9→§7.10 and `fix-r1.md` §7.8→§7.9, §7.9→§7.10. All repointed and every `§7.N` reference re-checked against an existing item. |
-| §7.9's PR-title item | **Found:** it still said *"the commit description stays as written"*, which stopped being true when round 1 amended the body to drop the silent-in-release claim. Reworded to say the type and framing are what both reviews ratified, and that the body was amended. |
-| §0/§8 path counts | Six → **seven** paths and three process documents, since `fix-r2.md` joins the diff. §8's content subtotal is unchanged in kind: the four content files' counts are the stable ones and are restated from the tool, while the process documents stay named-but-uncounted for the fixed-point reason §8 gives. |
-| §2.5 restructure | No new claim introduced: every one of the four structural facts was re-verified against source in this round (directive count by `grep -c '^(allow file-write'` = 1; `include_str!` at `sandbox.rs:18`; `occurrences != 1` at `:43`; `write_root` at `run.rs:1218`/`:1233`/`:1234`). |
-| Cosmetic path/line fixes | Verified by re-grepping for the old forms afterwards: zero remaining `:2386`, zero unqualified `sandbox.rs:42-47` or `run.rs:1218-1234`. |
-| The "non-silence rests on X" claim | **Found:** the draft aggregated my 20 enforced runs with round 2's contention runs into "30 of 30 exited non-zero". Wrong twice: round 2 ran **50** runs (20 idle + 20 loaded `mt-write`, 10 `mt-spawn`), not 10, and the review reports `InvalidState` frequency for them rather than exit codes. Corrected to **20 of 20**, with the two sets kept separate in `impl.md` §2.3 and §2.5. |
-| Every `§N` cross-reference in all three documents | **Found:** `§0` resolved to nothing — `impl.md`'s headline section was unnumbered while three documents referred to it as `§0`. Heading renamed to `## 0. Headline: …`. Every `§N`/`§N.M` reference in `impl.md`, `fix-r1.md` and `fix-r2.md` now resolves to an existing heading or item, checked mechanically. |
-| `fix-r1.md`'s description of `§8` | **Found:** it still claimed `§8` "carries per-file line counts including the two process documents", which stopped being true when `§8` was restructured around the fixed-point problem in the same round. An as-of note now scopes round 1's six-path figure to `f1b57a67` and states what `§8` does instead. |
-| The **commit description** | **Found:** the identical R2-1 misattribution, a *third* instance — its `mt-spawn` bullet said "the run does not fail silently: the supervisor holds an independent per-`ThreadId` guard". Amended to name the EFAULT refusal, with the guard demoted to a parenthetical stating its 0/10 rate. The `mt-spawn` severity paragraph was also reordered to lead with the structural policy argument, matching `impl.md` §2.5. |
-| **This document's own panic-line claim** | **Found:** the draft said the `mt_write` assertion line moved 398 → 406, extrapolated from the file growing rather than measured. It is still **398** — every edit this round landed after it. Corrected, and left recorded in the gates section as the fifth instance. |
+| **(a) Ship as-is**, document the hazard in the harness, file a follow-up | CI is unaffected; the cost falls on concurrent local runs, which is where it has already been paid once |
+| **(b) Scope the reaper before publish** — restrict it to children this process created | Touches #134's shipped reaper, which is the **deferred item 5** (orphan-leak) machinery, so it is outside the ratified envelope. And the scoping is a design decision, not a one-liner — see the correction below |
+| (c) Re-`#[ignore]` the two cases | Undoes the ratified success criterion. Not viable |
+
+> **A correction to limb (b)'s stated reason, from the scope reviewer — it was too
+> strong, and it sat in tension with the follow-up box below, which names a descendant
+> check.** "Parentage is not a usable filter" is wrong as written. A sibling suite's
+> tracee is *not* a descendant of this process, so a descent test **would** correctly
+> spare it. The real difficulty is the other way round: the stray this reaper exists
+> for has been **reparented to `launchd`** by the time it is reaped, so a descent
+> filter fails in exactly the case the reaper is for. A descent filter therefore buys
+> concurrency-safety at the cost of the reaper's actual job — a design decision on
+> deferred item 5's machinery, not a mechanical fix. **The conclusion stands on firmer
+> ground than the reason I first gave it.**
+
+**My recommendation was (a)**, on the grounds that CI is unaffected, that the reaper is
+pre-existing shipped code, and that item 5's machinery is explicitly deferred to its
+own arc — the same reasoning that kept the exec fixture out of round 1. **Both
+reviewers endorsed (a) at round 3 with no escalation**, and round 3 delivered the
+harness note that (a) depends on: see `fix-r3.md`.
+
+> **Tracking issue for `merge_gate` to file.** `StrayFixtureChildren` matches
+> candidate strays by executable *name*, machine-wide, so it cannot distinguish a
+> sibling suite's live tracee from its own stray. Not introduced by this change; newly
+> reachable because of it. The issue should carry:
+>
+> - **Concurrent developer worktrees** — the real-world exposure, and this repository
+>   is worked in `umbra-worktrees/`.
+> - **The conditional case of two `native-qualification` jobs on one physical host** —
+>   not reachable today, because those jobs use different fixture basenames, but the
+>   basename is what makes it safe rather than the job boundary.
+> - **Master's own revisit trigger** — `FIXTURE_LAUNCH`'s *"if that ever changes, this
+>   is the place that has to change with it"*, which this arc is the first thing to
+>   trip.
+> - **The design decision**, stated above: a per-run marker in the spawned child, or a
+>   descent check that would have to be reconciled with strays reparented to `launchd`.
+>   Related to deferred #135 item 5.
 
 ---
 
-## Gates, re-run against the final tree (lesson 24), verdicts read by name (lesson 23)
+## 3. What the measurement also settles
 
-The C fixture was recompiled from this tree and `cargo build -p umbra-platform-macos
---tests` re-run **after** the last edit, before any figure below was taken. The only
-compiled artefact this round could affect is `tests/fixtures.rs`, and only its
-comments changed.
+- **The `3/3` re-run claim is restated** in `fix-r1.md` §7 with the candour the `101`
+  gets. It names both observations rather than picking one: it was true for me and
+  false for a reviewer **on the same tree**, and neither of us was wrong about what we
+  saw. What was wrong was the assumption behind reporting it — that repeated runs of
+  this suite on this machine are independent observations. With a second suite
+  running, they are not.
+- **`mt_write` and `mt_spawn` are not implicated.** 15/15 sequential here, 8/8 under
+  a concurrent master, and 12/12 in the reviewer's dedicated runs. Where they fail,
+  they fail by receiving `SIGKILL` from another test process.
 
-| Gate | Result |
+---
+
+## 4. SYN2-2, SYN2-3, SYN2-4
+
+**SYN2-2 — the count is gone, and no number replaces it.** `impl.md` §7 no longer says
+"added to it twice" or "the second time"; `fix-r1.md` §0 no longer says "for the second
+time in this arc". §7 now states that the pre-arc figure is **four** per D5 — the only
+reading that stays stable — and that this arc's own additions are **named and
+deliberately not totalled**, because every count of them has been wrong in every round,
+including the ones written inside the fix for the previous wrong count. The synthesis
+asked for no corrected number and none is supplied.
+
+**SYN2-3 — true on both readings.** §3 said *"no existing test function was modified"*,
+which is true against the parent and false against this change's own history: round 1
+edited the absorb pin, a test this change created. It now states both, and says why the
+parent-relative claim alone reads as exhaustive and is not.
+
+> **Round 2 recorded this as "SYN-5's exact shape, in the paragraph where SYN-5 was
+> fixed". That framing was wrong twice over, and §6 carries the corrected one.** The
+> sentence is byte-identical at rounds 0 and 1 — the SYN-5 fix changed the sentence
+> *next to* it, not this one — so the correction and the defect were never one
+> sentence. What actually happened is §J's **original** generator: round 1's *other*
+> deliverable joined the diff and silently falsified prose that had been true when
+> written. A **code** edit — adding assertions to the absorb pin, a test this change
+> created — made a sentence in a **different file** false, and no sweep of either file
+> alone could see it.
+
+**SYN2-4 — the count is replaced by the enumeration, not by a better count.**
+"All 17 mechanism pins" is gone; `fix-r1.md` §7 now points at audit §L as the
+enumeration and checks mechanism by mechanism without totalling. §L lists 12; the 17 was
+my own working set with extra mechanisms folded in, and an unenumerated total is the
+same defect as the symbol count withdrawn for SYN-8. The mechanisms themselves remain
+verified — byte-identical against the parent in production source, re-checked this
+round.
+
+---
+
+## 5. SYN2-5 — root process documents belong to other arcs
+
+Recorded for `publish` and `merge_gate`, with **no action on the files**; they are not
+this arc's to change.
+
+The worktree root carries `review-synthesis-r1.md` (arc `dg-egt6apy1`), `publish.md`
+(#129), and `review-synthesis-r2/r3/r4.md` and `ci-round1.md` from earlier arcs. All are
+tracked at master and **none is in this diff**. This arc's syntheses exist only under
+`/tmp/graph-dg-0ved1w0e/` and in `knowledge/umbra/graph-audits/dg-0ved1w0e-*`.
+
+**`publish` must not read process documents from the worktree root.** `merge_gate`
+should carry this as a live instance of #132, the root-document convention issue, which
+is already open and out of scope here.
+
+---
+
+## 6. Lesson 28 — the arc's instances, as one finding
+
+#134 called this *"plausibly this arc's most transferable finding"*. The evidence is now
+strong enough that it outweighs either defect this arc measured, and it belongs in the
+merge-gate record as a first-class finding rather than as a per-round footnote.
+
+**The generator, restated from this arc's evidence.** The fixed point is not a document
+editing itself. It is **the correction pass itself** — the act of restating an
+established fact in new words is the act that manufactures a new false one. Every
+instance below is a claim written *while fixing a different claim*, and in each the
+author had just demonstrated they understood the underlying mechanism.
+
+**This arc's instances, in order:**
+
+| instance | shape |
 |---|---|
-| `cargo fmt --all -- --check` | exit 0 |
-| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, **0** lines matching `^(warning\|error)` |
-| `cargo test --workspace --all-targets` | exit 0; **52 suites, 832 passed, 0 failed, 5 ignored** |
-| `--test fixtures` (integration env) | **11 passed, 0 failed, 2 ignored**; **0** `SKIP`, **0** `MISSED` |
-| `--test provider_ipc` | 1 passed — `CAPTURED open-libc provider IPC` |
-| `--test sandbox_launch` | 4 passed |
-| `-p umbra-cli --test run_fixtures` | 10 passed, **20** distinct `PASS` verdicts, 2 declared `SKIP nfs_fixture_matrix` / `SKIP nfs_utility_matrix` |
-| `-p umbra-cli --test resume_cli` | 3 passed |
-| `-p umbra-supervisor --test reopen` | 7 passed |
-| `smoke.sh` untraced | **12 of 12 PASS**, both new arms included |
+| **SYN-1** | The claim that the per-thread tripwire pinned the process-wide one-window property. **Written in round 0's correction pass**, propagated to five sites across three of that round's own deliverables. The `native.rs` comment stated the correct mechanism in its **first sentence** and misattributed it in the next. Found by two reviewers independently, by reading and by measurement; by no author sweep. |
+| **SYN2-3** | *"no existing test function was modified"* — true when written and false afterwards, because **round 1's code edit to the absorb pin falsified a sentence in another file**. §J's original generator: the round's own other deliverable joining the diff invalidates what the round just corrected. Neither file's sweep could see it alone. |
+| **SYN2-2** | A count of this arc's own firings, wrong in every round that stated one — **including the rounds that were fixing the previous wrong count**. How many rounds that is, is itself a count of this arc's own corrections, and it is not supplied: round 2's "five consecutive rounds" was unsupported, it originated as "fourth" in a review and was escalated to "fifth" in a synthesis, and it reached a table whose subject is wrong counts past an author sweep, two reviewers and the driver. The right move is to stop producing the number. |
+| **SYN-8 / SYN-9** | A symbol count with no recorded command, and a symbol name that passed its own check **as a substring of the real name** — a verification that confirmed itself. |
+| **SYN-6 recurrence** | Fixed a count; wrote another one paragraph later. **Caught in-round by the author** — the first time in the arc that happened, and only because the sweep was run against the round's own new text rather than against the reviews. |
+| **fix-r1's `fixture_argv`** | A function name wrong in `fix-r1.md` while **restating** two reviews that both had it right, and an `impl.md` that had it right. The restatement was the risky act, not the original. |
+| **`review_scope`'s own two** | It nearly filed a **critical false finding** from a bad `grep` that appeared to show a keyed `remove` where production has `std::mem::take`; and it carried an unverified `impl.md` claim into round 1. Disclosed both itself. |
+| **The dispatch's own** | Round 2's instructions pointed both reviewers at another arc's `review-synthesis-r1.md`. Caught by both reviewers; neither contaminated. |
 
-**The 832 figure carries the same qualification it has carried since round 0 and is
-still the weaker figure**: no `--nocapture` and no fixture environment, so every
-integration case in it takes `fixture_argv`'s skip branch (`tests/fixtures.rs:47`) and
-reports `ok` with its `SKIP` invisible. The rows beneath it are the qualification.
+**What that list shows that no single instance does.** It fired in the author, in both
+reviewers, and in the dispatch — every role in the graph, including the ones whose job
+is to catch it. It is not attributable to carelessness or to a weak participant. And
+the instances that were caught before shipping were caught in one of two ways, and
+neither is "the writer looked harder". **A different reader than the writer** caught
+SYN-1, SYN2-3 and the dispatch's own mis-pointed synthesis. **Running the sweep against
+the round's own new text rather than against its inputs** caught the SYN-6 recurrence
+and `fix-r1.md`'s wrong function name. That is the actionable split — and this sentence
+previously said "the two instances" and then named four, which is the catalogued defect
+occurring inside the paragraph cataloguing it.
 
-**The eleven `CAPTURED` verdicts, read by name from this round's own captured
-output:** `argv0-check`, `dirfd-rename`, `dup-inherit-write`, `exec-write`,
-`fork-write`, `grandchild-write`, `open-libc`, `open-svc`, `posix-spawn-write`,
-`symlink-cycle`, `wnohang-wait`. Zero `SKIP`, zero `MISSED` in that run.
+**The remedies that actually worked in this arc**, distinguished from the ones that
+sounded good:
 
-*On the `PASS` count:* correctness round 2 noted its own first count came back 15
-rather than 20 and reported it as a grep artefact rather than a finding — five verdicts
-share a line with the `test <name>` prefix under `--nocapture`. Counting distinct
-`PASS <case>` occurrences rather than lines gives 20, which is what the table above
-reports and what round 1 reported.
-
-**The two `SKIP`s are skips, not passes**, both on `UMBRA_TEST_SKIP_NFS_MATRIX` — the
-same opt-out CI sets for that job. Nothing about a live NFS mount is qualified here.
-
-**The five `#[ignore]`d tests, by name:** three pre-existing NFS-fault cases in
-`umbra-storage-nfs/tests/mounted.rs`, plus `mt_write` and `mt_spawn`.
-
-**Both `#[ignore]`d cases re-measured with `--ignored` against this build**, giving the
-same two verdicts as rounds 0 and 1 — this round changed what the documents claim, not
-what the tracer does:
-
-```
-thread 'mt_write' panicked at crates/umbra-platform-macos/tests/fixtures.rs:398:5:
-MISSED mt-write: the second thread's output reached the host at …
-
-thread 'mt_spawn' panicked at crates/umbra-platform-macos/src/native.rs:571:9:
-a second intercepted syscall entered while one was still in flight: …
-```
-
-The `mt_write` assertion line did **not** move this round: it is still
-`fixtures.rs:398`, because every edit this round landed *after* it (the `mt_spawn` doc
-comment sits further down the file). `impl.md` §5.5's record of the earlier 373 → 375
-→ 398 movement therefore stands unchanged.
-
-*This paragraph is the round's fifth lesson-28 catch, and it was mine.* The draft of
-this document asserted the line had moved to 406 — extrapolating from "the file grew"
-without running it. Running it gave 398. Recorded rather than quietly corrected,
-because it is the identical error class this round exists to sweep for: a plausible
-number written into a correction pass without being measured.
-
-**No new measurement was taken.** Every enforced-run figure in `impl.md` is round 1's,
-restated; round 2's contention table is the reviewer's, attributed to it.
+1. **Make the code assert what the prose claims.** SYN-1's five-site correction would
+   have been just as driftable as the original. Adding `debug_assert!(pending.is_empty())`
+   is what makes the next revision of that paragraph unable to go quietly wrong — and it
+   turned out to close a real detection gap too. The correctness reviewer measured it and
+   I re-verified it here, rebuilt, 3 runs of 3: under M1 the round-0 tree failed only
+   `mt_write` — `mt_spawn` **passed with the freeze deliberately broken** — and the
+   current tree fails **both**, `mt_spawn` on the new assertion's own message. The
+   assertion written to make a comment honest turned out to be the only thing that
+   detects a broken freeze on that path.
+2. **Stop producing the number.** Not a better count — no count. Applied to the symbol
+   figure (SYN-8), the pin total (SYN2-4), the arc's own firings (SYN2-2), and the clean-
+   run tally. Each had been "corrected" at least once before being withdrawn, and the
+   corrections were wrong too.
+3. **Sweep the round's own new text, not its inputs.** The one author-caught instance
+   came from re-reading what this round had just written. Re-reading the reviews finds
+   nothing, because the reviews were right.
+4. **Measure the thing nobody measured rather than disclosing it.** SYN2-1 was heading
+   for a third careful disclosure of an unexplained intermittent. One throwaway worktree
+   and **70 suite runs** turned it into a mechanism. The instinct to disclose honestly is
+   not a substitute for the cheap experiment.
 
 ---
 
-## Not done, and why
+## 7. Gates, re-run
 
-- **Slice 1**, any code change, any production-source edit, any new measurement — out
-  of scope by instruction and by both reviewers' judgement that this round is small.
-- **Removing the twelve other-arc root documents** (F5/S2-1). They belong to two other
-  arcs and deleting them would pre-empt #132; noted precisely instead, which is the
-  mitigation S2-1 exists to keep honest.
-- **Items 6 and 7** — `publish`'s obligations, blocked here by #123/#131. Item 6
-  remains marked a ratified ship-gate.
-- **The PR title** — `publish`'s to set; recommendation recorded at `impl.md` §7.9.
+| Gate | Verdict |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test --workspace --all-targets -- --test-threads=1` | **exit 0**, 52 suites ok, 0 failed, 3 ignored (the pre-existing NFS fault-injection cases) |
+| direct tracer + `provider_ipc` + `sandbox_launch` + `--lib` | exit 0; **14 `CAPTURED`, 0 `SKIP`** (13 fixtures + the provider-IPC verdict); 13 / 1 / 4 / 36 passed |
 
-Change **`wppwptxswssr`** on `feat/mt-fork`, parent `master` `e44d0db8`.
+**Qualified by `CAPTURED` (lesson 23)** from the `--nocapture` run; the workspace run
+captures stderr and its `ok` is exactly the signal SYN-10 shows these cases can emit
+without running.
+
+**Rebuild discipline (lesson 24), and the artifact hazard.** The `transport-raw`
+provider was rebuilt **immediately before** its symbols were read, because a
+default-feature `cargo build --workspace --bins` overwrites that path *and moves mtime
+backwards*, so freshness cannot be judged from the file:
+
+```
+$ cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
+  warning: …: libnfs raw binding: 16 functions emitted
+$ nm target/debug/umbra-storage-nfs-userspace | grep -E " _rpc_(connect_async|service|nfs4_compound_task)$"
+00000001001244ec T _rpc_connect_async
+0000000100128518 T _rpc_nfs4_compound_task
+0000000100123464 T _rpc_service
+```
+
+The tracer provider, same discipline: `Session15continue_thread`,
+`Session17continue_absorbed`, and the `vCont;c:` literal present in a binary built
+immediately before reading it.
+
+**Standing constraints re-verified.** `z0`/`Z0` byte-identical — the filter over the
+whole diff returns nothing. `single_thread()` stays with both call sites. Deferred items
+3 / 4b / 5 / 6 absent. No line numbers in new text. The throwaway master worktree is
+outside the repo and is **not** in this diff.

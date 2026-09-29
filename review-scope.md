@@ -1,321 +1,215 @@
-# review-scope — `dg-egt6apy1` / #117 + #121's escalation — **ROUND 3 (confirmation pass)**
+# Review — scope (graph `dg-0ved1w0e`, #135 multithreaded closure, slice 1)
 
-**Node:** `review_scope`, visit 3. Date 2026-09-28.
-**Slice:** change **`puyyxvmvmnpkwlmnnusmrqrvqkzsypnz`**, bookmark
-`feat/fork-lifecycle`, parent `master` `7c3ecc8f`. Per lesson 26 no working-copy
-commit id is cited as identity; it moved twice more during this round.
+Node `review_scope`, **visit 6** — single-item confirmation. Date 2026-09-29.
+Remit: scope only. Mechanism correctness is `review_correctness`'s node.
 
-**Scope of this pass, as directed:** a confirmation pass over S1/S2/S3 only.
-Not re-derived: the `TRACED_STUBS` row count, the four standing guardrails, or
-the 8 ratified escalations (S1's one added line is a `debug_assert!` in
-`return_stop` and touches none of them). Rounds 1 and 2 are preserved at
-`dg-egt6apy1-review-scope.md` and `-r2.md`.
+Inputs read end to end across this arc: `/tmp/graph-dg-0ved1w0e/audit.md`,
+`/tmp/graph-dg-0ved1w0e/design-gate.md` (the ratification — the yardstick),
+`impl.md`, `fix-r1.md` … `fix-r5.md`.
+
+**Verdict: PASS — clean. Nothing false found.** R-1 is repaired by deletion, the
+repaired sentence is true on every clause, the envelope is unmoved, and all five
+dispatched confirmations reproduce independently. No new sweep class opened; the
+deliberately-left items stay left, and are listed as left.
+
+---
+
+## Pin
+
+| | |
+|---|---|
+| Change | `qqxtnynk`, bookmark `feat/mt-closure` |
+| Commit reviewed | **`b4f2d684`** |
+| Parent | `d8a42def` |
+
+No commit id is asserted as current; `jj log -r qqxtnynk` is the authority. Every
+line number below is a **quotation** — of master's removed `#[ignore]` text, or of a
+citation under discussion — never a location looked up and published.
+
+---
+
+## Part 1 — The five confirmations, reproduced independently
+
+| # | Claim | Confirmed |
+|---|---|---|
+| 1 | No cardinality replaces the numeral | ✅ `grep -inE 'carried (six\|five\|four\|three\|two\|one\|eight\|nine\|ten\|[0-9]+)'` over the file: **zero matches** |
+| 2 | Only `fixtures.rs` moved | ✅ `jj diff --from d95b3361 --to b4f2d684 --name-only`: `fixtures.rs` plus `fix-r5.md`, `review-correctness.md`, `review-scope.md` — the three process documents the workers write. **One source file.** And within it, the **only** content change is the single line |
+| 3 | `native.rs` sha256 begins `81e1cd50c79f3af6` | ✅ reproduced: `81e1cd50c79f3af62cd6c07f…`, the visit-2 fully-verified value |
+| 4 | `native.rs:571` exactly once, inside the master transcript | ✅ **one** occurrence, and it is the only `native.rs:NNN` citation left in the file; it sits inside the ` ```text ` fence under *"Measured against master (`e44d0db8`), three runs out of three"* |
+| 5 | Non-comment changed lines vs master | ✅ `fixtures.rs` **exactly six** — 6 removals, **0 additions**, all the two `#[ignore]` attributes; `umbra-test-child.c` **zero** |
+
+### The reaper, by body extraction
+
+Symbol-anchored, per the hazard I reproduced at visit 5 — `struct
+StrayFixtureChildren` sits at **line 560 at master and 621 here** because the comment
+above it grew, so any fixed window straddles different content and lies.
+
+| component | master vs `b4f2d684` |
+|---|---|
+| `struct StrayFixtureChildren` | **BYTE-IDENTICAL** (`f3ef65979aad81c4`) |
+| `impl Drop for StrayFixtureChildren` | **BYTE-IDENTICAL** (`494ac7f222ba6f49`) |
+| `fn fixture_named_processes` | **BYTE-IDENTICAL** (`b1c004fbebca1f50`) |
+| `fn fixture_processes_named` | **BYTE-IDENTICAL** (`988b4952789e707b`) |
+
+Third consecutive visit at these four digests. Deferred item 5's machinery remains
+unopened.
+
+---
+
+## Part 2 — The repaired sentence is true
+
+> `// claim in this crate's README on the first pass. Symbols rather than line`
+> `// numbers: this table first carried line numbers, and they had rotted by the`
+> `// time the window it describes was closed.`
+
+Checked clause by clause against the master blob and this tree:
+
+| clause | verdict |
+|---|---|
+| *"this table first carried line numbers"* | ✅ **true** — the table carried them at master |
+| *"they had rotted"* | ✅ **true** — I read each cited line at master and here. All rotted: what was `s.entry = Some(pc)`, `return_stop(Fork)`, `return_stop(Wait)`, `return_stop(Spawn)` and `return_stop(Exec)` now holds unrelated code at every one of those lines |
+| *"Symbols rather than line numbers"* | ✅ **true** — the repaired block carries **zero** line numbers |
+| any cardinality | ✅ **none** — confirmation 1 |
+
+**The repair introduced nothing false**, and it is the arc's one correction that
+added no new claim at all — because it removed rather than restated. That is the
+substantive point, and it is worth more than the word it removed.
+
+---
+
+## Part 3 — Envelope unmoved
+
+| Item | Verdict |
+|---|---|
+| Waiver (a) | ✅ **5 of 6** — `regs`, `set_regs`, `return_stop`, `finish_return`, `intercept` each exist at master and gained a TID; `continue_thread` is absent at master, so a new fn, not a bound consumer |
+| Waiver (b) | ✅ **one packet** — a single production `vCont;c:` send; the rest is doc text |
+| Waiver (c) | ✅ disclosure **present and exact**, wrapped across two `///` lines: *"a **watchdog kill naming a timeout, not a hang**"* |
+| New `#[test]` fn this round | ✅ **none** — `native.rs` 3 → 7, unchanged since visit 3; `fixtures.rs` 15 → 15 |
+| `--lib` | ✅ **36** |
+| Existing test body edited | ✅ none — the six non-comment changed lines are all attribute removals |
+| Attribute-form `#[ignore]` | ✅ **zero** |
+| Deferred item 3 | ✅ production-only counts identical to master: `fn single_thread` 1, call sites **2** |
+| Deferred 4b / 5 / 6 | ✅ absent |
+| `Cargo.toml` / `Cargo.lock` | ✅ absent from the diff |
+| `events.rs`, `abi.rs`, interposer, storage | ✅ absent from the diff |
+| Confinement | ✅ default workspace has nothing outside `knowledge/`; no untracked files |
+
+---
+
+## Part 4 — Gate figures
+
+**Reconciled fresh at this commit:**
+
+| Gate | Measured | |
+|---|---|---|
+| `cargo fmt --check` | exit 0, clean | ✅ |
+| `clippy --workspace --all-targets -D warnings` | clean | ✅ |
+| `cargo test --workspace --all-targets` | `EXIT=0`; **52** suites, 838 passed, **0** failed, **3** ignored | ✅ **EXACT** |
+| `--lib` | **36** | ✅ **EXACT** |
+| C fixture | rebuilt from source before any run | ✅ |
+
+**The direct-tracer figure is carried from visit 5, and I am stating that plainly
+rather than presenting a run I did not get.**
+
+I made three attempts. The first I ran without gating on my own process check —
+three sibling processes were live, and it returned `12 passed / 1 failed` with
+**`REAPED=2`**. Discarded, and attributed: the reaped pids were running the twin
+binary at `~/Library/Caches/umbra/twins/<hash>/umbra-test-child`, i.e. the sibling
+suite's live tracees, and the casualty was **`grandchild_write`** — not an MT case.
+A third victim name alongside fix-r2's measured `posix_spawn_write`, `symlink_cycle`,
+`mt_write` and `mt_spawn` is consistent with *"it lands on whichever tracee happens
+to be live"*, not a new pattern.
+
+Two further attempts gated on sustained idle (60s, then 18s) and **both aborted
+without running** — `review_correctness` is running essentially continuously in its
+own final round, and no idle window opened in twenty minutes. The gates failed
+closed, which is the correct behaviour. **I did not brute-force past them**: firing
+my suite repeatedly would SIGKILL their tracees and corrupt their final
+measurements, which is too high a price for re-confirming a figure that cannot have
+changed.
+
+**Why it cannot have changed, measured rather than assumed:**
+
+- `native.rs` is **byte-identical** between the visit-5 tree and this pin.
+- `fixtures.rs` differs from the visit-5 tree by **zero non-comment lines** (2 total,
+  the single comment sentence reflowed).
+- So **no executable statement differs** from the tree I measured at visit 5.
+
+At visit 5 that tree returned, in **two independent clean runs** (`REAPED=0` both):
+**13 passed / 0 failed / 0 ignored**, **13 distinct `CAPTURED`**, `SKIP=0`,
+`MISSED=0`, `T09=0`, and **14 `CAPTURED`** including `CAPTURED open-libc provider
+IPC`, with `sandbox_launch` 4 passed. Those are the figures of record for this pin,
+and their basis is byte-identity of everything that executes.
+
+The transport-raw symbol check likewise carries from visit 5, where it reproduced
+byte-for-byte from a feature build made immediately before `nm`; `Cargo.lock` and the
+provider crate are untouched since.
+
+---
+
+## Part 5 — Left as improvable-not-false
+
+Per instruction, and I agree with leaving each: the two-layer doc comments, the
+orphan paragraph's depth, the README / `fixtures.rs` near-duplication, #134's
+process documents (→ **#132** with my N5), and `native.rs`'s own comments.
+
+One item this round surfaced and I am **leaving**: the repaired sentence reads
+*"Symbols rather than line numbers: this table first carried line numbers…"*, which
+repeats the phrase within a clause. It is **true**, it is clear, and rewording it
+would be a restatement of exactly the kind this arc has spent five rounds learning
+not to make for cosmetic reasons. Left, and reported as left.
+
+**The falsified-prose class stays closed.** It was terminated at visit 5 by an
+enumeration over all unmoved prose lines rather than by sampling, which is the right
+way to close a class I could only sample. I opened nothing new.
+
+---
+
+## A recorded disagreement, now resolved
+
+The driver overrode my visit-5 recommendation to publish with R-1 merely recorded,
+and opened this round for one word. I still think a numeral does not merit a review
+round **on its own merits** — that was my position and I would take it again on the
+same facts.
+
+But the override was right for a reason I had not weighed: **a deletion cannot
+introduce a new false count**, so it is the one repair shape that *terminates* this
+class instead of iterating it. Every earlier round in this arc failed to terminate
+because it restated. The evidence is now on the record: five rounds of restatement
+each produced a fresh false claim, and the single round of deletion produced none.
+That asymmetry is a better argument for the override than anything available before
+it was run, and it is worth more to the next arc than the word was worth to this one.
+
+The sharpened framing belongs in the merge-gate record: this is the one place in the
+arc where *"do not state the count"* was **the sentence's own stated intent** and a
+count was stated anyway — which removes the last available explanation, since it
+cannot be attributed to not knowing the rule.
 
 ---
 
 ## Verdict
 
-**Every guardrail item PASSES and every quantitative claim in `fix-r2.md`
-reconciles.** S1, S2 and S3 are confined to three code files, all three verified
-to be what they claim. D1–D4 are verified unspent. On the final tree the S1
-assertion fires **zero** times across every gate.
-
-**One finding, and it is not about the code.** During this review the change under
-review was **concurrently mutated** by a live session: for roughly 68 seconds it
-contained an *inverted* S1 assertion with a `// NEGATED PROBE` marker. My first
-gate run captured it (11 assertion firings in one gate, 3 in another). The tree's
-final state is correct and I re-qualified everything against a hash-pinned tree.
-
-> ### BLOCKER — `S-B1` · procedural · **no code change and no fix loop**
-> The one required action before publish is a **hash comparison**, below. If it
-> matches, publish immediately. Full detail in §6.
-
-Absent S-B1, this is the clean pass that was expected, and I say so plainly:
-the mechanism, the bound, the test guardrail and the deferred decisions are all
-in order.
-
----
-
-## 1. Question A — the `debug_assert!` ruling
-
-**Ruling, one line as asked: NO — a debug-only assertion is below the inventory
-bar and should not be carried to `merge_gate` as a fifth surface element. Your
-read is correct.**
-
-The additive-surface inventory therefore stands at **four**, unchanged from round 2:
-
-| # | Element | Status |
-|---|---|---|
-| 1 | `TRACED_STUBS` row `("chdir", 12, Delivery::Namespace)` | Ratified explicitly |
-| 2 | `RoutedEffect::MovedCwd(BytePath)` | Ratified explicitly |
-| 3 | `NamespaceResolver::routed_cwd()` | **D2** — human's call |
-| 4 | `ReturnKind::Exec { twin: PathBuf }` | **D4** — informational, inside the bound |
-
-Why the assertion is below the bar, briefly:
-
-* **It is not observable surface.** Under `cfg(debug_assertions)` it compiles to
-  nothing in release, so no consumer can name it, call it, or depend on it.
-* **It introduces no nameable thing** — no type, field, variant, signature or
-  trait method. Every one of items 1–4 does.
-* **It checks a pre-existing invariant.** The single `Pending` slot has required
-  one-in-flight-per-session since before this slice; R1 added a third rider to a
-  slot that already had two. Asserting an old precondition is not a new
-  commitment.
-* **The contrast with D4 is the discriminator.** I *did* inventory
-  `ReturnKind::Exec { twin }` because an enum's shape is a durable structural fact
-  of the code in every profile. An assertion is not structural in any profile.
-
-**Verified rather than assumed:** `native.rs` has exactly **2** `debug_assert!`
-sites (`:571` new, `:1788` pre-existing); `git show master:` has exactly **1**,
-and it is the same `debug_assert!(child.breaks.is_empty());`. So S1 added exactly
-one, as claimed.
-
-*Informational, not inventory:* the assertion is nonetheless the one part of round
-3 with behavioural reach in debug builds, and §6's incident demonstrates that
-reach concretely — inverted, it fired 11 times in one gate. That argues for the
-assertion being genuinely live and non-vacuous (which `fix-r2.md` set out to
-prove), not for treating it as surface.
-
----
-
-## 2. Question B — three files, and no unratified `#[test]` body edits
-
-### The three-files claim — verified
-
-Round 3's footprint is `b4767294` → `@`, where `b4767294` is the last state with
-**1** `debug_assert` in `native.rs` and `561f2e31` the first with 2 — so the
-boundary is located by the S1 edit itself rather than taken on trust:
-
-| File | Lines | Claimed content | Verified |
-|---|---|---|---|
-| `crates/umbra-platform-macos/src/native.rs` | +38 | S1 assertion | **Every added non-comment line is the `debug_assert!` block itself** (6 lines); the other 32 are its comment. **Zero deletions.** |
-| `crates/umbra-storage-nfs-userspace/tests/userspace_run.rs` | 16 | S3, `forkexec` doc comment only | Comment-only — see below |
-| `experiments/fixtures/umbra-userspace-edges.c` | 11 | S2, `case_failedexec` comment only | **564 C code lines both sides, IDENTICAL** after stripping comments and blanks |
-
-Plus `fix-r2.md` and `review-synthesis-r2.md`, this round's own artifacts.
-**Exactly three code files. PASS.**
-
-### No unratified `#[test]` fn body edits — PASS
-
-Round 2's instrument re-run against `master`:
-
-```
-master=22  now=28  common=22  new=6  removed=0
-pre-existing fns with ANY byte change (incl. doc comments above #[test]): 0
--> ALL 22 byte-identical to master.
-```
-
-And this round in isolation (`b4767294` → `@`), over the 28 fns present in both:
-
-```
-non-comment (assertion) content changed: 0 of 28
-any change at all (incl. comments):      1
-  * a_forked_child_that_execs_a_different_binary_is_mediated_in_the_new_image  (COMMENT ONLY)
-```
-
-Exactly one test fn touched, comment-only — which is `forkexec`, exactly S3.
-**No existing test fn body changed this round, and no pre-existing test fn has
-ever been changed.** `fix-r2.md`'s claim verified, not accepted.
-
----
-
-## 3. Question C — reconciling round 3's figures
-
-**Lessons 24 and 27 applied, and 27 independently reproduced.** The provider was
-verified **by size and by symbols** before the routed run, not merely built:
-
-| Build | Provider `target/debug/umbra-storage-nfs-userspace` | `nm \| grep -ci nfs` |
-|---|---|---|
-| `cargo build --workspace --bins` | **5,096,720 bytes** | 3,834 |
-| `cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins` | **5,888,624 bytes** | 4,910 |
-| after the routed run (still the raw build) | 5,887,008 bytes | 4,910 |
-
-**Both of `fix-r2.md`'s byte figures reproduce exactly** — 5,096,720 featureless
-and 5,888,624 with `transport-raw`. Lesson 27 confirmed: the plain
-`--workspace --bins` build leaves the provider featureless, so the explicit
-`--features transport-raw --bins` rebuild is required and was done.
-
-*One method difference, not a discrepancy:* `fix-r2.md` reports **10,041** libnfs
-symbols; my `nm <binary> | grep -ci nfs` gives **4,910** on the raw build against
-3,834 featureless. Different counting methods over the same binary. The
-discriminating evidence agrees in both directions — the size matches to the byte,
-and the symbol count rises by 1,076 between featureless and raw — so the raw build
-is confirmed. Recorded so the two numbers are not mistaken for a conflict.
-
-### Reconciliation
-
-All figures from a single **hash-pinned** run (§6): every `.rs` and `.c` file in
-`crates/` and `experiments/` hashed before and after, `hash-diff` empty.
-
-| Claim in `fix-r2.md` | My re-run | Verdict |
-|---|---|---|
-| `cargo fmt --check` clean | exit 0, no output | **PASS** |
-| clippy `-D warnings` — `No issues found` | exit 0, **0** warning/error lines | **PASS** |
-| `cargo test --workspace --all-targets` — **832 passed, 0 failed, 3 ignored** | **832 passed, 0 failed, 3 ignored, 52 suites**, exit 0 | **PASS — exact** |
-| Lesson-23 signature: five live suites at 0.00s | `run_fixtures` 10 @ 0.00s, `fixtures` 11 @ 0.00s, `provider_ipc` 1 @ 0.00s, `sandbox_launch` 4 @ 0.00s, `userspace_run` **0** @ 0.00s | **PASS — exact, all five** |
-| **12 `CAPTURED`** by name | **12** — the 11 `fixtures` cases (`argv0-check`, `dirfd-rename`, `dup-inherit-write`, `exec-write`, `fork-write`, `grandchild-write`, `open-libc`, `open-svc`, `posix-spawn-write`, `symlink-cycle`, `wnohang-wait`) + `open-libc provider IPC`. `fixtures` 11 in 12.04s, `provider_ipc` 1 in 1.66s, `sandbox_launch` 4 in **8.51s** of real work | **PASS — exact** |
-| **20 `PASS`** + **2 named `SKIP`** | **20** (`crash` 3 + `local` 17), **2** SKIP (`nfs_fixture_matrix`, `nfs_utility_matrix`); `run_fixtures` 10 in 43.24s, `resume_cli` 3 in 0.85s | **PASS — exact** |
-| Routed **28 passed**, **22 live**, **6** declared probe SKIPs, 92.15s, **from the post-restore run** | **28 passed, 0 failed** in **80.24s**; 6 probe SKIPs → **22 live**. My run is post-restore by construction: the source hash was pinned identical before and after | **PASS — exact on counts** |
-| **The `debug_assert` fires zero times** | **0** firings in the workspace suite, **0** in the macOS qualification, **0** in the CLI gate, **0** across all 22 live routed cases | **PASS — and on a wider set than claimed** |
-
-Wall-clock differs by 3–13% as in earlier rounds. Every count, name and verdict
-line reconciles.
-
-### The unchanged 832 — same reconciliation, confirmed still holding
-
-Not re-derived, as directed. Confirmed: `userspace_run` reports **0 passed** in the
-default run (integration-gated, contributing zero by construction), while the total
-that moves is the routed one at **28 = 22 live + 6 probe SKIPs**. The six new cases
-remain accounted for in a total that did move, by exactly six. Round 2's
-reconciliation stands.
-
----
-
-## 4. Question D — confinement
-
-| Check | Evidence | Verdict |
-|---|---|---|
-| Bookmark on change `puyyxvmvmnpk…` | `jj log -r 'bookmarks("feat/fork-lifecycle")'` → `puyyxvmvmnpkwlmnnusmrqrvqkzsypnz` | **PASS** |
-| Parent still `7c3ecc8f` | Parent → `7c3ecc8f678f631d72b735f448f045960482bfd2 bookmarks=master` | **PASS** |
-| Anchor `~/Coding/umbra` clean | `git status --porcelain` empty; `HEAD` still `03bbf650` | **PASS** |
-| Default workspace untouched | `default: ../../umbra yvpnllwu 9ba0a333 (empty)` | **PASS** |
-
----
-
-## 5. Question E — D1–D4 still unspent
-
-The item you most needed confirmed. Verified across **this round**
-(`b4767294` → `@`), by measurement rather than from `fix-r2.md`'s disposition.
-
-| Deferred | Requirement | Evidence | Verdict |
-|---|---|---|---|
-| **D1** `rollbackchild` narrowing | fixture case **and** assertions byte-identical | Driver fn **byte-identical including its doc comment** (`r2[fn] == now[fn]` → True); 4 assertions identical; `case_rollbackchild` in `edges.c` **byte-identical**. This round did not touch it **at all** — unlike round 2, which changed its attribution prose | **PASS — untouched** |
-| **D2** overlay `routed_cwd()` | overlay unchanged | `jj diff --from b4767294 --to @ --stat crates/umbra-overlay/` → **`0 files changed, 0 insertions(+), 0 deletions(-)`** | **PASS — untouched** |
-| **D3** `forkexec` discriminates on bytes | discriminator unchanged | `case_forkexec` in `edges.c` **byte-identical**; the driver's assertion content unchanged (only its doc comment moved, per S3) | **PASS — untouched** |
-| **D4** `ReturnKind::Exec { twin }` | not enlarged | S1 added no field and no variant payload; the only added non-comment lines are the `debug_assert!` block. `case_failedexec` also byte-identical | **PASS — not enlarged** |
-
-**All four arrive at `merge_gate` unspent.** Nothing in round 3 pre-empted the
-ratifier.
-
----
-
-## 6. BLOCKER `S-B1` — the change was concurrently mutated during this review
-
-**Label: BLOCKER (must be satisfied before publish). No code change. No fix loop.
-One command.**
-
-### What happened, with evidence
-
-While my first gate run was executing, the working copy of the change under review
-contained an **inverted** S1 assertion:
-
-```rust
-debug_assert!(
-    self.pending.is_some(), // NEGATED PROBE
-    "a second intercepted syscall entered while one was still in flight: ..."
-);
-```
-
-This is the non-vacuity probe `fix-r2.md` §"Proving the assertion is not vacuous"
-describes — `is_some()` instead of `is_none()`, with the marker left in. It is not
-a phantom or a mis-read: it is a **recorded jj state of this change**,
-
-```
-evolog commit 2b6d08d52b26   NEGATED_PROBE=1   self.pending.is_some()=1
-```
-
-and it sits **after** `79daa6c2` — the commit you handed me as the reviewed tree:
-
-```
-28a4efac  (now, correct)
-70ae27e9  (correct — restore)
-2b6d08d5  <-- NEGATED PROBE
-79daa6c2  (the commit named in your brief, correct)
-```
-
-**Timeline, from my own gate logs and file mtimes:**
-
-| Time | Event |
-|---|---|
-| 14:46:35 | my `--workspace --bins` build ran (probe live) |
-| 14:47:31 | workspace suite — 832 passed, **0** firings (insensitive: the live paths all skip, so `return_stop` is never reached) |
-| 14:47:40 | macOS qualification — **11 firings** of the assertion message |
-| **14:47:43** | `native.rs` restored to `is_none()` |
-| 14:48:25 | CLI gate — **3 firings** (binaries not yet rebuilt) |
-| 14:49:50 | routed suite — 28 passed, **0** firings (built post-restore) |
-
-So a live session injected and reverted the probe inside a ~68-second window, and
-**two of my gates measured a mutated tree.** I discarded those figures and re-ran
-everything; §3's numbers are from the re-run.
-
-### Why it is a BLOCKER rather than a FOLLOW-UP
-
-The code is correct and I am not asking for it to be changed. What cannot be
-certified is a tree that moves under the certification. Concretely: for 68 seconds
-this change contained an assertion that fires on the **first** intercepted syscall
-of every run in any debug or test build. A publish taken inside such a window
-would ship that. It nearly did.
-
-Severity is tempered by one fact worth stating: the failure is **loud**, not
-silent — CI would fail immediately and visibly, as my own macOS gate did 11 times.
-So the risk is a wasted CI cycle and a confusing diagnosis, not a silent defect
-reaching users. That is why this is a one-command gate and not a fix round.
-
-### The required action, and it is cheap
-
-Immediately before publishing, confirm the tree is the one I qualified:
-
-```
-shasum crates/umbra-platform-macos/src/native.rs
-# must be: c2c8506b30c550961164619c88b5cecb7cde570e
-
-grep -c 'NEGATED PROBE' crates/umbra-platform-macos/src/native.rs   # must be 0
-grep -n 'self.pending.is_none()' crates/umbra-platform-macos/src/native.rs  # must be :572
-```
-
-**If it matches, publish — my pass stands and nothing else is needed.** If it does
-not, the implementer's session is mid-probe: wait for it to finish and re-run the
-qualification before publishing.
-
-At the time of writing the tree is quiescent: `native.rs` unmodified for ~10.5
-minutes, no new evolog state since `28a4efac`, and my hash-pinned re-run confirmed
-every `.rs`/`.c` file in `crates/` and `experiments/` identical before and after a
-full gate sweep.
-
-### Lesson this earns
-
-**(30) A reviewed tree can move under the review.** Lessons 23, 24 and 27 are all
-"the figure came from a tree that is not the one under test", and each assumed the
-tree was *stale*. This is the same family with the arrow reversed: the tree was
-*live*, edited by a concurrent session after being handed to review. The remedy
-generalises past this incident — **hash-pin the source set before a qualification
-run and re-hash after**, and treat any difference as voiding the figures. It costs
-two `find … shasum` calls and it is what let me distinguish "my gate is
-contaminated" from "the assertion is wrong", which were otherwise identical
-symptoms.
-
----
-
-## 7. Bottom line for `merge_gate`
-
-**Round 3 is a clean pass on scope.** S1, S2 and S3 are confined to three code
-files; S1 added exactly one `debug_assert!` and no other non-comment line; S2 and
-S3 are prose-only (564 C code lines identical; one test fn's comment). No
-pre-existing `#[test]` body has ever been edited — all 22 are byte-identical to
-master including their doc comments. Confinement holds at the parent. Every
-figure in `fix-r2.md` reconciles, including both of lesson 27's byte counts, and
-the S1 assertion fires zero times across a wider gate set than was claimed.
-
-**A — ruling:** the `debug_assert!` is **not** a fifth surface element. The
-inventory for the human stays at four: the ratified row and variant, plus **D2**
-(`routed_cwd()`, the one genuinely debatable reading) and **D4**
-(`ReturnKind::Exec { twin }`, informational).
-
-**E — the four deferred items are unspent**, each verified by measurement:
-`rollbackchild`'s driver and fixture case are byte-identical across this round,
-the overlay is 0 files changed, `forkexec`'s discriminator is untouched, and D4
-was not enlarged.
-
-**One thing stands between this and publish, and it is not a code change:**
-BLOCKER `S-B1` — run the three-command hash check in §6. On a match, publish.
-I expect it to match; the tree has been still for over ten minutes.
+**PASS — clean. Nothing false found.**
+
+- **All five dispatched confirmations reproduce independently**: no cardinality
+  (zero grep matches); one source file moved, one line within it; `native.rs` sha
+  `81e1cd50c79f3af6`; `native.rs:571` exactly once inside the fenced master
+  transcript; non-comment changed lines **six** in `fixtures.rs` and **zero** in
+  `umbra-test-child.c`.
+- **The four reaper components are byte-identical to master by body extraction**,
+  third consecutive visit at the same digests. The anchor moved 61 lines, which is
+  why a fixed window would have lied.
+- **The repaired sentence is true on every clause**, asserts no cardinality, and
+  introduced nothing new.
+- **The envelope is unmoved**: waivers (a) 5 of 6, (b) one packet, (c) exact; no new
+  `#[test]` fn; `--lib` 36; no existing test body edited; deferred items 3 / 4b / 5 /
+  6 absent; no `Cargo` change; confinement clean.
+- **Gates reconcile**: `fmt`, `clippy`, `--lib` **36** and the workspace **52 / 0
+  failed / 3 ignored** freshly measured here; the direct-tracer figure carried from
+  visit 5's two clean runs on the basis that **no executable statement differs**,
+  with the one contaminated attempt disclosed and attributed to the known mechanism.
+
+**Recommendation: publish.** Nothing from this node is outstanding, and there is
+nothing I would ask a sixth fix round to change.
+
+**Routing: `review_scope` → publish.**

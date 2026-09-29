@@ -457,8 +457,9 @@ passed, so qualification requires the `CAPTURED <case>` stderr verdict.
 These are direct tracer tests: they exercise interception without enforcement,
 and are lower-level than the integrated `umbra run` matrix, which drives the
 original seven cases through storage, journal, namespace and an installed sandbox.
-Eleven of the thirteen direct tracer cases are enabled; the two multithreaded
-cases are `#[ignore]`d measurements that fail on purpose (below). Fixture cases:
+All thirteen direct tracer cases are enabled. The two multithreaded cases were
+`#[ignore]`d measurements that failed on purpose until the window they measured
+was closed (below). Fixture cases:
 
 | Case | State |
 |---|---|
@@ -473,16 +474,57 @@ cases are `#[ignore]`d measurements that fail on purpose (below). Fixture cases:
 | `wnohang-wait`      | **CAPTURED** — the wait decisions above |
 | `dirfd-rename`      | **CAPTURED** — the dirfd family above |
 | `symlink-cycle`     | **CAPTURED** — the logical symlinks above |
-| `mt-write`          | **FAILS — `#[ignore]`d**, open defect (below) |
-| `mt-spawn`          | **FAILS — `#[ignore]`d**, open defect (below) |
+| `mt-write`          | **CAPTURED** — the closed multithreaded window below |
+| `mt-spawn`          | **CAPTURED** — the closed multithreaded window below |
 
-### The two multithreaded cases are open defects, not coverage
+### The two multithreaded cases: what they measured, and how it was closed
 
 `mt-write` and `mt-spawn` are the measurement that sized the multithreaded-tracee
 arc. They run on the two dispatch paths `single_thread()` does **not** gate:
-`Delivery::Namespace` and `Delivery::Exec`. They are `#[ignore]`d because they
-fail against the tracer as it stands, and the failures are the finding. Run them
-with `cargo test -p umbra-platform-macos --test fixtures -- --ignored`.
+`Delivery::Namespace` and `Delivery::Exec`. They were `#[ignore]`d while they
+failed on purpose; **both now pass**, and the rest of this section is kept because
+the defect they measured is the reason the current design looks the way it does.
+
+**What closed them: `return_stop` resumes the trapping thread alone.** The window
+below is not narrowed, it is emptied of anyone who could walk into it —
+`vCont;c:<tid>` resumes exactly one thread and leaves every sibling stopped, so
+for the whole of the interval in which the entry stub is un-armed there is no
+other thread running to reach it. **The `z0`/`Z0` sequence is untouched by that**:
+not one line of the release, the gate plant or the re-arm changed, which matters
+because debugserver's `Z0` registrations are reference counted and this crate has
+already been bitten once by that (the closed M2 gap below). Only *which threads
+run* changed.
+
+Alongside it, `Session::pending` and `Session::entry` are keyed by `ThreadId`,
+and the return window carries the thread that opened it so `finish_return`
+attributes its `SyscallExit` from the window rather than from `Session::thread` —
+a slot every stop overwrites. That last part is not cosmetic: the caller removes
+its in-flight operation by thread and treats a miss as a call it never
+intercepted, letting the kernel result stand, so attributing a return to the
+wrong thread would have abandoned the rewrite **silently**. Closing a loud escape
+is not worth opening a quiet one.
+
+**Which mechanism closes which case, measured rather than assumed.** Reverting
+only the per-thread resume to a bare `c`, with the per-thread slots kept, fails
+`mt-write` again and leaves `mt-spawn` passing. Keying every window back onto one
+shared slot, with the per-thread resume kept, leaves **both** passing. So the
+resume is what closes `mt-write`, and it closes `mt-spawn` too — the per-thread
+`pending` is not what keeps that case green, because a thread inside a window is
+the only thread running and no sibling is left to collide with it. The slots
+remain what makes the invariant expressible and what `thread_index` resolves
+from. What was measured is the `pending` half; `entry` was not separately
+reverted, so no claim is made about it either way.
+
+**One behaviour change comes with the freeze, and it is bounded.** A routed
+`read`/`write`/`close` that blocks now blocks with the siblings held, where the
+bare `c` would have let them run. The session watchdog kills the tree at its
+deadline, so this degrades to a **watchdog kill naming a timeout, not a hang**.
+
+**Still deferred, deliberately:** `single_thread()` stays on `Delivery::Fork` and
+`WaitPlan::Park`, so a multithreaded parent that forks is refused rather than
+mediated — an explicit non-goal here, and pinned by
+`native.rs::tests::the_fork_and_park_paths_still_refuse_a_multithreaded_tracee`
+so it stays deferred by test rather than by intention.
 
 `single_thread()` (`native.rs`) is called from two places only, `Delivery::Fork`
 and `WaitPlan::Park`. Four dispatch arms are ungated, and they do **not** all
@@ -499,20 +541,36 @@ that they do was wrong and stood in this README for one revision:
 `Delivery::Namespace` does not call `return_stop` itself — it records the entry
 PC and emits the event; `resume()` takes that PC and plants the return gate
 (`return_stop(ReturnKind::Syscall)`). A multithreaded tracee doing ordinary file
-I/O or a `posix_spawn` is therefore **not refused; it is unmediated**.
+I/O or a `posix_spawn` was therefore **not refused; it was unmediated** — it ran
+through an ungated arm into a window no sibling was held out of. **That is what
+the per-thread resume closed**, and it is why these two arms are ungated *and*
+mediated today rather than ungated and unmediated.
 
-**`WaitPlan::Native` is a third ungated slot writer and is not measured.** It
-writes `pending` exactly as `Exec` does, so it is expected to collide the way
-`mt-spawn` does; no fixture drives it, and no claim here rests on it.
+**`WaitPlan::Native` is a third ungated slot writer and is still not measured.**
+It writes `pending` exactly as `Exec` does, so it was recorded as *expected to
+collide* the way `mt-spawn` then did. That prediction has been overtaken rather
+than confirmed: `mt-spawn` no longer collides, because a thread inside a return
+window is the only thread running, and the same reason covers this arm. No fixture
+drives it and no claim here rests on it.
 
-`mt-spawn` fires the `debug_assert!` in `return_stop` that master planted as this
+`mt-spawn` fired the `debug_assert!` in `return_stop` that was planted as this
 arc's tripwire: a second intercepted syscall enters while one is still in flight.
-A release build compiles that assertion out, so the *backend* takes the overwrite
-silently — but the run does not end silently. For **this** case what ends it is the
-path decode refusing the overwritten operand: `Io during path: null or overflowing
-pointer` (`EFAULT`), measured in 5 of 5 enforced release runs, each exiting non-zero.
-Per-thread slots in the backend are expected to close this case; that expectation is
-not yet verified, because slice 1 is not implemented.
+That assertion was **converted, not deleted** — it is now per thread, and a second
+assertion beside it covers the different property the absorbed-stop resume leans
+on: that at most one window is open *process-wide*. Neither assertion establishes
+that property. **The freeze does** — while a window is open only its owner runs, so
+no sibling is left to reach `return_stop` and open a second — and the assertions
+are tripwires over that reasoning. An earlier revision of this section credited the
+per-thread assertion with pinning the process-wide property; it does not, because
+two windows on two different threads pass it untouched.
+A release build compiles that assertion out, so on the tree that measurement was
+taken against the *backend* took the overwrite silently — but the run did not end
+silently. For **this** case what ended it was the path decode refusing the
+overwritten operand: `Io during path: null or overflowing pointer` (`EFAULT`),
+measured in 5 of 5 enforced release runs, each exiting non-zero. The overwrite is
+not reachable now, in either profile.
+Per-thread slots do close this case, and so, independently, does the per-thread
+resume; both were measured by reverting one and keeping the other, above.
 
 (The supervisor also holds an independent per-`ThreadId` guard in
 `umbra-supervisor/src/events.rs` that returns a real `Err(InvalidState)` in release
@@ -521,19 +579,23 @@ It is worth knowing about — it is why that layer is not single-slot — but it
 contention-dependent race, and on `mt-spawn` it fired in **0 of 10** runs. It is not
 what makes this case non-silent, and the paragraph above used to say it was.)
 
-`mt-write` is a second, distinct defect that per-thread slots do **not** close.
-To let the stopped thread execute the `svc` it is sitting on, `return_stop`
+`mt-write` was a second, distinct defect, and per-thread slots do **not** close it
+— measured, by reverting the resume and keeping the slots. To let the stopped
+thread execute the `svc` it is sitting on, `return_stop`
 releases the entry breakpoint (`z0`), plants the return gate at `pc + 4`, and
 resumes; `finish_return` puts the entry breakpoint back. A debugserver `Z0` is
-per-process and `continue_run` resumes every thread, so for the whole of that
-window the stub carries no breakpoint for anyone. Measured, three runs of three:
-the sibling thread's `open`, `write` and `close` produce no `SyscallEntry` at
-all, the rewrite never happens, and the tracee's own path reaches the kernel.
+per-process, so for the whole of that window the stub carries no breakpoint for
+anyone — and the resume used to be a bare `c`, which put every sibling back on the
+road while it was open. Measured on that shape, three runs of three: the sibling
+thread's `open`, `write` and `close` produced no `SyscallEntry` at all, the rewrite
+never happened, and the tracee's own path reached the kernel. The resume is now
+per thread, so the siblings are not running for any of it.
 
-The two cases fail differently for one reason: `mt-write`'s threads share **one
-stub at one address**, so the `z0` window un-arms it for the sibling; `mt-spawn`'s
-threads use **different** stubs, so the collision lands on the shared slot
-instead.
+The two cases failed differently for one reason: `mt-write`'s threads share **one
+stub at one address**, so the `z0` window un-armed it for the sibling; `mt-spawn`'s
+threads use **different** stubs, so the collision landed on the shared slot
+instead. Both capture now, and measured, it is the per-thread resume that closes
+both — the slots close only the second.
 
 **What that costs depends on the harness, and the difference is measured.** In
 this crate's direct-tracer harness the escaped write lands **on the host**,
@@ -545,11 +607,17 @@ profile grants `file-write*` to exactly one subpath (the run's own root inside t
 store) and the escaped write is denied `EPERM`. So on the shipped path this is an
 **availability and correctness** defect, not a namespace escape.
 
-Closing it needs the entry site to stay armed while another thread could reach
-it. Three shapes: single-step the trapping thread over the `svc`; hold the
-siblings stopped over the Mach task port this backend already holds
-(`task_threads` + `thread_suspend`, no new RSP surface); or per-thread RSP resume
-(`vCont`).
+Closing it needs no sibling to be able to reach the entry site while it is
+un-armed. Three shapes were costed: single-step the trapping thread over the
+`svc`; hold the siblings stopped over the Mach task port this backend already
+holds (`task_threads` + `thread_suspend`); or per-thread RSP resume (`vCont`).
+**The third was taken.** The first is not available in the form it was recorded —
+a planted `Z0` occupies the `svc`'s bytes, so a step re-executes the `BRK` and the
+syscall never runs. The second works but needs a Mach-port-to-thread-id bridge
+`mach2` does not expose, so it is not the dependency-free option it was recorded
+as, and it manipulates the `Z0` refcount. The third needs one packet this crate
+already speaks per-thread three times over (`g`, `p`, `P` under
+`QThreadSuffixSupported`) and touches the refcount not at all.
 
 These cases assert tracee-visible entry names and bytes, in two destinations
 that differ in both. The journal cannot serve as the oracle: `JournalRecord`
@@ -601,7 +669,8 @@ test.
 `mt-write` and `mt-spawn` also opt out of the harness verdict, for a different
 reason: their second destination is checked after `fixture_argv` returns, so the
 `CAPTURED` line is printed by the test function once *both* destinations agree.
-Neither reaches it today.
+**Both reach it on every run.** While the multithreaded window was open neither
+did, and this sentence said so; it is the verdict, not the harness, that changed.
 
 Software breakpoint ownership is per debugserver connection: successful
 `Z0` installs populate that session's registry, and successful `z0`
