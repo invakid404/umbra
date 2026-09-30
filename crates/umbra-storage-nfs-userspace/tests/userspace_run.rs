@@ -1,6 +1,16 @@
 //! `umbra run` over the userspace NFSv4 client, end to end -- the toy program,
+//! the edge and directory-listing fixtures, the Rust library-wrapper fixture,
 //! the three standard utilities, and the six mutation probes that prove the
 //! routing is load-bearing.
+//!
+//! **Five kinds of fixture, and the fifth is not C.** Four of them --
+//! `umbra-userspace-toy.c`, `-edges.c`, `-listing.c`, and the Apple binaries the
+//! utility matrix launches -- reach the filesystem through bare syscalls or
+//! through libc, so every transfer they make is one they sized themselves.
+//! `umbra-userspace-rustio.rs` reaches it through `std::fs`'s own wrappers,
+//! which take a capacity hint from a descriptor and complete their own short I/O
+//! *inside the library*. It is built by bare `rustc` rather than cargo, because
+//! `experiments/` is not a workspace member; see `rust_fixture_binary`.
 //!
 //! # What these cases assert, and why here
 //!
@@ -23,7 +33,8 @@
 //! may be enabled at once. Always rebuild the unmutated binaries afterwards.
 //!
 //! ```text
-//! # end to end: the toy must exit 0, and the utility matrix must pass
+//! # end to end: the toy and the Rust I/O fixture must exit 0, and the utility
+//! # matrix must pass
 //! cargo build --workspace --bins
 //! cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run
 //!
@@ -305,6 +316,42 @@ fn fixture_binary(scratch: &Path, name: &str, variable: &str) -> PathBuf {
     binary
 }
 
+/// One compiled Rust fixture from `experiments/fixtures/`.
+///
+/// The sibling of `fixture_binary`, and a separate function rather than that one
+/// parameterised by compiler: the source extension, the flags, and the reason
+/// the file exists at all are different in each, and a `match` on a language tag
+/// inside one function would be longer than the two functions are.
+///
+/// `rustc` is no new host requirement. `rust-toolchain.toml` pins the toolchain
+/// the whole workspace is already built with, and CI builds the workspace before
+/// every proof step in this job. No `--target` is passed, for the reason
+/// `fixture_binary` passes `-arch arm64`: this file only compiles on
+/// `aarch64-apple-darwin` and the host toolchain is native to it.
+fn rust_fixture_binary(scratch: &Path, name: &str, variable: &str) -> PathBuf {
+    if let Some(explicit) = std::env::var_os(variable) {
+        let path = PathBuf::from(explicit);
+        assert!(path.is_file(), "{variable}: {}", path.display());
+        return path;
+    }
+    let source = repository().join(format!("experiments/fixtures/{name}.rs"));
+    let binary = scratch.join(name);
+    let built = Command::new("rustc")
+        .args(["--edition", "2021", "-O"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("rustc is the toolchain this workspace is already built with");
+    assert!(
+        built.status.success(),
+        "compiling {}: {}",
+        source.display(),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    binary
+}
+
 /// A registry naming the built provider executables and this fixture's export.
 ///
 /// `timeout_ms` is the authoritative per-request IPC deadline and it is bounded
@@ -452,6 +499,19 @@ fn routed_exec_edge(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
 fn routed_edge(scratch: &Path, host: &str, port: u16, case: &str, env: &[&str]) -> Run {
     let edges = fixture_binary(scratch, "umbra-userspace-edges", "UMBRA_EDGES_PATH");
     launch(scratch, host, port, &edges, &[case], env)
+}
+
+/// Launch the Rust I/O fixture, which takes a case name before the path exactly
+/// as the edge fixture does.
+///
+/// `launch` is untouched and has to be: it already seeds `workspace/seed.txt`,
+/// which *is* the existing source file the fixture's first leg reads, and it
+/// already appends the destination after the leading arguments. So the fixture
+/// receives `<case> <workspace>/out.txt` and derives every sibling it needs from
+/// that path.
+fn routed_rust_io(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
+    let fixture = rust_fixture_binary(scratch, "umbra-userspace-rustio", "UMBRA_RUSTIO_PATH");
+    launch(scratch, host, port, &fixture, &[case], &[])
 }
 
 /// Run one supervised command against the live fixture and collect its verdict.
@@ -628,6 +688,65 @@ fn stored_size_through_client(host: &str, port: u16, components: &[Vec<u8>]) -> 
         "the shadow object is not a regular file"
     );
     attributes.size
+}
+
+/// One byte **range** of an object in the export, through the client.
+///
+/// Neither existing read-back can answer what a multi-chunk payload needs.
+/// `read_through_client` caps its `READ` at 4 KiB, which is right for the small
+/// objects it checks; `stored_size_through_client` asks for the size and nothing
+/// else. What discriminates a library loop that finished its transfer from one
+/// that completed a single remainder and stopped is the bytes *at* the chunk
+/// boundaries, and this asks for exactly those -- without pulling three
+/// megabytes back over NFS to get them.
+///
+/// A separate function rather than an offset parameter on the existing one, for
+/// the reason `attributes_through_client` is separate: a caller that wants a
+/// whole small object should not have to name a range to say so.
+///
+/// `count` must stay at or below the backend's 1 048 572-byte per-call bound, or
+/// the read this performs is itself the thing under test. `None` means the name
+/// does not exist.
+fn read_range_through_client(
+    host: &str,
+    port: u16,
+    components: &[Vec<u8>],
+    offset: u64,
+    count: u32,
+) -> Option<Vec<u8>> {
+    let mut config = RawTransportConfig::loopback(port);
+    config.host = host.to_owned();
+    config.limits.default_deadline = Deadline { millis: 10_000 };
+    let deadline = config.limits.default_deadline;
+    let mut transport = LibnfsRawTransport::connect(config).expect("connect to the fixture");
+    let mut handle = transport
+        .root_filehandle(deadline)
+        .expect("PUTROOTFH; GETFH");
+    let mut attributes = None;
+    for component in components {
+        let name = ComponentName::new(component.clone()).expect("component");
+        let (next, found) = transport
+            .lookup(&handle, &name, AttrMask::STAT, deadline)
+            .ok()?;
+        handle = next;
+        attributes = Some(found);
+    }
+    let attributes = attributes.expect("at least one component");
+    assert_eq!(
+        attributes.file_type,
+        Some(Nfs4Type::Regular),
+        "the shadow object is not a regular file"
+    );
+    let read = transport
+        .read(
+            &handle,
+            umbra_storage_nfs_userspace::handle::Stateid::ANONYMOUS,
+            offset,
+            count,
+            deadline,
+        )
+        .expect("READ with the anonymous stateid");
+    Some(read.data)
 }
 
 /// The components of one run's shadow object, below the export root.
@@ -2655,4 +2774,568 @@ fn mutation_probe_setattrlistat_makes_touch_on_an_existing_file_fail() {
     let stored = read_through_client(host.as_str(), port, &utility_shadow(&absent, &operand))
         .expect("the create path is untouched by this probe");
     assert!(stored.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Codex slate rank 1 -- a small-file edit and read-back through `std::fs`'s own
+// wrappers rather than through bare syscalls.
+//
+// Every fixture above this line issues `open`/`read`/`write`/`close` itself, so
+// every transfer it makes is one it sized and looped by hand. The library
+// wrappers codex's synchronous exec-server core is built from do neither: they
+// take a capacity hint from a descriptor's metadata and they complete their own
+// short I/O *inside std*, invisibly to the program. Whether they are routed,
+// whether those internal loops finish, and whether the sizes they read back are
+// exact is the gap these cases close.
+//
+// The four probe cases below reuse the four shipped probes -- `read`, `write`,
+// `fstat`, `mkdir` -- and add no cargo feature, which is why
+// `every_mutation_probe_is_wired_into_the_userspace_job` is byte-identical to
+// what it was before this slice.
+//
+// **KNOWN COVERAGE LIMIT, AND IT FALLS ON THE HEADLINE LEG.** None of those four
+// probes reaches leg vi, and since leg vi moved into its own case `big` that is
+// now structural rather than incidental: the probe cases launch `edit`, which does
+// not contain leg vi at all. Even within `edit` each probe breaks the earliest leg
+// that uses its mechanism and the run stops there -- `read` and `fstat` in leg i,
+// `write` in leg iii, `mkdir` in leg iv. So leg vi has **no mutation backstop**. Its assertions are
+// positive-only: the stored size, the bytes at both chunk boundaries, and the two
+// read wrappers agreeing. If routing for a multi-chunk transfer regressed in a way
+// that still satisfied all three, nothing here would fail.
+//
+// This is **not** the claim that nothing above covers a multi-chunk transfer --
+// the `bigio` control does, at the same size, and it is mutation-covered by the
+// shipped `read` and `write` probes through the toy. What no probe reaches is
+// this leg's own subject: that *std's* loops, the ones the program cannot see,
+// finish such a transfer. `bigio` cannot stand in for that, because its loop is
+// hand-written in the fixture and asserts its own shortness.
+//
+// That is a deliberate consequence of reusing the shipped probes rather than an
+// oversight. A probe that stopped at leg vi would have to be a new cargo feature
+// on a production crate, which is what the design gate refused: it would add a
+// seventh probe, a seventh CI proof step, and a row in the wiring test above --
+// whose byte-identity is the evidence that refusal was honoured. Recorded here so
+// the gap is read off the file rather than rediscovered.
+// ---------------------------------------------------------------------------
+
+/// Bytes the Rust I/O fixture leaves behind, which must match the constants of
+/// the same shape in `experiments/fixtures/umbra-userspace-rustio.rs`; nothing
+/// but these assertions checks that they agree, exactly as `PAYLOAD` above is
+/// the only thing pinning the toy's own message.
+///
+/// The fixture's `MODIFIED` has no constant here on purpose: leg v overwrites it
+/// before the run ends, so it is never observable through the client and the
+/// harness would be declaring a value it cannot check.
+const RUSTIO_SHORT: &[u8] = b"short\n";
+const RUSTIO_LEAF: &[u8] = b"leaf under a routed directory\n";
+
+/// Leg vi's payload size, matching `BIG` in the fixture, which carries the full
+/// reasoning. In short: it is the **smallest** size that crosses the backend's
+/// 1 048 572-byte per-call bound more than once -- 8 bytes past two bounds -- and
+/// it is no larger because leg vi moves it three times inside a per-run session
+/// watchdog that is this harness's own `timeout_ms` (`registry`, above) and that
+/// the writer lease will not let anyone raise. That margin is spent by CPU
+/// contention rather than by bytes: measured, 2 621 440 expires the watchdog with
+/// four competing CPU workers on a ten-core host while this size does not.
+const RUSTIO_BIG: u64 = 2_097_152;
+
+/// `LibnfsRawTransport`'s per-call bound, and therefore where leg vi's chunk
+/// boundaries fall.
+const RUSTIO_BOUND: u64 = 1_048_572;
+
+/// Leg vi's payload byte at `index`, which must match `big_payload` in the
+/// fixture.
+///
+/// The payload is position-dependent for one reason: a constant fill cannot tell
+/// a correct read from one that returned the right *number* of bytes from the
+/// wrong offset, and the offsets this suite asks about are the chunk boundaries,
+/// where an offset error is exactly what a broken loop would produce.
+fn rustio_big_byte(index: u64) -> u8 {
+    (index as usize).wrapping_mul(31).wrapping_add(7) as u8
+}
+
+/// Eight payload bytes starting at `offset`, as the fixture would have written
+/// them.
+fn rustio_big_range(offset: u64) -> Vec<u8> {
+    (offset..offset + 8).map(rustio_big_byte).collect()
+}
+
+/// The shadow components of one sibling of the run's destination.
+///
+/// The fixture derives `<path>.d/leaf.txt` and `<path>.big` from the one path the
+/// harness gave it, so the harness derives the same names the same way rather
+/// than hard-coding `out.txt`.
+fn rustio_sibling(run: &Run, suffix: &[u8], leaf: Option<&[u8]>) -> Vec<Vec<u8>> {
+    let mut components = shadow_path(run);
+    components
+        .last_mut()
+        .expect("the destination has at least one component")
+        .extend_from_slice(suffix);
+    if let Some(leaf) = leaf {
+        components.push(leaf.to_vec());
+    }
+    components
+}
+
+/// **The slate's own case: read an existing file with its metadata, write a
+/// modified version, close, reopen and compare -- all of it through `std::fs`.**
+///
+/// Six legs across **two routed runs**. Case `edit` carries five of them and the
+/// order inside it is load-bearing rather than incidental: legs i, ii, iii and v
+/// act on `<path>` and leg iv on `<path>.d/leaf.txt`, so each of the four probe
+/// cases below can point at an object an *earlier* leg already put in the export
+/// as positive evidence that the run was alive when its own leg broke. Case `big`
+/// carries leg vi by itself, because the watchdog is per session rather than per
+/// call and leg vi is the leg that spends it; `RUSTIO_BIG` has the measurement
+/// and states what the separation does and does not buy.
+///
+/// What this asserts that no case above it does:
+///
+/// * **A library wrapper's own completion loop finishes a routed transfer.**
+///   `bigio` proves the backend answers a over-bound transfer short and that a
+///   loop *the fixture wrote* finishes it. `write_all` and `default_read_to_end`
+///   loop inside std where the program cannot see them, and leg vi's payload
+///   crosses the bound twice so a loop that completes one remainder and stops is
+///   caught.
+/// * **A size taken from a descriptor is exact.** Nothing above compares
+///   `fstat`'s `st_size` against what was written. Codex's read and write paths
+///   both branch on `file.metadata()?`, so a routed `fstat` that answered a
+///   plausible wrong size would satisfy every shipped case.
+/// * **Truncation to a shorter non-empty length through a library wrapper.**
+///   `trunc` pins 10 bytes to 2 by hand; leg v reaches the same arm through
+///   `File::create` and requires both the exact new length and the absence of
+///   the old tail.
+/// * **`std::fs::read` and `File::read_to_end` agree.** They take different
+///   routed paths -- only the second asks `stream_position()`, which is
+///   `lseek`(199), which a virtual descriptor refuses with EBADF and std then
+///   degrades to reading by probing. Requiring them to agree is the only thing
+///   here that would catch a future `lseek` answering a *wrong* offset rather
+///   than refusing.
+#[test]
+fn a_rust_library_write_reopen_and_compare_crosses_the_std_fs_wrappers() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    // **Two routed runs, not one, and the separation is the point.** The registry
+    // `timeout_ms` is a whole-session watchdog armed before the twin is resigned,
+    // so legs sharing a run share one budget. Leg vi is the expensive leg; giving
+    // it case `big` and a run of its own means the margin measured for it
+    // describes the session that actually executes. It does not make it
+    // saturation-proof -- see `RUSTIO_BIG`.
+    //
+    // **Separate scratch directories, deliberately.** `launch` derives
+    // `workspace`, `state` and `registry.json` from `scratch`, and
+    // `rust_fixture_binary` compiles the fixture to `scratch/<name>`. One shared
+    // scratch would work -- shadows are keyed by run id and every per-run
+    // assertion below is per-run -- but it would also rewrite the very executable
+    // the first run just launched, which is the `ETXTBSY` class this repository
+    // already had to remove from another test. Two directories cost one extra
+    // `rustc` invocation locally, nothing at all in CI where `UMBRA_RUSTIO_PATH`
+    // is set, and leave no question to answer.
+    let scratch = tempfile::tempdir().unwrap();
+    let big_scratch = tempfile::tempdir().unwrap();
+    // Nothing is mounted, checked before and after for the reason every case
+    // here checks it: a helpfully-mounted export would satisfy everything below
+    // through the kernel client and nothing would say so. Both scratch roots are
+    // covered, because both hold a run.
+    let paths: Vec<&Path> = vec![scratch.path(), big_scratch.path()];
+    assert_no_nfs_mount(&host, port, &paths, "before the runs");
+    let run = routed_rust_io(scratch.path(), &host, port, "edit");
+    let big_run = routed_rust_io(big_scratch.path(), &host, port, "big");
+    assert_no_nfs_mount(&host, port, &paths, "after the runs");
+
+    // 1. Each fixture's own verdict. Exit zero is every leg of that case
+    //    agreeing, and each leg has its own exit code, so a nonzero status names
+    //    the step that failed rather than the run.
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "a std::fs edit/read-back round trip over the userspace client failed:\n{}",
+        run.stderr
+    );
+    assert_eq!(run.status, Some(0), "{}", run.stderr);
+    assert_eq!(
+        big_run.child_exit(),
+        0,
+        "the multi-chunk write and its two read-backs failed:\n{}",
+        big_run.stderr
+    );
+    assert_eq!(big_run.status, Some(0), "{}", big_run.stderr);
+
+    // 2. Legs ii, iii and v, out of band: the destination in the export holds
+    //    exactly the shorter replacement. Its *size* is asserted beside its
+    //    bytes because they are different claims -- the bytes could be right
+    //    with a stale tail behind them, and `trunc` above cannot see that
+    //    because it reads the whole object back in one 4 KiB `READ`.
+    let destination = shadow_path(&run);
+    assert_eq!(
+        read_through_client(&host, port, &destination).as_deref(),
+        Some(RUSTIO_SHORT),
+        "the export does not hold the shorter replacement leg v wrote"
+    );
+    assert_eq!(
+        stored_size_through_client(&host, port, &destination),
+        Some(RUSTIO_SHORT.len() as u64),
+        "the shorter replacement left the object's old length behind it"
+    );
+
+    // 3. Leg iv: a file named absolutely inside a directory the same `edit` run
+    //    created, which is codex's `create_directory` then `write_file`
+    //    sequence and which no case above performs.
+    let leaf = rustio_sibling(&run, b".d", Some(b"leaf.txt"));
+    assert_eq!(
+        read_through_client(&host, port, &leaf).as_deref(),
+        Some(RUSTIO_LEAF),
+        "the export does not hold the file leg iv wrote under the directory the \
+         same run made"
+    );
+
+    // 4. Leg vi, out of the **second** run. The size proves std's `write_all`
+    //    finished a transfer that crossed the per-call bound twice; the ranged
+    //    reads prove it finished it
+    //    *in order*. Asked at both boundaries and at both ends, because a loop
+    //    that completed one remainder and stopped, or one that repeated a chunk,
+    //    would leave the right number of bytes with the wrong ones at a seam --
+    //    which is invisible to a size and invisible to a constant fill.
+    //
+    //    **This payload is the same 2 MiB the `bigio` control uses, and the
+    //    overlap is in the number only.** `bigio`'s loop is written in the
+    //    fixture and asserts its own shortness, and its read-back is a size;
+    //    here the loops are std's own and invisible to the program, the bytes are
+    //    position-dependent so a seam can be probed, the boundaries are read back
+    //    through the client from both sides, and the same object is read twice
+    //    through two wrappers that take different routed paths. The size is
+    //    where it is because a watchdog put it there (`RUSTIO_BIG`), not because
+    //    2 MiB is the interesting quantity.
+    let big = rustio_sibling(&big_run, b".big", None);
+    assert_eq!(
+        stored_size_through_client(&host, port, &big),
+        Some(RUSTIO_BIG),
+        "the export does not hold all {RUSTIO_BIG} bytes std's write_all was given \
+         in one call"
+    );
+    // Both sides of both chunk boundaries, plus the start. At this payload
+    // `2 * RUSTIO_BOUND` is also `RUSTIO_BIG - 8`, so the last probe covers the
+    // final 8-byte chunk and the second boundary at once -- which is why the
+    // list names it once rather than twice.
+    for offset in [
+        0,
+        RUSTIO_BOUND - 8,
+        RUSTIO_BOUND,
+        2 * RUSTIO_BOUND - 8,
+        2 * RUSTIO_BOUND,
+    ] {
+        assert_eq!(
+            read_range_through_client(&host, port, &big, offset, 8),
+            Some(rustio_big_range(offset)),
+            "the eight bytes at offset {offset} are not the ones the fixture \
+             wrote there, so the transfer landed out of order or short"
+        );
+    }
+
+    // 5. None of it reached the host, for **either** run. Between them the two
+    //    fixtures named four paths and created none of them here: each workspace
+    //    still holds exactly its seed.
+    for (label, each) in [("edit", &run), ("big", &big_run)] {
+        assert!(
+            !each.destination.exists(),
+            "{label}: the host destination {} was created",
+            each.destination.display()
+        );
+        assert_workspace_pristine(each);
+        assert_host_write_root_empty(each);
+
+        // 6. And each run is journalled complete rather than merely quiet.
+        assert!(
+            journal_records_completion(each),
+            "{label}: no RunCompleted record in the run's journal"
+        );
+    }
+}
+
+/// Probe A against the Rust fixture -- a routed `read` hands back bytes that are
+/// not what the store holds.
+///
+/// **The exit code is 93, not leg vi's 106, and the reason is the probe's own
+/// shape rather than a choice.** The mutation XORs the first byte of *every*
+/// routed read reply (`engine.rs:1896-1900`), so the first leg that reads is the
+/// leg that breaks -- and that is leg i, which reads the seeded source and
+/// compares it. Measured: `finished: Some(Code(93))`. No ordering of the legs
+/// avoids this, because a mutation on a whole direction breaks the earliest user
+/// of that direction by construction.
+///
+/// **The discriminating half, stated for exactly what it supports and no more.**
+/// Because the run stops in leg i, there is no later object in the export to
+/// point at, so this case cannot use the surviving-object discriminator the
+/// `mkdir` case below uses. What it has instead is the *code*, and what the code
+/// rules out is narrower than "the read direction":
+///
+/// * 93 is reached only after `File::open` answered -- otherwise 91 -- and only
+///   after the descriptor's own `metadata()` answered for a regular file --
+///   otherwise 92. The `fstat` case below measures 92 on this same fixture, so
+///   that second exclusion is observed rather than argued.
+/// * 93 covers **two** arms of leg i and does not separate them: `read_to_end`
+///   returning `Err`, and bytes that are not the seed. On the first arm the
+///   length comparison is never reached, so 93 does **not** imply that the
+///   descriptor's reported length agreed with the bytes -- only the second arm
+///   establishes that, because a disagreement there returns 92.
+/// * So what this case establishes is narrower than "the read direction": the
+///   routed open and the routed fd metadata both answered, and the routed read
+///   still did not deliver the seed. It does not, on its own, prove the bytes
+///   were corrupted rather than the call refused.
+///
+/// That the shipped mutation corrupts bytes while leaving the count and the
+/// mechanism alone is a property of the probe's own code
+/// (`engine.rs:1896-1900`), not something this assertion establishes.
+#[test]
+fn mutation_probe_read_makes_the_rust_wrapper_read_back_reject() {
+    if declared_probe().as_deref() != Some("read") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=read with a binary built with \
+                   --features mutation-probe-read"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let run = routed_rust_io(scratch.path(), &host, port, "edit");
+
+    assert_eq!(
+        run.child_exit(),
+        93,
+        "breaking read routing did not make the library read-back reject the \
+         bytes:\n{}",
+        run.stderr
+    );
+    assert_ne!(
+        run.status,
+        Some(0),
+        "umbra reported a failed run as success"
+    );
+    // The failure belongs to the call, not to the run.
+    assert!(
+        run.stderr.contains("finished:"),
+        "the run did not finish:\n{}",
+        run.stderr
+    );
+    // Leg i rejected before leg ii ever wrote, so the destination is not in the
+    // export at all. Asserted rather than assumed: if it *were* there, this
+    // probe would have let a write through and the exit code would be describing
+    // something other than the read direction.
+    assert!(
+        read_through_client(&host, port, &shadow_path(&run)).is_none(),
+        "the run wrote the destination before rejecting its own source read, so \
+         exit 93 is not describing leg i"
+    );
+    assert!(!run.destination.exists());
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+}
+
+/// Probe B against the Rust fixture -- a routed `write` reports success and
+/// stores nothing, and the library's own reopen catches it by *size*.
+///
+/// **The exit code is 97, not leg vi's 105.** The mutation drops the storage
+/// writes while keeping the success `resolve` planned (`engine.rs:3772-3773`), so
+/// the tracee is told its write landed and the first leg that reads back is the
+/// leg that notices. That is leg iii, whose size check runs before its byte
+/// check precisely so this has one code rather than two. Measured:
+/// `finished: Some(Code(97))`.
+///
+/// **This is the case that pins `fstat`'s size against what was written**, which
+/// nothing in this file did before: `EmptyFile` proves `touch` can report
+/// honestly, and no other case compares a descriptor's `st_size` to a byte count
+/// it chose. Codex's read and write paths both branch on `file.metadata()?`
+/// (`no_follow/unix.rs:107`, `:135`), so a routed `fstat` answering a plausible
+/// wrong size is exactly the defect this catches.
+///
+/// **The discriminating half** is the pair the shipped `write` probe uses and no
+/// read fault can reproduce: the object in the export is absent or empty. And
+/// unlike the read case above, this one also carries a genuine positive -- exit
+/// 97 rather than 93 means leg i read the seed back correctly through the same
+/// routing in the same run, so the read direction is intact and only the write
+/// direction is not.
+#[test]
+fn mutation_probe_write_makes_the_rust_reopen_disagree_on_size() {
+    if declared_probe().as_deref() != Some("write") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=write with a binary built with \
+                   --features mutation-probe-write"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let run = routed_rust_io(scratch.path(), &host, port, "edit");
+
+    assert_eq!(
+        run.child_exit(),
+        97,
+        "breaking write routing did not make the library's reopen disagree about \
+         the size:\n{}",
+        run.stderr
+    );
+    assert_ne!(
+        run.status,
+        Some(0),
+        "umbra reported a failed run as success"
+    );
+    // The discriminator. A wrong size alone could be explained by a broken
+    // `fstat`; an object in the export that is absent or empty could not, and the
+    // case above measures 92 for a broken `fstat` rather than 97.
+    match read_through_client(&host, port, &shadow_path(&run)) {
+        None => {}
+        Some(stored) => assert!(
+            stored.is_empty(),
+            "the write probe left {} bytes in the export, so the run's own \
+             size complaint is not about a write that vanished",
+            stored.len()
+        ),
+    }
+    assert!(!run.destination.exists());
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+}
+
+/// Probe C against the Rust fixture -- `fstat` on a virtual descriptor answers
+/// `EBADF`, and the leg that notices is the one codex actually wrote.
+///
+/// **This is the highest-value probe here and it took reading std to place.**
+/// `std::fs::read` asks for its capacity hint with `.ok()`
+/// (`library/std/src/fs.rs:343`), so a routed `fstat` answering EBADF costs it a
+/// hint and changes nothing observable -- the read still completes by probing. A
+/// fixture built only out of `fs::read` would pass this probe while proving
+/// nothing about `fstat` at all, which is the #134 failure shape exactly. The leg
+/// that does break is the one that propagates, `file.metadata()?.is_file()`
+/// (`no_follow/unix.rs:107`), which is why `descriptor_length` in the fixture
+/// returns `None` on `Err` instead of defaulting. Measured:
+/// `finished: Some(Code(92))`.
+///
+/// **The discriminating half**: 92 rather than 91 means the routed `open` of the
+/// base object answered in this same run, so the mutation is isolated to the
+/// descriptor's metadata reply -- the same "this breaks the reply and nothing
+/// else" claim the shipped `touch` case makes, asserted here against a library
+/// wrapper instead of an Apple binary.
+#[test]
+fn mutation_probe_fstat_makes_the_rust_metadata_check_fail() {
+    if declared_probe().as_deref() != Some("fstat") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=fstat with a binary built with \
+                   --features mutation-probe-fstat"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let run = routed_rust_io(scratch.path(), &host, port, "edit");
+
+    assert_eq!(
+        run.child_exit(),
+        92,
+        "breaking fstat routing did not make the propagating metadata check \
+         fail:\n{}",
+        run.stderr
+    );
+    assert_ne!(
+        run.status,
+        Some(0),
+        "umbra reported a failed run as success"
+    );
+    assert!(
+        run.stderr.contains("finished:"),
+        "the run did not finish:\n{}",
+        run.stderr
+    );
+    // Nothing was written: the metadata check is the first thing leg i does after
+    // the open, so a destination in the export would mean the run got further
+    // than exit 92 claims.
+    assert!(
+        read_through_client(&host, port, &shadow_path(&run)).is_none(),
+        "the run reached its write legs, so exit 92 is not describing leg i's \
+         metadata check"
+    );
+    assert!(!run.destination.exists());
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+}
+
+/// Probe D against the Rust fixture -- the `mkdir`(136) decode arm is removed and
+/// `std::fs::create_dir` reaches nothing.
+///
+/// **There is no child exit code to assert, and that is measured rather than
+/// assumed.** With the arm gone, 136 reaches the decoder's "unclassified Darwin
+/// syscall" refusal, which `syscall_entry` propagates and which stops the *run*:
+/// measured, umbra emits `UnsupportedCapability during macos: unclassified
+/// Darwin syscall 136` with no status line at all, so `child_exit()` would find
+/// nothing to parse. This case therefore asserts `status != Some(0)`, exactly as
+/// the shipped `/bin/mkdir` case does and for the same reason.
+///
+/// **This is the one case here whose discriminator is a surviving object, and it
+/// is the strongest of the four.** Legs i, ii, iii and v all complete before leg
+/// iv is reached -- that is what the fixture's execution order is *for* -- so the
+/// destination is in the export holding the shorter replacement, byte for byte,
+/// while the directory and the file under it exist nowhere. No common cause
+/// upstream of the decode arm satisfies that pair: a broken open, a broken read,
+/// a broken write or a broken `fstat` each stop the fixture in leg i or leg iii
+/// with a child exit code, which is a state this case would reject.
+#[test]
+fn mutation_probe_mkdir_makes_the_rust_new_file_appear_nowhere() {
+    if declared_probe().as_deref() != Some("mkdir") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=mkdir with umbra-platform-macos built \
+                   with --features mutation-probe-mkdir"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let run = routed_rust_io(scratch.path(), &host, port, "edit");
+
+    assert_ne!(
+        run.status,
+        Some(0),
+        "removing the mkdir decode arm did not stop the run:\n{}",
+        run.stderr
+    );
+    // The negative half: neither the directory nor the file the fixture would
+    // have put inside it is anywhere.
+    let leaf = rustio_sibling(&run, b".d", Some(b"leaf.txt"));
+    assert!(
+        attributes_through_client(&host, port, &leaf).is_none(),
+        "a refused mkdir still captured the file underneath it"
+    );
+    assert!(
+        attributes_through_client(&host, port, &rustio_sibling(&run, b".d", None)).is_none(),
+        "a refused mkdir was captured in the export"
+    );
+    assert!(
+        !run.destination.exists(),
+        "the run reached the host destination"
+    );
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+
+    // The positive half, and everything above is satisfiable by any failure that
+    // stops the run early -- this is the assertion that is not. The destination
+    // carries leg v's shorter replacement, so the routed open, write, close,
+    // reopen, `fstat` and truncate all worked in this same mutated binary and
+    // only the directory leg broke.
+    assert_eq!(
+        read_through_client(&host, port, &shadow_path(&run)).as_deref(),
+        Some(RUSTIO_SHORT),
+        "the destination the legs before mkdir wrote is not in the export with \
+         its bytes, so this case proves nothing about the mkdir decode arm"
+    );
 }
