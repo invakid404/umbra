@@ -35,7 +35,7 @@ jobs:
     # Exact label, not `ubuntu-latest`: the setup-memoria Action below supports
     # Ubuntu 24.04 only and refuses any other release, so the alias moving to a
     # newer image would fail this job at setup. Change it in step with the Action.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: write
