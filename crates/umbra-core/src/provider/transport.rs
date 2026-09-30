@@ -808,10 +808,16 @@ mod tests {
     fn connect_reaps_a_provider_that_never_completes_the_handshake() {
         // A script that ignores its args and sleeps: it stays alive but never dials
         // back the private socket, so `connect` must hit the accept timeout (D-4).
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("stall");
-        std::fs::write(&script, b"#!/bin/sh\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        //
+        // The script is a checked-in fixture rather than written at test time: a
+        // concurrent sibling test's `posix_spawn` copies the shared fd table
+        // (glibc uses `CLONE_VM|CLONE_VFORK` without `CLONE_FILES`), so it can
+        // inherit a still-open writable fd from `fs::write`. The child's
+        // reference keeps `inode->i_writecount > 0` until its own `execve`
+        // completes `close-on-exec`, and any `execve` of that script during
+        // that window fails with `ETXTBSY` from `deny_write_access` (#146).
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stall-provider.sh");
         let descriptor = ProviderDescriptor {
             id: "fake".into(),
             role: "test".into(),
