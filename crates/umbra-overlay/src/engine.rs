@@ -4036,8 +4036,31 @@ impl NamespaceSession for Overlay {
             // reachable by anything but `(task, generation, fd)`, this stops
             // being an accounting note and becomes a correctness one.
             if let Some((task, generation, fd)) = closed {
+                // MUTATION PROBE G -- the eviction itself. Compiled out of every
+                // build that does not ask for it, so no product binary contains
+                // this branch.
+                //
+                // It removes *only* the eviction, and that is what makes it a
+                // probe rather than a break: the insert above still happens, the
+                // close is still routed and still journalled, and the tracee
+                // still sees a successful `close`. What survives is the entry
+                // this line exists to delete -- a completed enumeration's empty
+                // remainder, under a key whose `fd` is about to be reissued.
+                //
+                // The behaviour it restores is measured, not imagined, and the
+                // measurement is recorded at `resolve_routed_close` above: a
+                // program that listed a directory, closed it and listed it
+                // again got three names then *nothing*, exit 0, because
+                // `resolve_directory` prefers this cache over `merged`. So a
+                // test that passes with this enabled is a test whose second
+                // enumeration never depended on the eviction, and the
+                // discriminator is the one an exit code cannot carry: the second
+                // listing's *names*.
+                #[cfg(not(feature = "mutation-probe-dircache"))]
                 self.directories
                     .retain(|(t, g, f, _), _| (*t, *g, *f) != (task, generation, fd));
+                #[cfg(feature = "mutation-probe-dircache")]
+                let _ = (task, generation, fd);
             }
             self.pending = None;
             return Ok(CommitReceipt {

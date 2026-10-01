@@ -703,9 +703,10 @@ on an absent one exits non-zero with its own *No such file or directory* on the
 tracee's stderr; the listing entries read back through the client are proven
 separately, by
 `a_directory_listing_through_fts_reaches_the_tracee_over_the_userspace_client`.
-Six mutation probes cover the two routed data directions and the four metadata
-and directory calls this slice routed, and a mismatch between the selector and
-the binaries fails the case rather than passing it, so a passing probe means the
+Seven mutation probes cover the two routed data directions, the four metadata
+and directory calls this slice routed, and the residual-page eviction a closed
+directory descriptor triggers, and a mismatch between the selector and the
+binaries fails the case rather than passing it, so a passing probe means the
 mutation was detected rather than that the case was skipped.
 
 What that does *not* extend to: the rewrite-backed matrices in `run_fixtures.rs`
@@ -762,11 +763,12 @@ missing-evidence refusal back into a clean verdict.
 `tests/userspace_run.rs` (feature `transport-raw`, macOS arm64, gated on
 `UMBRA_NFS_RAW_FIXTURE`) drives the real `umbra` binary against a live server and
 checks the result three independent ways — through the raw client, through the
-run's journal, and against the host. Six **mutation probes** — cargo features on
-`umbra-overlay` (`read`, `write`, `fstat`), `umbra-platform-macos` (`mkdir`,
-`setattrlistat`) and `umbra-supervisor` (`readdir`), so no product build contains
-any of them — break one routed direction or one routed call each, and each must
-fail distinguishably from the other five:
+run's journal, and against the host. Seven **mutation probes** — cargo features
+on `umbra-overlay` (`read`, `write`, `fstat`, `dircache`),
+`umbra-platform-macos` (`mkdir`, `setattrlistat`) and `umbra-supervisor`
+(`readdir`), so no product build contains any of them — break one routed
+direction, one routed call, or one cache invariant each, and each must fail
+distinguishably from the other six:
 
 ```sh
 # end to end: the toy, the Rust I/O fixture and the utility matrix must pass
@@ -817,6 +819,16 @@ UMBRA_MUTATION_PROBE=setattrlistat cargo test -p umbra-storage-nfs-userspace \
 cargo build -p umbra-platform-macos
 cargo build -p umbra-cli --features mutation-probe-readdir
 UMBRA_MUTATION_PROBE=readdir cargo test -p umbra-storage-nfs-userspace \
+    --features transport-raw --test userspace_run
+
+# probe G -- a closed descriptor's residual directory page is never evicted, so
+# a second enumeration of a reopened directory is served the first one's empty
+# remainder. The run still exits 0 and the first pass is still correct, so only
+# the second listing's names discriminate: it must come back empty where the
+# unmutated run reports the whole tree. Same crate as probe F, so this feature
+# swap rebuilds `umbra` and clears the previous probe on its own.
+cargo build -p umbra-cli --features mutation-probe-dircache
+UMBRA_MUTATION_PROBE=dircache cargo test -p umbra-storage-nfs-userspace \
     --features transport-raw --test userspace_run
 ```
 

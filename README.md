@@ -81,14 +81,17 @@ that client. `touch`, `cat`, `mkdir` and `ls` work over it too, routed through
 the tracer rather than the interposer. A third CI job proves all of it against
 the same Ganesha container on the macOS runner: an end-to-end
 create/write/close/reopen/read/compare for the toy, the four standard utilities
-against the store read back through the client, and six mutation probes that
-break one routing direction each and must make the case fail. The two oldest
-probes assert distinct exit codes; the three utility probes assert distinct
-observable pairs instead, because Apple's utilities all exit 1. The directory
-probe asserts on neither: it compares the *entry names* read back through the
-client, because a tracee inherits the provider's `Stdio::null()` standard output,
-so a listing is unreadable by any harness and an exit code cannot tell a correct
-listing from an empty one. What the routed
+against the store read back through the client, and seven mutation probes that
+break one routing direction, routed call or cache invariant each and must make
+the case fail. The two oldest probes assert distinct exit codes; the three
+utility probes assert distinct observable pairs instead, because Apple's
+utilities all exit 1. The two directory probes assert on neither: they compare
+the *entry names* read back through the client, because a tracee inherits the
+provider's `Stdio::null()` standard output, so a listing is unreadable by any
+harness and an exit code cannot tell a correct listing from an empty one. One
+corrupts the encoded names; the other stops a closed descriptor's cached
+directory page being evicted, so a second enumeration of the same directory
+comes back empty while the run still exits 0. What the routed
 path does **not** claim, and why, is enumerated in that crate's README. The
 `UMBRA_TEST_SKIP_NFS_MATRIX` opt-out above is unaffected: it is about the mounted
 `storage-nfs` adapter, which the routed path does not replace.

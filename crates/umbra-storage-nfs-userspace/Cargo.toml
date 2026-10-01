@@ -27,6 +27,12 @@ uuid.workspace = true
 # host. None of them is reachable from the crate's own surface alone.
 umbra-journal = { path = "../umbra-journal" }
 umbra-journal-file = { path = "../umbra-journal-file" }
+# The production `getattrlistbulk` record encoder. `userspace_run.rs` asserts
+# that the project-tree listing case really does need more than one reply by
+# calling `dirents::encode` itself, rather than transcribing the record-size
+# formula test-side where it could drift from the encoder it is modelling. A
+# dev-dependency, so no product binary gains an edge.
+umbra-platform = { path = "../umbra-platform" }
 tempfile.workspace = true
 # `userspace_run.rs` asserts, executably, that no NFS mount covers the run --
 # the addendum's guard against the whole end-to-end proof being an illusion.

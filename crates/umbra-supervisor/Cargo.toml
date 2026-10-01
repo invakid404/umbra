@@ -12,6 +12,7 @@ publish = false
 mutation-probe-read = ["umbra-overlay/mutation-probe-read"]
 mutation-probe-write = ["umbra-overlay/mutation-probe-write"]
 mutation-probe-fstat = ["umbra-overlay/mutation-probe-fstat"]
+mutation-probe-dircache = ["umbra-overlay/mutation-probe-dircache"]
 # **The one probe that lives in this crate rather than being forwarded.** The
 # production `DirectoryEncoder` is here -- see `directory.rs` for why it cannot
 # be in the ABI backend -- so the probe that corrupts a directory reply is here

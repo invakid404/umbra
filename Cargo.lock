@@ -750,6 +750,7 @@ dependencies = [
  "umbra-core",
  "umbra-journal",
  "umbra-journal-file",
+ "umbra-platform",
  "umbra-storage",
  "uuid",
 ]

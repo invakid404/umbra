@@ -334,6 +334,16 @@ jobs:
           # exit code cannot tell a correct listing from an empty one.
           clang -arch arm64 -O1 experiments/fixtures/umbra-userspace-listing.c \
             -o "$fixture_dir/umbra-userspace-listing"
+          # The project-tree listing fixture is the control's sibling: it
+          # enumerates a 239-entry tree twice over one reused descriptor number,
+          # reporting the same 239 names each time, and records the number each
+          # pass started on. It writes nothing into the directory it reads.
+          # It is what covers what the three-name control cannot -- a reply
+          # buffer that overflows, so later pages come from the residual-page
+          # cache, and a second enumeration on the same descriptor number, whose
+          # names prove the cache was evicted.
+          clang -arch arm64 -O1 experiments/fixtures/umbra-userspace-listing-project.c \
+            -o "$fixture_dir/umbra-userspace-listing-project"
           # The Rust I/O fixture is the only one here that is not C and not a
           # bare syscall: it reaches the filesystem through `std::fs`'s own
           # wrappers -- File::open, File::metadata, write_all, read_to_end,
@@ -346,6 +356,7 @@ jobs:
             -o "$fixture_dir/umbra-userspace-rustio"
           echo "UMBRA_USERSPACE_TOY_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
           echo "UMBRA_USERSPACE_LISTING_PATH=$fixture_dir/umbra-userspace-listing" >> "$GITHUB_ENV"
+          echo "UMBRA_USERSPACE_LISTING_PROJECT_PATH=$fixture_dir/umbra-userspace-listing-project" >> "$GITHUB_ENV"
           echo "UMBRA_EDGES_PATH=$fixture_dir/umbra-userspace-edges" >> "$GITHUB_ENV"
           echo "UMBRA_RUSTIO_PATH=$fixture_dir/umbra-userspace-rustio" >> "$GITHUB_ENV"
           # The standard-utilities matrix reads `UMBRA_TEST_FIXTURE_PATH` as a
@@ -362,14 +373,15 @@ jobs:
           # `UMBRA_INTEGRATION_REQUIRED`, set for this whole job.
           echo "UMBRA_TEST_FIXTURE_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
 
-      # Six invocations, because the mutation probes are cargo features and no
+      # Eight invocations, because the mutation probes are cargo features and no
       # two may be enabled at once. The order matters: the baseline runs against
       # unmutated binaries, and each probe run is preceded by the build that
       # puts its probe in.
       #
       # **Two crates carry probes, and which one decides the build command.**
-      # A, B and C are features of `umbra-overlay`, forwarded through
-      # `umbra-supervisor` to `umbra-cli`, so they go into `target/debug/umbra`.
+      # A, B, C and G are features of `umbra-overlay` and F is one of
+      # `umbra-supervisor`, all forwarded to `umbra-cli`, so they go into
+      # `target/debug/umbra`.
       # D and E are features of `umbra-platform-macos`, which is a provider
       # *executable* the registry names rather than a library `umbra` links, so
       # they go into `target/debug/umbra-platform-macos` and
@@ -464,6 +476,17 @@ jobs:
           # place would put two probes in one run.
           cargo build -p umbra-platform-macos
           cargo build -p umbra-cli --features mutation-probe-readdir
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw \
+            --test userspace_run -- --nocapture --test-threads=1
+
+      - name: Proof 8 -- mutation probe G, the closed descriptor's page not evicted
+        env:
+          UMBRA_MUTATION_PROBE: dircache
+        run: |
+          # This probe is on `umbra`, and so was Proof 7's, so the feature swap
+          # rebuilds the same binary and clears the previous probe on its own.
+          # `umbra-platform-macos` was already restored before Proof 7.
+          cargo build -p umbra-cli --features mutation-probe-dircache
           cargo test -p umbra-storage-nfs-userspace --features transport-raw \
             --test userspace_run -- --nocapture --test-threads=1
 
