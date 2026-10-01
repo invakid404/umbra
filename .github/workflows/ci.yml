@@ -314,7 +314,7 @@ jobs:
             up -d --build --wait --wait-timeout 180
           docker ps --filter name=$UMBRA_NFS_FIXTURE_CONTAINER
 
-      - name: Build the toy and edge fixtures
+      - name: Build the toy, edge, listing and Rust I/O fixtures
         run: |
           test "$(uname -m)" = arm64
           fixture_dir=$(mktemp -d)
@@ -334,9 +334,20 @@ jobs:
           # exit code cannot tell a correct listing from an empty one.
           clang -arch arm64 -O1 experiments/fixtures/umbra-userspace-listing.c \
             -o "$fixture_dir/umbra-userspace-listing"
+          # The Rust I/O fixture is the only one here that is not C and not a
+          # bare syscall: it reaches the filesystem through `std::fs`'s own
+          # wrappers -- File::open, File::metadata, write_all, read_to_end,
+          # fs::read, fs::create_dir -- which do their short-I/O completion
+          # inside the library where the program cannot see it. `rustc` is the
+          # toolchain this job already builds the workspace with, so this needs
+          # no new setup, and `experiments/` is not a workspace member so the
+          # file is invisible to cargo.
+          rustc --edition 2021 -O experiments/fixtures/umbra-userspace-rustio.rs \
+            -o "$fixture_dir/umbra-userspace-rustio"
           echo "UMBRA_USERSPACE_TOY_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
           echo "UMBRA_USERSPACE_LISTING_PATH=$fixture_dir/umbra-userspace-listing" >> "$GITHUB_ENV"
           echo "UMBRA_EDGES_PATH=$fixture_dir/umbra-userspace-edges" >> "$GITHUB_ENV"
+          echo "UMBRA_RUSTIO_PATH=$fixture_dir/umbra-userspace-rustio" >> "$GITHUB_ENV"
           # The standard-utilities matrix reads `UMBRA_TEST_FIXTURE_PATH` as a
           # *provisioning signal* and never launches what it points at: it is
           # the suite's existing marker for "this host has workspace binaries
@@ -390,7 +401,7 @@ jobs:
       # reason (see its comment); this job stays green only because
       # `--test userspace_run` never reaches it. Widening the selector without
       # the skip reddens the job on a fixture gap this change did not cause.
-      - name: Proof 1 -- end to end, the toy must exit 0
+      - name: Proof 1 -- end to end, the toy and the Rust I/O fixture must exit 0
         run: |
           cargo build --workspace --bins
           cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
