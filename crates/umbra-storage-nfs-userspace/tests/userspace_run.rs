@@ -1,6 +1,6 @@
 //! `umbra run` over the userspace NFSv4 client, end to end -- the toy program,
 //! the edge and directory-listing fixtures, the Rust library-wrapper fixture,
-//! the three standard utilities, and the six mutation probes that prove the
+//! the three standard utilities, and the seven mutation probes that prove the
 //! routing is load-bearing.
 //!
 //! **Five kinds of fixture, and the fifth is not C.** Four of them --
@@ -29,8 +29,9 @@
 //!
 //! # Running them
 //!
-//! **Six separate invocations**, because the probes are compile-time and no two
-//! may be enabled at once. Always rebuild the unmutated binaries afterwards.
+//! **Eight separate invocations**, because the probes are compile-time and no
+//! two may be enabled at once. Always rebuild the unmutated binaries
+//! afterwards.
 //!
 //! ```text
 //! # end to end: the toy and the Rust I/O fixture must exit 0, and the utility
@@ -66,11 +67,25 @@
 //! cargo build -p umbra-platform-macos --features mutation-probe-setattrlistat
 //! UMBRA_MUTATION_PROBE=setattrlistat cargo test -p umbra-storage-nfs-userspace \
 //!     --features transport-raw --test userspace_run
+//!
+//! # probe F -- each directory entry's name reversed; the run must still exit 0
+//! #            while the names read back are wrong
+//! cargo build -p umbra-cli --features mutation-probe-readdir
+//! UMBRA_MUTATION_PROBE=readdir cargo test -p umbra-storage-nfs-userspace \
+//!     --features transport-raw --test userspace_run
+//!
+//! # probe G -- a closed descriptor's residual directory page is never
+//! #            evicted; the second enumeration of a re-opened directory must
+//! #            lose the names created since the first
+//! cargo build -p umbra-cli --features mutation-probe-dircache
+//! UMBRA_MUTATION_PROBE=dircache cargo test -p umbra-storage-nfs-userspace \
+//!     --features transport-raw --test userspace_run
 //! ```
 //!
 //! **The probes are not all on the same crate, and the build command differs
-//! because of it.** A and B and C are features of `umbra-overlay`, forwarded
-//! through `umbra-supervisor` to `umbra-cli`, so they go into the `umbra`
+//! because of it.** A, B, C and G are features of `umbra-overlay`, and F is one
+//! of `umbra-supervisor`; all five are forwarded to `umbra-cli`, so they go
+//! into the `umbra`
 //! binary. D and E are features of `umbra-platform-macos`, which is a provider
 //! *executable* the registry names rather than a library `umbra` links -- so
 //! they go into that binary, and `cargo build -p umbra-cli --features
@@ -100,11 +115,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use umbra_core::{
-    BytePath, JournalAccess, JournalControlBinding, JournalFormatPolicy, JournalLifecycle,
-    JournalOpenRequest, JournalPayload, PhysicalPath, RunId, Sequence,
+    BlobStat, BytePath, DirectoryEntry, JournalAccess, JournalControlBinding, JournalFormatPolicy,
+    JournalLifecycle, JournalOpenRequest, JournalPayload, ObjectId, ObjectKind, PhysicalPath,
+    RunId, Sequence,
 };
 use umbra_journal::Journal;
 use umbra_journal_file::FileJournal;
+// The *production* `getattrlistbulk` record encoder, as a dev-dependency. The
+// pagination assertion calls it rather than transcribing its five-line record
+// formula, so the case cannot quietly stop paginating when `dirents.rs`
+// changes: a transcribed formula that drifts from the encoder makes the
+// assertion pass while meaning nothing.
+use umbra_platform::dirents;
 use umbra_storage_nfs_userspace::transport::raw::{LibnfsRawTransport, RawTransportConfig};
 use umbra_storage_nfs_userspace::transport::{
     AttrMask, ComponentName, Deadline, Nfs4Type, RawTransport,
@@ -186,6 +208,27 @@ fn listing_fixture(scratch: &Path) -> PathBuf {
         scratch,
         "umbra-userspace-listing",
         "UMBRA_USERSPACE_LISTING_PATH",
+    )
+}
+
+/// The compiled project-tree listing fixture: the control's sibling, which
+/// enumerates a directory **twice** over one reused descriptor number, and
+/// records the number each enumeration started on. It writes nothing into the
+/// directory it reads -- see `project_listing_run` for why that matters.
+///
+/// A separate `.c` file rather than an argv mode inside
+/// `umbra-userspace-listing.c`, deliberately. The established pattern for a
+/// multi-shape C fixture here is argv dispatch -- `umbra-userspace-edges.c`
+/// carries about twenty `case_*` functions behind a `strcmp` -- and it would
+/// have saved the ~15 duplicated lines of `emit` and `fts` boilerplate. The
+/// design gate declined it anyway: the listing fixture is the *control* for
+/// everything in this area, and the cheapest way to keep it a control is for
+/// its file to stay byte-identical.
+fn project_listing_fixture(scratch: &Path) -> PathBuf {
+    fixture_binary(
+        scratch,
+        "umbra-userspace-listing-project",
+        "UMBRA_USERSPACE_LISTING_PROJECT_PATH",
     )
 }
 
@@ -288,6 +331,378 @@ fn assert_listing_workspace_pristine(run: &Run, names: &[&str]) {
         read(&run.workspace.join("entries")),
         names,
         "the listing run changed the host directory it enumerated"
+    );
+}
+
+/// The project-shaped core of the two-pass tree, seeded on the host as base
+/// entries. Nine names, chosen for *record shapes* the control's three flat
+/// ASCII files cannot produce: two hidden, four containing a space, one 2-byte
+/// and one 3-byte UTF-8 name, and two directories -- whose records are 4 bytes
+/// shorter than a file's, because a directory entry omits
+/// `ATTR_FILE_LINKCOUNT` (`umbra-platform/src/dirents.rs:275-277`).
+const PROJECT_CORE_FILES: &[&str] = &[
+    ".gitignore",
+    ".hidden config",
+    "Cargo.toml",
+    "README copy.md",
+    "naïve café.txt",
+    "two words.rs",
+    "日本語ファイル.txt",
+];
+
+/// The two multibyte names in the core, called out because the assertions need
+/// them by name: a reversed multibyte name is what makes `listed_lines` return
+/// bytes, and both of these must land beyond the first reply for the
+/// residual-page coverage to mean anything.
+const PROJECT_CORE_UTF8_NAMES: &[&str] = &["naïve café.txt", "日本語ファイル.txt"];
+
+/// Seeded, and deliberately never entered. The fixture keeps
+/// `fts_set(FTS_SKIP)`; these exist for their directory *records*, not to be
+/// descended. Recursive traversal is explicitly not claimed by this slice
+/// (`README.md:688`) and nothing here changes that.
+const PROJECT_CORE_DIRECTORIES: &[&str] = &["src", "test fixtures"];
+
+/// Pagination ballast, and named as ballast rather than dressed up as project
+/// files.
+///
+/// **Being honest about why it is here.** No realistic small project tree
+/// reaches 32 KiB of encoded records -- that is roughly 200 entries at
+/// 100-byte names, or 455 at 14 -- and pretending otherwise by inventing two
+/// hundred plausible-looking source files would make the fixture lie about what
+/// it is. The core above carries the semantic coverage; this carries the bytes.
+///
+/// 230 at a 100-byte name is the measured choice. 210 entries is the bare
+/// minimum that clears the reply buffer, by 8 bytes, which is too fragile to be
+/// worth having; 239 clears it by 4 648 (14 %). A 14-byte name would need 456
+/// entries and roughly double the round trips `Overlay::merged` makes.
+const PROJECT_BALLAST: usize = 230;
+
+/// Bytes in each ballast name. Encoded record: `align8(48 + 4 + 100 + 1)` = 160.
+const PROJECT_BALLAST_BYTES: usize = 100;
+
+/// The `getattrlistbulk` buffer `fts` passes, every call.
+///
+/// Measured on this host rather than assumed: lldb on `getattrlistbulk` with a
+/// probe using the shipped fixture's flags reads `x3 = 0x8000` under
+/// `fts_build` -> `advance_directory`, and `x3` is the register
+/// `umbra-platform-macos/src/abi.rs:559` reads as `max_bytes`. 32768 is far
+/// below that path's 1 MiB clamp, so it arrives unmodified.
+const FTS_REPLY_BYTES: u32 = 32768;
+
+/// The ballast names, in the order the fixture's seeding produces them.
+fn project_ballast_names() -> Vec<String> {
+    (0..PROJECT_BALLAST)
+        .map(|index| {
+            let mut name = format!("ballast-{index:04}-");
+            while name.len() < PROJECT_BALLAST_BYTES {
+                name.push('p');
+            }
+            assert_eq!(
+                name.len(),
+                PROJECT_BALLAST_BYTES,
+                "a ballast name must be exactly {PROJECT_BALLAST_BYTES} bytes or the measured \
+                 pagination threshold no longer describes the tree"
+            );
+            name
+        })
+        .collect()
+}
+
+/// Every name **each** pass must report: the core, the directories and the
+/// ballast. Both passes enumerate the same tree and nothing writes into it, so
+/// one expectation serves both -- and pass 2 matching it *is* the eviction
+/// proof, because a surviving residual page would answer the empty remainder
+/// pass 1 left instead.
+fn project_tree_names() -> Vec<Vec<u8>> {
+    let mut names: Vec<Vec<u8>> = PROJECT_CORE_FILES
+        .iter()
+        .chain(PROJECT_CORE_DIRECTORIES.iter())
+        .map(|name| name.as_bytes().to_vec())
+        .chain(project_ballast_names().into_iter().map(String::into_bytes))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The tree as the production encoder sees it: byte-sorted `DirectoryEntry`
+/// values, which is the order `Overlay::merged` returns and therefore the order
+/// the reply pages are packed in.
+///
+/// Only `name` and `stat.kind` affect a record's size, which is what the
+/// assertions here are about; the rest is filled with values a real entry could
+/// carry.
+fn project_directory_entries(names: &[Vec<u8>]) -> Vec<DirectoryEntry> {
+    let directories: Vec<&[u8]> = PROJECT_CORE_DIRECTORIES
+        .iter()
+        .map(|name| name.as_bytes())
+        .collect();
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| DirectoryEntry {
+            name: BytePath::new(name.clone()).expect("a seeded name is a nonempty NUL-free byte"),
+            stat: BlobStat {
+                object_id: ObjectId(uuid::Uuid::from_u128(index as u128 + 1)),
+                kind: if directories.contains(&name.as_slice()) {
+                    ObjectKind::Directory
+                } else {
+                    ObjectKind::File
+                },
+                len: 1,
+                link_count: 1,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                modified_nanos: 0,
+            },
+        })
+        .collect()
+}
+
+/// Run the project-tree listing fixture over a routed workspace and return the
+/// run together with the host path of the file it was told to write.
+///
+/// A sibling of `listing_run` rather than a generalisation of it. That helper is
+/// shared by the control case and by the `readdir` probe case, and widening its
+/// signature would put this change inside the control's own code path -- which
+/// is the one thing the design gate held fixed.
+///
+/// The output file goes at the workspace root for `listing_run`'s documented
+/// reason, which still holds -- and here it carries a second reason that is
+/// load-bearing rather than tidy. **Nothing in this case writes into the
+/// enumerated directory, and that is a precondition, not an accident.** A write
+/// there materialises the directory into the shadow, and a routed `stat` by path
+/// on a shadow object is refused `ENOTSUP` at `engine.rs:3020-3023` -- a
+/// limitation the comment above it defers to a later slice. `fts` stats a root
+/// entry before walking it, so pass 2 would report nothing for a reason that has
+/// nothing to do with the directory cache this case exists to exercise.
+///
+/// **So the base-plus-shadow merge is deliberately NOT claimed here.** An earlier
+/// draft created two files between the passes to prove it and measured exactly
+/// that refusal; the claim moved to the slice that lifts the `Stat` limitation.
+/// An edit that reintroduces a write into the enumerated directory -- including
+/// moving the output file there -- silently returns this case to that path.
+fn project_listing_run(scratch: &Path, host: &str, port: u16) -> (Run, PathBuf) {
+    let workspace = scratch.join("project-listing-workspace");
+    let state = scratch.join("project-listing-state");
+    let entries = workspace.join("entries");
+    std::fs::create_dir_all(&entries).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed\n").unwrap();
+    for name in PROJECT_CORE_FILES {
+        std::fs::write(entries.join(name), b"x").unwrap();
+    }
+    for name in PROJECT_CORE_DIRECTORIES {
+        std::fs::create_dir(entries.join(name)).unwrap();
+    }
+    for name in project_ballast_names() {
+        std::fs::write(entries.join(&name), b"x").unwrap();
+    }
+    let workspace = workspace.canonicalize().unwrap();
+    let entries = workspace.join("entries");
+    let destination = workspace.join("listing.txt");
+    let registry = registry(scratch, host, port);
+    let program = project_listing_fixture(scratch);
+
+    let output = Command::new(binaries().join("umbra"))
+        .args(["run", "--registry"])
+        .arg(&registry)
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("--experimental")
+        .arg("--")
+        .arg(&program)
+        .arg(&entries)
+        .arg(&destination)
+        .stdin(Stdio::null())
+        .output()
+        .expect("umbra run");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let run_id = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("umbra: run ")
+                .and_then(|line| line.strip_suffix(" prepared"))
+        })
+        .unwrap_or_else(|| panic!("no prepared run id in:\n{stderr}"));
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(run_id).unwrap()),
+        status: output.status.code(),
+        stderr,
+        destination: destination.clone(),
+        state,
+        workspace,
+        registry,
+    };
+    (run, destination)
+}
+
+/// The fixture's output read back through the client as **bytes**, one entry
+/// per line, in the order the fixture wrote them.
+///
+/// Two differences from `listed_names`, both mandatory rather than stylistic:
+///
+/// **Bytes, not `String`.** `listed_names` unwraps `String::from_utf8`. This
+/// tree carries multibyte UTF-8 names, and the `readdir` probe byte-reverses
+/// each name (`umbra-supervisor/src/directory.rs:145-156`) -- byte-reversing
+/// multibyte UTF-8 yields invalid UTF-8, so the probe case would panic inside
+/// the helper instead of asserting.
+///
+/// **Unsorted.** `listed_names` sorts so the assertion does not depend on
+/// enumeration order, which is right for a one-pass case. Here the order is
+/// what separates pass 1 from pass 2, so sorting happens later, per pass.
+fn listed_lines(host: &str, port: u16, run: &Run, destination: &Path) -> Vec<Vec<u8>> {
+    let stored = read_whole_object_through_client(host, port, &utility_shadow(run, destination))
+        .expect("the project listing fixture's output file is not in the export");
+    stored
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// One object's **whole** contents, through the client, however many `READ`s
+/// that takes.
+///
+/// A third sibling of `read_through_client` and `stored_size_through_client`,
+/// and it exists because neither of those fits this case. The first caps its
+/// `READ` at 4 KiB, which is right for the small payloads it checks and silently
+/// wrong here: this fixture's output is about 48 KiB, so that helper returns the
+/// first page and a listing assertion built on it would compare 45 lines against
+/// 480 and fail for a reason that has nothing to do with the directory read.
+/// Measured exactly that way before this helper existed. The second answers the
+/// size without the bytes, which is what the 2 MiB case wants and not what a
+/// line-by-line assertion can use.
+///
+/// `read_through_client` is deliberately left alone rather than generalised: it
+/// is shared with the control case and with four others, and the 4 KiB cap is
+/// load-bearing for the 2 MiB payload they have to not pull back.
+fn read_whole_object_through_client(
+    host: &str,
+    port: u16,
+    components: &[Vec<u8>],
+) -> Option<Vec<u8>> {
+    let mut config = RawTransportConfig::loopback(port);
+    config.host = host.to_owned();
+    config.limits.default_deadline = Deadline { millis: 10_000 };
+    let deadline = config.limits.default_deadline;
+    let mut transport = LibnfsRawTransport::connect(config).expect("connect to the fixture");
+    let mut handle = transport
+        .root_filehandle(deadline)
+        .expect("PUTROOTFH; GETFH");
+    let mut attributes = None;
+    for component in components {
+        let name = ComponentName::new(component.clone()).expect("component");
+        let (next, found) = transport
+            .lookup(&handle, &name, AttrMask::STAT, deadline)
+            .ok()?;
+        handle = next;
+        attributes = Some(found);
+    }
+    let attributes = attributes.expect("at least one component");
+    assert_eq!(
+        attributes.file_type,
+        Some(Nfs4Type::Regular),
+        "the shadow object is not a regular file"
+    );
+    let length = attributes.size.unwrap_or(0);
+    let mut bytes: Vec<u8> = Vec::with_capacity(length as usize);
+    // A short `READ` reply is a real answer rather than an error, so this reads
+    // until the server reports EOF or stops making progress -- not until one
+    // call happens to return everything.
+    while (bytes.len() as u64) < length {
+        let want = (length - bytes.len() as u64).min(4096) as u32;
+        let reply = transport
+            .read(
+                &handle,
+                umbra_storage_nfs_userspace::handle::Stateid::ANONYMOUS,
+                bytes.len() as u64,
+                want,
+                deadline,
+            )
+            .expect("READ with the anonymous stateid");
+        let empty = reply.data.is_empty();
+        bytes.extend_from_slice(&reply.data);
+        if reply.eof || empty {
+            break;
+        }
+    }
+    assert_eq!(
+        bytes.len() as u64,
+        length,
+        "the export reports a {length}-byte object but served {} bytes",
+        bytes.len()
+    );
+    Some(bytes)
+}
+
+/// Split the fixture's output into its two passes.
+///
+/// The fixture emits `probe-fd=<n>` immediately before each `fts_open`, so that
+/// line both carries the descriptor observation and delimits the pass that
+/// follows it. Returns the recorded descriptor number and the sorted names, per
+/// pass, and insists there are exactly two.
+fn project_passes(lines: &[Vec<u8>]) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut passes: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    for line in lines {
+        if let Some(number) = line.strip_prefix(b"probe-fd=".as_slice()) {
+            passes.push((number.to_vec(), Vec::new()));
+            continue;
+        }
+        passes
+            .last_mut()
+            .expect("the fixture emits probe-fd=<n> before the first name it reports")
+            .1
+            .push(line.clone());
+    }
+    assert_eq!(
+        passes.len(),
+        2,
+        "the fixture enumerates twice and marks each pass with probe-fd=<n>; \
+         got {} marker(s)",
+        passes.len()
+    );
+    for pass in &mut passes {
+        pass.1.sort();
+    }
+    passes
+}
+
+/// Refuse any change the project listing run could have made to its host
+/// workspace.
+///
+/// `assert_listing_workspace_pristine` cannot be reused: it is shared with the
+/// control case and takes the enumerated directory's exact contents as a
+/// `&[&str]`, and this tree's contents are 239 generated names. The property
+/// asserted is the same one, at both levels -- the workspace root holds what it
+/// was seeded with, and the enumerated directory still holds exactly the tree it
+/// was given, so the run neither created the listing file on the host nor
+/// disturbed what it read.
+///
+/// It reads the host with `std::fs::read_dir`, as the sibling does, and that is
+/// inside the guardrail: the rule the design gate ratified is no `read_dir` in
+/// the *traced fixture*. This inspects host state, which is the one thing the
+/// client cannot be asked about.
+fn assert_project_workspace_pristine(run: &Run) {
+    let read = |path: &Path| -> Vec<Vec<u8>> {
+        let mut found: Vec<Vec<u8>> = std::fs::read_dir(path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+            .map(|entry| entry.unwrap().file_name().as_bytes().to_vec())
+            .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(
+        read(&run.workspace),
+        vec![b"entries".to_vec(), b"seed.txt".to_vec()],
+        "the project listing run changed its host workspace"
+    );
+    assert_eq!(
+        read(&run.workspace.join("entries")),
+        project_tree_names(),
+        "the project listing run changed the host directory it enumerated"
     );
 }
 
@@ -2417,8 +2832,8 @@ fn standard_utilities_run_over_the_userspace_client() {
 /// nothing had run.
 ///
 /// The matrix's own gate is hard-failed under `UMBRA_INTEGRATION_REQUIRED` now,
-/// which closes that half. A probe cannot be hard-failed the same way -- five
-/// probes across six invocations means four or five legitimately skip every
+/// which closes that half. A probe cannot be hard-failed the same way -- seven
+/// probes across eight invocations means six or seven legitimately skip every
 /// time -- so the property is checked here instead: for each probe, the
 /// workflow must both select it and build the crate that carries it.
 ///
@@ -2451,6 +2866,10 @@ fn every_mutation_probe_is_wired_into_the_userspace_job() {
         // `umbra-cli` -- so it is built like the first three, not like the two
         // provider-executable probes.
         ("readdir", "umbra-cli"),
+        // `dircache` removes `Engine::commit`'s eviction of a closed
+        // descriptor's residual directory page. An `umbra-overlay` feature like
+        // the first three, so it reaches the same binary the same way.
+        ("dircache", "umbra-cli"),
     ] {
         assert!(
             job.contains(&format!("UMBRA_MUTATION_PROBE: {probe}")),
@@ -2620,6 +3039,408 @@ fn mutation_probe_readdir_makes_the_listed_names_wrong() {
     );
     assert!(!destination.exists());
     assert_listing_workspace_pristine(&run, &names);
+    assert_host_write_root_empty(&run);
+}
+
+/// **A project-shaped directory, enumerated twice over one reused descriptor
+/// number, paginating both times.** The regression guard the control cannot be.
+///
+/// **What it guards is live and was un-exercised.** The residual-page cache is
+/// keyed on the descriptor *number* (`umbra-overlay/src/engine.rs`'s
+/// `DirectoryKey`), a routed `close` marks the descriptor closed, and
+/// `Engine::commit` evicts the key. That eviction works -- and until this case
+/// nothing ran it, because every shipped fixture reads each directory once.
+/// `crates/umbra-storage-nfs-userspace/README.md:688` records what that costs:
+/// an earlier defect here was first mis-diagnosed as a recursion problem, and
+/// *"fixtures that read each directory once, which is how this was first
+/// checked, could not have shown either the defect or the fix."* This is that
+/// fixture, and the `dircache` probe below is what proves the assertion is not
+/// vacuous.
+///
+/// What the control proves and this adds, item by item:
+///
+/// - **Pagination.** The control's three names encode to 192 bytes, one reply.
+///   This tree encodes to 37 416, so at least two replies carry entries and
+///   every page after the first comes from the cached remainder. The assertion
+///   calls the production encoder to establish that rather than hard-coding a
+///   count, so editing a name or the ballast count cannot silently turn the
+///   case back into a one-reply one while it keeps passing.
+/// - **Record shapes.** Two hidden names, four with spaces, a 2-byte and a
+///   3-byte UTF-8 name, and two directory records -- which are 4 bytes shorter
+///   than a file's. Under byte-sorted packing every one of those except the two
+///   leading hidden names falls on the *second* reply, so they are served from
+///   the cache-hit path rather than the first `merged` call.
+/// - **Descriptor reuse, and why it is not assumed.** umbra allocates the
+///   lowest free number at or above the run's floor, so close-then-reopen
+///   reuses it; `dup2` would not work here at all, since `FsOp::Dup` is decoded
+///   nowhere and reaches the kernel as `EBADF`. The fixture records the number
+///   it is handed immediately before each `fts_open`, and the two must match --
+///   which is what makes the cache key collide, and therefore what makes pass 2
+///   a test of eviction rather than of a fresh key.
+/// - **Eviction.** Pass 2 reporting the same 239 names is the proof. Nothing is
+///   written between the passes, so the only thing that can make the second
+///   enumeration differ is what umbra did with the first one's leftovers: a
+///   surviving residual page answers the empty remainder a completed
+///   enumeration leaves, which `fts` reads as end-of-directory. The failure
+///   this catches is therefore 0 names against 239, with exit 0 either way --
+///   which is why it asserts on names and not on status.
+/// - **Pagination does not contaminate the reuse.** The two properties are
+///   asserted together on purpose: a tree that pages leaves a *different* cache
+///   state behind than one that fits a single reply, and this is the only case
+///   that shows the second enumeration is clean after a paged first one.
+///
+/// **What it deliberately does not claim.** The base-plus-shadow merge. An
+/// earlier draft created two files in the enumerated directory between the
+/// passes to prove it; measured, that write materialises the directory into the
+/// shadow, and a routed `stat` by path on a shadow object is refused `ENOTSUP`
+/// at `engine.rs:3020-3023` -- a limitation the comment above it already
+/// defers. `fts` stats a root before walking it, so pass 2 reported nothing for
+/// a reason unrelated to the cache. That claim belongs to the slice that lifts
+/// the `Stat` limitation.
+#[test]
+fn a_project_tree_listing_paginates_and_survives_a_reused_descriptor_number() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let began = std::time::Instant::now();
+    let (run, destination) = project_listing_run(scratch.path(), &host, port);
+    let elapsed = began.elapsed();
+    // `Overlay::merged` re-looks-up every entry, so 239 entries is several
+    // hundred NFSv4 round trips per enumeration and this case is materially
+    // slower than the control's three names. The registry's 12 s deadline is
+    // per *request*, so no single call is at risk; the total is worth printing
+    // so a slow runner is diagnosable rather than mysterious.
+    eprintln!(
+        "PASS userspace project listing: two passes over {} entries in {:.1}s",
+        PROJECT_BALLAST + PROJECT_CORE_FILES.len() + PROJECT_CORE_DIRECTORIES.len(),
+        elapsed.as_secs_f64()
+    );
+    assert_eq!(
+        run.status,
+        Some(0),
+        "the project listing fixture failed over the userspace client:\n{}",
+        run.stderr
+    );
+
+    let passes = project_passes(&listed_lines(&host, port, &run, &destination));
+    let expected = project_tree_names();
+
+    // Pass 1: the seeded tree, byte for byte.
+    assert_eq!(
+        passes[0].1, expected,
+        "the first enumeration's names are not the shadow's entries"
+    );
+
+    // Pass 2: the same tree again, and this is the eviction proof. Nothing was
+    // written between the passes, so the only thing that can make the second
+    // enumeration differ from the first is what umbra did with the first one's
+    // leftovers. A residual page that outlived its descriptor answers the empty
+    // remainder a completed enumeration leaves behind, which `fts` reads as
+    // end-of-directory -- so the failure this catches is 0 names against 239,
+    // with the run still exiting 0.
+    assert_eq!(
+        passes[1].1, expected,
+        "the second enumeration did not re-read the directory, so the residual \
+         page outlived the descriptor that produced it"
+    );
+
+    // The pagination claim, asserted against the production encoder rather than
+    // a transcribed formula: if one whole reply cannot hold the tree, at least
+    // two replies carry entries and the second one came from the cache.
+    let entries = project_directory_entries(&expected);
+    let (_, consumed) = dirents::encode(&entries, FTS_REPLY_BYTES)
+        .expect("the production encoder serves this tree's records");
+    assert!(
+        consumed < entries.len(),
+        "the whole {}-entry tree fits in one {FTS_REPLY_BYTES}-byte reply \
+         ({consumed} consumed), so this case no longer paginates and the \
+         residual-page path it exists to cover is unexercised",
+        entries.len()
+    );
+
+    // The residual page's *contents*, which is the part worth pinning as the
+    // fixture is maintained.
+    //
+    // **What this can and cannot assert, stated precisely.** The output file is a
+    // flat list of names with no reply boundaries in it, so which reply carried a
+    // given name is **not observable from it at all** -- that was measured by
+    // instrumenting `resolve_directory`, not by reading this file. Asserting that
+    // a residual name "came back" would also be vacuous: the pass-1 equality
+    // above already pins every name, and `residual` is a subslice of the same
+    // expectation.
+    //
+    // What is *not* vacuous is the encoder's own split. Both UTF-8 names and both
+    // directory records -- the record shapes that differ from the control's flat
+    // ASCII files, a directory record being 4 bytes shorter for want of
+    // `ATTR_FILE_LINKCOUNT` -- must fall beyond reply 1, because being served
+    // from the cache-hit path rather than the first `merged` call is the whole
+    // reason they are in the tree. An edit to a name or to the ballast count that
+    // slid them onto reply 1 would leave every other assertion here passing while
+    // quietly ending that coverage.
+    let residual = &expected[consumed..];
+    assert!(
+        residual.len() > 1,
+        "the model puts only {} entry on the second reply, which is too thin to \
+         carry the record shapes this case exists to exercise",
+        residual.len()
+    );
+    for shape in PROJECT_CORE_DIRECTORIES
+        .iter()
+        .chain(PROJECT_CORE_UTF8_NAMES.iter())
+    {
+        assert!(
+            residual.contains(&shape.as_bytes().to_vec()),
+            "{shape:?} is one of the record shapes this case exists to serve from \
+             the cached residual page, and the production encoder now packs it \
+             into the first reply ({consumed} of {} entries), so that coverage is \
+             gone",
+            expected.len()
+        );
+    }
+
+    // The descriptor number was reused, which is what made the cache key
+    // collide. Precisely: this proves the allocator's free-slot state was
+    // identical at the start of both passes. Combined with lowest-free
+    // allocation -- a property of `allocate_descriptor`'s source, not of this
+    // measurement -- `fts` received the same number both times.
+    assert_eq!(
+        passes[0].0, passes[1].0,
+        "the two enumerations started from different descriptor numbers, so the \
+         cache key never collided and the second pass proves nothing about \
+         eviction"
+    );
+
+    // The host keeps none of it: not the listing the fixture wrote, and not the
+    // tree it read.
+    assert!(
+        !destination.exists(),
+        "the listing escaped to the host at {}",
+        destination.display()
+    );
+    assert_project_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+    assert!(
+        journal_records_completion(&run),
+        "the run's journal does not record completion"
+    );
+}
+
+/// Probe F again, now across a paginated listing and a reused descriptor.
+///
+/// **What this adds over `mutation_probe_readdir_makes_the_listed_names_wrong`,
+/// which is the only reason a second case for one probe is worth having.** That
+/// one exercises a single reply of three short ASCII names. Nothing in it shows
+/// that the *second* reply of an enumeration, or the *second* enumeration on a
+/// reused descriptor, is produced by `AbiDirectoryEncoder::encode` at all rather
+/// than fabricated somewhere else -- the residual page is served from a cached
+/// entry list, and a reader is entitled to ask whether that path re-encodes.
+/// Under this probe it must, in all four places, or the names come back right.
+///
+/// It follows the sibling's five-part shape, in **bytes**: the probe reverses
+/// each name bytewise, and a reversed multibyte UTF-8 name is not valid UTF-8,
+/// so `listed_names` would panic inside the helper rather than assert. That is
+/// what `listed_lines` exists for.
+#[test]
+fn mutation_probe_readdir_corrupts_a_paginated_listing_across_a_descriptor_reuse() {
+    if declared_probe().as_deref() != Some("readdir") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=readdir with a binary built with \
+                   --features mutation-probe-readdir"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let (run, destination) = project_listing_run(scratch.path(), &host, port);
+    // Positive half: the probe breaks the names and nothing else. None of this
+    // tree's names is a palindrome -- the ballast names end in a run of `p` and
+    // begin `ballast-`, and no core name reads the same backwards -- so a
+    // reversal is always observable.
+    assert_eq!(
+        run.status,
+        Some(0),
+        "the probe was meant to corrupt names, not to break the run:\n{}",
+        run.stderr
+    );
+    let passes = project_passes(&listed_lines(&host, port, &run, &destination));
+    let expected = project_tree_names();
+
+    // Positive: the counts are untouched, on both pages of both passes. A probe
+    // that changed how many entries were reported would not be isolated to the
+    // encoded names.
+    assert_eq!(
+        passes[0].1.len(),
+        expected.len(),
+        "the probe changed how many entries the first enumeration reported"
+    );
+    assert_eq!(
+        passes[1].1.len(),
+        expected.len(),
+        "the probe changed how many entries the second enumeration reported"
+    );
+
+    // Positive: every name is a byte reversal of a real one, so what came back
+    // is a permutation of the real reply and not some other failure's output.
+    // Nothing upstream of the encoding can satisfy this and still get the names
+    // wrong: a broken open, a refused `getattrlistbulk`, a dead `fchdir` or an
+    // unrouted `close` all fail to produce the file at all.
+    for pass in [&passes[0].1, &passes[1].1] {
+        for name in pass {
+            let restored: Vec<u8> = name.iter().rev().copied().collect();
+            assert!(
+                expected.contains(&restored),
+                "{:?} is not a byte reversal of any real entry, so something \
+                 other than the probe changed the reply",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    // Positive: the descriptor was still reused, so the corruption is being
+    // observed on the same key collision the unmutated case establishes rather
+    // than on a different one.
+    assert_eq!(
+        passes[0].0, passes[1].0,
+        "the two enumerations started from different descriptor numbers"
+    );
+
+    // Negative half, and the whole point: the names are wrong -- in the first
+    // reply, in the cached residual page, and after the reuse.
+    assert_ne!(
+        passes[0].1, expected,
+        "breaking the encoded names did not change what the first enumeration \
+         reads back, so this proof never depended on the directory encoding"
+    );
+    assert_ne!(
+        passes[1].1, expected,
+        "breaking the encoded names did not change what the second enumeration \
+         reads back, so the post-reuse reply is not encoder-produced"
+    );
+
+    assert!(!destination.exists());
+    assert_project_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+}
+
+/// Probe G -- the residual-page cache is never evicted on `close`.
+///
+/// **The probe that makes the eviction a live mutation instead of a historical
+/// counterfactual.** The eviction is live on master and nothing exercised it,
+/// so without this probe the arc's own second pass would be the only thing
+/// asserting it -- and a test whose subject is never broken on purpose is a
+/// test nobody has checked. It deletes exactly the `retain` in `Engine::commit`
+/// and nothing else, so the insert still happens, the `close` is still routed
+/// and journalled, and the tracee still sees success.
+///
+/// **The discriminator cannot be an exit code, and that is the point.** The
+/// behaviour it restores leaves the tracee on *exit 0* -- the first
+/// enumeration's names, then nothing. A completed enumeration leaves the cache
+/// entry holding an **empty remainder**, `resolve_directory` prefers that cache
+/// over `merged`, and an empty `getattrlistbulk` reply means end-of-directory --
+/// so `fts` stops, the fixture writes what it has, and the run completes
+/// normally. So this asserts on the second enumeration's *names and bytes*: it
+/// must come back **empty** where the unmutated run reports all 239.
+///
+/// The positive half is load-bearing for the reason probe D's doc records -- a
+/// probe that passes for a cause outside its own mutation certifies exactly what
+/// it cannot detect. So the run must still exit 0, the *first* pass must still
+/// report the full tree byte for byte, and the descriptor must still have been
+/// reused. Those three together exclude every failure that is not this
+/// mutation: a broken open, a refused directory read or a dead `fchdir` would
+/// cost pass 1 its names, and a different descriptor number would mean pass 2
+/// read a fresh key rather than a surviving one.
+///
+/// **One precondition this case relies on and does not assert.** The signature
+/// it checks -- exit 0, pass 1 full, descriptor reused, pass 2 empty -- is
+/// *also* exactly what a routed `stat` refused `ENOTSUP` produces: `fts` stats a
+/// root before walking it, gets `FTS_NS`, and reports nothing while still
+/// exiting 0 (measured; see `project_listing_run`'s doc and
+/// `engine.rs:3009-3018`). That path is unreachable here only because the
+/// fixture writes nothing into the enumerated directory, so the directory is
+/// never materialised into the shadow. An edit that reintroduces such a write --
+/// including moving the output file out of the workspace root and into the
+/// enumerated directory -- would leave this probe **passing for the wrong
+/// reason**, which is the one failure mode a mutation probe must not have.
+/// Deliberately a note and not an assertion: distinguishing the two causes needs
+/// reply-level observability the output file does not carry, and the non-vacuity
+/// this probe does rest on is the ON/OFF pair, which is checked by running the
+/// unmutated case against both feature states.
+#[test]
+fn mutation_probe_dircache_lets_a_closed_descriptors_page_outlive_it() {
+    if declared_probe().as_deref() != Some("dircache") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=dircache with a binary built with \
+                   --features mutation-probe-dircache"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let (run, destination) = project_listing_run(scratch.path(), &host, port);
+    // Positive half: the probe breaks the second enumeration and nothing else.
+    assert_eq!(
+        run.status,
+        Some(0),
+        "the probe was meant to strand a cached page, not to break the run:\n{}",
+        run.stderr
+    );
+    let passes = project_passes(&listed_lines(&host, port, &run, &destination));
+    let expected = project_tree_names();
+
+    // Positive: pass 1 is untouched, byte for byte. The mutation is on `close`,
+    // so the first enumeration cannot be affected by it -- and if it were, the
+    // negative half below would be satisfiable by a plain broken listing.
+    assert_eq!(
+        passes[0].1, expected,
+        "the probe changed the first enumeration, so it is not isolated to the \
+         eviction and the negative half proves nothing"
+    );
+
+    // Positive: the descriptor number was still reused, so pass 2 really did
+    // reproduce pass 1's cache key. Without this the absence below could just
+    // be a fresh key answering from a different entry.
+    assert_eq!(
+        passes[0].0, passes[1].0,
+        "the two enumerations started from different descriptor numbers, so pass \
+         2 did not read the page this probe stranded"
+    );
+
+    // Negative half, on names and bytes: the second enumeration did not re-read
+    // the directory, because it was answered from the page the closed descriptor
+    // left behind.
+    assert_ne!(
+        passes[1].1, expected,
+        "the second enumeration still reported the tree with the eviction \
+         removed, so this proof never depended on the eviction at all"
+    );
+    // And specifically the shape the stranded page produces: a completed
+    // enumeration's remainder is empty, so pass 2 reports nothing at all. This
+    // is the bytes half of the assertion -- not "different names" but "no
+    // names", which no other probe in this file can produce.
+    assert!(
+        passes[1].1.is_empty(),
+        "the stranded page should have answered end-of-directory, but the second \
+         enumeration reported {} names: {:?}",
+        passes[1].1.len(),
+        passes[1]
+            .1
+            .iter()
+            .take(4)
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    assert!(!destination.exists());
+    assert_project_workspace_pristine(&run);
     assert_host_write_root_empty(&run);
 }
 

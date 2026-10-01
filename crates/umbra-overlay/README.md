@@ -287,13 +287,18 @@ Refusals rather than wrong answers, in every case the engine cannot represent:
   so `unlink` or `rename` of an open file is not representable. This is the
   handle-based-`Storage` gap `docs/design/syscall-matrix.md` records.
 
-`umbra-overlay` carries three cargo features, `mutation-probe-read`,
-`mutation-probe-write` and `mutation-probe-fstat`. The first two break one
-routing direction each; `mutation-probe-fstat` answers a virtual descriptor
-`EBADF` instead of the emulated metadata, which is what the tracee received
-before that call was routed. Each exists so a test can prove an end-to-end
-fixture depends on the thing it breaks. They are compile-time only: no product
-build contains any of these branches. Never enable one outside a mutation test.
+`umbra-overlay` carries four cargo features, `mutation-probe-read`,
+`mutation-probe-write`, `mutation-probe-fstat` and `mutation-probe-dircache`.
+The first two break one routing direction each; `mutation-probe-fstat` answers a
+virtual descriptor `EBADF` instead of the emulated metadata, which is what the
+tracee received before that call was routed; `mutation-probe-dircache` removes
+`Engine::commit`'s eviction of a closed descriptor's residual directory page, so
+a second enumeration of a reopened directory is answered from the first one's
+empty remainder instead of going back through `merged` -- it reports nothing and
+still exits 0, which is why the case that detects it asserts on entry names
+rather than on status. Each exists so a test can prove an end-to-end fixture
+depends on the thing it breaks. They are compile-time only: no product build
+contains any of these branches. Never enable one outside a mutation test.
 
 ## Journal and whiteouts
 

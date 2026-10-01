@@ -37,6 +37,20 @@ mutation-probe-write = []
 # NFS client -- nothing is mounted on a routed run -- and because `fstat` is
 # only load-bearing where the descriptor is virtual.
 mutation-probe-fstat = []
+# The `close` eviction of the residual directory-page cache in `Engine::commit`
+# removed, restoring the measured pre-fix behaviour recorded at
+# `resolve_routed_close`: a program that listed a directory, closed it and
+# listed it again got the first page's names and then nothing, exit 0, because
+# `resolve_directory` prefers a cached remainder over a fresh `merged`. The
+# insert, the routing and the journalling all stay, so what breaks is only the
+# *second* enumeration's names.
+#
+# `a_project_tree_listing_paginates_and_survives_a_reused_descriptor_number`'s
+# sibling probe case in `crates/umbra-storage-nfs-userspace/tests/
+# userspace_run.rs` asserts on those names and their bytes rather than on an
+# exit code, because the pre-fix disposition exits 0 -- which is exactly why an
+# exit code cannot discriminate it.
+mutation-probe-dircache = []
 
 [dependencies]
 umbra-core = { path = "../umbra-core" }
