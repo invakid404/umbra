@@ -6,10 +6,14 @@ version = 3
 # - **/.dSYM/**: macOS debug bundles that can appear under target or ad-hoc.
 # - .jj/**: jj internal state (colocated with .git; .git is already jj-invisible).
 # - Cargo.lock: dependency resolution; avoid review churn on lockfile-only updates.
-# - delegation-graph process docs (impl.md, fix-r*.md, review-*.md, ci-round*.md,
-#   publish.md, merge-gate.md, done.md, audit.md, design-gate.md): per-arc records
-#   archived at knowledge/umbra/graph-audits/. Never a repo-tree input, so they
-#   don't re-pend the root README and don't collide across arcs on master (#132).
+# - delegation-graph process docs (impl.md, fix-r*.md, ci-fix-r*.md, ci-round*.md,
+#   review-*.md, slate-rank*.md, prep-workspace.md, mt-closure.md, mt-fork.md,
+#   memoria-upgrade.md, publish.md, merge-gate.md, done.md, audit.md,
+#   design-gate.md, audit-comment*.md): per-arc records archived at
+#   knowledge/umbra/graph-audits/. Never a repo-tree input, so they don't re-pend
+#   the root README and don't collide across arcs on master (#132). These globs
+#   are start-anchored, so every name needs a pattern that matches it from the
+#   first character: `fix-r*.md` does not match `ci-fix-r1.md`.
 ignore = [
     "experiments/**",
     "target/**",
@@ -22,11 +26,15 @@ ignore = [
     "merge-gate.md",
     "audit.md",
     "design-gate.md",
+    "prep-workspace.md",
+    "mt-closure.md",
+    "mt-fork.md",
+    "memoria-upgrade.md",
     "fix-r*.md",
+    "ci-fix-r*.md",
     "ci-round*.md",
-    "review-correctness*.md",
-    "review-scope*.md",
-    "review-synthesis*.md",
+    "slate-rank*.md",
+    "review-*.md",
     "audit-comment*.md",
 ]
 include = []
