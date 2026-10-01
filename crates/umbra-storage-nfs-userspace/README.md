@@ -693,13 +693,20 @@ sufficient, because umbra must be able to represent it too.
 **What the shipped claim above rests on.** Routing for all three utilities is
 proven **by execution against a live NFS-Ganesha fixture**, not inferred. The
 end-to-end case is `standard_utilities_run_over_the_userspace_client` in
-`tests/userspace_run.rs`: five cases -- `mkdir` into the shadow, `touch` on an
-absent and on an existing operand, `cat` on a present and on an absent one -- each
-asserting the store holds the result *read back through this client* and the host
-workspace is untouched. Three mutation probes cover the three syscalls this slice
-routed, and each was run with its negative control: against an **unmutated** binary
-every probe **fails**, so a passing probe means the mutation was detected rather
-than that the case was skipped.
+`tests/userspace_run.rs`: six cases -- `mkdir` into the shadow, `touch` on an
+absent and on an existing operand, `cat` on a present and on an absent one, and
+`ls` on the workspace root -- all six asserting the host workspace is untouched,
+and the three that write also asserting the store holds the result *read back
+through this client*. What the other three assert is their exit status: `cat` on a
+present operand and `ls` exit 0 with the journal recording completion, and `cat`
+on an absent one exits non-zero with its own *No such file or directory* on the
+tracee's stderr; the listing entries read back through the client are proven
+separately, by
+`a_directory_listing_through_fts_reaches_the_tracee_over_the_userspace_client`.
+Six mutation probes cover the two routed data directions and the four metadata
+and directory calls this slice routed, and a mismatch between the selector and
+the binaries fails the case rather than passing it, so a passing probe means the
+mutation was detected rather than that the case was skipped.
 
 What that does *not* extend to: the rewrite-backed matrices in `run_fixtures.rs`
 (`--local-dev` and the kernel-mount `nfs` adapter) cannot substitute for the above,
@@ -755,12 +762,15 @@ missing-evidence refusal back into a clean verdict.
 `tests/userspace_run.rs` (feature `transport-raw`, macOS arm64, gated on
 `UMBRA_NFS_RAW_FIXTURE`) drives the real `umbra` binary against a live server and
 checks the result three independent ways — through the raw client, through the
-run's journal, and against the host. Two **mutation probes**, cargo features on
-`umbra-overlay` so no product build contains them, break one routing direction
-each and must make the fixture fail with *different* exit codes:
+run's journal, and against the host. Six **mutation probes** — cargo features on
+`umbra-overlay` (`read`, `write`, `fstat`), `umbra-platform-macos` (`mkdir`,
+`setattrlistat`) and `umbra-supervisor` (`readdir`), so no product build contains
+any of them — break one routed direction or one routed call each, and each must
+fail distinguishably from the other five:
 
 ```sh
-# end to end: the toy must exit 0
+# end to end: the toy, the Rust I/O fixture and the utility matrix must pass
+cargo build --workspace --bins
 cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run
 
 # probe A -- read routing corrupted; the toy's compare must reject (exit 8),
@@ -774,10 +784,46 @@ UMBRA_MUTATION_PROBE=read cargo test -p umbra-storage-nfs-userspace \
 cargo build -p umbra-cli --features mutation-probe-write
 UMBRA_MUTATION_PROBE=write cargo test -p umbra-storage-nfs-userspace \
     --features transport-raw --test userspace_run
+
+# probe C -- `fstat` on a virtual descriptor answers EBADF; `touch` on an absent
+# operand must fail with its empty file still in the export
+cargo build -p umbra-cli --features mutation-probe-fstat
+UMBRA_MUTATION_PROBE=fstat cargo test -p umbra-storage-nfs-userspace \
+    --features transport-raw --test userspace_run
+
+# probe D -- the `mkdir`(136) decode arm removed; the directory must appear
+# nowhere while `touch` on an absent operand still exits 0.
+# NOTE the crate: this probe is on the provider executable, not on `umbra`, and
+# `cargo build -p umbra-cli --features mutation-probe-mkdir` does not exist.
+# Building it does not rebuild `umbra`, so clear probe C first or two probes are
+# live in one run.
+cargo build -p umbra-cli
+cargo build -p umbra-platform-macos --features mutation-probe-mkdir
+UMBRA_MUTATION_PROBE=mkdir cargo test -p umbra-storage-nfs-userspace \
+    --features transport-raw --test userspace_run
+
+# probe E -- `setattrlistat`(524) refused; `touch` on an existing file must fail
+# while `touch` on an absent one still exits 0. Same crate as probe D, so this
+# feature swap rebuilds the provider and clears the previous probe on its own.
+cargo build -p umbra-platform-macos --features mutation-probe-setattrlistat
+UMBRA_MUTATION_PROBE=setattrlistat cargo test -p umbra-storage-nfs-userspace \
+    --features transport-raw --test userspace_run
+
+# probe F -- each directory entry's name reversed; the listing must come back
+# with the right number of entries, each a permutation of a real name, while the
+# run still exits 0 -- no refusal of a directory read changes the exit status, so
+# only the names discriminate. Probe D's note in the other direction: this probe
+# is on `umbra`, so clear the provider first.
+cargo build -p umbra-platform-macos
+cargo build -p umbra-cli --features mutation-probe-readdir
+UMBRA_MUTATION_PROBE=readdir cargo test -p umbra-storage-nfs-userspace \
+    --features transport-raw --test userspace_run
 ```
 
-`cargo build -p umbra-cli --features ...` overwrites `target/<profile>/umbra`, so
-rebuild without the feature before running the baseline again.
+`cargo build -p umbra-cli --features ...` overwrites `target/<profile>/umbra` and
+`cargo build -p umbra-platform-macos --features ...` overwrites the provider
+executable beside it, so rebuild **both** without features before running the
+baseline again.
 
 ## Golden fixtures
 
