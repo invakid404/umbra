@@ -2527,6 +2527,383 @@ fn a_path_operation_on_an_untouched_base_object_still_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
+// Recoverable application errors on a routed run, each paired with a liveness
+// sentinel.
+//
+// Four cases, and **three of the four end the run**. That is the finding rather
+// than an inconvenience, and it decides the shape of every assertion below.
+// `Overlay::resolve` answers an exclusive-create collision and a
+// mkdir-on-existing with `Err(AlreadyExists)` and a non-empty removal with
+// `Err(Denied)`; the one recovering arm in `syscall_entry` takes only a
+// `NotFound` that is neither a mutation nor routed, so none of the three
+// qualifies, the `Err` propagates, and `handle_event` poisons the run. The
+// tracee is never resumed.
+//
+// The chain, in `crates/umbra-supervisor/src/events.rs`: `syscall_entry` opens
+// at `:301`, the `resolve` call is `:552`, the sole recovering arm `:571`, the
+// propagation `:579`, and the poisoning itself is in `handle_event`, `:197-204`.
+//
+// So a sentinel after the refusal cannot run, and these three place it
+// **before**. What it proves is correspondingly narrower, and the narrow version
+// is the one claimed: *the run was alive up to the refusal, and the writes it
+// made before it are in the run's shadow.* Not "supervision survived the
+// error" -- it did not. `journal_records_completion` is what carries that half,
+// exactly as it does for `rollbackchild` above, and `run.status != Some(0)`
+// alone would be vacuous without it: a fixture that merely returned 71 lands
+// there too.
+//
+// Only `missingparent` is non-fatal, so it is the only one that places its
+// sentinel after the operation and the only one that can call `child_exit()`.
+//
+// **All four assert today's measured answer, not the answer POSIX gives.** Two
+// of them characterize #156 and one #81, and each doc comment says what to
+// change when its issue is fixed. The #127 pair at the top of this file is the
+// precedent.
+// ---------------------------------------------------------------------------
+
+/// **A creating `open` under an ancestor that is not there succeeds, and its
+/// bytes land in the export** --
+/// [#67](https://github.com/invakid404/umbra/issues/67), end to end on a routed
+/// run.
+///
+/// POSIX answers `ENOENT` for `open("a/b", O_CREAT)` when `a` does not exist.
+/// The routed namespace takes `create_parents` from `flags.create`, swallows the
+/// absent non-final component during the walk, and materializes the ancestor as
+/// a directory -- so the `open` succeeds. This asserts that, positively,
+/// because it is what happens today. When #67 is fixed this case goes red on
+/// purpose: invert it to require a nonzero child exit and to assert the nested
+/// object is absent from the export.
+///
+/// **That inversion is not complete on the Rust side alone -- the fixture's
+/// sentinel has to move with it.** The sentinel sits *after* the characterized
+/// `open`, so a fixed #67 makes the `open` fail, `case_missingparent` returns
+/// `errno` before it ever reaches `sentinel()`, and the sentinel object is never
+/// written -- which fails the sentinel assertion below too, for a reason that
+/// has nothing to do with liveness. Measured unrouted, where the `open` already
+/// fails today: the case exits 2 and writes nothing at all, sentinel included.
+/// So on the fix, move the sentinel **before** the `open`, where the three
+/// run-fatal cases already place theirs, and the liveness evidence survives the
+/// inversion.
+///
+/// **What is new here is the routed half alone, and the distinction is worth
+/// keeping straight.** Whether the divergence is real was already settled before
+/// this case existed, by two passing `umbra-overlay` tests that execute it
+/// in-process against `LocalStorage`. Neither says anything about a routed run,
+/// where three things differ and none of them had been measured: the ancestor is
+/// created through `NfsUserspaceStorage` and the NFSv4 client rather than by
+/// `mkdir`(2), the shadow is an export over a read-only host base rather than a
+/// local directory, and the `open` arrives through the breakpoint path rather
+/// than as a direct `FsOp`. This is the first evidence that the divergence
+/// survives all three.
+///
+/// The sentinel is placed **after** the operation, which only this one of the
+/// four cases can do: its bytes prove the tracee was resumed *past* the `open`
+/// rather than merely alive before it. `child_exit()` is available for the same
+/// reason, and is unavailable in the three cases below.
+#[test]
+fn a_creating_open_under_an_absent_parent_succeeds_against_live_ganesha_67() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let paths: Vec<&Path> = vec![scratch.path()];
+    assert_no_nfs_mount(&host, port, &paths, "before the run");
+    let run = routed_edge(scratch.path(), &host, port, "missingparent", &[]);
+    assert_no_nfs_mount(&host, port, &paths, "after the run");
+
+    // The fixture's own verdict: the `open` returned a descriptor, the write and
+    // close both worked, and the sentinel after them did too. A nonzero exit
+    // here is this case's own diagnosis that #67 no longer reproduces.
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "a creating open under an absent parent did not succeed -- see this \
+         case's doc comment before changing anything:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        run.status,
+        Some(0),
+        "the run did not finish cleanly:\n{}",
+        run.stderr
+    );
+
+    // The claim, read back through the client with nothing mounted: nothing ever
+    // created `<destination>.mp`, and the object under it is in the export
+    // anyway.
+    assert_eq!(
+        read_through_client(&host, port, &rustio_sibling(&run, b".mp", Some(b"file")))
+            .expect("the object under the absent ancestor is in the export")
+            .as_slice(),
+        b"missingparent",
+        "the nested object does not hold the bytes the fixture wrote"
+    );
+
+    // The sentinel, which ran *after* the characterized `open`.
+    assert_eq!(
+        read_through_client(
+            &host,
+            port,
+            &rustio_sibling(&run, b".missingparentlive", None)
+        )
+        .expect("the liveness sentinel is in the export")
+        .as_slice(),
+        b"missingparent",
+        "the sentinel's bytes are not this case's own"
+    );
+
+    assert!(
+        journal_records_completion(&run),
+        "a run that finished cleanly recorded no RunCompleted"
+    );
+    assert_host_write_root_empty(&run);
+    assert_workspace_pristine(&run);
+}
+
+/// **A second `O_CREAT|O_EXCL` on a path the run already created ends the run**
+/// rather than answering the tracee `EEXIST` --
+/// [#156](https://github.com/invakid404/umbra/issues/156).
+///
+/// `resolve` returns `Err(ErrorKind::AlreadyExists, "exclusive create target
+/// exists")`, which is not the one recovered shape, so it propagates out of
+/// `syscall_entry` (`events.rs:579`) and `handle_event` poisons the run
+/// (`:197-204`). The tracee never sees the collision
+/// and is never resumed, which is why the sentinel is written **before** it and
+/// why `child_exit()` is not called here: a run stopped this way never prints
+/// the `finished:` line that function parses, and calling it would panic.
+///
+/// **What this pins, exactly.** `status != Some(0)` is the weakest of the three
+/// assertions and would hold for a merely-nonzero child as well -- the fixture
+/// returns 71 if the refusal ever stops firing, and that lands here too. The
+/// absent `RunCompleted` record is what tells those apart, because a run that
+/// ended with a nonzero child still reaches `finish_run` and still records it.
+/// And the sentinel's bytes, read back out of a run with no completion record,
+/// are the structural half: the writes made before the refusal are in the run's
+/// shadow.
+///
+/// When #156 is fixed, the tracee sees `EEXIST` and the run finishes: this case
+/// then returns 71. Rewrite it to require `child_exit() == 17`, drop the journal
+/// assertion, and change the fixture to report the `errno` rather than 71.
+#[test]
+fn an_exclusive_create_collision_ends_the_run_rather_than_answering_eexist() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let paths: Vec<&Path> = vec![scratch.path()];
+    assert_no_nfs_mount(&host, port, &paths, "before the run");
+    let run = routed_edge(scratch.path(), &host, port, "exclcollide", &[]);
+    assert_no_nfs_mount(&host, port, &paths, "after the run");
+
+    assert_ne!(
+        run.status,
+        Some(0),
+        "the refused exclusive create did not stop the run:\n{}",
+        run.stderr
+    );
+
+    // The sentinel was written before the collision, so these bytes say the run
+    // was alive up to it -- and they name this case, so a cross-wired read-back
+    // cannot satisfy the assertion.
+    assert_eq!(
+        read_through_client(
+            &host,
+            port,
+            &rustio_sibling(&run, b".exclcollidelive", None)
+        )
+        .expect("the liveness sentinel is in the run's shadow")
+        .as_slice(),
+        b"exclcollide",
+        "the sentinel's bytes are not this case's own"
+    );
+
+    // And the first exclusive create's own object, the one the collision was
+    // against, is still in the export with its bytes.
+    assert_eq!(
+        read_through_client(&host, port, &shadow_path(&run))
+            .expect("the first exclusive create's object is in the run's shadow")
+            .as_slice(),
+        b"exclcollide",
+        "the collision took the bytes written before it"
+    );
+
+    assert!(
+        !journal_records_completion(&run),
+        "a run stopped by a refused exclusive create still recorded RunCompleted"
+    );
+    assert_host_write_root_empty(&run);
+    assert_workspace_pristine(&run);
+}
+
+/// **`std::fs::create_dir_all` on a directory that already exists ends a routed
+/// run** -- [#156](https://github.com/invakid404/umbra/issues/156).
+///
+/// That framing is the measured one and it is deliberately not the weaker
+/// "wrong errno" or "false success": there is no wrong errno here and nothing
+/// reports success. `resolve` returns `Err(ErrorKind::AlreadyExists, "mkdir
+/// target exists")` and the run dies.
+///
+/// **Why `create_dir_all` is the headline rather than a bare `mkdir`.** Measured
+/// on this host: `create_dir_all` on an already-existing directory issues
+/// exactly one `mkdir`(2) on that path, unconditionally and before any existence
+/// check, then swallows the `EEXIST` and returns `Ok`. `mkdir` is a
+/// `TRACED_STUBS` row, so that call reaches `FsOp::Mkdir` and the run is gone.
+/// Every Rust program that ensures an output directory before writing into it
+/// does this, which is what makes the case worth a run of its own.
+///
+/// Sentinel **before**, `child_exit()` not called, and the absent
+/// `RunCompleted` record carrying the claim -- all for the reasons
+/// `an_exclusive_create_collision_ends_the_run_rather_than_answering_eexist`
+/// states. When #156 is fixed this case returns 71; rewrite it to require
+/// `child_exit() == 17` and drop the journal assertion -- which also needs the
+/// matching fixture change `case_mkdirexists` names, reporting the second
+/// `mkdir`'s `errno` instead of reaching 71.
+#[test]
+fn a_mkdir_on_an_existing_directory_ends_the_run_rather_than_answering_eexist() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let paths: Vec<&Path> = vec![scratch.path()];
+    assert_no_nfs_mount(&host, port, &paths, "before the run");
+    let run = routed_edge(scratch.path(), &host, port, "mkdirexists", &[]);
+    assert_no_nfs_mount(&host, port, &paths, "after the run");
+
+    assert_ne!(
+        run.status,
+        Some(0),
+        "the refused mkdir on an existing directory did not stop the run:\n{}",
+        run.stderr
+    );
+
+    assert_eq!(
+        read_through_client(
+            &host,
+            port,
+            &rustio_sibling(&run, b".mkdirexistslive", None)
+        )
+        .expect("the liveness sentinel is in the run's shadow")
+        .as_slice(),
+        b"mkdirexists",
+        "the sentinel's bytes are not this case's own"
+    );
+
+    // The directory the first `mkdir` created is still there, and it is a
+    // directory rather than whatever the lookup chain happened to resolve to.
+    // `attributes_through_client` rather than `read_through_client`, which
+    // requires a regular file before it reads a byte.
+    assert_eq!(
+        attributes_through_client(&host, port, &rustio_sibling(&run, b".me", None))
+            .expect("the first mkdir's directory is in the run's shadow")
+            .file_type,
+        Some(Nfs4Type::Directory),
+        "the first mkdir did not leave a directory behind"
+    );
+
+    assert!(
+        !journal_records_completion(&run),
+        "a run stopped by a refused mkdir still recorded RunCompleted"
+    );
+    assert_host_write_root_empty(&run);
+    assert_workspace_pristine(&run);
+}
+
+/// **Removing a directory that is not empty ends the run** rather than
+/// answering the tracee `ENOTEMPTY` --
+/// [#81](https://github.com/invakid404/umbra/issues/81).
+///
+/// `resolve` enumerates the merged directory and returns
+/// `Err(ErrorKind::Denied, "rmdir target is not empty")`, which propagates and
+/// poisons the run. The overlay's own unit test for this refusal asserts
+/// `!poisoned` on the `Overlay` object and that nothing was journaled; neither
+/// contradicts this. Those say the *session* is reusable. The `Err` still
+/// reaches `handle_event`, which poisons the *run* and sets
+/// `RunLifecycle::RecoveryRequired`, and that is the half only an end-to-end
+/// case can observe.
+///
+/// **The fixture uses `unlinkat(AT_FDCWD, dir, AT_REMOVEDIR)` and the choice is
+/// load-bearing.** Bare `rmdir`(2) has no `TRACED_STUBS` row and is not one of
+/// the interposer's four entries, so it is intercepted by neither mechanism: it
+/// reaches the kernel against a path whose shadow object has no host existence
+/// and answers `ENOENT`. A case written that way would look like an ordinary
+/// error and would measure nothing at all about this refusal. The fixture's own
+/// comment pins it so a later simplification cannot void the case quietly.
+///
+/// Sentinel **before**, `child_exit()` not called, journal record absent. When
+/// #81 lands its `Deny(ENOTEMPTY)` this case returns 71; rewrite it to require
+/// `child_exit() == 66` -- `ENOTEMPTY` is 66 on Darwin -- and drop the journal
+/// assertion, which also needs the matching fixture change `case_rmdirfull`
+/// names, reporting the `unlinkat`'s `errno` instead of reaching 71.
+#[test]
+fn a_non_empty_directory_removal_ends_the_run_rather_than_answering_enotempty_81() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let paths: Vec<&Path> = vec![scratch.path()];
+    assert_no_nfs_mount(&host, port, &paths, "before the run");
+    let run = routed_edge(scratch.path(), &host, port, "rmdirfull", &[]);
+    assert_no_nfs_mount(&host, port, &paths, "after the run");
+
+    assert_ne!(
+        run.status,
+        Some(0),
+        "the refused non-empty removal did not stop the run:\n{}",
+        run.stderr
+    );
+
+    assert_eq!(
+        read_through_client(&host, port, &rustio_sibling(&run, b".rmdirfulllive", None))
+            .expect("the liveness sentinel is in the run's shadow")
+            .as_slice(),
+        b"rmdirfull",
+        "the sentinel's bytes are not this case's own"
+    );
+
+    // The directory survived the refusal, which is what makes "not empty" the
+    // reason it was refused rather than a guess.
+    assert_eq!(
+        attributes_through_client(&host, port, &rustio_sibling(&run, b".rf", None))
+            .expect("the directory is in the run's shadow")
+            .file_type,
+        Some(Nfs4Type::Directory),
+        "the refused removal took the directory anyway"
+    );
+
+    // And so did the child that made it non-empty, with its bytes.
+    assert_eq!(
+        read_through_client(&host, port, &rustio_sibling(&run, b".rf", Some(b"child")))
+            .expect("the directory's child is in the run's shadow")
+            .as_slice(),
+        b"rmdirfull",
+        "the entry that made the directory non-empty is not in the export"
+    );
+
+    assert!(
+        !journal_records_completion(&run),
+        "a run stopped by a refused non-empty removal still recorded RunCompleted"
+    );
+    assert_host_write_root_empty(&run);
+    assert_workspace_pristine(&run);
+}
+
+// ---------------------------------------------------------------------------
 // Standard utilities over the userspace client.
 //
 // `crates/umbra-cli/tests/run_fixtures.rs` already has a `local_utility_matrix`
@@ -3735,6 +4112,10 @@ fn rustio_big_range(offset: u64) -> Vec<u8> {
 /// The fixture derives `<path>.d/leaf.txt` and `<path>.big` from the one path the
 /// harness gave it, so the harness derives the same names the same way rather
 /// than hard-coding `out.txt`.
+///
+/// Shared with the edge fixture's four recoverable-error cases, which derive
+/// their operands and their liveness sentinels the same way. The `rustio_`
+/// prefix is where it was first needed, not a restriction on who may call it.
 fn rustio_sibling(run: &Run, suffix: &[u8], leaf: Option<&[u8]>) -> Vec<Vec<u8>> {
     let mut components = shadow_path(run);
     components
