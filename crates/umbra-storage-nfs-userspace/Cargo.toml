@@ -37,7 +37,7 @@ tempfile.workspace = true
 # `userspace_run.rs` asserts, executably, that no NFS mount covers the run --
 # the addendum's guard against the whole end-to-end proof being an illusion.
 # `getmntinfo` is the only way to ask that without parsing `mount(8)`.
-libc = "=0.2.189"
+libc = "=0.2.190"
 uuid.workspace = true
 
 [build-dependencies]
