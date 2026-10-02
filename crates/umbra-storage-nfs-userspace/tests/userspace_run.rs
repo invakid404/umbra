@@ -1,16 +1,37 @@
 //! `umbra run` over the userspace NFSv4 client, end to end -- the toy program,
 //! the edge and directory-listing fixtures, the Rust library-wrapper fixture,
-//! the three standard utilities, and the seven mutation probes that prove the
-//! routing is load-bearing.
+//! the buffered-output pair, the three standard utilities, and the seven
+//! mutation probes that prove the routing is load-bearing.
 //!
-//! **Five kinds of fixture, and the fifth is not C.** Four of them --
+//! **Six kinds of fixture, and two of them are not C.** Four of them --
 //! `umbra-userspace-toy.c`, `-edges.c`, `-listing.c`, and the Apple binaries the
 //! utility matrix launches -- reach the filesystem through bare syscalls or
 //! through libc, so every transfer they make is one they sized themselves.
 //! `umbra-userspace-rustio.rs` reaches it through `std::fs`'s own wrappers,
 //! which take a capacity hint from a descriptor and complete their own short I/O
-//! *inside the library*. It is built by bare `rustc` rather than cargo, because
-//! `experiments/` is not a workspace member; see `rust_fixture_binary`.
+//! *inside the library*. `umbra-userspace-stdio.c` and
+//! `umbra-userspace-buffered.rs` are a **pair**, and they exist for one
+//! comparison: the first writes through C stdio, whose flush reaches the kernel
+//! as `__write_nocancel`(397) -- a call with **no `TRACED_STUBS` row**, issued
+//! from inside the dyld shared cache where interposition cannot rebind it -- and
+//! the second writes through a Rust `BufWriter`, whose final `write` is compiled
+//! into the executable where interposition does reach it. Breakpoints are not
+//! the limitation: `fopen`'s 398 and `fclose`'s 399 fire from inside libsystem
+//! on this very path, which is why the object is created and released cleanly
+//! and only its bytes are lost. Both Rust fixtures are built by bare `rustc`
+//! rather than cargo, because `experiments/` is not a workspace member; see
+//! `rust_fixture_binary`.
+//!
+//! **Two cases here assert a defect rather than a fix, and they say so.** The
+//! stdio fixture's `checked` and `ignored` cases characterize
+//! [#127](https://github.com/invakid404/umbra/issues/127): buffered output to a
+//! routed descriptor persists *nothing*, while the object itself is created and
+//! released perfectly cleanly -- and the `ignored` shape does it at exit 0.
+//! Neither is `#[ignore]`d. No step of this job passes `--include-ignored`, so
+//! an ignored case would report green without ever running, which is the
+//! skip-as-pass shape those two cases exist to catch. They assert today's wrong
+//! answer positively instead; the fix to #127 turns both of them red on
+//! purpose, and each one's doc comment says what to change when it does.
 //!
 //! # What these cases assert, and why here
 //!
@@ -44,7 +65,8 @@
 //! UMBRA_MUTATION_PROBE=read cargo test -p umbra-storage-nfs-userspace \
 //!     --features transport-raw --test userspace_run
 //!
-//! # probe B -- write routing broken; the toy must exit 7
+//! # probe B -- write routing broken; the toy must exit 7, and the raw and
+//! #            BufWriter writers must keep exit 0 while their objects go empty
 //! cargo build -p umbra-cli --features mutation-probe-write
 //! UMBRA_MUTATION_PROBE=write cargo test -p umbra-storage-nfs-userspace \
 //!     --features transport-raw --test userspace_run
@@ -132,7 +154,15 @@ use umbra_storage_nfs_userspace::transport::{
     AttrMask, ComponentName, Deadline, Nfs4Type, RawTransport,
 };
 
-/// Bytes the toy writes and reads back. Must match `umbra-userspace-toy.c`.
+/// Bytes the toy writes and reads back.
+///
+/// Must match `umbra-userspace-toy.c`, `umbra-userspace-stdio.c` and
+/// `umbra-userspace-buffered.rs`. The last two share it with the toy on
+/// purpose rather than by accident: the buffered-output comparison is only
+/// exact if every case persisted the same payload, so one constant here is
+/// what makes "the same bytes in every case" a property of the suite instead
+/// of a convention nothing checks. It must also stay below 4096 bytes -- see
+/// `umbra-userspace-stdio.c`'s header for the measured reason.
 const PAYLOAD: &[u8] = b"umbra-userspace-nfs\n";
 
 /// The export and run parent the fixture carries, matching the other live suites.
@@ -927,6 +957,25 @@ fn routed_edge(scratch: &Path, host: &str, port: u16, case: &str, env: &[&str]) 
 fn routed_rust_io(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
     let fixture = rust_fixture_binary(scratch, "umbra-userspace-rustio", "UMBRA_RUSTIO_PATH");
     launch(scratch, host, port, &fixture, &[case], &[])
+}
+
+/// Launch one of the stdio fixture's cases, which take a case name before the
+/// path exactly as the edge fixture's do.
+fn routed_stdio(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
+    let fixture = fixture_binary(scratch, "umbra-userspace-stdio", "UMBRA_STDIO_PATH");
+    launch(scratch, host, port, &fixture, &[case], &[])
+}
+
+/// Launch the buffered Rust control, which takes the destination and nothing
+/// else.
+///
+/// No case name, because the fixture has exactly one case and refuses a second
+/// argument -- so `leading` is empty and `launch` appends the destination
+/// alone, as it does for the toy. The fixture's own header records why a second
+/// case was measured and then left out.
+fn routed_buffered(scratch: &Path, host: &str, port: u16) -> Run {
+    let fixture = rust_fixture_binary(scratch, "umbra-userspace-buffered", "UMBRA_BUFFERED_PATH");
+    launch(scratch, host, port, &fixture, &[], &[])
 }
 
 /// Run one supervised command against the live fixture and collect its verdict.
@@ -4159,4 +4208,423 @@ fn mutation_probe_mkdir_makes_the_rust_new_file_appear_nowhere() {
         "the destination the legs before mkdir wrote is not in the export with \
          its bytes, so this case proves nothing about the mkdir decode arm"
     );
+}
+
+/// The buffered-output positive control: bare `write(2)` on a routed
+/// descriptor, from the executable's own call site.
+///
+/// **This case is what makes the two #127 characterizations below worth
+/// anything.** They assert `Some(vec![])` -- an object that exists in the
+/// export and holds no bytes -- and a `read_through_client` that always
+/// returned an empty vector would satisfy them while measuring nothing. This
+/// case puts the same call, against the same export, in the same slice, and
+/// requires the full payload and its exact size back. That pairing is the
+/// non-vacuity argument for cases 2 and 3; no shipped mutation probe supplies
+/// one, because #127 already produces the `write` probe's effect on those two
+/// shapes.
+///
+/// It is also the half of the comparison that localises the defect. The same
+/// bytes, the same destination, the same run shape -- the only difference is
+/// whether the final `write` instruction lives in the executable or inside the
+/// dyld shared cache. Measured: `finished: Some(Code(0))` and 20 bytes.
+#[test]
+fn a_raw_write_to_a_routed_descriptor_persists_every_byte() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    // Nothing is mounted, before and after, for the reason every case here
+    // checks it: a helpfully-mounted export would satisfy the read-back through
+    // the kernel client and nothing below would say so.
+    let paths: Vec<&Path> = vec![scratch.path()];
+    assert_no_nfs_mount(&host, port, &paths, "before the run");
+    let run = routed_stdio(scratch.path(), &host, port, "raw");
+    assert_no_nfs_mount(&host, port, &paths, "after the run");
+
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "the raw write did not report success:\n{}",
+        run.stderr
+    );
+    assert_eq!(run.status, Some(0), "umbra run failed:\n{}", run.stderr);
+
+    let components = shadow_path(&run);
+    let stored = read_through_client(&host, port, &components)
+        .expect("the shadow object exists in the export");
+    assert_eq!(
+        stored, PAYLOAD,
+        "the export does not hold the bytes the raw case wrote"
+    );
+    // The size attribute as well as the bytes: `read_through_client` caps its
+    // READ, so a longer object that happened to start with the payload would
+    // satisfy the comparison above on its own.
+    assert_eq!(
+        stored_size_through_client(&host, port, &components),
+        Some(PAYLOAD.len() as u64),
+        "the export's size attribute disagrees with the bytes the raw case wrote"
+    );
+
+    assert!(
+        !run.destination.exists(),
+        "the host destination {} was created",
+        run.destination.display()
+    );
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+    assert!(
+        journal_records_completion(&run),
+        "no RunCompleted record in the run's journal"
+    );
+}
+
+/// **Characterization of [#127](https://github.com/invakid404/umbra/issues/127),
+/// not a passing behaviour.** Buffered stdio output to a routed descriptor
+/// persists nothing, and this is the shape in which the program is at least
+/// told.
+///
+/// What is asserted is today's wrong answer, stated positively: exit 126, and
+/// an object in the export that **exists** and holds **zero** bytes. The fix to
+/// #127 will make this case red, and that is intended -- when it goes red, the
+/// assertions to change are the exit code (to 0) and the byte comparison (to
+/// `PAYLOAD`, as in the raw case above). Do not reach for `#[ignore]` instead:
+/// no step of this job passes `--include-ignored`, so an ignored case reports
+/// green without running.
+///
+/// **Why 126 and not some other arm.** The fixture gives `fflush` and `fclose`
+/// separate exit codes precisely so the status says which one reported first.
+/// Measured: `fflush` returns -1 with `errno` EBADF and `ferror` already set,
+/// so `fclose`'s own code (129) is never reached. The chain underneath is
+/// `__sflush` -> `_swrite` -> `__swrite` -> `__write_nocancel`(397), which is in
+/// neither `abi::TRACED_STUBS` nor anything `DYLD_INTERPOSE` can rebind. Public
+/// `write`(4) is never entered on this path, whatever #127's own text says, so
+/// routing `write` alone would leave this case unchanged.
+///
+/// **Why the object is not simply missing.** `fopen`'s `__open_nocancel`(398)
+/// and `fclose`'s `__close_nocancel`(399) *are* breakpointed, so creation and
+/// release route normally. Only the bytes are lost. `read_through_client`
+/// distinguishes the two outcomes -- `None` for an absent name, `Some(vec![])`
+/// for an empty object -- and this case needs the second, because an absent
+/// object would be a different and much louder defect.
+#[test]
+fn a_checked_buffered_write_to_a_routed_descriptor_fails_observably_127() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let paths: Vec<&Path> = vec![scratch.path()];
+    assert_no_nfs_mount(&host, port, &paths, "before the run");
+    let run = routed_stdio(scratch.path(), &host, port, "checked");
+    assert_no_nfs_mount(&host, port, &paths, "after the run");
+
+    assert_eq!(
+        run.child_exit(),
+        126,
+        "the checked buffered write did not fail at the flush arm; #127 may be \
+         fixed, in which case this characterization is the thing to update:\n{}",
+        run.stderr
+    );
+    assert_ne!(
+        run.status,
+        Some(0),
+        "umbra reported a failed run as success"
+    );
+
+    let stored = read_through_client(&host, port, &shadow_path(&run))
+        .expect("the shadow object exists even though no byte of the payload reached it");
+    assert!(
+        stored.is_empty(),
+        "the export holds {} bytes, so buffered stdio output now reaches a \
+         routed descriptor and this characterization of #127 is stale",
+        stored.len()
+    );
+
+    assert!(
+        !run.destination.exists(),
+        "the host destination {} was created",
+        run.destination.display()
+    );
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+    // The run itself completed normally. The tracee failed; the supervisor did
+    // not, and a case that could not tell those apart would not be measuring
+    // #127.
+    assert!(
+        journal_records_completion(&run),
+        "no RunCompleted record in the run's journal"
+    );
+}
+
+/// **Characterization of [#127](https://github.com/invakid404/umbra/issues/127)
+/// in its silent shape -- the one this slice exists for.** The same buffered
+/// write as above, with `fclose`'s result discarded, which is what a great many
+/// programs do. The process exits **0**, umbra reports success, and the export
+/// holds an object that exists with **zero bytes** in it. Nothing anywhere
+/// reports a problem.
+///
+/// **The two assertions have to be made together or the case is worthless.**
+/// Exit 0 alone is what a correct run looks like. An empty object alone could be
+/// a run that died. Exit 0 *and* an empty object is the wrong answer that looks
+/// like a right one, and it is the only combination that distinguishes this
+/// defect from both of its neighbours.
+///
+/// **Why the payload has to stay small, which is a constraint on `PAYLOAD` and
+/// not on this case.** stdio sizes its buffer from the descriptor's
+/// `st_blksize`, which this backend reports as 4096. Measured sweep: at 4095
+/// bytes `fprintf` returns the full count with `ferror` clear, and the export
+/// holds nothing -- silent. At 4096 the buffer spills during the `fprintf`
+/// itself, which returns -1, and the fixture exits 125 instead: the defect stops
+/// being silent and this case stops testing it.
+///
+/// The fix to #127 turns this case red, on purpose. When it does, the assertion
+/// to change is the byte comparison -- to `PAYLOAD` -- while the exit code stays
+/// 0. As rank 4 of the slate puts it: do not label a current defect acceptable
+/// permanent behaviour just to get a green test. This case is green because it
+/// asserts the defect, and it is the reason the defect cannot now change shape
+/// unnoticed.
+#[test]
+fn a_buffered_write_whose_fclose_is_ignored_exits_zero_with_an_empty_object_127() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let paths: Vec<&Path> = vec![scratch.path()];
+    assert_no_nfs_mount(&host, port, &paths, "before the run");
+    let run = routed_stdio(scratch.path(), &host, port, "ignored");
+    assert_no_nfs_mount(&host, port, &paths, "after the run");
+
+    // Half one: everything the program and the supervisor can see says success.
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "the ignored-fclose case did not exit zero, so it is no longer the \
+         silent shape of #127:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        run.status,
+        Some(0),
+        "umbra run failed, which is a different defect from the silent one this \
+         case characterizes:\n{}",
+        run.stderr
+    );
+
+    // Half two: and the file is empty. The export is the only place this is
+    // visible, which is exactly why "inspect it independently through the NFS
+    // client" is a requirement of the experiment and not decoration.
+    let stored = read_through_client(&host, port, &shadow_path(&run))
+        .expect("the shadow object exists in the export, empty, rather than being absent");
+    assert!(
+        stored.is_empty(),
+        "the export holds {} bytes, so buffered stdio output now persists and \
+         this characterization of #127 is stale",
+        stored.len()
+    );
+
+    assert!(
+        !run.destination.exists(),
+        "the host destination {} was created",
+        run.destination.display()
+    );
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+    assert!(
+        journal_records_completion(&run),
+        "no RunCompleted record in the run's journal"
+    );
+}
+
+/// The control that **passes**: a Rust `BufWriter` with an explicit, checked
+/// flush persists every byte over the same routed destination the stdio cases
+/// lose theirs on.
+///
+/// **This is the case that says what #127 is actually about.** Buffering is not
+/// the fault line. `std`'s final `write` is compiled into the executable, which
+/// puts it at exactly the call sites `DYLD_INTERPOSE` rebinds, so a buffered
+/// Rust write routes and lands. C stdio's is inside the dyld shared cache, where
+/// interposition cannot reach and no `TRACED_STUBS` row covers it. Without this
+/// case, #127 reads as "buffered writes are broken" and the next person to work
+/// on it looks in the wrong place.
+///
+/// So this is a control and not a second defect case: it exits 0 with all 20
+/// bytes in the export on master, and if it ever goes red that is a regression
+/// in routing rather than a known-unfixed shape.
+///
+/// Measured: `finished: Some(Code(0))`, 20 bytes. The fixture's own header
+/// records the second case that was measured and then deliberately left out --
+/// `BufWriter` + `drop` lands the same bytes here and the same zero bytes under
+/// the `write` probe, so it could never fail differently from this one.
+#[test]
+fn a_rust_bufwriter_with_an_explicit_flush_persists_every_byte() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let paths: Vec<&Path> = vec![scratch.path()];
+    assert_no_nfs_mount(&host, port, &paths, "before the run");
+    let run = routed_buffered(scratch.path(), &host, port);
+    assert_no_nfs_mount(&host, port, &paths, "after the run");
+
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "the BufWriter control failed; 113 is its explicit flush, which is the \
+         arm C stdio fails on:\n{}",
+        run.stderr
+    );
+    assert_eq!(run.status, Some(0), "umbra run failed:\n{}", run.stderr);
+
+    let components = shadow_path(&run);
+    let stored = read_through_client(&host, port, &components)
+        .expect("the shadow object exists in the export");
+    assert_eq!(
+        stored, PAYLOAD,
+        "the export does not hold the bytes the BufWriter flushed"
+    );
+    assert_eq!(
+        stored_size_through_client(&host, port, &components),
+        Some(PAYLOAD.len() as u64),
+        "the export's size attribute disagrees with the bytes the BufWriter flushed"
+    );
+
+    assert!(
+        !run.destination.exists(),
+        "the host destination {} was created",
+        run.destination.display()
+    );
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+    assert!(
+        journal_records_completion(&run),
+        "no RunCompleted record in the run's journal"
+    );
+}
+
+/// Probe B against both writers that are supposed to work -- and the reason the
+/// two cases that *do* work are not asserting their exit codes alone.
+///
+/// **The discriminator is the byte count, and nothing else.** Under
+/// `mutation-probe-write` the overlay drops the bytes and still reports the
+/// success the transaction planned, so the tracee is told its write landed.
+/// Measured, both writers, both worlds: exit **0** with no probe and exit **0**
+/// under the probe, while the export goes from the full payload to empty. A
+/// case resting on the exit code would therefore pass in both worlds and mean
+/// nothing; the two cases above rest on the bytes, and this is the measurement
+/// that proves they had to.
+///
+/// **Why this probe and no new one.** `write` is shipped, and a new probe is not
+/// a local edit: it needs a cargo feature on a production crate, a `#[cfg]` in
+/// production source, a ninth proof step in `ci.yml` and a row in
+/// `every_mutation_probe_is_wired_into_the_userspace_job`. Reusing `write` costs
+/// none of that.
+///
+/// **And it is honestly vacuous on the two stdio cases, which is why they are
+/// not here.** #127 already produces this probe's exact effect on them -- exit
+/// code unchanged, zero bytes -- so a probe case over `checked` or `ignored`
+/// would assert the same state in both worlds. Their non-vacuity comes from
+/// pairing with the raw control instead, which is what
+/// `a_raw_write_to_a_routed_descriptor_persists_every_byte` is for.
+#[test]
+fn mutation_probe_write_empties_both_routed_writers_while_leaving_their_exit_codes_zero() {
+    if declared_probe().as_deref() != Some("write") {
+        eprintln!(
+            "SKIP: set UMBRA_MUTATION_PROBE=write with a binary built with \
+                   --features mutation-probe-write"
+        );
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    // **Two runs, and two scratch directories.** `launch` derives `workspace`,
+    // `state` and `registry.json` from `scratch`, and the fixture helpers
+    // compile into `scratch/<name>`. One shared scratch would also work here --
+    // the two fixtures have different basenames and every assertion below is
+    // per-run -- but it would rewrite files beside an executable a previous run
+    // just launched, which is the `ETXTBSY` class this repository already had to
+    // remove from another test. Two directories cost one extra compile locally
+    // and nothing at all in CI, where both `UMBRA_*_PATH` variables are set.
+    let raw_scratch = tempfile::tempdir().unwrap();
+    let buffered_scratch = tempfile::tempdir().unwrap();
+    let raw = routed_stdio(raw_scratch.path(), &host, port, "raw");
+    let buffered = routed_buffered(buffered_scratch.path(), &host, port);
+
+    for (run, writer) in [
+        (&raw, "the raw write(2)"),
+        (&buffered, "the Rust BufWriter"),
+    ] {
+        // The half that must *not* move. This is the whole claim: breaking write
+        // routing is invisible in the status.
+        assert_eq!(
+            run.child_exit(),
+            0,
+            "{writer} noticed the dropped bytes in its own exit code, so this \
+             probe is no longer the silent one this case rests on:\n{}",
+            run.stderr
+        );
+        assert_eq!(
+            run.status,
+            Some(0),
+            "umbra reported {writer}'s run as failed under the write probe:\n{}",
+            run.stderr
+        );
+
+        // The half that must: the object **exists** and holds **nothing**.
+        //
+        // Both halves are required, and requiring the first is the point.
+        // Measured: this probe drops the bytes inside the write path and does
+        // not touch the `open(O_CREAT)` that created the object, so under the
+        // probe both writers leave an object that is *present* and empty --
+        // never absent. An assertion that also accepted absence would admit a
+        // state no measurement has produced, and would stop discriminating a
+        // probe that silently stopped creating objects at all, or a read-back
+        // that never works.
+        //
+        // **This diverges from the two shipped `write`-probe cases on purpose**,
+        // and the divergence is not an oversight.
+        // `mutation_probe_write_makes_the_read_back_come_up_short` and
+        // `mutation_probe_write_makes_the_rust_reopen_disagree_on_size` both
+        // still tolerate absence: they predate the measurement above, and
+        // tightening them would edit shipped controls that other proofs rest
+        // on, which this slice does not do. So the looser form stays where it
+        // is and the tighter form is used here, where the measurement is in
+        // hand.
+        let Some(stored) = read_through_client(&host, port, &shadow_path(run)) else {
+            panic!(
+                "the export holds no object at all for {writer}; the write probe \
+                 drops bytes but leaves the object the O_CREAT open made, so an \
+                 absent name means something other than this probe emptied it"
+            )
+        };
+        assert!(
+            stored.is_empty(),
+            "the write probe left {} bytes in the export for {writer}, so \
+             routing its write is not what put them there",
+            stored.len()
+        );
+
+        assert!(
+            !run.destination.exists(),
+            "the host destination {} was created",
+            run.destination.display()
+        );
+        assert_workspace_pristine(run);
+        assert_host_write_root_empty(run);
+    }
 }

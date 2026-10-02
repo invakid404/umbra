@@ -314,7 +314,7 @@ jobs:
             up -d --build --wait --wait-timeout 180
           docker ps --filter name=$UMBRA_NFS_FIXTURE_CONTAINER
 
-      - name: Build the toy, edge, listing and Rust I/O fixtures
+      - name: Build the toy, edge, listing, Rust I/O and buffered-output fixtures
         run: |
           test "$(uname -m)" = arm64
           fixture_dir=$(mktemp -d)
@@ -354,11 +354,32 @@ jobs:
           # file is invisible to cargo.
           rustc --edition 2021 -O experiments/fixtures/umbra-userspace-rustio.rs \
             -o "$fixture_dir/umbra-userspace-rustio"
+          # The buffered-output pair, and they are only worth building together.
+          # The C one writes the same payload three ways -- bare write(2), then
+          # checked stdio, then stdio whose fclose result is discarded -- and the
+          # Rust one writes it through a BufWriter with an explicit flush. The
+          # comparison is the measurement: stdio's flush reaches the kernel as
+          # __write_nocancel(397), which has no row in TRACED_STUBS -- so no
+          # breakpoint covers it -- and which DYLD_INTERPOSE cannot rebind
+          # because the call is issued from inside the dyld shared cache.
+          # Breakpoints themselves do fire in there: fopen's 398 and fclose's
+          # 399 route normally on this very path, which is why only the bytes
+          # are lost and the object is left existing and empty -- at exit 0 in
+          # the discarded case.
+          # std's final write is compiled into the executable, so it routes and
+          # lands. Two of the stdio cases characterize issue #127 and are
+          # deliberately green on today's wrong answer; the fix turns them red.
+          clang -arch arm64 -O1 experiments/fixtures/umbra-userspace-stdio.c \
+            -o "$fixture_dir/umbra-userspace-stdio"
+          rustc --edition 2021 -O experiments/fixtures/umbra-userspace-buffered.rs \
+            -o "$fixture_dir/umbra-userspace-buffered"
           echo "UMBRA_USERSPACE_TOY_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
           echo "UMBRA_USERSPACE_LISTING_PATH=$fixture_dir/umbra-userspace-listing" >> "$GITHUB_ENV"
           echo "UMBRA_USERSPACE_LISTING_PROJECT_PATH=$fixture_dir/umbra-userspace-listing-project" >> "$GITHUB_ENV"
           echo "UMBRA_EDGES_PATH=$fixture_dir/umbra-userspace-edges" >> "$GITHUB_ENV"
           echo "UMBRA_RUSTIO_PATH=$fixture_dir/umbra-userspace-rustio" >> "$GITHUB_ENV"
+          echo "UMBRA_STDIO_PATH=$fixture_dir/umbra-userspace-stdio" >> "$GITHUB_ENV"
+          echo "UMBRA_BUFFERED_PATH=$fixture_dir/umbra-userspace-buffered" >> "$GITHUB_ENV"
           # The standard-utilities matrix reads `UMBRA_TEST_FIXTURE_PATH` as a
           # *provisioning signal* and never launches what it points at: it is
           # the suite's existing marker for "this host has workspace binaries
