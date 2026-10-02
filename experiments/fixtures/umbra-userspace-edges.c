@@ -235,6 +235,89 @@
  *       It proved the launch survived and nothing else. Now a pass means the
  *       initializer really did read a file from inside that window.
  *
+ *   umbra-userspace-edges missingparent <path>
+ *       `open("<path>.mp/file", O_CREAT|O_WRONLY, 0644)` with no `<path>.mp`
+ *       anywhere -- not in the run's shadow and not in the read-only base.
+ *       POSIX answers ENOENT; a routed run **creates the missing ancestor and
+ *       succeeds**, which is
+ *       [#67](https://github.com/invakid404/umbra/issues/67). Exits 0 on that
+ *       success, and with **errno** if the `open` fails -- which is #67 being
+ *       fixed and this case being stale.
+ *
+ *       Non-fatal, so the liveness sentinel comes **after** the operation: a
+ *       routed write to `<path>.missingparentlive`, which can only run if the
+ *       tracee was resumed. This is the only one of the four cases below where
+ *       sentinel-after is the correct placement.
+ *
+ *       Whether the divergence is real is already settled in-tree, by two
+ *       passing `umbra-overlay` tests against `LocalStorage`. What this case
+ *       adds, and what nothing in the tree measures, is whether it reproduces
+ *       **end to end on a routed run whose shadow is an NFSv4 export** -- where
+ *       the ancestor is materialized through the userspace client rather than
+ *       by `mkdir`(2), and the `open` arrives through the breakpoint path
+ *       rather than as a direct namespace operation. When #67 is fixed this
+ *       `open` starts failing: invert the case to require ENOENT and the Rust
+ *       side to assert the nested object is absent.
+ *
+ *   umbra-userspace-edges exclcollide <path>
+ *       A second `O_CREAT|O_EXCL` open of a path this same run already created
+ *       exclusively. POSIX answers EEXIST to the caller; the routed namespace
+ *       returns `Err(AlreadyExists)` out of `resolve`, which no arm recovers,
+ *       so it propagates and **ends the run** --
+ *       [#156](https://github.com/invakid404/umbra/issues/156), the same class
+ *       as #81.
+ *
+ *       The tracee therefore never observes the collision, and this case does
+ *       not return in a working tree: the `return 71` is the refusal failing to
+ *       fire. The sentinel comes **before** the collision for that reason, and
+ *       what it proves is narrower than "supervision survived" -- it is "the
+ *       run was alive up to the refusal, and its pre-refusal writes are in the
+ *       run's shadow". The Rust side carries the other half, the absent
+ *       terminal `RunCompleted` record. When #156 is fixed this case returns
+ *       71: rewrite it to require the second open to fail and to report
+ *       `errno`, which POSIX says is EEXIST (17).
+ *
+ *   umbra-userspace-edges mkdirexists <path>
+ *       `mkdir` on a directory this run already created. **This is what
+ *       `std::fs::create_dir_all` on an already-existing directory issues**:
+ *       exactly one `mkdir`(2) on the path, unconditionally and before any
+ *       existence check, whose EEXIST the library then swallows. So the shape
+ *       is not exotic -- it is what every Rust program that ensures an output
+ *       directory does. The routed namespace answers `Err(AlreadyExists)` and
+ *       **ends the run** --
+ *       [#156](https://github.com/invakid404/umbra/issues/156).
+ *
+ *       The framing matters and is narrower than it looks: there is no wrong
+ *       errno here and no false success. The run dies. Sentinel **before**, a
+ *       `return 71` for a refusal that stopped firing, and the Rust side reads
+ *       the missing completion record. When #156 is fixed this case returns 71:
+ *       rewrite it to require the second `mkdir` to fail with EEXIST (17).
+ *
+ *   umbra-userspace-edges rmdirfull <path>
+ *       Build `<path>.rf` and one child inside it, both through routing, then
+ *       remove the directory with `unlinkat(AT_FDCWD, "<path>.rf",
+ *       AT_REMOVEDIR)`. POSIX answers ENOTEMPTY; the routed namespace returns
+ *       `Err(Denied)` -- "rmdir target is not empty" -- and **ends the run**,
+ *       which is [#81](https://github.com/invakid404/umbra/issues/81).
+ *
+ *       **`unlinkat` and not `rmdir`(2), and that is load-bearing rather than
+ *       stylistic.** Bare `rmdir` has no `TRACED_STUBS` row, so no breakpoint
+ *       is ever planted on it, and it is absent from the interposer's
+ *       four-entry table as well -- so neither mechanism intercepts it. It
+ *       reaches the kernel against a path whose shadow object has no host
+ *       existence, and comes back ENOENT: a plausible-looking ordinary error
+ *       that measures **nothing** about #81. A future "simplification" of this
+ *       case to `rmdir()` would void it silently and still look green.
+ *       `unlinkat(..., AT_REMOVEDIR)` is the only operand shape that reaches
+ *       `FsOp::Unlink { directory: true }`.
+ *
+ *       The directory is built inside this same run because there is no
+ *       cross-run state to inherit and the read-only base carries no such
+ *       name. Sentinel **before**, for the reason `exclcollide` states. When
+ *       #81 lands its `Deny(ENOTEMPTY)` this case returns 71: rewrite it to
+ *       require the `unlinkat` to fail and to report `errno`, which is 66 on
+ *       Darwin.
+ *
  * Exit codes below 64 are errno values; the codes above are this program's own,
  * kept clear of them:
  *
@@ -272,6 +355,15 @@
  *       state it exists to reach was never entered and it must not report a
  *       pass. A successful exec never returns, so reaching the line after it is
  *       itself the diagnosis.
+ *
+ *   87  the liveness sentinel's own routed write failed, so the case has
+ *       nothing to say about whatever came after it. Deliberately **not**
+ *       folded into 72: the sentinel is this case's assertion rather than its
+ *       setup, and reporting "umbra stopped supervising" as "could not create
+ *       the file" is the same conflation 80, 83 and 85 each exist to prevent.
+ *       The underlying errno is collapsed on purpose -- *which* write failed is
+ *       the diagnosis, and the sentinel is a known-good operation that four
+ *       shipped cases already perform.
  *
  * Build: clang -arch arm64 -O1 umbra-userspace-edges.c -o umbra-userspace-edges
  */
@@ -977,6 +1069,196 @@ static int case_bigio(const char *path) {
     return 0;
 }
 
+/*
+ * Write the liveness sentinel for one case.
+ *
+ * `<path>.<case>live` rather than anything the case itself operates on, for the
+ * reason `case_fork` states: two assertions that share an object can each pass
+ * by reading what the other wrote. The payload is the case name, so a
+ * cross-wired read-back on the Rust side names the case that actually ran
+ * rather than resolving to whichever sentinel happens to be there.
+ *
+ * Collapsed to 87 rather than propagating the errno: see 87's entry above.
+ */
+static int sentinel(const char *path, const char *case_name) {
+    char derived[1024];
+    char suffix[64];
+    int written = snprintf(suffix, sizeof suffix, ".%slive", case_name);
+    if (written <= 0 || (size_t)written >= sizeof suffix) {
+        return 84;
+    }
+    int failure = derive(derived, sizeof derived, path, suffix);
+    if (failure) {
+        return failure;
+    }
+    if (routed_write(derived, case_name, strlen(case_name)) != 0) {
+        return 87;
+    }
+    return 0;
+}
+
+/*
+ * A creating `open` under an ancestor that is not there -- #67.
+ *
+ * `create_parents` on the routed namespace is `flags.create`, so a non-final
+ * component that does not resolve is swallowed during the walk and the missing
+ * ancestor is materialized as a directory. POSIX says ENOENT; this exits 0
+ * because today it succeeds, and the Rust side reads the nested object's bytes
+ * back through the NFSv4 client to say that it really was created in the
+ * export.
+ *
+ * The divergence itself is already proven in-tree against `LocalStorage`. What
+ * this case contributes is the end-to-end routed half: the same shape where the
+ * ancestor is created through the userspace client. Non-fatal, so the sentinel
+ * goes **after** the operation -- the only case here where it can.
+ *
+ * When #67 is fixed the `open` fails and this returns errno; invert it then to
+ * require ENOENT and have the Rust side assert the nested object is absent.
+ */
+static int case_missingparent(const char *path) {
+    char parent[1024];
+    char nested[1024];
+    int failure = derive(parent, sizeof parent, path, ".mp");
+    if (failure) {
+        return failure;
+    }
+    /* Two components past the destination, and neither of them created first:
+     * the absent ancestor is the whole case. */
+    failure = derive(nested, sizeof nested, parent, "/file");
+    if (failure) {
+        return failure;
+    }
+    errno = 0;
+    int fd = open(nested, O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) {
+        return errno ? errno : 81;
+    }
+    errno = 0;
+    if (write(fd, "missingparent", 13) != 13) {
+        int cause = errno ? errno : 81;
+        (void)close(fd);
+        return cause;
+    }
+    errno = 0;
+    if (close(fd) != 0) {
+        return errno ? errno : 81;
+    }
+    /* After, not before: this is the one case whose characterized operation is
+     * expected to return, so a write that follows it is what proves the tracee
+     * was resumed rather than merely that it was alive beforehand. */
+    return sentinel(path, "missingparent");
+}
+
+/*
+ * A second exclusive create of the same path -- #156.
+ *
+ * `resolve` returns `Err(AlreadyExists)`, which is not the recovered arm, so it
+ * propagates and the run ends. This function does not return in a working tree;
+ * the `return 71` is the refusal failing to fire, exactly as in
+ * `case_rollbackchild`.
+ *
+ * When #156 is fixed, require the second open to fail and report `errno`
+ * (EEXIST, 17) instead of reaching 71.
+ */
+static int case_exclcollide(const char *path) {
+    int failure = sentinel(path, "exclcollide");
+    if (failure) {
+        return failure;
+    }
+    /* The first exclusive create must succeed -- it is what makes the second a
+     * collision rather than an ordinary create. Its bytes are what the Rust
+     * side reads back out of a run that never completed. */
+    int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd < 0 || write(fd, "exclcollide", 11) != 11 || close(fd) < 0) {
+        return 72;
+    }
+    fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd >= 0) {
+        /* Already failing; a close error cannot make this clearer. */
+        (void)close(fd);
+    }
+    return 71;
+}
+
+/*
+ * `mkdir` on a directory that is already there -- #156.
+ *
+ * `std::fs::create_dir_all` on an existing directory issues exactly this call
+ * and absorbs its EEXIST, so this is the shape of every Rust program that
+ * ensures an output directory. The routed namespace answers
+ * `Err(AlreadyExists)` and the run ends: there is no wrong errno here and no
+ * false success to characterize, which is why the claim is "the run dies" and
+ * nothing weaker.
+ *
+ * When #156 is fixed, require the second `mkdir` to fail with EEXIST (17)
+ * instead of reaching 71.
+ */
+static int case_mkdirexists(const char *path) {
+    char directory[1024];
+    int failure = derive(directory, sizeof directory, path, ".me");
+    if (failure) {
+        return failure;
+    }
+    failure = sentinel(path, "mkdirexists");
+    if (failure) {
+        return failure;
+    }
+    if (mkdir(directory, 0755) != 0) {
+        return 72;
+    }
+    /* The collision. Does not return in a working tree. */
+    (void)mkdir(directory, 0755);
+    return 71;
+}
+
+/*
+ * Removing a directory that is not empty -- #81.
+ *
+ * `unlinkat(AT_FDCWD, dir, AT_REMOVEDIR)` **and not `rmdir`(2)**, and the
+ * difference decides whether this case measures anything at all. Bare `rmdir`
+ * has no `TRACED_STUBS` row, so nothing resolves its symbol and no breakpoint
+ * is planted on it, and it is not one of the interposer's four entries either
+ * -- so it reaches the kernel directly, against a path whose shadow object has
+ * no host existence, and answers ENOENT. That is a plausible ordinary error
+ * which says nothing whatever about this refusal, and a later edit that
+ * "simplifies" this call to `rmdir()` would void the case while leaving it
+ * green. `unlinkat` with `AT_REMOVEDIR` is the only operand shape that reaches
+ * `FsOp::Unlink { directory: true }`.
+ *
+ * The directory and its child are built in this same run: there is no
+ * cross-run state and the read-only base has no such name.
+ *
+ * When #81 lands its `Deny(ENOTEMPTY)`, require the `unlinkat` to fail and
+ * report `errno` (66 on Darwin) instead of reaching 71.
+ */
+static int case_rmdirfull(const char *path) {
+    char directory[1024];
+    char child[1024];
+    int failure = derive(directory, sizeof directory, path, ".rf");
+    if (failure) {
+        return failure;
+    }
+    failure = derive(child, sizeof child, directory, "/child");
+    if (failure) {
+        return failure;
+    }
+    failure = sentinel(path, "rmdirfull");
+    if (failure) {
+        return failure;
+    }
+    if (mkdir(directory, 0755) != 0) {
+        return 72;
+    }
+    /* What makes the removal below a non-empty one. 72 rather than 87: this is
+     * the case's setup, and the sentinel above has already spoken for liveness. */
+    if (routed_write(child, "rmdirfull", 9) != 0) {
+        return 72;
+    }
+    /* Does not return in a working tree. */
+    (void)unlinkat(AT_FDCWD, directory, AT_REMOVEDIR);
+    return 71;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         return 70;
@@ -1031,6 +1313,18 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "rollbackchild") == 0) {
         return case_rollbackchild(argv[2]);
+    }
+    if (strcmp(argv[1], "missingparent") == 0) {
+        return case_missingparent(argv[2]);
+    }
+    if (strcmp(argv[1], "exclcollide") == 0) {
+        return case_exclcollide(argv[2]);
+    }
+    if (strcmp(argv[1], "mkdirexists") == 0) {
+        return case_mkdirexists(argv[2]);
+    }
+    if (strcmp(argv[1], "rmdirfull") == 0) {
+        return case_rmdirfull(argv[2]);
     }
     if (strcmp(argv[1], "ctor") == 0) {
         /* Set by the constructor before `main` was entered. */
