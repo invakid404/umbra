@@ -978,6 +978,20 @@ fn routed_buffered(scratch: &Path, host: &str, port: u16) -> Run {
     launch(scratch, host, port, &fixture, &[], &[])
 }
 
+/// Launch one of the append fixture's cases, which take a case name before the
+/// path exactly as the edge fixture's do.
+fn routed_append(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
+    let fixture = fixture_binary(scratch, "umbra-userspace-append", "UMBRA_APPEND_PATH");
+    launch(scratch, host, port, &fixture, &[case], &[])
+}
+
+/// Launch the Rust half of the append pair, which takes the same three case
+/// names as the C half and derives the same targets from the same destination.
+fn routed_append_std(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
+    let fixture = rust_fixture_binary(scratch, "umbra-userspace-appendstd", "UMBRA_APPENDSTD_PATH");
+    launch(scratch, host, port, &fixture, &[case], &[])
+}
+
 /// Run one supervised command against the live fixture and collect its verdict.
 fn launch(
     scratch: &Path,
@@ -5008,4 +5022,446 @@ fn mutation_probe_write_empties_both_routed_writers_while_leaving_their_exit_cod
         assert_workspace_pristine(run);
         assert_host_write_root_empty(run);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The routed `O_APPEND` refusal -- issue #161, characterized in both languages.
+//
+// https://github.com/invakid404/umbra/issues/161 -- "overlay: O_APPEND is
+// deliberately refused with `Err(UnsupportedCapability)`, ending the run".
+//
+// Six cases over the `umbra-userspace-append.c` / `umbra-userspace-appendstd.rs`
+// pair, measured against live Ganesha before any assertion below was written.
+// Four reach the append check and are stopped by it; two do not reach it at all
+// and are the **ordering controls** that say so.
+//
+// The ordering is the part that is easy to get wrong, and it is why there are
+// six cases rather than four. `Overlay::resolve` answers an absent target
+// first: a target that does not resolve, opened without `O_CREAT`, is `ENOENT`
+// from name resolution, decided before the `O_APPEND` test is reached. So a
+// *bare* append to an absent path is not an append measurement at all -- it is
+// `notfound` with extra flags, and the tracee gets an ordinary errno while the
+// run survives. Adding `O_CREAT` is what carries the call past that first test
+// and into the refusal.
+//
+// A change that moved the append test above the absent test would silently
+// convert the two controls from a tracee `ENOENT` into a run stop, and nothing
+// else in this file would notice. That is what they are here to catch.
+//
+// Measured, and identical in both languages: the four that reach the check are
+// stopped with `UnsupportedCapability during overlay: routed open with
+// O_APPEND: ... (errno: None)` and the tracee is never resumed -- there is no
+// `finished:` line at all, so it receives no answer, not even a failure. The
+// C half and the Rust half produce byte-identical refusal text, which is the
+// pair's own finding: `OpenOptions::append(true)` is not an emulation, it sets
+// the same flag bit and arrives at the same decision point.
+// ---------------------------------------------------------------------------
+
+/// The four shared assertions for a shape whose routed `O_APPEND` stopped the
+/// run, with the sentinel read that makes the absence assertions mean
+/// something.
+///
+/// A helper rather than four transcriptions, because these four claims have to
+/// stay identical across the pair for the C-against-Rust comparison to be
+/// exact; four copies would be four places for one of them to drift.
+///
+/// **Which assertion carries which claim**, following the discipline
+/// `a_forked_child_s_writes_are_scoped_to_the_parent_s_run_and_its_terminal_evidence`
+/// states for the same refusal:
+///
+/// * `status != Some(0)` is the weakest and proves the least -- a merely
+///   nonzero tracee also produces it. It is here for the diagnostic, not the
+///   claim.
+/// * The **absent `finished:` line** is the tracee-visible half: umbra prints
+///   that line with the child's code whenever the child was resumed and exited,
+///   and the controls below do produce one. Its absence is how "the tracee got
+///   no answer at all" is observed rather than inferred.
+/// * The **journal** is what pins that *the refusal fired*: a run that ended
+///   with a nonzero child still reaches `finish_run` and still records
+///   `RunCompleted`; one stopped by a refused operation does not.
+/// * The **sentinel** read is what makes every *absence* assertion at the call
+///   sites non-vacuous. It is written before the refusal, so reading it back
+///   through the client proves the run's shadow directory exists and was being
+///   routed into right up to the refused open -- without it, a `None` for the
+///   append target could just as well mean the shadow was never created and the
+///   case would be asserting nothing.
+fn assert_append_refusal_stopped_the_run(run: &Run, host: &str, port: u16, case: &str) {
+    assert_ne!(
+        run.status,
+        Some(0),
+        "the refused O_APPEND open did not fail the run:\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("routed open with O_APPEND"),
+        "the run did not stop on the O_APPEND refusal:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("finished:"),
+        "the tracee was resumed and reported a status, so the refusal was \
+         answered to it rather than stopping the run:\n{}",
+        run.stderr
+    );
+    assert!(
+        !journal_records_completion(run),
+        "a run stopped by the O_APPEND refusal still recorded RunCompleted"
+    );
+
+    let mut live = shadow_path(run);
+    live.last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(format!(".{case}live").as_bytes());
+    assert_eq!(
+        read_through_client(host, port, &live)
+            .expect("the pre-refusal sentinel is in the run's shadow")
+            .as_slice(),
+        case.as_bytes(),
+        "the run was not routing into its shadow before the refused open, so \
+         nothing below about what the shadow does *not* hold means anything"
+    );
+
+    assert_host_write_root_empty(run);
+    assert_workspace_pristine(run);
+}
+
+/// One shadow object of this run, named by a suffix on the destination's leaf.
+fn shadow_leaf(run: &Run, suffix: &[u8]) -> Vec<Vec<u8>> {
+    let mut components = shadow_path(run);
+    components
+        .last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(suffix);
+    components
+}
+
+/// The run's shadow sibling of the harness's pre-seeded `seed.txt`.
+fn shadow_seed(run: &Run) -> Vec<Vec<u8>> {
+    let mut components = shadow_path(run);
+    components.pop();
+    components.push(b"seed.txt".to_vec());
+    components
+}
+
+/// Assert the base `seed.txt` survived a refused append **byte for byte**.
+///
+/// This is the half of the slate's invariant that nothing in this file covered
+/// before. `assert_workspace_pristine` compares directory entry *names* only,
+/// so a truncation of `seed.txt` -- which is exactly what a mishandled append
+/// open would produce, since `O_APPEND`'s neighbour `O_TRUNC` is honoured on
+/// this path -- passes it in silence. Reading the bytes is what catches that.
+///
+/// The shadow read beside it is the other half: the base file must not have
+/// been copied up either. The refusal returns from `resolve`, which runs before
+/// `prepare` mints an `OperationId` and before any copy-up, so nothing should
+/// exist at that name -- and the sentinel assertion above is what makes this
+/// `None` evidence rather than an accident of a missing shadow.
+fn assert_seed_untouched(run: &Run, host: &str, port: u16) {
+    assert_eq!(
+        std::fs::read(run.workspace.join("seed.txt")).expect("the seeded base file"),
+        b"seed\n",
+        "the refused append changed the base file's bytes"
+    );
+    assert_eq!(
+        read_through_client(host, port, &shadow_seed(run)),
+        None,
+        "the refused append copied the base file up into the run's shadow"
+    );
+}
+
+/// A routed **bare** `O_APPEND` on a file that exists and is **not empty**
+/// stops the run -- #161.
+///
+/// MEASURED, not predicted. `open(seed.txt, O_WRONLY | O_APPEND)` -- flag word
+/// `0x9` on Darwin -- resolves, reaches the append check and is refused with
+/// `UnsupportedCapability during overlay: routed open with O_APPEND: no atomic
+/// append-at-end storage operation exists, and stat-then-write is wrong for a
+/// second writer (errno: None)`. umbra exits non-zero, the journal carries no
+/// `RunCompleted`, and there is **no `finished:` line**: the tracee is never
+/// resumed, so it receives no answer at all -- not an errno, not a short write.
+/// A program cannot branch on this the way it branches on `ENOENT`.
+///
+/// This is the shape that matters most of the six, and `seed.txt` is why: it is
+/// the only target here that **has content to append to**, so it is the only
+/// one where "append" has an observable meaning beyond "create". That makes it
+/// the case that pins the no-truncation half of the invariant -- the bytes are
+/// still `seed\n` afterwards, which `assert_workspace_pristine` cannot see
+/// because it compares entry names only.
+///
+/// WHAT REPLACES THIS WHEN APPEND IS ADMITTED. #161 carries two candidate
+/// remedies and one of them lifts the refusal. On that day the fixture's open
+/// succeeds, it exits `131`, and this case fails on the `finished:` assertion
+/// -- deliberately, rather than passing vacuously. What to write in its place
+/// is the **positive invariant**, which is expressible here and in
+/// `a_rust_openoptions_append_to_a_non_empty_file_stops_the_run_161` and nowhere
+/// else in this set: *each successful write extends the existing content*. Keep
+/// the `seed.txt` read and change what it expects -- `seed\n` followed by the
+/// appended bytes, not the appended bytes alone, which is what a silent
+/// truncate-and-write would leave. The other remedy, answering `Deny(ENOTSUP)`,
+/// turns this into a tracee-errno case shaped like the two controls below.
+#[test]
+fn a_routed_bare_append_to_a_non_empty_file_stops_the_run_161() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_append(scratch.path(), &host, port, "bare-existing");
+
+    assert_append_refusal_stopped_the_run(&run, &host, port, "bare-existing");
+    assert_seed_untouched(&run, &host, port);
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// A routed `O_CREAT | O_WRONLY | O_APPEND` on an **absent** path stops the run
+/// and creates **nothing** -- #161.
+///
+/// MEASURED. `O_CREAT` is what carries this past the absent test that answers
+/// the control below, so the call reaches the append check and is refused with
+/// the same `UnsupportedCapability` and the same missing `finished:` line as
+/// the bare case above. Flag word `0x209`.
+///
+/// This is the **E4 shape**: a persistence layer that opens its log
+/// append-mode-and-create-if-needed issues exactly this, which is why the
+/// create-absent pair exists at all rather than only the two bare cases.
+///
+/// `umbra-userspace-edges.c::case_rollbackchild` already issues this same flag
+/// combination and its test already asserts the run-stop disposition, so the
+/// *disposition* is not what this adds. What it adds is that the refused open
+/// left **nothing behind**: no object at the target in the run's shadow.
+/// `rollbackchild`'s subject is run-scoping and it asserts nothing about
+/// creation, so this is net-new coverage rather than a second copy of it.
+///
+/// WHAT REPLACES THIS WHEN APPEND IS ADMITTED. The fixture's open succeeds and
+/// it exits `131`, failing this case on purpose. The replacement is not the
+/// positive append invariant -- there is no prior content here to extend, so
+/// this case cannot express it -- but the creation half: the target now exists
+/// in the shadow holding exactly the bytes written. Invert the
+/// `read_through_client` assertion below rather than deleting it.
+#[test]
+fn a_routed_creating_append_to_an_absent_path_stops_the_run_and_creates_nothing_161() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_append(scratch.path(), &host, port, "create-absent");
+
+    assert_append_refusal_stopped_the_run(&run, &host, port, "create-absent");
+    assert_eq!(
+        read_through_client(&host, port, &shadow_leaf(&run, b".ap")),
+        None,
+        "the refused creating append left an object behind in the run's shadow"
+    );
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// Rust's `OpenOptions::append(true)` on a non-empty file stops the run exactly
+/// as the C bare case does -- #161.
+///
+/// MEASURED, and the measurement is the point of the pair. `std` does not
+/// emulate append: it sets `O_APPEND` in the flag word it hands to `open`,
+/// which is a traced stub, so this arrives at the same decision point and is
+/// refused with **byte-identical** text to
+/// `a_routed_bare_append_to_a_non_empty_file_stops_the_run_161`. Same missing
+/// `finished:` line, same absent `RunCompleted`.
+///
+/// That the two languages agree is not a foregone conclusion in this tree, and
+/// that is why the pair exists rather than one fixture. One slice over,
+/// `umbra-userspace-stdio.c` and `umbra-userspace-buffered.rs` measured the
+/// opposite answer to the same question: C stdio's buffered write escapes
+/// routing entirely through `__write_nocancel`(397) while Rust's does not,
+/// because std's write is compiled into the executable where `DYLD_INTERPOSE`
+/// reaches it. "Both languages do the same thing here" had to be measured.
+///
+/// This is the **E3 shape**. The fixture opens with `.read(true).append(true)`
+/// because the persistence code it transcribes does; the append bit alone
+/// decides the refusal, so the read bit is fidelity rather than mechanism.
+///
+/// WHAT REPLACES THIS WHEN APPEND IS ADMITTED. The same replacement as its C
+/// twin, and it should be made to both in one change or the pair stops being a
+/// comparison: the positive invariant, *each successful write extends the
+/// existing content* -- `seed\n` followed by the appended bytes.
+#[test]
+fn a_rust_openoptions_append_to_a_non_empty_file_stops_the_run_161() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_append_std(scratch.path(), &host, port, "bare-existing");
+
+    assert_append_refusal_stopped_the_run(&run, &host, port, "bare-existing");
+    assert_seed_untouched(&run, &host, port);
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// Rust's `.append(true).create(true)` on an absent path stops the run and
+/// creates nothing -- #161.
+///
+/// MEASURED. The Rust half of the **E4 shape**, and the same refusal text as
+/// its C twin. `create(true)` plays the role `O_CREAT` plays there: it carries
+/// the call past the absent test and into the append check.
+///
+/// WHAT REPLACES THIS WHEN APPEND IS ADMITTED. As with the C twin: no prior
+/// content, so no positive append invariant to state -- invert the shadow
+/// assertion to require the created object instead of its absence.
+#[test]
+fn a_rust_openoptions_creating_append_to_an_absent_path_stops_the_run_and_creates_nothing_161() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_append_std(scratch.path(), &host, port, "create-absent");
+
+    assert_append_refusal_stopped_the_run(&run, &host, port, "create-absent");
+    assert_eq!(
+        read_through_client(&host, port, &shadow_leaf(&run, b".ap")),
+        None,
+        "the refused creating append left an object behind in the run's shadow"
+    );
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **Ordering control.** A routed *bare* `O_APPEND` on an absent path answers
+/// the tracee `ENOENT` and the run survives -- it never reaches the append
+/// check at all.
+///
+/// MEASURED, and it is the opposite disposition to all four cases above:
+/// `child_exit()` is `2`, umbra prints its `finished: Some(Code(2))` line, and
+/// the journal **does** record `RunCompleted`. Nothing in the run's stderr
+/// mentions `O_APPEND`.
+///
+/// This case is not an append measurement and must not be read as one. Without
+/// `O_CREAT` the target does not resolve and name resolution answers first, so
+/// what it actually measures is `notfound` reached through a path carrying the
+/// append bit. It is here for one reason: a change that moved the append test
+/// above the absent test would convert this from a tracee errno into a run
+/// stop, and every other case in this set would keep passing. It is the
+/// positive half whose absence `umbra-userspace-edges.c`'s header records probe
+/// D as having had.
+///
+/// Its sentinel is written **after** the refused open rather than before, per
+/// `missingparent`: the refusal here is non-fatal, so the run is still alive to
+/// write it, and that it lands is the second half of the claim -- the run kept
+/// routing past the refused call rather than merely surviving it.
+///
+/// WHAT CHANGES WHEN APPEND IS ADMITTED: nothing. This case does not reach the
+/// append check, so lifting the refusal leaves it exactly as it is -- which is
+/// what makes it a control. If it *does* change, the ordering changed with it,
+/// and that is the regression it exists to report.
+#[test]
+fn a_routed_bare_append_to_an_absent_path_answers_enoent_before_the_append_check_161() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_append(scratch.path(), &host, port, "bare-absent");
+
+    assert_control_answered_enoent(&run, &host, port, "bare-absent");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **Ordering control**, the Rust half: `OpenOptions::append(true)` with no
+/// `create` on an absent path answers `ENOENT` and the run survives.
+///
+/// MEASURED, and identical to the C control -- `child_exit()` `2`, a
+/// `finished:` line, a recorded `RunCompleted`. `std` reports it as
+/// `ErrorKind::NotFound` with `raw_os_error() == Some(2)`, and the fixture
+/// returns that errno verbatim rather than a code of its own, so the `2`
+/// asserted here is the tracee's own answer rather than a fixture convention.
+///
+/// Both halves of the pair are controlled because the ordering claim has to
+/// hold for both call paths: `std` could have chosen to pre-`stat`, or to add
+/// `O_CREAT` under some condition, and then this would not be the same
+/// measurement as its C twin. It is.
+///
+/// WHAT CHANGES WHEN APPEND IS ADMITTED: nothing, for the C control's reason.
+#[test]
+fn a_rust_openoptions_append_to_an_absent_path_answers_enoent_before_the_append_check_161() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_append_std(scratch.path(), &host, port, "bare-absent");
+
+    assert_control_answered_enoent(&run, &host, port, "bare-absent");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// The shared assertions for the two ordering controls.
+///
+/// The mirror image of `assert_append_refusal_stopped_the_run`, and worth
+/// reading against it: every claim is inverted. The tracee *does* get an answer
+/// and it is `ENOENT`; the run *does* record `RunCompleted`; the stderr does
+/// **not** mention `O_APPEND`. That last one is the ordering claim stated
+/// directly -- if the append check had fired, its message would be there.
+///
+/// The sentinel is read for the same reason as in the stop case, but it proves
+/// something slightly different here: written *after* the refused open, its
+/// presence says the run kept routing past the refusal rather than limping to
+/// an exit.
+fn assert_control_answered_enoent(run: &Run, host: &str, port: u16, case: &str) {
+    assert_eq!(
+        run.child_exit(),
+        2,
+        "a bare routed append to an absent path did not answer ENOENT:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("O_APPEND"),
+        "the append check fired on a path that should have been answered by \
+         name resolution first -- the ordering changed:\n{}",
+        run.stderr
+    );
+    assert!(
+        journal_records_completion(run),
+        "a run whose refusal was answered to the tracee recorded no \
+         RunCompleted, so it was stopped rather than answered"
+    );
+    let mut live = shadow_path(run);
+    live.last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(format!(".{case}live").as_bytes());
+    assert_eq!(
+        read_through_client(host, port, &live)
+            .expect("the post-refusal sentinel is in the run's shadow")
+            .as_slice(),
+        case.as_bytes(),
+        "the run did not keep routing after the refused open"
+    );
+    assert_eq!(
+        read_through_client(host, port, &shadow_leaf(run, b".ab")),
+        None,
+        "the refused bare append created the object it could not open"
+    );
+    assert_host_write_root_empty(run);
+    assert_workspace_pristine(run);
 }

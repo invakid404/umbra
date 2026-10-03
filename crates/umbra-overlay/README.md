@@ -271,7 +271,14 @@ Refusals rather than wrong answers, in every case the engine cannot represent:
   not an error that stops the run.
 - A routed `Open` with `O_APPEND` is refused: honouring it needs an atomic
   append-at-end storage operation, and stat-then-write is right for one writer
-  and silently wrong for two.
+  and silently wrong for two. Unlike the `EBADF` denial above, this refusal is
+  an `UnsupportedCapability` **error** rather than a `Deny`, so it propagates
+  instead of reaching the caller -- the run stops and the tracee receives no
+  errno at all. A bare append to an absent path is a different answer: it never
+  reaches this refusal, because name resolution denies it `ENOENT` first and the
+  run survives -- `O_APPEND` reaches the refusal only when the target exists, or
+  when `O_CREAT` carries it there. Measured in `userspace_run.rs`'s six `_161`
+  cases; see #161.
 - A routed `Open` of a *writable* directory is refused: the descriptor could not
   keep the contract it would be handing out. A **read-only** directory open is
   served -- `getattrlistbulk` is routed and answered from the merged view, with
