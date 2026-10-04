@@ -119,7 +119,7 @@ jobs:
       # exposes no sha256 input, and hand-editing it would forfeit Memoria's
       # management of the file.
       - name: Set up Memoria
-        uses: viktordanov/rs-memoria@1eaff8b6688e8345a5cbb6c8dbac6a2e367fe32c # v0.7.0
+        uses: viktordanov/rs-memoria@1eaf0bd9947872643542931409980bc276aca9b0 # v0.8.0
         with:
           version: '0.7.0'
           sha256: 'efdbf68399c8e40e4d4e6abcf2761f92c27cd461929d47520c6797b6d6916ae7'
