@@ -6375,15 +6375,23 @@ fn assert_walk_composed_through_to_set_len(run: &Run, host: &str, port: u16, cas
          so the refusal was propagated rather than answered to the tracee"
     );
     assert_eq!(
-        read_through_client(host, port, &shadow_leaf(run, format!(".{case}live").as_bytes()))
-            .expect("the pre-walk sentinel is in the run's shadow")
-            .as_slice(),
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}live").as_bytes())
+        )
+        .expect("the pre-walk sentinel is in the run's shadow")
+        .as_slice(),
         case.as_bytes(),
         "the {case} walk was not routing into its shadow before it started, so \
          nothing below about where it stopped means anything"
     );
     assert_eq!(
-        read_through_client(host, port, &shadow_leaf(run, format!(".{case}done").as_bytes())),
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}done").as_bytes())
+        ),
         None,
         "the {case} walk wrote its completion sentinel, so it finished every \
          stage -- stage (d) is now served and this case must be rewritten to \
@@ -6406,12 +6414,7 @@ fn assert_walk_composed_through_to_set_len(run: &Run, host: &str, port: u16, cas
 /// no `finished:` line, no `RunCompleted` -- and the one positive assertion, the
 /// pre-walk sentinel, is what keeps the negatives from being satisfied by a run
 /// that never routed anything at all.
-fn assert_nofollow_symlink_refusal_stopped_the_run(
-    run: &Run,
-    host: &str,
-    port: u16,
-    case: &str,
-) {
+fn assert_nofollow_symlink_refusal_stopped_the_run(run: &Run, host: &str, port: u16, case: &str) {
     assert_ne!(
         run.status,
         Some(0),
@@ -6435,15 +6438,23 @@ fn assert_nofollow_symlink_refusal_stopped_the_run(
         "a run stopped by the final-symlink refusal still recorded RunCompleted"
     );
     assert_eq!(
-        read_through_client(host, port, &shadow_leaf(run, format!(".{case}live").as_bytes()))
-            .expect("the pre-walk sentinel is in the run's shadow")
-            .as_slice(),
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}live").as_bytes())
+        )
+        .expect("the pre-walk sentinel is in the run's shadow")
+        .as_slice(),
         case.as_bytes(),
         "the run was not routing into its shadow before the refused open, so \
          nothing above about the run ending means anything"
     );
     assert_eq!(
-        read_through_client(host, port, &shadow_leaf(run, format!(".{case}done").as_bytes())),
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}done").as_bytes())
+        ),
         None,
         "the run wrote its completion sentinel although the refusal was supposed \
          to have ended it"
@@ -6881,7 +6892,11 @@ fn a_host_seeded_fifo_in_the_approved_workspace_stops_the_run_before_it_launches
     let leaf = seed_workspace_entry(scratch.path(), SeededEntry::Fifo);
     let (status, stderr) = attempt_routed_nofollow(scratch.path(), &host, port, "safe-path");
 
-    assert_ne!(status, Some(0), "the seeded FIFO did not fail the run:\n{stderr}");
+    assert_ne!(
+        status,
+        Some(0),
+        "the seeded FIFO did not fail the run:\n{stderr}"
+    );
     assert!(
         stderr.contains("only regular files and directories are supported"),
         "the run did not stop on the workspace inventory scan's refusal:\n{stderr}"
@@ -6927,7 +6942,11 @@ fn a_host_seeded_symlink_in_the_approved_workspace_stops_the_run_before_it_launc
     let leaf = seed_workspace_entry(scratch.path(), SeededEntry::Symlink);
     let (status, stderr) = attempt_routed_nofollow(scratch.path(), &host, port, "safe-path");
 
-    assert_ne!(status, Some(0), "the seeded symlink did not fail the run:\n{stderr}");
+    assert_ne!(
+        status,
+        Some(0),
+        "the seeded symlink did not fail the run:\n{stderr}"
+    );
     assert!(
         stderr.contains("symbolic links in the approved workspace are not supported"),
         "the run did not stop on the workspace inventory scan's symlink refusal:\n{stderr}"
