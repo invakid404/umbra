@@ -992,6 +992,33 @@ fn routed_append_std(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
     launch(scratch, host, port, &fixture, &[case], &[])
 }
 
+/// Launch one of the descriptor fixture's cases, which take a case name before
+/// the path exactly as the append fixture's do.
+fn routed_descriptor(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
+    let fixture = fixture_binary(
+        scratch,
+        "umbra-userspace-descriptor",
+        "UMBRA_DESCRIPTOR_PATH",
+    );
+    launch(scratch, host, port, &fixture, &[case], &[])
+}
+
+/// Launch the Rust half of the descriptor pair, which takes its own five case
+/// names and derives the same targets from the same destination.
+///
+/// Five rather than the C half's seven, and the gap is a measurement rather
+/// than an omission: `std` has no positional-I/O method on a `File` on this
+/// platform without `FileExt`, so `pread`/`pwrite` have no Rust call site to
+/// issue here. The fixture pair's headers record it.
+fn routed_descriptor_std(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
+    let fixture = rust_fixture_binary(
+        scratch,
+        "umbra-userspace-descriptorstd",
+        "UMBRA_DESCRIPTORSTD_PATH",
+    );
+    launch(scratch, host, port, &fixture, &[case], &[])
+}
+
 /// Run one supervised command against the live fixture and collect its verdict.
 fn launch(
     scratch: &Path,
@@ -5464,4 +5491,686 @@ fn assert_control_answered_enoent(run: &Run, host: &str, port: u16, case: &str) 
     );
     assert_host_write_root_empty(run);
     assert_workspace_pristine(run);
+}
+
+/// The shared assertions for the ten descriptor-primitive refusals.
+///
+/// `assert_control_answered_enoent`'s shape rather than
+/// `assert_append_refusal_stopped_the_run`'s, and the choice is a measurement
+/// rather than a preference. The append refusal is *propagated*: the run stops
+/// inside the open, the tracee is never resumed, and there is no `finished:`
+/// line and no `RunCompleted` to read. This refusal is **answered**: every one
+/// of the ten produces `finished: Some(Code(9))`, a recorded `RunCompleted`,
+/// and `umbra` exiting non-zero only because `ProcessFailed` wraps a nonzero
+/// child. Transcribing the stop-shaped helper here would have asserted the
+/// opposite of what happens.
+///
+/// Nine claims, and the order is the order they become readable:
+///
+/// 1. **`child_exit() == 9`.** The tracee's own answer, `EBADF`, read from the
+///    status line umbra prints. A program *can* branch on this, which is what
+///    separates this disposition from the append pair's.
+/// 2. **umbra itself failed.** `ProcessFailed` wrapping a nonzero child, so a
+///    green `umbra` exit here would mean the fixture reported success.
+/// 3. **No `UnsupportedCapability` in the stderr.** The P1 claim stated
+///    directly: if this refusal were propagated the way `O_APPEND`'s is, that
+///    diagnostic would be there and there would be no exit code above to read.
+/// 4. **`RunCompleted` is recorded.** The journal half of the same claim. A run
+///    stopped by a refused operation never reaches `finish_run`.
+/// 5. **The pre-sentinel reads back as the case name.** Written before the
+///    primitive, so it proves the run was alive and routing into its shadow
+///    right up to the refusal -- this file's standing discipline, where an
+///    absence assertion is never allowed to stand alone.
+/// 6. **The post-sentinel reads back as the case name.** Written after the
+///    refusal, so it proves routing *survived* it. Five and six together are
+///    the slate's boundedness invariant, asserted on bytes through the client
+///    rather than inferred from the exit code. The fixture also read this
+///    object back in-process, through routing, before exiting; this read comes
+///    over NFSv4 from the server instead, so the claim is made twice by two
+///    paths that share no code.
+/// 7. **The host `seed.txt` is still `seed\n`.** `assert_workspace_pristine`
+///    compares entry *names* only, so a truncation of the base file -- exactly
+///    what a mishandled `ftruncate` or `pwrite` would produce -- passes it in
+///    silence. Reading the bytes is what catches that.
+/// 8. **The shadow `seed.txt` is `Some(b"seed\n")` -- present and byte-identical.**
+///    This is the one place `assert_seed_untouched` must **not** be copied, and
+///    the reason is measured. That helper asserts the shadow object is `None`,
+///    on the correct ground that an append refusal returns from `resolve`
+///    before any copy-up. Here the open must *succeed* to produce a descriptor
+///    at all, and MEASURED: it copies the base file up, in all ten cases. So
+///    the assertion is the stronger one -- the object exists and its bytes are
+///    unchanged -- and transcribing the `None` would have failed every case for
+///    the wrong reason.
+/// 9. **Host negative space.** No host write allowance was spent and the
+///    workspace holds exactly `seed.txt`.
+fn assert_descriptor_refusal_answered_ebadf(run: &Run, host: &str, port: u16, case: &str) {
+    assert_eq!(
+        run.child_exit(),
+        9,
+        "the refused descriptor primitive did not answer EBADF to the tracee:\n{}",
+        run.stderr
+    );
+    assert_ne!(
+        run.status,
+        Some(0),
+        "umbra reported success for a run whose child failed:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("UnsupportedCapability"),
+        "the refusal was propagated as an unsupported capability instead of \
+         being answered to the tracee -- the disposition changed:\n{}",
+        run.stderr
+    );
+    assert!(
+        journal_records_completion(run),
+        "a run whose refusal was answered to the tracee recorded no \
+         RunCompleted, so it was stopped rather than answered"
+    );
+    assert_eq!(
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}live").as_bytes())
+        )
+        .expect("the pre-refusal sentinel is in the run's shadow")
+        .as_slice(),
+        case.as_bytes(),
+        "the run was not routing into its shadow before the refused primitive, \
+         so nothing else here means anything"
+    );
+    assert_eq!(
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}after").as_bytes())
+        )
+        .expect("the post-refusal sentinel is in the run's shadow")
+        .as_slice(),
+        case.as_bytes(),
+        "the run did not keep routing after the refused primitive, so the \
+         refusal was not bounded"
+    );
+    assert_eq!(
+        std::fs::read(run.workspace.join("seed.txt")).expect("the seeded base file"),
+        b"seed\n",
+        "the refused primitive changed the base file's bytes"
+    );
+    assert_eq!(
+        read_through_client(host, port, &shadow_seed(run)).as_deref(),
+        Some(&b"seed\n"[..]),
+        "the routed open's copy-up of the base file is missing or no longer \
+         byte-identical, so the refusal was not without effect"
+    );
+    assert_host_write_root_empty(run);
+    assert_workspace_pristine(run);
+}
+
+/// The shared assertions for the two served-member controls.
+///
+/// The mirror image of the helper above, and worth reading against it: the
+/// primitive **succeeds** on the very descriptor the ten are refused on, so the
+/// fixture exits `141` rather than an errno, and the post-sentinel it would
+/// have written on a refusal is **absent**.
+///
+/// That absence is the sharpest claim here and it is non-vacuous for a reason
+/// the file already relies on elsewhere: the pre-sentinel is read back in the
+/// same breath, so the shadow demonstrably exists and was being routed into.
+/// A `None` for the post-sentinel therefore means the fixture never reached its
+/// refusal path, which is the same statement as "the primitive was served" made
+/// on bytes instead of on an exit code.
+///
+/// **Why this is the slice's non-vacuity mechanism.** Ten `EBADF`s on their own
+/// are consistent with a duller claim than the one being made -- that
+/// descriptor-relative calls simply do not work on a routed descriptor, or that
+/// the open never routed. `fstat` and `File::metadata` are descriptor-relative,
+/// are issued on the same descriptor at the same point in the same run, and are
+/// answered. That makes the ten refusals a statement about `TRACED_STUBS`
+/// *membership* -- these calls have no row -- rather than about descriptors.
+/// It is stronger than a mutation probe would be here, because it runs in the
+/// **unmutated** job.
+fn assert_descriptor_control_was_served(run: &Run, host: &str, port: u16, case: &str) {
+    assert_eq!(
+        run.child_exit(),
+        141,
+        "a served member was not served on the routed descriptor -- the \
+         membership claim the ten refusals rest on has changed:\n{}",
+        run.stderr
+    );
+    assert!(
+        journal_records_completion(run),
+        "the control run recorded no RunCompleted"
+    );
+    assert_eq!(
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}live").as_bytes())
+        )
+        .expect("the control's sentinel is in the run's shadow")
+        .as_slice(),
+        case.as_bytes(),
+        "the control was not routing into its shadow, so the absence below \
+         would be asserting nothing"
+    );
+    assert_eq!(
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}after").as_bytes())
+        ),
+        None,
+        "the control wrote its post-refusal sentinel, so it took the refusal \
+         path after all"
+    );
+    assert_eq!(
+        std::fs::read(run.workspace.join("seed.txt")).expect("the seeded base file"),
+        b"seed\n",
+        "the served primitive changed the base file's bytes"
+    );
+    assert_eq!(
+        read_through_client(host, port, &shadow_seed(run)).as_deref(),
+        Some(&b"seed\n"[..]),
+        "the routed open's copy-up of the base file is missing or no longer \
+         byte-identical"
+    );
+    assert_host_write_root_empty(run);
+    assert_workspace_pristine(run);
+}
+
+/// `lseek(fd, 0, SEEK_END)` on a routed descriptor is answered `EBADF`.
+///
+/// MEASURED, not predicted. The routed `open` of `seed.txt` succeeds and
+/// returns a descriptor above the 4096 fence -- it is umbra's -- and `read` on
+/// that same descriptor is served. `lseek`(199) has no row in
+/// `abi::TRACED_STUBS`, so no breakpoint covers it, the call reaches the kernel
+/// bare, and the kernel has never heard of the number: `errno` is `EBADF`(9),
+/// the tracee is resumed to report it, and the run records `RunCompleted`.
+///
+/// This is the one a reader expects to work, and that is why it leads: a
+/// descriptor with no file position is not a file descriptor in any sense a
+/// program recognises. Every `std`-style read-then-seek-then-read loop, every
+/// "how big is this" probe written as seek-to-end, and every format reader that
+/// rewinds breaks on it, and breaks with an errno that says the descriptor is
+/// invalid rather than that the operation is unsupported -- which sends the
+/// caller looking for its own bug.
+///
+/// WHAT REPLACES THIS WHEN `lseek` IS ADMITTED. The fixture exits `141` and
+/// this case fails on `child_exit() == 9`, deliberately, rather than passing
+/// vacuously. What to write in its place is the **positive invariant**: a seek
+/// to `SEEK_END` returns the object's size -- `5` for `seed\n` -- a seek to
+/// `SEEK_SET` returns `0`, and a `read` after each one starts at the offset the
+/// seek named. Keep the two sentinels and the shadow `seed.txt` read exactly as
+/// they are; it is only the exit code and the new offset claim that change.
+/// Nothing recorded here is acceptable permanent behaviour.
+#[test]
+fn a_routed_lseek_on_a_routed_descriptor_is_answered_ebadf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor(scratch.path(), &host, port, "lseek");
+
+    assert_descriptor_refusal_answered_ebadf(&run, &host, port, "lseek");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// `fcntl(fd, F_DUPFD, 0)` on a routed descriptor is answered `EBADF`.
+///
+/// MEASURED. `fcntl`(92) has no `TRACED_STUBS` row, so the aliasing request
+/// never reaches the overlay and the kernel answers `EBADF`(9) for a number it
+/// does not own. The run survives and records `RunCompleted`.
+///
+/// The command is `F_DUPFD`(0), the bare duplicate. Its Rust twin issues
+/// `F_DUPFD_CLOEXEC`(67) instead -- a different command on the same syscall,
+/// which is why
+/// `a_rust_file_try_clone_on_a_routed_descriptor_is_answered_ebadf` is a
+/// separate case and not a duplicate of this one. A read-only command on the
+/// same syscall (`F_GETFL`) was measured to be refused identically, so the
+/// refusal is the **syscall's** and not the command's; that is recorded here
+/// rather than given a case of its own, because it adds no disposition. Bare
+/// `dup`(41) is a third syscall again and is deliberately out of scope: it is
+/// in neither language's `std` path.
+///
+/// WHAT REPLACES THIS WHEN `fcntl` IS ADMITTED. The positive invariant for an
+/// alias is **shared offsets**: the two descriptors name one open file
+/// description, so a `read` on the duplicate continues where a `read` on the
+/// original stopped, a seek through either is visible through the other, and
+/// closing one leaves the other usable. Assert that, not merely that the
+/// duplicate is a number above the fence -- a duplicate with its own private
+/// offset would satisfy the weaker claim and be wrong.
+#[test]
+fn a_routed_fcntl_dupfd_on_a_routed_descriptor_is_answered_ebadf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor(scratch.path(), &host, port, "dupfd");
+
+    assert_descriptor_refusal_answered_ebadf(&run, &host, port, "dupfd");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// `ftruncate(fd, 2)` on a routed descriptor is answered `EBADF`.
+///
+/// MEASURED. `ftruncate`(201) has no `TRACED_STUBS` row and the kernel answers
+/// `EBADF`(9) for a descriptor number it does not own.
+///
+/// This is the destructive one, and the assertion that matters most is the one
+/// that could not be read off an exit code: the base file's bytes are still
+/// `seed\n`, on the host *and* in the shadow. A truncation that half-landed --
+/// the shape where the call fails after the object has already been shortened
+/// -- would exit `9` exactly like a clean refusal and pass any assertion that
+/// only read the status. `assert_workspace_pristine` would not catch it either,
+/// since it compares entry names. The byte reads are what make the refusal
+/// *bounded* rather than merely reported.
+///
+/// WHAT REPLACES THIS WHEN `ftruncate` IS ADMITTED. The positive invariant is
+/// **exact truncation**: after `ftruncate(fd, 2)` the object is exactly two
+/// bytes, those bytes are `se`, and a read past the new end returns nothing.
+/// Extension is the other half and is worth asserting in the same breath --
+/// `ftruncate` past the end zero-fills, so growing `seed\n` to 8 bytes must
+/// leave `seed\n\0\0\0` and not 8 bytes of anything else. Keep both byte reads
+/// and change what they expect.
+#[test]
+fn a_routed_ftruncate_on_a_routed_descriptor_is_answered_ebadf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor(scratch.path(), &host, port, "ftruncate");
+
+    assert_descriptor_refusal_answered_ebadf(&run, &host, port, "ftruncate");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// `fsync(fd)` on a routed descriptor is answered `EBADF`.
+///
+/// MEASURED. `fsync`(95) has no `TRACED_STUBS` row and the kernel answers
+/// `EBADF`(9).
+///
+/// This is the refusal a caller is least able to compensate for, and the reason
+/// is the direction of the error. A program that cannot seek can often restructure
+/// itself to read forward; a program that cannot *flush* has no way to obtain
+/// the guarantee it asked for, and the only honest responses are to fail the
+/// write it was about to acknowledge or to proceed without durability. `EBADF`
+/// is also the least informative answer it could get: the descriptor it just
+/// wrote through successfully is reported invalid, which reads as a bug in the
+/// caller rather than as a missing capability.
+///
+/// Note the asymmetry with the Rust half, which is measured and not incidental:
+/// `File::sync_all` does **not** issue this syscall. It issues
+/// `fcntl(F_FULLFSYNC)`, so this case is the only `fsync`(2) call site in the
+/// pair. Its Rust counterpart is
+/// `a_rust_file_sync_all_on_a_routed_descriptor_is_answered_ebadf`.
+///
+/// WHAT REPLACES THIS WHEN `fsync` IS ADMITTED. The positive invariant is an
+/// **honest sync result**: `fsync` returns zero only once the bytes written
+/// through that descriptor are durable in the store, and returns an error
+/// otherwise -- never zero on a flush that did not happen. Assert it by reading
+/// the written bytes back through the client *after* the successful `fsync` and
+/// before the descriptor is closed, which is the only ordering where "durable
+/// now" is distinguishable from "durable at close".
+///
+/// **Admitting the syscall is not sufficient here, and this case must not be
+/// rewritten as though it were.** An honest sync result cannot be issued until
+/// the userspace-NFS flush work lands -- verifier-mismatch recovery, and the
+/// strict-remote-persistence mode that is still refused at `open_run`, which
+/// are **#108 items 2-3**. A `TRACED_STUBS` row for 95 added before then would
+/// buy a call that returns zero with no durability guarantee behind it, which
+/// is a worse outcome than the `EBADF` recorded here: it is the
+/// silent-wrong-answer shape rather than the loud-refusal shape. If this case
+/// goes red because the row was added alone, the replacement assertion is that
+/// `fsync` reports an **error**.
+#[test]
+fn a_routed_fsync_on_a_routed_descriptor_is_answered_ebadf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor(scratch.path(), &host, port, "fsync");
+
+    assert_descriptor_refusal_answered_ebadf(&run, &host, port, "fsync");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// `pread(fd, buf, 4, 0)` on a routed descriptor is answered `EBADF`.
+///
+/// MEASURED, and the sharpest pair in the file: `read` on this very descriptor
+/// is **served**, and `pread`(153) -- the same transfer at an explicit offset --
+/// is not. So what the refusal isolates is *positional*, not reading. The
+/// descriptor is umbra's and the data is reachable through it, and the two
+/// spellings are served by **different mechanisms, not by one table**: `read`
+/// is one of the four functions the interposer replaces, `fstat`(339) below is
+/// reached through a `TRACED_STUBS` breakpoint, and `pread` has **neither** --
+/// no interposer entry and no row. "Not interposed" is not the same as "not
+/// routed", which is the distinction `umbra_interpose.c`'s own LIMITS block
+/// warns against collapsing and which this file's header states for
+/// `__write_nocancel`(397).
+///
+/// This is the shape a reader of a random-access format issues -- an index, a
+/// page cache, a database file -- and such a reader rarely has a fallback,
+/// because "seek then read" is also refused (see
+/// `a_routed_lseek_on_a_routed_descriptor_is_answered_ebadf`). The two
+/// refusals together leave no way to read anything but a stream.
+///
+/// WHAT REPLACES THIS WHEN `pread` IS ADMITTED. The positive invariant is an
+/// **unchanged file offset**: `pread` returns the bytes at the offset it names
+/// -- `seed` for offset 0, length 4 -- and the descriptor's own position is
+/// exactly what it was before the call. Assert the second half by reading
+/// through the same descriptor afterwards and requiring that it continues from
+/// where it was, not from where the `pread` ended; a `pread` implemented as
+/// seek-read-seek would pass the first half and fail this.
+#[test]
+fn a_routed_pread_on_a_routed_descriptor_is_answered_ebadf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor(scratch.path(), &host, port, "pread");
+
+    assert_descriptor_refusal_answered_ebadf(&run, &host, port, "pread");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// `pwrite(fd, "X", 1, 0)` on a routed descriptor is answered `EBADF`.
+///
+/// MEASURED. `pwrite`(154) has no `TRACED_STUBS` row, while plain `write` on
+/// the same descriptor is served -- the `pread` case's isolation, in the
+/// writing direction.
+///
+/// It is also the second destructive case, and the byte assertions carry the
+/// same weight they do for `ftruncate`: a `pwrite` that landed its byte and
+/// *then* failed would exit `9` indistinguishably from one that never touched
+/// the object. The base file is still `seed\n` on the host and byte-identical
+/// in the shadow, so the single `X` this case tried to place at offset 0 went
+/// nowhere.
+///
+/// WHAT REPLACES THIS WHEN `pwrite` IS ADMITTED. The positive invariant is the
+/// `pread` case's, in the other direction: the byte lands at the offset named
+/// and **nowhere else** -- `Xeed\n`, not `seed\nX` and not `X` alone -- and the
+/// descriptor's own position is unchanged afterwards. The "nowhere else" half
+/// is the one that needs the shadow read: an implementation that appended, or
+/// that truncated and rewrote, would satisfy "the byte is in the file".
+#[test]
+fn a_routed_pwrite_on_a_routed_descriptor_is_answered_ebadf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor(scratch.path(), &host, port, "pwrite");
+
+    assert_descriptor_refusal_answered_ebadf(&run, &host, port, "pwrite");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// `File::seek(SeekFrom::End(0))` on a routed descriptor is answered `EBADF`.
+///
+/// MEASURED, and the Rust half of the pair agrees with the C half here:
+/// `std` compiles this straight to `lseek`(199), the same syscall
+/// `a_routed_lseek_on_a_routed_descriptor_is_answered_ebadf` issues, and the
+/// disposition is identical -- `child_exit()` `9`, a `finished:` line, a
+/// recorded `RunCompleted`.
+///
+/// That agreement is the measurement rather than an assumption, and it is not
+/// the default outcome in this file: `umbra-userspace-buffered.rs` exists
+/// because C stdio and Rust `std` were measured to reach *different* syscalls
+/// for an identical-looking write, and two of this pair's four shared shapes do
+/// the same. Both halves are tested for that reason -- `std` could have
+/// pre-`stat`ed, or cached the length, and then this would not be the same
+/// measurement as its C twin. It is.
+///
+/// WHAT REPLACES THIS WHEN `lseek` IS ADMITTED. The C case's positive
+/// invariant, expressed through `std`: `seek(End(0))` returns `5` for `seed\n`,
+/// `rewind()` returns the position to `0`, and `Read` after each starts at the
+/// offset the seek named. `stream_position()` is worth asserting in the same
+/// breath, since it is the method callers actually use and it is a `seek` of
+/// its own.
+#[test]
+fn a_rust_file_seek_on_a_routed_descriptor_is_answered_ebadf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor_std(scratch.path(), &host, port, "seek");
+
+    assert_descriptor_refusal_answered_ebadf(&run, &host, port, "seek");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// `File::try_clone()` on a routed descriptor is answered `EBADF`.
+///
+/// MEASURED, and this is where the pair earns its existence. `try_clone` does
+/// **not** issue the `F_DUPFD`(0) its C twin issues: it issues `fcntl`(92) with
+/// command **67**, `F_DUPFD_CLOEXEC`, because `std` sets the close-on-exec
+/// variant unconditionally. Same syscall number, different command, and a
+/// C-only fixture would have reported the wrong call for Rust's aliasing path.
+/// The disposition is the same -- `EBADF`(9), run surviving -- because
+/// `fcntl` has no `TRACED_STUBS` row at all, so no command of it is reachable.
+///
+/// Bare `dup`(41) is a third syscall again. It was measured to be refused
+/// identically and is deliberately **not** a case here: it is in neither
+/// language's `std` path, so a case for it would be scope rather than coverage.
+///
+/// WHAT REPLACES THIS WHEN `fcntl` IS ADMITTED. The alias invariant --
+/// **shared offsets** -- stated through `std`: the clone and the original name
+/// one open file description, so reading through the clone continues where the
+/// original stopped, a `seek` through either is visible through the other, and
+/// dropping one leaves the other usable. Assert the close-on-exec bit too,
+/// since `try_clone` is specified to set it and a `F_DUPFD`-based
+/// implementation would silently not.
+#[test]
+fn a_rust_file_try_clone_on_a_routed_descriptor_is_answered_ebadf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor_std(scratch.path(), &host, port, "try_clone");
+
+    assert_descriptor_refusal_answered_ebadf(&run, &host, port, "try_clone");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// `File::set_len(2)` on a routed descriptor is answered `EBADF`.
+///
+/// MEASURED. `set_len` compiles to `ftruncate`(201) -- the same syscall the C
+/// half's `ftruncate` case issues, so the pair agrees here as it does for
+/// `seek` -- and the kernel answers `EBADF`(9) for a descriptor number it does
+/// not own.
+///
+/// The destructive-case reasoning is the C twin's and applies unchanged: the
+/// byte reads on the host and in the shadow are what separate a clean refusal
+/// from a truncation that half-landed, and neither the exit code nor
+/// `assert_workspace_pristine` could tell them apart.
+///
+/// WHAT REPLACES THIS WHEN `ftruncate` IS ADMITTED. **Exact truncation**,
+/// through `std`: after `set_len(2)` the file is exactly two bytes and they are
+/// `se`; after `set_len(8)` it is exactly eight and the tail is zero-filled,
+/// `seed\n\0\0\0`. `std` documents both directions of `set_len`, so both are
+/// expressible here and both should be asserted -- an implementation that only
+/// shortened would pass a one-directional test.
+#[test]
+fn a_rust_file_set_len_on_a_routed_descriptor_is_answered_ebadf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor_std(scratch.path(), &host, port, "set_len");
+
+    assert_descriptor_refusal_answered_ebadf(&run, &host, port, "set_len");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// `File::sync_all()` on a routed descriptor is answered `EBADF`.
+///
+/// MEASURED, and the second place the pair's two halves diverge. `sync_all`
+/// does **not** issue `fsync`(95): it issues `fcntl`(92) with command **51**,
+/// `F_FULLFSYNC`, which is Darwin's stronger barrier. `File::sync_data` was
+/// measured to issue the identical call on this SDK, so **Rust has no
+/// `fsync`(2) call site for a `File` at all** -- which is why there is no
+/// `sync_data` case: it would be a byte-identical measurement under a different
+/// name, and the slate's one-scenario-per-primitive rule excludes it.
+///
+/// The disposition is `EBADF`(9) with the run surviving, the same as the C
+/// half's `fsync`, for the same root cause: `fcntl` has no `TRACED_STUBS` row,
+/// so no command of it reaches the overlay. The durability reasoning is the C
+/// twin's -- a caller that cannot flush cannot obtain the guarantee it asked
+/// for, and `EBADF` tells it to look for a bug in itself instead.
+///
+/// WHAT REPLACES THIS WHEN `fcntl` IS ADMITTED. An **honest sync result**:
+/// `sync_all` returns `Ok(())` only once the bytes written through that `File`
+/// are durable in the store, and an `Err` otherwise -- never `Ok` for a flush
+/// that did not happen, which is the failure mode `umbra-userspace-stdio.c`
+/// characterizes for a different call. Assert it by reading the written bytes
+/// back through the client after the `Ok` and before the `File` is dropped.
+/// `sync_data`'s own result is worth asserting beside it once the call is
+/// reachable, since the two are the same syscall today and need not stay so.
+///
+/// **Admitting `fcntl` is not sufficient here either**, for the C twin's
+/// reason: the honest result this case is waiting on is gated on the
+/// userspace-NFS flush work -- verifier-mismatch recovery, and the
+/// strict-remote-persistence mode still refused at `open_run`, which are
+/// **#108 items 2-3** -- not on the syscall becoming reachable. An `Ok(())`
+/// issued before then would be the silent wrong answer, and the replacement
+/// assertion in that interim is that `sync_all` returns an `Err`.
+#[test]
+fn a_rust_file_sync_all_on_a_routed_descriptor_is_answered_ebadf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor_std(scratch.path(), &host, port, "sync_all");
+
+    assert_descriptor_refusal_answered_ebadf(&run, &host, port, "sync_all");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **Served-member control**, the C half: `fstat(fd, &info)` **succeeds** on the
+/// very descriptor the six C primitives are refused on.
+///
+/// MEASURED: `child_exit()` `141` -- the fixture's "the primitive succeeded"
+/// status -- a recorded `RunCompleted`, and no post-refusal sentinel, because
+/// the fixture never reached the path that writes one.
+///
+/// This is the most important case in the slice and the reason the other ten
+/// mean what they claim. Six `EBADF`s on their own are consistent with a much
+/// duller reading: that descriptor-relative calls do not work on a routed
+/// descriptor, or that the `open` never routed at all and the fence guard is
+/// the only thing standing between this suite and a green test asserting
+/// nothing. `fstat`(339) is descriptor-relative, is issued on the same
+/// descriptor at the same point in the same run, and is **answered**. So the
+/// refusals are a statement about `TRACED_STUBS` **membership** -- one row per
+/// admitted call, and the six have no row -- rather than about descriptors.
+///
+/// It is also this slice's non-vacuity mechanism in place of a mutation probe,
+/// and a stronger one, because it runs in the **unmutated** job rather than
+/// only under a deliberately broken binary.
+///
+/// WHAT CHANGES WHEN THE OTHERS ARE ADMITTED: nothing here, and that is the
+/// point -- this case is the invariant the others are measured against. It
+/// **inverts**, though: anything but `141` is a regression rather than
+/// progress, and if `fstat` ever starts answering `EBADF` the ten refusal cases
+/// stop being evidence of anything and should be read as broken rather than as
+/// newly correct.
+#[test]
+fn a_routed_fstat_is_served_on_the_descriptor_the_others_are_refused_on() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor(scratch.path(), &host, port, "fstat");
+
+    assert_descriptor_control_was_served(&run, &host, port, "fstat");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **Served-member control**, the Rust half: `File::metadata()` **succeeds** on
+/// the very descriptor the four Rust primitives are refused on.
+///
+/// MEASURED, and identical to the C control -- `child_exit()` `141`, a recorded
+/// `RunCompleted`, no post-refusal sentinel. `std`'s `metadata` on an open
+/// `File` is `fstat`(339), the same syscall the C control issues, so the pair
+/// agrees here.
+///
+/// Both halves are controlled rather than one, for the reason the append pair
+/// controls both and for a reason this pair has measured twice: `std` does not
+/// reliably reach the same syscall as the obvious C spelling. It does not for
+/// `try_clone` and it does not for `sync_all`. So "the Rust side's served
+/// member is served" is a separate measurement from the C side's, not a
+/// corollary of it, and without it the four Rust refusals would rest on the C
+/// control alone.
+///
+/// WHAT CHANGES WHEN THE OTHERS ARE ADMITTED: nothing, and it inverts the same
+/// way the C control does -- anything but `141` here is a regression, and it
+/// would invalidate the four Rust refusal cases rather than improve them.
+#[test]
+fn a_rust_file_metadata_is_served_on_the_descriptor_the_others_are_refused_on() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_descriptor_std(scratch.path(), &host, port, "metadata");
+
+    assert_descriptor_control_was_served(&run, &host, port, "metadata");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
 }
