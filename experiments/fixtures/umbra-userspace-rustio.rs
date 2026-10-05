@@ -99,7 +99,7 @@
 //     refused; the rest reach calls outside the routed set for no coverage.
 //
 // Exit codes are this program's own and are kept clear of
-// `umbra-userspace-edges.c`'s 70-86, so a status is never ambiguous between the
+// `umbra-userspace-edges.c`'s 70-87, so a status is never ambiguous between the
 // two fixtures. Every code names one step:
 //
 //   90  wrong argument count, unknown case, or a <path> with no parent
