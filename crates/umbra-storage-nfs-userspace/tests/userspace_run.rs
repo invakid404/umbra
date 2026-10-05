@@ -972,6 +972,25 @@ fn routed_nofollow(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
     launch(scratch, host, port, &fixture, &[case], &[])
 }
 
+/// Launch one of the symlink-read fixture's cases.
+///
+/// `launch` is untouched, as it is for the walk fixture and for the same reason:
+/// the cases build their trees **in-run**, so nothing is staged on the host and
+/// the one seeded `seed.txt` is irrelevant to them.
+///
+/// **`launch` rather than a bespoke sibling, although both cases end the run.**
+/// `attempt_routed_nofollow` exists because its two cases are refused by the
+/// workspace inventory scan *before* a run is prepared, so there is no run id
+/// for `launch` to scrape. These two are not: the run IS prepared, the tracee
+/// launches, it routes a directory create, a write and a symlink into its own
+/// shadow, and only then does the link read end it. The `prepared` line is
+/// there -- measured -- so `launch` works and a `Run` can be built, which is
+/// what makes the shadow read-backs below reachable at all.
+fn routed_metadata(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
+    let fixture = rust_fixture_binary(scratch, "umbra-userspace-metadata", "UMBRA_METADATA_PATH");
+    launch(scratch, host, port, &fixture, &[case], &[])
+}
+
 /// Launch one of the stdio fixture's cases, which take a case name before the
 /// path exactly as the edge fixture's do.
 fn routed_stdio(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
@@ -3377,6 +3396,22 @@ fn every_mutation_probe_is_wired_into_the_userspace_job() {
     assert!(
         job.contains("UMBRA_NOFOLLOW_PATH="),
         "the userspace job builds the no-follow walk fixture but never exports          UMBRA_NOFOLLOW_PATH, so the suite ignores the build and compiles its          own copy"
+    );
+    // The symlink-read fixture, by the same pair and for the same reason. Its
+    // two routed cases END THE RUN, so a dropped build line would not fail
+    // them -- `rust_fixture_binary` would quietly recompile from source eight
+    // times over and every assertion would still hold. Nothing but this would
+    // say so.
+    assert!(
+        job.contains("experiments/fixtures/umbra-userspace-metadata.rs"),
+        "the userspace job does not build the symlink-read fixture, so its two \
+         cases each recompile it from source on every invocation"
+    );
+    assert!(
+        job.contains("UMBRA_METADATA_PATH="),
+        "the userspace job builds the symlink-read fixture but never exports \
+         UMBRA_METADATA_PATH, so the suite ignores the build and compiles its \
+         own copy"
     );
     // The matrix needs no probe; it needs its provisioning signal.
     assert!(
@@ -7014,4 +7049,447 @@ fn a_host_seeded_regular_leaf_launches_and_walks_as_a_shadow_created_one_does() 
         "the run changed the seeded base-layer file's bytes on the host"
     );
     assert_host_write_root_empty(&run);
+}
+
+/// The link target the symlink-read fixture creates, and the bytes a served
+/// `readlink` would hand back. Must match `umbra-userspace-metadata.rs`'s
+/// `TARGET`.
+const LINK_TARGET: &[u8] = b"target.txt";
+
+/// Assert the unbound-`ReadLink` gap ENDED the run.
+///
+/// The shape is `assert_nofollow_symlink_refusal_stopped_the_run`'s, for a
+/// related but distinct defect: an `Err` out of `resolve` is raised rather than
+/// answered, so the tracee is never resumed. The discriminators are therefore
+/// all negative -- no `finished:` line, no `RunCompleted` -- and the positive
+/// assertions, the pre-sequence sentinel and the unmutated target, are what keep
+/// the negatives from being satisfied by a run that never routed anything at
+/// all.
+///
+/// **WHAT TO WRITE HERE WHEN THE BINDING LANDS**, so the replacement is not
+/// re-derived from scratch: the message assertion goes, the two `!contains`
+/// assertions invert into `run.child_exit() == 0` and
+/// `journal_records_completion(run)`, the `done` sentinel becomes
+/// `Some(case.as_bytes())`, and one new assertion covers what nothing can
+/// assert today -- that the tracee was handed `LINK_TARGET` and nothing longer,
+/// which is the fixture's own stage (b) and reaches exit 164 when it is wrong.
+/// The target-unmutated assertion stays exactly as it is: a served link read
+/// still must not touch what the link points at.
+fn assert_readlink_binding_gap_stopped_the_run(run: &Run, host: &str, port: u16, case: &str) {
+    // **The order below is the diagnostic contract, not an accident.** Every
+    // assertion must hold, so the VERDICT is identical whatever the order --
+    // but the FIRST one to fire is what a reader is told the defect is, and
+    // this fixture's own exit codes promise to name the first stage that
+    // failed. The assertions therefore ascend the same way the run does: the
+    // run failed, it was routing, its tree is intact, the tracee was never
+    // resumed, and only then WHICH internal error ended it. Asserting the
+    // message earlier reported "did not stop on the unbound readlink buffer"
+    // for a regression in `FsOp::Symlink` three stages below it.
+    //
+    // Exactly `Some(1)` rather than merely non-zero, because that is what was
+    // measured on both arms: `ProcessFailed` out of a run the overlay ended.
+    assert_eq!(
+        run.status,
+        Some(1),
+        "the unbound ReadLink did not fail the {case} run the way it was \
+         measured to:\n{}",
+        run.stderr
+    );
+    // **The write prerequisites, before anything about the refusal.** These are
+    // what keep every negative assertion below from being satisfied by a run
+    // that never routed anything at all -- and putting them first means a break
+    // in them is reported as itself rather than as a ReadLink finding.
+    assert_eq!(
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}live").as_bytes())
+        )
+        .expect("the pre-sequence sentinel is in the run's shadow")
+        .as_slice(),
+        case.as_bytes(),
+        "the {case} run was not routing into its shadow before the link read, \
+         so nothing below about the run ending means anything"
+    );
+    // **The link's target is intact**, and this is the only place it can be
+    // checked. `assert_workspace_pristine` below is structurally incapable of
+    // covering it: that compares HOST workspace entry *names*, and this object
+    // never exists on the host at all, being built in-run in the shadow. The
+    // fixture's own exit 165 cannot cover it either, because this gap ENDS THE
+    // RUN -- the fixture is never resumed, so its own read-back never runs in
+    // any routed case. Reading the bytes out of the export by their own name is
+    // what is left.
+    //
+    // It is also the second write prerequisite: these bytes being present and
+    // correct is what proves the in-run `create_dir`, write and `symlink` all
+    // succeeded, so a regression in any of them fails HERE rather than at the
+    // message assertion below.
+    //
+    // Spelled out component by component because `shadow_leaf` cannot express
+    // this path -- it only appends a suffix to the *destination's* leaf, and this
+    // object is a sibling three components deeper.
+    let mut leaf = shadow_path(run);
+    leaf.pop();
+    leaf.extend([
+        case.as_bytes().to_vec(),
+        b"parent".to_vec(),
+        b"target.txt".to_vec(),
+    ]);
+    assert_eq!(
+        read_through_client(host, port, &leaf).as_deref(),
+        Some(&b"original bytes\n"[..]),
+        "the {case} run left the link's target changed or missing. Reading a \
+         link is read-only on what it points at, so this must hold whether the \
+         read is served or refused -- and the tree having been built at all is \
+         the prerequisite for everything this helper asserts after it"
+    );
+    // The tracee was never resumed. Ordered before the message assertion
+    // because "the run ended rather than answering" is the disposition this
+    // case owns, while the message only says which internal error ended it --
+    // so a run that completed normally at some other stage is reported as a
+    // resumed tracee rather than as a missing ReadLink message.
+    assert!(
+        !run.stderr.contains("finished:"),
+        "the tracee was resumed and reported a status, so the {case} link read \
+         was answered to it rather than stopping the run -- which is the fix \
+         this case is waiting for, and it must now assert the tracee's own \
+         successful readlink, the target bytes, and this fixture's exit 0:\n{}",
+        run.stderr
+    );
+    // The message, not merely a failure. `UnsupportedCapability` is raised from
+    // more than one site, and this one names the missing binding specifically --
+    // so a run that ended for an unrelated reason fails this case rather than
+    // passing it for the wrong one.
+    assert!(
+        run.stderr.contains("ReadLink requires set_readlink_buffer"),
+        "the {case} run did not stop on the unbound readlink buffer:\n{}",
+        run.stderr
+    );
+    assert!(
+        !journal_records_completion(run),
+        "a {case} run stopped by the unbound readlink buffer still recorded \
+         RunCompleted"
+    );
+    assert_eq!(
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}done").as_bytes())
+        ),
+        None,
+        "the {case} run wrote its completion sentinel although the unbound \
+         readlink buffer was supposed to have ended it"
+    );
+    assert_host_write_root_empty(run);
+    assert_workspace_pristine(run);
+}
+
+/// **A routed `readlink` on a symlink in the run's own shadow ENDS THE RUN**
+/// rather than answering the tracee -- because the engine arm that would answer
+/// it requires a buffer no production caller ever binds.
+///
+/// MEASURED against the live fixture, not predicted:
+/// `UnsupportedCapability during overlay: ReadLink requires
+/// set_readlink_buffer; typed read_link is available (errno: None)`. umbra exits
+/// 1, there is no `finished:` line, the journal records no `RunCompleted`, and
+/// the fixture's own exit code is never produced at all. A program cannot branch
+/// on this, because there is nothing to branch on -- the process is gone.
+///
+/// **THE ROOT CLASS IS THE SUPERVISOR BINDING GAP, and it is not any of the
+/// three umbrellas this suite already carries.** Stated per-case rather than
+/// globally, because the four cases this slice adds do not share one class:
+///
+///   * NOT #152. That is `resolve` returning `Deny(Errno(45))` at
+///     `engine.rs:3006` -- an `ENOTSUP` *answered* to the tracee, with the run
+///     surviving -- and its residual is path `Stat` and `Access` only.
+///     `FsOp::ReadLink` was deliberately routed OUT of that arm: its own arm at
+///     `engine.rs:2855` is unconditional, with no `routed()` and no shadow
+///     guard, and it resolves the link's target correctly before it fails. **So
+///     this case does NOT go red when #152 is fixed.**
+///   * NOT #165. That is the KERNEL's `EBADF` on a descriptor above umbra's
+///     `RLIMIT_NOFILE` fence, with the run surviving.
+///   * NOT #167, which is path-walk.
+///
+/// The gap itself: `readlink_buffer` is populated only by
+/// `Overlay::set_readlink_buffer`, and `routing_for` in
+/// `umbra-supervisor/src/events.rs` binds buffers for `FsOp::Open`, `FsOp::Read`
+/// and `FsOp::Write`, the stat buffer for `FsOp::Fstat` and the directory buffer
+/// for `FsOp::ReadDir` -- while `FsOp::ReadLink` appears nowhere in that file's
+/// complete set of `FsOp` variants. Every `set_readlink_buffer` call site in the
+/// tree is a unit test or a test harness. The engine arm is therefore reached
+/// with `readlink_buffer == None` and raises, and an `Err` out of `resolve` ends
+/// the run.
+///
+/// **This case does not label the current behaviour acceptable.** It reddens the
+/// moment the binding lands: the `!stderr.contains("finished:")` assertion in
+/// the helper fails against the first implementation that answers the tracee.
+/// What to write in its place is recorded there.
+///
+/// **The fix is deliberately not in this slice.** Wiring the buffer means
+/// changing `umbra-supervisor/src/events.rs`, which is production source; this
+/// is a characterization slice, so the test that EXECUTES the gap ships and the
+/// fix is filed separately.
+#[test]
+fn a_routed_readlink_on_a_shadow_symlink_ends_the_run_instead_of_answering_the_tracee() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_metadata(scratch.path(), &host, port, "readlink-shadow");
+
+    assert_readlink_binding_gap_stopped_the_run(&run, &host, port, "readlink-shadow");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **The descriptor-relative half: `readlinkat` on the same shadow symlink ends
+/// the run the same way, with the same message.**
+///
+/// This is what makes the case above a statement about the OPERATION rather than
+/// about one libc stub. `readlink`(58) and `readlinkat`(473) are two separate
+/// `TRACED_STUBS` rows that decode to one `FsOp::ReadLink`, so without this half
+/// the finding would be consistent with the path form alone being unbound while
+/// the descriptor-relative form worked -- and the gap would be mis-filed as a
+/// decoder problem with a much smaller blast radius than it has.
+///
+/// MEASURED: byte-identical to the path form, including the message. The run
+/// ends on the link read and not before it -- the `O_SEARCH` open of the
+/// parent directory that precedes it is SERVED, as the walk fixture measured, so
+/// `161` (the fixture's code for that open failing) is not what happens here.
+///
+/// **`readlinkat` has no Rust call site without an `extern "C"` declaration**:
+/// `std::fs::read_link` reaches `readlink`(58), but `std` offers no
+/// descriptor-relative link read at all. That is why the fixture declares its
+/// calls rather than using `std`, and it is a mechanism rather than a style
+/// choice -- this case could not exist otherwise.
+///
+/// Same root class as the case above (the supervisor binding gap), so the same
+/// per-case mapping applies: **this case does NOT go red when #152 is fixed.**
+#[test]
+fn a_routed_readlinkat_on_a_shadow_symlink_ends_the_run_the_same_way_the_path_form_does() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_metadata(scratch.path(), &host, port, "readlinkat-shadow");
+
+    assert_readlink_binding_gap_stopped_the_run(&run, &host, port, "readlinkat-shadow");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **The host control: the same fixture, the same two cases, outside umbra
+/// entirely -- both reach their completion sentinel and exit 0.**
+///
+/// This is what makes the two routed cases above say something about umbra. A
+/// run-ending disposition is an ABSENCE of evidence -- no exit code, no errno,
+/// no `finished:` line -- and an absence is equally consistent with the fixture
+/// being broken: a sequence that could never succeed anywhere would satisfy
+/// every negative assertion in the helper above. This runs the identical binary
+/// against a plain host tmpdir, where `readlink` and `readlinkat` both work, and
+/// pins that exit 0 IS reachable and that the bytes handed back are the link's
+/// target.
+///
+/// **It needs neither Ganesha nor umbra**, so it is not gated on the fixture
+/// endpoint and carries no `declared_probe` skip: a mutated `umbra` binary
+/// cannot affect a run that never invokes `umbra`. It therefore executes on
+/// every host that runs this suite, including the eight probe invocations where
+/// the two routed cases skip -- which is exactly when a silently broken fixture
+/// would otherwise go unnoticed.
+///
+/// What it asserts is the fixture's own contract, so the routed cases do not
+/// have to: stage (a) and stage (b) both pass (exit 0 is only returned after the
+/// bytes compare equal to `LINK_TARGET`), both sentinels are written, and the
+/// link's target is unmutated.
+#[test]
+fn the_symlink_read_fixture_reaches_its_completion_sentinel_on_the_host() {
+    let scratch = tempfile::tempdir().unwrap();
+    let fixture = rust_fixture_binary(
+        scratch.path(),
+        "umbra-userspace-metadata",
+        "UMBRA_METADATA_PATH",
+    );
+    for case in ["readlink-shadow", "readlinkat-shadow"] {
+        let root = scratch.path().join(format!("host-{case}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = root.join("out.txt");
+        let status = Command::new(&fixture)
+            .arg(case)
+            .arg(&destination)
+            .stdin(Stdio::null())
+            .status()
+            .expect("the symlink-read fixture runs on the host");
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{case} did not succeed unrouted on the host, so the routed cases' \
+             run-ending assertions are consistent with a broken fixture rather \
+             than with umbra"
+        );
+        // The completion sentinel, which the fixture writes ONLY after the link
+        // read returned `LINK_TARGET` and the target read-back matched. Its
+        // presence here is what gives its measured ABSENCE in both routed cases
+        // its meaning.
+        let mut done = destination.clone().into_os_string();
+        done.push(format!(".{case}done"));
+        assert_eq!(
+            std::fs::read(PathBuf::from(done)).expect("the host completion sentinel"),
+            case.as_bytes(),
+            "{case} exited 0 on the host without writing its completion sentinel"
+        );
+        let mut live = destination.clone().into_os_string();
+        live.push(format!(".{case}live"));
+        assert_eq!(
+            std::fs::read(PathBuf::from(live)).expect("the host pre-sequence sentinel"),
+            case.as_bytes(),
+            "{case} did not write its pre-sequence sentinel on the host, so that \
+             sentinel's presence in a routed shadow would prove nothing"
+        );
+        // The link resolves to the bytes the fixture wrote, through the link, on
+        // the host -- so `LINK_TARGET` is the answer a SERVED routed read owes
+        // the tracee, which is what the helper above records as the replacement
+        // assertion.
+        assert_eq!(
+            std::fs::read_link(root.join(case).join("parent").join("link"))
+                .expect("the in-run symlink exists on the host")
+                .as_os_str()
+                .as_bytes(),
+            LINK_TARGET,
+            "{case} built a link pointing somewhere other than LINK_TARGET, so \
+             the routed cases' replacement assertion names the wrong bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.join(case).join("parent").join("target.txt"))
+                .expect("the link's target exists on the host"),
+            b"original bytes\n",
+            "{case} changed the link's target on the host, where nothing is \
+             routed -- so the fixture mutates it and the routed \
+             target-unmutated assertion proves nothing about umbra"
+        );
+    }
+}
+
+/// **`stat`, `lstat` and the `getdirentries` fallback are in neither the
+/// interposed set nor `TRACED_STUBS`, so they reach the kernel bare** -- which
+/// is why no path-metadata case exists anywhere in this suite.
+///
+/// This is the classification half of a measurement whose behavioural half
+/// CANNOT be shipped, and the reason is the finding: a routed run never sees
+/// these calls at all. `stat` issues 338 and `lstat` issues 340 -- measured on
+/// this host by scanning each resolved libc stub for the `movz x16, #imm16`
+/// preceding its `svc`, which is the same technique `install()` uses -- and
+/// neither carries a breakpoint nor is rebound by the interposer. For a path
+/// only the run created, the kernel answers `ENOENT`: a wrong answer that looks
+/// like a right one. An assertion on it would pin the KERNEL rather than umbra,
+/// which is why `umbra-userspace-rustio.rs`'s DELIBERATELY ABSENT block refuses
+/// to make one and why `umbra-userspace-nofollow.rs`'s stage (c) takes its
+/// metadata from a descriptor instead.
+///
+/// **THIS IS THE CASE THAT GOES RED WHEN #152 IS FIXED PROPERLY**, and it is the
+/// only one of the four this slice adds that does. #152's residual is path
+/// `Stat` and `Access` on a shadow object, refused `ENOTSUP` at
+/// `engine.rs:3006`; routing them properly means answering them through an ABI
+/// encoder the way `Fstat` already is, and a path `Stat` cannot be answered at
+/// all while the calls that issue it carry no breakpoint. So the fix must add
+/// rows here, and the moment it does this case fails by name. The two
+/// `readlink` cases in this group map to a DIFFERENT root class -- the
+/// supervisor binding gap -- and will not move when #152 lands; the mapping is
+/// stated per case rather than as one claim over the group.
+///
+/// **WHAT TO WRITE HERE WHEN THAT LANDS**: the four `assert!(!...)` row
+/// assertions invert into positive ones naming the numbers the new rows carry,
+/// and this case's name changes with them. The interpose count assertion stays:
+/// routing metadata through the tracer must not quietly grow the interposer.
+///
+/// Enumerated by reading the two tables as TEXT and asserting on LITERALS,
+/// because both are literal arrays and a keyword grep over either is exactly the
+/// kind of evidence that has been wrong in this file before. Each call is
+/// asserted twice, by symbol row and by syscall number, because the two failure
+/// modes differ: a row added under a different symbol spelling would slip past
+/// the first, and a renumbering would slip past the second. The number
+/// assertions are scoped to the TABLE rather than to the whole file on purpose
+/// -- `344` appears twice elsewhere in `abi.rs`, in doc comments recording that
+/// it is never called on the normal path, and a file-wide assertion would fail
+/// on prose.
+#[test]
+fn stat_and_lstat_and_the_getdirentries_fallback_are_kernel_bare() {
+    let abi = include_str!("../../umbra-platform-macos/src/abi.rs");
+    let interpose = include_str!("../../umbra-platform-macos/interpose/umbra_interpose.c");
+
+    let stubs = abi
+        .split_once("pub const TRACED_STUBS")
+        .expect("the traced-stub table is defined in abi.rs")
+        .1
+        .split_once("\n];")
+        .expect("the traced-stub table is terminated")
+        .0;
+    // By symbol row. `("stat",` is not a substring of `("fstat",` and `("lstat",`
+    // is not a substring of either, so these four do not alias the rows that DO
+    // exist -- which is the reason the open paren is part of every needle.
+    for (call, number) in [
+        ("stat", "338"),
+        ("lstat", "340"),
+        ("getdirentries", "196"),
+        ("__getdirentries64", "344"),
+    ] {
+        assert!(
+            !stubs.contains(&format!("(\"{call}\",")),
+            "{call} has a TRACED_STUBS row now, so it is breakpointed rather \
+             than kernel-bare. Every claim in this suite that path metadata \
+             cannot reach umbra needs re-measuring, and the fixtures that take \
+             their metadata from a descriptor to avoid it can now take it from \
+             a path"
+        );
+        assert!(
+            !stubs.contains(number),
+            "syscall {number} ({call}) has a TRACED_STUBS row now under some \
+             other symbol spelling, so it is breakpointed rather than \
+             kernel-bare"
+        );
+    }
+    // The positive half, and it is what the two `readlink` cases in this group
+    // rest on: both numbers must still be breakpointed, or those cases are
+    // measuring a kernel-bare call and their run-ending disposition means
+    // something else entirely.
+    for (call, number) in [("readlink", "58"), ("readlinkat", "473")] {
+        assert!(
+            stubs.contains(&format!("(\"{call}\", {number}")),
+            "{call}({number}) no longer has a TRACED_STUBS row, so a routed \
+             link read is kernel-bare and the two run-ending cases in this \
+             group are no longer about umbra at all"
+        );
+    }
+
+    let replaced = interpose
+        .split_once("umbra_interposed[]")
+        .expect("the interpose array is defined")
+        .1
+        .split_once("};")
+        .expect("the interpose array is terminated")
+        .0;
+    // Exactly four symbols are replaced, and this counts them rather than
+    // trusting the number: no metadata operation is interposed at any point, and
+    // this is the assertion that catches the first one that is.
+    assert_eq!(
+        replaced.matches("(const void *)umbra_").count(),
+        4,
+        "the interposer no longer replaces exactly four symbols, so every claim \
+         in this group about what is kernel-bare needs re-measuring"
+    );
+    for call in ["stat", "lstat", "getdirentries", "readlink"] {
+        assert!(
+            !replaced.contains(call),
+            "{call} is interposed now, so it is no longer reached the way this \
+             group measured it"
+        );
+    }
 }
