@@ -81,8 +81,16 @@
 //     that looks like a right one. An assertion on it would pin the kernel
 //     rather than umbra, so every metadata read below comes from a descriptor.
 //     That is also what codex's own core does (`no_follow/unix.rs:107,135`).
-//   * `File::set_len`. It is `ftruncate`(201), in the interposer's refused
-//     descriptor-relative set, so it answers EBADF on a virtual descriptor.
+//   * `File::set_len`. It is `ftruncate`(201), which answers EBADF on a virtual
+//     descriptor -- but NOT because anything in umbra refuses it, which is what
+//     this note used to say. There is no "interposer's refused
+//     descriptor-relative set": the interposer replaces exactly four symbols
+//     (`open`, `read`, `write`, `close`) and refuses nothing at all, and
+//     `ftruncate` is in neither that set nor `abi::TRACED_STUBS`. So the call is
+//     kernel-bare -- it reaches the kernel untouched, and the EBADF is the
+//     KERNEL's, for a descriptor above the `RLIMIT_NOFILE` fence umbra allocates
+//     above. Same observable errno, different mechanism, and the mechanism is
+//     what a reader needs in order to predict the next call's disposition.
 //     Codex's no-follow write path uses it, so leg v is *not* a literal
 //     transcription: it reaches truncation through an `O_TRUNC` open instead.
 //   * `fs::read_dir`, `sync_all`/`fsync`, `fs::copy`, `fs::canonicalize`,

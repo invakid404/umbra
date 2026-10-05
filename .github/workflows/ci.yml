@@ -314,7 +314,7 @@ jobs:
             up -d --build --wait --wait-timeout 180
           docker ps --filter name=$UMBRA_NFS_FIXTURE_CONTAINER
 
-      - name: Build the toy, edge, listing, Rust I/O and buffered-output fixtures
+      - name: Build the toy, edge, listing, Rust I/O, buffered-output and no-follow fixtures
         run: |
           test "$(uname -m)" = arm64
           fixture_dir=$(mktemp -d)
@@ -373,6 +373,14 @@ jobs:
             -o "$fixture_dir/umbra-userspace-stdio"
           rustc --edition 2021 -O experiments/fixtures/umbra-userspace-buffered.rs \
             -o "$fixture_dir/umbra-userspace-buffered"
+          # The no-follow walk fixture. The only one here that composes two
+          # routed opens -- a directory with `O_SEARCH`, then the leaf with
+          # `openat` relative to the virtual descriptor that returned -- which is
+          # how its cases ask which COMPONENT `O_NOFOLLOW` governs. Built here
+          # rather than compiled per-invocation because this job runs the suite
+          # eight times.
+          rustc --edition 2021 -O experiments/fixtures/umbra-userspace-nofollow.rs \
+            -o "$fixture_dir/umbra-userspace-nofollow"
           echo "UMBRA_USERSPACE_TOY_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
           echo "UMBRA_USERSPACE_LISTING_PATH=$fixture_dir/umbra-userspace-listing" >> "$GITHUB_ENV"
           echo "UMBRA_USERSPACE_LISTING_PROJECT_PATH=$fixture_dir/umbra-userspace-listing-project" >> "$GITHUB_ENV"
@@ -380,6 +388,7 @@ jobs:
           echo "UMBRA_RUSTIO_PATH=$fixture_dir/umbra-userspace-rustio" >> "$GITHUB_ENV"
           echo "UMBRA_STDIO_PATH=$fixture_dir/umbra-userspace-stdio" >> "$GITHUB_ENV"
           echo "UMBRA_BUFFERED_PATH=$fixture_dir/umbra-userspace-buffered" >> "$GITHUB_ENV"
+          echo "UMBRA_NOFOLLOW_PATH=$fixture_dir/umbra-userspace-nofollow" >> "$GITHUB_ENV"
           # The standard-utilities matrix reads `UMBRA_TEST_FIXTURE_PATH` as a
           # *provisioning signal* and never launches what it points at: it is
           # the suite's existing marker for "this host has workspace binaries

@@ -959,6 +959,19 @@ fn routed_rust_io(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
     launch(scratch, host, port, &fixture, &[case], &[])
 }
 
+/// Launch one of the no-follow walk fixture's cases.
+///
+/// `launch` is untouched, as it is for the Rust I/O fixture: the walk cases
+/// build every tree they need **in-run**, under a subdirectory of the workspace
+/// named for the case, so the one seeded `seed.txt` is irrelevant to them and
+/// nothing has to be staged on the host. That is not a style choice -- the
+/// workspace inventory scan refuses a seeded symlink outright and the run never
+/// launches, so in-run is the only construction these cases have.
+fn routed_nofollow(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
+    let fixture = rust_fixture_binary(scratch, "umbra-userspace-nofollow", "UMBRA_NOFOLLOW_PATH");
+    launch(scratch, host, port, &fixture, &[case], &[])
+}
+
 /// Launch one of the stdio fixture's cases, which take a case name before the
 /// path exactly as the edge fixture's do.
 fn routed_stdio(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
@@ -3349,6 +3362,22 @@ fn every_mutation_probe_is_wired_into_the_userspace_job() {
             "probe {probe} is selected by the userspace job but the job never              builds {package} with it, so the run is unmutated and the case              fails for the wrong reason"
         );
     }
+    // The no-follow walk fixture needs no probe either; it needs to be BUILT.
+    // Checked here, in a test named for probes, because this is the one place
+    // that reads the workflow as text and the failure mode is the same one the
+    // test exists for: the suite's cases would compile the fixture themselves
+    // from source on every one of the eight invocations, so a dropped build line
+    // costs eight `rustc` runs rather than failing, and nothing would say so.
+    // The env export is the half that matters -- a build whose path is never
+    // exported is dead weight -- so both are asserted.
+    assert!(
+        job.contains("experiments/fixtures/umbra-userspace-nofollow.rs"),
+        "the userspace job does not build the no-follow walk fixture, so its          nine cases each recompile it from source on every invocation"
+    );
+    assert!(
+        job.contains("UMBRA_NOFOLLOW_PATH="),
+        "the userspace job builds the no-follow walk fixture but never exports          UMBRA_NOFOLLOW_PATH, so the suite ignores the build and compiles its          own copy"
+    );
     // The matrix needs no probe; it needs its provisioning signal.
     assert!(
         job.contains("UMBRA_TEST_FIXTURE_PATH="),
@@ -6173,4 +6202,816 @@ fn a_rust_file_metadata_is_served_on_the_descriptor_the_others_are_refused_on() 
 
     assert_descriptor_control_was_served(&run, &host, port, "metadata");
     assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+// ===========================================================================
+// The no-follow path walk: `O_SEARCH` directory open, `openat` leaf, and what
+// `O_NOFOLLOW` means when the final component is a symlink.
+//
+// Nine cases, and what separates them from the twelve descriptor cases above is
+// the question they ask. Those ask "is this call on a routed descriptor served
+// or refused". These ask "does the WALK compose, and which COMPONENT does a flag
+// govern" -- a path-resolution question, not a descriptor-operation one. The
+// five stages are fixed across every case and the fixture's exit code names the
+// first one that failed: (a) open the parent with `O_SEARCH`, (b) `openat` the
+// leaf, (c) fd metadata, (d) `set_len(0)`, (e) write.
+//
+// **Stage (d) is NOT this group's finding and no case here asserts on it.** Four
+// of the shapes below reach (d) and fail there with `ftruncate`(201)'s `EBADF`,
+// which is already characterized by
+// `a_rust_file_set_len_on_a_routed_descriptor_is_answered_ebadf` above, under
+// umbrella #165. These cases carry (d) only because REACHING it is the proof
+// that (a), (b) and (c) composed, and their assertions say exactly that -- the
+// stage reached, never the errno. When #165 is fixed they advance to (e) and
+// each one's doc comment says what to write in its place.
+//
+// EVERY DISPOSITION BELOW IS EXECUTED, against live NFS-Ganesha at
+// `9e89f60a`, with the rig first validated by routing a shipped case
+// (`umbra-userspace-rustio edit`) end to end. Nothing here is predicted.
+// ===========================================================================
+
+/// The fixture reached stage (d) -- so (a), (b) and (c) all composed.
+///
+/// Named for the stage REACHED rather than for `set_len`'s errno, because that
+/// errno is #165's and this group asserts on neither it nor its call number.
+const WALK_REACHED_SET_LEN: i32 = 155;
+
+/// The fixture was refused at stage (b), the leaf `openat`.
+///
+/// What the HOST exits for a no-follow symlink leaf, where the refusal is
+/// answered to the caller as `ELOOP`(62). No routed case reaches this code at
+/// this pin: the routed refusal ends the run instead, so the code is never
+/// produced. It is named here because two cases assert they did NOT exit it,
+/// which is how "the parent symlink was followed" is stated as an assertion.
+const WALK_REFUSED_AT_LEAF_OPEN: i32 = 153;
+
+/// What kind of object the harness seeds into the approved workspace.
+///
+/// The three kinds are the whole point: two of them stop the run before it
+/// launches and one does not, which is what makes the refusals a statement about
+/// the object's KIND rather than about host-seeding.
+enum SeededEntry {
+    Fifo,
+    Symlink,
+    Regular,
+}
+
+/// Seed one entry into the workspace `launch` is about to use.
+///
+/// This runs BEFORE `launch`, which is what makes it work: `launch` creates the
+/// workspace with `create_dir_all` and writes `seed.txt` into it, and neither
+/// removes anything already there. So the inventory scan the supervisor runs at
+/// startup sees this entry, which is the only way to put an object in front of
+/// that scan -- a routed run cannot create a FIFO or a symlink the scan would
+/// reject, because the scan happens before the tracee exists.
+///
+/// `libc::mkfifo` rather than a `mkfifo(1)` child, because the utility's exit
+/// status would have to be translated back into the errno this needs to not
+/// have; it is already a dev-dependency of this crate for `getmntinfo`.
+fn seed_workspace_entry(scratch: &Path, kind: SeededEntry) -> PathBuf {
+    let prepared = scratch.join("workspace").join("prepared");
+    std::fs::create_dir_all(&prepared).expect("the seeded workspace subdirectory");
+    let leaf = prepared.join("leaf.txt");
+    match kind {
+        SeededEntry::Fifo => {
+            let mut path = leaf.as_os_str().as_bytes().to_vec();
+            path.push(0);
+            let made = unsafe { libc::mkfifo(path.as_ptr().cast(), 0o600) };
+            assert_eq!(
+                made,
+                0,
+                "mkfifo on the host failed, so the case cannot seed the object it \
+                 exists to have refused: errno {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        SeededEntry::Symlink => {
+            std::fs::write(prepared.join("target.txt"), b"original bytes\n")
+                .expect("the symlink's target");
+            std::os::unix::fs::symlink("target.txt", &leaf).expect("the seeded symlink");
+        }
+        SeededEntry::Regular => {
+            std::fs::write(&leaf, b"original bytes\n").expect("the seeded regular file");
+        }
+    }
+    leaf
+}
+
+/// Run the walk fixture and return umbra's own status and stderr, without
+/// requiring that the run ever started.
+///
+/// A deliberate sibling of `launch` rather than a parameter on it. `launch`
+/// scrapes the run id out of the `umbra: run <uuid> prepared` line and **panics
+/// when that line is absent** -- correctly, because every case it serves has a
+/// run to identify. The two cases below are the ones where no run is ever
+/// prepared: the workspace inventory scan refuses before the supervisor reaches
+/// that point, so there is no id to scrape and a `Run` cannot be built at all.
+/// Folding this into `launch` would mean making its return optional for every
+/// caller in this file to buy two.
+fn attempt_routed_nofollow(
+    scratch: &Path,
+    host: &str,
+    port: u16,
+    case: &str,
+) -> (Option<i32>, String) {
+    let workspace = scratch.join("workspace");
+    let state = scratch.join("state");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed\n").unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let destination = workspace.join("out.txt");
+    let registry = registry(scratch, host, port);
+    let fixture = rust_fixture_binary(scratch, "umbra-userspace-nofollow", "UMBRA_NOFOLLOW_PATH");
+    let output = Command::new(binaries().join("umbra"))
+        .args(["run", "--registry"])
+        .arg(&registry)
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("--experimental")
+        .arg("--")
+        .arg(&fixture)
+        .arg(case)
+        .arg(&destination)
+        .stdin(Stdio::null())
+        .output()
+        .expect("umbra run");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Assert the walk composed all the way to stage (d).
+///
+/// **What this asserts and what it deliberately does not.** It asserts the
+/// STAGE the walk reached: `WALK_REACHED_SET_LEN` means the `O_SEARCH` directory
+/// open was served, the `openat` of the leaf relative to that virtual descriptor
+/// was served, and `fstat` on the result reported a regular file. It asserts
+/// nothing about why (d) then failed -- not the call number, not the errno, not
+/// the mechanism. That failure is `ftruncate`(201)'s and it belongs to #165 and
+/// to `a_rust_file_set_len_on_a_routed_descriptor_is_answered_ebadf`; a second
+/// assertion on it here would pin one defect in two places and make the fix
+/// touch both.
+///
+/// The pre-walk sentinel is what stops the rest from being vacuous: it proves
+/// this run was routing into its own shadow before the walk began, so an absent
+/// `done` sentinel means the walk stopped rather than that nothing ever ran.
+fn assert_walk_composed_through_to_set_len(run: &Run, host: &str, port: u16, case: &str) {
+    assert_eq!(
+        run.child_exit(),
+        WALK_REACHED_SET_LEN,
+        "the {case} walk did not reach stage (d): exit {} is a failure at an \
+         earlier stage, so the O_SEARCH open, the relative openat and the \
+         descriptor's metadata no longer compose:\n{}",
+        run.child_exit(),
+        run.stderr
+    );
+    assert!(
+        journal_records_completion(run),
+        "the {case} walk reached stage (d) but the run recorded no RunCompleted, \
+         so the refusal was propagated rather than answered to the tracee"
+    );
+    assert_eq!(
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}live").as_bytes())
+        )
+        .expect("the pre-walk sentinel is in the run's shadow")
+        .as_slice(),
+        case.as_bytes(),
+        "the {case} walk was not routing into its shadow before it started, so \
+         nothing below about where it stopped means anything"
+    );
+    assert_eq!(
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}done").as_bytes())
+        ),
+        None,
+        "the {case} walk wrote its completion sentinel, so it finished every \
+         stage -- stage (d) is now served and this case must be rewritten to \
+         assert the replacement bytes instead of the stage reached"
+    );
+    assert_eq!(
+        std::fs::read(run.workspace.join("seed.txt")).expect("the seeded base file"),
+        b"seed\n",
+        "the {case} walk changed the seeded base file's bytes"
+    );
+    assert_host_write_root_empty(run);
+    assert_workspace_pristine(run);
+}
+
+/// Assert the no-follow symlink-leaf refusal ENDED the run.
+///
+/// The shape is `assert_append_refusal_stopped_the_run`'s, for the same class of
+/// defect: an `Err` out of `resolve` is raised rather than answered, so the
+/// tracee is never resumed. The discriminators are therefore all negative --
+/// no `finished:` line, no `RunCompleted` -- and the one positive assertion, the
+/// pre-walk sentinel, is what keeps the negatives from being satisfied by a run
+/// that never routed anything at all.
+fn assert_nofollow_symlink_refusal_stopped_the_run(run: &Run, host: &str, port: u16, case: &str) {
+    assert_ne!(
+        run.status,
+        Some(0),
+        "the refused no-follow symlink leaf did not fail the run:\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("open refuses final symlink"),
+        "the run did not stop on the final-symlink refusal:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("finished:"),
+        "the tracee was resumed and reported a status, so the refusal was \
+         answered to it rather than stopping the run -- which is the fix this \
+         case is waiting for, and it must now assert the tracee's ELOOP:\n{}",
+        run.stderr
+    );
+    assert!(
+        !journal_records_completion(run),
+        "a run stopped by the final-symlink refusal still recorded RunCompleted"
+    );
+    assert_eq!(
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}live").as_bytes())
+        )
+        .expect("the pre-walk sentinel is in the run's shadow")
+        .as_slice(),
+        case.as_bytes(),
+        "the run was not routing into its shadow before the refused open, so \
+         nothing above about the run ending means anything"
+    );
+    assert_eq!(
+        read_through_client(
+            host,
+            port,
+            &shadow_leaf(run, format!(".{case}done").as_bytes())
+        ),
+        None,
+        "the run wrote its completion sentinel although the refusal was supposed \
+         to have ended it"
+    );
+    // **The leaf is unmutated** -- the second half of the write-ascending
+    // invariant, and the half nothing else here can reach.
+    //
+    // `assert_workspace_pristine` below is structurally incapable of covering
+    // it: that compares HOST workspace entry *names*, and this leaf never exists
+    // on the host at all, being built in-run in the shadow. The fixture's own
+    // exit 158 cannot cover it either, because this refusal ENDS THE RUN -- the
+    // fixture is never resumed, so `mutated_before_write` is never evaluated in
+    // any routed case. Reading the bytes out of the export by their own name is
+    // what is left, and it is what the audit's success criterion asks for:
+    // "run-ending refusal WITH THE LEAF UNMUTATED".
+    //
+    // Spelled out component by component because `shadow_leaf` cannot express
+    // this path -- it only appends a suffix to the *destination's* leaf, and this
+    // object is a sibling three components deeper.
+    let mut leaf = shadow_path(run);
+    leaf.pop();
+    leaf.extend([
+        case.as_bytes().to_vec(),
+        b"parent".to_vec(),
+        b"target.txt".to_vec(),
+    ]);
+    assert_eq!(
+        read_through_client(host, port, &leaf).as_deref(),
+        Some(&b"original bytes\n"[..]),
+        "the refused no-follow walk left the leaf changed or missing. Stages (a) \
+         through (c) are read-only on the leaf, so a refusal before (d) must \
+         leave it byte-identical -- if this fires, the refusal is no longer \
+         ordered before the mutation and the defect is far larger than the \
+         run-ending disposition the rest of this helper pins"
+    );
+    assert_host_write_root_empty(run);
+    assert_workspace_pristine(run);
+}
+
+/// **The walk-composition baseline: an `O_SEARCH` directory open and an `openat`
+/// of a leaf relative to the virtual descriptor it returns both work.**
+///
+/// This is the case the other four are read against, and it is the one that
+/// proves the routed side can walk at all. Nothing in this suite had composed
+/// two routed opens before: every other fixture names its target by a whole path
+/// and lets the engine resolve it once. Here the first open returns a virtual
+/// directory descriptor and the second resolves a name *against that
+/// descriptor*, which is a different engine path -- `DirRef::Fd`, with an anchor
+/// lookup and an object-identity re-check -- and a third call, `fstat`, then
+/// describes the result.
+///
+/// MEASURED, not predicted: (a) served, returning `fd=4096`, the first number
+/// above the `RLIMIT_NOFILE` fence; (b) served, returning `fd=4097`; (c) served,
+/// reporting `is_file=true len=15`. The walk then fails at (d).
+///
+/// **The (d) failure is inherited, not this case's finding.** `set_len` is
+/// `ftruncate`(201), already characterized by
+/// `a_rust_file_set_len_on_a_routed_descriptor_is_answered_ebadf` under umbrella
+/// #165, and this case asserts the stage it reached rather than that errno --
+/// see `assert_walk_composed_through_to_set_len`. The mechanism is the kernel's,
+/// not a refusal: `ftruncate` is in neither the interposer's four replaced
+/// symbols nor `abi::TRACED_STUBS`, so it reaches the kernel bare and the kernel
+/// has never heard of a descriptor above the fence.
+///
+/// WHAT REPLACES THIS WHEN #165 IS FIXED. The walk runs to (e) and the fixture
+/// exits 0, so this case fails on `child_exit() == 155` rather than passing
+/// vacuously. What to write then is the positive invariant the fixture already
+/// computes and this assertion cannot reach: the leaf holds exactly
+/// `replaced by the no-follow walk\n`, read back through the NFSv4 client, and
+/// the `done` sentinel is present.
+#[test]
+fn a_routed_walk_composes_an_o_search_open_with_an_openat_of_the_leaf() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_nofollow(scratch.path(), &host, port, "safe-path");
+
+    assert_walk_composed_through_to_set_len(&run, &host, port, "safe-path");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **`O_NOFOLLOW` governs the FINAL component only: a symlink in a parent
+/// position is followed, and the leaf opens.**
+///
+/// The tree is `link -> real` with the file at `real/leaf.txt`, and the walk
+/// opens `link` at stage (a) and then `leaf.txt` relative to it at stage (b)
+/// **with `O_NOFOLLOW` set**. POSIX scopes `O_NOFOLLOW` to the last component,
+/// so the parent symlink must be followed and the open must succeed; the host
+/// control does exactly that.
+///
+/// MEASURED: the routed walk agrees with the host and the leaf opens, reaching
+/// (d). That makes this case the SCOPE half of the pair whose other half is
+/// `o_nofollow_on_a_symlink_leaf_ends_the_routed_run_instead_of_answering_eloop`
+/// below: without this one, that one would be consistent with a routed run
+/// refusing any walk that touches a symlink anywhere, which it does not.
+///
+/// The assertion that carries that claim is `child_exit() != 153`: 153 is the
+/// stage-(b) refusal code, so exiting anything else means the leaf open was not
+/// refused, and the parent symlink was therefore followed. The (d) failure it
+/// then hits is #165's, asserted as a stage and not as an errno -- see
+/// `a_routed_walk_composes_an_o_search_open_with_an_openat_of_the_leaf`.
+///
+/// WHAT REPLACES THIS WHEN #165 IS FIXED. Same as the baseline's: the walk
+/// reaches (e), and what to assert is that `real/leaf.txt` holds the replacement
+/// bytes -- read back by its real name, never through `link`, so the assertion
+/// is about the object and not about the symlink that found it.
+#[test]
+fn a_symlink_in_a_parent_component_is_followed_although_the_leaf_open_is_no_follow() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_nofollow(scratch.path(), &host, port, "symlink-in-parent");
+
+    // The scope claim, stated as its own assertion rather than left implicit in
+    // the stage code: a refusal at (b) is what a resolver that applied
+    // `O_NOFOLLOW` to every component would produce.
+    assert_ne!(
+        run.child_exit(),
+        WALK_REFUSED_AT_LEAF_OPEN,
+        "the leaf open was refused although the symlink was in a PARENT \
+         component -- `O_NOFOLLOW` is being applied to more than the final \
+         component, which is neither what POSIX says nor what the host does:\n{}",
+        run.stderr
+    );
+    assert_walk_composed_through_to_set_len(&run, &host, port, "symlink-in-parent");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **`O_NOFOLLOW` on a symlink LEAF ends the routed run instead of answering the
+/// tracee `ELOOP`.** The one genuinely new path-walk defect in this group.
+///
+/// The host answers `ELOOP`(62) to the caller and the program continues, which
+/// is what POSIX requires. A routed run instead raises
+/// `InvalidPath during overlay: open refuses final symlink`: the tracee is never
+/// resumed, there is no `finished:` line, the journal records no `RunCompleted`,
+/// and the fixture's own exit code is never produced at all. A program cannot
+/// branch on this, because there is nothing to branch on -- the process is gone.
+///
+/// MEASURED at `9e89f60a`, and the mechanism is read from the source at the same
+/// pin: `no_follow` is decoded correctly and has exactly ONE non-test consumer,
+/// `umbra-overlay/src/engine.rs`'s `follow_final` computation; with the flag set
+/// the resolver does not follow, the final object is a `LogicalSymlink`, and the
+/// open arm returns `Err(ErrorKind::InvalidPath, "open refuses final symlink")`.
+/// An `Err` out of `resolve` is raised and ends the run; only a
+/// `Resolution::Deny(Errno)` is answered to the tracee and resumed. This is the
+/// #81 / #156 / #161 class -- "the refusal ends the run instead of being
+/// answered" -- but a NEW member of it: those three are descriptor or namespace
+/// operations and this one is **path resolution**. `ErrorKind::SymlinkLoop`
+/// already exists in `umbra-core` and this site does not use it.
+///
+/// **This case does not label the current behaviour acceptable.** It reddens the
+/// moment the refusal softens: `assert_nofollow_symlink_refusal_stopped_the_run`
+/// asserts there is no `finished:` line, so the first implementation that
+/// answers the tracee `ELOOP` and lets it exit fails this case by name. What to
+/// write in its place is stated there too -- the tracee's `ELOOP`, the fixture's
+/// own stage-(b) exit code 153, and a `RunCompleted` in the journal.
+#[test]
+fn o_nofollow_on_a_symlink_leaf_ends_the_routed_run_instead_of_answering_eloop() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_nofollow(scratch.path(), &host, port, "symlink-leaf");
+
+    // **THIS CASE GOES RED WHEN F-1 SOFTENS TO A TRACEE `ELOOP` RESPONSE**, and
+    // that is deliberate: the current behaviour is characterized here, never
+    // endorsed. The assertion that carries it is
+    // `!stderr.contains("finished:")` inside the helper below -- the first
+    // implementation that answers the tracee instead of raising resumes the
+    // tracee, which prints a `finished:` line and reddens this case by name.
+    // What to write in its place when that lands: the tracee's `ELOOP`(62), the
+    // fixture's own stage-(b) exit code 153, and a `RunCompleted` in the
+    // journal, with the leaf-unmutated assertion kept exactly as it is -- a
+    // softened refusal still must not have touched the leaf.
+    assert_nofollow_symlink_refusal_stopped_the_run(&run, &host, port, "symlink-leaf");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **The follow half of the pair: the SAME symlink leaf opens when the walk does
+/// not ask for `O_NOFOLLOW`.**
+///
+/// Identical tree, identical walk, one bit of difference. This is what makes the
+/// case above a statement about `O_NOFOLLOW` rather than about symlinks: without
+/// this half, a routed run that refused every symlink leaf under every flag
+/// would satisfy it just as well, and the defect would be mis-filed as a blanket
+/// symlink refusal with a much larger blast radius than it has.
+///
+/// MEASURED: the leaf is followed, `fstat` reports the regular file behind it,
+/// and the walk reaches (d) -- the same stage the baseline reaches, which is the
+/// point. The (d) failure is #165's and is asserted as a stage, not an errno;
+/// see `a_routed_walk_composes_an_o_search_open_with_an_openat_of_the_leaf`.
+///
+/// WHAT REPLACES THIS WHEN #165 IS FIXED. The walk reaches (e) and what to
+/// assert is that `target.txt` -- the symlink's target, read back by its own
+/// name -- holds the replacement bytes, which is the proof the follow reached
+/// the object rather than replacing the link.
+#[test]
+fn the_same_symlink_leaf_opens_when_the_walk_does_not_ask_for_no_follow() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_nofollow(scratch.path(), &host, port, "symlink-leaf-follow");
+
+    // The run must have SURVIVED, which is the half of the pair this case owns.
+    // Its twin asserts the absence of this line; asserting its presence here is
+    // what makes the two a controlled comparison rather than two observations.
+    assert!(
+        run.stderr.contains("finished:"),
+        "the walk without `O_NOFOLLOW` also ended the run, so the refusal its \
+         twin pins is not about `O_NOFOLLOW` at all and both cases are \
+         mis-framed:\n{}",
+        run.stderr
+    );
+    assert_ne!(
+        run.child_exit(),
+        WALK_REFUSED_AT_LEAF_OPEN,
+        "the symlink leaf was refused at stage (b) even without `O_NOFOLLOW`, \
+         so the refusal is a blanket one and its twin's framing as a no-follow \
+         defect is wrong:\n{}",
+        run.stderr
+    );
+    assert_walk_composed_through_to_set_len(&run, &host, port, "symlink-leaf-follow");
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **The routed open-flag decoder admits every `O_SEARCH` combination, including
+/// bare `O_EXEC` -- which the host refuses `EISDIR`.** A silent divergence in
+/// the permissive direction.
+///
+/// `O_SEARCH` is not an independent bit on this platform: it is
+/// `O_EXEC | O_DIRECTORY` = `0x40100000`. The decoder masks `0x100000`, so the
+/// `O_DIRECTORY` half is decoded and the open is served as a plain directory
+/// open, while the `O_EXEC` half (`0x40000000`) is dropped with no diagnostic --
+/// and `OpenFlags` has no field that could hold it, so the bit is *structurally*
+/// unrepresentable rather than merely unhandled. The measured consequence is
+/// that a routed open SUCCEEDS where the host answers `EISDIR`(21): umbra is
+/// more permissive than the thing it is emulating, which is the direction that
+/// does not fail closed.
+///
+/// Worth naming beside it, because the tree states the opposite principle
+/// elsewhere: `at_flags` in the same ABI module *refuses* unmodelled `*at` bits,
+/// on the stated grounds that silently forwarding a flag the decode did not
+/// represent would execute different semantics from the ones the namespace
+/// resolved. `open_flags` applies no such rule.
+///
+/// **It reports through the export rather than through its exit status**, for
+/// the directory-listing fixture's reason: seven results do not fit in one exit
+/// code, and an exit code could say that the admitted set changed but never
+/// WHICH row changed -- and the row is the finding. The fixture writes one
+/// `label=ok` or `label=errno:N` line per combination into the routed workspace
+/// and this reads the record back out through the NFSv4 client with nothing
+/// mounted.
+#[test]
+fn the_routed_open_flag_decoder_admits_every_o_search_combination_including_bare_o_exec() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_nofollow(scratch.path(), &host, port, "flagscan");
+
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "the flag scan did not complete:\n{}",
+        run.stderr
+    );
+    assert!(
+        journal_records_completion(&run),
+        "the flag scan recorded no RunCompleted"
+    );
+    // The admitted set, pinned row by row and errno by errno.
+    //
+    // **THIS IS THE ASSERTION THAT GOES RED WHEN `O_EXEC` IS PROPERLY
+    // ADMITTED**, which is the substitution this case carries: the slate asked
+    // for a case that reddens when "virtual-dirfd rejection" softens, and there
+    // is no such rejection to soften -- `openat` on a virtual dirfd is SERVED at
+    // this pin, measured, returning a second virtual descriptor. The real
+    // admission point is this row. A decoder that represents the `O_EXEC` bit
+    // would answer `EISDIR`(21) to bare `O_EXEC` on a directory, as the host
+    // does, and this comparison fails on the exact line that changed -- which is
+    // why the errno is in the record and not just the word "refused". Replace
+    // `O_EXEC=ok` with `O_EXEC=errno:21` when that lands.
+    let expected = "O_RDONLY=ok\n\
+                    O_RDONLY|O_DIRECTORY=ok\n\
+                    O_RDONLY|O_DIRECTORY|O_CLOEXEC=ok\n\
+                    O_SEARCH=ok\n\
+                    O_SEARCH|O_CLOEXEC=ok\n\
+                    O_EXEC=ok\n\
+                    O_RDONLY|O_NOFOLLOW|O_DIRECTORY=ok\n";
+    let record = read_through_client(&host, port, &shadow_leaf(&run, b".flagscan"))
+        .expect("the flag-scan record is in the run's shadow");
+    assert_eq!(
+        String::from_utf8_lossy(&record),
+        expected,
+        "the routed decoder's admitted flag set changed"
+    );
+    assert_host_write_root_empty(&run);
+    assert_workspace_pristine(&run);
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **`mkfifo` is in neither the interposed set nor `TRACED_STUBS`, so it reaches
+/// the kernel bare** -- which is why no FIFO case exists anywhere in this group.
+///
+/// This is the classification half of a measurement whose behavioural half
+/// cannot be shipped. Enumerated here by reading the two tables as text, because
+/// both are literal arrays and a keyword grep over either is exactly the kind of
+/// evidence that has been wrong in this file before: the interposer's array is
+/// four entries long and the only `open`/`read`/`write`/`close` in it are the
+/// replacements themselves.
+///
+/// MEASURED CONSEQUENCE, EXECUTED at this pin with an audit probe that is
+/// deliberately not shipped: an in-run `mkfifo` answers `ENOENT`(2) and the host
+/// workspace stays pristine. The kernel resolves the *host* path, whose parent
+/// exists only in this run's shadow, so there is nothing there to make a node
+/// in -- and the pristine host is what confirms the kernel-bare classification
+/// by measurement rather than by reading the table.
+///
+/// **NO HANDLING-VERSUS-BLOCKING DISTINCTION IS DRAWN ANYWHERE IN THIS GROUP,
+/// IN EITHER DIRECTION.** A named-pipe leaf cannot be constructed at this pin by
+/// either route -- in-run `mkfifo` is kernel-bare as asserted here, and a
+/// host-seeded FIFO never reaches a tracee at all, as the next case asserts --
+/// so nothing here says whether a routed run would handle one correctly, block
+/// on one, or refuse one. The `O_NONBLOCK` the fixture sets on every leaf open
+/// is a hazard guard on an unreachable shape, not evidence about it: measured
+/// host-side, `O_WRONLY` on a FIFO with no reader blocks forever and had to be
+/// killed, which would hang the session watchdog rather than fail a case.
+///
+/// `mknod` is in the same two tables and in neither of them, so it is
+/// kernel-bare by the same reading -- but it was never exercised, in this group
+/// or by the audit, and this case claims nothing behavioural about it.
+/// `mkfifo` is the libc spelling that matters here.
+#[test]
+fn mkfifo_is_in_neither_the_interposed_set_nor_the_traced_stubs() {
+    let abi = include_str!("../../umbra-platform-macos/src/abi.rs");
+    let interpose = include_str!("../../umbra-platform-macos/interpose/umbra_interpose.c");
+
+    let stubs = abi
+        .split_once("pub const TRACED_STUBS")
+        .expect("the traced-stub table is defined in abi.rs")
+        .1
+        .split_once("\n];")
+        .expect("the traced-stub table is terminated")
+        .0;
+    for call in ["mkfifo", "mknod"] {
+        assert!(
+            !stubs.contains(&format!("(\"{call}\",")),
+            "{call} has a TRACED_STUBS row now, so it is breakpointed rather than \
+             kernel-bare and the reason this group ships no FIFO case has changed"
+        );
+    }
+
+    let replaced = interpose
+        .split_once("umbra_interposed[]")
+        .expect("the interpose array is defined")
+        .1
+        .split_once("};")
+        .expect("the interpose array is terminated")
+        .0;
+    // Exactly four symbols are replaced, and this counts them rather than
+    // trusting the number: the sibling fixture's doc comment claimed an
+    // "interposer's refused descriptor-relative set" that has never existed,
+    // and this is the assertion that would have caught it.
+    assert_eq!(
+        replaced.matches("(const void *)umbra_").count(),
+        4,
+        "the interposer no longer replaces exactly four symbols, so every claim \
+         in this group about what is kernel-bare needs re-measuring"
+    );
+    for call in ["mkfifo", "mknod"] {
+        assert!(
+            !replaced.contains(call),
+            "{call} is interposed now, so it is no longer kernel-bare"
+        );
+    }
+}
+
+/// **A host-seeded FIFO in the approved workspace stops the run before it
+/// launches.** The second of the two refusals that make a FIFO case
+/// unconstructible.
+///
+/// The supervisor walks the approved workspace before the tracee exists and
+/// refuses any entry that is not a regular file or a directory. So there is no
+/// run, no run id, and no tracee: this case cannot use `launch` at all, because
+/// `launch` scrapes the `prepared` line that is never printed.
+///
+/// MEASURED: `UnsupportedCapability during run.workspace: <path>: only regular
+/// files and directories are supported`, with no `prepared` line in the output
+/// at all. Together with the kernel-bare `mkfifo` above, this is why the slate's
+/// named-pipe case was removed rather than deferred -- it is not a refusal to
+/// characterize at a walk stage, it is a pair of refusals at *construction*, one
+/// of them before the tracee exists. **No handling-versus-blocking distinction
+/// can be drawn here at all**; see the case above.
+///
+/// The same scan is also why every symlink tree in this group is built IN-RUN:
+/// a seeded symlink is refused by the next case's message.
+#[test]
+fn a_host_seeded_fifo_in_the_approved_workspace_stops_the_run_before_it_launches() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let leaf = seed_workspace_entry(scratch.path(), SeededEntry::Fifo);
+    let (status, stderr) = attempt_routed_nofollow(scratch.path(), &host, port, "safe-path");
+
+    assert_ne!(
+        status,
+        Some(0),
+        "the seeded FIFO did not fail the run:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("only regular files and directories are supported"),
+        "the run did not stop on the workspace inventory scan's refusal:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(" prepared"),
+        "a run was prepared although the workspace scan refused, so the refusal \
+         now happens after the tracee exists and a FIFO case may be \
+         constructible after all:\n{stderr}"
+    );
+    assert!(
+        leaf.exists(),
+        "the refused run removed the seeded FIFO from the host"
+    );
+}
+
+/// **A host-seeded symlink in the approved workspace stops the run before it
+/// launches** -- which is why every symlink tree in this group is built in-run.
+///
+/// Refused by name, one arm earlier than the FIFO above: the inventory walk
+/// tests `is_symlink()` before it tests for a regular file or directory, so the
+/// message is the symlink-specific one. As with the FIFO, there is no run id and
+/// no tracee, so `launch` cannot serve this case.
+///
+/// MEASURED: `UnsupportedCapability during run.workspace: <path>: symbolic links
+/// in the approved workspace are not supported`, with no `prepared` line.
+///
+/// **This is a harness constraint with teeth, not a curiosity.** It is the
+/// reason the three symlink cases in this group build their trees with
+/// `symlink`(57) inside the run -- which works, because that call *does* have a
+/// `TRACED_STUBS` row -- rather than having the harness stage them, which is how
+/// every other fixture in this file gets the objects it reads.
+#[test]
+fn a_host_seeded_symlink_in_the_approved_workspace_stops_the_run_before_it_launches() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let leaf = seed_workspace_entry(scratch.path(), SeededEntry::Symlink);
+    let (status, stderr) = attempt_routed_nofollow(scratch.path(), &host, port, "safe-path");
+
+    assert_ne!(
+        status,
+        Some(0),
+        "the seeded symlink did not fail the run:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("symbolic links in the approved workspace are not supported"),
+        "the run did not stop on the workspace inventory scan's symlink refusal:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(" prepared"),
+        "a run was prepared although the workspace scan refused the symlink, so \
+         symlink trees may no longer need to be built in-run:\n{stderr}"
+    );
+    assert!(
+        leaf.symlink_metadata().is_ok(),
+        "the refused run removed the seeded symlink from the host"
+    );
+}
+
+/// **A host-seeded REGULAR leaf launches and walks exactly as a shadow-created
+/// one does** -- so the two refusals above are about the object's KIND, not
+/// about host-seeding.
+///
+/// This is the control that stops the pair above from being read as "host-seeded
+/// trees do not work in this harness", which would be a wrong lesson with
+/// consequences: it would imply the symlink cases are built in-run for a harness
+/// reason rather than because the scan refuses the kind, and it would leave the
+/// FIFO's unconstructibility looking like an accident of staging.
+///
+/// MEASURED: the same seeded location that holds a FIFO in one case and a
+/// symlink in another holds a regular file here, the inventory scan admits it,
+/// the run is prepared, the tracee launches, and the walk reaches stage (d) with
+/// the same `155` the shadow-created baseline reports. The walk itself still
+/// builds its own tree in the shadow -- the seeded file's job is to be *present*
+/// in front of the scan, not to be walked -- so what this case adds is the
+/// admission, not a second walk.
+///
+/// `assert_workspace_pristine` is deliberately not called here, and this is the
+/// one case in the group where that is correct: it asserts the workspace holds
+/// exactly `seed.txt`, and this case has put a second entry there on purpose.
+/// The seeded leaf's bytes are checked instead.
+#[test]
+fn a_host_seeded_regular_leaf_launches_and_walks_as_a_shadow_created_one_does() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let leaf = seed_workspace_entry(scratch.path(), SeededEntry::Regular);
+    let run = routed_nofollow(scratch.path(), &host, port, "safe-path");
+
+    assert_eq!(
+        run.child_exit(),
+        WALK_REACHED_SET_LEN,
+        "a seeded regular file in the workspace changed where the walk stops, so \
+         the inventory scan is doing more than admitting it:\n{}",
+        run.stderr
+    );
+    assert!(
+        journal_records_completion(&run),
+        "the run with a seeded regular leaf recorded no RunCompleted"
+    );
+    assert_eq!(
+        std::fs::read(&leaf).expect("the seeded regular leaf"),
+        b"original bytes\n",
+        "the run changed the seeded base-layer file's bytes on the host"
+    );
+    assert_host_write_root_empty(&run);
 }
