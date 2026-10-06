@@ -812,10 +812,28 @@ has to outlive it), then the blob, then the placeholder, and poisons if any of t
 three fails. See the rollback-list section above for the ordering rule.
 
 The iterative resolver expands at most **40 symlinks per lookup**, including cwd
-or dirfd anchor expansion, and returns structured `SymlinkLoop` on overflow —
-a distinct `ErrorKind`, so a platform answers a link loop with its own native
-errno without reading an error message, and containment failures stay
-`InvalidPath`.
+or dirfd anchor expansion, and returns structured `SymlinkLoop` on overflow — a
+distinct `ErrorKind` (`umbra-core/src/lib.rs:81`), kept separate so a caller can
+tell a link loop from a containment failure without reading an error message;
+containment failures stay `InvalidPath`.
+
+**The distinct kind is library-API clarity, not a wired errno path.** Nothing in
+production translates `SymlinkLoop` into an errno: the only
+`ErrorKind::SymlinkLoop => Errno(62)` mapping in the tree lives in
+`umbra-platform-macos`'s own test fixtures. The overflow is therefore an `Err`
+raised out of `resolve`, which **ends the run** — a tracee that exhausts the
+expansion bound receives no errno at all. That is the same disposition
+[#167](https://github.com/invakid404/umbra/issues/167) removed from the
+`O_NOFOLLOW` symlink-leaf refusal, still in place here, and it wants its own
+filing rather than being read as already solved.
+
+Tracee-visible errnos are produced at the refusal site instead, as
+`Ok(ResolvedAction::Deny(Errno(N)))` — the dominant idiom inside
+`Overlay::resolve`: `Errno(62)` for the `O_NOFOLLOW` symlink leaf at
+`engine.rs:2575`, and `Errno(45)` at `:2813` and `:3006`. Of `resolve`'s two
+outcomes only a `Deny` reaches `deny_to_tracee` and resumes the tracee; an `Err`
+does not.
+
 Absolute targets restart at `ProcessContext::root`; relative targets start at the
 link's containing logical directory. Expansion precedes `..` processing, and a
 parent above the logical root returns the existing containment error before any

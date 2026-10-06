@@ -6335,10 +6335,12 @@ const WALK_REACHED_SET_LEN: i32 = 155;
 /// The fixture was refused at stage (b), the leaf `openat`.
 ///
 /// What the HOST exits for a no-follow symlink leaf, where the refusal is
-/// answered to the caller as `ELOOP`(62). No routed case reaches this code at
-/// this pin: the routed refusal ends the run instead, so the code is never
-/// produced. It is named here because two cases assert they did NOT exit it,
-/// which is how "the parent symlink was followed" is stated as an assertion.
+/// answered to the caller as `ELOOP`(62), and since #167 what the ROUTED run
+/// exits for it too -- `o_nofollow_on_a_symlink_leaf_answers_eloop_to_the_tracee`
+/// asserts it positively, and that assertion is how the tracee's `ELOOP` is
+/// stated at all, the fixture having no stdio to report an errno through. Two
+/// further cases assert they did NOT exit it, which is how "the parent symlink
+/// was followed" and "the leaf opens without the flag" are stated.
 const WALK_REFUSED_AT_LEAF_OPEN: i32 = 153;
 
 /// What kind of object the harness seeds into the approved workspace.
@@ -6502,36 +6504,51 @@ fn assert_walk_composed_through_to_set_len(run: &Run, host: &str, port: u16, cas
     assert_workspace_pristine(run);
 }
 
-/// Assert the no-follow symlink-leaf refusal ENDED the run.
+/// Assert the no-follow symlink-leaf refusal was ANSWERED to the tracee.
 ///
-/// The shape is `assert_append_refusal_stopped_the_run`'s, for the same class of
-/// defect: an `Err` out of `resolve` is raised rather than answered, so the
-/// tracee is never resumed. The discriminators are therefore all negative --
-/// no `finished:` line, no `RunCompleted` -- and the one positive assertion, the
-/// pre-walk sentinel, is what keeps the negatives from being satisfied by a run
-/// that never routed anything at all.
-fn assert_nofollow_symlink_refusal_stopped_the_run(run: &Run, host: &str, port: u16, case: &str) {
-    assert_ne!(
-        run.status,
-        Some(0),
-        "the refused no-follow symlink leaf did not fail the run:\n{}",
+/// The post-#167 shape, and every discriminator that used to be negative is now
+/// positive. This helper asserted the opposite until the fix landed -- no
+/// `finished:` line, no `RunCompleted` -- because an `Err` out of `resolve` is
+/// raised rather than answered and the tracee was never resumed. The open arm
+/// now returns `Ok(ResolvedAction::Deny(Errno(62)))`, so the refusal reaches
+/// `deny_to_tracee`, the tracee is resumed with `ELOOP` in its errno, and it
+/// runs on to its own exit.
+///
+/// **The tracee's `ELOOP` is asserted through the fixture's exit code, because
+/// that is the only channel there is.** The fixture has no stdio by
+/// construction -- its verdict travels in its exit status alone -- and
+/// `deny_to_tracee` logs nothing, so no stream anywhere carries the number 62.
+/// What `WALK_REFUSED_AT_LEAF_OPEN` says instead is that stage (b)'s `openat`
+/// returned an error AND the leaf was left byte-identical: the same arm of the
+/// fixture exits 158, not 153, if the object changed. Which error it was is
+/// pinned by the served control rather than by this assertion -- identical
+/// tree, identical walk, `O_NOFOLLOW` cleared, and the same leaf opens -- so
+/// stage (b) failing here is a statement about the flag and not about symlinks.
+///
+/// The pre-walk sentinel is what keeps the rest from being vacuous: it proves
+/// this run was routing into its own shadow before the walk began, so a
+/// stage-(b) exit means the open was refused rather than that nothing ever ran.
+fn assert_nofollow_symlink_leaf_was_answered_eloop(run: &Run, host: &str, port: u16, case: &str) {
+    assert!(
+        !run.stderr.contains("open refuses final symlink"),
+        "the final-symlink refusal was raised out of `resolve` rather than \
+         answered to the tracee, so the run ended and #167 is back:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        run.child_exit(),
+        WALK_REFUSED_AT_LEAF_OPEN,
+        "the {case} walk did not report the stage-(b) refusal: exit {} means \
+         either the no-follow leaf open was not refused at all, or it was \
+         refused and the leaf changed anyway (158), which a refusal ordered \
+         before (d) must never do:\n{}",
+        run.child_exit(),
         run.stderr
     );
     assert!(
-        run.stderr.contains("open refuses final symlink"),
-        "the run did not stop on the final-symlink refusal:\n{}",
-        run.stderr
-    );
-    assert!(
-        !run.stderr.contains("finished:"),
-        "the tracee was resumed and reported a status, so the refusal was \
-         answered to it rather than stopping the run -- which is the fix this \
-         case is waiting for, and it must now assert the tracee's ELOOP:\n{}",
-        run.stderr
-    );
-    assert!(
-        !journal_records_completion(run),
-        "a run stopped by the final-symlink refusal still recorded RunCompleted"
+        journal_records_completion(run),
+        "the {case} walk was answered its refusal and exited, but the run \
+         recorded no RunCompleted, so the denial did not carry it to completion"
     );
     assert_eq!(
         read_through_client(
@@ -6552,8 +6569,8 @@ fn assert_nofollow_symlink_refusal_stopped_the_run(run: &Run, host: &str, port: 
             &shadow_leaf(run, format!(".{case}done").as_bytes())
         ),
         None,
-        "the run wrote its completion sentinel although the refusal was supposed \
-         to have ended it"
+        "the run wrote its completion sentinel although stage (b) was refused, \
+         so the walk ran past a leaf open it was answered an error for"
     );
     // **The leaf is unmutated** -- the second half of the write-ascending
     // invariant, and the half nothing else here can reach.
@@ -6561,11 +6578,20 @@ fn assert_nofollow_symlink_refusal_stopped_the_run(run: &Run, host: &str, port: 
     // `assert_workspace_pristine` below is structurally incapable of covering
     // it: that compares HOST workspace entry *names*, and this leaf never exists
     // on the host at all, being built in-run in the shadow. The fixture's own
-    // exit 158 cannot cover it either, because this refusal ENDS THE RUN -- the
-    // fixture is never resumed, so `mutated_before_write` is never evaluated in
-    // any routed case. Reading the bytes out of the export by their own name is
-    // what is left, and it is what the audit's success criterion asks for:
-    // "run-ending refusal WITH THE LEAF UNMUTATED".
+    // exit 158 does not retire this read-back either, though the reason changed
+    // with #167: the refusal no longer ends the run, so the fixture IS resumed
+    // and `mutated_before_write` IS evaluated, and a 153 rather than a 158 is
+    // the fixture's own verdict that the object was untouched. The two are
+    // still not redundant, because they do not share a channel. 158 is the
+    // fixture reading the bytes back through its own routed read -- inside the
+    // run, through umbra -- while this reads them out of the export through an
+    // independent NFSv4 client after the run has ended, so it still holds if
+    // the routed read is itself the thing that is wrong. Nor does it presuppose
+    // a resumed tracee, where a 158 exists only if the fixture got far enough to
+    // run its own check -- though that independence is about what the read-back
+    // can prove and not about what still executes here: should the refusal ever
+    // harden back into a run-ending raise, the stderr assertion at the head of
+    // this helper fires long before the read-back is reached.
     //
     // Spelled out component by component because `shadow_leaf` cannot express
     // this path -- it only appends a suffix to the *destination's* leaf, and this
@@ -6584,7 +6610,7 @@ fn assert_nofollow_symlink_refusal_stopped_the_run(run: &Run, host: &str, port: 
          through (c) are read-only on the leaf, so a refusal before (d) must \
          leave it byte-identical -- if this fires, the refusal is no longer \
          ordered before the mutation and the defect is far larger than the \
-         run-ending disposition the rest of this helper pins"
+         answered-ELOOP disposition the rest of this helper pins"
     );
     assert_host_write_root_empty(run);
     assert_workspace_pristine(run);
@@ -6649,7 +6675,7 @@ fn a_routed_walk_composes_an_o_search_open_with_an_openat_of_the_leaf() {
 ///
 /// MEASURED: the routed walk agrees with the host and the leaf opens, reaching
 /// (d). That makes this case the SCOPE half of the pair whose other half is
-/// `o_nofollow_on_a_symlink_leaf_ends_the_routed_run_instead_of_answering_eloop`
+/// `o_nofollow_on_a_symlink_leaf_answers_eloop_to_the_tracee`
 /// below: without this one, that one would be consistent with a routed run
 /// refusing any walk that touches a symlink anywhere, which it does not.
 ///
@@ -6691,36 +6717,60 @@ fn a_symlink_in_a_parent_component_is_followed_although_the_leaf_open_is_no_foll
     assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
 }
 
-/// **`O_NOFOLLOW` on a symlink LEAF ends the routed run instead of answering the
-/// tracee `ELOOP`.** The one genuinely new path-walk defect in this group.
+/// **`O_NOFOLLOW` on a symlink LEAF is answered to the tracee as `ELOOP`**, so
+/// the program branches on it and runs on. This was #167 and it is now fixed.
 ///
 /// The host answers `ELOOP`(62) to the caller and the program continues, which
-/// is what POSIX requires. A routed run instead raises
-/// `InvalidPath during overlay: open refuses final symlink`: the tracee is never
-/// resumed, there is no `finished:` line, the journal records no `RunCompleted`,
-/// and the fixture's own exit code is never produced at all. A program cannot
-/// branch on this, because there is nothing to branch on -- the process is gone.
+/// is what POSIX requires, and the routed run now agrees: the tracee is resumed,
+/// the fixture reaches its own stage-(b) exit code 153, and the journal records
+/// `RunCompleted`. It used to raise `InvalidPath during overlay: open refuses
+/// final symlink` instead -- the tracee was never resumed, there was no
+/// `finished:` line, no `RunCompleted`, and the fixture's own exit code was
+/// never produced at all, so a program had nothing to branch on.
 ///
-/// MEASURED at `9e89f60a`, and the mechanism is read from the source at the same
-/// pin: `no_follow` is decoded correctly and has exactly ONE non-test consumer,
-/// `umbra-overlay/src/engine.rs`'s `follow_final` computation; with the flag set
-/// the resolver does not follow, the final object is a `LogicalSymlink`, and the
-/// open arm returns `Err(ErrorKind::InvalidPath, "open refuses final symlink")`.
-/// An `Err` out of `resolve` is raised and ends the run; only a
-/// `Resolution::Deny(Errno)` is answered to the tracee and resumed. This is the
+/// MEASURED behaviour before the fix, at `9e89f60a`; the mechanism was read from
+/// the source at the same pin. `no_follow` is decoded correctly and has exactly
+/// ONE non-test consumer, `umbra-overlay/src/engine.rs`'s `follow_final`
+/// computation; with the flag set the resolver does not follow and the final
+/// object is a `LogicalSymlink`. The open arm reached there returned
+/// `Err(error(ErrorKind::InvalidPath, "open refuses final symlink"))`, and an
+/// `Err` out of `resolve` is raised and ends the run -- only an
+/// `Ok(ResolvedAction::Deny(Errno))` is answered to the tracee and resumed. The
+/// fix is that one arm, now `Ok(ResolvedAction::Deny(Errno(62)))`. This is the
 /// #81 / #156 / #161 class -- "the refusal ends the run instead of being
-/// answered" -- but a NEW member of it: those three are descriptor or namespace
-/// operations and this one is **path resolution**. `ErrorKind::SymlinkLoop`
-/// already exists in `umbra-core` and this site does not use it.
+/// answered" -- and it is the third member of that class living inside the one
+/// `FsOp::Open` arm of `Overlay::resolve`: #156's `"exclusive create target
+/// exists"` is eight lines above this fix and #161's `"routed open with
+/// O_APPEND"` some fifty below it, so both neighbours are `open` refusals and
+/// not descriptor ones. Only #81, `"rmdir target is not empty"`, is a namespace
+/// operation, and none of the three is a descriptor operation.
 ///
-/// **This case does not label the current behaviour acceptable.** It reddens the
-/// moment the refusal softens: `assert_nofollow_symlink_refusal_stopped_the_run`
-/// asserts there is no `finished:` line, so the first implementation that
-/// answers the tracee `ELOOP` and lets it exit fails this case by name. What to
-/// write in its place is stated there too -- the tracee's `ELOOP`, the fixture's
-/// own stage-(b) exit code 153, and a `RunCompleted` in the journal.
+/// **Nor is this fix in path resolution, despite being about a path flag.**
+/// `resolve_path_follow` has already returned successfully and `lookup` has
+/// already run before the `match operation` this arm belongs to is entered; the
+/// arm then reads the *already resolved* final object's `stat.kind`. The
+/// genuinely resolution-stage raise is the expansion-bound check inside
+/// `resolve_path_follow`, which this change deliberately leaves alone. What is
+/// new here is the disposition rather than the stage: this is the first of the
+/// three to be answered to the tracee instead of raised.
+///
+/// **`ErrorKind::SymlinkLoop` is deliberately NOT what carries this.** It exists
+/// in `umbra-core` and this site still does not use it, which the issue read as
+/// the obvious remedy. It is not one: the only production use, the expansion-
+/// bound check in `Overlay::resolve_path_follow`, is itself an
+/// `Err(error(ErrorKind::SymlinkLoop, ..))` and is therefore raised exactly like
+/// the defect was, and nothing in production translates that kind into an errno
+/// -- the one `SymlinkLoop => Errno(62)` map in the tree lives in
+/// `umbra-platform-macos`'s own test fixtures. Routing through the kind would
+/// have reproduced #167 under a different name.
+///
+/// **This case is non-vacuous in the other direction now.** It reddens if the
+/// refusal hardens back into a raise: `assert_nofollow_symlink_leaf_was_answered_eloop`
+/// requires the `finished:` line, the stage-(b) code and the `RunCompleted`, and
+/// it keeps asserting the leaf is byte-identical -- a softened refusal still must
+/// not have touched it.
 #[test]
-fn o_nofollow_on_a_symlink_leaf_ends_the_routed_run_instead_of_answering_eloop() {
+fn o_nofollow_on_a_symlink_leaf_answers_eloop_to_the_tracee() {
     if declared_probe().is_some() {
         eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
         return;
@@ -6732,17 +6782,14 @@ fn o_nofollow_on_a_symlink_leaf_ends_the_routed_run_instead_of_answering_eloop()
     assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
     let run = routed_nofollow(scratch.path(), &host, port, "symlink-leaf");
 
-    // **THIS CASE GOES RED WHEN F-1 SOFTENS TO A TRACEE `ELOOP` RESPONSE**, and
-    // that is deliberate: the current behaviour is characterized here, never
-    // endorsed. The assertion that carries it is
-    // `!stderr.contains("finished:")` inside the helper below -- the first
-    // implementation that answers the tracee instead of raising resumes the
-    // tracee, which prints a `finished:` line and reddens this case by name.
-    // What to write in its place when that lands: the tracee's `ELOOP`(62), the
-    // fixture's own stage-(b) exit code 153, and a `RunCompleted` in the
-    // journal, with the leaf-unmutated assertion kept exactly as it is -- a
-    // softened refusal still must not have touched the leaf.
-    assert_nofollow_symlink_refusal_stopped_the_run(&run, &host, port, "symlink-leaf");
+    // **THIS CASE WENT RED WHEN F-1 SOFTENED TO A TRACEE `ELOOP` RESPONSE**, by
+    // design, and the assertions below are the replacement its predecessor
+    // named: the tracee's `ELOOP`(62) via the fixture's own stage-(b) exit code
+    // 153, and a `RunCompleted` in the journal. The leaf-unmutated assertion is
+    // kept exactly as it was -- a softened refusal still must not have touched
+    // the leaf, and that half of the invariant never depended on the
+    // disposition.
+    assert_nofollow_symlink_leaf_was_answered_eloop(&run, &host, port, "symlink-leaf");
     assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
 }
 
@@ -7269,7 +7316,12 @@ fn assert_readlink_binding_gap_stopped_the_run(run: &Run, host: &str, port: u16,
 ///     this case does NOT go red when #152 is fixed.**
 ///   * NOT #165. That is the KERNEL's `EBADF` on a descriptor above umbra's
 ///     `RLIMIT_NOFILE` fence, with the run surviving.
-///   * NOT #167, which is path-walk.
+///   * NOT #167. That was the `FsOp::Open` arm refusing a symlink FINAL
+///     component, and it is now `Deny(Errno(62))` answered to the tracee with
+///     the run surviving; this gap is `FsOp::ReadLink`'s own arm failing on a
+///     buffer nothing binds. The same object kind reached through a different
+///     operation, with the opposite disposition -- so **this case does NOT go
+///     green when #167 is fixed**, and did not.
 ///
 /// The gap itself: `readlink_buffer` is populated only by
 /// `Overlay::set_readlink_buffer`, and `routing_for` in
