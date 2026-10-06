@@ -991,6 +991,36 @@ fn routed_metadata(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
     launch(scratch, host, port, &fixture, &[case], &[])
 }
 
+/// The exec'd half of the lifecycle fixture's `execenv` case.
+///
+/// **A separate program rather than a copy under a new basename**, which is the
+/// opposite of what [`exec_helper`] has to do and is worth stating because the
+/// two sit next to each other. `exec_helper` copies the *edge* fixture, whose
+/// exec'd half is a case of itself: identical contents and an identical
+/// basename would resign to the same `<sha256>/<basename>` twin as the launch
+/// target, so umbra would arm it for the wrong reason and the case would report
+/// a pass against the defect it exists to catch. `umbra-userspace-envwriter.rs`
+/// is a different program, so its contents hash differently and its twin is a
+/// different image to umbra without any copying at all.
+fn lifecycle_helper(scratch: &Path) -> PathBuf {
+    rust_fixture_binary(scratch, "umbra-userspace-envwriter", "UMBRA_ENVWRITER_PATH")
+}
+
+/// Launch one of the process-lifecycle fixture's cases.
+///
+/// The helper image is named through the environment, exactly as
+/// [`routed_exec_edge`] names the edge fixture's, so the fixture's own
+/// `<case> <destination>` argv contract is untouched. `launch` is otherwise
+/// unmodified: all three cases build what they need **in-run**, under names
+/// derived from the destination, so the one seeded `seed.txt` is irrelevant to
+/// them and nothing is staged on the host.
+fn routed_lifecycle(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
+    let fixture = rust_fixture_binary(scratch, "umbra-userspace-lifecycle", "UMBRA_LIFECYCLE_PATH");
+    let helper = lifecycle_helper(scratch);
+    let entry = format!("UMBRA_LIFECYCLE_HELPER={}", helper.display());
+    launch(scratch, host, port, &fixture, &[case], &[&entry])
+}
+
 /// Launch one of the stdio fixture's cases, which take a case name before the
 /// path exactly as the edge fixture's do.
 fn routed_stdio(scratch: &Path, host: &str, port: u16, case: &str) -> Run {
@@ -3413,6 +3443,37 @@ fn every_mutation_probe_is_wired_into_the_userspace_job() {
          UMBRA_METADATA_PATH, so the suite ignores the build and compiles its \
          own copy"
     );
+    // The process-lifecycle fixture, by the same pair -- and its exec'd half,
+    // which is why this is four assertions rather than two. The `execenv` case
+    // cannot run at all without the helper binary: the fixture reads its path
+    // from `UMBRA_LIFECYCLE_HELPER`, which the harness sets from
+    // `UMBRA_ENVWRITER_PATH`, so a dropped export there makes the case exit 171
+    // on a missing helper rather than measuring anything. The other two cases
+    // would silently recompile from source on each of the eight invocations,
+    // the no-follow fixture's failure mode.
+    for (source, variable, what) in [
+        (
+            "experiments/fixtures/umbra-userspace-lifecycle.rs",
+            "UMBRA_LIFECYCLE_PATH=",
+            "the process-lifecycle fixture",
+        ),
+        (
+            "experiments/fixtures/umbra-userspace-envwriter.rs",
+            "UMBRA_ENVWRITER_PATH=",
+            "the lifecycle fixture's exec'd half",
+        ),
+    ] {
+        assert!(
+            job.contains(source),
+            "the userspace job does not build {what}, so its cases each \
+             recompile it from source on every invocation"
+        );
+        assert!(
+            job.contains(variable),
+            "the userspace job builds {what} but never exports {variable} so \
+             the suite ignores the build and compiles its own copy"
+        );
+    }
     // The matrix needs no probe; it needs its provisioning signal.
     assert!(
         job.contains("UMBRA_TEST_FIXTURE_PATH="),
@@ -7491,5 +7552,446 @@ fn stat_and_lstat_and_the_getdirentries_fallback_are_kernel_bare() {
             "{call} is interposed now, so it is no longer reached the way this \
              group measured it"
         );
+    }
+}
+
+/// **A forked child's write and its parent's next write do NOT share one
+/// offset.** This case pins a divergence from POSIX rather than verifying an
+/// invariant, so it is GREEN at this pin and green is the correct disposition:
+/// it asserts the divergent bytes a routed run produces today and excludes the
+/// POSIX ones. It turns RED the day shared-offset routing lands, and on that
+/// day it is the case to DELETE -- which is what the assertion below says in
+/// the message it fails with, rather than something to recover here.
+///
+/// One descriptor, three writes, two processes: the parent writes `seed`, forks,
+/// the child writes `child` on the descriptor it inherited, and the parent --
+/// after the handshake and the reap -- writes `parent` on the SAME descriptor.
+/// POSIX gives those three writes one Open File Description, so they would
+/// append in sequence and the object would hold `seedchildparent`. MEASURED: it
+/// holds `seedparent`. The parent's third write starts at the offset its FIRST
+/// write left, as though the child's had never happened, and overwrites the
+/// child's bytes where they lie.
+///
+/// **The mechanism is in production source, and it is a model gap rather than a
+/// missing borrow.** `ProcessContext::fds` is a `BTreeMap<TracedFd, FdState>`
+/// held by value; `FdState::offset` is a plain `u64` with no indirection; and
+/// `track_process` seeds a forked child by cloning the parent's
+/// `ProcessContext` outright. Cloning a `u64` copies it, so two processes leave
+/// the fork with two offsets where POSIX gives them one -- and there is no Open
+/// File Description object anywhere in the shadow model for them to share
+/// instead.
+///
+/// **Why the third write is the whole case.** The shipped
+/// `a_routed_descriptor_survives_a_fork_and_the_child_s_write_reaches_the_store`
+/// already measures the first two writes and asserts `seedchild`, and that
+/// sequence cannot tell the two models apart: a copied offset and a shared one
+/// both place the child's write at 4. Only a write issued by the PARENT after
+/// the child has advanced the position discriminates, and nothing before this
+/// case issued one.
+///
+/// **Why the verdict is bytes and never `lseek`.** `lseek`(199) is in neither
+/// `abi::TRACED_STUBS` nor the interposer's replaced set, so it is kernel-bare
+/// and answers `EBADF`(9) on a virtual descriptor -- #165's shape, the kernel's
+/// refusal rather than umbra's. A fixture that asked its own descriptor where it
+/// was would measure nothing, so the object is read back out of the export
+/// **through the client**, which shares no resolution code with the run.
+///
+/// The host control below pins that this exact sequence produces
+/// `seedchildparent` where the offset genuinely is shared, which is what makes
+/// the measurement here a divergence rather than a broken fixture.
+#[test]
+fn a_forked_child_s_write_and_its_parent_s_next_write_do_not_share_one_offset() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_lifecycle(scratch.path(), &host, port, "sharedofd");
+
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "the three-write fork sequence did not complete, so nothing is \
+         measured about offsets:\n{}",
+        run.stderr
+    );
+
+    // The load-bearing assertion, and the one that inverts when the model is
+    // fixed. `seedparent` is 10 bytes; the POSIX answer is 15.
+    let stored = read_through_client(&host, port, &shadow_path(&run))
+        .expect("the shadow object exists in the export");
+    assert_eq!(
+        stored.as_slice(),
+        b"seedparent",
+        "the parent's post-reap write did not land at the offset its own first \
+         write left. If this now reads `seedchildparent` the shadow model has \
+         grown a shared Open File Description and THIS CASE IS THE ONE TO \
+         DELETE -- the divergence it pins is fixed. Any other value is a third \
+         disposition nobody has measured: {:?}",
+        String::from_utf8_lossy(&stored)
+    );
+    // Stated separately so the failure message names the fix rather than a
+    // byte string, because this is the comparison a reader comes here for.
+    assert_ne!(
+        stored.as_slice(),
+        b"seedchildparent",
+        "the three writes shared one offset, which is POSIX-correct and is not \
+         what this pin does"
+    );
+
+    // The run was routing when it did it. Without this, every assertion above
+    // is equally consistent with a run that never reached the fork.
+    let mut live = shadow_path(&run);
+    live.last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".sharedofdlive");
+    assert_eq!(
+        read_through_client(&host, port, &live)
+            .expect("the pre-sequence sentinel is in the shadow")
+            .as_slice(),
+        b"sharedofd",
+        "the pre-sequence sentinel is not in the shadow, so the sequence above \
+         was not measured inside a routed run"
+    );
+    // And the sequence ran to the end: this case characterizes BYTES, not a
+    // refusal, so a missing completion sentinel would mean something else
+    // entirely happened.
+    let mut done = shadow_path(&run);
+    done.last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".sharedofddone");
+    assert_eq!(
+        read_through_client(&host, port, &done)
+            .expect("the completion sentinel is in the shadow")
+            .as_slice(),
+        b"sharedofd",
+        "the fixture did not reach its completion sentinel, so the bytes above \
+         are a partial sequence rather than the measured disposition"
+    );
+    assert!(
+        run.stderr.contains("finished:"),
+        "the run did not finish:\n{}",
+        run.stderr
+    );
+    assert!(
+        journal_records_completion(&run),
+        "the journal has no completion record for a run that finished"
+    );
+    assert_host_write_root_empty(&run);
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **A bare forked child's `chdir` moves its own logical working directory and
+/// not its parent's** -- the same `ProcessContext` cloning the case above
+/// measures as a defect, asked of a field where copying is the correct answer.
+///
+/// This case ships GREEN, and it is here so the fixture is not a one-sided story
+/// about cloning: duplicating the descriptor table breaks POSIX, duplicating the
+/// working directory IS POSIX, and both come out of the same
+/// `.map(|p| p.context.clone())`.
+///
+/// **No `exec` anywhere, which is the whole distinction from the shipped
+/// `a_forked_child_s_chdir_is_routed_and_its_relative_write_lands_there`
+/// shape.** That case's child `exec`s a helper, and an `exec` rebuilds the
+/// address space and re-arms the interposer -- so a pass there is equally
+/// consistent with the working directory being re-derived at `exec` time rather
+/// than cloned at `fork` time. With a bare fork there is no `exec` to re-derive
+/// anything, so cloning is the only mechanism left that can produce the split.
+///
+/// **Both names are asserted, which is what makes it discriminating.** One
+/// relative spelling, `leaf.txt`, written twice from two anchors: the child's
+/// lands inside `<path>.d` and the parent's lands beside the workspace root. A
+/// single shared anchor would put both in one place -- `<path>.d/leaf.txt`
+/// holding `parent` and the workspace-root name absent entirely -- which
+/// satisfies "the child's write landed somewhere" just as well.
+#[test]
+fn a_bare_forked_child_s_chdir_does_not_move_its_parent_s_cwd() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_lifecycle(scratch.path(), &host, port, "cwdsplit");
+
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "the bare-fork chdir sequence did not complete:\n{}",
+        run.stderr
+    );
+
+    // The child's anchor: inside the directory it moved into.
+    let mut moved = shadow_path(&run);
+    moved
+        .last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".d");
+    moved.push(b"leaf.txt".to_vec());
+    let inner = read_through_client(&host, port, &moved)
+        .expect("the child's relative write landed in the directory it chdir'd into");
+    assert_eq!(
+        inner.as_slice(),
+        b"child",
+        "the directory the child moved into does not hold the CHILD's bytes. \
+         `parent` here means the parent's own relative write resolved against \
+         the child's anchor, so the `chdir` moved a working directory the two \
+         processes share: {:?}",
+        String::from_utf8_lossy(&inner)
+    );
+
+    // The parent's anchor: beside the workspace root, where a working directory
+    // that never moved resolves a relative name.
+    let mut stayed = shadow_path(&run);
+    stayed.pop();
+    stayed.push(b"leaf.txt".to_vec());
+    let outer = read_through_client(&host, port, &stayed)
+        .expect("the parent's relative write landed at the launch directory");
+    assert_eq!(
+        outer.as_slice(),
+        b"parent",
+        "the parent's relative write is not beside the workspace root, so its \
+         own working directory followed the child's: {:?}",
+        String::from_utf8_lossy(&outer)
+    );
+
+    let mut done = shadow_path(&run);
+    done.last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".cwdsplitdone");
+    assert_eq!(
+        read_through_client(&host, port, &done)
+            .expect("the completion sentinel is in the shadow")
+            .as_slice(),
+        b"cwdsplit",
+        "the fixture did not reach its completion sentinel"
+    );
+    assert!(
+        run.stderr.contains("finished:"),
+        "the run did not finish:\n{}",
+        run.stderr
+    );
+    assert_host_write_root_empty(&run);
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **An `exec` whose child rebuilt its environment from nothing keeps that child
+/// mediated** -- a replaced `argv[0]`, an explicit `PATH`, a marker of the
+/// fixture's own, every inherited variable dropped, and `DYLD_INSERT_LIBRARIES`
+/// deliberately carried across.
+///
+/// This is the PRESERVE arm, and it is the only arm. It differs from the shipped
+/// `a_forked_child_that_execs_a_different_binary_is_mediated_in_the_new_image`
+/// in exactly one respect, which is the respect that matters: that case's child
+/// `exec`s with the environment it inherited, so it measures that umbra re-arms
+/// the interposer in a new image. This one rebuilds `envp` from scratch first,
+/// so it measures that re-arming survives an environment retaining nothing the
+/// launch put there except the single variable dyld needs.
+///
+/// **The preserved set is a set of one, measured rather than assumed.** umbra
+/// injects exactly one variable into a supervised launch -- `native.rs` says
+/// "One variable, and only dyld's" -- because the interposer's image and its
+/// descriptor floor are written into the library's own `__DATA` through the
+/// debugger port rather than read from the environment. So a controlled rebuild
+/// that keeps `DYLD_INSERT_LIBRARIES` keeps everything mediation depends on.
+///
+/// **Why the bytes and not the presence of the name.** A stripped environment
+/// does not fail loudly here, and that is the measured shape rather than a
+/// guess: the tracer re-plants every `TRACED_STUBS` breakpoint after an exec
+/// unconditionally, so the child's `open` would still route and still return a
+/// virtual descriptor, while `write` reaches umbra through the interposer and
+/// nowhere else -- so it would carry a number the kernel does not own and be
+/// refused `EBADF`, leaving `<path>.exec` **created and empty**. Presence alone
+/// would therefore pass against the very thing this case is about. The bytes
+/// are the discriminator, and they can only be there if the interposer was live
+/// in the rebuilt image.
+#[test]
+fn an_exec_with_a_rebuilt_environment_keeps_the_child_mediated() {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "before the run");
+    let run = routed_lifecycle(scratch.path(), &host, port, "execenv");
+
+    assert_eq!(
+        run.child_exit(),
+        0,
+        "the rebuilt-environment exec did not complete. 177 means `execve` \
+         returned, so the new image never ran at all:\n{}",
+        run.stderr
+    );
+
+    // The load-bearing assertion: the exec'd image's own routed write, read
+    // back out of the export by a client that shares no resolution code with
+    // the run.
+    let mut produced = shadow_path(&run);
+    produced
+        .last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".exec");
+    let written = read_through_client(&host, port, &produced)
+        .expect("the exec'd image's object exists in the export");
+    assert_eq!(
+        written.as_slice(),
+        b"execenv",
+        "the exec'd image's write did not reach the store. An EMPTY object here \
+         is the strip-arm shape -- the interposer absent from the new image, its \
+         `write` refused `EBADF` by the kernel -- which would mean the rebuild \
+         dropped `DYLD_INSERT_LIBRARIES` after all: {:?}",
+        String::from_utf8_lossy(&written)
+    );
+
+    let mut done = shadow_path(&run);
+    done.last_mut()
+        .expect("the shadow path has a leaf")
+        .extend_from_slice(b".execenvdone");
+    assert_eq!(
+        read_through_client(&host, port, &done)
+            .expect("the completion sentinel is in the shadow")
+            .as_slice(),
+        b"execenv",
+        "the parent did not reach its completion sentinel, so it never reaped \
+         the exec'd child cleanly"
+    );
+    assert!(
+        run.stderr.contains("finished:"),
+        "the run did not finish:\n{}",
+        run.stderr
+    );
+    assert_host_write_root_empty(&run);
+    assert_no_nfs_mount(&host, port, &[scratch.path()], "after the run");
+}
+
+/// **The host control: the same fixture, all three cases, outside umbra entirely
+/// -- every one reaches its completion sentinel and exits 0.**
+///
+/// This is what makes the three routed cases above say something about umbra,
+/// and for `sharedofd` it does more than that: it is the POSIX half of the
+/// comparison. The routed measurement is `seedparent`, and on its own that is
+/// equally consistent with a fixture whose child write never happens anywhere.
+/// Run unrouted against a plain tmpdir, where `fork` shares the Open File
+/// Description the way POSIX requires, the identical binary produces
+/// `seedchildparent` -- so the sequence demonstrably CAN append all three
+/// writes, and the routed 10 bytes are a divergence rather than a bug in the
+/// fixture.
+///
+/// **It needs neither Ganesha nor umbra**, so it is not gated on the fixture
+/// endpoint and carries no `declared_probe` skip: a mutated `umbra` binary
+/// cannot affect a run that never invokes `umbra`. It therefore executes on
+/// every host that runs this suite, including the probe invocations where all
+/// three routed cases skip -- which is exactly when a silently broken fixture
+/// would otherwise go unnoticed.
+///
+/// **One test looping three cases rather than three tests**, following
+/// `the_symlink_read_fixture_reaches_its_completion_sentinel_on_the_host`: what
+/// it asserts is the fixture's own contract, which is one claim about one
+/// program.
+///
+/// Each case runs with its own working directory, which `cwdsplit` requires: its
+/// parent writes a RELATIVE name from a directory it never moved, so the
+/// unrouted anchor has to be somewhere the case owns rather than wherever cargo
+/// happened to start the test binary.
+#[test]
+fn the_lifecycle_fixture_reaches_its_completion_sentinels_on_the_host() {
+    let scratch = tempfile::tempdir().unwrap();
+    let fixture = rust_fixture_binary(
+        scratch.path(),
+        "umbra-userspace-lifecycle",
+        "UMBRA_LIFECYCLE_PATH",
+    );
+    let helper = lifecycle_helper(scratch.path());
+    for case in ["sharedofd", "cwdsplit", "execenv"] {
+        let root = scratch.path().join(format!("host-{case}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = root.join("out.txt");
+        let status = Command::new(&fixture)
+            .arg(case)
+            .arg(&destination)
+            .env("UMBRA_LIFECYCLE_HELPER", &helper)
+            // The unrouted anchor for `cwdsplit`'s parent-side relative write.
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .status()
+            .expect("the lifecycle fixture runs on the host");
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{case} did not succeed unrouted on the host, so the routed cases' \
+             assertions are consistent with a broken fixture rather than with \
+             umbra"
+        );
+
+        // Both sentinels. The completion one is what gives the routed cases'
+        // sentinel assertions their meaning.
+        for suffix in ["live", "done"] {
+            let mut name = destination.clone().into_os_string();
+            name.push(format!(".{case}{suffix}"));
+            assert_eq!(
+                std::fs::read(PathBuf::from(name)).expect("the host sentinel"),
+                case.as_bytes(),
+                "{case} exited 0 on the host without writing its {suffix} \
+                 sentinel, so that sentinel's presence in a routed shadow \
+                 would prove nothing"
+            );
+        }
+
+        // The per-case contract, which is what the routed halves compare
+        // against.
+        match case {
+            // THE POSIX CONTROL. Where the Open File Description genuinely is
+            // shared, all three writes append and the object is 15 bytes. This
+            // is the single assertion that makes the routed `seedparent`
+            // measurement a statement about umbra's model.
+            "sharedofd" => assert_eq!(
+                std::fs::read(&destination).expect("the host object exists"),
+                b"seedchildparent",
+                "the three-write sequence does not append on a host where \
+                 `fork` shares the offset, so the routed 10-byte measurement \
+                 is not evidence of a divergence"
+            ),
+            // Two anchors, two objects, one relative spelling -- unrouted,
+            // where `chdir` plainly works.
+            "cwdsplit" => {
+                assert_eq!(
+                    std::fs::read(root.join("out.txt.d").join("leaf.txt"))
+                        .expect("the child's relative write exists on the host"),
+                    b"child",
+                    "{case} did not write the child's bytes into the directory \
+                     it chdir'd into, on a host where nothing is routed"
+                );
+                assert_eq!(
+                    std::fs::read(root.join("leaf.txt"))
+                        .expect("the parent's relative write exists on the host"),
+                    b"parent",
+                    "{case} did not write the parent's bytes at its own \
+                     unmoved anchor, on a host where nothing is routed"
+                );
+            }
+            // The exec'd helper runs and writes, unrouted, with an environment
+            // its parent rebuilt -- which pins that the rebuild itself does not
+            // break the exec.
+            "execenv" => assert_eq!(
+                std::fs::read(root.join("out.txt.exec"))
+                    .expect("the exec'd helper's object exists on the host"),
+                b"execenv",
+                "{case}'s rebuilt-environment exec did not produce its object \
+                 on the host, so the routed case's assertion is consistent \
+                 with a rebuild that breaks `execve` outright"
+            ),
+            other => panic!("unlisted host case {other}"),
+        }
     }
 }

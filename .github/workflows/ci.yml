@@ -314,7 +314,7 @@ jobs:
             up -d --build --wait --wait-timeout 180
           docker ps --filter name=$UMBRA_NFS_FIXTURE_CONTAINER
 
-      - name: Build the toy, edge, listing, Rust I/O, buffered-output, no-follow and symlink-read fixtures
+      - name: Build the toy, edge, listing, Rust I/O, buffered-output, no-follow, symlink-read and process-lifecycle fixtures
         run: |
           test "$(uname -m)" = arm64
           fixture_dir=$(mktemp -d)
@@ -391,6 +391,28 @@ jobs:
           # reason above: this job runs the suite eight times.
           rustc --edition 2021 -O experiments/fixtures/umbra-userspace-metadata.rs \
             -o "$fixture_dir/umbra-userspace-metadata"
+          # The process-lifecycle fixture and its exec'd half. Two binaries
+          # rather than one, because the `execenv` case's child execs a
+          # DIFFERENT image and a separate program is the honest way to be one:
+          # umbra caches each tracee as a resigned twin at
+          # `<sha256 of contents>/<basename>`, so the edge fixture -- whose
+          # exec'd half is a case of itself -- has to be copied to a new
+          # basename by the harness to avoid resigning to the launch target's
+          # own twin, while a genuinely different program hashes differently
+          # and needs no copy. Its `sharedofd` case pins that a forked child's
+          # write and its parent's next write do not share one offset. That
+          # case is GREEN here and is REQUIRED to be: this workflow carries no
+          # `continue-on-error` on any step, so a RED `sharedofd` fails the
+          # job. It is green because it asserts the divergent bytes a routed
+          # run produces today, and it turns RED when shared-OFD routing lands
+          # -- on that day it is the case to DELETE, not a CI failure to
+          # tolerate and not a workflow to loosen. Built here
+          # rather than compiled per-invocation because this job runs the suite
+          # eight times.
+          rustc --edition 2021 -O experiments/fixtures/umbra-userspace-lifecycle.rs \
+            -o "$fixture_dir/umbra-userspace-lifecycle"
+          rustc --edition 2021 -O experiments/fixtures/umbra-userspace-envwriter.rs \
+            -o "$fixture_dir/umbra-userspace-envwriter"
           echo "UMBRA_USERSPACE_TOY_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
           echo "UMBRA_USERSPACE_LISTING_PATH=$fixture_dir/umbra-userspace-listing" >> "$GITHUB_ENV"
           echo "UMBRA_USERSPACE_LISTING_PROJECT_PATH=$fixture_dir/umbra-userspace-listing-project" >> "$GITHUB_ENV"
@@ -400,6 +422,8 @@ jobs:
           echo "UMBRA_BUFFERED_PATH=$fixture_dir/umbra-userspace-buffered" >> "$GITHUB_ENV"
           echo "UMBRA_NOFOLLOW_PATH=$fixture_dir/umbra-userspace-nofollow" >> "$GITHUB_ENV"
           echo "UMBRA_METADATA_PATH=$fixture_dir/umbra-userspace-metadata" >> "$GITHUB_ENV"
+          echo "UMBRA_LIFECYCLE_PATH=$fixture_dir/umbra-userspace-lifecycle" >> "$GITHUB_ENV"
+          echo "UMBRA_ENVWRITER_PATH=$fixture_dir/umbra-userspace-envwriter" >> "$GITHUB_ENV"
           # The standard-utilities matrix reads `UMBRA_TEST_FIXTURE_PATH` as a
           # *provisioning signal* and never launches what it points at: it is
           # the suite's existing marker for "this host has workspace binaries
