@@ -356,10 +356,19 @@ runs. Reads are answered from that metadata. Three ABI pieces make that work:
   never exposes the empty placeholder as a regular file. Object kinds and modes
   the layout cannot represent fail explicitly rather than guessing.
 - **Link loops.** `umbra_core::ErrorKind::SymlinkLoop` is a distinct kind, so a
-  caller answers loop exhaustion with its own native errno — `ELOOP`, 62 on
-  Darwin — without reading an error message, and containment failures stay
-  `InvalidPath`. The overlay's 40-expansion bound is unchanged. There is no
-  fallback to native symlink traversal when logical resolution fails.
+  caller can tell loop exhaustion from a containment failure without reading an
+  error message, and containment failures stay `InvalidPath`. **That distinction
+  is library-API clarity, not a wired errno path:** nothing in production
+  translates the kind into an errno. The tree's only
+  `ErrorKind::SymlinkLoop => Errno(62)` mapping is in this crate's own
+  `tests/fixtures.rs`, a harness oracle whose remaining arms end in `_ => panic!`
+  rather than a silent catch-all. The overlay's overflow (`engine.rs:983`) is
+  therefore an `Err` raised out of `resolve`, which ends the run — a tracee that
+  exhausts the bound receives no errno at all. Tracee errnos are produced by
+  `Ok(ResolvedAction::Deny(Errno(N)))` at the refusal site instead, per the idiom
+  at `engine.rs:2575`, `:2813` and `:3006`. The overlay's 40-expansion bound is
+  unchanged. There is no fallback to native symlink traversal when logical
+  resolution fails.
 
 ### Wait decisions
 
