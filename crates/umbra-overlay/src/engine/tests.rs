@@ -1935,23 +1935,36 @@ fn symlink_rename_unlink_exclusive_and_nofollow_act_on_link_identity() {
         .stat(&root(b"link").unwrap(), false)
         .unwrap()
         .object_id;
-    for flags in [
-        OpenFlags {
-            read: true,
-            no_follow: true,
-            ..OpenFlags::default()
-        },
-        OpenFlags {
-            create: true,
-            exclusive: true,
-            ..OpenFlags::default()
-        },
-    ] {
-        assert!(f
-            .overlay
-            .resolve(&f.process, &open(b"link", flags))
-            .is_err());
-    }
+    assert_eq!(
+        f.overlay
+            .resolve(
+                &f.process,
+                &open(
+                    b"link",
+                    OpenFlags {
+                        read: true,
+                        no_follow: true,
+                        ..OpenFlags::default()
+                    }
+                )
+            )
+            .unwrap(),
+        ResolvedAction::Deny(Errno(62)),
+    );
+    assert!(f
+        .overlay
+        .resolve(
+            &f.process,
+            &open(
+                b"link",
+                OpenFlags {
+                    create: true,
+                    exclusive: true,
+                    ..OpenFlags::default()
+                }
+            )
+        )
+        .is_err());
     f.run(&rename(b"link", b"moved"));
     assert_eq!(
         f.overlay

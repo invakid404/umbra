@@ -2572,7 +2572,7 @@ impl NamespaceResolver for Overlay {
                 }
                 if let Some((stat, _)) = &existing {
                     if stat.kind == ObjectKind::LogicalSymlink {
-                        return Err(error(ErrorKind::InvalidPath, "open refuses final symlink"));
+                        return Ok(ResolvedAction::Deny(Errno(62))); // ELOOP on Darwin
                     }
                     if flags.directory && stat.kind != ObjectKind::Directory {
                         return Err(error(ErrorKind::InvalidPath, "open requires directory"));
