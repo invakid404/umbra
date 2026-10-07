@@ -1840,18 +1840,62 @@ fn symlink_parent_escape_is_rejected_before_prepare_including_process_root() {
     assert!(!f.shadow_root.parent().unwrap().join("outside").exists());
 }
 
+/// **The expansion bound is answered to the tracee as `ELOOP` rather than
+/// raised, on the operands that resolve through `hidden_or`** (#177 item (a)),
+/// which is the disposition [#167] already gave the `O_NOFOLLOW` symlink leaf
+/// and deliberately left alone here. A `rename` destination operand reaches
+/// `resolve_path_follow` through a bare `?` and no translator, so that one
+/// still ends the run; it is filed as #180 rather than fixed here.
+///
+/// Both halves of that are required and neither is sufficient alone. `walk`
+/// attaches the errno at the refusal; `hidden_or` turns an errno-carrying
+/// `SymlinkLoop` into a `Deny`. The kind on its own is inert -- the supervisor
+/// does not unwrap errnos from a `resolve` failure, so nothing downstream would
+/// answer a program -- and an errno with no translator never leaves `resolve`
+/// as anything but an `Err`.
+///
+/// **The two dispositions are asserted through two different entry points, and
+/// that is the shape of the case rather than an accident of it.** `resolve` is
+/// where a `Deny` can exist, so the answer is asserted there. `read_at` returns
+/// `Result<usize>` and resolves through `typed_path`, which returns
+/// `Result<StoragePath>`; neither type has anywhere to put a `Deny`, so the
+/// raise is still the only outcome available to it -- which is why the chain
+/// assertions further down are kept exactly as they were. Asserting only the
+/// `Deny` would pass against a refusal that softened everywhere instead of
+/// being translated at the one site that can answer; asserting only the raise
+/// is what this case did before the fix.
+///
+/// `a/../file` is asserted on the `resolve` side only: `FsOp` operands are
+/// `BytePath`, which carries `..`, while `read_at` takes a `StoragePath`, whose
+/// constructor rejects parent components outright and so would refuse that name
+/// before resolution ever began.
 #[test]
-fn symlink_loop_and_long_chain_have_a_bounded_iterative_expansion() {
+fn symlink_loop_and_long_chain_are_answered_eloop_within_a_bounded_expansion() {
     let mut f = Fixture::new(&[(b"file", b"safe")]);
     f.run(&symlink(b"a", b"b"));
     f.run(&symlink(b"b", b"a"));
     for path in [b"a".as_slice(), b"a/../file"] {
-        let err = f.overlay.resolve(&f.process, &stat(path)).unwrap_err();
-        // A distinct kind, so a caller can answer with ELOOP without reading
-        // the message; containment failures stay InvalidPath.
-        assert_eq!(err.kind, ErrorKind::SymlinkLoop);
-        assert_eq!(err.context, "symlink expansion limit exceeded");
+        // 62 is `ELOOP` on Darwin. The value is read off the error instead of
+        // being written here, which is what keeps the one platform number at
+        // the one refusal site.
+        assert_eq!(
+            f.overlay.resolve(&f.process, &stat(path)).unwrap(),
+            ResolvedAction::Deny(Errno(62)),
+            "the expansion bound must be answered to the tracee"
+        );
     }
+    // The raise itself is unchanged, and it carries the errno the translator
+    // reads. The kind is still asserted alongside the errno so it stays
+    // non-vacuous: a caller can tell loop exhaustion from a containment
+    // failure, which stays `InvalidPath`.
+    let err = f.read(b"a").unwrap_err();
+    assert_eq!(err.kind, ErrorKind::SymlinkLoop);
+    assert_eq!(err.context, "symlink expansion limit exceeded");
+    assert_eq!(
+        err.errno,
+        Some(Errno(62)),
+        "the distinct kind must carry the errno that makes it answerable"
+    );
     for n in (0..=MAX_SYMLINK_EXPANSIONS).rev() {
         let target = if n == MAX_SYMLINK_EXPANSIONS {
             "file".to_string()
@@ -1861,6 +1905,17 @@ fn symlink_loop_and_long_chain_have_a_bounded_iterative_expansion() {
         f.run(&symlink(format!("link{n}").as_bytes(), target.as_bytes()));
     }
     assert_eq!(f.read(b"link1").unwrap(), b"safe");
+    // The chain's own *answer*, not only its raise. Asserting the raise alone
+    // let this half pass with the translation reverted, so the case name was
+    // broader than what it checked (a review finding, measured rather than
+    // argued). Both assertions stay: `resolve` is the only entry point where a
+    // `Deny` can exist, and `read_at` is the one that still has nowhere to put
+    // one, so they witness the two dispositions separately.
+    assert_eq!(
+        f.overlay.resolve(&f.process, &stat(b"link0")).unwrap(),
+        ResolvedAction::Deny(Errno(62)),
+        "a long chain over the bound must be answered to the tracee too"
+    );
     assert_eq!(
         f.read(b"link0").unwrap_err().context,
         "symlink expansion limit exceeded"

@@ -183,9 +183,11 @@ new resolutions are blocked while a transaction is pending.
   Refusing at `resolve` keeps the journal and the overlay session clean, but it
   does **not** hand the tracee an errno: it ends the run. `Fchownat` is
   `Materialise`, so `mutation` is true, and the non-mutating outcomes above have
-  no equivalent on the mutation path — every `resolve` error propagates and marks
-  the run recovery-required, and the `!mutation` guard on the whiteout denial is
-  what keeps it off this path. That covers both refusals above plus an absent
+  no equivalent on the mutation path — every other `resolve` error propagates and
+  marks the run recovery-required, and the `!mutation` guard on the whiteout
+  denial is what keeps it off this path. The one exception is the link-loop
+  refusal, which `hidden_or` answers on the mutation path too because a denial
+  mutates nothing. That covers both refusals above plus an absent
   target, and it is sharper than a non-mutating probe, which either resumes as
   host passthrough (truly absent) or is answered with a clean `ENOENT`
   (whiteout-hidden). The shapes ordinary
@@ -817,20 +819,48 @@ distinct `ErrorKind` (`umbra-core/src/lib.rs:81`), kept separate so a caller can
 tell a link loop from a containment failure without reading an error message;
 containment failures stay `InvalidPath`.
 
-**The distinct kind is library-API clarity, not a wired errno path.** Nothing in
-production translates `SymlinkLoop` into an errno: the only
-`ErrorKind::SymlinkLoop => Errno(62)` mapping in the tree lives in
-`umbra-platform-macos`'s own test fixtures. The overflow is therefore an `Err`
-raised out of `resolve`, which **ends the run** — a tracee that exhausts the
-expansion bound receives no errno at all. That is the same disposition
-[#167](https://github.com/invakid404/umbra/issues/167) removed from the
-`O_NOFOLLOW` symlink-leaf refusal, still in place here, and it wants its own
-filing rather than being read as already solved.
+**The overflow is answered to the tracee as `ELOOP`, and the errno is what
+carries it — not the kind.** The refusal attaches `Errno(62)` to the error it
+raises (`engine.rs:1022`) and `Overlay::hidden_or` turns an errno-carrying
+`SymlinkLoop` into `Ok(ResolvedAction::Deny(errno))`, which the supervisor
+answers through `deny_to_tracee`. That is
+[#177](https://github.com/invakid404/umbra/issues/177) item (a), giving the
+expansion bound the disposition
+[#167](https://github.com/invakid404/umbra/issues/167) gave the `O_NOFOLLOW`
+symlink-leaf refusal.
+
+**Neither half answers anything alone, which is why there are two.** The distinct
+kind is still not a wired errno path: nothing in production maps `SymlinkLoop` to
+a number, and the tree's only `ErrorKind::SymlinkLoop => Errno(62)` mapping
+remains `umbra-platform-macos`'s own test fixtures. Routing the kind to a number
+at the translator is what would have reproduced #167 under a new name, so the one
+platform number stays at the one refusal site. The errno is equally inert by
+itself: the supervisor does not unwrap errnos from a `resolve` failure — its arm
+is `Err(e) => return Err(e)` — so an errno with no translator never leaves
+`resolve` as anything but an `Err` that ends the run.
+
+**`hidden_or` gates on the kind as well as the errno, deliberately.**
+`resolve_path_follow` reaches the backing store, and every `Storage`
+implementation attaches the host's errno to its io errors, so an errno-only
+predicate there would answer the tracee for an unreachable store, a stale handle
+or a backing-store `EIO`. None of those is the program's problem and they all
+still stop the run — the same narrowing the `NotFound` arm beside it makes. The
+remaining raises that an errno-only predicate would have swept up therefore still
+end the run by design. Two of them are worth naming: the rename destination
+operand reaches `resolve_path_follow` through a bare `?` rather than through
+`hidden_or`, and the typed `read_at`/`list` callers resolve through `typed_path`,
+which returns `Result<StoragePath>` into callers returning `Result<usize>` and
+`Result<DirectoryPage>`, so neither can express a `Deny` at all. The rename
+destination is now filed as
+[#180](https://github.com/invakid404/umbra/issues/180). The typed-caller class is
+not, because answering there needs those signatures changed rather than one call
+site rewired, and neither path is among #177's own remaining items, which are
+documentation and fixture-precision follow-ups.
 
 Tracee-visible errnos are produced at the refusal site instead, as
 `Ok(ResolvedAction::Deny(Errno(N)))` — the dominant idiom inside
 `Overlay::resolve`: `Errno(62)` for the `O_NOFOLLOW` symlink leaf at
-`engine.rs:2575`, and `Errno(45)` at `:2813` and `:3006`. Of `resolve`'s two
+`engine.rs:2615`, and `Errno(45)` at `:2853` and `:3046`. Of `resolve`'s two
 outcomes only a `Deny` reaches `deny_to_tracee` and resumes the tracee; an `Err`
 does not.
 
