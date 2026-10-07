@@ -357,18 +357,37 @@ runs. Reads are answered from that metadata. Three ABI pieces make that work:
   the layout cannot represent fail explicitly rather than guessing.
 - **Link loops.** `umbra_core::ErrorKind::SymlinkLoop` is a distinct kind, so a
   caller can tell loop exhaustion from a containment failure without reading an
-  error message, and containment failures stay `InvalidPath`. **That distinction
-  is library-API clarity, not a wired errno path:** nothing in production
-  translates the kind into an errno. The tree's only
-  `ErrorKind::SymlinkLoop => Errno(62)` mapping is in this crate's own
-  `tests/fixtures.rs`, a harness oracle whose remaining arms end in `_ => panic!`
-  rather than a silent catch-all. The overlay's overflow (`engine.rs:983`) is
-  therefore an `Err` raised out of `resolve`, which ends the run — a tracee that
-  exhausts the bound receives no errno at all. Tracee errnos are produced by
-  `Ok(ResolvedAction::Deny(Errno(N)))` at the refusal site instead, per the idiom
-  at `engine.rs:2575`, `:2813` and `:3006`. The overlay's 40-expansion bound is
+  error message, and containment failures stay `InvalidPath`. The overlay's
+  overflow (`engine.rs:1022`) attaches `Errno(62)` to that kind and
+  `Overlay::hidden_or` translates the pair into
+  `Ok(ResolvedAction::Deny(Errno(62)))`. **Which paths that reaches is the
+  whole of it.** A tracee whose operand resolves through `hidden_or` —
+  `chdir`'s own resolver at `engine.rs:2222`, and `resolve`'s main operand
+  resolution at `:2594`, which is the ordinary `open`/`stat` route — is
+  answered `ELOOP` and continues:
+  [#177](https://github.com/invakid404/umbra/issues/177) item (a). A `rename`
+  whose *destination* operand exhausts the bound still ends the run, because
+  that operand reaches `resolve_path_follow` through a bare `?` at `:2865` and
+  so reaches no translator at all; that gap is filed as
+  [#180](https://github.com/invakid404/umbra/issues/180) rather than fixed
+  here. The kind is still not itself a wired errno path: nothing in
+  production maps it to a number, and the translation is gated on the kind while
+  the errno supplies the value. Tracee errnos are produced by
+  `Ok(ResolvedAction::Deny(Errno(N)))` at the refusal site, per the idiom at
+  `engine.rs:2615`, `:2853` and `:3046`. The overlay's 40-expansion bound is
   unchanged. There is no fallback to native symlink traversal when logical
   resolution fails.
+
+  **This crate's own harness hid that defect for the life of it.** The tree's
+  only `ErrorKind::SymlinkLoop => Errno(62)` mapping is in
+  `tests/fixtures.rs`'s `denial`, and because that helper reads
+  `error.errno.unwrap_or_else(..)` with a kind map behind it, `symlink_cycle`
+  emulated the answered-`ELOOP` outcome while production still raised and ended
+  the run. The case was re-run with both halves of the fix reverted and still
+  passed. A harness oracle that can supply an errno production does not have is
+  not an oracle for that errno, however loud its remaining `_ => panic!` arms
+  are; the kind map now duplicates a translation the engine performs, rather
+  than standing in for a missing one.
 
 ### Wait decisions
 

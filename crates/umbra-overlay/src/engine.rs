@@ -808,9 +808,31 @@ impl Overlay {
     /// A truly-absent NotFound keeps the error, whose resume is equivalent to the
     /// answer the namespace predicts because the base *is* the host filesystem.
     /// Mutating operations are untouched: they have no resume escape in the
-    /// supervisor and every resolve error already ends the run, so the `!mutation`
-    /// guard is what confines this to the non-mutating path.
+    /// supervisor and every other resolve error already ends the run, so the
+    /// `!mutation` guard is what confines this to the non-mutating path.
+    ///
+    /// The link-loop arm below is the one exception to that "every other", and it
+    /// is deliberately not `!mutation`-gated: a denial mutates nothing, and the
+    /// `O_NOFOLLOW` leaf refusal answers a mutating open the same way.
     fn hidden_or(&self, e: UmbraError, mutation: bool) -> Result<ResolvedAction> {
+        // **A link loop is the program's own doing, so the program gets it back**
+        // (#177 item (a)). The errno carries the value -- `walk` attached it at
+        // the refusal -- and this is only the gate, which is why no number is
+        // written here. Routing the *kind* to a number at this end is what would
+        // have reproduced #167 under a new name.
+        //
+        // **Gated on the kind and not on the errno alone**, which is the same
+        // narrowing the `NotFound` comment above describes. `resolve_path_follow`
+        // reaches the backing store, and every `Storage` implementation attaches
+        // the host's errno to its io errors, so an errno-only predicate here
+        // would answer the tracee for an unreachable store, a stale handle or a
+        // backing-store `EIO`. None of those is the program's problem and they
+        // all still stop the run.
+        if e.kind == ErrorKind::SymlinkLoop {
+            if let Some(errno) = e.errno {
+                return Ok(ResolvedAction::Deny(errno));
+            }
+        }
         if e.kind != ErrorKind::NotFound {
             return Err(e);
         }
@@ -979,10 +1001,28 @@ impl Overlay {
                                 // message: the platform answers a link loop
                                 // with its own native errno, and containment
                                 // failures must not be mistaken for one.
+                                //
+                                // **The errno rides on the error because that
+                                // is what makes it answerable.** The kind alone
+                                // is inert: the supervisor does not unwrap
+                                // errnos from a `resolve` failure, so nothing
+                                // downstream turns this into a tracee answer,
+                                // and the bound ended the run until #177 item
+                                // (a). `hidden_or` converts it: the kind gates
+                                // the arm, the errno supplies the number. A
+                                // kind-to-number map at the translator is what
+                                // would have reproduced #167 under a new name.
+                                //
+                                // 62 is `ELOOP` on Darwin, spelled at the
+                                // refusal and not at the translator so the one
+                                // platform number lives with the one refusal,
+                                // which is the idiom `Overlay::resolve` uses
+                                // for the `O_NOFOLLOW` leaf #167 answers.
                                 return Err(error(
                                     ErrorKind::SymlinkLoop,
                                     "symlink expansion limit exceeded",
-                                ));
+                                )
+                                .with_errno(Errno(62)));
                             }
                             let target = self.target(&prefix, &stat, shadow)?;
                             if target.as_bytes().is_empty() {

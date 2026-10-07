@@ -582,7 +582,7 @@ impl Supervisor {
         // it needs no journaled preparation and no operation slot: answer the
         // tracee here, before minting an OperationId.
         //
-        // **Eight things reach it**, and the list is kept current because it is
+        // **Nine things reach it**, and the list is kept current because it is
         // the only place they are enumerated together. Every one names the
         // `umbra-overlay` *function* that produces it, never a line: this block
         // carried twelve line citations that were all correct on master and all
@@ -641,6 +641,23 @@ impl Supervisor {
         //    of the four backends refuse a timestamp update, and reaching that
         //    refusal from inside `prepare` would flush an intent for a change
         //    that never happened and stop the run.
+        // 9. `ELOOP` for a path whose logical symlink expansion exhausted its
+        //    bound -- `Overlay::walk` raises the refusal with the errno already
+        //    attached and `Overlay::hidden_or` translates it, the third class
+        //    that one function produces. **Added by the change that added this
+        //    line**; before it the bound raised an errno-less `Err` and ended
+        //    the run, which is the disposition the `O_NOFOLLOW` symlink-leaf
+        //    refusal had already shed. Two properties of it are deliberate and
+        //    neither is obvious from the call site. The translation is gated on
+        //    `ErrorKind::SymlinkLoop`, *not* on an errno being present at all:
+        //    name resolution reaches the backing store and every `Storage`
+        //    attaches the host's errno to its io errors, so an errno-only gate
+        //    would answer an unreachable store, a stale handle or a
+        //    backing-store `EIO` to the program instead of stopping the run --
+        //    the hazard item 2 describes, one layer down. And it is the only
+        //    entry here that is not confined to non-mutating operations: a
+        //    denial mutates nothing, so a mutating open of a looping path gets
+        //    the same answer.
         //
         // A seventh tracee-visible refusal exists and deliberately does *not*
         // reach this point: a bad `fstat` output pointer is bound and answered
