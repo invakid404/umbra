@@ -46,7 +46,7 @@
 //
 // THIS IS A DIFFERENT CLASS FROM THE THREE NAMED UMBRELLAS, which is why this
 // fixture exists rather than a case being added to an existing one. It is not
-// #152 (`ENOTSUP` answered to the tracee at engine.rs:3006, run survives, and
+// #152 (`ENOTSUP` answered to the tracee at engine.rs:3009, run survives, and
 // whose residual is path `Stat`/`Access` only -- `ReadLink` was routed out of
 // that arm deliberately). It is not #165 (the KERNEL's `EBADF` on a descriptor
 // above umbra's `RLIMIT_NOFILE` fence, run survives). It is not #167

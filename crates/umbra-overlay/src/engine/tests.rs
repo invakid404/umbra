@@ -1843,9 +1843,11 @@ fn symlink_parent_escape_is_rejected_before_prepare_including_process_root() {
 /// **The expansion bound is answered to the tracee as `ELOOP` rather than
 /// raised, on the operands that resolve through `hidden_or`** (#177 item (a)),
 /// which is the disposition [#167] already gave the `O_NOFOLLOW` symlink leaf
-/// and deliberately left alone here. A `rename` destination operand reaches
-/// `resolve_path_follow` through a bare `?` and no translator, so that one
-/// still ends the run; it is filed as #180 rather than fixed here.
+/// and deliberately left alone here. The `rename` destination operand reached
+/// `resolve_path_follow` through a bare `?` and no translator, so that one ended
+/// the run until #180 rewired it through `hidden_or`; the case below,
+/// `a_rename_destination_over_the_expansion_bound_is_answered_eloop`, is what
+/// witnesses it.
 ///
 /// Both halves of that are required and neither is sufficient alone. `walk`
 /// attaches the errno at the refusal; `hidden_or` turns an errno-carrying
@@ -1919,6 +1921,44 @@ fn symlink_loop_and_long_chain_are_answered_eloop_within_a_bounded_expansion() {
     assert_eq!(
         f.read(b"link0").unwrap_err().context,
         "symlink expansion limit exceeded"
+    );
+}
+
+/// **A `rename` DESTINATION operand over the expansion bound is answered to the
+/// tracee as `ELOOP` too** (#180). This is the sibling the case above names and
+/// deliberately left out: `FsOp::Rename`'s destination reached
+/// `resolve_path_follow` through a bare `?` and no translator, so the bound
+/// ended the run for a rename after every operand that routes through
+/// `hidden_or` had started answering it.
+///
+/// **This case cannot be satisfied by a harness-side map.** It reads
+/// `ResolvedAction` straight off `Overlay::resolve`, and the only code in the
+/// tree that turns an errno-carrying `SymlinkLoop` into a `Deny` is
+/// `Overlay::hidden_or`. Nothing stands between the assertion and the engine:
+/// the one `SymlinkLoop => Errno(62)` map in the tree lives in
+/// `umbra-platform-macos`'s own test fixtures, which is exactly why that
+/// crate's `symlink_cycle` kept passing with #179's production half reverted.
+///
+/// **The loop sits on a non-final component on purpose.** A rename destination
+/// resolves with `follow_final: false`, and `walk` expands a `LogicalSymlink`
+/// only when `follow_final || !queue.is_empty()`, so a bare `to` of `a` would
+/// never expand and the case would assert nothing. `a/dest` is what puts the
+/// loop on the traversal.
+///
+/// The source is an ordinary base file because the arm reads `existing` and
+/// refuses a non-file before it resolves the destination at all; a loop-free
+/// source is what leaves the destination as the thing under test.
+#[test]
+fn a_rename_destination_over_the_expansion_bound_is_answered_eloop() {
+    let mut f = Fixture::new(&[(b"source", b"moved")]);
+    f.run(&symlink(b"a", b"b"));
+    f.run(&symlink(b"b", b"a"));
+    assert_eq!(
+        f.overlay
+            .resolve(&f.process, &rename(b"source", b"a/dest"))
+            .unwrap(),
+        ResolvedAction::Deny(Errno(62)),
+        "the rename destination's expansion bound must be answered to the tracee"
     );
 }
 

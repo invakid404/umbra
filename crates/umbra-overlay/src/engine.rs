@@ -2862,7 +2862,10 @@ impl NamespaceResolver for Overlay {
                         "directory rename requires subtree materialisation",
                     ));
                 }
-                let dest = self.resolve_path_follow(context, *to_dir, to, true, false)?;
+                let dest = match self.resolve_path_follow(context, *to_dir, to, true, false) {
+                    Ok(dest) => dest,
+                    Err(e) => return self.hidden_or(e, mutation),
+                };
                 if dest.as_bytes().is_empty() {
                     return Err(error(ErrorKind::Denied, "cannot replace root"));
                 }

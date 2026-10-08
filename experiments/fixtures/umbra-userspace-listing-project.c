@@ -9,7 +9,7 @@
 // twice, the second time on the descriptor number the first one gave back.
 //
 // **What it guards.** `Engine::commit` evicts a closed descriptor's residual
-// directory page (`umbra-overlay/src/engine.rs:4033-4041`), and that eviction is
+// directory page (`umbra-overlay/src/engine.rs:4036-4044`), and that eviction is
 // what makes a second enumeration re-read the directory instead of being served
 // the empty remainder the first one left behind. The eviction is live on master
 // and **nothing exercised it** -- every shipped fixture reads each directory
@@ -65,7 +65,7 @@
 // draft of this fixture created two files there between the passes, to prove the
 // base-plus-shadow merge at the same time. Measured: that write *materialises
 // the directory into the shadow*, and a routed `stat` by path on a shadow object
-// is refused `ENOTSUP` at `engine.rs:3020-3023` -- a limitation the comment
+// is refused `ENOTSUP` at `engine.rs:3023-3026` -- a limitation the comment
 // above it already defers. `fts` stats a root entry before walking it, so pass 2
 // got `FTS_NS` and reported nothing for a reason that had nothing to do with the
 // cache. The merge claim therefore belongs to a different arc, and this one
