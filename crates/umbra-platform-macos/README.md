@@ -362,19 +362,19 @@ runs. Reads are answered from that metadata. Three ABI pieces make that work:
   `Overlay::hidden_or` translates the pair into
   `Ok(ResolvedAction::Deny(Errno(62)))`. **Which paths that reaches is the
   whole of it.** A tracee whose operand resolves through `hidden_or` —
-  `chdir`'s own resolver at `engine.rs:2222`, and `resolve`'s main operand
-  resolution at `:2594`, which is the ordinary `open`/`stat` route — is
-  answered `ELOOP` and continues:
-  [#177](https://github.com/invakid404/umbra/issues/177) item (a). A `rename`
-  whose *destination* operand exhausts the bound still ends the run, because
-  that operand reaches `resolve_path_follow` through a bare `?` at `:2865` and
-  so reaches no translator at all; that gap is filed as
-  [#180](https://github.com/invakid404/umbra/issues/180) rather than fixed
-  here. The kind is still not itself a wired errno path: nothing in
+  `chdir`'s own resolver at `engine.rs:2222`, `resolve`'s main operand
+  resolution at `:2594`, which is the ordinary `open`/`stat` route, and a
+  `rename`'s *destination* operand at `:2867`, which
+  [#180](https://github.com/invakid404/umbra/issues/180) rewired from a bare
+  `?` to that same translator — is answered `ELOOP` and continues:
+  [#177](https://github.com/invakid404/umbra/issues/177) item (a). #180 stays
+  open for the second site it names, `Overlay::routed_binding`, whose own
+  resolve failure is gated to `NotFound` alone and so still ends the run on a
+  link loop. The kind is still not itself a wired errno path: nothing in
   production maps it to a number, and the translation is gated on the kind while
   the errno supplies the value. Tracee errnos are produced by
   `Ok(ResolvedAction::Deny(Errno(N)))` at the refusal site, per the idiom at
-  `engine.rs:2615`, `:2853` and `:3046`. The overlay's 40-expansion bound is
+  `engine.rs:2615`, `:2853` and `:3049`. The overlay's 40-expansion bound is
   unchanged. There is no fallback to native symlink traversal when logical
   resolution fails.
 

@@ -846,21 +846,25 @@ predicate there would answer the tracee for an unreachable store, a stale handle
 or a backing-store `EIO`. None of those is the program's problem and they all
 still stop the run — the same narrowing the `NotFound` arm beside it makes. The
 remaining raises that an errno-only predicate would have swept up therefore still
-end the run by design. Two of them are worth naming: the rename destination
-operand reaches `resolve_path_follow` through a bare `?` rather than through
-`hidden_or`, and the typed `read_at`/`list` callers resolve through `typed_path`,
-which returns `Result<StoragePath>` into callers returning `Result<usize>` and
-`Result<DirectoryPage>`, so neither can express a `Deny` at all. The rename
-destination is now filed as
-[#180](https://github.com/invakid404/umbra/issues/180). The typed-caller class is
-not, because answering there needs those signatures changed rather than one call
-site rewired, and neither path is among #177's own remaining items, which are
-documentation and fixture-precision follow-ups.
+end the run by design. One is worth naming: the typed `read_at`/`list` callers
+resolve through `typed_path`, which returns `Result<StoragePath>` into callers
+returning `Result<usize>` and `Result<DirectoryPage>`, so neither can express a
+`Deny` at all. That class is unfiled, because answering there needs those
+signatures changed rather than one call site rewired, and it is not among #177's
+own remaining items, which are documentation and fixture-precision follow-ups.
+
+The rename destination operand was the other and is no longer: it reached
+`resolve_path_follow` through a bare `?` and so no translator at all, and
+[#180](https://github.com/invakid404/umbra/issues/180) rewired it through
+`hidden_or` with the same `mutation` argument the main operand resolution
+already passes. #180 stays open for the second site it names,
+`Overlay::routed_binding`, whose own resolve failure is gated to `NotFound`
+alone and so still ends the run on a link loop.
 
 Tracee-visible errnos are produced at the refusal site instead, as
 `Ok(ResolvedAction::Deny(Errno(N)))` — the dominant idiom inside
 `Overlay::resolve`: `Errno(62)` for the `O_NOFOLLOW` symlink leaf at
-`engine.rs:2615`, and `Errno(45)` at `:2853` and `:3046`. Of `resolve`'s two
+`engine.rs:2615`, and `Errno(45)` at `:2853` and `:3049`. Of `resolve`'s two
 outcomes only a `Deny` reaches `deny_to_tracee` and resumes the tracee; an `Err`
 does not.
 

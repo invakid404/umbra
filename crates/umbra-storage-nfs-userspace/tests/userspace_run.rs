@@ -502,7 +502,7 @@ fn project_directory_entries(names: &[Vec<u8>]) -> Vec<DirectoryEntry> {
 /// load-bearing rather than tidy. **Nothing in this case writes into the
 /// enumerated directory, and that is a precondition, not an accident.** A write
 /// there materialises the directory into the shadow, and a routed `stat` by path
-/// on a shadow object is refused `ENOTSUP` at `engine.rs:3020-3023` -- a
+/// on a shadow object is refused `ENOTSUP` at `engine.rs:3023-3026` -- a
 /// limitation the comment above it defers to a later slice. `fts` stats a root
 /// entry before walking it, so pass 2 would report nothing for a reason that has
 /// nothing to do with the directory cache this case exists to exercise.
@@ -3685,7 +3685,7 @@ fn mutation_probe_readdir_makes_the_listed_names_wrong() {
 /// earlier draft created two files in the enumerated directory between the
 /// passes to prove it; measured, that write materialises the directory into the
 /// shadow, and a routed `stat` by path on a shadow object is refused `ENOTSUP`
-/// at `engine.rs:3020-3023` -- a limitation the comment above it already
+/// at `engine.rs:3023-3026` -- a limitation the comment above it already
 /// defers. `fts` stats a root before walking it, so pass 2 reported nothing for
 /// a reason unrelated to the cache. That claim belongs to the slice that lifts
 /// the `Stat` limitation.
@@ -3954,7 +3954,7 @@ fn mutation_probe_readdir_corrupts_a_paginated_listing_across_a_descriptor_reuse
 /// *also* exactly what a routed `stat` refused `ENOTSUP` produces: `fts` stats a
 /// root before walking it, gets `FTS_NS`, and reports nothing while still
 /// exiting 0 (measured; see `project_listing_run`'s doc and
-/// `engine.rs:3009-3018`). That path is unreachable here only because the
+/// `engine.rs:3012-3021`). That path is unreachable here only because the
 /// fixture writes nothing into the enumerated directory, so the directory is
 /// never materialised into the shadow. An edit that reintroduces such a write --
 /// including moving the output file out of the workspace root and into the
@@ -4559,7 +4559,7 @@ fn mutation_probe_read_makes_the_rust_wrapper_read_back_reject() {
 /// stores nothing, and the library's own reopen catches it by *size*.
 ///
 /// **The exit code is 97, not leg vi's 105.** The mutation drops the storage
-/// writes while keeping the success `resolve` planned (`engine.rs:3772-3773`), so
+/// writes while keeping the success `resolve` planned (`engine.rs:3775-3776`), so
 /// the tracee is told its write landed and the first leg that reads back is the
 /// leg that notices. That is leg iii, whose size check runs before its byte
 /// check precisely so this has one code rather than two. Measured:
@@ -7308,7 +7308,7 @@ fn assert_readlink_binding_gap_stopped_the_run(run: &Run, host: &str, port: u16,
 /// globally, because the four cases this slice adds do not share one class:
 ///
 ///   * NOT #152. That is `resolve` returning `Deny(Errno(45))` at
-///     `engine.rs:3006` -- an `ENOTSUP` *answered* to the tracee, with the run
+///     `engine.rs:3009` -- an `ENOTSUP` *answered* to the tracee, with the run
 ///     surviving -- and its residual is path `Stat` and `Access` only.
 ///     `FsOp::ReadLink` was deliberately routed OUT of that arm: its own arm at
 ///     `engine.rs:2855` is unconditional, with no `routed()` and no shadow
@@ -7510,7 +7510,7 @@ fn the_symlink_read_fixture_reaches_its_completion_sentinel_on_the_host() {
 /// **THIS IS THE CASE THAT GOES RED WHEN #152 IS FIXED PROPERLY**, and it is the
 /// only one of the four this slice adds that does. #152's residual is path
 /// `Stat` and `Access` on a shadow object, refused `ENOTSUP` at
-/// `engine.rs:3006`; routing them properly means answering them through an ABI
+/// `engine.rs:3009`; routing them properly means answering them through an ABI
 /// encoder the way `Fstat` already is, and a path `Stat` cannot be answered at
 /// all while the calls that issue it carry no breakpoint. So the fix must add
 /// rows here, and the moment it does this case fails by name. The two
