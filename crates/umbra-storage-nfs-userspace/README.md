@@ -760,6 +760,40 @@ missing-evidence refusal back into a clean verdict.
 
 ### Proving it
 
+The slate thread/fork tests also require `UMBRA_SLATE_EVIDENCE`, an absolute
+writable evidence directory. C10-10 checks the live `native.rs` content SHA-256
+against its characterized pin using `/usr/bin/shasum`. A mismatch fails with
+`RE-CHARACTERIZE C10-10`: repeat the structural and runtime characterization
+before updating the pin. No snapshot file or Git history is required:
+
+```sh
+export UMBRA_SLATE_EVIDENCE="$(mktemp -d /tmp/umbra-slate.XXXXXX)"
+# With live Ganesha, UMBRA_NFS_RAW_FIXTURE and the provider binaries prepared:
+"$UMBRA_SERIAL_TEST" cargo test \
+    -p umbra-storage-nfs-userspace --features transport-raw \
+    --test userspace_run slate_ -- --test-threads=1
+```
+
+Set `UMBRA_SERIAL_TEST` to the path of your serial wrapper; it is a local test prerequisite. C10-10 builds its guard-test
+executable before entering the bounded execution window; build failure is a
+prerequisite failure. The launcher uses a 60-second execution deadline and a
+10-second cleanup grace (`slate_bounded`/`slate_bounded_for`). The group-scoped census permits at most three attempts for missing readings,
+each capped at 400ms including a 100ms kill/reap reserve and by the phase
+deadline. Completed readings return immediately; cleanup actions may produce
+progress observations while grace remains. Terminal failure or exhausted
+unavailable census denies qualification; case oracles are recorded before final
+cleanup qualification. `ZOMBIES_ONLY` records dead table entries explicitly and
+requires no live survivors, direct-child reap and pipe EOF.
+
+Results qualify measured runs, not all schedules. C10-10 requires both the
+behavioural refusal and the unchanged structural assertion; together they still
+do not prove the guard fired at the guarded instruction. C10-15 observes Tokio
+task-level results plus independent stored bytes and lengths, not blocking-worker
+syscall errno or TID attribution. Attribution loss, wrong data, premature
+completion and timeout remain falsifiers. Writer-authority reopen is separate
+from journal completion. The isolated Tokio fixture builds with its own locked
+Cargo package; it is not a root workspace member.
+
 `tests/userspace_run.rs` (feature `transport-raw`, macOS arm64, gated on
 `UMBRA_NFS_RAW_FIXTURE`) drives the real `umbra` binary against a live server and
 checks the result three independent ways — through the raw client, through the

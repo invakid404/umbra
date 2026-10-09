@@ -8047,3 +8047,1173 @@ fn the_lifecycle_fixture_reaches_its_completion_sentinels_on_the_host() {
         }
     }
 }
+
+// Increment A: process-group membership is observed until the group disappears.
+// The provider's tracee and debugserver must remain in this group. A surviving
+// group fails qualification; killing the CLI alone is never cleanup evidence.
+// Census output goes to regular temporary files, so a full pipe cannot block ps.
+// Even an injected hung census is killed and polled, never waited on unboundedly.
+
+// Cleanup qualification is deferred until the caller has recorded its oracles.
+// An unknown terminal status stays unknown; it is never synthesized as an exit.
+#[derive(Clone, Copy, Debug)]
+struct SlateStatus(Option<std::process::ExitStatus>);
+impl SlateStatus {
+    fn success(self) -> bool {
+        self.0.is_some_and(|s| s.success())
+    }
+    fn code(self) -> Option<i32> {
+        self.0.and_then(|s| s.code())
+    }
+    fn signal(self) -> Option<i32> {
+        self.0
+            .and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s))
+    }
+}
+impl std::fmt::Display for SlateStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(s) => write!(f, "{s}"),
+            None => write!(f, "NOT AVAILABLE"),
+        }
+    }
+}
+struct SlateOutput {
+    status: SlateStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+fn slate_finish_cleanup() {
+    let failures = SLATE_CLEANUP_FAILURES.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    assert!(
+        failures.is_empty(),
+        "cleanup qualification failed AFTER oracle recording: {failures:?}"
+    );
+}
+fn slate_cleanup_failure(detail: String) {
+    SLATE_CLEANUP_FAILURES.with(|slot| slot.borrow_mut().push(detail));
+}
+thread_local! {
+    static SLATE_CLEANUP_FAILURES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SLATE_CENSUS_INJECT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static SLATE_CENSUS_EVIDENCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+fn slate_census(command: &mut Command, deadline: std::time::Instant) -> Result<String, String> {
+    use std::io::{Read, Seek, Write};
+    use std::time::{Duration, Instant, SystemTime};
+    let started = Instant::now();
+    let wall = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let mut out = tempfile::tempfile().map_err(|e| e.to_string())?;
+    let mut err = tempfile::tempfile().map_err(|e| e.to_string())?;
+    let limit = deadline.min(started + Duration::from_millis(400));
+    let budget = limit.saturating_duration_since(started);
+    let mut killed = None;
+    let mut reaped = None;
+    let result = (|| {
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(out.try_clone().unwrap())
+            .stderr(err.try_clone().unwrap())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                reaped = Some(started.elapsed().as_micros());
+                if killed.is_some() {
+                    return Err("census overrun: killed and reaped".into());
+                }
+                return if status.success()
+                    || (command.get_program() == "/bin/ps" && status.code() == Some(1))
+                {
+                    Ok(())
+                } else {
+                    Err(format!("census status {status}"))
+                };
+            }
+            if killed.is_none() && Instant::now() + Duration::from_millis(100) >= limit {
+                child.kill().map_err(|e| e.to_string())?;
+                killed = Some(started.elapsed().as_micros());
+            }
+            if Instant::now() >= limit {
+                return Err("census could not be reaped within its bound; ESCALATE".into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    })();
+    out.rewind().unwrap();
+    err.rewind().unwrap();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    out.read_to_string(&mut stdout).unwrap();
+    err.read_to_string(&mut stderr).unwrap();
+    SLATE_CENSUS_EVIDENCE.with(|slot| { if let Some(path)=slot.borrow().as_ref() {
+        let row=serde_json::json!({"kind":if result.is_ok() { "READING" } else { "NO_READING" },"started_unix_us":wall,"budget_us":budget.as_micros(),"elapsed_us":started.elapsed().as_micros(),"killed_us":killed,"reaped_us":reaped,"error":result.as_ref().err(),"stdout":stdout,"stderr":stderr});
+        writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap(),"{row}").unwrap();
+    }});
+    result.map(|()| stdout)
+}
+
+fn slate_census_event(kind: &str, detail: &str) {
+    use std::io::Write;
+    SLATE_CENSUS_EVIDENCE.with(|slot| {
+        if let Some(path) = slot.borrow().as_ref() {
+            let row = serde_json::json!({"kind":kind,"detail":detail});
+            writeln!(
+                std::fs::OpenOptions::new().append(true).open(path).unwrap(),
+                "{row}"
+            )
+            .unwrap();
+        }
+    });
+}
+fn slate_group_members(group: u32, deadline: std::time::Instant) -> Result<String, String> {
+    let injected = SLATE_CENSUS_INJECT.with(|slot| slot.borrow_mut().take());
+    let mut error = "phase budget exhausted before census".to_string();
+    for attempt in 1..=3 {
+        if deadline.saturating_duration_since(std::time::Instant::now())
+            <= std::time::Duration::from_millis(100)
+        {
+            break;
+        }
+        slate_census_event("ATTEMPT", &format!("group={group} attempt={attempt}"));
+        let mut command = Command::new(injected.as_deref().unwrap_or(Path::new("/bin/ps")));
+        if injected.is_some() {
+            command.arg("hang-census");
+        } else {
+            command.args([
+                "-g",
+                &group.to_string(),
+                "-o",
+                "pid=,ppid=,pgid=,stat=,command=",
+            ]);
+        }
+        match slate_census(&mut command, deadline) {
+            Ok(text) => {
+                return Ok(text
+                    .lines()
+                    .filter(|line| {
+                        line.split_whitespace()
+                            .nth(2)
+                            .is_some_and(|v| v == group.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            Err(reason) => error = reason,
+        }
+    }
+    slate_census_event("NO_READING_EXHAUSTED", &error);
+    Err(error)
+}
+
+fn slate_bounded(command: &mut Command, evidence: &Path) -> SlateOutput {
+    let (output, timed_out) =
+        slate_bounded_for(command, evidence, std::time::Duration::from_secs(60));
+    if timed_out {
+        slate_cleanup_failure("external execution deadline elapsed".into());
+    }
+    output
+}
+fn slate_bounded_for(
+    command: &mut Command,
+    evidence: &Path,
+    timeout: std::time::Duration,
+) -> (SlateOutput, bool) {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    SLATE_CENSUS_EVIDENCE
+        .with(|slot| *slot.borrow_mut() = Some(evidence.with_extension("census.jsonl")));
+    std::fs::write(evidence.with_extension("census.jsonl"), "").unwrap();
+    let collected =
+        std::sync::Arc::new(std::sync::Mutex::new([Vec::<u8>::new(), Vec::<u8>::new()]));
+    let retain = |detail: &str| {
+        let bytes = collected.lock().unwrap();
+        std::fs::write(evidence.with_extension("stdout"), &bytes[0]).unwrap();
+        std::fs::write(evidence.with_extension("stderr"), &bytes[1]).unwrap();
+        let stderr = String::from_utf8_lossy(&bytes[1]);
+        let tracee = stderr
+            .lines()
+            .find(|line| line.contains("finished:"))
+            .unwrap_or("tracee_status=NOT AVAILABLE");
+        std::fs::write(
+            evidence.with_extension("cleanup"),
+            format!("{detail}\n{tracee}\n"),
+        )
+        .unwrap();
+    };
+    command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("bounded launch");
+    let group = child.id();
+    let out = child.stdout.take().unwrap();
+    let err = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (which, mut pipe) in [
+        (0, Box::new(out) as Box<dyn Read + Send>),
+        (1, Box::new(err) as Box<dyn Read + Send>),
+    ] {
+        let tx = tx.clone();
+        let collected = collected.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            let result = loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break Ok(collected.lock().unwrap()[which].clone()),
+                    Ok(n) => collected.lock().unwrap()[which].extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => break Err(e),
+                }
+            };
+            let _ = tx.send((which, result));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + timeout;
+    let mut census_error = None;
+    let mut group_kills = 0;
+    let mut census = String::new();
+    let mut timed_out = false;
+    let status = loop {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break None;
+        }
+        if deadline.saturating_duration_since(Instant::now()) > Duration::from_millis(400) {
+            match slate_group_members(group, deadline) {
+                Ok(members) => {
+                    census.push_str(&members);
+                    census.push('\n');
+                }
+                Err(error) => {
+                    census_error = Some(error);
+                    break None;
+                }
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20)); // polling, never fixture ordering
+    };
+    let grace = Instant::now() + Duration::from_secs(10);
+    if timed_out || census_error.is_some() {
+        // SAFETY: this child was launched as leader of its own process group.
+        unsafe {
+            libc::kill(-(group as i32), libc::SIGKILL);
+            group_kills += 1;
+        }
+    }
+    let mut status = status;
+
+    let mut pipes: [Option<Vec<u8>>; 2] = [None, None];
+    let mut cleanup_failure = None;
+    let mut zombies = String::new();
+    loop {
+        if status.is_none() {
+            status = child.try_wait().unwrap();
+        }
+        while let Ok((which, bytes)) = rx.try_recv() {
+            match bytes {
+                Ok(bytes) => pipes[which] = Some(bytes),
+                Err(e) => {
+                    cleanup_failure = Some(format!("cleanup FAILED: pipe read: {e}"));
+                }
+            }
+        }
+        if cleanup_failure.is_some() {
+            break;
+        }
+        if grace.saturating_duration_since(Instant::now()) <= Duration::from_millis(100) {
+            cleanup_failure =
+                Some("cleanup UNMEASURABLE: insufficient remaining census/reap budget".into());
+            break;
+        }
+        let members = match slate_group_members(group, grace) {
+            Ok(members) => members,
+            Err(error) => {
+                cleanup_failure = Some(format!("cleanup UNMEASURABLE: {error}"));
+                break;
+            }
+        };
+        census.push_str(&members);
+        census.push('\n');
+        zombies = members
+            .lines()
+            .filter(|line| {
+                line.split_whitespace()
+                    .nth(3)
+                    .is_some_and(|v| v.starts_with('Z'))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let live = members
+            .lines()
+            .filter(|line| {
+                !line
+                    .split_whitespace()
+                    .nth(3)
+                    .is_some_and(|v| v.starts_with('Z'))
+            })
+            .collect::<Vec<_>>();
+        if status.is_some() && live.is_empty() && pipes.iter().all(Option::is_some) {
+            break;
+        }
+        if grace.saturating_duration_since(Instant::now()) <= Duration::from_millis(400) {
+            cleanup_failure=Some(format!("cleanup FAILED: grace exhausted with live={live:?}, direct_status={status:?}, pipes_complete={}",pipes.iter().all(Option::is_some)));
+            break;
+        }
+        slate_census_event(
+            "PROGRESS",
+            "poll/reap direct child, drain pipes and signal survivors with grace remaining",
+        );
+        // Signal live PIDs only. Zombies are already dead and cannot be killed.
+        if status.is_some() {
+            for line in &live {
+                let pid = line
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap();
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                group_kills += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Some(error) = census_error.as_ref() {
+        cleanup_failure = Some(format!("cleanup UNMEASURABLE during execution: {error}"));
+    }
+    let buffered = collected.lock().unwrap();
+    let output = SlateOutput {
+        status: SlateStatus(status),
+        stdout: pipes[0].take().unwrap_or_else(|| buffered[0].clone()),
+        stderr: pipes[1].take().unwrap_or_else(|| buffered[1].clone()),
+    };
+    drop(buffered);
+    std::fs::write(evidence.with_extension("stdout"), &output.stdout).unwrap();
+    std::fs::write(evidence.with_extension("stderr"), &output.stderr).unwrap();
+    if let Some(error) = cleanup_failure {
+        slate_census_event(
+            if error.contains("UNMEASURABLE") {
+                "NO_READING_EXHAUSTED"
+            } else {
+                "TERMINAL_FAILURE"
+            },
+            &error,
+        );
+        retain(&format!("{error}; supervisor_status={:?} timed_out={timed_out} group={group} zombies={zombies:?}\n{census}",output.status));
+        slate_cleanup_failure(format!("{}: {error}", evidence.display()));
+    } else {
+        let disposition = if zombies.is_empty() {
+            "cleanup CLEAN"
+        } else {
+            "cleanup ZOMBIES_ONLY: no live survivors; accepted dead-table residue"
+        };
+        std::fs::write(evidence.with_extension("cleanup"),format!("{disposition}; status={} timed_out={timed_out} group_kills={group_kills} group={group} final_live_members=0 pipes=EOF direct_child=reaped zombies={zombies:?}\n{census}",output.status)).unwrap();
+    }
+    (output, timed_out)
+}
+
+#[test]
+fn slate_launcher_timeout_and_census_overrun() {
+    use std::time::{Duration, Instant};
+    let Some(evidence) = slate_evidence() else {
+        return;
+    };
+    std::fs::create_dir_all(&evidence).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(
+        scratch.path(),
+        "umbra-userspace-threads",
+        "UMBRA_THREADS_PATH",
+    );
+    let start = Instant::now();
+    let (output, timed_out) = slate_bounded_for(
+        Command::new(&program).arg("hang"),
+        &evidence.join("forced"),
+        Duration::from_secs(1),
+    );
+    assert!(timed_out);
+    assert_eq!(output.status.signal(), Some(libc::SIGKILL));
+    assert!(start.elapsed() < Duration::from_secs(12));
+    let cleanup = std::fs::read_to_string(evidence.join("forced.cleanup")).unwrap();
+    let seen: std::collections::BTreeSet<_> = cleanup
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert!(
+        seen.len() >= 2,
+        "group-kill qualification must observe both hang processes"
+    );
+    assert!(
+        cleanup.contains("group_kills=1")
+            && cleanup.contains("final_live_members=0 pipes=EOF direct_child=reaped")
+    );
+    let start = Instant::now();
+    let error = slate_census(
+        Command::new(&program).arg("hang-census"),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert_eq!(error, "census overrun: killed and reaped");
+    assert!(start.elapsed() < Duration::from_secs(1));
+    std::fs::write(evidence.join("census-overrun.txt"), error).unwrap();
+    // Exercise the launcher failure branch, not just the census primitive.
+    SLATE_CENSUS_INJECT.with(|slot| *slot.borrow_mut() = Some(program));
+    let failed = std::panic::catch_unwind(|| {
+        slate_bounded(
+            Command::new("/bin/echo").arg("retained-before-census-failure"),
+            &evidence.join("injected-failure"),
+        );
+        std::fs::write(
+            evidence.join("oracle-after-cleanup-failure.txt"),
+            "oracle reached before deferred qualification",
+        )
+        .unwrap();
+        slate_finish_cleanup();
+    });
+    assert!(failed.is_err());
+    assert!(
+        std::fs::read_to_string(evidence.join("injected-failure.stdout"))
+            .unwrap()
+            .contains("retained-before-census-failure")
+    );
+    assert!(
+        std::fs::read_to_string(evidence.join("injected-failure.cleanup"))
+            .unwrap()
+            .contains("cleanup UNMEASURABLE")
+    );
+    assert!(
+        std::fs::read_to_string(evidence.join("injected-failure.census.jsonl"))
+            .unwrap()
+            .contains("killed_us")
+    );
+}
+
+#[test]
+fn slate_c10_01_single_thread_control() {
+    slate_main_io_control("c10-01");
+}
+
+// Ordinary Namespace I/O with a live helper, NOT a Fork-guard witness.
+// Removing the Fork guard should leave this case passing.
+#[test]
+fn slate_c10_02_main_io_helper_alive() {
+    slate_main_io_control("c10-02");
+}
+
+#[test]
+fn slate_c10_03_helper_io() {
+    slate_main_io_control("c10-03");
+}
+
+#[test]
+fn slate_c10_04_alternating_files() {
+    slate_main_io_control("c10-04");
+}
+#[test]
+fn slate_c10_05_competing_files() {
+    slate_main_io_control("c10-05");
+}
+#[test]
+fn slate_c10_06_shared_descriptor_handoff() {
+    slate_main_io_control("c10-06");
+}
+
+#[test]
+fn slate_c10_14_tokio_sync_io() {
+    slate_main_io_control("c10-14");
+}
+
+// ATTRIBUTION GAP: Tokio fs exposes task-level Result, not blocking-worker
+// per-syscall errno. An async task ID is not a blocking-pool TID.
+// A task completing before correct stored bytes, blocking-pool attribution loss or timeout falsifies the target. Do not assume async tasks equal OS threads or that runtime worker count bounds blocking threads.
+// Watch task/path/payload, Results, independent bytes and lifecycle diagnostics.
+// A passing bounded run is NOT proof of blocking-pool syscall attribution.
+#[test]
+fn slate_c10_15_tokio_async_roundtrip() {
+    slate_main_io_control("c10-15");
+}
+
+fn slate_evidence() -> Option<PathBuf> {
+    let evidence = input("UMBRA_SLATE_EVIDENCE")?;
+    if declared_probe().is_some() {
+        eprintln!("SKIP: slate characterization requires unmutated production");
+        return None;
+    }
+    Some(PathBuf::from(evidence))
+}
+
+fn slate_main_io_control(case: &str) {
+    let payload: &[u8] = match case {
+        "c10-03" => b"HELPER",
+        "c10-14" => b"RUNTIME",
+        "c10-15" => b"ASYNC",
+        _ => b"MAIN",
+    };
+    let expected = slate_expected_files(case, payload);
+    let Some(evidence) = slate_evidence() else {
+        return;
+    };
+    let evidence = evidence.join(case);
+    std::fs::create_dir_all(&evidence).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let program = if matches!(case, "c10-14" | "c10-15") {
+        let target = evidence.parent().unwrap().join("tokio-target");
+        let built = slate_bounded(
+            Command::new("cargo")
+                .args(["build", "--locked", "--manifest-path"])
+                .arg(repository().join("experiments/fixtures/slate-r10-tokio/Cargo.toml"))
+                .arg("--target-dir")
+                .arg(&target)
+                .args(["--bin", "slate-r10-tokio"]),
+            &evidence.join("fixture-build"),
+        );
+        assert!(built.status.success(), "fixture build prerequisite failed");
+        target.join("debug/slate-r10-tokio")
+    } else {
+        fixture_binary(
+            scratch.path(),
+            "umbra-userspace-threads",
+            "UMBRA_THREADS_PATH",
+        )
+    };
+    let native = scratch.path().join("native");
+    std::fs::create_dir(&native).unwrap();
+    std::fs::write(native.join("seed.txt"), b"ABCDEF").unwrap();
+    let output = slate_bounded(
+        Command::new(&program)
+            .arg(case)
+            .arg(native.join("seed.txt"))
+            .arg(native.join("out.txt"))
+            .arg(native.join("records")),
+        &evidence.join("native"),
+    );
+    assert!(output.status.success());
+    for (name, bytes) in &expected {
+        assert_eq!(
+            std::fs::read(native.join(name)).unwrap(),
+            *bytes,
+            "native {name}"
+        );
+    }
+    let records = std::fs::read(native.join("records")).unwrap();
+    std::fs::write(evidence.join("native.records"), &records).unwrap();
+    if matches!(case, "c10-04" | "c10-05" | "c10-06") {
+        slate_team_records(&records, case);
+    } else if matches!(case, "c10-14" | "c10-15") {
+        slate_tokio_records(&records, case);
+    } else {
+        slate_control_records(&records, payload);
+    }
+    if case == "c10-03" {
+        slate_helper_io_records(&records);
+    }
+    if case == "c10-02" {
+        slate_blocking_handoff_records(&records);
+    }
+    let (host, port) = fixture().expect("live Ganesha required; no skipped qualification");
+    let workspace = scratch.path().join("workspace");
+    let state = scratch.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"ABCDEF").unwrap();
+    let registry = registry(scratch.path(), &host, port);
+    assert_no_nfs_mount(&host, port, &[&workspace], "slate before");
+    let output = slate_bounded(
+        Command::new(binaries().join("umbra"))
+            .args(["run", "--registry"])
+            .arg(&registry)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["--experimental", "--"])
+            .arg(&program)
+            .arg(case)
+            .arg(workspace.join("seed.txt"))
+            .arg(workspace.join("out.txt"))
+            .arg(workspace.join("records")),
+        &evidence.join("routed"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let id = stderr
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("umbra: run ")
+                .and_then(|v| v.strip_suffix(" prepared"))
+        })
+        .expect("prepared run");
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+        status: output.status.code(),
+        stderr,
+        destination: workspace.join("out.txt"),
+        state,
+        workspace,
+        registry,
+    };
+    assert_eq!(run.status, Some(0), "{}", run.stderr);
+    assert_eq!(run.child_exit(), 0);
+    let mut verified = String::new();
+    for (name, bytes) in &expected {
+        let mut path = shadow_path(&run);
+        *path.last_mut().unwrap() = name.as_bytes().to_vec();
+        assert_eq!(
+            read_through_client(&host, port, &path).expect(name),
+            *bytes,
+            "NFS {name}"
+        );
+        assert_eq!(
+            stored_size_through_client(&host, port, &path),
+            Some(bytes.len() as u64)
+        );
+        verified.push_str(&format!(
+            "{name} bytes={} length={}\n",
+            String::from_utf8_lossy(bytes),
+            bytes.len()
+        ));
+    }
+    std::fs::write(evidence.join("per-file-oracles.txt"), &verified).unwrap();
+    let mut path = shadow_path(&run);
+    *path.last_mut().unwrap() = b"records".to_vec();
+    let records = read_whole_object_through_client(&host, port, &path).expect("record object");
+    std::fs::write(evidence.join("routed.records"), &records).unwrap();
+    if matches!(case, "c10-04" | "c10-05" | "c10-06") {
+        slate_team_records(&records, case);
+    } else if matches!(case, "c10-14" | "c10-15") {
+        slate_tokio_records(&records, case);
+    } else {
+        slate_control_records(&records, payload);
+    }
+    if case == "c10-03" {
+        slate_helper_io_records(&records);
+    }
+    if case == "c10-02" {
+        slate_blocking_handoff_records(&records);
+    }
+    assert!(journal_records_completion(&run));
+    // Separate writer-authority witness: resume acquires with TakeoverPolicy::Refuse.
+    // Do not inspect the backend's private marker representation.
+    let reopened = slate_bounded(
+        Command::new(binaries().join("umbra"))
+            .args(["resume", "--registry"])
+            .arg(&run.registry)
+            .arg("--workspace")
+            .arg(&run.workspace)
+            .arg("--state-dir")
+            .arg(&run.state)
+            .arg(run.run_id.0.to_string()),
+        &evidence.join("reopen"),
+    );
+    assert!(reopened.status.success());
+    assert!(String::from_utf8_lossy(&reopened.stderr).contains("requires no reconciliation"));
+    std::fs::write(
+        evidence.join("writer-authority.txt"),
+        format!(
+            "resume_status={} stderr_match=requires no reconciliation\n",
+            reopened.status
+        ),
+    )
+    .unwrap();
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+    assert_eq!(
+        std::fs::read(run.workspace.join("seed.txt")).unwrap(),
+        b"ABCDEF"
+    );
+    assert_no_nfs_mount(&host, port, &[&run.workspace], "slate after");
+    std::fs::write(evidence.join("oracles.txt"), format!("native_tracee=0 native_supervisor=not-applicable\nrouted_supervisor={:?} routed_tracee={}\nNFS verified_files={} journal=RunCompleted host=pristine host_allowance=empty run_id={}\n", run.status, run.child_exit(), expected.len(), run.run_id.0)).unwrap();
+    slate_finish_cleanup();
+}
+fn slate_control_records(bytes: &[u8], payload: &[u8]) {
+    let text = std::str::from_utf8(bytes).unwrap();
+    assert!(text.starts_with("phase=complete tid="));
+    assert!(text.contains(&format!(
+        "input=ABCDEF output={} length={}",
+        String::from_utf8_lossy(payload),
+        payload.len()
+    )));
+    for line in text.lines().skip(1) {
+        assert!(line.ends_with("errno=0"), "{line}");
+    }
+    assert!(text.contains("open-input "));
+    assert!(text.contains("open-output "));
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("close 0 ")).count(),
+        2
+    );
+    for (name, total) in [("read", 6), ("write", payload.len() as i64)] {
+        let n: i64 = text
+            .lines()
+            .filter_map(|l| l.strip_prefix(&format!("{name} ")))
+            .map(|l| l.split_whitespace().next().unwrap().parse::<i64>().unwrap())
+            .inspect(|n| assert!(*n > 0))
+            .sum();
+        assert_eq!(n, total);
+    }
+}
+
+// Main acquired the helper's mutex after wait entry while the release predicate
+// was false. This excludes an already-ready wait, without claiming kernel sleep
+// duration or excluding spurious wakeups (which the fixture counts and loops).
+fn slate_blocking_handoff_records(bytes: &[u8]) {
+    let text = std::str::from_utf8(bytes).unwrap();
+    let header = text.lines().next().unwrap();
+    let field = |name: &str| -> u64 {
+        header
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .parse()
+            .unwrap()
+    };
+    assert_ne!(field("tid"), field("helper_tid"));
+    assert_ne!(field("helper_tid"), 0);
+    assert_eq!(field("ready"), 1);
+    assert!(field("waits_before_io") >= 1);
+    assert!(field("wait_calls") >= field("waits_before_io"));
+    assert_eq!(field("wait_returns"), field("wait_calls"));
+    assert_eq!(field("finished_before_release"), 0);
+    assert_eq!(field("finished_after_join"), 1);
+}
+
+fn slate_helper_io_records(bytes: &[u8]) {
+    let text = std::str::from_utf8(bytes).unwrap();
+    let field = |line: &str, key: &str| -> u64 {
+        line.split_whitespace()
+            .find_map(|s| s.strip_prefix(&format!("{key}=")))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let header = text.lines().next().unwrap();
+    let helper = field(header, "io_tid");
+    assert_ne!(helper, 0);
+    assert_ne!(helper, field(header, "tid"));
+    assert_eq!(field(header, "helper_entered"), 1);
+    assert_eq!(field(header, "helper_done"), 1);
+    assert!(field(header, "main_waits") >= 1);
+    for line in text.lines().skip(1) {
+        assert_eq!(field(line, "tid"), helper);
+    }
+}
+
+fn slate_expected_files(case: &str, payload: &[u8]) -> Vec<(String, Vec<u8>)> {
+    if matches!(case, "c10-04" | "c10-05") {
+        (0..4)
+            .flat_map(|round| {
+                ['M', 'H'].map(move |role| {
+                    let bytes = if case == "c10-04" {
+                        format!("{role}{round:02}")
+                    } else {
+                        format!("{}{round:02}", if role == 'M' { "MAIN" } else { "HELPER" })
+                    };
+                    (format!("out.txt.{role}{round:02}"), bytes.into_bytes())
+                })
+            })
+            .collect()
+    } else {
+        vec![(
+            "out.txt".into(),
+            if case == "c10-06" {
+                b"AABBBC".to_vec()
+            } else {
+                payload.to_vec()
+            },
+        )]
+    }
+}
+fn slate_team_records(bytes: &[u8], case: &str) {
+    let text = std::str::from_utf8(bytes).unwrap();
+    let mut lines = text.lines();
+    let header = lines.next().unwrap();
+    assert!(header.starts_with("phase=complete "));
+    let field = |line: &str, key: &str| -> i64 {
+        line.split_whitespace()
+            .find_map(|v| v.strip_prefix(&format!("{key}=")))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let main = field(header, "main_tid");
+    let helper = field(header, "helper_tid");
+    assert!(main > 0 && helper > 0 && main != helper);
+    assert_eq!(field(header, "joined"), 1);
+    assert_eq!(field(header, "mode"), case[4..].parse::<i64>().unwrap());
+    assert_eq!(
+        field(header, "barrier_generations"),
+        if case == "c10-05" { 9 } else { 1 }
+    );
+    assert_eq!(
+        field(header, "turn"),
+        match case {
+            "c10-04" => 8,
+            "c10-06" => 2,
+            _ => 0,
+        }
+    );
+    let rows: Vec<_> = lines.collect();
+    for line in &rows {
+        assert_eq!(field(line, "errno"), 0);
+        assert_eq!(
+            field(line, "tid"),
+            if line.contains("role=M") {
+                main
+            } else {
+                helper
+            }
+        );
+    }
+    if case == "c10-06" {
+        assert_eq!(rows.len(), 5);
+        let opens: Vec<_> = rows
+            .iter()
+            .filter(|l| l.starts_with("open-output "))
+            .collect();
+        assert_eq!(opens.len(), 1);
+        let fd = field(opens[0], "fd");
+        assert!(fd >= 0);
+        for row in &rows {
+            assert_eq!(field(row, "fd"), fd);
+        }
+        for (round, role, n) in [(0, "M", 2), (1, "H", 3), (2, "M", 1)] {
+            let writes: Vec<_> = rows
+                .iter()
+                .filter(|l| l.starts_with("write ") && field(l, "round") == round)
+                .collect();
+            assert_eq!(writes.len(), 1);
+            assert!(writes[0].contains(&format!("role={role}")));
+            assert_eq!(
+                writes[0]
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap(),
+                n
+            );
+        }
+        assert_eq!(
+            rows.iter()
+                .filter(|l| l.starts_with("close 0 ")
+                    && l.contains("role=M")
+                    && field(l, "round") == 2)
+                .count(),
+            1
+        );
+    } else {
+        assert_eq!(rows.len(), 24);
+        for round in 0..4 {
+            for role in ["M", "H"] {
+                let group: Vec<_> = rows
+                    .iter()
+                    .filter(|l| field(l, "round") == round && l.contains(&format!("role={role}")))
+                    .collect();
+                assert_eq!(group.len(), 3);
+                assert!(group[0].starts_with("open-output "));
+                assert!(group[1].starts_with("write "));
+                assert!(group[2].starts_with("close 0 "));
+                let fd = field(group[0], "fd");
+                assert!(fd >= 0);
+                assert_eq!(field(group[1], "fd"), fd);
+                assert_eq!(field(group[2], "fd"), fd);
+                let expected = if case == "c10-04" {
+                    3
+                } else if role == "M" {
+                    6
+                } else {
+                    8
+                };
+                assert_eq!(
+                    group[1]
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .parse::<i64>()
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+// RUNTIME-WITNESS LIMITATION: a bypassed guard emitting a matching diagnostic
+// could satisfy the behavioural half. Even paired with the unchanged structural
+// test, this does NOT prove the guard fired at the guarded instruction.
+// Classification ceiling: CHARACTERIZED REFUSAL WITH A RECORDED RUNTIME-WITNESS LIMITATION.
+#[test]
+fn slate_c10_10_fork_helper_refusal() {
+    let Some(evidence) = slate_evidence() else {
+        return;
+    };
+    let evidence = evidence.join("c10-10");
+    std::fs::create_dir_all(&evidence).unwrap();
+    let native_source = repository().join("crates/umbra-platform-macos/src/native.rs");
+    let digest = Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .arg(&native_source)
+        .output()
+        .expect("compute native.rs SHA-256 prerequisite");
+    assert!(
+        digest.status.success(),
+        "native.rs SHA-256 prerequisite failed"
+    );
+    assert_eq!(
+        String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
+        Some("81e1cd50c79f3af62cd6c07f295844d48f49d2155588e992524e7ed96281c66d"),
+        "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
+    );
+    // Compile is a prerequisite, not part of the 60-second execution window.
+    let build = Command::new("cargo")
+        .current_dir(repository())
+        .args([
+            "test",
+            "-p",
+            "umbra-platform-macos",
+            "--lib",
+            "--no-run",
+            "--message-format=json",
+        ])
+        .output()
+        .expect("guard target build");
+    std::fs::write(evidence.join("guard-build.stdout"), &build.stdout).unwrap();
+    std::fs::write(evidence.join("guard-build.stderr"), &build.stderr).unwrap();
+    assert!(build.status.success(), "guard build prerequisite failed");
+    let executable = String::from_utf8(build.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|row| {
+            (row["reason"] == "compiler-artifact"
+                && row["profile"]["test"] == true
+                && row["target"]["name"] == "umbra_platform_macos")
+                .then(|| row["executable"].as_str().map(PathBuf::from))
+                .flatten()
+        })
+        .expect("guard test executable");
+    let guard = slate_bounded(
+        Command::new(executable).args([
+            "the_fork_and_park_paths_still_refuse_a_multithreaded_tracee",
+            "--nocapture",
+        ]),
+        &evidence.join("guard"),
+    );
+    assert!(guard.status.success());
+    assert!(String::from_utf8_lossy(&guard.stdout).contains("1 passed"));
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(
+        scratch.path(),
+        "umbra-userspace-threads",
+        "UMBRA_THREADS_PATH",
+    );
+    let native = scratch.path().join("native");
+    std::fs::create_dir(&native).unwrap();
+    let control = slate_bounded(
+        Command::new(&program)
+            .arg("c10-10")
+            .arg(native.join("seed.txt"))
+            .arg(native.join("out.txt"))
+            .arg(native.join("records")),
+        &evidence.join("native"),
+    );
+    assert!(control.status.success());
+    let child = b"C10-10-CHILD-WRITE-ATTEMPT\n";
+    assert_eq!(std::fs::read(native.join("out.txt")).unwrap(), child);
+    let ready = std::fs::read(native.join("records")).unwrap();
+    slate_fork_ready(&ready);
+    let done = std::fs::read(native.join("records.done")).unwrap();
+    assert!(String::from_utf8_lossy(&done).contains("child_exit=0 joined=1"));
+    std::fs::write(evidence.join("native.ready"), ready).unwrap();
+    std::fs::write(evidence.join("native.done"), done).unwrap();
+    std::fs::write(evidence.join("native.child"), child).unwrap();
+    let (host, port) = fixture().expect("live Ganesha");
+    let workspace = scratch.path().join("workspace");
+    let state = scratch.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"ABCDEF").unwrap();
+    let registry = registry(scratch.path(), &host, port);
+    assert_no_nfs_mount(&host, port, &[&workspace], "fork before");
+    let output = slate_bounded(
+        Command::new(binaries().join("umbra"))
+            .args(["run", "--registry"])
+            .arg(&registry)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["--experimental", "--"])
+            .arg(&program)
+            .arg("c10-10")
+            .arg(workspace.join("seed.txt"))
+            .arg(workspace.join("out.txt"))
+            .arg(workspace.join("records")),
+        &evidence.join("routed"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let id = stderr
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("umbra: run ")
+                .and_then(|s| s.strip_suffix(" prepared"))
+        })
+        .expect("prepared run");
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+        status: output.status.code(),
+        stderr,
+        destination: workspace.join("out.txt"),
+        workspace,
+        state,
+        registry,
+    };
+    let shadow = shadow_path(&run);
+    let child_absent = read_through_client(&host, port, &shadow).is_none();
+    let mut path = shadow.clone();
+    *path.last_mut().unwrap() = b"records".to_vec();
+    let ready = read_whole_object_through_client(&host, port, &path).expect("pre-fork readiness");
+    std::fs::write(evidence.join("routed.ready"), &ready).unwrap();
+    slate_fork_ready(&ready);
+    *path.last_mut().unwrap() = b"records.done".to_vec();
+    let no_done = read_through_client(&host, port, &path).is_none();
+    let completed = journal_records_completion(&run);
+    std::fs::write(evidence.join("oracles.txt"),format!("supervisor={:?} tracee_status_line={:?}\nchild_shadow_absent={child_absent} child_host_absent={} post_fork_absent={no_done} journal_completed={completed} run_id={}\n",run.status,run.stderr.lines().find(|l|l.contains("finished:")),!run.destination.exists(),run.run_id.0)).unwrap();
+    assert!(run
+        .stderr
+        .contains("fork/deferred wait requires one thread"));
+    assert_ne!(run.status, Some(0));
+    assert!(!run.stderr.contains("finished:"));
+    assert!(child_absent && !run.destination.exists() && no_done);
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+    assert_eq!(
+        std::fs::read(run.workspace.join("seed.txt")).unwrap(),
+        b"ABCDEF"
+    );
+    assert_no_nfs_mount(&host, port, &[&run.workspace], "fork after");
+    // Observe reopen separately; refusal runs need not be journalled complete.
+    let reopened = slate_bounded(
+        Command::new(binaries().join("umbra"))
+            .args(["resume", "--registry"])
+            .arg(&run.registry)
+            .arg("--workspace")
+            .arg(&run.workspace)
+            .arg("--state-dir")
+            .arg(&run.state)
+            .arg(run.run_id.0.to_string()),
+        &evidence.join("reopen"),
+    );
+    std::fs::write(
+        evidence.join("writer-authority.txt"),
+        format!(
+            "resume_status={}\n{}",
+            reopened.status,
+            String::from_utf8_lossy(&reopened.stderr)
+        ),
+    )
+    .unwrap();
+    assert!(reopened.status.success(), "writer authority reopen failed");
+    slate_finish_cleanup();
+}
+fn slate_fork_ready(bytes: &[u8]) {
+    let s = std::str::from_utf8(bytes).unwrap();
+    assert!(s.starts_with("phase=pre-fork ") && s.ends_with("finished=0\n"));
+    let field = |key: &str| -> u64 {
+        s.split_whitespace()
+            .find_map(|x| x.strip_prefix(&format!("{key}=")))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert_ne!(field("main_tid"), field("helper_tid"));
+    assert!(field("helper_tid") > 0);
+    assert_eq!(field("ready"), 1);
+    assert!(field("waits") >= 1);
+}
+
+fn slate_tokio_records(bytes: &[u8], case: &str) {
+    let text = std::str::from_utf8(bytes).unwrap();
+    let header = text.lines().next().unwrap();
+    let field = |key: &str| -> u64 {
+        header
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix(&format!("{key}=")))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert!(header.starts_with("phase=complete "));
+    let ids = [
+        field("tid"),
+        field("main_tid"),
+        field("worker0"),
+        field("worker1"),
+    ];
+    assert!(ids.iter().all(|id| *id > 0));
+    assert_eq!(
+        ids.into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4
+    );
+    assert_eq!(field("workers_ready"), 2);
+    assert_eq!(field("workers_still_alive"), 2);
+    assert!(text.ends_with("owner_joined=1\n"));
+    if case == "c10-14" {
+        assert!(header.contains("output=RUNTIME length=7"));
+        let rows: Vec<_> = text
+            .lines()
+            .skip(1)
+            .filter(|l| !l.starts_with("owner_joined"))
+            .collect();
+        for row in &rows {
+            assert!(row.contains(&format!("tid={} ", field("tid"))));
+            assert!(row.ends_with("errno=0"));
+        }
+        assert_eq!(rows.iter().filter(|r| r.starts_with("close 0 ")).count(), 2);
+        for (op, total) in [("read", 6), ("write", 7)] {
+            let n: i64 = rows
+                .iter()
+                .filter(|r| r.starts_with(&format!("{op} ")))
+                .map(|r| r.split_whitespace().nth(1).unwrap().parse::<i64>().unwrap())
+                .inspect(|n| assert!(*n > 0))
+                .sum();
+            assert_eq!(n, total);
+        }
+    } else {
+        assert!(header.contains("output=ASYNC length=5"));
+        let rows: Vec<_> = text
+            .lines()
+            .skip(1)
+            .filter(|l| !l.starts_with("owner_joined"))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].starts_with("dispatch task=roundtrip operation=write path="));
+        assert!(rows[0].contains("out.txt"));
+        assert!(rows[1].starts_with("result task=roundtrip operation=write value=Ok(())"));
+        assert!(rows[2]
+            .starts_with("result task=roundtrip operation=read value=Ok([65, 83, 89, 78, 67])"));
+        for row in &rows {
+            assert!(row.ends_with(&format!("poll_tid={}", field("tid"))));
+        }
+    }
+}
