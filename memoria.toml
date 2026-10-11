@@ -36,6 +36,7 @@ ignore = [
     "slate-rank*.md",
     "review-*.md",
     "audit-comment*.md",
+    "knowledge/umbra/codex-ideation-*.md",
 ]
 include = []
 
