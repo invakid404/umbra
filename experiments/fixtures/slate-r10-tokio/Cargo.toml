@@ -1,0 +1,14 @@
+[package]
+name = "slate-r10-tokio"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "slate-r10-tokio"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "=1.48.0", default-features = false, features = ["rt-multi-thread", "sync", "fs"] }
