@@ -15,8 +15,8 @@ jobs:
           persist-credentials: false
       - name: Set up Memoria
         id: memoria
-        uses: viktordanov/rs-memoria@1eaf0bd9947872643542931409980bc276aca9b0
+        uses: viktordanov/rs-memoria@v0.9.2
         with:
-          version: '0.8.0'
+          version: '0.9.2'
       - run: memoria --version
       - run: memoria check
