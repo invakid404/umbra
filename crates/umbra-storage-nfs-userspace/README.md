@@ -1070,7 +1070,6 @@ adapter uses and `tests/goldens/retry-*.json` pins. An exact-key retry is
 answered from its record and never re-dispatched; an outcome whose server-side
 disposition is unknown is left unsettled rather than recorded as a failure a
 later retry would trust. Reads are not journalled.
-<!-- /memoria:section -->
 
 An **interrupted** intent is recovered rather than stalled. Beside each record,
 `.provider/retries/pre-<hex>` holds the object and parent identities the mutation
@@ -1123,6 +1122,7 @@ under other keys are untouched by either, and a blocked recovery and a latched
 write failure are terminal states rather than obligations, so neither is ever
 discharged. A run whose obligations are all discharged mutates and releases
 normally again; one still holding any of them does neither.
+<!-- /memoria:section -->
 
 Records are read in bounded chunks to end of file and written in as many round
 trips as the server needs, because a short `READ` or `WRITE` is a legal answer

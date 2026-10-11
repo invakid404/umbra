@@ -57,7 +57,6 @@ the boundary reached is the client fsync.
 Construction does not mount anything. `NfsStorage::new` retains the config and
 defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
 
-<!-- memoria:section id="public-api" files="src/lib.rs" -->
 ## Public API
 
 - `NfsStorage::new(NfsStorageConfig)` — lazy, retains config; validation
@@ -68,7 +67,6 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
 - `NfsStorageConfig { mount_root, run_parent, root_anchor, control_anchor }`
   with `NfsStorageConfig::new(mount)` and
   `NfsStorageConfig::from_options(json_bytes)` for the provider handshake.
-<!-- /memoria:section -->
 
 <!-- memoria:section id="shipped-behavior" files="src/operations.rs src/mount.rs src/native.rs" guidance="../../docs/guides/reviewing-provider-ops.md" -->
 ## Shipped behavior
