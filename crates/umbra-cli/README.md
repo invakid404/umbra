@@ -36,6 +36,7 @@ confirmation, reads stdin for setup, invokes `sudo`, runs an installer, mounts
 anything, or falls back from the requested storage to something weaker. stdin
 belongs to the supervised program; the CLI's own tests run with it closed.
 
+<!-- memoria:section id="selecting-a-run" files="src/commands/**" -->
 ## Selecting a run
 
 `--registry` is required and is the single source of storage configuration.
@@ -97,7 +98,9 @@ variable and `--inherit-env NAME` forwards one from the caller, failing if it is
 unset rather than passing an empty value. Repeated names across either flag are
 rejected, so the child never receives duplicate environment entries. The supervisor
 adds `TMPDIR`.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="exit-codes-and-streams" files="src/main.rs src/lib.rs" -->
 ## Exit codes and streams
 
 Clap usage diagnostics exit 2. Every structured failure exits 1, including a
@@ -114,6 +117,7 @@ stdin and stdout on `/dev/null` and stderr inherited
 therefore reaches the caller and its stdout is discarded — `/bin/cat` under
 `umbra run` exits 0 and prints nothing. Plumbing the tracee's stdout through to
 the caller is unimplemented.
+<!-- /memoria:section -->
 
 ## Compatibility changes
 
@@ -121,6 +125,7 @@ the caller is unimplemented.
 route. `--storage-root` no longer defaults to `.umbra` and is rejected outright by
 `run` rather than silently ignored, since storage lives in the registry.
 
+<!-- memoria:section id="composition" files="src/composition.rs" -->
 ## Composition
 
 `composition::load_registry(path)` performs a bounded read, decode and validate.
@@ -138,6 +143,7 @@ supervisor does not yet route a run to a configured namespace provider — see
 `umbra providers --registry PATH [--role ROLE]` validates installed provider
 connections and starts trusted provider processes but no tracees. See
 [registry configuration](../../docs/providers.md).
+<!-- /memoria:section -->
 
 ```sh
 cargo check -p umbra-cli

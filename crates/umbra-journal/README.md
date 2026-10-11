@@ -6,6 +6,7 @@ journal-file I/O, CRC implementation, storage backend or lease service.
 Its `provider` module implements the journal server harness and IPC proxy.
 The workspace uses edition 2021 and pins Rust 1.98.1 for build validation.
 
+<!-- memoria:section id="public-contract" files="src/lib.rs" -->
 ## Public contract
 
 ```rust
@@ -54,7 +55,9 @@ publishes both an immutable snapshot and its reference, in that order. Checkpoin
 contain logical state and version/base/toolchain fingerprints, independent of mount
 roots and process memory. Recovery selects the last valid checkpoint and validated
 subsequent frames; it must not select a partially published checkpoint.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="recovery-leases-and-clean-handoff" files="src/provider.rs" -->
 ## Recovery, leases and clean handoff
 
 The supervisor supplies the runtime control-directory binding obtained from storage.
@@ -81,6 +84,7 @@ marker. Only then release the fenced lease. Journal success alone cannot establi
 clean handoff. Resume validates base/toolchain/agent/supervisor compatibility,
 obtains safe exclusive authority, reconstructs logical state at the new runtime
 mount root, and launches a new agent process; there is no live process migration.
+<!-- /memoria:section -->
 
 ## Adding a new journal backend
 

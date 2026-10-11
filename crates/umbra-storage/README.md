@@ -133,6 +133,7 @@ must reject that capability.
    the backend qualifies for strict remote persistence and record the tested
    service/deployment assumptions; local tests cannot establish NFS durability.
 
+<!-- memoria:section id="who-the-writer-is" files="src/provider.rs" -->
 ## Who the writer is
 
 `RunBinding::admitted_writer` reports the writer identity a backend has
@@ -151,6 +152,7 @@ that writer never obtained.
 So a caller receiving `Some` must acquire under exactly that identity. The field
 is `#[serde(default)]`, so a provider that does not send it decodes as `None` --
 which is also the right answer for every backend that admits late.
+<!-- /memoria:section -->
 
 ## Proxy capabilities move when a run opens
 

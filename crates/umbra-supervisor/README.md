@@ -130,6 +130,7 @@ boundary and scheduled at half the lease interval, with a 100 ms floor.
 Configurations are rejected when the provider timeout consumes half the lease
 or the floored interval leaves no timeout headroom before expiry.
 
+<!-- memoria:section id="event-loop" files="src/events.rs" -->
 ## Event loop
 
 `Supervisor::launch_prepared` takes ownership of the stopped tree.
@@ -231,7 +232,9 @@ process count, and duplicate exits do not count twice.
 `Supervisor::new` and `with_namespace` take `Option<Box<dyn Agent>>`; a raw
 command run has no adapter. Construction still performs no I/O and starts in
 `RunLifecycle::Created`.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="routed-runs" files="src/run.rs src/directory.rs" -->
 ## Routed runs
 
 A run whose storage exposes no kernel-visible path cannot have its tracee's file
@@ -273,7 +276,9 @@ Reopening on another host is therefore refused rather than attempted: it needs
 the store *and* the log, and the log is on the host that created the run. Moving
 it into the store needs `JournalControlBinding` to carry something other than a
 `PhysicalPath`.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="sandbox" files="src/sandbox.rs" -->
 ## Sandbox
 
 `sandbox::render` embeds `experiments/seatbelt/umbra.sb` with `include_str!` and
@@ -283,7 +288,9 @@ separators, control characters and non-UTF-8 bytes, and escapes quotes and
 backslashes. The module is pure: it validates representation only. Preparation
 resolves the run root first, because Seatbelt matches `subpath` against resolved
 paths. Installation belongs to the platform backend.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="base" files="src/base.rs" -->
 ## Base
 
 `base::WorkspaceInventory` walks the approved workspace with bounded, safe
@@ -305,6 +312,7 @@ the namespace predicted. That equivalence holds only while the base is the host.
 whiteout-hidden target does not take this branch: the namespace resolves it to
 `Deny` instead, which the supervisor emulates, so the host object the whiteout
 hides is never revealed.
+<!-- /memoria:section -->
 
 ```sh
 cargo check -p umbra-supervisor

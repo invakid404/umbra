@@ -53,6 +53,16 @@ guidance = [
     "Prefer short sections with clear takeaways and progressive detail over long walls. Explain each term the first time it appears. Number multi-step procedures.",
 ]
 guidance_files = []
+# Section guides are reusable review checklists that a section can bind via
+# `guidance="…"` on its marker. They add to project guidance for the sections
+# that cite them. They are not project guidance themselves and must not be
+# listed under `guidance_files` above.
+section_guidance_files = [
+    "docs/guides/reviewing-provider-ops.md",
+    "docs/guides/reviewing-syscall-coverage.md",
+    "docs/guides/reviewing-provider-binary.md",
+    "docs/guides/reviewing-test-sections.md",
+]
 
 [fingerprints]
 default = "raw"
