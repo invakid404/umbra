@@ -141,7 +141,7 @@ The M1 mechanisms named in the tracker spec are all present:
     `a_failed_exec_does_not_leave_a_later_fork_pointed_at_an_image_the_tracee_never_ran`.
 <!-- /memoria:section -->
 
-<!-- memoria:section id="what-interception-does-not-cover" files="src/unsupported.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->
+<!-- memoria:section id="what-interception-does-not-cover" files="src/abi.rs src/interpose.rs src/native.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->
 ## What interception does not cover
 
 Stated here rather than implied, because two of these are architectural and a

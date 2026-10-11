@@ -130,7 +130,7 @@ boundary and scheduled at half the lease interval, with a 100 ms floor.
 Configurations are rejected when the provider timeout consumes half the lease
 or the floored interval leaves no timeout headroom before expiry.
 
-<!-- memoria:section id="event-loop" files="src/events.rs" -->
+<!-- memoria:section id="event-loop" files="src/events.rs src/lib.rs" -->
 ## Event loop
 
 `Supervisor::launch_prepared` takes ownership of the stopped tree.

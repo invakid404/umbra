@@ -111,13 +111,6 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
     atomic exchange; native exchange is implemented but cannot be advertised
     for an unqualified export.* Native code is retained for future
     qualification.
-- **Writer authority**: `acquire_writer` / `renew_writer` / `release_writer`
-  use a 60-second lease with epoch fencing via `.provider/writer.lock`
-  and `.provider/epoch`. Takeover is refused; epoch checks do not fence
-  existing kernel descriptors or mappings. Exact retries with the same
-  idempotency key recover recorded results from `.provider/retries`;
-  reusing an operation ID with a different key is rejected, and incomplete
-  intents require reconciliation.
 - **Persistence barrier** (`src/native.rs::flush`): blocking `flush()` supports
   only `FlushScope::EntireRun`; object scopes return `UnsupportedCapability`
   before I/O. It synchronizes regular files, directories after their children
@@ -152,6 +145,18 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
   and recovery across process restart still require supervisor integration;
   a fresh tree walk cannot recover already-lost writes. Same-device bind mounts
   and server failover/storage configuration are not independently qualified.
+<!-- /memoria:section -->
+
+<!-- memoria:section id="writer-authority" files="src/lib.rs" -->
+## Writer authority and runtime config
+
+- **Writer authority**: `acquire_writer` / `renew_writer` / `release_writer`
+  use a 60-second lease with epoch fencing via `.provider/writer.lock`
+  and `.provider/epoch`. Takeover is refused; epoch checks do not fence
+  existing kernel descriptors or mappings. Exact retries with the same
+  idempotency key recover recorded results from `.provider/retries`;
+  reusing an operation ID with a different key is rejected, and incomplete
+  intents require reconciliation.
 - **Runtime config**: mount root, `run_parent`, `root_anchor`,
   `control_anchor` all flow through `NfsStorageConfig`. The mount root is
   supplied at runtime; `root`/`control` are configurable library defaults,

@@ -180,7 +180,7 @@ rather than silently desynchronising. `OpenFile::next_seqid` reads the same
 counter without creating a guard, so inspecting an owner cannot poison it.
 <!-- /memoria:section -->
 
-<!-- memoria:section id="operations" files="src/ops.rs src/crud.rs src/journal.rs" guidance="../../docs/guides/reviewing-provider-ops.md" -->
+<!-- memoria:section id="operations" files="src/ops.rs src/crud.rs src/anchor.rs src/capability.rs src/identity.rs src/pages.rs src/namespace/**" guidance="../../docs/guides/reviewing-provider-ops.md" -->
 ## Operations
 
 `src/ops.rs` is the operations surface: one typed `Storage` primitive in, one
@@ -1059,6 +1059,9 @@ that window out under a bounded budget instead of reading it as a failure.
 `authority::AdmissionControl` is bound: `open_run` acquires admission and
 `close_run` releases it.
 
+<!-- memoria:section id="durable-replay" files="src/journal.rs" guidance="../../docs/guides/reviewing-provider-ops.md" -->
+### Durable replay
+
 Durable replay is bound too. Every supported mutation `execute` dispatches goes
 through [`journal`](src/journal.rs) first: the exact request is recorded in
 `.provider/retries/key-<hex>` before the operation reaches the wire, and the
@@ -1067,6 +1070,7 @@ adapter uses and `tests/goldens/retry-*.json` pins. An exact-key retry is
 answered from its record and never re-dispatched; an outcome whose server-side
 disposition is unknown is left unsettled rather than recorded as a failure a
 later retry would trust. Reads are not journalled.
+<!-- /memoria:section -->
 
 An **interrupted** intent is recovered rather than stalled. Beside each record,
 `.provider/retries/pre-<hex>` holds the object and parent identities the mutation
