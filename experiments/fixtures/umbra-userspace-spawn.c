@@ -376,6 +376,10 @@ static int e8(const char *root, const char *helper) {
             }
             for (int i = 0; i < 3; i++) {
                 if (stream[i].fd != wait[j].fd) continue;
+                /* A full buffer is more output than any E8 echo produces: a
+                 * fixture error, never EOF (a zero-length read would look
+                 * like one and leave the child blocked on a full pipe). */
+                if (stream[i].length == sizeof stream[i].bytes - 1) return 67;
                 ssize_t n = read(stream[i].fd, stream[i].bytes + stream[i].length,
                                  sizeof stream[i].bytes - 1 - stream[i].length);
                 if (n < 0 && errno == EINTR) continue;

@@ -8251,7 +8251,10 @@ fn slate_launch(
     std::fs::write(evidence.with_extension("census.jsonl"), "").unwrap();
     let mut watched = SlateWatchState::default();
     if let Some(watch) = watch {
-        std::fs::create_dir_all(&watch.signals).unwrap();
+        // The observer appends and every reader decodes the whole directory,
+        // so records left by an earlier launch against this evidence root
+        // would count as this one's.
+        slate_fresh_dir(&watch.signals);
         if let Some(observer) = &watch.observer {
             command
                 .env("DYLD_INSERT_LIBRARIES", observer)
@@ -8586,7 +8589,11 @@ impl SlateWatchState {
             return Ok(());
         }
         let text = String::from_utf8_lossy(stdout);
-        let announced: Vec<i32> = text
+        // Only newline-terminated lines: a read can end mid-announcement, and
+        // a partial `ledger pid=12` would be counted as announced and never
+        // re-read once the rest of the number arrives.
+        let complete = text.rfind('\n').map_or("", |end| &text[..end]);
+        let announced: Vec<i32> = complete
             .lines()
             .filter_map(|l| l.strip_prefix("ledger pid="))
             .map(|v| v.trim().parse().unwrap())
@@ -8776,6 +8783,16 @@ fn slate_processes() -> Result<Vec<SlateProcess>, String> {
         }
     }
     Ok(found)
+}
+
+/// An empty directory at `path`, whatever an earlier run left there.
+fn slate_fresh_dir(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("clearing {}: {e}", path.display()),
+    }
+    std::fs::create_dir_all(path).unwrap();
 }
 
 /// The observer dylib, compiled from `experiments/fixtures/umbra-slate-signals.c`.
@@ -10470,7 +10487,9 @@ fn slate_c11_signal_observer_qualification() {
         } else {
             "plain"
         });
-        std::fs::create_dir_all(&signals).unwrap();
+        // Fresh per run: a record from an earlier run here would be a second
+        // delivery.
+        slate_fresh_dir(&signals);
         let mut command = Command::new(&spawn.helper);
         command
             .arg("hold")
