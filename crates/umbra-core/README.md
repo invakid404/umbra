@@ -120,6 +120,7 @@ and distinct across pairs for that seed. They are opaque 128-bit values; consume
 must not rely on UUID version or variant bits. Transport retries reuse the
 already-built request context.
 
+<!-- memoria:section id="userspace-routing" files="src/namespace.rs src/provider.rs src/provider/** src/lib.rs" -->
 ## Userspace routing
 
 Three types exist for a run whose storage has no kernel-visible path, where the
@@ -147,3 +148,4 @@ not an invariant, and fencing `RLIMIT_NOFILE` -- soft *and* hard -- instead make
 the kernel's range and umbra's disjoint by construction. Lowering the hard limit
 is the load-bearing half; with only the soft limit lowered the tracee raises it
 back.
+<!-- /memoria:section -->

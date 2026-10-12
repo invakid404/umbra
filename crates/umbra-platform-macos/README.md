@@ -19,6 +19,7 @@ The RSP client (`src/rsp.rs`) is a
 small, bounded reverse-connect implementation with framed `$…#CC` packets,
 RLE decode, and a per-request deadline.
 
+<!-- memoria:section id="public-api" files="src/lib.rs" -->
 ## Public API
 
 - `MacosTraceBackend` implements `umbra_platform::TraceBackend` and
@@ -34,7 +35,9 @@ RLE decode, and a per-request deadline.
   `xcode-select -p` is consulted; it exists so the test suites can run on
   hosts whose selected Xcode keeps debugserver under `SharedFrameworks`
   rather than the `Library/PrivateFrameworks` path probed below.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="shipped-mechanisms" files="src/interpose.rs src/rsp.rs src/native.rs src/abi.rs src/cache.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->
 ## Shipped mechanisms
 
 The M1 mechanisms named in the tracker spec are all present:
@@ -136,7 +139,9 @@ The M1 mechanisms named in the tracker spec are all present:
     and, for the failed-`execve` case that must not leave a later `fork` pointed
     at an image the tracee never ran,
     `a_failed_exec_does_not_leave_a_later_fork_pointed_at_an_image_the_tracee_never_ran`.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="what-interception-does-not-cover" files="src/abi.rs src/interpose.rs src/native.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->
 ## What interception does not cover
 
 Stated here rather than implied, because two of these are architectural and a
@@ -414,7 +419,9 @@ the upper half of a register holding an `int` argument unspecified and the
 kernel's argument munger drops it, so reading all 64 bits turned legal
 `WNOHANG` callers into refused option masks. The `wnohang-wait` fixture case
 exposed that; the raw-`svc` leg with high bits set in `x2` guards it.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="provider-binary" files="src/main.rs" guidance="../../docs/guides/reviewing-provider-binary.md" -->
 ## Provider binary
 
 `src/main.rs` is the shipped provider binary. It calls
@@ -487,7 +494,9 @@ It uses the fixture env vars and prints `SKIP` if either is missing:
 UMBRA_TEST_FIXTURE_PATH=<abs> UMBRA_TEST_REDIRECT_ROOT=<abs> \
   cargo test -p umbra-platform-macos --test provider_ipc -- --nocapture
 ```
+<!-- /memoria:section -->
 
+<!-- memoria:section id="test-coverage" files="tests/**" guidance="../../docs/guides/reviewing-test-sections.md" -->
 ## Test coverage
 
 `tests/fixtures.rs` drives Track D's C fixtures through the Rust tracer.
@@ -757,6 +766,7 @@ suspend flag fails on the marker the child then leaves behind. The marker
 command is exec'd directly rather than through a shell, so a temporary
 directory containing whitespace cannot split the path and turn a regression
 into a silent pass; both mutations were re-confirmed under such a `TMPDIR`.
+<!-- /memoria:section -->
 
 
 ## Closed M2 gap: `exec-write` post-exec breakpoint loop

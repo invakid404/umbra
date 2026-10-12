@@ -68,6 +68,7 @@ by the other, and one-session-one-Umbra admission remains product-wide.
   transport facade so the M2 gate does not reopen the seam; no consumer path in
   this crate calls them.
 
+<!-- memoria:section id="the-five-facades" files="src/transport.rs src/handle.rs src/error.rs src/replay.rs src/fake.rs" -->
 ## The five facades
 
 | Facade | File | What it fixes in place |
@@ -85,7 +86,9 @@ compiled only under `transport-raw`; see [Raw transport](#raw-transport) below.
 implementation; `src/lib.rs` exports the provider id and the run-layout
 constants. `src/state/` and the operations modules consume the facades rather
 than adding to them.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="protocol-state" files="src/state.rs src/state/**" -->
 ## Protocol state
 
 `src/state/` is the client state machine: everything that makes raw RPC an NFSv4.0
@@ -175,7 +178,9 @@ section 9.1.7 rule about which failures hold it, and both an explicit `abandon`
 and an unresolved drop poison the sequence so the next caller is told to recover
 rather than silently desynchronising. `OpenFile::next_seqid` reads the same
 counter without creating a guard, so inspecting an owner cannot poison it.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="operations" files="src/ops.rs src/crud.rs src/anchor.rs src/capability.rs src/identity.rs src/pages.rs src/namespace/**" guidance="../../docs/guides/reviewing-provider-ops.md" -->
 ## Operations
 
 `src/ops.rs` is the operations surface: one typed `Storage` primitive in, one
@@ -351,7 +356,9 @@ Three things the dispatcher refuses rather than absorbs:
   The conversion is fallible and refuses before any SETATTR reaches the wire.
   Pre-epoch times still floor their seconds and carry a positive remainder,
   because `nfstime4.nseconds` is unsigned.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="raw-transport" files="src/transport/** src/pdu.rs" -->
 ## Raw transport
 
 `transport::raw::LibnfsRawTransport` implements `RawTransport` over
@@ -418,7 +425,9 @@ reply borrows C memory. They are copied with `read_unaligned`: libnfs decodes
 into a ZDR bump allocator with four-byte granularity, while `nfs_resop4` and
 `entry4` contain `uint64_t` fields, and a misaligned reference is undefined
 behaviour in Rust even where C tolerates the same address.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="joining-the-two" files="src/integration.rs" -->
 ## Joining the two
 
 `integration::StateSession` is the seam where the protocol state machine and a
@@ -442,7 +451,9 @@ build. Where a fixture is configured, `m1_conformance.rs`, `live_state.rs` and
 `fault_matrix.rs` give the provider a live `LibnfsRawTransport` instead; that live
 provider acceptance — the persistence, server-restart and failure-handling cases
 that qualify `Durability::Remote` — is done rather than deferred.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="authority-and-recovery" files="src/authority.rs src/authority/**" -->
 ## Authority and recovery
 
 `src/authority/` owns the two questions the protocol state machine deliberately
@@ -544,7 +555,9 @@ winner may be selected. `CrashWindow::SplitBrain` and `CrashWindow::HardPartitio
 stop *both* sides and record `Deferral::M3Fencing`; `CrashWindow::ServerPowerLoss`
 records `Deferral::M3Qualification`. An increasing epoch is not a fence and
 nothing here pretends otherwise.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="configuration-and-registration" files="src/lib.rs src/main.rs src/storage.rs" guidance="../../docs/guides/reviewing-provider-binary.md" -->
 ## Configuration and registration
 
 `NfsUserspaceConfig` carries the server host and port, a server-relative `export`
@@ -624,6 +637,7 @@ journal is touched*, so a request that will be refused consumes no operation id
 and leaves no record behind. `Operations::preflight` holds the rules and
 `Operations::execute` re-runs them, because a direct caller reaches that seam
 without a provider in front of it.
+<!-- /memoria:section -->
 
 ## Running a supervised command over this provider
 
@@ -1045,6 +1059,9 @@ that window out under a bounded budget instead of reading it as a failure.
 `authority::AdmissionControl` is bound: `open_run` acquires admission and
 `close_run` releases it.
 
+<!-- memoria:section id="durable-replay" files="src/journal.rs" guidance="../../docs/guides/reviewing-provider-ops.md" -->
+### Durable replay
+
 Durable replay is bound too. Every supported mutation `execute` dispatches goes
 through [`journal`](src/journal.rs) first: the exact request is recorded in
 `.provider/retries/key-<hex>` before the operation reaches the wire, and the
@@ -1105,6 +1122,7 @@ under other keys are untouched by either, and a blocked recovery and a latched
 write failure are terminal states rather than obligations, so neither is ever
 discharged. A run whose obligations are all discharged mutates and releases
 normally again; one still holding any of them does neither.
+<!-- /memoria:section -->
 
 Records are read in bounded chunks to end of file and written in as many round
 trips as the server needs, because a short `READ` or `WRITE` is a legal answer

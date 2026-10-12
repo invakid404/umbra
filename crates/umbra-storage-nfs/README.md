@@ -68,6 +68,7 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
   with `NfsStorageConfig::new(mount)` and
   `NfsStorageConfig::from_options(json_bytes)` for the provider handshake.
 
+<!-- memoria:section id="shipped-behavior" files="src/operations.rs src/mount.rs src/native.rs" guidance="../../docs/guides/reviewing-provider-ops.md" -->
 ## Shipped behavior
 
 - **Mount validation** (`src/mount.rs`): parses `/sbin/mount` output with
@@ -108,13 +109,6 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
     atomic exchange; native exchange is implemented but cannot be advertised
     for an unqualified export.* Native code is retained for future
     qualification.
-- **Writer authority**: `acquire_writer` / `renew_writer` / `release_writer`
-  use a 60-second lease with epoch fencing via `.provider/writer.lock`
-  and `.provider/epoch`. Takeover is refused; epoch checks do not fence
-  existing kernel descriptors or mappings. Exact retries with the same
-  idempotency key recover recorded results from `.provider/retries`;
-  reusing an operation ID with a different key is rejected, and incomplete
-  intents require reconciliation.
 - **Persistence barrier** (`src/native.rs::flush`): blocking `flush()` supports
   only `FlushScope::EntireRun`; object scopes return `UnsupportedCapability`
   before I/O. It synchronizes regular files, directories after their children
@@ -149,6 +143,18 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
   and recovery across process restart still require supervisor integration;
   a fresh tree walk cannot recover already-lost writes. Same-device bind mounts
   and server failover/storage configuration are not independently qualified.
+<!-- /memoria:section -->
+
+<!-- memoria:section id="writer-authority" files="src/lib.rs" -->
+## Writer authority and runtime config
+
+- **Writer authority**: `acquire_writer` / `renew_writer` / `release_writer`
+  use a 60-second lease with epoch fencing via `.provider/writer.lock`
+  and `.provider/epoch`. Takeover is refused; epoch checks do not fence
+  existing kernel descriptors or mappings. Exact retries with the same
+  idempotency key recover recorded results from `.provider/retries`;
+  reusing an operation ID with a different key is rejected, and incomplete
+  intents require reconciliation.
 - **Runtime config**: mount root, `run_parent`, `root_anchor`,
   `control_anchor` all flow through `NfsStorageConfig`. The mount root is
   supplied at runtime; `root`/`control` are configurable library defaults,
@@ -156,7 +162,9 @@ defers validation to `open_run`; `NfsStorage::connect` validates eagerly.
   `run_parent`. Shipped provider options carry
   only the mount root as a JSON-encoded `BytePath`; custom layout fields
   are available through the library config.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="provider-binary" files="src/main.rs" guidance="../../docs/guides/reviewing-provider-binary.md" -->
 ## Provider binary
 
 `src/main.rs` calls `umbra_storage::provider::serve_provider("nfs",
@@ -165,7 +173,9 @@ The eager `connect` runs the mount validation during the handshake so a
 misconfigured export fails fast. Register it via `umbra providers
 --registry <path> --role storage`. See `provider.json` template and
 `docs/providers.md`.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="test-coverage" files="tests/** src/tests.rs src/flush_tests.rs" guidance="../../docs/guides/reviewing-test-sections.md" -->
 ## Test coverage
 
 Unit tests inject sync failures and authority loss, check child-before-parent
@@ -198,6 +208,7 @@ evidence of NFS coverage; inspect `--nocapture` output for skips.
 Verified on the scratch mount on 2026-09-09: 13 library tests and seven ordinary
 mounted tests passed; both opt-in fault tests also ran and passed individually
 (22 passing tests across those runs, zero failures).
+<!-- /memoria:section -->
 
 ## Verification
 

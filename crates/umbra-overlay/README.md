@@ -36,6 +36,7 @@ repairing the tree rather than detecting that it cannot be trusted — remains
 unimplemented. The supervisor's `run` composition supplies this initialization.
 Unbound engines return `InvalidState`.
 
+<!-- memoria:section id="mvp-behavior" files="src/engine.rs" guidance="../../docs/guides/reviewing-provider-ops.md" -->
 ## MVP behavior
 
 `resolve` performs lookups and plans actions without mutating storage or journal.
@@ -906,7 +907,9 @@ unlinked directory handles, and restart recovery fail explicitly or require futu
 caller integration. Directory streams must not reuse a tracked fd/object identity
 within one exec generation; descriptor lifecycle integration will remove that
 restriction. This is an executable regular-file MVP, not complete POSIX coverage.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="validation" files="src/engine/tests.rs" guidance="../../docs/guides/reviewing-test-sections.md" -->
 ## Validation
 
 Run `cargo test -p umbra-overlay`. Tests inject real `umbra-storage-local` base and
@@ -929,7 +932,9 @@ recording `Storage` wrapper, because `mkdir(2)` applies the process umask to wha
 lands on disk; the on-disk checks alongside them account for the measured umask.
 APFS configurations that reject non-UTF-8 filenames still run byte resolver and
 marker checks; actual raw-name filesystem I/O is conditional on native support.
+<!-- /memoria:section -->
 
+<!-- memoria:section id="run-lifecycle" files="src/lib.rs src/provider.rs" -->
 ## Run lifecycle
 
 `NamespaceSession` adds three lifecycle methods, each defaulting to a refusal so a
@@ -977,3 +982,4 @@ so requests stay attributable to the operation the journal recorded.
 protocol now carries the lifecycle calls, but `umbra_supervisor` still binds
 `standard_namespace` and refuses a namespace-role registry, so an alternative
 namespace provider cannot yet own a run.
+<!-- /memoria:section -->

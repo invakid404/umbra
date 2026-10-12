@@ -157,6 +157,7 @@ use `<platform>-<arch>-abi-v<decimal version>`; run composition requires exactly
 one for its negotiated architecture. Protocol version 2 rejects stale providers
 before decoding the required sandbox policy and rewrite messages.
 
+<!-- memoria:section id="data-transfers-and-the-iobuffer-seam" files="src/provider.rs src/dirents.rs src/lib.rs" -->
 ## Data transfers and the `IoBuffer` seam
 
 `FsOp` is ABI-independent: `FsOp::Read` and `FsOp::Write` say how *many* bytes
@@ -210,3 +211,4 @@ lifetime of the tracee or any descendant. A backend that cannot do both must
 refuse the launch: an interposed tracee whose descriptors are not fenced can be
 handed a kernel descriptor number that already names something else, which is a
 wrong-object read rather than a refusal.
+<!-- /memoria:section -->

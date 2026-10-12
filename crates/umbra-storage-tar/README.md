@@ -8,6 +8,7 @@ physical paths for kernel syscall rewriting. It therefore advertises no storage
 mode feature and cannot be selected by `umbra run`, which needs a kernel-visible
 run root for both rewriting and sandbox enforcement.
 
+<!-- memoria:section id="architecture-and-format" files="src/archive.rs" -->
 ## Architecture and format
 
 This implements **option 2: tar with an index**. One archive contains one run, with
@@ -42,7 +43,9 @@ bindings and archive extraction hazards while providing zero-service testing and
 atomic index updates. Direct dependencies are core, storage, tar, uuid, serde_json,
 and the standard library, with tempfile only for tests. `tar = "=0.4.46"` follows
 the workspace's exact-pin style ([tar documentation](https://docs.rs/tar/0.4.46/tar/)).
+<!-- /memoria:section -->
 
+<!-- memoria:section id="shipped-semantics" files="src/operations.rs" guidance="../../docs/guides/reviewing-provider-ops.md" -->
 ## Shipped semantics
 
 - Exclusive create returns AlreadyExists on a duplicate name and NotFound when a
@@ -83,6 +86,7 @@ the workspace's exact-pin style ([tar documentation](https://docs.rs/tar/0.4.46/
 - CopyUp, Link, Truncate, xattrs, whiteouts, and AtomicSwap are deferred
   and return UnsupportedCapability. Kernel shadow, complete emulation, remote
   durability, and kernel fencing are not advertised.
+<!-- /memoria:section -->
 
 ## Writer authority, retries, and durability
 
@@ -141,6 +145,7 @@ replacement by another program, and live sidecar deletion are outside the model.
 Use one canonical archive location for a run, and quiesce its provider before
 moving or restoring it. Archive integrity is structural, not cryptographic.
 
+<!-- memoria:section id="configuration-and-provider-registration" files="src/lib.rs src/main.rs" guidance="../../docs/guides/reviewing-provider-binary.md" -->
 ## Configuration and provider registration
 
 `TarStorageConfig::new(archive_path)` is lazy. `connect(config)` validates the
@@ -176,6 +181,7 @@ cargo run -p umbra-cli -- providers --registry tar-providers.json --role storage
 Registration probes the real provider handshake without opening a run. Unix IPC
 is required; the non-Unix binary reports unsupported transport. The CLI's existing
 default selection is unchanged.
+<!-- /memoria:section -->
 
 ## Tests and deferred work
 

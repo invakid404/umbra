@@ -107,7 +107,7 @@ jobs:
       #
       # `sha256` pins the release archive itself. The Action always fetches and
       # compares the published checksum sidecar, but a GitHub release is mutable
-      # unless marked immutable, and v0.8.0 is not -- so anyone able to replace
+      # unless marked immutable, and v0.9.2 is not -- so anyone able to replace
       # the archive could replace its sidecar too. This input is an independent
       # expected value that a sidecar swap cannot satisfy. It matters most here:
       # this is the repo's highest-privilege job, `pull_request_target` with a
@@ -119,10 +119,10 @@ jobs:
       # exposes no sha256 input, and hand-editing it would forfeit Memoria's
       # management of the file.
       - name: Set up Memoria
-        uses: viktordanov/rs-memoria@1eaf0bd9947872643542931409980bc276aca9b0 # v0.8.0
+        uses: viktordanov/rs-memoria@1eaf13e15b44816137933cc48dac1c659569ec45 # v0.9.2
         with:
-          version: '0.8.0'
-          sha256: '34f3ce8a015852ef36e567f474c66e862c43f0b460f295200372a06d1b11cb19'
+          version: '0.9.2'
+          sha256: '7b2286ba714d1442e25bae8b075f4591d28571989c7b82f487b02d57319fa88c'
 
       - name: Create PR head worktree (isolated data checkout)
         env:
