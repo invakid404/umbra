@@ -8209,6 +8209,19 @@ fn slate_group_members(group: u32, deadline: std::time::Instant) -> Result<Strin
     Err(error)
 }
 
+/// `slate_bounded` with a rank-11 watch: same 60-second deadline.
+fn slate_watched(command: &mut Command, evidence: &Path, watch: &SlateWatch) -> SlateOutput {
+    let (output, timed_out) = slate_launch(
+        command,
+        evidence,
+        std::time::Duration::from_secs(60),
+        Some(watch),
+    );
+    if timed_out {
+        slate_cleanup_failure("external execution deadline elapsed".into());
+    }
+    output
+}
 fn slate_bounded(command: &mut Command, evidence: &Path) -> SlateOutput {
     let (output, timed_out) =
         slate_bounded_for(command, evidence, std::time::Duration::from_secs(60));
@@ -8222,12 +8235,32 @@ fn slate_bounded_for(
     evidence: &Path,
     timeout: std::time::Duration,
 ) -> (SlateOutput, bool) {
+    slate_launch(command, evidence, timeout, None)
+}
+fn slate_launch(
+    command: &mut Command,
+    evidence: &Path,
+    timeout: std::time::Duration,
+    watch: Option<&SlateWatch>,
+) -> (SlateOutput, bool) {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
     SLATE_CENSUS_EVIDENCE
         .with(|slot| *slot.borrow_mut() = Some(evidence.with_extension("census.jsonl")));
     std::fs::write(evidence.with_extension("census.jsonl"), "").unwrap();
+    let mut watched = SlateWatchState::default();
+    if let Some(watch) = watch {
+        // The observer appends and every reader decodes the whole directory,
+        // so records left by an earlier launch against this evidence root
+        // would count as this one's.
+        slate_fresh_dir(&watch.signals);
+        if let Some(observer) = &watch.observer {
+            command
+                .env("DYLD_INSERT_LIBRARIES", observer)
+                .env("UMBRA_SLATE_SIGNAL_DIR", &watch.signals);
+        }
+    }
     let collected =
         std::sync::Arc::new(std::sync::Mutex::new([Vec::<u8>::new(), Vec::<u8>::new()]));
     let retain = |detail: &str| {
@@ -8245,13 +8278,19 @@ fn slate_bounded_for(
         )
         .unwrap();
     };
+    let ledgered = watch.is_some_and(|w| w.ledger);
     command
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(if ledgered {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("bounded launch");
     let group = child.id();
+    watched.input = child.stdin.take();
     let out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -8280,6 +8319,7 @@ fn slate_bounded_for(
     let mut group_kills = 0;
     let mut census = String::new();
     let mut timed_out = false;
+    let mut members = String::new();
     let status = loop {
         if Instant::now() >= deadline {
             timed_out = true;
@@ -8287,14 +8327,22 @@ fn slate_bounded_for(
         }
         if deadline.saturating_duration_since(Instant::now()) > Duration::from_millis(400) {
             match slate_group_members(group, deadline) {
-                Ok(members) => {
-                    census.push_str(&members);
+                Ok(found) => {
+                    census.push_str(&found);
                     census.push('\n');
+                    members = found;
                 }
                 Err(error) => {
                     census_error = Some(error);
                     break None;
                 }
+            }
+        }
+        if let Some(watch) = watch {
+            let stdout = collected.lock().unwrap()[0].clone();
+            if let Err(error) = watched.poll(watch, group, &stdout, &members) {
+                census_error = Some(error);
+                break None;
             }
         }
         if let Some(status) = child.try_wait().unwrap() {
@@ -8306,6 +8354,12 @@ fn slate_bounded_for(
         }
         std::thread::sleep(Duration::from_millis(20)); // polling, never fixture ordering
     };
+    if watch.is_some() {
+        watched.snapshot(group, "direct-exit-or-deadline");
+    }
+    // The ledger's stdin is closed here, so a fixture still waiting for an
+    // acknowledgment reads EOF rather than blocking past its own process.
+    drop(watched.input.take());
     let grace = Instant::now() + Duration::from_secs(10);
     if timed_out || census_error.is_some() {
         // SAFETY: this child was launched as leader of its own process group.
@@ -8366,17 +8420,45 @@ fn slate_bounded_for(
                     .is_some_and(|v| v.starts_with('Z'))
             })
             .collect::<Vec<_>>();
-        if status.is_some() && live.is_empty() && pipes.iter().all(Option::is_some) {
+        // Ledger census: every announced child by birth identity, whatever
+        // session or group it is in now (R3). No reading is UNMEASURABLE.
+        let (escaped, unannounced) = match watched.ledger_census(group) {
+            Ok(found) => found,
+            Err(error) => {
+                cleanup_failure = Some(format!("cleanup UNMEASURABLE: ledger: {error}"));
+                break;
+            }
+        };
+        if !unannounced.is_empty() {
+            cleanup_failure = Some(format!(
+                "cleanup FAILED: unannounced descendant(s) outside the group: {unannounced:?}"
+            ));
+            break;
+        }
+        if status.is_some()
+            && live.is_empty()
+            && escaped.is_empty()
+            && pipes.iter().all(Option::is_some)
+        {
             break;
         }
         if grace.saturating_duration_since(Instant::now()) <= Duration::from_millis(400) {
-            cleanup_failure=Some(format!("cleanup FAILED: grace exhausted with live={live:?}, direct_status={status:?}, pipes_complete={}",pipes.iter().all(Option::is_some)));
+            cleanup_failure=Some(format!("cleanup FAILED: grace exhausted with live={live:?}, escaped={escaped:?}, direct_status={status:?}, pipes_complete={}",pipes.iter().all(Option::is_some)));
             break;
         }
         slate_census_event(
             "PROGRESS",
             "poll/reap direct child, drain pipes and signal survivors with grace remaining",
         );
+        // An escaped child is signalled only by the PID whose birth identity
+        // the census above just matched, so a recycled PID is never touched.
+        for birth in &escaped {
+            slate_census_event("LEDGER_KILL", &format!("{birth:?}"));
+            unsafe {
+                libc::kill(birth.pid, libc::SIGKILL);
+            }
+            group_kills += 1;
+        }
         // Signal live PIDs only. Zombies are already dead and cannot be killed.
         if status.is_some() {
             for line in &live {
@@ -8396,6 +8478,10 @@ fn slate_bounded_for(
     }
     if let Some(error) = census_error.as_ref() {
         cleanup_failure = Some(format!("cleanup UNMEASURABLE during execution: {error}"));
+    }
+    if let Some(watch) = watch {
+        watched.snapshot(group, "after-cleanup");
+        watched.retain(watch, evidence);
     }
     let buffered = collected.lock().unwrap();
     let output = SlateOutput {
@@ -8426,6 +8512,349 @@ fn slate_bounded_for(
         std::fs::write(evidence.with_extension("cleanup"),format!("{disposition}; status={} timed_out={timed_out} group_kills={group_kills} group={group} final_live_members=0 pipes=EOF direct_child=reaped zombies={zombies:?}\n{census}",output.status)).unwrap();
     }
     (output, timed_out)
+}
+
+// Rank-11 additions to the launcher (owner scope S3, design-gate R2/R3).
+// `slate_launch` with a watch adds three things and changes nothing else:
+//  - the test-only signal observer dylib, injected by environment into the
+//    launched tree (a native fixture, or `umbra` and the providers it starts);
+//  - external snapshots of PID/PPID/PGID/SID/terminal/foreground group from
+//    `proc_pidinfo`, at launch, on every new delivery record, at the direct
+//    child's exit and after cleanup -- never from the processes themselves;
+//  - a birth-identity ledger for fixture children that leave the group.
+// Group census, deadline, grace and the L26 taxonomy are the r10 code above.
+struct SlateWatch {
+    observer: Option<PathBuf>,
+    signals: PathBuf,
+    ledger: bool,
+}
+impl SlateWatch {
+    fn new(scratch: &Path, evidence: &Path, ledger: bool) -> SlateWatch {
+        SlateWatch {
+            observer: Some(slate_observer(scratch)),
+            signals: evidence.with_extension("signals"),
+            ledger,
+        }
+    }
+}
+
+/// A process's birth identity: its PID and the start time `proc_pidinfo`
+/// reports. A PID whose start time differs is a different process.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SlateBirth {
+    pid: i32,
+    start: (u64, u64),
+}
+
+#[derive(Default)]
+struct SlateWatchState {
+    input: Option<std::process::ChildStdin>,
+    ledger: Vec<SlateBirth>,
+    announced: usize,
+    delivered: usize,
+    launched: bool,
+    members: std::collections::BTreeSet<i32>,
+    snapshots: Vec<serde_json::Value>,
+}
+impl SlateWatchState {
+    fn poll(
+        &mut self,
+        watch: &SlateWatch,
+        group: u32,
+        stdout: &[u8],
+        members: &str,
+    ) -> Result<(), String> {
+        use std::io::Write;
+        if !self.launched {
+            self.launched = true;
+            self.snapshot(group, "launch");
+        }
+        let current: std::collections::BTreeSet<i32> = members
+            .lines()
+            .filter_map(|l| l.split_whitespace().next()?.parse().ok())
+            .collect();
+        if !current.is_subset(&self.members) && self.snapshots.len() < 64 {
+            self.snapshot(group, "group-change");
+        }
+        self.members.extend(current);
+        let delivered = slate_signal_records(&watch.signals)
+            .iter()
+            .filter(|r| r["kind"] == "delivered")
+            .count();
+        if delivered > self.delivered {
+            self.delivered = delivered;
+            self.snapshot(group, "signal-record");
+        }
+        if !watch.ledger {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(stdout);
+        // Only newline-terminated lines: a read can end mid-announcement, and
+        // a partial `ledger pid=12` would be counted as announced and never
+        // re-read once the rest of the number arrives.
+        let complete = text.rfind('\n').map_or("", |end| &text[..end]);
+        let announced: Vec<i32> = complete
+            .lines()
+            .filter_map(|l| l.strip_prefix("ledger pid="))
+            .map(|v| v.trim().parse().unwrap())
+            .collect();
+        for pid in announced.into_iter().skip(self.announced) {
+            self.announced += 1;
+            // The child cannot have been reaped: its parent is blocked on the
+            // acknowledgment this has not sent yet, so its PID is its own.
+            let found = slate_process(pid)?
+                .ok_or_else(|| format!("announced child {pid} not live at identification"))?;
+            self.ledger.push(SlateBirth {
+                pid,
+                start: found.start,
+            });
+            self.snapshot(group, "ledger-announce");
+            let input = self.input.as_mut().ok_or("ledger without stdin")?;
+            input
+                .write_all(b"G")
+                .and_then(|()| input.flush())
+                .map_err(|e| format!("ledger acknowledgment: {e}"))?;
+        }
+        Ok(())
+    }
+    /// Live announced children, and any process outside the launch group
+    /// whose parent, group or session is an announced child and which was
+    /// never announced itself (R3: a survivor, TERMINAL_FAILURE).
+    fn ledger_census(&self, group: u32) -> Result<(Vec<SlateBirth>, Vec<i32>), String> {
+        if self.ledger.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut live = Vec::new();
+        for birth in &self.ledger {
+            if let Some(found) = slate_process(birth.pid)? {
+                if found.start == birth.start {
+                    live.push(*birth);
+                }
+            }
+        }
+        let owners: Vec<i32> = live.iter().map(|b| b.pid).collect();
+        let unannounced = slate_processes()?
+            .into_iter()
+            .filter(|p| p.pgid != group as i32 && !owners.contains(&p.pid))
+            .filter(|p| {
+                owners.contains(&p.ppid) || owners.contains(&p.pgid) || owners.contains(&p.sid)
+            })
+            .map(|p| p.pid)
+            .collect();
+        Ok((live, unannounced))
+    }
+    fn snapshot(&mut self, group: u32, phase: &str) {
+        let owners: Vec<i32> = self.ledger.iter().map(|b| b.pid).collect();
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let row = match slate_processes() {
+            Ok(all) => serde_json::json!({"phase": phase, "unix_us": at, "processes": all
+                .iter()
+                .filter(|p| p.pgid == group as i32 || owners.contains(&p.pid)
+                    || owners.contains(&p.pgid) || owners.contains(&p.sid))
+                .map(SlateProcess::json)
+                .collect::<Vec<_>>()}),
+            Err(error) => serde_json::json!({"phase": phase, "unix_us": at,
+                "processes": "UNAVAILABLE", "error": error}),
+        };
+        self.snapshots.push(row);
+    }
+    fn retain(&self, watch: &SlateWatch, evidence: &Path) {
+        let lines: Vec<String> = self.snapshots.iter().map(|r| r.to_string()).collect();
+        std::fs::write(
+            evidence.with_extension("snapshots.jsonl"),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            evidence.with_extension("ledger.json"),
+            serde_json::to_vec_pretty(&serde_json::json!(self
+                .ledger
+                .iter()
+                .map(|b| serde_json::json!({"pid": b.pid, "start_sec": b.start.0,
+                    "start_usec": b.start.1}))
+                .collect::<Vec<_>>()))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            evidence.with_extension("signals.json"),
+            serde_json::to_vec_pretty(&slate_signal_records(&watch.signals)).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+/// One process as the kernel reports it to another process.
+#[derive(Clone, Debug)]
+struct SlateProcess {
+    pid: i32,
+    ppid: i32,
+    pgid: i32,
+    /// `getsid`; -1 when the kernel would not say.
+    sid: i32,
+    /// Controlling terminal device and its foreground group, if any.
+    tty: Option<u32>,
+    tpgid: u32,
+    status: u32,
+    start: (u64, u64),
+    command: String,
+}
+impl SlateProcess {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({"pid": self.pid, "ppid": self.ppid, "pgid": self.pgid,
+            "sid": self.sid, "session_leader": self.sid == self.pid,
+            "tty": self.tty.map(|d| format!("{:#x}", d)), "tpgid": self.tpgid,
+            "status": self.status, "start_sec": self.start.0, "start_usec": self.start.1,
+            "command": self.command})
+    }
+}
+/// `Ok(None)` is ESRCH, which `proc_pidinfo` answers for an exited (zombie)
+/// process exactly as for an absent one -- measured -- so it means "not live".
+fn slate_process(pid: i32) -> Result<Option<SlateProcess>, String> {
+    slate_pidinfo(pid).map_err(|e| format!("proc_pidinfo({pid}): {e}"))
+}
+fn slate_pidinfo(pid: i32) -> std::io::Result<Option<SlateProcess>> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if written != size {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    // SAFETY: getsid reads no memory of ours.
+    let sid = unsafe { libc::getsid(pid) };
+    let command = unsafe { std::ffi::CStr::from_ptr(info.pbi_comm.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    Ok(Some(SlateProcess {
+        pid,
+        ppid: info.pbi_ppid as i32,
+        pgid: info.pbi_pgid as i32,
+        sid,
+        tty: (info.e_tdev != u32::MAX).then_some(info.e_tdev),
+        tpgid: info.e_tpgid,
+        status: info.pbi_status,
+        start: (info.pbi_start_tvsec, info.pbi_start_tvusec),
+        command,
+    }))
+}
+/// Every process of this user the kernel lists, read one by one. A process
+/// that exits between the listing and the read is skipped; another user's is
+/// refused EPERM and is not this harness's to census.
+fn slate_processes() -> Result<Vec<SlateProcess>, String> {
+    // SAFETY: a null buffer asks only for the count.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Err(format!("proc_listallpids count {count}"));
+    }
+    let mut pids = vec![0i32; count as usize + 256];
+    // SAFETY: the buffer holds `pids.len()` ints and the size says so.
+    let listed = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<i32>()) as libc::c_int,
+        )
+    };
+    if listed <= 0 {
+        return Err(format!("proc_listallpids {listed}"));
+    }
+    let mut found = Vec::new();
+    for pid in pids.into_iter().take(listed as usize).filter(|p| *p > 0) {
+        match slate_pidinfo(pid) {
+            Ok(Some(process)) => found.push(process),
+            Ok(None) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {}
+            Err(error) => return Err(format!("proc_pidinfo({pid}): {error}")),
+        }
+    }
+    Ok(found)
+}
+
+/// An empty directory at `path`, whatever an earlier run left there.
+fn slate_fresh_dir(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("clearing {}: {e}", path.display()),
+    }
+    std::fs::create_dir_all(path).unwrap();
+}
+
+/// The observer dylib, compiled from `experiments/fixtures/umbra-slate-signals.c`.
+fn slate_observer(scratch: &Path) -> PathBuf {
+    let binary = scratch.join("umbra-slate-signals.dylib");
+    if binary.is_file() {
+        return binary;
+    }
+    let source = repository().join("experiments/fixtures/umbra-slate-signals.c");
+    let built = Command::new("clang")
+        .args(["-arch", "arm64", "-O1", "-dynamiclib"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("clang");
+    assert!(
+        built.status.success(),
+        "compiling {}: {}",
+        source.display(),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    binary
+}
+
+/// Decode every observer record under `directory`. A trailing partial record
+/// is reported as such: a coverage gap, never a delivery.
+fn slate_signal_records(directory: &Path) -> Vec<serde_json::Value> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    let mut files: Vec<PathBuf> = entries.map(|e| e.unwrap().path()).collect();
+    files.sort();
+    for file in files {
+        let bytes = std::fs::read(&file).unwrap();
+        for chunk in bytes.chunks(104) {
+            if chunk.len() != 104 || chunk[..4] != 0x534c4154u32.to_le_bytes() {
+                rows.push(serde_json::json!({"kind": "PARTIAL_OR_FOREIGN",
+                    "file": file.display().to_string(), "length": chunk.len()}));
+                continue;
+            }
+            let u32_at = |at: usize| u32::from_le_bytes(chunk[at..at + 4].try_into().unwrap());
+            let i32_at = |at: usize| i32::from_le_bytes(chunk[at..at + 4].try_into().unwrap());
+            let i64_at = |at: usize| i64::from_le_bytes(chunk[at..at + 8].try_into().unwrap());
+            let name = &chunk[72..104];
+            let name = &name[..name.iter().position(|b| *b == 0).unwrap_or(32)];
+            let mask = u32_at(44);
+            let signals: Vec<u32> = (1..32).filter(|n| mask & (1 << n) != 0).collect();
+            rows.push(serde_json::json!({
+                "kind": match u32_at(8) {
+                    0 => "installed", 1 => "delivered", 2 => "declined", 3 => "intact-at-exit",
+                    _ => "UNKNOWN" },
+                "sequence": u32_at(12), "recipient": i32_at(16), "parent": i32_at(20),
+                "group": i32_at(24), "signal": i32_at(28), "si_code": i32_at(32),
+                "si_pid": i32_at(36), "si_uid": u32_at(40), "mask_signals": signals,
+                "dropped_before": u32_at(48), "unix_sec": i64_at(56), "unix_nsec": i64_at(64),
+                "image": String::from_utf8_lossy(name),
+            }));
+        }
+    }
+    rows
 }
 
 #[test]
@@ -9026,13 +9455,16 @@ fn slate_c10_10_fork_helper_refusal() {
     );
     let native = scratch.path().join("native");
     std::fs::create_dir(&native).unwrap();
-    let control = slate_bounded(
+    // Rank-11 S3 instrumentation for #186: the observer and the external
+    // snapshots ride along; every assertion below is the r10 one, unchanged.
+    let control = slate_watched(
         Command::new(&program)
             .arg("c10-10")
             .arg(native.join("seed.txt"))
             .arg(native.join("out.txt"))
             .arg(native.join("records")),
         &evidence.join("native"),
+        &SlateWatch::new(scratch.path(), &evidence.join("native"), false),
     );
     assert!(control.status.success());
     let child = b"C10-10-CHILD-WRITE-ATTEMPT\n";
@@ -9053,7 +9485,7 @@ fn slate_c10_10_fork_helper_refusal() {
     std::fs::write(workspace.join("seed.txt"), b"ABCDEF").unwrap();
     let registry = registry(scratch.path(), &host, port);
     assert_no_nfs_mount(&host, port, &[&workspace], "fork before");
-    let output = slate_bounded(
+    let output = slate_watched(
         Command::new(binaries().join("umbra"))
             .args(["run", "--registry"])
             .arg(&registry)
@@ -9068,6 +9500,7 @@ fn slate_c10_10_fork_helper_refusal() {
             .arg(workspace.join("out.txt"))
             .arg(workspace.join("records")),
         &evidence.join("routed"),
+        &SlateWatch::new(scratch.path(), &evidence.join("routed"), false),
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     let id = stderr
@@ -9216,4 +9649,912 @@ fn slate_tokio_records(bytes: &[u8], case: &str) {
             assert!(row.ends_with(&format!("poll_tid={}", field("tid"))));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rank 11: posix_spawn admission, inherited descriptors, E8's pipe launch.
+//
+// Every leaf runs the native control on disposable data first, then the
+// enforced userspace-registry run against live Ganesha, with identical fixture
+// bytes and arguments other than the root. Both launches carry the S3 schema:
+// the observer dylib (native: the fixture tree; routed: `umbra` and the
+// providers, never the tracee, whose environment umbra builds from nothing)
+// and external `proc_pidinfo` snapshots. Records and shadow bytes are written
+// to the evidence directory BEFORE any classification assertion, so a red
+// assertion still leaves its reading behind.
+//
+// Classification vocabulary (owner scope S1/S5): SUPPORTED-AND-CORRECT,
+// EXACT KNOWN REFUSAL, DEMONSTRATED SEMANTIC DEFECT (filed separately, open,
+// never fixed here), NOT QUALIFIED.
+// ---------------------------------------------------------------------------
+
+/// The exact diagnostic `native.rs` emits for trap 244 with a nonzero packed
+/// descriptor in x2. Its presence is the x2 reading (design-gate R1), so the
+/// literal must have exactly one emission site, inside the `number == 244`
+/// arm, behind `get(&regs, 2)? != 0`. Checked over every production source
+/// file by literal, not by keyword (L17).
+const SLATE_SPAWN_REFUSAL: &str = "spawn requires null attributes/file actions";
+fn slate_spawn_refusal_site() -> String {
+    fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, found);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(repository().join("crates")).unwrap() {
+        let source = entry.unwrap().path().join("src");
+        if source.is_dir() {
+            sources(&source, &mut files);
+        }
+    }
+    let mut sites = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        for index in 0..lines.len() {
+            if lines[index].contains(SLATE_SPAWN_REFUSAL) {
+                sites.push((file.clone(), index, lines.clone()));
+            }
+        }
+    }
+    let found: Vec<_> = sites
+        .iter()
+        .map(|(file, index, _)| format!("{}:{}", file.display(), index + 1))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "the spawn refusal diagnostic must have exactly one emission site, or its \
+         presence no longer identifies the x2 != 0 branch: {found:?}"
+    );
+    let (file, index, lines) = &sites[0];
+    assert!(file.ends_with("crates/umbra-platform-macos/src/native.rs"));
+    assert!(
+        lines[index - 1].trim() == "if get(&regs, 2)? != 0 {"
+            && lines[index - 2].trim() == "if number == 244 {",
+        "the emission site is no longer gated solely by number == 244 && x2 != 0"
+    );
+    format!("native.rs:{}", index + 1)
+}
+
+/// One case's built fixtures and its evidence directory.
+struct SlateSpawn {
+    evidence: PathBuf,
+    scratch: tempfile::TempDir,
+    program: PathBuf,
+    helper: PathBuf,
+}
+fn slate_spawn(case: &str) -> Option<SlateSpawn> {
+    let evidence = slate_evidence()?.join(case);
+    std::fs::create_dir_all(&evidence).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(scratch.path(), "umbra-userspace-spawn", "UMBRA_SPAWN_PATH");
+    // Absolute by construction: umbra refuses a relative spawn path before
+    // the guard, which would be a different stage.
+    let helper = fixture_binary(
+        scratch.path(),
+        "umbra-userspace-spawn-child",
+        "UMBRA_SPAWN_CHILD_PATH",
+    )
+    .canonicalize()
+    .unwrap();
+    let mut hashes = String::new();
+    for path in [&program, &helper, &slate_observer(scratch.path())] {
+        let digest = Command::new("/usr/bin/shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+            .unwrap();
+        hashes.push_str(&String::from_utf8_lossy(&digest.stdout));
+    }
+    std::fs::write(evidence.join("fixture-hashes.txt"), hashes).unwrap();
+    Some(SlateSpawn {
+        evidence,
+        scratch,
+        program,
+        helper,
+    })
+}
+
+/// The native control. Every file the fixture left is copied into evidence.
+fn slate_spawn_native(spawn: &SlateSpawn, mode: &str) -> (PathBuf, SlateOutput) {
+    let root = spawn.scratch.path().join("native");
+    std::fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let watch = SlateWatch::new(
+        spawn.scratch.path(),
+        &spawn.evidence.join("native"),
+        matches!(mode, "c11-10" | "ledger-escape"),
+    );
+    let output = slate_watched(
+        Command::new(&spawn.program)
+            .arg(mode)
+            .arg(&root)
+            .arg(&spawn.helper),
+        &spawn.evidence.join("native"),
+        &watch,
+    );
+    let kept = spawn.evidence.join("native-root");
+    std::fs::create_dir_all(&kept).unwrap();
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), kept.join(entry.file_name())).unwrap();
+    }
+    (root, output)
+}
+
+/// A routed run's reading: the run, its status, and every named object read
+/// back through the client (`None` = the lookup found no such name).
+struct SlateRouted {
+    run: Run,
+    output: SlateOutput,
+    objects: std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    host: String,
+    port: u16,
+}
+impl SlateRouted {
+    fn object(&self, name: &str) -> Option<&[u8]> {
+        self.objects[name].as_deref()
+    }
+    fn text(&self, name: &str) -> String {
+        String::from_utf8_lossy(self.object(name).unwrap_or_else(|| panic!("{name} absent")))
+            .into_owned()
+    }
+}
+const SLATE_RECORDS: [&str; 3] = ["records.pre", "records.done", "records.child"];
+fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRouted {
+    let (host, port) = fixture().expect("live Ganesha required; no skipped qualification");
+    let workspace = spawn.scratch.path().join("workspace");
+    let state = spawn.scratch.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"ABCDEF").unwrap();
+    let registry = registry(spawn.scratch.path(), &host, port);
+    assert_no_nfs_mount(&host, port, &[&workspace], "rank-11 before");
+    let watch = SlateWatch::new(spawn.scratch.path(), &spawn.evidence.join("routed"), false);
+    let output = slate_watched(
+        Command::new(binaries().join("umbra"))
+            .args(["run", "--registry"])
+            .arg(&registry)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["--experimental", "--"])
+            .arg(&spawn.program)
+            .arg(mode)
+            .arg(&workspace)
+            .arg(&spawn.helper),
+        &spawn.evidence.join("routed"),
+        &watch,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let id = stderr
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("umbra: run ")
+                .and_then(|v| v.strip_suffix(" prepared"))
+        })
+        .expect("prepared run");
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+        status: output.status.code(),
+        stderr,
+        destination: workspace.join("child.txt"),
+        state,
+        workspace,
+        registry,
+    };
+    let mut objects = std::collections::BTreeMap::new();
+    let mut kept = serde_json::Map::new();
+    for name in names.iter().chain(SLATE_RECORDS.iter()) {
+        let mut path = shadow_path(&run);
+        *path.last_mut().unwrap() = name.as_bytes().to_vec();
+        let bytes = read_whole_object_through_client(&host, port, &path);
+        kept.insert(
+            name.to_string(),
+            match &bytes {
+                Some(b) => serde_json::json!(String::from_utf8_lossy(b)),
+                None => serde_json::json!(null),
+            },
+        );
+        objects.insert(name.to_string(), bytes);
+    }
+    std::fs::write(
+        spawn.evidence.join("routed-objects.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "run_id": run.run_id.0.to_string(), "supervisor_status": output.status.to_string(),
+            "tracee_status_line": run.stderr.lines().find(|l| l.contains("finished:")),
+            "refusal_diagnostic": run.stderr.contains(SLATE_SPAWN_REFUSAL),
+            "objects_through_client": kept,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    SlateRouted {
+        run,
+        output,
+        objects,
+        host,
+        port,
+    }
+}
+
+/// What every routed leaf owes after its own oracles: no host effect, no
+/// mount, a reopen that takes writer authority, no SIGHUP anywhere observed.
+fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
+    let reopened = slate_bounded(
+        Command::new(binaries().join("umbra"))
+            .args(["resume", "--registry"])
+            .arg(&routed.run.registry)
+            .arg("--workspace")
+            .arg(&routed.run.workspace)
+            .arg("--state-dir")
+            .arg(&routed.run.state)
+            .arg(routed.run.run_id.0.to_string()),
+        &spawn.evidence.join("reopen"),
+    );
+    std::fs::write(
+        spawn.evidence.join("writer-authority.txt"),
+        format!(
+            "resume_status={}\n{}",
+            reopened.status,
+            String::from_utf8_lossy(&reopened.stderr)
+        ),
+    )
+    .unwrap();
+    assert!(reopened.status.success(), "writer authority reopen failed");
+    assert_workspace_pristine(&routed.run);
+    assert_host_write_root_empty(&routed.run);
+    assert_eq!(
+        std::fs::read(routed.run.workspace.join("seed.txt")).unwrap(),
+        b"ABCDEF"
+    );
+    assert_no_nfs_mount(
+        &routed.host,
+        routed.port,
+        &[&routed.run.workspace],
+        "rank-11 after",
+    );
+    for side in ["native", "routed"] {
+        let records = slate_signal_records(&spawn.evidence.join(side).with_extension("signals"));
+        assert!(
+            !records
+                .iter()
+                .any(|r| r["kind"] == "delivered" && r["signal"] == libc::SIGHUP),
+            "{side}: an observed process received SIGHUP: {records:?}"
+        );
+    }
+}
+
+/// Which images the observer attested installation in, per side. A missing
+/// image is a coverage gap to report (R2), not a failure of the case.
+fn slate_observer_coverage(spawn: &SlateSpawn, side: &str) -> Vec<String> {
+    let mut images: Vec<String> =
+        slate_signal_records(&spawn.evidence.join(side).with_extension("signals"))
+            .iter()
+            .filter(|r| r["kind"] == "installed")
+            .map(|r| r["image"].as_str().unwrap().to_string())
+            .collect();
+    images.sort();
+    images
+}
+
+fn slate_field<'a>(text: &'a str, line: &str, key: &str) -> &'a str {
+    text.lines()
+        .find(|l| l.starts_with(line))
+        .unwrap_or_else(|| panic!("no `{line}` record in:\n{text}"))
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+        .unwrap_or_else(|| panic!("no {key} in `{line}`:\n{text}"))
+}
+
+fn slate_record(spawn: &SlateSpawn, classification: &str, detail: serde_json::Value) {
+    std::fs::write(
+        spawn.evidence.join("classification.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "classification": classification,
+            "detail": detail,
+            "observer_native": slate_observer_coverage(spawn, "native"),
+            "observer_routed": slate_observer_coverage(spawn, "routed"),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// C11-01 and the three C11-02 leaves: one helper, one write each from child
+/// and parent, a different public pointer shape per mode.
+fn slate_spawn_shape(mode: &str, admitted: bool) {
+    let site = slate_spawn_refusal_site();
+    let Some(spawn) = slate_spawn(mode) else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert_eq!(std::fs::read(root.join("parent.txt")).unwrap(), b"PARENT");
+    let done = std::fs::read_to_string(root.join("records.done")).unwrap();
+    let child = std::fs::read_to_string(root.join("records.child")).unwrap();
+    assert_eq!(slate_field(&done, "spawn ", "result"), "0");
+    assert_eq!(
+        slate_field(&done, "spawn ", "pid"),
+        slate_field(&child, "identity ", "pid")
+    );
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
+    let refused = routed.run.stderr.contains(SLATE_SPAWN_REFUSAL);
+    let correct = routed.run.status == Some(0)
+        && routed.object("child.txt") == Some(b"CHILD".as_slice())
+        && routed.object("parent.txt") == Some(b"PARENT".as_slice());
+    let exact_refusal = refused
+        && routed.run.status != Some(0)
+        && !routed.run.stderr.contains("finished:")
+        && routed.object("records.pre").is_some()
+        && ["records.done", "records.child", "child.txt", "parent.txt"]
+            .iter()
+            .all(|name| routed.object(name).is_none());
+    let classification = match (correct && !refused, exact_refusal) {
+        (true, _) => "SUPPORTED-AND-CORRECT",
+        (_, true) => "EXACT KNOWN REFUSAL",
+        _ => "NOT QUALIFIED",
+    };
+    slate_record(
+        &spawn,
+        classification,
+        serde_json::json!({
+            "x2_side": if refused { "nonzero: the single-site diagnostic was emitted" }
+                else { "zero: no diagnostic; libc passed a null packed descriptor" },
+            "emission_site": site,
+            "run_id": routed.run.run_id.0.to_string(),
+            "supervisor_status": routed.output.status.to_string(),
+        }),
+    );
+    if admitted {
+        assert_eq!(
+            classification, "SUPPORTED-AND-CORRECT",
+            "{}",
+            routed.run.stderr
+        );
+        assert_eq!(routed.run.child_exit(), 0);
+        // A mediated child: the supervisor accounted for two process exits,
+        // and the child's write is in the shadow, not on the host. Its own
+        // getppid() is no witness -- MEASURED: under the tracer it reports the
+        // debugserver attached to it, so PPID comes from the external census.
+        assert!(
+            routed
+                .run
+                .stderr
+                .contains("finished: Some(Code(0)) after 2 process exits"),
+            "{}",
+            routed.run.stderr
+        );
+        assert!(journal_records_completion(&routed.run));
+    } else {
+        assert_eq!(
+            classification, "EXACT KNOWN REFUSAL",
+            "{}",
+            routed.run.stderr
+        );
+        let pre = routed.text("records.pre");
+        assert!(pre.starts_with(&format!("phase=pre-spawn mode={mode} ")));
+        for line in pre.lines().filter(|l| l.contains("-init ")) {
+            assert!(line.split_whitespace().any(|t| t == "result=0"), "{line}");
+        }
+    }
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+/// C11-01: both public pointers null. The positive foundation for rank 11.
+#[test]
+fn slate_c11_01_null_spawn_control() {
+    slate_spawn_shape("c11-01", true);
+}
+
+/// C11-02, actions only: an initialized, EMPTY file-actions object.
+#[test]
+fn slate_c11_02_empty_actions() {
+    slate_spawn_shape("c11-02-actions", true);
+}
+
+/// C11-02, attributes only: an initialized, empty attribute object.
+#[test]
+fn slate_c11_02_empty_attributes() {
+    slate_spawn_shape("c11-02-attributes", false);
+}
+
+/// C11-02, both objects initialized and empty.
+#[test]
+fn slate_c11_02_empty_both() {
+    slate_spawn_shape("c11-02-both", false);
+}
+
+/// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
+/// premise, with the errno the first reading did not keep.
+#[test]
+fn slate_c11_05_collision_premise_apparatus() {
+    let Some(spawn) = slate_spawn("c11-05-premise") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "c11-05-premise");
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("victim.txt")).unwrap(), b"");
+    let pre = std::fs::read_to_string(root.join("records.pre")).unwrap();
+    assert_eq!(
+        slate_field(&pre, "dup2-live-victim", "result"),
+        slate_field(&pre, "dup2-live-victim", "victim")
+    );
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("pipe-read result=16 bytes=COLLISION-c11-05"));
+    let routed = slate_spawn_routed(&spawn, "c11-05-premise", &["victim.txt"]);
+    let pre = routed.text("records.pre");
+    let victim: u64 = slate_field(&pre, "dup2-live-victim", "victim")
+        .parse()
+        .unwrap();
+    let limit: u64 = slate_field(&pre, "dup2-live-victim", "rlimit-cur")
+        .parse()
+        .unwrap();
+    slate_record(
+        &spawn,
+        "APPARATUS READING",
+        serde_json::json!({
+            "dup2_result": slate_field(&pre, "dup2-live-victim", "result"),
+            "dup2_errno": slate_field(&pre, "dup2-live-victim", "errno"),
+            "victim": victim, "rlimit_cur": limit,
+            "tracee_exit": routed.run.stderr.lines().find(|l| l.contains("finished:")),
+            "run_id": routed.run.run_id.0.to_string(),
+        }),
+    );
+    // MEASURED: the kernel refuses a dup2 onto a live routed descriptor with
+    // EBADF, because umbra puts every virtual descriptor at or above the
+    // RLIMIT_NOFILE it fences the tracee at (interpose.rs DESCRIPTOR_LIMIT).
+    // dup2 is neither traced nor interposed; the refusal is the kernel's limit
+    // check, so it says nothing about the logical table.
+    assert_eq!(slate_field(&pre, "dup2-live-victim", "result"), "-1");
+    assert_eq!(slate_field(&pre, "dup2-live-victim", "errno"), "9");
+    assert_eq!(limit, 4096);
+    assert!(
+        victim >= limit,
+        "a virtual descriptor below the fence: {victim}"
+    );
+    assert_eq!(routed.run.child_exit(), 34);
+    assert_eq!(routed.object("victim.txt"), Some(b"".as_slice()));
+    assert!(routed.object("records.done").is_none());
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+/// C11-05, the null-pointer leaf only (owner scope S1; amendment A2's natural
+/// allocation, no dup2 to make the collision). Does a spawned child keep the
+/// parent's close-on-exec ROUTED descriptor? The spawn's Child event clones
+/// the parent's context (events.rs:219, :1431); only the Exec arm (:231)
+/// drops close-on-exec entries.
+///
+/// **MEASURED: it does keep it -- #189, a DEMONSTRATED SEMANTIC DEFECT, pinned
+/// GREEN here on today's wrong answer.** The child's `write(V)` returns 16 and
+/// the nonce lands in the parent's victim object, where natively V's number
+/// was closed at exec and the bytes went to whatever the kernel put there. The
+/// day spawn drops close-on-exec routed entries, `write(V)` answers EBADF, the
+/// victim stays `VICTIM-SEED`, and THIS CASE IS THE ONE TO INVERT.
+///
+/// No kernel/virtual collision arises routed, and none can: virtual numbers
+/// start at the RLIMIT_NOFILE fence the tracee is held to (4096), so the
+/// child's `pipe()` lands far below V. A2's dup2 discriminators do not
+/// discriminate either: `dup2` onto V and onto 4200 (never virtual) both fail
+/// EBADF, which is the kernel's limit check, not a reading of umbra's table.
+#[test]
+fn slate_c11_05_cloexec_null_spawn() {
+    let Some(spawn) = slate_spawn("c11-05") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "c11-05");
+    assert!(native.status.success(), "native control: {}", native.status);
+    let child = std::fs::read_to_string(root.join("records.child")).unwrap();
+    assert_eq!(
+        std::fs::read(root.join("victim.txt")).unwrap(),
+        b"VICTIM-SEED"
+    );
+    assert_eq!(
+        std::fs::read(root.join("control.txt")).unwrap(),
+        b"CONTROL-c11-05"
+    );
+    // Natively the collision arises: V's number is free after exec and the
+    // pipe's write end lands on it, so the nonce is in the pipe.
+    assert_eq!(slate_field(&child, "pipe ", "collision"), "1");
+    assert!(child.contains("pipe-read result=16 errno=0 bytes=COLLISION-c11-05"));
+    assert_eq!(
+        slate_field(&child, "kernel-view kernel-cloexec", "getfd"),
+        "-1"
+    );
+    assert_ne!(
+        slate_field(&child, "kernel-view kernel-inherited", "getfd"),
+        "-1"
+    );
+    let routed = slate_spawn_routed(&spawn, "c11-05", &["victim.txt", "control.txt"]);
+    let child = routed.text("records.child");
+    let victim = routed.object("victim.txt").map(<[u8]>::to_vec);
+    let stale = victim.as_deref() == Some(b"VICTIM-SEEDCOLLISION-c11-05".as_slice())
+        && slate_field(&child, "write-victim", "result") == "16";
+    let pruned = victim.as_deref() == Some(b"VICTIM-SEED".as_slice())
+        && slate_field(&child, "write-victim", "result") == "-1"
+        && slate_field(&child, "write-victim", "errno") == "9";
+    slate_record(
+        &spawn,
+        if stale {
+            "DEMONSTRATED SEMANTIC DEFECT"
+        } else if pruned {
+            "SUPPORTED-AND-CORRECT"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({
+            "victim": victim.as_deref().map(String::from_utf8_lossy),
+            "control": routed.object("control.txt").map(String::from_utf8_lossy),
+            "child_records": child,
+            "run_id": routed.run.run_id.0.to_string(),
+        }),
+    );
+    assert!(
+        stale,
+        "the spawned child's write through the parent's close-on-exec routed \
+         descriptor no longer reaches the victim. If it now fails EBADF and the \
+         victim reads VICTIM-SEED, #189 is fixed and THIS CASE IS THE ONE TO \
+         INVERT; any other reading is a third disposition nobody has measured:\n\
+         victim={victim:?}\n{child}"
+    );
+    assert_eq!(slate_field(&child, "write-victim", "errno"), "0");
+    assert_eq!(slate_field(&child, "pipe ", "collision"), "0");
+    assert_eq!(
+        slate_field(&child, "pipe-read", "errno"),
+        libc::EAGAIN.to_string()
+    );
+    assert_eq!(
+        routed.object("control.txt"),
+        Some(b"CONTROL-c11-05".as_slice())
+    );
+    assert_eq!(slate_field(&child, "rlimit-nofile", "cur"), "4096");
+    for probe in ["dup2-victim", "dup2-never-virtual-above-fence"] {
+        assert_eq!(slate_field(&child, probe, "result"), "-1");
+        assert_eq!(slate_field(&child, probe, "errno"), "9");
+    }
+    assert_eq!(slate_field(&child, "dup2-never-virtual ", "result"), "100");
+    assert!(
+        routed
+            .run
+            .stderr
+            .contains("finished: Some(Code(0)) after 2 process exits"),
+        "{}",
+        routed.run.stderr
+    );
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+/// C11-09: the spawn analogue of #172's fork offset finding. Native AABBBC.
+///
+/// **MEASURED: routed `AACBB` -- #190, a DEMONSTRATED SEMANTIC DEFECT, pinned
+/// GREEN here on today's wrong answer.** The child's `BBB` starts at the
+/// offset it inherited (2), and the parent's `C`, after the acknowledgment and
+/// the reap, starts at the offset its own `AA` left (2), over the child's
+/// first byte: a copied offset, not a shared Open File Description. Every
+/// call reports success. The day a shared-offset model lands this reads
+/// `AABBBC` and THIS CASE IS THE ONE TO DELETE.
+#[test]
+fn slate_c11_09_inherited_offset() {
+    let Some(spawn) = slate_spawn("c11-09") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "c11-09");
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("out.txt")).unwrap(), b"AABBBC");
+    let routed = slate_spawn_routed(&spawn, "c11-09", &["out.txt"]);
+    let stored = routed.object("out.txt").map(<[u8]>::to_vec);
+    slate_record(
+        &spawn,
+        match stored.as_deref() {
+            Some(b"AABBBC") => "SUPPORTED-AND-CORRECT",
+            Some(_) => "DEMONSTRATED SEMANTIC DEFECT",
+            None => "NOT QUALIFIED",
+        },
+        serde_json::json!({
+            "out": stored.as_deref().map(String::from_utf8_lossy),
+            "records_done": routed.objects["records.done"].as_deref().map(String::from_utf8_lossy),
+            "records_child": routed.objects["records.child"].as_deref().map(String::from_utf8_lossy),
+            "run_id": routed.run.run_id.0.to_string(),
+        }),
+    );
+    assert_eq!(
+        stored.as_deref(),
+        Some(b"AACBB".as_slice()),
+        "the parent's post-reap write did not land at the offset its own first \
+         write left. If this now reads AABBBC, #190 is fixed and THIS CASE IS THE \
+         ONE TO DELETE; any other value is a third disposition nobody has \
+         measured: {:?}",
+        stored.as_deref().map(String::from_utf8_lossy)
+    );
+    let child = routed.text("records.child");
+    let done = routed.text("records.done");
+    assert_eq!(slate_field(&child, "write-inherited", "result"), "3");
+    assert_eq!(slate_field(&done, "ack ", "token"), "K");
+    assert_eq!(slate_field(&done, "write-parent", "result"), "1");
+    assert!(
+        routed
+            .run
+            .stderr
+            .contains("finished: Some(Code(0)) after 2 process exits"),
+        "{}",
+        routed.run.stderr
+    );
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+/// C11-10: E8's full pipe launch in single-threaded C. Natively the whole
+/// composition must be exact; routed, the packed descriptor is nonzero, so the
+/// guard's refusal is predicted. A refusal qualifies the refusal only, never
+/// composition support.
+#[test]
+fn slate_c11_10_e8_pipe_refusal() {
+    let site = slate_spawn_refusal_site();
+    let Some(spawn) = slate_spawn("c11-10") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "c11-10");
+    assert!(native.status.success(), "native control: {}", native.status);
+    let done = std::fs::read_to_string(root.join("records.done")).unwrap();
+    let child = std::fs::read_to_string(root.join("records.child")).unwrap();
+    assert_eq!(
+        std::fs::read(root.join("child.txt")).unwrap(),
+        b"C11-10-CHILD:e8-nonce"
+    );
+    for (stream, tag) in [("stdout", "OUT"), ("stderr", "ERR"), ("inherit", "INH")] {
+        assert!(
+            done.contains(&format!("{stream} bytes={tag}:e8-nonce length=12 eof=1")),
+            "{stream}:\n{done}"
+        );
+    }
+    assert!(
+        slate_field(&done, "sigchld ", "count")
+            .parse::<u32>()
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(slate_field(&done, "wait ", "code"), "0");
+    // SETSID: the child leads its own session and group. CLOEXEC_DEFAULT plus
+    // one addinherit_np: exactly 0, 1, 2 and the inherited write end are open.
+    let pid = slate_field(&child, "identity ", "pid");
+    assert_eq!(slate_field(&child, "identity ", "sid"), pid);
+    assert_eq!(slate_field(&child, "identity ", "pgid"), pid);
+    let inherited = slate_field(&child, "decoy ", "inherited");
+    assert_eq!(
+        child.lines().find(|l| l.starts_with("census")).unwrap(),
+        format!("census 0 1 2 {inherited}")
+    );
+    assert_eq!(slate_field(&child, "decoy ", "open"), "0");
+    assert_eq!(
+        child.lines().find(|l| l.starts_with("cwd ")).unwrap(),
+        format!("cwd {}", root.display())
+    );
+    let ledger = std::fs::read_to_string(spawn.evidence.join("native.ledger.json")).unwrap();
+    assert!(ledger.contains(&format!("\"pid\": {pid}")), "{ledger}");
+    let routed = slate_spawn_routed(&spawn, "c11-10", &["child.txt"]);
+    let refused = routed.run.stderr.contains(SLATE_SPAWN_REFUSAL);
+    let exact = refused
+        && routed.run.status != Some(0)
+        && !routed.run.stderr.contains("finished:")
+        && routed.object("records.pre").is_some()
+        && ["records.done", "records.child", "child.txt"]
+            .iter()
+            .all(|name| routed.object(name).is_none());
+    slate_record(
+        &spawn,
+        if exact {
+            "EXACT KNOWN REFUSAL"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({
+            "trapped_stub": "__posix_spawn (244)",
+            "x2_side": if refused { "nonzero: the single-site diagnostic was emitted" }
+                else { "no diagnostic" },
+            "emission_site": site,
+            "stage": "Delivery::Exec arm, after the absolute-path check and resign, before \
+                      registers are installed and the spawn syscall resumes",
+            "effect_boundary": "no records.done, no records.child, no child.txt in the shadow; \
+                                host workspace pristine",
+            "run_id": routed.run.run_id.0.to_string(),
+            "supervisor_status": routed.output.status.to_string(),
+        }),
+    );
+    assert!(exact, "{}", routed.run.stderr);
+    let pre = routed.text("records.pre");
+    assert!(pre.starts_with("phase=pre-spawn mode=c11-10\n"));
+    for line in pre.lines().filter(|l| l.contains(" result=")) {
+        assert!(line.split_whitespace().any(|t| t == "result=0"), "{line}");
+    }
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+/// Apparatus (design-gate R3): a child born into its own session is invisible
+/// to the r10 process-group census. The fixture spawns one with
+/// POSIX_SPAWN_SETSID, announces it, and exits without releasing or reaping
+/// it; the child holds the launcher's output pipes and never exits by itself.
+/// With the ledger, cleanup must find it by birth identity and end it. The
+/// counterfactual runs the same fixture through the r10 launcher alone, which
+/// must fail cleanup rather than report it clean.
+#[test]
+fn slate_c11_ledger_escaped_session_cleanup() {
+    let Some(spawn) = slate_spawn("ledger") else {
+        return;
+    };
+    let (_, output) = slate_spawn_native(&spawn, "ledger-escape");
+    assert!(output.status.success(), "{}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let pid: i32 = slate_field(&stdout, "ledger ", "pid").parse().unwrap();
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("native.cleanup")).unwrap();
+    let census = std::fs::read_to_string(spawn.evidence.join("native.census.jsonl")).unwrap();
+    let snapshots = std::fs::read_to_string(spawn.evidence.join("native.snapshots.jsonl")).unwrap();
+    assert!(cleanup.starts_with("cleanup CLEAN") || cleanup.starts_with("cleanup ZOMBIES_ONLY"));
+    assert!(census.contains("LEDGER_KILL"), "{census}");
+    // The ledger saw it in its own session, outside the launch group.
+    let announced = snapshots
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|row| row["phase"] == "ledger-announce")
+        .expect("an announcement snapshot");
+    let row = announced["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["pid"] == pid)
+        .expect("the announced child in its snapshot")
+        .clone();
+    assert_eq!(row["sid"], pid);
+    assert_eq!(row["pgid"], pid);
+    assert_eq!(row["session_leader"], true);
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(spawn.evidence.join("native.ledger.json")).unwrap())
+            .unwrap();
+    let birth = (
+        ledger[0]["start_sec"].as_u64().unwrap(),
+        ledger[0]["start_usec"].as_u64().unwrap(),
+    );
+    assert!(
+        slate_process(pid).unwrap().is_none_or(|p| p.start != birth),
+        "the escaped child survived cleanup"
+    );
+    slate_finish_cleanup();
+
+    // Counterfactual: no ledger. The announcement goes unanswered (stdin is
+    // /dev/null), the fixture exits 82, and the escaped child keeps the pipes.
+    let root = spawn.scratch.path().join("counterfactual");
+    std::fs::create_dir(&root).unwrap();
+    let output = slate_bounded(
+        Command::new(&spawn.program)
+            .arg("ledger-escape")
+            .arg(&root)
+            .arg(&spawn.helper),
+        &spawn.evidence.join("counterfactual"),
+    );
+    let failures = SLATE_CLEANUP_FAILURES.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    let stdout = std::fs::read_to_string(spawn.evidence.join("counterfactual.stdout")).unwrap();
+    let escaped: i32 = slate_field(&stdout, "ledger ", "pid").parse().unwrap();
+    // Not the harness's cleanup: hygiene, by the identity this run can still
+    // check -- the helper's own session, which it leads.
+    if let Some(found) = slate_process(escaped).unwrap() {
+        if found.sid == escaped && found.command.starts_with("umbra-userspace") {
+            unsafe {
+                libc::kill(escaped, libc::SIGKILL);
+            }
+        }
+    }
+    assert_eq!(output.status.code(), Some(82));
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("cleanup FAILED: grace exhausted")
+                && f.contains("pipes_complete=false")),
+        "the r10 launcher alone must not report an escaped session clean: {failures:?}"
+    );
+}
+
+/// Apparatus (design-gate R2): the observer against an uninstrumented fatal
+/// SIGHUP on the same image. Both must die by SIGHUP; only the instrumented
+/// one may leave records, and its delivery record must name this harness as
+/// the sender. A difference in wait status would mean the observer changed
+/// the experiment.
+#[test]
+fn slate_c11_signal_observer_qualification() {
+    use std::time::{Duration, Instant};
+    let Some(spawn) = slate_spawn("observer") else {
+        return;
+    };
+    let observer = slate_observer(spawn.scratch.path());
+    let mut statuses = Vec::new();
+    for instrumented in [false, true] {
+        let signals = spawn.evidence.join(if instrumented {
+            "instrumented"
+        } else {
+            "plain"
+        });
+        // Fresh per run: a record from an earlier run here would be a second
+        // delivery.
+        slate_fresh_dir(&signals);
+        let mut command = Command::new(&spawn.helper);
+        command
+            .arg("hold")
+            .arg(spawn.scratch.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if instrumented {
+            command
+                .env("DYLD_INSERT_LIBRARIES", &observer)
+                .env("UMBRA_SLATE_SIGNAL_DIR", &signals);
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // Readiness is the installation record, not a sleep. The plain image
+        // has none, and SIGHUP's default action does not depend on timing.
+        while instrumented
+            && !slate_signal_records(&signals)
+                .iter()
+                .any(|r| r["kind"] == "installed")
+        {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                panic!("the observer never attested installation");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGHUP);
+        }
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                panic!("SIGHUP did not end the {instrumented} image");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        statuses.push(SlateStatus(Some(status)).signal());
+        let records = slate_signal_records(&signals);
+        std::fs::write(
+            signals.with_extension("json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": status.to_string(), "records": records}))
+            .unwrap(),
+        )
+        .unwrap();
+        if !instrumented {
+            assert!(records.is_empty());
+            continue;
+        }
+        let delivered: Vec<_> = records
+            .iter()
+            .filter(|r| r["kind"] == "delivered")
+            .collect();
+        assert_eq!(delivered.len(), 1, "{records:?}");
+        assert_eq!(delivered[0]["signal"], libc::SIGHUP);
+        assert_eq!(delivered[0]["recipient"], child.id());
+        assert_eq!(delivered[0]["si_pid"], std::process::id());
+        assert_eq!(delivered[0]["si_uid"], unsafe { libc::getuid() });
+        assert_eq!(delivered[0]["dropped_before"], 0);
+        // Killed by the signal, so no destructor ran: no intact record.
+        assert!(!records.iter().any(|r| r["kind"] == "intact-at-exit"));
+    }
+    assert_eq!(statuses, [Some(libc::SIGHUP), Some(libc::SIGHUP)]);
 }

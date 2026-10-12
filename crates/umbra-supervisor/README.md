@@ -226,7 +226,10 @@ A backend that cannot skip the trap still fails closed, because rewriting return
 registers alone would execute the very call the namespace answered. The loop ends when every
 process has exited, not when the root
 does. Fork preserves every inherited descriptor; only Exec drops close-on-exec
-entries. An Exit for an uncaptured task poisons the run without reducing its live
+entries. A `posix_spawn` child arrives as the same Child event, not an Exec, so
+it keeps the parent's close-on-exec entries too (measured, #189). Like a forked
+child, it holds copies of the parent's offsets, not shared ones (#172, #190).
+An Exit for an uncaptured task poisons the run without reducing its live
 process count, and duplicate exits do not count twice.
 
 `Supervisor::new` and `with_namespace` take `Option<Box<dyn Agent>>`; a raw
