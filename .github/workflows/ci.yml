@@ -484,8 +484,8 @@ jobs:
         run: |
           cargo build --workspace --bins
           cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
-          # environmental SIGHUP terminates routed run under self-hosted Actions runner before guard emits refusal; investigated 2026-10-10, source unidentified, filed as #<DRAFT-PENDING>
-          # Provisional reference only: followup-sighup-issue.md is drafted, not filed.
+          # environmental SIGHUP terminates routed run under self-hosted Actions runner before guard emits refusal; investigated 2026-10-10, source unidentified: #186 (open).
+          # C10-10 carries the rank-11 signal observer; it stays skipped here until a cause is identified and fixed.
           cargo test -p umbra-storage-nfs-userspace --features transport-raw \
             --test userspace_run -- --nocapture --test-threads=1 \
             --skip slate_c10_10_fork_helper_refusal
