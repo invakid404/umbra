@@ -802,8 +802,10 @@ requires no live survivors, direct-child reap and pipe EOF.
 C10-10 and every routed rank-11 leaf also require two things of their routed
 run (`slate_assert_tracee_not_orphaned`): no census reading or snapshot ever shows
 a member of the run's group with PPID 1, and cleanup ends `cleanup CLEAN`. Before
-#186's ordered teardown, every refusal left its tracee reparented to launchd as a
-PPID-1 zombie, which in launchd's session orphaned the group with SIGHUP.
+#186's ordered teardown, a refusal commonly left its tracee reparented to launchd as
+a PPID-1 zombie: 21/21 runs in the arc's E1/E2, and 3 of 4 cases on the pre-fix
+readings of this assertion. In launchd's session that orphaned the group with
+SIGHUP.
 
 The rank-11 spawn cases and C10-10 launch their native and routed runs through
 `slate_launch` with a watch, which adds three things and changes none of the

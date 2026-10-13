@@ -1880,14 +1880,9 @@ fn teardown_times_out_on_unresponsive_tracer() {
         let elapsed = started.elapsed();
         let report = tracer.teardown_reports().last().unwrap().clone();
         eprintln!("teardown report ({elapsed:?}): {report:?}");
-        let error = result.expect_err("unconfirmed termination must be reported");
-        assert!(
-            error
-                .to_string()
-                .contains("tracee termination unconfirmed; tracer killed"),
-            "{error}"
-        );
         assert!(report.timed_out);
+        let outcome = post_kill_outcome(&report, &result);
+        eprintln!("post-kill outcome: {outcome}");
         // The bound is 1.5 s for `k` and the barrier, plus 0.25 s for each reap.
         assert!(
             elapsed >= std::time::Duration::from_millis(1500)
@@ -1954,11 +1949,9 @@ fn teardown_reports_dead_tracer_without_waiting() {
         let elapsed = started.elapsed();
         let report = tracer.teardown_reports().last().unwrap().clone();
         eprintln!("teardown report ({elapsed:?}): {report:?}");
-        assert!(
-            result.is_err(),
-            "a dead tracer is an unconfirmed termination"
-        );
         assert!(report.timed_out);
+        let outcome = post_kill_outcome(&report, &result);
+        eprintln!("post-kill outcome: {outcome}");
         assert!(
             elapsed < std::time::Duration::from_millis(1000),
             "waited {elapsed:?} for a dead tracer"
@@ -1980,4 +1973,207 @@ fn teardown_reports_dead_tracer_without_waiting() {
         );
         assert!(no_children_left(), "a child of this process leaked");
     });
+}
+
+/// Review ruling 1 V3: after a timeout (warning, then the tracer kill), the
+/// result follows the one post-kill barrier. Confirmed after the kill means
+/// `terminate` succeeds; still unconfirmed means it fails. Either step comes
+/// after `TracerKilled`. Returns which one the end state proved.
+fn post_kill_outcome(report: &TeardownReport, result: &Result<()>) -> &'static str {
+    let killed = step_index(report, |s| *s == TeardownStep::TracerKilled).unwrap();
+    let confirmed = step_index(report, |s| {
+        matches!(s, TeardownStep::ConfirmedAfterTracerKill(_))
+    });
+    let unconfirmed = step_index(report, |s| {
+        matches!(s, TeardownStep::UnconfirmedAfterTracerKill(_))
+    });
+    match (confirmed, unconfirmed) {
+        (Some(at), None) => {
+            assert!(at > killed, "post-kill confirmation before the kill");
+            assert!(!report.unconfirmed);
+            assert!(result.is_ok(), "confirmed after the kill, yet {result:?}");
+            "confirmed after tracer kill"
+        }
+        (None, Some(at)) => {
+            assert!(at > killed, "post-kill reading before the kill");
+            assert!(report.unconfirmed);
+            let error = result
+                .as_ref()
+                .expect_err("unconfirmed must fail terminate");
+            assert!(
+                error
+                    .to_string()
+                    .contains("tracee termination unconfirmed; tracer killed"),
+                "{error}"
+            );
+            "still unconfirmed"
+        }
+        other => panic!("no single post-kill reading: {other:?} in {report:?}"),
+    }
+}
+
+/// Launch `--mt-spawn` (a multithreaded root that spawns one traced child) and
+/// resume every event without rewrites until `stop` says to stop. Returns the
+/// child's pid, or `None` (skip) without the fixture variable.
+fn mt_spawn_until(
+    case: &str,
+    stop: impl Fn(&TraceEvent, ProcessHandle) -> bool,
+) -> Option<(MacosTraceBackend, ProcessHandle, i32)> {
+    let Some(fixture) = std::env::var_os("UMBRA_TEST_FIXTURE_PATH") else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_TEST_FIXTURE_PATH"
+        );
+        eprintln!("SKIP {case}: set UMBRA_TEST_FIXTURE_PATH");
+        return None;
+    };
+    let fixture = PathBuf::from(fixture);
+    let host = std::env::temp_dir().join(format!("umbra-teardown-{}-{case}", std::process::id()));
+    std::fs::create_dir_all(&host).unwrap();
+    let mut tracer = MacosTraceBackend::new(Options {
+        timeout_ms: 25_000,
+        ..Options::default()
+    });
+    let process = tracer
+        .launch_experimental(LaunchSpec {
+            executable: byte_path(&fixture),
+            argv: vec![
+                bytes(&fixture),
+                b"--mt-spawn".to_vec(),
+                bytes(&host.join("a")),
+                bytes(&host.join("b")),
+            ],
+            environment: vec![],
+            cwd: byte_path(&std::env::current_dir().unwrap()),
+            policy: LaunchPolicy {
+                persistence: PersistencePolicy::LocalDevelopment,
+                inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                interpose: false,
+                descriptor_limit: None,
+            },
+            sandbox: SandboxRequirement::UnsandboxedExperiment,
+        })
+        .unwrap();
+    let mut child = 0;
+    loop {
+        let event = tracer.next_event().unwrap();
+        eprintln!("{case}: {event:?}");
+        if let TraceEvent::Child { child: c, .. } = &event {
+            child = c.0 .0.native_id as i32;
+        }
+        if stop(&event, process) {
+            break;
+        }
+        let resume = match event {
+            TraceEvent::ThreadStarted { thread, .. }
+            | TraceEvent::SyscallEntry { thread, .. }
+            | TraceEvent::SyscallExit { thread, .. }
+            | TraceEvent::Exec { thread, .. } => Some(thread),
+            _ => None,
+        };
+        if let Some(thread) = resume {
+            tracer
+                .resume(ResumeCommand {
+                    thread,
+                    mode: ResumeMode::Syscall,
+                    signal: None,
+                })
+                .unwrap();
+        }
+    }
+    assert!(child > 0, "{case}: no child was spawned");
+    Some((tracer, process, child))
+}
+
+/// Review ruling 1 V4, the P1/P3 shape: the root has exited and its traced
+/// child is live when `terminate` runs (a failure path). The child's tracer
+/// cannot hand it back, so the barrier needs the V1 proof or a zombie. The
+/// first `k` draws only the child's queued stop reply, so `k` is re-sent
+/// (V2). The teardown must end confirmed before the tracer kill, with no
+/// warning, and `terminate` must succeed.
+#[test]
+fn teardown_confirms_a_live_orphaned_child_without_warning() {
+    in_fresh_session(
+        "teardown_confirms_a_live_orphaned_child_without_warning",
+        || {
+            let _serial = fixture_launch_lock();
+            let Some((mut tracer, process, child)) = mt_spawn_until(
+                "orphan",
+                |event, root| matches!(event, TraceEvent::Exit { task, .. } if *task == root.0),
+            ) else {
+                return;
+            };
+            let started = std::time::Instant::now();
+            let result = tracer.terminate(process, TerminationPolicy::Immediate);
+            let elapsed = started.elapsed();
+            let reports = tracer.teardown_reports().to_vec();
+            eprintln!("teardown ({elapsed:?}): {reports:?}");
+            result.expect("a live orphaned child's teardown confirms");
+            assert!(reports.iter().all(|r| !r.timed_out && !r.unconfirmed));
+            let report = reports
+                .iter()
+                .find(|r| r.pid == child)
+                .expect("child report");
+            let confirmed = step_index(report, |s| {
+                matches!(s, TeardownStep::Barrier(BarrierReading::Confirmed(_)))
+            })
+            .expect("confirmed barrier");
+            let killed = step_index(report, |s| *s == TeardownStep::TracerKilled).unwrap();
+            assert!(confirmed < killed, "the tracer died before the barrier");
+            assert!(step_index(report, |s| matches!(s, TeardownStep::Warning(_))).is_none());
+            // V2: if the first reply was a stop, `k` was re-sent right after it.
+            if let Some(stop) = step_index(
+                report,
+                |s| matches!(s, TeardownStep::Reply(r) if r.starts_with('T') || r.starts_with('S')),
+            ) {
+                assert_eq!(report.steps.get(stop + 1), Some(&TeardownStep::KillResent));
+            }
+            // The measured outcome is the V1 proof, `ReapedProven { Absent }`: the
+            // child's own tracer reaps it with no handback. A barrier poll can also
+            // land in the brief zombie window before that reap, which proves the
+            // same passage. Anything else fails. The decision table pins V1 itself.
+            eprintln!("orphan evidence: {:?}", report.steps[confirmed]);
+            assert!(
+                matches!(
+                    &report.steps[confirmed],
+                    TeardownStep::Barrier(BarrierReading::Confirmed(
+                        BarrierEvidence::ReapedProven { .. } | BarrierEvidence::Zombie
+                    ))
+                ),
+                "{:?}",
+                report.steps[confirmed]
+            );
+            assert!(gone(child), "the orphaned child was left behind");
+            assert!(no_children_left(), "a child of this process leaked");
+        },
+    );
+}
+
+/// Review ruling 1 V4, the P2 control: the same fixture stopped at the child's
+/// first event, with the root still alive. Both sessions confirm with no
+/// warning and `terminate` succeeds.
+#[test]
+fn teardown_confirms_a_live_child_while_its_root_is_alive() {
+    in_fresh_session(
+        "teardown_confirms_a_live_child_while_its_root_is_alive",
+        || {
+            let _serial = fixture_launch_lock();
+            let Some((mut tracer, process, child)) = mt_spawn_until("rooted", |event, _| {
+                matches!(event, TraceEvent::Child { .. })
+            }) else {
+                return;
+            };
+            let result = tracer.terminate(process, TerminationPolicy::Immediate);
+            let reports = tracer.teardown_reports().to_vec();
+            eprintln!("teardown: {reports:?}");
+            result.expect("a live child with its root alive confirms");
+            assert_eq!(reports.len(), 2, "child and root sessions");
+            for report in &reports {
+                assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
+                assert!(step_index(report, |s| matches!(s, TeardownStep::Warning(_))).is_none());
+            }
+            assert!(gone(child) && gone(process.0 .0.native_id as i32));
+            assert!(no_children_left(), "a child of this process leaked");
+        },
+    );
 }

@@ -360,13 +360,17 @@ impl Rsp {
     }
 }
 impl Drop for Rsp {
-    /// The fallback for a connection no session tore down in order. That only
-    /// happens where no inferior can be mid-exit: a failed connect or a failed
-    /// attach inside `Session::attach`, before umbra has terminated anything.
-    /// A held, still-traced inferior is handed back to its original parent and
-    /// killed by the kernel when its tracer dies
-    /// (xnu-12377.121.6 `kern_exit.c:2556-2608`), which is the counted path.
-    /// Every `Session` instead runs `Session::ordered_teardown` first (#186).
+    /// The fallback for a connection no session tore down in order: a failed
+    /// connect or a failed attach inside `Session::attach`, before umbra has
+    /// terminated anything. Every `Session` runs `Session::ordered_teardown`
+    /// first instead (#186).
+    ///
+    /// **Not shown safe.** Measured in the #186 arc: when a tracer dies while
+    /// holding an attached, not-yet-terminated inferior, the inferior has been
+    /// seen as a PPID-1 zombie within 5 ms. It was not handed back to its
+    /// original parent, and the reason is not established. So in launchd's
+    /// session this fallback may take the #186 route. It is a residual tracked
+    /// in #193.
     fn drop(&mut self) {
         if self.torn_down {
             return;

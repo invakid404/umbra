@@ -9406,9 +9406,10 @@ fn slate_c10_10_fork_helper_refusal() {
         "native.rs SHA-256 prerequisite failed"
     );
     // Re-pinned for #186 (was 81e1cd50…, the slate-r10/r11 characterization).
-    // native.rs gained the ordered teardown only: +590/-0 lines, all of them
+    // native.rs gained the ordered teardown only: +695/-0 lines, all of them
     // teardown (Session::ordered_teardown, its barrier and decision table,
-    // terminate/Drop wiring, the exit-report capture in `stop`).
+    // terminate/Drop wiring, the exit-report capture in `stop`, the k re-send
+    // and the post-kill barrier of the #186 review ruling).
     // The fork guard (`fn single_thread`, sha256 41efdfc0…, and its call sites)
     // and the __posix_spawn x2 guard (`if number == 244 {` block, sha256
     // fe7c9f4b…) are byte-identical to 7ccd7b0e. The runtime refusal
@@ -9416,7 +9417,7 @@ fn slate_c10_10_fork_helper_refusal() {
     // the #186 fix un-skips in required CI on the runner.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("06ca5b7bc2a784ed310cc102e6de9ceda0a16bc4ec955d00d9dd419b9086ca98"),
+        Some("383d54a310ab3e0825e85dfdc69f929c8dafe7f7acf80de8f85981cd4fb39ecb"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -9949,19 +9950,23 @@ fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
 /// launchd (PPID 1), and the run's cleanup ends CLEAN, so the tracee was reaped
 /// rather than left as anyone's zombie.
 ///
-/// Before the ordered teardown, every refusal left its tracee as a PPID-1
-/// zombie, whatever the session (21/21 in the #186 arc). Debugserver was killed
+/// Before the ordered teardown, refusals in the #186 arc left the tracee as a
+/// PPID-1 zombie in both sessions (E1/E2: 21/21 runs), and this assertion failed
+/// on 3 of the 4 refusal cases' pre-fix readings. C11-02 attributes showed no
+/// PPID-1 member on its one pre-fix reading. Debugserver was killed
 /// while it still held the tracee, so the tracee went to launchd uncounted
 /// (xnu-12377.121.6 `kern_exit.c:2610-2614`). In launchd's own session that
 /// orphans the whole group with SIGHUP. Every census reading and every watched
 /// snapshot of the group is checked, not just the last one.
 fn slate_assert_tracee_not_orphaned(evidence: &Path) {
     let census = std::fs::read_to_string(evidence.with_extension("census.jsonl")).unwrap();
+    let mut readings = 0;
     for line in census.lines() {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
         if row["kind"] != "READING" {
             continue;
         }
+        readings += 1;
         for member in row["stdout"].as_str().unwrap_or_default().lines() {
             assert_ne!(
                 member.split_whitespace().nth(1),
@@ -9970,6 +9975,10 @@ fn slate_assert_tracee_not_orphaned(evidence: &Path) {
             );
         }
     }
+    assert!(
+        readings > 0,
+        "#186: the witness read no census of the run's group"
+    );
     if let Ok(snapshots) = std::fs::read_to_string(evidence.with_extension("snapshots.jsonl")) {
         for line in snapshots.lines() {
             let row: serde_json::Value = serde_json::from_str(line).unwrap();
