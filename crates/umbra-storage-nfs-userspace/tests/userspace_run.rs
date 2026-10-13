@@ -9948,8 +9948,8 @@ fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
 
 /// #186 regression witness (cause-gate ruling R4(a)), and session-independent:
 /// no sampled member of the routed run's process group (census readings and
-/// snapshots) is observed reparented to launchd (PPID 1), and the run's cleanup ends CLEAN, so the tracee was reaped
-/// rather than left as anyone's zombie.
+/// snapshots) is observed reparented to launchd (PPID 1), and the run's cleanup
+/// ends CLEAN, so the tracee was reaped rather than left as anyone's zombie.
 ///
 /// Before the ordered teardown, refusals in the #186 arc left the tracee as a
 /// PPID-1 zombie in both sessions (E1/E2: 21/21 runs), and this assertion failed

@@ -1807,10 +1807,21 @@ fn where_now(pid: i32) -> String {
     }
 }
 
-/// Whether `pid` is past its exit as `terminate` returns: a zombie still
-/// carrying the attach-time start identity, nothing at the pid, or a different
-/// process there. `false` means the attached process is still live.
-fn past_exit(pid: i32, identity: Option<(u64, u64)>) -> bool {
+/// The tracee's end state as `terminate` returns, read the way the barrier's
+/// `lookup` reads it.
+#[derive(Debug, PartialEq, Eq)]
+enum EndState {
+    /// ESRCH, a zombie still carrying the attach-time start identity, or a
+    /// different process at the pid.
+    PastExit,
+    /// The attached process, not a zombie.
+    Live,
+    /// Any other lookup failure, a short record, or no attach identity to
+    /// compare: evidence of neither.
+    Unreadable(String),
+}
+
+fn end_state(pid: i32, identity: Option<(u64, u64)>) -> EndState {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
     // SAFETY: `info` is a writable buffer of exactly `size` bytes.
@@ -1824,10 +1835,22 @@ fn past_exit(pid: i32, identity: Option<(u64, u64)>) -> bool {
         )
     };
     if got != size {
-        return true;
+        let error = std::io::Error::last_os_error();
+        return if got <= 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            EndState::PastExit
+        } else if got <= 0 {
+            EndState::Unreadable(error.to_string())
+        } else {
+            EndState::Unreadable(format!("short record: {got} of {size} bytes"))
+        };
     }
     let start = (info.pbi_start_tvsec, info.pbi_start_tvusec);
-    identity.is_some_and(|attached| attached != start) || info.pbi_status == libc::SZOMB
+    match identity {
+        _ if info.pbi_status == libc::SZOMB => EndState::PastExit,
+        Some(attached) if attached != start => EndState::PastExit,
+        Some(_) => EndState::Live,
+        None => EndState::Unreadable("no attach identity".into()),
+    }
 }
 
 /// The post-kill result must match the tracee's end state (C2-N1). A confirmed
@@ -1836,10 +1859,13 @@ fn past_exit(pid: i32, identity: Option<(u64, u64)>) -> bool {
 /// The end state is read as `terminate` returns, after a post-kill barrier
 /// that polls the whole 250 ms reap window; a released tracee was measured as a
 /// zombie within 5 ms, so a tracee still live then is held, not mid-exit.
-fn assert_outcome_matches_end_state(outcome: &str, past: bool) {
-    match (outcome, past) {
-        ("confirmed after tracer kill", true) | ("still unconfirmed", false) => {}
-        _ => panic!("post-kill outcome {outcome:?} with tracee past its exit = {past}"),
+/// An end state the test cannot read fails the test: it is evidence for
+/// neither outcome.
+fn assert_outcome_matches_end_state(outcome: &str, end: &EndState) {
+    match (outcome, end) {
+        ("confirmed after tracer kill", EndState::PastExit)
+        | ("still unconfirmed", EndState::Live) => {}
+        _ => panic!("post-kill outcome {outcome:?} with tracee end state {end:?}"),
     }
 }
 
@@ -1916,12 +1942,12 @@ fn teardown_times_out_on_unresponsive_tracer() {
         let result = tracer.terminate(process, TerminationPolicy::Immediate);
         let elapsed = started.elapsed();
         let report = tracer.teardown_reports().last().unwrap().clone();
-        let past = past_exit(tracee, report.identity);
+        let end = end_state(tracee, report.identity);
         eprintln!("teardown report ({elapsed:?}): {report:?}");
         assert!(report.timed_out);
         let outcome = post_kill_outcome(&report, &result);
-        eprintln!("post-kill outcome: {outcome}; tracee past its exit: {past}");
-        assert_outcome_matches_end_state(outcome, past);
+        eprintln!("post-kill outcome: {outcome}; tracee end state: {end:?}");
+        assert_outcome_matches_end_state(outcome, &end);
         // The bound is 1.5 s for `k` and the barrier, plus 0.25 s for each reap.
         assert!(
             elapsed >= std::time::Duration::from_millis(1500)
@@ -1987,12 +2013,12 @@ fn teardown_reports_dead_tracer_without_waiting() {
         let result = tracer.terminate(process, TerminationPolicy::Immediate);
         let elapsed = started.elapsed();
         let report = tracer.teardown_reports().last().unwrap().clone();
-        let past = past_exit(tracee, report.identity);
+        let end = end_state(tracee, report.identity);
         eprintln!("teardown report ({elapsed:?}): {report:?}");
         assert!(report.timed_out);
         let outcome = post_kill_outcome(&report, &result);
-        eprintln!("post-kill outcome: {outcome}; tracee past its exit: {past}");
-        assert_outcome_matches_end_state(outcome, past);
+        eprintln!("post-kill outcome: {outcome}; tracee end state: {end:?}");
+        assert_outcome_matches_end_state(outcome, &end);
         assert!(
             elapsed < std::time::Duration::from_millis(1000),
             "waited {elapsed:?} for a dead tracer"
