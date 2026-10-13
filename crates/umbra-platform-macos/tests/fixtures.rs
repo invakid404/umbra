@@ -7,7 +7,10 @@ use std::{
 };
 use umbra_core::*;
 use umbra_platform::{SyscallAbi, TraceBackend, TraceControl, TraceMemory};
-use umbra_platform_macos::{DarwinArm64Abi, MacosTraceBackend, Options};
+use umbra_platform_macos::{
+    BarrierEvidence, BarrierReading, DarwinArm64Abi, MacosTraceBackend, Options, TeardownReport,
+    TeardownStep,
+};
 fn byte_path(path: &Path) -> BytePath {
     BytePath::new(path.as_os_str().as_bytes().to_vec()).unwrap()
 }
@@ -300,6 +303,27 @@ fn fixture_argv_locked(
     tracer
         .terminate(process, TerminationPolicy::Immediate)
         .unwrap();
+    // #186 (implement ruling 1, I3.2): a normal run's ordered teardown never
+    // reports "tracee termination unconfirmed". The orphaned-child topology
+    // (`mt-spawn`: the root exits before its traced child, whose tracer then
+    // reaps it with no handback) must be admitted as `TracerReportedExit`
+    // instead, or that false-warning class could come back silently.
+    let reports = tracer.teardown_reports();
+    assert!(
+        reports.iter().all(|r| !r.timed_out),
+        "{case}: a normal run's teardown warned 'tracee termination unconfirmed': {reports:?}"
+    );
+    if case == "mt-spawn" {
+        assert!(
+            reports.iter().any(|r| r.steps.iter().any(|s| matches!(
+                s,
+                TeardownStep::Barrier(BarrierReading::Confirmed(
+                    BarrierEvidence::TracerReportedExit { .. }
+                ))
+            ))),
+            "{case}: the orphaned child was not admitted as TracerReportedExit: {reports:?}"
+        );
+    }
     assert!(opens > 0);
     assert!(!host.exists(), "MISSED {case}: host output exists");
     assert_eq!(
@@ -1671,4 +1695,553 @@ fn symlink_cycle() {
             );
         },
     )
+}
+
+// ---- #186 ordered teardown: timeout-path acceptance (cause-gate ruling R3.7) ----
+//
+// Normal refusals never take the timeout path, so they cannot validate it. These
+// tests drive it on purpose: a tracer that never answers RSP `k` (stopped), and a
+// tracer that is already dead. A third test pins the ordinary path's order.
+//
+// **Each body runs in a child of this test binary that leads a fresh session.**
+// That is a non-exposed context wherever this suite runs, including the
+// self-hosted runner, whose jobs live in launchd's session. The timeout path in
+// an exposed context is the documented residual; it is not asserted here.
+
+/// Re-run this one test in a child that leads a fresh session, and pass only
+/// if the child passes. In the child, `UMBRA_TEARDOWN_CHILD` is set and `body`
+/// runs instead.
+fn in_fresh_session(test: &str, body: impl FnOnce()) {
+    if std::env::var_os("UMBRA_TEARDOWN_CHILD").is_some() {
+        body();
+        return;
+    }
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env("UMBRA_TEARDOWN_CHILD", "1");
+    // SAFETY: only async-signal-safe libc between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().expect("re-run in a fresh session");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "fresh-session child failed");
+    assert!(
+        stdout.contains("1 passed"),
+        "the fresh-session child did not run {test}"
+    );
+}
+
+/// Launch the fixture and stop at the attached, held root: the same state a
+/// refusal leaves the tracee in. `None` (skip) without the fixture variables.
+fn teardown_launch(case: &str) -> Option<(MacosTraceBackend, ProcessHandle, i32, i32)> {
+    let Some(fixture) = std::env::var_os("UMBRA_TEST_FIXTURE_PATH") else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_TEST_FIXTURE_PATH"
+        );
+        eprintln!("SKIP {case}: set UMBRA_TEST_FIXTURE_PATH");
+        return None;
+    };
+    let fixture = PathBuf::from(fixture);
+    let host = std::env::temp_dir().join(format!("umbra-teardown-{}-{case}", std::process::id()));
+    let mut tracer = MacosTraceBackend::new(Options {
+        timeout_ms: 25_000,
+        ..Options::default()
+    });
+    let process = tracer
+        .launch_experimental(LaunchSpec {
+            executable: byte_path(&fixture),
+            argv: vec![bytes(&fixture), b"open_libc".to_vec(), bytes(&host)],
+            environment: vec![],
+            cwd: byte_path(&std::env::current_dir().unwrap()),
+            policy: LaunchPolicy {
+                persistence: PersistencePolicy::LocalDevelopment,
+                inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                interpose: false,
+                descriptor_limit: None,
+            },
+            sandbox: SandboxRequirement::UnsandboxedExperiment,
+        })
+        .unwrap();
+    let tracers = tracer.tracer_pids();
+    assert_eq!(tracers.len(), 1, "one session, one tracer");
+    Some((tracer, process, process.0 .0.native_id as i32, tracers[0]))
+}
+
+/// True once nothing is left at `pid`, not even a zombie: `kill(pid, 0)`
+/// succeeds on a zombie and fails with ESRCH only once it is reaped.
+fn gone(pid: i32) -> bool {
+    // SAFETY: signal 0 delivers nothing.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Where `pid` is now, for the record only (never asserted): its parent and
+/// `p_stat`, or that nothing is left.
+fn where_now(pid: i32) -> String {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if got == size {
+        format!("ppid={} p_stat={}", info.pbi_ppid, info.pbi_status)
+    } else {
+        "gone".into()
+    }
+}
+
+/// The tracee's end state as `terminate` returns, read the way the barrier's
+/// `lookup` reads it.
+#[derive(Debug, PartialEq, Eq)]
+enum EndState {
+    /// ESRCH, a zombie still carrying the attach-time start identity, or a
+    /// different process at the pid.
+    PastExit,
+    /// The attached process, not a zombie.
+    Live,
+    /// Any other lookup failure, a short record, or a process found with no
+    /// attach identity to compare, which the barrier also leaves unconfirmed,
+    /// zombie or not: evidence of neither.
+    Unreadable(String),
+}
+
+fn end_state(pid: i32, identity: Option<(u64, u64)>) -> EndState {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if got != size {
+        let error = std::io::Error::last_os_error();
+        return if got <= 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            EndState::PastExit
+        } else if got <= 0 {
+            EndState::Unreadable(error.to_string())
+        } else {
+            EndState::Unreadable(format!("short record: {got} of {size} bytes"))
+        };
+    }
+    let start = (info.pbi_start_tvsec, info.pbi_start_tvusec);
+    match identity {
+        None => EndState::Unreadable("no attach identity".into()),
+        Some(attached) if attached != start => EndState::PastExit,
+        Some(_) if info.pbi_status == libc::SZOMB => EndState::PastExit,
+        Some(_) => EndState::Live,
+    }
+}
+
+/// The post-kill result must match the tracee's end state (C2-N1). A confirmed
+/// result with the tracee still live is a false positive, and an unconfirmed
+/// one with the tracee past its exit means the barrier missed a provable state.
+/// The end state is read as `terminate` returns, after a post-kill barrier
+/// that polls the whole 250 ms reap window; a released tracee was measured as a
+/// zombie within 5 ms, so a tracee still live then is held, not mid-exit.
+/// An end state the test cannot read fails the test: it is evidence for
+/// neither outcome.
+fn assert_outcome_matches_end_state(outcome: &str, end: &EndState) {
+    match (outcome, end) {
+        ("confirmed after tracer kill", EndState::PastExit)
+        | ("still unconfirmed", EndState::Live) => {}
+        _ => panic!("post-kill outcome {outcome:?} with tracee end state {end:?}"),
+    }
+}
+
+/// No child of this process remains, live or zombie: nothing F1 owns leaked.
+fn no_children_left() -> bool {
+    // SAFETY: WNOHANG never blocks; the status pointer may be null.
+    let rc = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+}
+
+fn step_index(report: &TeardownReport, wanted: impl Fn(&TeardownStep) -> bool) -> Option<usize> {
+    report.steps.iter().position(wanted)
+}
+
+/// The ordinary path: `k`, a confirmed barrier, and only then the tracer kill.
+/// No warning, nothing left behind, and `terminate` succeeds.
+#[test]
+fn teardown_confirms_exit_before_killing_tracer() {
+    in_fresh_session("teardown_confirms_exit_before_killing_tracer", || {
+        let _serial = fixture_launch_lock();
+        let Some((mut tracer, process, tracee, debugserver)) = teardown_launch("confirm") else {
+            return;
+        };
+        tracer
+            .terminate(process, TerminationPolicy::Immediate)
+            .expect("ordinary teardown confirms the exit");
+        let report = tracer.teardown_reports().last().unwrap().clone();
+        eprintln!("teardown report: {report:?}");
+        assert_eq!(report.pid, tracee);
+        assert_eq!(report.tracer, debugserver);
+        assert!(report.identity.is_some(), "identity read at attach");
+        assert!(!report.timed_out);
+        let confirmed = step_index(&report, |s| {
+            matches!(s, TeardownStep::Barrier(BarrierReading::Confirmed(_)))
+        })
+        .expect("confirmed barrier");
+        let killed = step_index(&report, |s| *s == TeardownStep::TracerKilled).unwrap();
+        assert_eq!(
+            step_index(&report, |s| *s == TeardownStep::KillSent),
+            Some(0)
+        );
+        assert!(confirmed < killed, "the tracer died before the barrier");
+        assert!(step_index(&report, |s| matches!(s, TeardownStep::Warning(_))).is_none());
+        assert!(report.steps.contains(&TeardownStep::TracerReaped(true)));
+        assert!(report.steps.contains(&TeardownStep::TraceeReaped(true)));
+        assert!(gone(tracee) && gone(debugserver));
+        assert!(no_children_left());
+    });
+}
+
+/// A tracer that never answers `k` (stopped): the barrier cannot be confirmed,
+/// so after the bound the warning goes out, then the tracer is killed and
+/// reaped. `terminate`'s result follows the post-kill barrier, which must match
+/// the tracee's end state. Nothing this process owns leaks.
+#[test]
+fn teardown_times_out_on_unresponsive_tracer() {
+    in_fresh_session("teardown_times_out_on_unresponsive_tracer", || {
+        let _serial = fixture_launch_lock();
+        let Some((mut tracer, process, tracee, debugserver)) = teardown_launch("unresponsive")
+        else {
+            return;
+        };
+        let mut status = 0;
+        // SAFETY: plain libSystem calls on our own child.
+        unsafe {
+            assert_eq!(libc::kill(debugserver, libc::SIGSTOP), 0);
+            assert_eq!(
+                libc::waitpid(debugserver, &mut status, libc::WUNTRACED),
+                debugserver
+            );
+        }
+        assert!(libc::WIFSTOPPED(status), "tracer did not stop");
+        let started = std::time::Instant::now();
+        let result = tracer.terminate(process, TerminationPolicy::Immediate);
+        let elapsed = started.elapsed();
+        let report = tracer.teardown_reports().last().unwrap().clone();
+        let end = end_state(tracee, report.identity);
+        eprintln!("teardown report ({elapsed:?}): {report:?}");
+        assert!(report.timed_out);
+        let outcome = post_kill_outcome(&report, &result);
+        eprintln!("post-kill outcome: {outcome}; tracee end state: {end:?}");
+        assert_outcome_matches_end_state(outcome, &end);
+        // The bound is 1.5 s for `k` and the barrier, plus 0.25 s for each reap.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1500)
+                && elapsed <= std::time::Duration::from_millis(2500),
+            "teardown took {elapsed:?}"
+        );
+        let warning =
+            step_index(&report, |s| matches!(s, TeardownStep::Warning(_))).expect("warning");
+        let killed = step_index(&report, |s| *s == TeardownStep::TracerKilled).unwrap();
+        assert!(warning < killed, "the warning must precede the tracer kill");
+        assert!(matches!(
+            report.steps[warning - 1],
+            TeardownStep::Barrier(BarrierReading::Unconfirmed(_))
+        ));
+        assert!(report.steps.contains(&TeardownStep::TracerReaped(true)));
+        assert!(gone(debugserver), "tracer left behind");
+        // The tracee is ours to reap only if the kernel handed it back to us;
+        // if it went to launchd instead (the residual), it is launchd's.
+        eprintln!(
+            "tracee {tracee}: reaped by platform = {}; now {}",
+            report.steps.contains(&TeardownStep::TraceeReaped(true)),
+            where_now(tracee)
+        );
+        assert!(no_children_left(), "a child of this process leaked");
+    });
+}
+
+/// A tracer that is already dead: the closed connection is seen at once, so the
+/// timeout path is taken without waiting for the bound (ruling R3.4).
+#[test]
+fn teardown_reports_dead_tracer_without_waiting() {
+    in_fresh_session("teardown_reports_dead_tracer_without_waiting", || {
+        let _serial = fixture_launch_lock();
+        let Some((mut tracer, process, tracee, debugserver)) = teardown_launch("dead") else {
+            return;
+        };
+        // SAFETY: plain libSystem call on our own child.
+        unsafe {
+            assert_eq!(libc::kill(debugserver, libc::SIGKILL), 0);
+        }
+        // Wait for it to die (it stays our unreaped zombie for the backend).
+        let dead = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+            // SAFETY: `info` is a writable buffer of exactly `size` bytes.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    debugserver,
+                    libc::PROC_PIDTBSDINFO,
+                    1,
+                    &mut info as *mut _ as *mut libc::c_void,
+                    size,
+                )
+            };
+            if got == size && info.pbi_status == libc::SZOMB {
+                break;
+            }
+            assert!(std::time::Instant::now() < dead, "tracer did not die");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let started = std::time::Instant::now();
+        let result = tracer.terminate(process, TerminationPolicy::Immediate);
+        let elapsed = started.elapsed();
+        let report = tracer.teardown_reports().last().unwrap().clone();
+        let end = end_state(tracee, report.identity);
+        eprintln!("teardown report ({elapsed:?}): {report:?}");
+        assert!(report.timed_out);
+        let outcome = post_kill_outcome(&report, &result);
+        eprintln!("post-kill outcome: {outcome}; tracee end state: {end:?}");
+        assert_outcome_matches_end_state(outcome, &end);
+        assert!(
+            elapsed < std::time::Duration::from_millis(1000),
+            "waited {elapsed:?} for a dead tracer"
+        );
+        assert!(report.steps.iter().any(|s| matches!(
+            s,
+            TeardownStep::KillSendFailed(_) | TeardownStep::ConnectionClosed(_)
+        )));
+        let warning =
+            step_index(&report, |s| matches!(s, TeardownStep::Warning(_))).expect("warning");
+        let killed = step_index(&report, |s| *s == TeardownStep::TracerKilled).unwrap();
+        assert!(warning < killed, "the warning must precede the tracer kill");
+        assert!(report.steps.contains(&TeardownStep::TracerReaped(true)));
+        assert!(gone(debugserver), "tracer left behind");
+        eprintln!(
+            "tracee {tracee}: reaped by platform = {}; now {}",
+            report.steps.contains(&TeardownStep::TraceeReaped(true)),
+            where_now(tracee)
+        );
+        assert!(no_children_left(), "a child of this process leaked");
+    });
+}
+
+/// Review ruling 1 V3: after a timeout (warning, then the tracer kill), the
+/// result follows the one post-kill barrier. Confirmed after the kill means
+/// `terminate` succeeds; still unconfirmed means it fails. Either step comes
+/// after `TracerKilled`. Returns which one the end state proved.
+fn post_kill_outcome(report: &TeardownReport, result: &Result<()>) -> &'static str {
+    let killed = step_index(report, |s| *s == TeardownStep::TracerKilled).unwrap();
+    let confirmed = step_index(report, |s| {
+        matches!(s, TeardownStep::ConfirmedAfterTracerKill(_))
+    });
+    let unconfirmed = step_index(report, |s| {
+        matches!(s, TeardownStep::UnconfirmedAfterTracerKill(_))
+    });
+    match (confirmed, unconfirmed) {
+        (Some(at), None) => {
+            assert!(at > killed, "post-kill confirmation before the kill");
+            assert!(!report.unconfirmed);
+            assert!(result.is_ok(), "confirmed after the kill, yet {result:?}");
+            "confirmed after tracer kill"
+        }
+        (None, Some(at)) => {
+            assert!(at > killed, "post-kill reading before the kill");
+            assert!(report.unconfirmed);
+            let error = result
+                .as_ref()
+                .expect_err("unconfirmed must fail terminate");
+            assert!(
+                error
+                    .to_string()
+                    .contains("tracee termination unconfirmed; tracer killed"),
+                "{error}"
+            );
+            "still unconfirmed"
+        }
+        other => panic!("no single post-kill reading: {other:?} in {report:?}"),
+    }
+}
+
+/// Launch `--mt-spawn` (a multithreaded root that spawns one traced child) and
+/// resume every event without rewrites until `stop` says to stop. Returns the
+/// child's pid, or `None` (skip) without the fixture variable.
+fn mt_spawn_until(
+    case: &str,
+    stop: impl Fn(&TraceEvent, ProcessHandle) -> bool,
+) -> Option<(MacosTraceBackend, ProcessHandle, i32)> {
+    let Some(fixture) = std::env::var_os("UMBRA_TEST_FIXTURE_PATH") else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_TEST_FIXTURE_PATH"
+        );
+        eprintln!("SKIP {case}: set UMBRA_TEST_FIXTURE_PATH");
+        return None;
+    };
+    let fixture = PathBuf::from(fixture);
+    let host = std::env::temp_dir().join(format!("umbra-teardown-{}-{case}", std::process::id()));
+    std::fs::create_dir_all(&host).unwrap();
+    let mut tracer = MacosTraceBackend::new(Options {
+        timeout_ms: 25_000,
+        ..Options::default()
+    });
+    let process = tracer
+        .launch_experimental(LaunchSpec {
+            executable: byte_path(&fixture),
+            argv: vec![
+                bytes(&fixture),
+                b"--mt-spawn".to_vec(),
+                bytes(&host.join("a")),
+                bytes(&host.join("b")),
+            ],
+            environment: vec![],
+            cwd: byte_path(&std::env::current_dir().unwrap()),
+            policy: LaunchPolicy {
+                persistence: PersistencePolicy::LocalDevelopment,
+                inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                interpose: false,
+                descriptor_limit: None,
+            },
+            sandbox: SandboxRequirement::UnsandboxedExperiment,
+        })
+        .unwrap();
+    let mut child = 0;
+    loop {
+        let event = tracer.next_event().unwrap();
+        eprintln!("{case}: {event:?}");
+        if let TraceEvent::Child { child: c, .. } = &event {
+            child = c.0 .0.native_id as i32;
+        }
+        if stop(&event, process) {
+            break;
+        }
+        let resume = match event {
+            TraceEvent::ThreadStarted { thread, .. }
+            | TraceEvent::SyscallEntry { thread, .. }
+            | TraceEvent::SyscallExit { thread, .. }
+            | TraceEvent::Exec { thread, .. } => Some(thread),
+            _ => None,
+        };
+        if let Some(thread) = resume {
+            tracer
+                .resume(ResumeCommand {
+                    thread,
+                    mode: ResumeMode::Syscall,
+                    signal: None,
+                })
+                .unwrap();
+        }
+    }
+    assert!(child > 0, "{case}: no child was spawned");
+    Some((tracer, process, child))
+}
+
+/// Review ruling 1 V4, the P1/P3 shape: the root has exited and its traced
+/// child is live when `terminate` runs (a failure path). The child's tracer
+/// cannot hand it back, so the barrier needs the V1 proof or a zombie. The
+/// first `k` draws only the child's queued stop reply, so `k` is re-sent
+/// (V2). The teardown must end confirmed before the tracer kill, with no
+/// warning, and `terminate` must succeed.
+#[test]
+fn teardown_confirms_a_live_orphaned_child_without_warning() {
+    in_fresh_session(
+        "teardown_confirms_a_live_orphaned_child_without_warning",
+        || {
+            let _serial = fixture_launch_lock();
+            let Some((mut tracer, process, child)) = mt_spawn_until(
+                "orphan",
+                |event, root| matches!(event, TraceEvent::Exit { task, .. } if *task == root.0),
+            ) else {
+                return;
+            };
+            let started = std::time::Instant::now();
+            let result = tracer.terminate(process, TerminationPolicy::Immediate);
+            let elapsed = started.elapsed();
+            let reports = tracer.teardown_reports().to_vec();
+            eprintln!("teardown ({elapsed:?}): {reports:?}");
+            result.expect("a live orphaned child's teardown confirms");
+            assert!(reports.iter().all(|r| !r.timed_out && !r.unconfirmed));
+            let report = reports
+                .iter()
+                .find(|r| r.pid == child)
+                .expect("child report");
+            let confirmed = step_index(report, |s| {
+                matches!(s, TeardownStep::Barrier(BarrierReading::Confirmed(_)))
+            })
+            .expect("confirmed barrier");
+            let killed = step_index(report, |s| *s == TeardownStep::TracerKilled).unwrap();
+            assert!(confirmed < killed, "the tracer died before the barrier");
+            assert!(step_index(report, |s| matches!(s, TeardownStep::Warning(_))).is_none());
+            // V2: if the first reply was a stop, `k` was re-sent right after it.
+            if let Some(stop) = step_index(
+                report,
+                |s| matches!(s, TeardownStep::Reply(r) if r.starts_with('T') || r.starts_with('S')),
+            ) {
+                assert_eq!(report.steps.get(stop + 1), Some(&TeardownStep::KillResent));
+            }
+            // The measured outcome is the V1 proof, `ReapedProven { Absent }`: the
+            // child's own tracer reaps it with no handback. A barrier poll can also
+            // land in the brief zombie window before that reap, which proves the
+            // same passage. Anything else fails. The decision table pins V1 itself.
+            eprintln!("orphan evidence: {:?}", report.steps[confirmed]);
+            assert!(
+                matches!(
+                    &report.steps[confirmed],
+                    TeardownStep::Barrier(BarrierReading::Confirmed(
+                        BarrierEvidence::ReapedProven { .. } | BarrierEvidence::Zombie
+                    ))
+                ),
+                "{:?}",
+                report.steps[confirmed]
+            );
+            assert!(gone(child), "the orphaned child was left behind");
+            assert!(no_children_left(), "a child of this process leaked");
+        },
+    );
+}
+
+/// Review ruling 1 V4, the P2 control: the same fixture stopped at the child's
+/// first event, with the root still alive. Both sessions confirm with no
+/// warning and `terminate` succeeds.
+#[test]
+fn teardown_confirms_a_live_child_while_its_root_is_alive() {
+    in_fresh_session(
+        "teardown_confirms_a_live_child_while_its_root_is_alive",
+        || {
+            let _serial = fixture_launch_lock();
+            let Some((mut tracer, process, child)) = mt_spawn_until("rooted", |event, _| {
+                matches!(event, TraceEvent::Child { .. })
+            }) else {
+                return;
+            };
+            let result = tracer.terminate(process, TerminationPolicy::Immediate);
+            let reports = tracer.teardown_reports().to_vec();
+            eprintln!("teardown: {reports:?}");
+            result.expect("a live child with its root alive confirms");
+            assert_eq!(reports.len(), 2, "child and root sessions");
+            for report in &reports {
+                assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
+                assert!(step_index(report, |s| matches!(s, TeardownStep::Warning(_))).is_none());
+            }
+            assert!(gone(child) && gone(process.0 .0.native_id as i32));
+            assert!(no_children_left(), "a child of this process leaked");
+        },
+    );
 }

@@ -292,6 +292,21 @@ struct Session {
     stopped: bool,
     done: bool,
     reaped: bool,
+    /// The tracee's start time (`pbi_start_tvsec`, `pbi_start_tvusec`), read
+    /// at attach while it is alive. The ordered teardown's SZOMB evidence only
+    /// counts when a later lookup returns this same identity (#186).
+    birth: Option<(u64, u64)>,
+    /// Set once [`Session::ordered_teardown`] has run, so `Drop` does not
+    /// run it a second time.
+    torn_down: bool,
+    /// Barrier evidence already collected, so it is not lost. A tracee's exit
+    /// is checked the moment its tracer reports it (W/X), while the zombie
+    /// still exists. Its own parent may reap it before teardown, and absence is
+    /// never evidence (ruling R2), but proof taken earlier stays proof.
+    exit_evidence: Option<BarrierEvidence>,
+    /// The tracer's own exit report for this tracee (its `W`/`X` packet),
+    /// kept for [`BarrierEvidence::TracerReportedExit`].
+    exit_report: Option<String>,
     exec_generation: u64,
     registers: Vec<(usize, usize)>,
     scratch: Vec<(u64, usize, usize)>,
@@ -354,6 +369,7 @@ impl Session {
     ) -> Result<Self> {
         let task = Arc::new(Task::acquire(pid)?);
         watchdog.add(task.clone());
+        let birth = bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
         let mut rsp = Rsp::connect(options, deadline)?;
         let stop = rsp.request(&format!("vAttach;{pid:x}"))?;
         if !stop.starts_with('T') {
@@ -410,6 +426,10 @@ impl Session {
             stopped: true,
             done: false,
             reaped: false,
+            birth,
+            torn_down: false,
+            exit_evidence: None,
+            exit_report: None,
             exec_generation: 0,
             registers,
             scratch: vec![],
@@ -1384,6 +1404,14 @@ impl Drop for Session {
         if !self.done {
             self.task.kill();
         }
+        // Every backend path tears its sessions down in order first, children
+        // before parents (`MacosTraceBackend::tear_down_sessions`). This only
+        // catches a session dropped some other way, so even then the tracer is
+        // never killed ahead of the barrier.
+        if !self.torn_down {
+            let report = self.ordered_teardown();
+            log_teardown(&report);
+        }
     }
 }
 
@@ -1391,6 +1419,9 @@ impl Drop for Session {
 pub struct MacosTraceBackend {
     options: Options,
     sessions: Vec<Session>,
+    /// Every ordered teardown this backend ran, in order. It is the teardown's
+    /// diagnostic record: read-only, and never consulted by the backend itself.
+    teardown_reports: Vec<TeardownReport>,
     events: VecDeque<TraceEvent>,
     // Stop replies consumed by quiesce still belong to the normal event loop.
     quiesced_stops: VecDeque<(usize, String)>,
@@ -1415,6 +1446,7 @@ impl MacosTraceBackend {
         Self {
             options,
             sessions: vec![],
+            teardown_reports: vec![],
             events: VecDeque::new(),
             quiesced_stops: VecDeque::new(),
             deadline: None,
@@ -1773,6 +1805,7 @@ impl MacosTraceBackend {
                 for session in &self.sessions {
                     session.task.kill();
                 }
+                self.tear_down_sessions();
                 let mut reaped = !self.sessions.is_empty();
                 for session in &self.sessions {
                     reaped &= (session.parent.is_none() && session.reaped)
@@ -2219,6 +2252,7 @@ impl MacosTraceBackend {
             let s = &mut self.sessions[index];
             s.done = true;
             s.stopped = false;
+            s.exit_report = Some(reply.clone());
             self.events.push_back(TraceEvent::Exit {
                 task: s.id,
                 status: if reply.starts_with('W') {
@@ -2235,6 +2269,9 @@ impl MacosTraceBackend {
                             == s.id.0.native_id as i32;
                 }
             }
+            // #186: take the teardown barrier's evidence now, while the exited
+            // tracee is still a zombie someone has yet to reap.
+            let _ = s.barrier();
             return Ok(());
         }
         if !reply.starts_with('T') {
@@ -2496,6 +2533,571 @@ fn reap_launched_child(pid: i32) -> bool {
     }
 }
 
+// ---- Ordered teardown (#186; cause-gate ruling F1-revised, R2, R3) ----
+//
+// **Why the order matters.** A debugger-held tracee cannot finish exiting while
+// its debugserver holds it: `task_terminate` only aborts its threads
+// (xnu-12377.121.6 `osfmk/kern/task.c:3063-3094`, `thread_act.c:285-320`). So
+// killing debugserver both releases the tracee's exit and runs debugserver's
+// own exit concurrently. If debugserver's child loop reaches the tracee after
+// the tracee's `proc_prepareexit` cleared `P_LTRACED` (`kern_exit.c:2278`), the
+// tracee goes to launchd through the untraced branch, which does no job-control
+// accounting (`kern_exit.c:2610-2614`, `proc_reparentlocked` `:3549-3594`). The
+// tracee's own `fixjobc` (`kern_exit.c:2505`) then counts launchd as a
+// qualifying parent whenever the run's process group is in launchd's session,
+// takes `pg_jobc` from 1 to 0 and `orphanpg` sends SIGHUP+SIGCONT to the whole
+// group, supervisor included (`kern_proc.c:3203-3211`, `:3321-3383`).
+//
+// **The order, per session.** RSP `k` over the existing connection (re-sent
+// once after a stale stop reply), then a state barrier that proves the tracee
+// has passed its exit accounting while the tracer is still alive, and only then
+// `SIGKILL` and reap the tracer, and reap the handed-back root tracee.
+//
+// **The timeout path (ruling R3 option (i), review ruling 1 V3).** If the
+// barrier does not confirm within the bound, the warning goes to stderr, the
+// tracer is killed anyway, and one post-kill barrier decides: confirmed means
+// `terminate` succeeds, still unconfirmed means it fails. In launchd's session
+// the #186 race can recur on that path. That is a residual, tracked in #193
+// together with what this code never reaches: the provider dying first, the
+// supervisor or a provider being `SIGKILL`ed, any cancellation that bypasses
+// `terminate`/`Drop`, and `Rsp`'s attach/connect failure fallback.
+
+/// Bound on the RSP `k` send and reply plus the barrier, per session. Measured
+/// replies took 16-91 ms (#186 arc, E4 K arm). With the two reap bounds, one
+/// session's teardown takes at most 2 s, and a tree of N sessions at most 2N s.
+/// Sessions are torn down one after another and each gets its own full bound,
+/// so one session's timeout never shortens another's.
+const TEARDOWN_BOUND: Duration = Duration::from_millis(1500);
+/// Bound on reaping the root tracee once it is platform's child again.
+const TRACEE_REAP_BOUND: Duration = Duration::from_millis(250);
+/// `p_stat` value of a process awaiting collection (`bsd/sys/proc.h:159`).
+const SZOMB: u32 = 5;
+
+/// One barrier lookup of a pid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Lookup {
+    /// The process, with its `p_stat` and start identity.
+    Found { status: u32, start: (u64, u64) },
+    /// `ESRCH`: no process holds this pid.
+    Absent,
+    /// Any other failure, or a short or unreadable record.
+    Error(String),
+}
+
+/// `proc_pidinfo(PROC_PIDTBSDINFO)` with the zombie fallback enabled
+/// (`arg = 1`), the only lookup the barrier uses.
+///
+/// **It finds a process from fork until the process is reaped, with no gap**
+/// (xnu-12377.121.6, the source proof `TracerReportedExit` rests on):
+/// - A process enters the pid hash at fork (`bsd/kern/kern_fork.c:988`) and
+///   leaves it only when reaped (`bsd/kern/kern_exit.c:2983`, in
+///   `reap_child_locked`). Both reap routes run after SZOMB is set
+///   (`kern_exit.c:2773` before a parent's `wait4` at `:3100`; `:2803` before
+///   the system reap at `:2815`), which is after `fixjobc` (`:2505`).
+/// - The lookup tries `proc_find` and then `proc_find_zombref`
+///   (`bsd/kern/proc_info.c:2198-2214`). `proc_find` fails only once
+///   `P_REF_DEAD` (or `P_REF_NEW`) is set (`kern_proc.c:886-899`,
+///   `:2520-2574`). `proc_find_zombref` finds the same pid-hash entry exactly
+///   when `P_REF_DEAD` is set (`kern_proc.c:1121-1143`, `:814-817`). It waits,
+///   rather than failing, while another thread holds `P_LIST_WAITING`.
+/// - `P_REF_DEAD` is set in `proc_prepareexit` together with the move from
+///   allproc to zombproc, under one `proc_list_lock` hold
+///   (`kern_exit.c:2260-2269`). So the allproc→zombproc / `P_REF_DEAD`
+///   transition opens no window in which this lookup misses the process. The
+///   only window in which it misses begins with `phash_remove_locked`, at the
+///   reap.
+///
+/// Hence `Absent` means the process was reaped, which means it is past
+/// `fixjobc`. A pid is reallocated only when `phash_find_locked(pid)` finds
+/// nothing (`kern_fork.c:972`), so a different start identity at the same pid
+/// also means the original holder was reaped. `p_start` survives `exec`
+/// (`kern_fork.c:1131-1135`, `in_exec`), so an exec cannot fake a reuse.
+///
+/// **An `exec` opens no window either.** It is the one lookup-relevant change a
+/// live process makes to its pid-hash entry:
+/// - The exec copy is never hashed beside the original: its `in_exec` branch
+///   copies the pid and sets `P_REF_SHADOW` without `phash_insert_locked`
+///   (`kern_fork.c:995-1004`).
+/// - Its `P_REF_NEW` is cleared in `pinsertchild` (`kern_proc.c:2931-2932`),
+///   before the swap.
+/// - The swap is `phash_replace_locked` under `proc_list_lock`
+///   (`kern_exec.c:5903`, `:5909`; `kern_proc.c:2483-2488`), one published
+///   store (`osfmk/kern/smr.h:1412-1432`), so a reader sees the old proc or
+///   the new one, never neither.
+/// - `proc_find` retries on a shadow proc (`kern_proc.c:2546-2552`) and waits
+///   out an exec in progress rather than failing (`:2558-2570`).
+///
+/// **The proof does not depend on any tracer report.** Every step above is a
+/// property of the pid hash and of `proc_exit`'s order, and holds for any
+/// process this backend attached to. That process was alive and hashed at
+/// attach (`task_for_pid` and `vAttach` of that pid), and its start identity
+/// was recorded then. So `Absent` and a reuse are positive for every session,
+/// live or done (review ruling 1 V1). A session whose tracer also reported the
+/// exit is labelled `TracerReportedExit`, and one without a report
+/// `ReapedProven`.
+fn lookup(pid: i32) -> Lookup {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if got == size {
+        return Lookup::Found {
+            status: info.pbi_status,
+            start: (info.pbi_start_tvsec, info.pbi_start_tvusec),
+        };
+    }
+    let error = std::io::Error::last_os_error();
+    if got <= 0 && error.raw_os_error() == Some(libc::ESRCH) {
+        Lookup::Absent
+    } else if got <= 0 {
+        Lookup::Error(error.to_string())
+    } else {
+        Lookup::Error(format!("short record: {got} of {size} bytes"))
+    }
+}
+
+fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (got == size).then_some(info)
+}
+
+/// The barrier's decision from one lookup, for a session that is not yet
+/// confirmed by a reap. Pure, so it is unit-tested directly.
+///
+/// `report` is the tracer's `W`/`X` packet if it reported this tracee's exit
+/// (implement ruling 1). Absence and pid reuse are positive with or without it,
+/// by the report-independent proof on [`lookup`] (review ruling 1 V1). Only
+/// the label differs. A present process that is not in SZOMB, a lookup error
+/// and a missing identity stay `Unconfirmed`.
+fn barrier_decision(
+    report: Option<&str>,
+    birth: Option<(u64, u64)>,
+    lookup: &Lookup,
+) -> BarrierReading {
+    match (lookup, report) {
+        (Lookup::Absent, Some(report)) => {
+            BarrierReading::Confirmed(BarrierEvidence::TracerReportedExit {
+                report: report.to_string(),
+                lookup: ReportedExitLookup::Absent,
+                admitted_by: ADMITTED_ABSENT,
+            })
+        }
+        (Lookup::Absent, None) => BarrierReading::Confirmed(BarrierEvidence::ReapedProven {
+            lookup: ReportedExitLookup::Absent,
+            admitted_by: ADMITTED_ABSENT,
+        }),
+        (Lookup::Error(why), _) => BarrierReading::Unconfirmed(format!("lookup failed: {why}")),
+        (Lookup::Found { .. }, _) if birth.is_none() => {
+            BarrierReading::Unconfirmed("no attach-time identity".into())
+        }
+        (Lookup::Found { start, .. }, Some(report)) if Some(*start) != birth => {
+            BarrierReading::Confirmed(BarrierEvidence::TracerReportedExit {
+                report: report.to_string(),
+                lookup: ReportedExitLookup::PidReused { start: *start },
+                admitted_by: ADMITTED_REUSED,
+            })
+        }
+        (Lookup::Found { start, .. }, None) if Some(*start) != birth => {
+            BarrierReading::Confirmed(BarrierEvidence::ReapedProven {
+                lookup: ReportedExitLookup::PidReused { start: *start },
+                admitted_by: ADMITTED_REUSED,
+            })
+        }
+        (Lookup::Found { status, .. }, _) if *status == SZOMB => {
+            BarrierReading::Confirmed(BarrierEvidence::Zombie)
+        }
+        (Lookup::Found { status, .. }, _) => {
+            BarrierReading::Unconfirmed(format!("p_stat {status}"))
+        }
+    }
+}
+
+/// What proved that a tracee has passed its exit-path job-control accounting
+/// (`fixjobc`, `kern_exit.c:2505`). Each is established from the
+/// xnu-12377.121.6 source, and nothing else counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BarrierEvidence {
+    /// A lookup returned the process in SZOMB with its attach-time start
+    /// identity. SZOMB is assigned only at `kern_exit.c:2773` and `:2803`,
+    /// both later in `proc_exit` than `fixjobc` at `:2505`.
+    Zombie,
+    /// This process reaped it with `waitpid`. `wait4` reaps only a child in
+    /// SZOMB (`kern_exit.c:3100`), so this implies the above.
+    ReapedByPlatform,
+    /// Its traced parent's intercepted `wait4` returned its pid
+    /// (`ReturnKind::Wait`): the kernel reaped it on the parent's behalf,
+    /// again only from SZOMB (`kern_exit.c:3100`).
+    ReapedByTracedParent,
+    /// Implement ruling 1 (done sessions only). The tracer reported the
+    /// tracee's exit (`report`, its `W`/`X` packet), and a lookup taken after
+    /// that report finds no process at the pid, or a different process.
+    /// Admitted by the xnu source proof on [`lookup`]: either way the original
+    /// was reaped, which is after SZOMB and so after `fixjobc`. This is the
+    /// orphaned child that its own tracer reaped with no handback
+    /// (`kern_exit.c:2863-2918`). A post-report lookup that still finds the
+    /// tracee, not in SZOMB, is `Unconfirmed`.
+    TracerReportedExit {
+        report: String,
+        lookup: ReportedExitLookup,
+        /// Which source-proof branch admitted it (logged with the outcome).
+        admitted_by: &'static str,
+    },
+    /// Review ruling 1 V1: the same proven absence or pid reuse for a session
+    /// with no tracer report, e.g. a live orphaned child that its own tracer
+    /// reaped with no handback. The proof on [`lookup`] needs no report.
+    ReapedProven {
+        lookup: ReportedExitLookup,
+        admitted_by: &'static str,
+    },
+}
+
+/// Ruling-1 branch (b): absence after the report.
+const ADMITTED_ABSENT: &str =
+    "xnu proof (b): pid leaves the hash only at reap (kern_exit.c:2983), after fixjobc (:2505)";
+/// Ruling-1 branch (c): pid reuse after the report.
+const ADMITTED_REUSED: &str =
+    "xnu proof (c): a pid is reallocated only once out of the hash (kern_fork.c:972)";
+
+/// What the post-report lookup behind [`BarrierEvidence::TracerReportedExit`]
+/// found. Both cases are admitted by the source proof on `lookup`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReportedExitLookup {
+    /// `ESRCH`: the pid is no longer in the pid hash.
+    Absent,
+    /// The pid now belongs to a different process (this start identity).
+    PidReused { start: (u64, u64) },
+}
+
+/// One barrier evaluation. Anything short of [`BarrierEvidence`] is
+/// "not yet confirmed", never "done": a failed lookup, absence without one of
+/// the reaps above, an identity mismatch, or a live state (ruling R2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BarrierReading {
+    Confirmed(BarrierEvidence),
+    Unconfirmed(String),
+}
+
+/// One step of a session's ordered teardown, in the order it happened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TeardownStep {
+    /// RSP `k` was written.
+    KillSent,
+    /// No `k`: the tracer already reported the tracee's exit.
+    KillSkipped,
+    /// `k` could not be written; straight to the timeout path (ruling R3.4).
+    KillSendFailed(String),
+    /// A packet the tracer sent during teardown.
+    Reply(String),
+    /// The connection closed during teardown.
+    ConnectionClosed(String),
+    /// The barrier's final reading.
+    Barrier(BarrierReading),
+    /// The termination-unconfirmed warning, written to stderr before the kill.
+    Warning(String),
+    TracerKilled,
+    TracerReaped(bool),
+    /// `k` re-sent once after a stop reply (review ruling 1 V2).
+    KillResent,
+    /// After a timeout and the tracer kill, the post-kill barrier confirmed the
+    /// exit (review ruling 1 V3). `terminate` succeeds; the warning stands.
+    ConfirmedAfterTracerKill(BarrierEvidence),
+    /// The post-kill barrier did not confirm either; `terminate` fails.
+    UnconfirmedAfterTracerKill(String),
+    /// The root tracee, once it is platform's child again.
+    TraceeReaped(bool),
+}
+
+/// The diagnostic record of one session's ordered teardown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeardownReport {
+    pub pid: i32,
+    /// The identity the barrier checked against (`None`: unreadable at attach).
+    pub identity: Option<(u64, u64)>,
+    pub tracer: i32,
+    pub steps: Vec<TeardownStep>,
+    /// The barrier did not confirm before the bound, so the timeout path ran:
+    /// the warning, then the tracer kill.
+    pub timed_out: bool,
+    /// Still not confirmed after the post-kill barrier either. Only this makes
+    /// `terminate` fail (review ruling 1 V3).
+    pub unconfirmed: bool,
+    pub elapsed: Duration,
+}
+impl TeardownReport {
+    fn summary(&self) -> String {
+        let barrier = self.steps.iter().rev().find_map(|step| match step {
+            TeardownStep::Barrier(reading) => Some(reading),
+            _ => None,
+        });
+        format!(
+            "pid={} identity={:?} tracer={} barrier={barrier:?}",
+            self.pid, self.identity, self.tracer
+        )
+    }
+}
+
+/// The teardown's diagnostic path to stderr. It is opt-in, like
+/// `UMBRA_RSP_LOG`, so routine runs keep their stderr exact. Timeout warnings
+/// are not opt-in: [`Session::ordered_teardown`] always writes them.
+fn log_teardown(report: &TeardownReport) {
+    if std::env::var_os("UMBRA_TEARDOWN_LOG").is_some() {
+        eprintln!("umbra-platform-macos: teardown {report:?}");
+    }
+}
+
+impl Session {
+    /// Evaluate the barrier once. It never blocks: the `waitpid` is `WNOHANG`.
+    fn barrier(&mut self) -> BarrierReading {
+        let reading = self.barrier_now();
+        if let BarrierReading::Confirmed(evidence) = &reading {
+            self.exit_evidence.get_or_insert(evidence.clone());
+        }
+        reading
+    }
+    fn barrier_now(&mut self) -> BarrierReading {
+        let pid = self.id.0.native_id as i32;
+        if let Some(evidence) = &self.exit_evidence {
+            return BarrierReading::Confirmed(evidence.clone());
+        }
+        if self.reaped {
+            return BarrierReading::Confirmed(if self.parent.is_none() {
+                BarrierEvidence::ReapedByPlatform
+            } else {
+                BarrierEvidence::ReapedByTracedParent
+            });
+        }
+        // Platform spawned the root, so it is the root's original parent and
+        // the root comes back to it once the tracer lets go
+        // (`kern_exit.c:2863-2918`). Before that, it is not our child.
+        if self.parent.is_none()
+            // SAFETY: plain libSystem call on a pid; no memory is passed.
+            && unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid
+        {
+            self.reaped = true;
+            return BarrierReading::Confirmed(BarrierEvidence::ReapedByPlatform);
+        }
+        barrier_decision(self.exit_report.as_deref(), self.birth, &lookup(pid))
+    }
+
+    /// Tear this session down in the #186 order: RSP `k`, the barrier, and only
+    /// then kill and reap the tracer, and reap the root tracee once it is
+    /// platform's child again. Every wait is bounded. On a timeout, the warning
+    /// goes to stderr **before** the tracer is killed (ruling R3.2).
+    fn ordered_teardown(&mut self) -> TeardownReport {
+        self.torn_down = true;
+        let started = Instant::now();
+        let deadline = started + TEARDOWN_BOUND;
+        let pid = self.id.0.native_id as i32;
+        let tracer = self.rsp.tracer_pid();
+        let mut steps = Vec::new();
+        // R3.4: an unsendable `k`, or a connection that closes before any
+        // reply, goes to the timeout path without waiting for the barrier.
+        let mut abandoned: Option<String> = None;
+        let mut replied = false;
+        let mut closed = false;
+        // Review ruling 1 V2, measured: a session left stopped at a breakpoint
+        // has its stop reply (`T05…`) queued, and debugserver answers the first
+        // `k` with that stale stop and does not act on it; a second `k` sent
+        // after it took effect within 20 ms (fix-r1 probe). So `k` is re-sent
+        // exactly once after the first stop reply, inside the same bound.
+        let mut resent = false;
+        if self.done {
+            steps.push(TeardownStep::KillSkipped);
+        } else {
+            match self.rsp.send_kill(Duration::from_millis(250)) {
+                Ok(()) => steps.push(TeardownStep::KillSent),
+                Err(e) => {
+                    steps.push(TeardownStep::KillSendFailed(e.to_string()));
+                    abandoned = Some(format!("not evaluated: RSP k not sent: {e}"));
+                }
+            }
+        }
+        let reading = loop {
+            if let Some(why) = abandoned.take() {
+                break BarrierReading::Unconfirmed(why);
+            }
+            // Read first, so a dead tracer's closed connection is seen before
+            // any barrier evaluation.
+            if self.done || closed {
+                std::thread::sleep(Duration::from_millis(1));
+            } else {
+                let wait = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(5));
+                match self.rsp.teardown_read(wait) {
+                    rsp::TeardownRead::Packet(packet) => {
+                        let stop = packet.starts_with('T') || packet.starts_with('S');
+                        steps.push(TeardownStep::Reply(packet));
+                        replied = true;
+                        if stop && !resent {
+                            resent = true;
+                            let bound = deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(250));
+                            match self.rsp.send_kill(bound) {
+                                Ok(()) => steps.push(TeardownStep::KillResent),
+                                Err(e) => steps.push(TeardownStep::KillSendFailed(e.to_string())),
+                            }
+                        }
+                    }
+                    rsp::TeardownRead::Quiet => {}
+                    rsp::TeardownRead::Closed(why) => {
+                        steps.push(TeardownStep::ConnectionClosed(why.clone()));
+                        closed = true;
+                        if !replied {
+                            break BarrierReading::Unconfirmed(format!(
+                                "not evaluated: connection closed before any reply: {why}"
+                            ));
+                        }
+                    }
+                }
+            }
+            let reading = self.barrier();
+            if matches!(reading, BarrierReading::Confirmed(_)) || Instant::now() >= deadline {
+                break reading;
+            }
+        };
+        let timed_out = !matches!(reading, BarrierReading::Confirmed(_));
+        steps.push(TeardownStep::Barrier(reading.clone()));
+        if timed_out {
+            let warning = format!(
+                "umbra-platform-macos: tracee termination unconfirmed; tracer killed: \
+                 pid={pid} identity={:?} tracer={tracer} barrier={reading:?}",
+                self.birth
+            );
+            eprintln!("{warning}");
+            steps.push(TeardownStep::Warning(warning));
+        }
+        self.rsp.kill_tracer();
+        steps.push(TeardownStep::TracerKilled);
+        // Review ruling 1 V3: after a timeout, ONE post-kill barrier, run inside
+        // the tracer-reap window (so the per-session total stays at most 2 s).
+        // Measured: a released tracee is a zombie within 5 ms of its tracer's
+        // death. The same positives apply (SZOMB with identity under any
+        // parent, or proven absence or reuse).
+        let limit = Instant::now() + rsp::TRACER_REAP_BOUND;
+        let mut tracer_reaped = false;
+        let mut after_kill: Option<BarrierReading> = None;
+        loop {
+            if !tracer_reaped {
+                tracer_reaped = self.rsp.reap_tracer(Duration::ZERO);
+            }
+            if timed_out && !matches!(after_kill, Some(BarrierReading::Confirmed(_))) {
+                after_kill = Some(self.barrier());
+            }
+            let settled = !timed_out || matches!(after_kill, Some(BarrierReading::Confirmed(_)));
+            if (tracer_reaped && settled) || Instant::now() >= limit {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        steps.push(TeardownStep::TracerReaped(tracer_reaped));
+        self.rsp.mark_torn_down();
+        let mut unconfirmed = false;
+        match after_kill {
+            Some(BarrierReading::Confirmed(evidence)) => {
+                eprintln!(
+                    "umbra-platform-macos: tracee exit confirmed after tracer kill: \
+                     pid={pid} identity={:?} evidence={evidence:?}",
+                    self.birth
+                );
+                steps.push(TeardownStep::ConfirmedAfterTracerKill(evidence));
+            }
+            Some(BarrierReading::Unconfirmed(why)) => {
+                steps.push(TeardownStep::UnconfirmedAfterTracerKill(why));
+                unconfirmed = true;
+            }
+            None => {}
+        }
+        if self.parent.is_none() {
+            let limit = Instant::now() + TRACEE_REAP_BOUND;
+            while !self.reaped {
+                // SAFETY: plain libSystem call on a pid; no memory is passed.
+                if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid {
+                    self.reaped = true;
+                } else if Instant::now() >= limit {
+                    break;
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            steps.push(TeardownStep::TraceeReaped(self.reaped));
+        }
+        TeardownReport {
+            pid,
+            identity: self.birth,
+            tracer,
+            steps,
+            timed_out,
+            unconfirmed,
+            elapsed: started.elapsed(),
+        }
+    }
+}
+
+impl MacosTraceBackend {
+    /// Run [`Session::ordered_teardown`] for every session not yet torn down,
+    /// children before parents (the reverse of creation order), so a child's
+    /// zombie still has its original parent to be handed back to. It does not
+    /// remove the sessions; callers clear them afterwards.
+    fn tear_down_sessions(&mut self) -> Vec<TeardownReport> {
+        let mut reports = Vec::new();
+        for index in (0..self.sessions.len()).rev() {
+            if !self.sessions[index].torn_down {
+                let report = self.sessions[index].ordered_teardown();
+                log_teardown(&report);
+                reports.push(report);
+            }
+        }
+        self.teardown_reports.extend(reports.iter().cloned());
+        reports
+    }
+    /// The tracer (debugserver) pid of each live session. Read-only test seam
+    /// for the timeout-path acceptance tests.
+    #[doc(hidden)]
+    pub fn tracer_pids(&self) -> Vec<i32> {
+        self.sessions.iter().map(|s| s.rsp.tracer_pid()).collect()
+    }
+    /// Every ordered-teardown report so far. Read-only test seam and the
+    /// teardown's in-process diagnostic record.
+    #[doc(hidden)]
+    pub fn teardown_reports(&self) -> &[TeardownReport] {
+        &self.teardown_reports
+    }
+}
+
+impl Drop for MacosTraceBackend {
+    /// A dropped backend tears its sessions down in the same order `terminate`
+    /// does, rather than leaving that to the `Vec`'s front-to-back drop.
+    fn drop(&mut self) {
+        for s in self.sessions.iter().rev() {
+            if !s.done {
+                s.task.kill();
+            }
+        }
+        self.tear_down_sessions();
+    }
+}
+
 impl TraceBackend for MacosTraceBackend {
     fn launch(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
         if matches!(spec.sandbox, SandboxRequirement::UnsandboxedExperiment) {
@@ -2734,10 +3336,29 @@ impl TraceControl for MacosTraceBackend {
                 s.task.kill();
             }
         }
+        let reports = self.tear_down_sessions();
         self.sessions.clear();
         self.events.clear();
         self.quiesced_stops.clear();
         self.watchdog.take();
+        // Each timed-out session already wrote its warning to stderr before its
+        // tracer was killed. Only a session the post-kill barrier could not
+        // confirm either fails `terminate` (`terminated = false` in
+        // `umbra-supervisor/src/run.rs`): its tree's termination is unknown.
+        let unconfirmed: Vec<String> = reports
+            .iter()
+            .filter(|r| r.unconfirmed)
+            .map(TeardownReport::summary)
+            .collect();
+        if !unconfirmed.is_empty() {
+            return Err(error(
+                "terminate",
+                format!(
+                    "tracee termination unconfirmed; tracer killed: {}",
+                    unconfirmed.join("; ")
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -3124,5 +3745,93 @@ mod tests {
             !ran,
             "child was not suspended; POSIX_SPAWN_START_SUSPENDED did not take effect"
         );
+    }
+
+    /// Decision table for the ordered teardown's barrier (#186; cause-gate
+    /// ruling R2, implement ruling 1 I3.3). No debugger, fixture or hook: the
+    /// decision is a pure function of the tracer's report, the attach-time
+    /// identity and one lookup.
+    #[test]
+    fn the_teardown_barrier_decides_from_report_identity_and_lookup() {
+        let birth = Some((1_000, 7));
+        let found = |status: u32, start: (u64, u64)| Lookup::Found { status, start };
+        let reported = Some("X09");
+        let unconfirmed = |r: &BarrierReading| matches!(r, BarrierReading::Unconfirmed(_));
+        // A done session (the tracer reported W/X).
+        assert!(unconfirmed(&barrier_decision(
+            reported,
+            birth,
+            &found(2, (1_000, 7))
+        )));
+        assert!(unconfirmed(&barrier_decision(
+            reported,
+            birth,
+            &found(4, (1_000, 7))
+        )));
+        assert_eq!(
+            barrier_decision(reported, birth, &found(SZOMB, (1_000, 7))),
+            BarrierReading::Confirmed(BarrierEvidence::Zombie)
+        );
+        assert_eq!(
+            barrier_decision(reported, birth, &Lookup::Absent),
+            BarrierReading::Confirmed(BarrierEvidence::TracerReportedExit {
+                report: "X09".into(),
+                lookup: ReportedExitLookup::Absent,
+                admitted_by: ADMITTED_ABSENT,
+            })
+        );
+        assert_eq!(
+            barrier_decision(reported, birth, &found(2, (2_000, 1))),
+            BarrierReading::Confirmed(BarrierEvidence::TracerReportedExit {
+                report: "X09".into(),
+                lookup: ReportedExitLookup::PidReused { start: (2_000, 1) },
+                admitted_by: ADMITTED_REUSED,
+            })
+        );
+        assert!(unconfirmed(&barrier_decision(
+            reported,
+            birth,
+            &Lookup::Error("Operation not permitted".into())
+        )));
+        assert!(unconfirmed(&barrier_decision(
+            reported,
+            None,
+            &found(SZOMB, (1_000, 7))
+        )));
+        // A live session (no report): SZOMB with the attach-time identity, or
+        // proven absence or reuse (review ruling 1 V1); nothing else.
+        assert_eq!(
+            barrier_decision(None, birth, &found(SZOMB, (1_000, 7))),
+            BarrierReading::Confirmed(BarrierEvidence::Zombie)
+        );
+        assert_eq!(
+            barrier_decision(None, birth, &Lookup::Absent),
+            BarrierReading::Confirmed(BarrierEvidence::ReapedProven {
+                lookup: ReportedExitLookup::Absent,
+                admitted_by: ADMITTED_ABSENT,
+            })
+        );
+        assert_eq!(
+            barrier_decision(None, birth, &found(SZOMB, (2_000, 1))),
+            BarrierReading::Confirmed(BarrierEvidence::ReapedProven {
+                lookup: ReportedExitLookup::PidReused { start: (2_000, 1) },
+                admitted_by: ADMITTED_REUSED,
+            })
+        );
+        assert!(unconfirmed(&barrier_decision(
+            None,
+            None,
+            &found(SZOMB, (1_000, 7))
+        )));
+        assert!(unconfirmed(&barrier_decision(
+            None,
+            birth,
+            &found(2, (1_000, 7))
+        )));
+        assert!(unconfirmed(&barrier_decision(
+            None,
+            birth,
+            &Lookup::Error("Operation not permitted".into())
+        )));
     }
 }
