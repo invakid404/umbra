@@ -596,3 +596,106 @@ jobs:
           docker compose \
             -f experiments/nfs-raw/docker-compose.yml \
             down -v
+
+  # TEMPORARY -- #186 arc (dg-dbjcvkg0) experiment E2, pre-registered in the
+  # arc's predictions.md. Reverted in a visible commit before this branch
+  # leaves draft. It runs the four deferred refusal tests twice on the
+  # self-hosted runner: arm F inside a FRESH session (os.setsid() wrapper), then
+  # arm R in the runner's own session (SID 1) as the paired control. The wrapper
+  # is identical in both arms except for os.setsid(). Required
+  # `native-userspace-routing` keeps its four --skip entries. No
+  # continue-on-error and no `|| true`: each step fails if any of its four
+  # tests fails, and a red run is the reading. It runs after the required job
+  # so the two never share the fixture container.
+  issue-186-session-inverse:
+    name: "TEMPORARY #186 fresh-session inverse (E2)"
+    needs: native-userspace-routing
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: [self-hosted, macOS, ARM64, umbra-integration]
+    timeout-minutes: 40
+    env:
+      UMBRA_INTEGRATION_REQUIRED: "1"
+      LIBNFS_PIN: 18c5c73ee88bb7dc8da0d55dc95164bb77e49dc6
+      UMBRA_LIBNFS_SRC: ${{ github.workspace }}/third_party/libnfs
+      UMBRA_NFS_RAW_FIXTURE: 127.0.0.1:12105
+      UMBRA_NFS_FIXTURE_CONTAINER: umbra-m1-transport-raw-ganesha
+      E2_EVIDENCE: /tmp/issue-186-e2-${{ github.run_id }}
+      E2_TESTS: slate_c10_10_fork_helper_refusal slate_c11_02_empty_attributes slate_c11_02_empty_both slate_c11_10_e8_pipe_refusal
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify libnfs.pin matches workflow constant
+        run: |
+          pinned=$(grep -v '^\s*#' crates/umbra-storage-nfs-userspace/libnfs.pin | tr -d '[:space:]')
+          if [ "$pinned" != "$LIBNFS_PIN" ]; then
+            echo "libnfs.pin says $pinned but this workflow expects $LIBNFS_PIN" >&2
+            exit 1
+          fi
+
+      - name: Fetch pinned libnfs source
+        run: |
+          if [ ! -d third_party/libnfs ]; then
+            mkdir -p third_party
+            git clone --filter=blob:none https://github.com/sahlberg/libnfs third_party/libnfs
+          fi
+          git -C third_party/libnfs fetch --depth 1 origin "$LIBNFS_PIN" || true
+          git -C third_party/libnfs -c advice.detachedHead=false checkout "$LIBNFS_PIN"
+
+      - name: Build and start the NFS-Ganesha fixture
+        run: |
+          docker compose \
+            -f experiments/nfs-raw/docker-compose.yml \
+            up -d --build --wait --wait-timeout 180
+          docker ps --filter name=$UMBRA_NFS_FIXTURE_CONTAINER
+
+      - name: Build the workspace, provider binaries and test binary
+        run: |
+          test "$(uname -m)" = arm64
+          cargo build --workspace --bins
+          cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run --no-run
+          mkdir -p "$E2_EVIDENCE/F" "$E2_EVIDENCE/R"
+          python3 -c 'import os; print("step shell pid", os.getppid(), "sid", os.getsid(0), "pgid", os.getpgrp())' | tee "$E2_EVIDENCE/step-session.txt"
+
+      - name: Arm F -- four refusal tests, each in a fresh session
+        run: |
+          set +e
+          for t in $E2_TESTS; do
+            mkdir -p "$E2_EVIDENCE/F/$t"
+            UMBRA_SLATE_EVIDENCE="$E2_EVIDENCE/F/$t" python3 -c 'import os, sys; os.setsid(); print("E2 arm=F test=%s pid=%d sid=%d pgid=%d" % (sys.argv[1], os.getpid(), os.getsid(0), os.getpgrp()), flush=True); os.execvp(sys.argv[2], sys.argv[2:])' "$t" \
+              /Users/inva/.local/bin/umbra-serial-test cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run "$t" -- --exact --nocapture --test-threads=1 2>&1 | tee "$E2_EVIDENCE/F/$t.log"
+            echo "arm=F test=$t rc=${PIPESTATUS[0]}" | tee -a "$E2_EVIDENCE/F/summary.txt"
+          done
+          set -e
+          ! grep -v 'rc=0$' "$E2_EVIDENCE/F/summary.txt"
+
+      - name: Arm R -- the same four tests in the runner's session (control)
+        if: always()
+        run: |
+          set +e
+          for t in $E2_TESTS; do
+            mkdir -p "$E2_EVIDENCE/R/$t"
+            UMBRA_SLATE_EVIDENCE="$E2_EVIDENCE/R/$t" python3 -c 'import os, sys; print("E2 arm=R test=%s pid=%d sid=%d pgid=%d" % (sys.argv[1], os.getpid(), os.getsid(0), os.getpgrp()), flush=True); os.execvp(sys.argv[2], sys.argv[2:])' "$t" \
+              /Users/inva/.local/bin/umbra-serial-test cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run "$t" -- --exact --nocapture --test-threads=1 2>&1 | tee "$E2_EVIDENCE/R/$t.log"
+            echo "arm=R test=$t rc=${PIPESTATUS[0]}" | tee -a "$E2_EVIDENCE/R/summary.txt"
+          done
+          set -e
+          ! grep -v 'rc=0$' "$E2_EVIDENCE/R/summary.txt"
+
+      - name: Upload E2 evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue-186-e2-${{ github.run_id }}
+          path: /tmp/issue-186-e2-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Tear down the fixture
+        if: always()
+        run: |
+          docker compose \
+            -f experiments/nfs-raw/docker-compose.yml \
+            down -v
