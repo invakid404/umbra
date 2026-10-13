@@ -9949,7 +9949,9 @@ fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
 /// #186 regression witness (cause-gate ruling R4(a)), and session-independent:
 /// no sampled member of the routed run's process group (census readings and
 /// snapshots) is observed reparented to launchd (PPID 1), and the run's cleanup
-/// ends CLEAN, so the tracee was reaped rather than left as anyone's zombie.
+/// ends CLEAN: the harness reaped its direct child, and the run's group had no
+/// live member and no zombie at the final census. CLEAN does not prove the
+/// routed tracee itself was waited for.
 ///
 /// Before the ordered teardown, refusals in the #186 arc left the tracee as a
 /// PPID-1 zombie in both sessions (E1/E2: 21/21 runs), and this assertion failed
@@ -9996,7 +9998,7 @@ fn slate_assert_tracee_not_orphaned(evidence: &Path) {
     let cleanup = std::fs::read_to_string(evidence.with_extension("cleanup")).unwrap();
     assert!(
         cleanup.starts_with("cleanup CLEAN"),
-        "#186: the run left a zombie instead of the platform reaping it: {cleanup}"
+        "#186: cleanup did not end CLEAN; a zombie remained in the run's group: {cleanup}"
     );
 }
 

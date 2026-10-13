@@ -1816,8 +1816,9 @@ enum EndState {
     PastExit,
     /// The attached process, not a zombie.
     Live,
-    /// Any other lookup failure, a short record, or no attach identity to
-    /// compare: evidence of neither.
+    /// Any other lookup failure, a short record, or a process found with no
+    /// attach identity to compare, which the barrier also leaves unconfirmed,
+    /// zombie or not: evidence of neither.
     Unreadable(String),
 }
 
@@ -1846,10 +1847,10 @@ fn end_state(pid: i32, identity: Option<(u64, u64)>) -> EndState {
     }
     let start = (info.pbi_start_tvsec, info.pbi_start_tvusec);
     match identity {
-        _ if info.pbi_status == libc::SZOMB => EndState::PastExit,
-        Some(attached) if attached != start => EndState::PastExit,
-        Some(_) => EndState::Live,
         None => EndState::Unreadable("no attach identity".into()),
+        Some(attached) if attached != start => EndState::PastExit,
+        Some(_) if info.pbi_status == libc::SZOMB => EndState::PastExit,
+        Some(_) => EndState::Live,
     }
 }
 
