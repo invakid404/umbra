@@ -1807,6 +1807,42 @@ fn where_now(pid: i32) -> String {
     }
 }
 
+/// Whether `pid` is past its exit as `terminate` returns: a zombie still
+/// carrying the attach-time start identity, nothing at the pid, or a different
+/// process there. `false` means the attached process is still live.
+fn past_exit(pid: i32, identity: Option<(u64, u64)>) -> bool {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if got != size {
+        return true;
+    }
+    let start = (info.pbi_start_tvsec, info.pbi_start_tvusec);
+    identity.is_some_and(|attached| attached != start) || info.pbi_status == libc::SZOMB
+}
+
+/// The post-kill result must match the tracee's end state (C2-N1). A confirmed
+/// result with the tracee still live is a false positive, and an unconfirmed
+/// one with the tracee past its exit means the barrier missed a provable state.
+/// The end state is read as `terminate` returns, after a post-kill barrier
+/// that polls the whole 250 ms reap window; a released tracee was measured as a
+/// zombie within 5 ms, so a tracee still live then is held, not mid-exit.
+fn assert_outcome_matches_end_state(outcome: &str, past: bool) {
+    match (outcome, past) {
+        ("confirmed after tracer kill", true) | ("still unconfirmed", false) => {}
+        _ => panic!("post-kill outcome {outcome:?} with tracee past its exit = {past}"),
+    }
+}
+
 /// No child of this process remains, live or zombie: nothing F1 owns leaked.
 fn no_children_left() -> bool {
     // SAFETY: WNOHANG never blocks; the status pointer may be null.
@@ -1856,7 +1892,8 @@ fn teardown_confirms_exit_before_killing_tracer() {
 
 /// A tracer that never answers `k` (stopped): the barrier cannot be confirmed,
 /// so after the bound the warning goes out, then the tracer is killed and
-/// reaped. `terminate` reports the failure. Nothing this process owns leaks.
+/// reaped. `terminate`'s result follows the post-kill barrier, which must match
+/// the tracee's end state. Nothing this process owns leaks.
 #[test]
 fn teardown_times_out_on_unresponsive_tracer() {
     in_fresh_session("teardown_times_out_on_unresponsive_tracer", || {
@@ -1879,10 +1916,12 @@ fn teardown_times_out_on_unresponsive_tracer() {
         let result = tracer.terminate(process, TerminationPolicy::Immediate);
         let elapsed = started.elapsed();
         let report = tracer.teardown_reports().last().unwrap().clone();
+        let past = past_exit(tracee, report.identity);
         eprintln!("teardown report ({elapsed:?}): {report:?}");
         assert!(report.timed_out);
         let outcome = post_kill_outcome(&report, &result);
-        eprintln!("post-kill outcome: {outcome}");
+        eprintln!("post-kill outcome: {outcome}; tracee past its exit: {past}");
+        assert_outcome_matches_end_state(outcome, past);
         // The bound is 1.5 s for `k` and the barrier, plus 0.25 s for each reap.
         assert!(
             elapsed >= std::time::Duration::from_millis(1500)
@@ -1948,10 +1987,12 @@ fn teardown_reports_dead_tracer_without_waiting() {
         let result = tracer.terminate(process, TerminationPolicy::Immediate);
         let elapsed = started.elapsed();
         let report = tracer.teardown_reports().last().unwrap().clone();
+        let past = past_exit(tracee, report.identity);
         eprintln!("teardown report ({elapsed:?}): {report:?}");
         assert!(report.timed_out);
         let outcome = post_kill_outcome(&report, &result);
-        eprintln!("post-kill outcome: {outcome}");
+        eprintln!("post-kill outcome: {outcome}; tracee past its exit: {past}");
+        assert_outcome_matches_end_state(outcome, past);
         assert!(
             elapsed < std::time::Duration::from_millis(1000),
             "waited {elapsed:?} for a dead tracer"

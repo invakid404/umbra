@@ -9406,10 +9406,11 @@ fn slate_c10_10_fork_helper_refusal() {
         "native.rs SHA-256 prerequisite failed"
     );
     // Re-pinned for #186 (was 81e1cd50…, the slate-r10/r11 characterization).
-    // native.rs gained the ordered teardown only: +695/-0 lines, all of them
+    // native.rs gained the ordered teardown only: +709/-0 lines, all of them
     // teardown (Session::ordered_teardown, its barrier and decision table,
     // terminate/Drop wiring, the exit-report capture in `stop`, the k re-send
-    // and the post-kill barrier of the #186 review ruling).
+    // and the post-kill barrier of the #186 review ruling, and the barrier
+    // lookup's exec-swap citations).
     // The fork guard (`fn single_thread`, sha256 41efdfc0…, and its call sites)
     // and the __posix_spawn x2 guard (`if number == 244 {` block, sha256
     // fe7c9f4b…) are byte-identical to 7ccd7b0e. The runtime refusal
@@ -9417,7 +9418,7 @@ fn slate_c10_10_fork_helper_refusal() {
     // the #186 fix un-skips in required CI on the runner.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("383d54a310ab3e0825e85dfdc69f929c8dafe7f7acf80de8f85981cd4fb39ecb"),
+        Some("298739649ddb961bc76bd2d5ae2186f634574c363639761797765efb2497d006"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -9946,8 +9947,8 @@ fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
 }
 
 /// #186 regression witness (cause-gate ruling R4(a)), and session-independent:
-/// no member of the routed run's process group is ever seen reparented to
-/// launchd (PPID 1), and the run's cleanup ends CLEAN, so the tracee was reaped
+/// no sampled member of the routed run's process group (census readings and
+/// snapshots) is observed reparented to launchd (PPID 1), and the run's cleanup ends CLEAN, so the tracee was reaped
 /// rather than left as anyone's zombie.
 ///
 /// Before the ordered teardown, refusals in the #186 arc left the tracee as a

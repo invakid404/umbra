@@ -521,8 +521,10 @@ Termination tears each session down in order, children first (#186):
 - wait for a barrier proving the tracee has passed its exit accounting:
   - a zombie with its attach-time start identity;
   - a reap by this process, or by its traced parent;
-  - for a tracee whose exit debugserver already reported, its absence or a
-    reused pid;
+  - no process at the pid, or a different process at it (a reused pid). The
+    pid stays hashed until the process is reaped, so either proves the tracee
+    is past its accounting, with or without a debugserver exit report
+    (`ReapedProven` / `TracerReportedExit`);
 - only then kill and reap debugserver.
 
 Killing debugserver first lets the kernel hand a half-exited tracee to launchd
@@ -543,10 +545,12 @@ Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome.
 The timeout path is still reachable by ordinary failure paths, not only abnormal
 ones. A session whose debugserver neither confirms the exit nor answers `k`
 within the bound gets there, and in launchd's session the #186 race can recur on
-it. The tests pin the measured cases:
+it. The tests pin these cases:
 - a live child whose root has exited now confirms without a warning;
-- an unresponsive or dead debugserver takes the timeout path and is confirmed
-  after the kill.
+- an unresponsive or dead debugserver takes the timeout path, and the post-kill
+  result must match the tracee's end state: past its exit means
+  `ConfirmedAfterTracerKill` and `Ok`, and only a tracee still live may end
+  `Err`. Measured, both are confirmed after the kill.
 
 Residual exposure is tracked in #193:
 - the timeout path above;
@@ -617,7 +621,7 @@ tracer was reaped and that no child of the test process remains.
 | Test | Pass bar |
 |---|---|
 | `teardown_confirms_exit_before_killing_tracer` | `terminate` returns `Ok`; steps `KillSent`, a confirmed barrier, then `TracerKilled`; no warning; tracer and tracee both reaped |
-| `teardown_times_out_on_unresponsive_tracer` | debugserver stopped with `SIGSTOP`; the timeout path runs in 1.5–2.5 s and the warning step precedes `TracerKilled`. Exactly one post-kill step follows the kill: `ConfirmedAfterTracerKill` with `terminate` returning `Ok`, or `UnconfirmedAfterTracerKill` with `Err` containing `tracee termination unconfirmed; tracer killed` |
+| `teardown_times_out_on_unresponsive_tracer` | debugserver stopped with `SIGSTOP`; the timeout path runs in 1.5–2.5 s and the warning step precedes `TracerKilled`. Exactly one post-kill step follows the kill: `ConfirmedAfterTracerKill` with `terminate` returning `Ok`, or `UnconfirmedAfterTracerKill` with `Err` containing `tracee termination unconfirmed; tracer killed`. The step must match the tracee's end state as `terminate` returns: a zombie with the attach identity, nothing at the pid, or a reused pid requires `ConfirmedAfterTracerKill`, and only a still-live tracee may end unconfirmed |
 | `teardown_reports_dead_tracer_without_waiting` | debugserver killed first; the timeout path runs in under 1 s, after a `KillSendFailed` or `ConnectionClosed` step; the warning precedes `TracerKilled`; the same post-kill split as above |
 | `teardown_confirms_a_live_orphaned_child_without_warning` | `--mt-spawn` stopped at the root's `Exit`, with the traced child live; `terminate` returns `Ok`; no report timed out; the child's barrier is confirmed before `TracerKilled` (`ReapedProven`, or `Zombie`); a stop reply is followed directly by `KillResent` |
 | `teardown_confirms_a_live_child_while_its_root_is_alive` | `--mt-spawn` stopped at the `Child` event; `terminate` returns `Ok`; both reports confirm with no warning |

@@ -2611,7 +2611,21 @@ enum Lookup {
 /// `fixjobc`. A pid is reallocated only when `phash_find_locked(pid)` finds
 /// nothing (`kern_fork.c:972`), so a different start identity at the same pid
 /// also means the original holder was reaped. `p_start` survives `exec`
-/// (`kern_fork.c:1130-1134`, `in_exec`), so an exec cannot fake a reuse.
+/// (`kern_fork.c:1131-1135`, `in_exec`), so an exec cannot fake a reuse.
+///
+/// **An `exec` opens no window either.** It is the one lookup-relevant change a
+/// live process makes to its pid-hash entry:
+/// - The exec copy is never hashed beside the original: its `in_exec` branch
+///   copies the pid and sets `P_REF_SHADOW` without `phash_insert_locked`
+///   (`kern_fork.c:995-1004`).
+/// - Its `P_REF_NEW` is cleared in `pinsertchild` (`kern_proc.c:2931-2932`),
+///   before the swap.
+/// - The swap is `phash_replace_locked` under `proc_list_lock`
+///   (`kern_exec.c:5903`, `:5909`; `kern_proc.c:2483-2488`), one published
+///   store (`osfmk/kern/smr.h:1412-1432`), so a reader sees the old proc or
+///   the new one, never neither.
+/// - `proc_find` retries on a shadow proc (`kern_proc.c:2546-2552`) and waits
+///   out an exec in progress rather than failing (`:2558-2570`).
 ///
 /// **The proof does not depend on any tracer report.** Every step above is a
 /// property of the pid hash and of `proc_exit`'s order, and holds for any
