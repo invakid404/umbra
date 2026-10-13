@@ -9405,9 +9405,18 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
+    // Re-pinned for #186 (was 81e1cd50…, the slate-r10/r11 characterization).
+    // native.rs gained the ordered teardown only: +590/-0 lines, all of them
+    // teardown (Session::ordered_teardown, its barrier and decision table,
+    // terminate/Drop wiring, the exit-report capture in `stop`).
+    // The fork guard (`fn single_thread`, sha256 41efdfc0…, and its call sites)
+    // and the __posix_spawn x2 guard (`if number == 244 {` block, sha256
+    // fe7c9f4b…) are byte-identical to 7ccd7b0e. The runtime refusal
+    // characterization this pin protects is repeated by this case itself, which
+    // the #186 fix un-skips in required CI on the runner.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("81e1cd50c79f3af62cd6c07f295844d48f49d2155588e992524e7ed96281c66d"),
+        Some("06ca5b7bc2a784ed310cc102e6de9ceda0a16bc4ec955d00d9dd419b9086ca98"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -9543,6 +9552,7 @@ fn slate_c10_10_fork_helper_refusal() {
         b"ABCDEF"
     );
     assert_no_nfs_mount(&host, port, &[&run.workspace], "fork after");
+    slate_assert_tracee_not_orphaned(&evidence.join("routed"));
     // Observe reopen separately; refusal runs need not be journalled complete.
     let reopened = slate_bounded(
         Command::new(binaries().join("umbra"))
@@ -9931,6 +9941,53 @@ fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
             "{side}: an observed process received SIGHUP: {records:?}"
         );
     }
+    slate_assert_tracee_not_orphaned(&spawn.evidence.join("routed"));
+}
+
+/// #186 regression witness (cause-gate ruling R4(a)), and session-independent:
+/// no member of the routed run's process group is ever seen reparented to
+/// launchd (PPID 1), and the run's cleanup ends CLEAN, so the tracee was reaped
+/// rather than left as anyone's zombie.
+///
+/// Before the ordered teardown, every refusal left its tracee as a PPID-1
+/// zombie, whatever the session (21/21 in the #186 arc). Debugserver was killed
+/// while it still held the tracee, so the tracee went to launchd uncounted
+/// (xnu-12377.121.6 `kern_exit.c:2610-2614`). In launchd's own session that
+/// orphans the whole group with SIGHUP. Every census reading and every watched
+/// snapshot of the group is checked, not just the last one.
+fn slate_assert_tracee_not_orphaned(evidence: &Path) {
+    let census = std::fs::read_to_string(evidence.with_extension("census.jsonl")).unwrap();
+    for line in census.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        if row["kind"] != "READING" {
+            continue;
+        }
+        for member in row["stdout"].as_str().unwrap_or_default().lines() {
+            assert_ne!(
+                member.split_whitespace().nth(1),
+                Some("1"),
+                "#186: a member of the run's group was reparented to launchd: {member}"
+            );
+        }
+    }
+    if let Ok(snapshots) = std::fs::read_to_string(evidence.with_extension("snapshots.jsonl")) {
+        for line in snapshots.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            for process in row["processes"].as_array().into_iter().flatten() {
+                assert_ne!(
+                    process["ppid"], 1,
+                    "#186: a member of the run's group was reparented to launchd \
+                     ({} snapshot): {process}",
+                    row["phase"]
+                );
+            }
+        }
+    }
+    let cleanup = std::fs::read_to_string(evidence.with_extension("cleanup")).unwrap();
+    assert!(
+        cleanup.starts_with("cleanup CLEAN"),
+        "#186: the run left a zombie instead of the platform reaping it: {cleanup}"
+    );
 }
 
 /// Which images the observer attested installation in, per side. A missing
@@ -9953,6 +10010,30 @@ fn slate_field<'a>(text: &'a str, line: &str, key: &str) -> &'a str {
         .split_whitespace()
         .find_map(|part| part.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
         .unwrap_or_else(|| panic!("no {key} in `{line}`:\n{text}"))
+}
+
+/// C-N1: the only `detail` a NOT QUALIFIED run carries -- which run it was
+/// and how the supervisor ended. Nothing derived from its outputs, because an
+/// unqualified (stopped, signalled, refused-off-script) run's outputs are not
+/// a reading of the case.
+fn slate_unqualified_detail(routed: &SlateRouted) -> serde_json::Value {
+    serde_json::json!({
+        "qualified": false,
+        "run_id": routed.run.run_id.0.to_string(),
+        "supervisor_status": routed.output.status.to_string(),
+    })
+}
+
+/// C-N1: a mediated two-process run completed as the case expects -- the
+/// supervisor exited 0 and accounted for both exits. Labels that interpret a
+/// completed run's outputs (DEMONSTRATED SEMANTIC DEFECT, SUPPORTED-AND-CORRECT)
+/// require it.
+fn slate_two_exit_completion(routed: &SlateRouted) -> bool {
+    routed.run.status == Some(0)
+        && routed
+            .run
+            .stderr
+            .contains("finished: Some(Code(0)) after 2 process exits")
 }
 
 fn slate_record(spawn: &SlateSpawn, classification: &str, detail: serde_json::Value) {
@@ -10004,16 +10085,22 @@ fn slate_spawn_shape(mode: &str, admitted: bool) {
         (_, true) => "EXACT KNOWN REFUSAL",
         _ => "NOT QUALIFIED",
     };
+    // C-N1: the derived reading (`x2_side`, `emission_site`) is recorded only
+    // for a qualified run; a NOT QUALIFIED one keeps its identity alone.
     slate_record(
         &spawn,
         classification,
-        serde_json::json!({
-            "x2_side": if refused { "nonzero: the single-site diagnostic was emitted" }
-                else { "zero: no diagnostic; libc passed a null packed descriptor" },
-            "emission_site": site,
-            "run_id": routed.run.run_id.0.to_string(),
-            "supervisor_status": routed.output.status.to_string(),
-        }),
+        if classification == "NOT QUALIFIED" {
+            slate_unqualified_detail(&routed)
+        } else {
+            serde_json::json!({
+                "x2_side": if refused { "nonzero: the single-site diagnostic was emitted" }
+                    else { "zero: no diagnostic; libc passed a null packed descriptor" },
+                "emission_site": site,
+                "run_id": routed.run.run_id.0.to_string(),
+                "supervisor_status": routed.output.status.to_string(),
+            })
+        },
     );
     if admitted {
         assert_eq!(
@@ -10101,16 +10188,27 @@ fn slate_c11_05_collision_premise_apparatus() {
     let limit: u64 = slate_field(&pre, "dup2-live-victim", "rlimit-cur")
         .parse()
         .unwrap();
+    // C-N1: an apparatus reading only from a run whose tracee ran to its end
+    // under supervision; otherwise NOT QUALIFIED with identity alone.
+    let finished = routed.run.stderr.lines().find(|l| l.contains("finished:"));
     slate_record(
         &spawn,
-        "APPARATUS READING",
-        serde_json::json!({
-            "dup2_result": slate_field(&pre, "dup2-live-victim", "result"),
-            "dup2_errno": slate_field(&pre, "dup2-live-victim", "errno"),
-            "victim": victim, "rlimit_cur": limit,
-            "tracee_exit": routed.run.stderr.lines().find(|l| l.contains("finished:")),
-            "run_id": routed.run.run_id.0.to_string(),
-        }),
+        if finished.is_some() {
+            "APPARATUS READING"
+        } else {
+            "NOT QUALIFIED"
+        },
+        if finished.is_some() {
+            serde_json::json!({
+                "dup2_result": slate_field(&pre, "dup2-live-victim", "result"),
+                "dup2_errno": slate_field(&pre, "dup2-live-victim", "errno"),
+                "victim": victim, "rlimit_cur": limit,
+                "tracee_exit": finished,
+                "run_id": routed.run.run_id.0.to_string(),
+            })
+        } else {
+            slate_unqualified_detail(&routed)
+        },
     );
     // MEASURED: the kernel refuses a dup2 onto a live routed descriptor with
     // EBADF, because umbra puts every virtual descriptor at or above the
@@ -10185,21 +10283,26 @@ fn slate_c11_05_cloexec_null_spawn() {
     let pruned = victim.as_deref() == Some(b"VICTIM-SEED".as_slice())
         && slate_field(&child, "write-victim", "result") == "-1"
         && slate_field(&child, "write-victim", "errno") == "9";
+    // C-N1: a label, and the outputs behind it, only for a completed run.
+    let completed = slate_two_exit_completion(&routed);
+    let label = match (completed, stale, pruned) {
+        (true, true, _) => "DEMONSTRATED SEMANTIC DEFECT",
+        (true, false, true) => "SUPPORTED-AND-CORRECT",
+        _ => "NOT QUALIFIED",
+    };
     slate_record(
         &spawn,
-        if stale {
-            "DEMONSTRATED SEMANTIC DEFECT"
-        } else if pruned {
-            "SUPPORTED-AND-CORRECT"
+        label,
+        if label == "NOT QUALIFIED" {
+            slate_unqualified_detail(&routed)
         } else {
-            "NOT QUALIFIED"
+            serde_json::json!({
+                "victim": victim.as_deref().map(String::from_utf8_lossy),
+                "control": routed.object("control.txt").map(String::from_utf8_lossy),
+                "child_records": child,
+                "run_id": routed.run.run_id.0.to_string(),
+            })
         },
-        serde_json::json!({
-            "victim": victim.as_deref().map(String::from_utf8_lossy),
-            "control": routed.object("control.txt").map(String::from_utf8_lossy),
-            "child_records": child,
-            "run_id": routed.run.run_id.0.to_string(),
-        }),
     );
     assert!(
         stale,
@@ -10257,19 +10360,27 @@ fn slate_c11_09_inherited_offset() {
     assert_eq!(std::fs::read(root.join("out.txt")).unwrap(), b"AABBBC");
     let routed = slate_spawn_routed(&spawn, "c11-09", &["out.txt"]);
     let stored = routed.object("out.txt").map(<[u8]>::to_vec);
+    // C-N1: DEMONSTRATED SEMANTIC DEFECT is the measured #190 value from a
+    // completed run, not "anything but AABBBC" -- a stopped or signalled run's
+    // partial file (e.g. `AA`) is NOT QUALIFIED and carries no derived detail.
+    let label = match (slate_two_exit_completion(&routed), stored.as_deref()) {
+        (true, Some(b"AABBBC")) => "SUPPORTED-AND-CORRECT",
+        (true, Some(b"AACBB")) => "DEMONSTRATED SEMANTIC DEFECT",
+        _ => "NOT QUALIFIED",
+    };
     slate_record(
         &spawn,
-        match stored.as_deref() {
-            Some(b"AABBBC") => "SUPPORTED-AND-CORRECT",
-            Some(_) => "DEMONSTRATED SEMANTIC DEFECT",
-            None => "NOT QUALIFIED",
+        label,
+        if label == "NOT QUALIFIED" {
+            slate_unqualified_detail(&routed)
+        } else {
+            serde_json::json!({
+                "out": stored.as_deref().map(String::from_utf8_lossy),
+                "records_done": routed.objects["records.done"].as_deref().map(String::from_utf8_lossy),
+                "records_child": routed.objects["records.child"].as_deref().map(String::from_utf8_lossy),
+                "run_id": routed.run.run_id.0.to_string(),
+            })
         },
-        serde_json::json!({
-            "out": stored.as_deref().map(String::from_utf8_lossy),
-            "records_done": routed.objects["records.done"].as_deref().map(String::from_utf8_lossy),
-            "records_child": routed.objects["records.child"].as_deref().map(String::from_utf8_lossy),
-            "run_id": routed.run.run_id.0.to_string(),
-        }),
     );
     assert_eq!(
         stored.as_deref(),
@@ -10355,6 +10466,7 @@ fn slate_c11_10_e8_pipe_refusal() {
         && ["records.done", "records.child", "child.txt"]
             .iter()
             .all(|name| routed.object(name).is_none());
+    // C-N1: the derived reading only for the qualified (exact) refusal.
     slate_record(
         &spawn,
         if exact {
@@ -10362,7 +10474,10 @@ fn slate_c11_10_e8_pipe_refusal() {
         } else {
             "NOT QUALIFIED"
         },
-        serde_json::json!({
+        if !exact {
+            slate_unqualified_detail(&routed)
+        } else {
+            serde_json::json!({
             "trapped_stub": "__posix_spawn (244)",
             "x2_side": if refused { "nonzero: the single-site diagnostic was emitted" }
                 else { "no diagnostic" },
@@ -10373,7 +10488,8 @@ fn slate_c11_10_e8_pipe_refusal() {
                                 host workspace pristine",
             "run_id": routed.run.run_id.0.to_string(),
             "supervisor_status": routed.output.status.to_string(),
-        }),
+            })
+        },
     );
     assert!(exact, "{}", routed.run.stderr);
     let pre = routed.text("records.pre");

@@ -11,7 +11,10 @@ mod native;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod rsp;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use native::MacosTraceBackend;
+pub use native::{
+    BarrierEvidence, BarrierReading, MacosTraceBackend, ReportedExitLookup, TeardownReport,
+    TeardownStep,
+};
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod unsupported;
 use umbra_core::{ErrorKind, UmbraError};

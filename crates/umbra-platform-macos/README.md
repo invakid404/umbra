@@ -35,6 +35,12 @@ RLE decode, and a per-request deadline.
   `xcode-select -p` is consulted; it exists so the test suites can run on
   hosts whose selected Xcode keeps debugserver under `SharedFrameworks`
   rather than the `Library/PrivateFrameworks` path probed below.
+- `TeardownReport`, `TeardownStep`, `BarrierReading`, `BarrierEvidence` and
+  `ReportedExitLookup` describe each session's ordered teardown (item 13
+  below). `MacosTraceBackend::teardown_reports()` returns every report so far
+  and `tracer_pids()` the live sessions' debugserver pids. Both are read-only,
+  `#[doc(hidden)]` seams for the acceptance tests; the backend never consults
+  them.
 <!-- /memoria:section -->
 
 <!-- memoria:section id="shipped-mechanisms" files="src/interpose.rs src/rsp.rs src/native.rs src/abi.rs src/cache.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->
@@ -139,6 +145,23 @@ The M1 mechanisms named in the tracker spec are all present:
     and, for the failed-`execve` case that must not leave a later `fork` pointed
     at an image the tracee never ran,
     `a_failed_exec_does_not_leave_a_later_fork_pointed_at_an_image_the_tracee_never_ran`.
+
+13. **Ordered session teardown** (#186): `Session::ordered_teardown`, run for
+    every session (children first) by `terminate`, by the sandboxed-handoff
+    launch failure and by every drop. It sends RSP `k`, then waits on a fail-closed barrier until the tracee
+    has passed its exit accounting, and only then kills and reaps debugserver
+    (`Rsp::kill_tracer`, `Rsp::reap_tracer`). The barrier accepts only these:
+    - a zombie with the tracee's attach-time start identity;
+    - a reap by this process, or by its traced parent;
+    - for a tracee whose exit debugserver already reported, a post-report
+      lookup finding no process at the pid, or a different one
+      (`TracerReportedExit`).
+
+    `barrier_decision` documents the kernel source behind each. Before this, a
+    refusal's teardown killed debugserver while it held the tracee, and in
+    launchd's session the kernel's orphaned-process-group SIGHUP killed the
+    supervisor. The bounds, the timeout warning and the residuals are under
+    `Request::Terminate` above.
 <!-- /memoria:section -->
 
 <!-- memoria:section id="what-interception-does-not-cover" files="src/abi.rs src/interpose.rs src/native.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->
@@ -486,6 +509,26 @@ drain events to a transaction boundary before retrying. Interrupted transport
 failures terminate held tasks. Finish with `Request::Terminate` using
 `TerminationPolicy::Immediate`.
 
+Termination tears each session down in order, children first (#186):
+- send RSP `k` to its debugserver;
+- wait for a barrier proving the tracee has passed its exit accounting:
+  - a zombie with its attach-time start identity;
+  - a reap by this process, or by its traced parent;
+  - for a tracee whose exit debugserver already reported, its absence or a
+    reused pid;
+- only then kill and reap debugserver.
+
+Killing debugserver first lets the kernel hand a half-exited tracee to launchd
+without job-control accounting, which orphans the run's process group with
+SIGHUP when it shares launchd's session.
+
+The `k` plus the barrier is bounded at 1.5 s per session, and each reap at
+250 ms. On a timeout the provider writes `tracee termination unconfirmed;
+tracer killed` to stderr before killing debugserver, and `Terminate` returns
+that error. Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome.
+Paths that never reach `Terminate` or a drop are tracked in #193: provider
+death, `SIGKILL`, and a tracer crash.
+
 `tests/provider_ipc.rs` exercises the socketpair handshake and real `open-libc`
 capture through these requests, including stopped and running quiescence.
 It uses the fixture env vars and prints `SKIP` if either is missing:
@@ -526,6 +569,32 @@ was closed (below). Fixture cases:
 | `symlink-cycle`     | **CAPTURED** — the logical symlinks above |
 | `mt-write`          | **CAPTURED** — the closed multithreaded window below |
 | `mt-spawn`          | **CAPTURED** — the closed multithreaded window below |
+
+### Ordered teardown (#186)
+
+Every case that runs through `fixture_argv` (all but `dirfd-rename` and
+`symlink-cycle`, which use the overlay harness) also asserts, after its
+`terminate(…).unwrap()`, that no session's teardown timed out:
+`teardown_reports()` holds no report with `timed_out`, so no false
+`tracee termination unconfirmed` warning was written. `mt-spawn`, whose root
+exits before its traced child, must additionally record a
+`TracerReportedExit` barrier outcome for that orphaned child.
+
+Three tests drive the teardown's paths directly. They are gated on
+`UMBRA_TEST_FIXTURE_PATH` alone, and print `SKIP` without it unless
+`UMBRA_INTEGRATION_REQUIRED` is set. Each re-runs itself in a child process
+that leads a fresh session, which keeps the abnormal paths out of launchd's
+session even on the self-hosted runner.
+
+| Test | Pass bar |
+|---|---|
+| `teardown_confirms_exit_before_killing_tracer` | `terminate` returns `Ok`; the report's steps are `KillSent`, a confirmed barrier, then `TracerKilled`; no warning; tracer and tracee are both reaped; no child of the test process remains |
+| `teardown_times_out_on_unresponsive_tracer` | debugserver is stopped with `SIGSTOP`; `terminate` returns `Err` containing `tracee termination unconfirmed; tracer killed` after 1.5–2.5 s; the warning step precedes `TracerKilled`; the tracer is reaped; no child of the test process remains |
+| `teardown_reports_dead_tracer_without_waiting` | debugserver is killed first; `terminate` returns `Err` in under 1 s, after a `KillSendFailed` or `ConnectionClosed` step; the warning precedes `TracerKilled`; the tracer is reaped; no child remains |
+
+`native::tests::the_teardown_barrier_decides_from_report_identity_and_lookup`
+is the barrier's decision table. It is a pure unit test that needs no
+debugger, fixture or environment variable.
 
 ### The two multithreaded cases: what they measured, and how it was closed
 

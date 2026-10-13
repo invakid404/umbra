@@ -484,18 +484,8 @@ jobs:
         run: |
           cargo build --workspace --bins
           cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
-          # environmental SIGHUP terminates routed run under self-hosted Actions runner before guard emits refusal; investigated 2026-10-10, source unidentified: #186 (open).
-          # C10-10 carries the rank-11 signal observer; it stays skipped here until a cause is identified and fixed.
-          # The three rank-11 __posix_spawn guard-refusal leaves below hit the same
-          # environmental SIGHUP on this runner (runs 38238404218 and 38239384653):
-          # EXACT KNOWN REFUSAL locally, NOT QUALIFIED here. They are gate-deferred
-          # on the same condition as C10-10. Refs #186.
           cargo test -p umbra-storage-nfs-userspace --features transport-raw \
-            --test userspace_run -- --nocapture --test-threads=1 \
-            --skip slate_c10_10_fork_helper_refusal \
-            --skip slate_c11_02_empty_attributes \
-            --skip slate_c11_02_empty_both \
-            --skip slate_c11_10_e8_pipe_refusal
+            --test userspace_run -- --nocapture --test-threads=1
 
       - name: Proof 2 -- mutation probe A, read routing broken
         env:

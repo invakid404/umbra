@@ -39,6 +39,21 @@ pub struct Rsp {
     buffer: Vec<u8>,
     no_ack: bool,
     deadline: Instant,
+    /// Set once the owning session's ordered teardown has killed and reaped
+    /// the tracer, so `Drop` does not do it a second time.
+    torn_down: bool,
+}
+/// How long a tracer is given to be reaped after its `SIGKILL`, by the ordered
+/// teardown and by the `Drop` fallback alike. Every wait in teardown is bounded.
+pub const TRACER_REAP_BOUND: Duration = Duration::from_millis(250);
+/// What one teardown read of the connection produced.
+pub enum TeardownRead {
+    /// A whole packet, e.g. debugserver's `X09` after an RSP `k`.
+    Packet(String),
+    /// Nothing within the wait.
+    Quiet,
+    /// The connection is gone (EOF, receive error or an undecodable packet).
+    Closed(String),
 }
 /// Debugserver discovery for callers that did not name one in `Options`:
 /// `UMBRA_DEBUGSERVER` first, then the path below `xcode-select -p`. The
@@ -127,6 +142,7 @@ impl Rsp {
             buffer: Vec::new(),
             no_ack: false,
             deadline,
+            torn_down: false,
         };
         r.stream
             .write_all(b"+")
@@ -170,7 +186,12 @@ impl Rsp {
             .map_err(|e| error("rsp interrupt", e))
     }
     pub fn poll(&mut self, timeout: Duration) -> Result<Option<String>> {
-        let limit = (Instant::now() + timeout).min(self.deadline);
+        self.poll_until((Instant::now() + timeout).min(self.deadline))
+    }
+    /// `poll` against an explicit limit. Teardown reads through this with its
+    /// own bound, because the session deadline may already have expired (the
+    /// watchdog path) and a teardown still has to read the tracer's reply.
+    fn poll_until(&mut self, limit: Instant) -> Result<Option<String>> {
         loop {
             if let Some(start) = self.buffer.iter().position(|b| *b == b'$') {
                 if let Some(end) = self.buffer[start + 1..]
@@ -289,10 +310,69 @@ impl Rsp {
         Ok(())
     }
 }
-impl Drop for Rsp {
-    fn drop(&mut self) {
+/// The primitives of the per-session ordered teardown (#186), which
+/// `native.rs` composes: RSP `k`, read the reply, and only after the tracee's
+/// exit is confirmed kill and reap the tracer.
+impl Rsp {
+    /// The debugserver this connection talks to.
+    pub fn tracer_pid(&self) -> i32 {
+        self.child.id() as i32
+    }
+    /// Send the RSP kill packet (`$k#6b`; acknowledgements are off since the
+    /// handshake). It bypasses the session deadline, because teardown also runs
+    /// after a watchdog expiry, and it is bounded by its own write timeout.
+    pub fn send_kill(&mut self, bound: Duration) -> std::io::Result<()> {
+        self.stream
+            .set_write_timeout(Some(bound.max(Duration::from_millis(1))))?;
+        self.stream.write_all(b"$k#6b")
+    }
+    /// One bounded read of whatever the tracer sends during teardown.
+    pub fn teardown_read(&mut self, wait: Duration) -> TeardownRead {
+        match self.poll_until(Instant::now() + wait) {
+            Ok(Some(packet)) => TeardownRead::Packet(packet),
+            Ok(None) => TeardownRead::Quiet,
+            Err(e) => TeardownRead::Closed(e.to_string()),
+        }
+    }
+    /// `SIGKILL` the tracer. Harmless if it has already exited.
+    pub fn kill_tracer(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+    }
+    /// Reap the tracer with `WNOHANG` polls until `bound`; true once reaped.
+    pub fn reap_tracer(&mut self, bound: Duration) -> bool {
+        let limit = Instant::now() + bound;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(_) => return false,
+            }
+            if Instant::now() >= limit {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    /// Record that the ordered teardown has killed and reaped (or tried to
+    /// reap) the tracer.
+    pub fn mark_torn_down(&mut self) {
+        self.torn_down = true;
+    }
+}
+impl Drop for Rsp {
+    /// The fallback for a connection no session tore down in order. That only
+    /// happens where no inferior can be mid-exit: a failed connect or a failed
+    /// attach inside `Session::attach`, before umbra has terminated anything.
+    /// A held, still-traced inferior is handed back to its original parent and
+    /// killed by the kernel when its tracer dies
+    /// (xnu-12377.121.6 `kern_exit.c:2556-2608`), which is the counted path.
+    /// Every `Session` instead runs `Session::ordered_teardown` first (#186).
+    fn drop(&mut self) {
+        if self.torn_down {
+            return;
+        }
+        self.kill_tracer();
+        let _ = self.reap_tracer(TRACER_REAP_BOUND);
     }
 }
 
