@@ -16,7 +16,7 @@ use crate::frame::{send, Msg, Read, Reader};
 use crate::record::{self, FdSink, Record};
 use crate::spawn;
 use crate::sweep::{self, Kind};
-use crate::{ENV_GUARDIAN, ENV_RUN_ISOLATED};
+use crate::ENV_GUARDIAN;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -252,7 +252,7 @@ pub(crate) fn run_with(exe: PathBuf, args: Vec<std::ffi::OsString>, dir: PathBuf
     let ((up_r, up_w), (down_r, down_w), (life_r, life_w)) =
         pipes.unwrap_or_else(|e| fail_before_launch(format!("pipe: errno {e}")));
     let env = spawn::environment(
-        &[ENV_GUARDIAN, ENV_RUN_ISOLATED],
+        &[ENV_GUARDIAN],
         &[(ENV_GUARDIAN, format!("{up_w},{down_r},{life_r}"))],
     );
     let g = match spawn::spawn(&exe, &args, &env, true, &[up_w, down_r, life_r]) {

@@ -38,10 +38,10 @@ In session 1, `isolate_run()` does not return. The process the caller started
 stays where it is, in the caller's group, as the **relay**. It spawns a
 **guardian** into a new session S (`POSIX_SPAWN_SETSID`, so S is the guardian's
 pid). The guardian spawns the **supervisor**, which is the same `umbra` binary
-with the same arguments and `UMBRA_RUN_ISOLATED=S` in its environment (a
-marker only; nothing in umbra changes behaviour on it). Everything the
-supervisor starts (providers, debugservers, the tracee) is in S. No exit in S
-can count against a group in session 1.
+with the same arguments and the caller's environment (less the guardian's own
+descriptors variable). Everything the supervisor starts (providers,
+debugservers, the tracee) is in S. No exit in S can count against a group in
+session 1.
 
 ```mermaid
 flowchart LR

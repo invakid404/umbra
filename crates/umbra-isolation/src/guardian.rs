@@ -1,8 +1,9 @@
 //! The guardian: leader of the run's session S (#193 D3).
 //!
 //! Spawned by the relay with `POSIX_SPAWN_SETSID`. It proves isolation, spawns
-//! the supervisor (the same `umbra` binary and arguments, with
-//! `UMBRA_RUN_ISOLATED=S`) only after the relay's `GO`, is the only process
+//! the supervisor (the same `umbra` binary, arguments and environment, less
+//! the guardian's own descriptors variable) only after the relay's `GO`, is
+//! the only process
 //! that waits on the supervisor, and sweeps S when the supervisor exits or the
 //! relay dies. While it runs, S persists (its leader is a member), so its own
 //! sweep needs no further ownership proof.
@@ -12,7 +13,7 @@ use crate::frame::{send, Msg, Read, Reader};
 use crate::record::{self, Record};
 use crate::spawn;
 use crate::sweep::{self, Kind};
-use crate::{ENV_GUARDIAN, ENV_RUN_ISOLATED};
+use crate::ENV_GUARDIAN;
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
@@ -73,7 +74,7 @@ pub fn run(spec: &std::ffi::OsStr) -> ! {
         }
     };
     let args: Vec<_> = std::env::args_os().collect();
-    let env = spawn::environment(&[ENV_GUARDIAN], &[(ENV_RUN_ISOLATED, me.to_string())]);
+    let env = spawn::environment(&[ENV_GUARDIAN], &[]);
     let supervisor = match spawn::spawn(&exe, &args, &env, false, &[]) {
         Ok(p) => p,
         Err(e) => {

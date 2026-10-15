@@ -15,23 +15,55 @@ use std::time::{Duration, Instant};
 use umbra_isolation::frame::{send, Msg, Read, Reader};
 use umbra_isolation::spawn::{close, environment, pipe, spawn};
 use umbra_isolation::sweep::Kind;
-use umbra_isolation::{ENV_GUARDIAN, ENV_RUN_ISOLATED};
+use umbra_isolation::ENV_GUARDIAN;
 
 const SCENARIO: &str = "UMBRA_ISOLATION_TEST_GUARDIAN_SCENARIO";
 const FAKE_RELAY: &str = "UMBRA_ISOLATION_TEST_FAKE_RELAY";
+/// Where the scripted supervisor records that it ran (set by the fake relay).
+const MARK: &str = "UMBRA_ISOLATION_TEST_SUPERVISOR_MARK";
+
+/// The supervisor role, from kernel facts, not from the environment: this
+/// process's parent leads the session this process is in (the guardian, which
+/// the relay spawns with `POSIX_SPAWN_SETSID`), and the parent is this same
+/// test binary. An ordinary test run's parent is cargo or a shell, never this
+/// binary.
+fn started_by_a_guardian() -> bool {
+    // SAFETY: getppid and getsid take no memory arguments.
+    let (parent, sid, parent_sid) = unsafe {
+        (
+            libc::getppid(),
+            libc::getsid(0),
+            libc::getsid(libc::getppid()),
+        )
+    };
+    if parent <= 1 || parent_sid != parent || sid != parent {
+        return false;
+    }
+    let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is valid for its stated length.
+    let n = unsafe { libc::proc_pidpath(parent, path.as_mut_ptr().cast(), path.len() as u32) };
+    if n <= 0 {
+        return false;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let parent_exe = std::path::Path::new(std::ffi::OsStr::from_bytes(&path[..n as usize]));
+    let me = std::env::current_exe().unwrap();
+    parent_exe.canonicalize().ok() == me.canonicalize().ok()
+}
 
 /// Guardian and scripted supervisor. A no-op in an ordinary test run.
 #[test]
 fn guardian_or_supervisor() {
     umbra_isolation::guardian_entry();
     // Not a guardian: the supervisor role, if the guardian started us.
-    let Some(sid) = std::env::var_os(ENV_RUN_ISOLATED) else {
+    if !started_by_a_guardian() {
         return;
-    };
-    // SAFETY: getsid has no memory arguments.
-    assert_eq!(sid.to_str().unwrap().parse::<i32>().unwrap(), unsafe {
-        libc::getsid(0)
-    });
+    }
+    // SAFETY: getpid, getppid and getsid take no memory arguments.
+    let (me, parent, sid) = unsafe { (libc::getpid(), libc::getppid(), libc::getsid(0)) };
+    if let Some(mark) = std::env::var_os(MARK) {
+        std::fs::write(mark, format!("{me} {parent} {sid}")).unwrap();
+    }
     if std::env::var(SCENARIO)
         .unwrap()
         .ends_with("supervisor-exits")
@@ -68,9 +100,13 @@ fn fake_relay() {
     .iter()
     .map(|s| s.to_os_string())
     .collect();
+    let mark = dir.path().join("supervisor.mark");
     let env = environment(
         &[FAKE_RELAY],
-        &[(ENV_GUARDIAN, format!("{up_w},{down_r},{life_r}"))],
+        &[
+            (ENV_GUARDIAN, format!("{up_w},{down_r},{life_r}")),
+            (MARK, mark.to_str().unwrap().to_string()),
+        ],
     );
     let g = spawn(&exe, &args, &env, true, &[up_w, down_r, life_r]).unwrap();
     close(up_w);
@@ -97,6 +133,16 @@ fn fake_relay() {
     line(format!(
         "supervisor={supervisor} supervisor_sid={}",
         unsafe { libc::getsid(supervisor) }
+    ));
+    line(format!("guardian={g}"));
+    // The supervisor found its role from kernel facts; it says so here.
+    let end = Instant::now() + Duration::from_secs(3);
+    while std::fs::metadata(&mark).map_or(true, |m| m.len() == 0) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    line(format!(
+        "supervisor_mark={}",
+        std::fs::read_to_string(&mark).unwrap_or_else(|_| "absent".into())
     ));
     let mut bytes = vec![0u8; 65536];
     // SAFETY: a valid buffer; read what the guardian wrote so far.
@@ -168,7 +214,7 @@ fn run(scenario: &str) -> Seen {
         .env(FAKE_RELAY, "1")
         .env(SCENARIO, scenario)
         .env_remove(ENV_GUARDIAN)
-        .env_remove(ENV_RUN_ISOLATED)
+        .env_remove(MARK)
         .output()
         .unwrap();
     let seen = Seen {
@@ -182,6 +228,20 @@ fn run(scenario: &str) -> Seen {
         seen.stderr
     );
     seen
+}
+
+/// The guardian's child took the supervisor role (role found from kernel
+/// facts, not the environment): it is the reported supervisor, its parent is
+/// the guardian, and it is in the guardian's session.
+fn assert_supervisor_ran(seen: &Seen) {
+    let supervisor = seen.get("supervisor");
+    let supervisor = supervisor.split_once(' ').unwrap().0;
+    let g = seen.get("guardian");
+    assert_eq!(
+        seen.get("supervisor_mark"),
+        format!("{supervisor} {g} {g}"),
+        "the supervisor role was not taken by the guardian's child"
+    );
 }
 
 fn assert_supervisor_in_guardian_session(seen: &Seen) {
@@ -198,6 +258,7 @@ fn assert_supervisor_in_guardian_session(seen: &Seen) {
 #[test]
 fn supervisor_exit_is_swept_and_reported() {
     let seen = run("supervisor-exits");
+    assert_supervisor_ran(&seen);
     assert_supervisor_in_guardian_session(&seen);
     assert_eq!(
         seen.get("outcome"),
@@ -221,6 +282,7 @@ fn supervisor_exit_is_swept_and_reported() {
 #[test]
 fn a_mid_run_record_failure_reaches_the_outcome() {
     let seen = run("record-fails-supervisor-exits");
+    assert_supervisor_ran(&seen);
     assert_eq!(
         seen.get("outcome"),
         format!(
@@ -240,6 +302,7 @@ fn a_mid_run_record_failure_reaches_the_outcome() {
 #[test]
 fn relay_death_sweeps_the_session() {
     let seen = run("relay-dies");
+    assert_supervisor_ran(&seen);
     assert_eq!(seen.get("guardian_exit"), "0");
     assert_eq!(seen.get("supervisor_alive"), "false");
     let after = seen.get("record_after");
@@ -255,6 +318,7 @@ fn relay_death_sweeps_the_session() {
 #[test]
 fn no_caller_and_no_record_reports_on_stderr() {
     let seen = run("record-fails-relay-dies");
+    assert_supervisor_ran(&seen);
     assert_eq!(seen.get("guardian_exit"), "1");
     assert_eq!(seen.get("supervisor_alive"), "false");
     assert!(

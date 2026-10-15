@@ -35,12 +35,6 @@ pub mod spawn;
 /// control descriptors (`up,down,life`). Never reaches the supervisor.
 pub const ENV_GUARDIAN: &str = "UMBRA_ISOLATION_GUARDIAN";
 
-/// Set in the supervisor's environment by the guardian: the run's session id.
-/// It marks the supervisor of an isolated run. Nothing in umbra changes
-/// behaviour on it: debugserver's kill on a lost connection comes from the
-/// `QSetDetachOnError:0` packet `umbra-platform-macos` sends in every mode.
-pub const ENV_RUN_ISOLATED: &str = "UMBRA_RUN_ISOLATED";
-
 /// Call first in `main`. In a guardian (the relay spawned this process with
 /// [`ENV_GUARDIAN`]), runs the guardian and never returns. Otherwise returns.
 pub fn guardian_entry() {
