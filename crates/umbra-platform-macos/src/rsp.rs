@@ -76,18 +76,6 @@ pub fn discover_debugserver() -> Option<std::path::PathBuf> {
                 .join("Library/PrivateFrameworks/LLDB.framework/Resources/debugserver")
         })
 }
-
-/// Whether this provider runs inside an isolated run's session: the
-/// `UMBRA_RUN_ISOLATED` marker set by `umbra-isolation`'s guardian parses to a
-/// session id above 1 that equals this process's own (#193).
-fn run_isolated() -> bool {
-    std::env::var("UMBRA_RUN_ISOLATED")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-        // SAFETY: getsid takes no memory arguments.
-        .is_some_and(|s| s > 1 && unsafe { libc::getsid(0) } == s)
-}
-
 impl Rsp {
     pub fn deadline(&self) -> Instant {
         self.deadline
@@ -106,19 +94,8 @@ impl Rsp {
         let address = listener
             .local_addr()
             .map_err(|e| error("debugserver listen", e))?;
-        let mut command = Command::new(executable);
-        command.args(["--reverse-connect", &address.to_string()]);
-        // #193: in an isolated run (launchd's session, moved into a fresh
-        // session S by `umbra-isolation`), debugserver must kill, never
-        // detach, its inferior if this connection is lost: the public
-        // debugserver source detaches by default (`g_detach_on_error`), and a
-        // detached tracee that left S would outlive the run's cleanup. Only
-        // when the marker names this process's own session, so every other
-        // session (terminals included) keeps today's arguments.
-        if run_isolated() {
-            command.arg("--kill-on-error");
-        }
-        let mut child = command
+        let mut child = Command::new(executable)
+            .args(["--reverse-connect", &address.to_string()])
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .stdin(Stdio::null())
@@ -175,7 +152,15 @@ impl Rsp {
         r.request("qSupported:xmlRegisters=arm64")?;
         r.ok("QThreadSuffixSupported")?;
         r.request("QListThreadsInStopReply")?;
-        r.request("QSetDetachOnError:0")?;
+        // Kill, never detach, the inferior if this connection is lost
+        // (#193). debugserver's default is detach (`g_detach_on_error =
+        // true`, debugserver.cpp:67); this packet clears it at runtime and the
+        // handler answers `OK` (RNBRemote.cpp:2429-2447, swift-6.3.2), and on a
+        // lost connection a running inferior is then killed rather than
+        // detached (debugserver.cpp:589-606). Sent before any `vAttach`, so it
+        // governs every inferior; any other reply fails `connect`, rather
+        // than leaving a traced process able to outlive its tracer.
+        r.ok("QSetDetachOnError:0")?;
         Ok(r)
     }
     pub fn send(&mut self, body: &str) -> Result<()> {

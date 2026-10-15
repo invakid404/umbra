@@ -169,22 +169,24 @@ The M1 mechanisms named in the tracker spec are all present:
     supervisor. The bounds, the timeout warning and the residuals are under
     `Request::Terminate` above.
 
-14. **Kill, never detach, on a lost connection in an isolated run** (#193):
-    `Rsp` starts debugserver with `--reverse-connect <address>`, and adds
-    `--kill-on-error` only when `UMBRA_RUN_ISOLATED` parses to a session id
-    above 1 that equals this provider's own `getsid(0)`. `umbra-isolation`'s
-    guardian sets that marker for a run it moved out of launchd's session
-    ([umbra-isolation](../umbra-isolation/README.md)). There, a tracee that
-    calls `setsid()` leaves the run's session, so the guardian's session sweep
-    does not reach it; it must die with its debugserver. Measured, the shipped
-    debugserver (`lldb-2100.0.17.108`) already kills its inferior when the RSP
-    connection is lost, but the public source detaches by default; the flag
-    pins the measured behaviour. In every other session, terminals included,
-    the arguments are unchanged unless the caller sets `UMBRA_RUN_ISOLATED`
-    to its own session id itself: the providers inherit the supervisor's
-    environment, so that opts in to this flag (kill rather than detach on RSP
-    loss) and to nothing else. Other detach routes inside debugserver are
-    unaudited (#200).
+14. **Kill, never detach, on a lost connection, verified** (#193):
+    `Rsp::connect` sends `QSetDetachOnError:0` at the end of its handshake,
+    before any `vAttach`, in every mode, and fails the connection unless
+    debugserver answers exactly `OK`. debugserver detaches by default
+    (`g_detach_on_error = true`, `debugserver.cpp:67`); the packet clears that
+    setting at runtime (`RNBRemote.cpp:2429-2447`), so when the RSP connection
+    is lost a running inferior is killed, not detached
+    (`debugserver.cpp:589-606`; swift-6.3.2 source, and the shipped
+    `lldb-2100.0.17.108` carries the same handler). umbra has sent the packet
+    since M1; #193 added the check of its reply. This is what kills a tracee
+    that left an isolated run's session with its own `setsid()`, which the
+    guardian's session sweep cannot reach
+    ([umbra-isolation](../umbra-isolation/README.md)); if instead its tracer
+    dies, the kernel kills it. debugserver's own `--kill-on-error` flag would
+    only set the same value at startup, before any inferior exists, so umbra
+    does not pass it. No test injects a rejected reply (there is no scripted
+    debugserver); every real connection exercises the `OK` path. Other detach
+    routes inside debugserver are unaudited (#200).
 <!-- /memoria:section -->
 
 <!-- memoria:section id="what-interception-does-not-cover" files="src/abi.rs src/interpose.rs src/native.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->

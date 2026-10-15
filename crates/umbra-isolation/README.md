@@ -5,8 +5,8 @@ issue #193. **Current state:** shipped on macOS and active only there, only in
 session 1. In every other session, every terminal session included, it does
 nothing, and on other platforms it compiles to no-ops. **Scope:** this crate's
 `src/` and `tests/`. The `umbra-cli` launch path that calls it is described in
-[the CLI README](../umbra-cli/README.md#exit-codes-and-streams), and the
-debugserver argument it enables in
+[the CLI README](../umbra-cli/README.md#exit-codes-and-streams), and how
+debugserver kills a traced process on a lost connection in
 [the platform README](../umbra-platform-macos/README.md).
 
 This is the one umbra crate in the `umbra` binary's tree that permits `unsafe`
@@ -38,14 +38,10 @@ In session 1, `isolate_run()` does not return. The process the caller started
 stays where it is, in the caller's group, as the **relay**. It spawns a
 **guardian** into a new session S (`POSIX_SPAWN_SETSID`, so S is the guardian's
 pid). The guardian spawns the **supervisor**, which is the same `umbra` binary
-with the same arguments and `UMBRA_RUN_ISOLATED=S` in its environment. Everything
-the supervisor starts (providers, debugservers, the tracee) is in S. No exit in S
+with the same arguments and `UMBRA_RUN_ISOLATED=S` in its environment (a
+marker only; nothing in umbra changes behaviour on it). Everything the
+supervisor starts (providers, debugservers, the tracee) is in S. No exit in S
 can count against a group in session 1.
-
-The marker can also be set by a caller. The supervisor passes its environment
-to the providers, so a caller that sets `UMBRA_RUN_ISOLATED` to its own session
-id, in any session, opts in to one effect only: debugserver gets
-`--kill-on-error` (platform README). No relay or guardian is started that way.
 
 ```mermaid
 flowchart LR
@@ -86,11 +82,13 @@ Who sweeps:
   within 1 s, records `relay-death` and exits.
 - **Relay fallback** (the guardian stopped, lost, malformed or slow): the relay
   SIGKILLs the guardian by pid, but only while it is the relay's own unreaped
-  child. It then sweeps S, writes the record's final line, reaps the guardian
-  once and exits 1.
+  child. It then sweeps S, writes its `relay-fallback` line, reaps the
+  guardian once, records the reap in a `guardian-reaped` line and exits 1.
 
-The relay's sweep rests on the **zombie anchor**. The relay never reaps the
-guardian until its sweep and final record line are done. While the guardian is
+The relay's sweep rests on the **zombie anchor**. The relay reaps the guardian
+only after its sweep and that sweep's `relay-fallback` (or, on the normal path,
+`outcome`) record line; the `guardian-reaped` line follows the reap. While the
+guardian is
 unreaped, its pid cannot be allocated again. A session id is its leader's pid.
 So no other process can create a session with id S, and any process with
 session id S belongs to this run. The XNU sources (xnu-12377.121.6), also
@@ -113,12 +111,17 @@ As defence in depth (`src/sweep.rs`):
   signalled.
 
 After the single reap, the relay performs no operation on a numeric pid or
-session id.
+session id (R-10): only the `guardian-reaped` record line, stderr, and its own
+exit or mirrored signal follow it (`relay.rs`, `Relay::fallback`, end of
+`run_with`).
 
 The isolation does not reach a process that leaves S with its own `setsid()`. A
-traced process that does so dies with its debugserver, because debugserver runs
-with `--kill-on-error` inside an isolated run (platform README). An untraced
-process that escapes S is not cleaned up.
+traced process that does so is still killed by its debugserver if the
+connection to the platform is lost while it runs: `umbra-platform-macos` sends
+`QSetDetachOnError:0` on every connection before attaching, and fails the
+connection unless debugserver answers `OK` (platform README). If its tracer
+dies, the kernel kills it (`kern_exit.c:2556-2608`). An untraced process that
+escapes S is not cleaned up.
 
 ## Exit status
 
@@ -187,19 +190,26 @@ A sweep checks its deadline in two places: at the top of each pass, and before
 each process of a census (`sweep.rs`, `census.rs`). Each of these steps runs to
 completion once it has started:
 
+- **the two anchor checks** of each pass (`anchor_ok`), one before the census
+  and one after it. In the relay's fallback sweep each is one
+  `waitid(…WNOWAIT…)` call on the guardian; the guardian's own sweep answers
+  them without a call;
 - **the process listing** at the start of each census: up to eight
   `proc_listallpids` calls (`all_pids`);
-- **one process's census step:** `getsid`, `proc_pidinfo`, `task_name_for_pid`,
-  two `task_info` reads around a second `getsid`, `mach_port_deallocate`, and
-  sometimes a third `getsid` (`MacHost::census`, `verified_token`);
+- **one process's census step:** `getsid`, `proc_pidinfo`, then either
+  `task_name_for_pid`, two `task_info` reads around a second `getsid`,
+  `mach_port_deallocate` and sometimes a third `getsid` (`verified_token`), or,
+  when `proc_pidinfo` gives no answer, one more `getsid` (`MacHost::census`);
 - **the kill loop:** one `proc_signal_with_audittoken` per owned process still
   alive, with no deadline check inside it;
 - **the 20 ms pause** after each pass, including a pass whose census failed.
 
-A sweep can therefore end later than its 3 s. The overrun is the step in
-progress at the deadline plus at most one 20 ms pause, or, when a census
-completes just before the deadline, that pass's kill loop and pause. A census
-cut at the deadline counts as failed, never as empty. Only an empty census
+A sweep can therefore end later than its 3 s. At most, the overrun is the
+composition of: the step in progress at the deadline, then the post-census
+anchor check, then that pass's kill loop, then one 20 ms pause. A census cut at
+the deadline counts as failed, never as empty, and so does a process whose
+`proc_pidinfo` gives no answer but whose `getsid` still names S: it is reported
+as a claimant without a token, which is never signalled. Only an empty census
 ends a sweep `COMPLETE`; otherwise the result is `UNVERIFIABLE` or
 `INCOMPLETE` from the last complete census, or `ERROR` if none completed.
 
@@ -207,9 +217,8 @@ The relay's reap of the guardian is bounded too. If a SIGKILLed guardian has
 not been reaped within 1 s, for example because it is still inside an
 uninterruptible call, the relay exits 1 without reaping it, saying so on stderr
 and in the record's `guardian-reaped` line (`"reaped": false`), and launchd
-inherits it. The reap still comes last: after the sweep and after the final
-record line, and nothing after it signals or censuses by number (`relay.rs`,
-`Relay::fallback`, end of `run_with`).
+inherits it. The reap still comes after the sweep and its `relay-fallback` or
+`outcome` line, and nothing after it signals or censuses by number.
 
 Outside every bound:
 
@@ -252,8 +261,9 @@ Stated, not closed here:
   nothing sweeps S, and its processes can outlive the run. They are in a session
   other than 1, so #193's SIGHUP cannot reach them. The platform also keeps such
   a run alive until its own deadline (#203).
-- **Other debugserver detach routes** (#200): only the RSP-loss route is pinned
-  (`--kill-on-error`).
+- **Other debugserver detach routes** (#200): only the RSP-loss route is
+  governed, by the verified `QSetDetachOnError:0`; any other route by which
+  debugserver might detach with that setting has not been audited.
 - **No caller plus an unwritable record:** R-4 above.
 - **Session continuity in the relay's fallback** (the design's R-9, as amended
   by the T1 resolution): continuity of S is proved by the zombie anchor, not by
@@ -262,9 +272,14 @@ Stated, not closed here:
 - **Only `umbra run` is isolated.** `umbra resume` and `umbra providers` also
   start provider processes, with no tracee, and stay in the caller's session.
 - **A tracee that leaves S** with its own `setsid()` is cleaned up through its
-  debugserver (`--kill-on-error`; platform README). That route was measured in
-  the #193 design readings; no test in this repository exercises it on the
-  shipped binary.
+  debugserver (the verified `QSetDetachOnError:0`; platform README). That
+  route was measured in the #193 design readings, where umbra already sent the
+  packet; no test in this repository exercises it on the shipped binary.
+- **A rejected `QSetDetachOnError:0` fails the connection**, but no test injects
+  a rejection: the suite has no scripted debugserver. The success path runs on
+  every connection to the real one (every `umbra run`, and
+  `umbra-platform-macos`'s handshake test), and the handler that answers `OK` is
+  `RNBRemote.cpp:2429-2447` (swift-6.3.2).
 
 ## Tests
 
@@ -301,8 +316,8 @@ Stated, not closed here:
   the sweep on supervisor exit and on relay death, a mid-run record failure in
   `OUTCOME`, and R-4's stderr line.
 
-The production-path tests in session 1 (P1-P4, topology, cleanup, the
-debugserver argument) and the terminal tests are `umbra-cli`'s
+The production-path tests in session 1 (P1-P4, topology, cleanup, and
+debugserver's arguments left as on master) and the terminal tests are `umbra-cli`'s
 `tests/isolation.rs`. CI's self-hosted runner, whose jobs run in session 1, runs
 both suites with `UMBRA_REQUIRE_SID1=1`.
 

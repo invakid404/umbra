@@ -36,8 +36,9 @@ pub mod spawn;
 pub const ENV_GUARDIAN: &str = "UMBRA_ISOLATION_GUARDIAN";
 
 /// Set in the supervisor's environment by the guardian: the run's session id.
-/// Providers inherit it; `umbra-platform-macos` adds `--kill-on-error` to
-/// debugserver only when it equals the provider's own `getsid(0)`.
+/// It marks the supervisor of an isolated run. Nothing in umbra changes
+/// behaviour on it: debugserver's kill on a lost connection comes from the
+/// `QSetDetachOnError:0` packet `umbra-platform-macos` sends in every mode.
 pub const ENV_RUN_ISOLATED: &str = "UMBRA_RUN_ISOLATED";
 
 /// Call first in `main`. In a guardian (the relay spawned this process with

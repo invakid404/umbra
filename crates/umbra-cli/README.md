@@ -126,10 +126,10 @@ the caller is unimplemented.
 A launchd job, or a CI runner, starts `umbra` in launchd's session (session id
 1). There, `main` hands a `run` command to `umbra_isolation::isolate_run()`
 right after argument parsing, before any run is prepared (#193). The process
-the caller started stays as a relay. The run executes in a fresh session, as the same `umbra` binary with the
-same arguments, under a guardian process. The relay then exits with the
-supervisor's status, mirrored: the same exit code, or the same signal. All the
-rules above are unchanged.
+the caller started stays as a relay. The run executes in a fresh session, as
+the same `umbra` binary with the same arguments, under a guardian process. The
+relay then exits with the supervisor's status, mirrored: the same exit code,
+or the same signal. All the rules above are unchanged.
 
 The relay exits 1 instead when:
 - the run's cleanup was not complete;
@@ -140,9 +140,7 @@ The relay exits 1 instead when:
 Each case has a line on stderr, and the record is under
 `~/Library/Logs/umbra/isolation/`. A run's tracee and providers can no longer
 be SIGHUPed through the caller's process group. In every other session, every
-terminal included, nothing changes, unless the caller itself sets
-`UMBRA_RUN_ISOLATED` to its own session id: that opts in to debugserver's
-`--kill-on-error` and to nothing else (platform README). `main` also calls
+terminal included, nothing changes. `main` also calls
 `umbra_isolation::guardian_entry()` first, before argument parsing; it returns
 at once unless this process was started as a guardian. See
 [umbra-isolation](../umbra-isolation/README.md).
@@ -202,13 +200,13 @@ Its cases fall into two groups:
   `pg_jobc`. The cases are:
   - P1 to P4 (no SIGHUP to `umbra`, its providers or the caller's group, the
     group never orphaned, nothing left);
-  - the run's topology, the mirrored status, the isolation record, and the
-    debugserver `--kill-on-error` pin;
+  - the run's topology, the mirrored status, the isolation record, and
+    debugserver's arguments left as on master (no `--kill-on-error`);
   - a descendant refused entry to the caller's group, and the tracee's own
     `setsid`;
   - cleanup after a `killpg` of the caller's group, a SIGTERM to the relay, and
     a same-named process outside the run left untouched.
-- **Other cases.** A fresh-session run (no relay, no pin) and ten pty cases run
+- **Other cases.** A fresh-session run (no relay) and ten pty cases run
   in any session. The pty cases put `umbra run` under a mini job-control shell
   and pin today's terminal semantics: Ctrl-C, Ctrl-Z then `fg`, Ctrl-\,
   TOSTOP, SIGWINCH, hangup, exit status and terminal ioctls.

@@ -204,3 +204,38 @@ fn a_stale_token_is_refused_and_a_live_one_kills() {
         "status {st:#x}"
     );
 }
+
+/// CR-1: the census reports a member it cannot read as a tokenless claimant,
+/// but never a zombie. Here session S's only process is its leader, left an
+/// unreaped zombie (as the relay's exited guardian is during the relay's
+/// fallback sweep). `proc_pidinfo` gives no answer for a zombie and `getsid`
+/// refuses it, so the census is empty and the sweep is COMPLETE with nothing
+/// sent, not UNVERIFIABLE.
+#[test]
+fn a_zombie_leader_is_not_a_claimant() {
+    let env = environment(&[], &[]);
+    let s = spawn(
+        Path::new("/usr/bin/true"),
+        &args(&["true"]),
+        &env,
+        true,
+        &[],
+    )
+    .unwrap();
+    for _ in 0..200 {
+        if stat(s).starts_with('Z') {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(stat(s).starts_with('Z'), "not a zombie: {:?}", stat(s));
+    let mut host = MacHost { anchor: || true };
+    let census = host
+        .census(s, std::time::Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    assert!(census.is_empty(), "a zombie was reported: {census:?}");
+    let o = sweep(&mut host, s, Duration::from_secs(1));
+    assert_eq!(o.kind, Kind::Complete, "{o:?}");
+    assert_eq!(o.sent, 0);
+    reap(s);
+}

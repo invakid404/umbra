@@ -179,7 +179,10 @@ fn args_of(pid: i32) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// debugserver's RSP-loss pin (#193 O4), added only inside an isolated run.
+/// debugserver's startup kill-on-error flag. umbra never passes it, in any
+/// mode: the kill on a lost connection comes from the `QSetDetachOnError:0`
+/// packet `umbra-platform-macos` sends and verifies on every connection
+/// (#193's O4 re-ruling). These cases pin that the argv stays master's.
 const PIN: &str = "--kill-on-error";
 
 fn kv(line: &str, key: &str) -> Option<i32> {
@@ -890,8 +893,8 @@ fn sid1_topology_status_and_record() {
     for d in &tree.debugservers {
         let args = args_of(*d);
         assert!(
-            args.split_whitespace().any(|a| a == PIN),
-            "debugserver {d} without {PIN}: {args}"
+            !args.contains(PIN),
+            "debugserver {d} has {PIN} in an isolated run: {args}"
         );
     }
     for (what, pid) in [

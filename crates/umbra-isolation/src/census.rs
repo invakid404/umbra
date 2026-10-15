@@ -128,7 +128,23 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
             }
             match is_zombie(pid) {
                 Some(false) => {}
-                _ => continue,
+                Some(true) => continue,
+                // `proc_pidinfo` gave no answer. That is what a zombie or an
+                // exited pid gives, but also a live member whose info cannot
+                // be read. Never read that as "not a member": re-check the
+                // session and report a member as a tokenless claimant, which
+                // the sweep never enrolls or signals and which ends it
+                // UNVERIFIABLE. A zombie or exited pid fails `getsid` (xnu
+                // kern_exit.c:2269 marks the zombie P_REF_DEAD, so
+                // kern_prot.c:269-275 `proc_find` refuses it), so neither is
+                // added.
+                None => {
+                    // SAFETY: getsid has no memory arguments.
+                    if unsafe { libc::getsid(pid) } == sid {
+                        out.push(Claimant { pid, token: None });
+                    }
+                    continue;
+                }
             }
             match verified_token(pid) {
                 Some((t, s)) if s == sid => out.push(Claimant {
