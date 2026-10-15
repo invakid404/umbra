@@ -1,5 +1,5 @@
 //! The session sweep: the one place that decides which processes a run's
-//! cleanup may signal (#193 T1 protocol, `t1-protocol.md` §3).
+//! cleanup may signal (#193's T1 protocol; README, Cleanup and ownership).
 //!
 //! Pure logic over a [`Host`], so every interleaving the protocol cares about
 //! can be scripted exactly in tests. The macOS host lives in `census.rs`.
@@ -53,7 +53,8 @@ pub enum Signalled {
 /// The process table and signal primitive the sweep runs against.
 pub trait Host {
     /// Whether ownership of the numeric session id is still proved (the zombie
-    /// anchor, `t1-protocol.md` §2). The guardian's own sweep answers `true`.
+    /// anchor; README, Cleanup and ownership). The guardian's own sweep
+    /// answers `true`.
     fn anchor_ok(&mut self) -> bool;
     /// Every live, non-zombie process whose session id is `sid`, or `Err` when
     /// the census could not be taken. Must not run past `deadline`.

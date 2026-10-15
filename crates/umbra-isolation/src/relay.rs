@@ -4,7 +4,7 @@
 //! session S (`POSIX_SPAWN_SETSID`, so S = the guardian's pid), and reports the
 //! run's status to the caller.
 //!
-//! **T1 (`t1-protocol.md`).** The relay never reaps the guardian until its
+//! **T1 (the arc's T1 protocol; README, Cleanup and ownership).** The relay never reaps the guardian until its
 //! fallback sweep (if any) and the record's final line are done: it observes
 //! the guardian only with `waitid(…WNOWAIT…)`. While the guardian is unreaped,
 //! no process outside the original session can carry session id S, so a
@@ -77,15 +77,27 @@ fn anchor(g: i32) -> bool {
     observe(g).is_some()
 }
 
-/// Reap the guardian. The last numeric-pid operation of the relay (R-10).
-fn reap(g: i32) {
-    let mut st = 0;
+/// Reap the guardian, polling with `WNOHANG` until `bound` passes (R-6: no
+/// blocking wait). The last numeric-pid operation of the relay (R-10).
+/// `false`: not reaped in time, for instance a SIGKILLed guardian still inside
+/// an uninterruptible call; the relay then exits without it, and launchd
+/// inherits and reaps it.
+fn reap(g: i32, bound: Duration) -> bool {
+    let end = Instant::now() + bound;
     loop {
+        let mut st = 0;
         // SAFETY: a valid out-pointer; `g` is our child.
-        let r = unsafe { libc::waitpid(g, &mut st, 0) };
-        if r >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return;
+        let r = unsafe { libc::waitpid(g, &mut st, libc::WNOHANG) };
+        if r == g {
+            return true;
         }
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return false;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -127,18 +139,23 @@ impl Relay {
             serde_json::json!({ "pid": self.g, "state": format!("{:?}", self.state), "sent": allowed }),
         );
         if allowed {
-            // SAFETY: `g` is our unreaped child; its pid cannot be reallocated
-            // before we reap it (t1-protocol.md §2.2, §4).
+            // SAFETY: `g` is our unreaped child; a pid is not reallocated
+            // while its proc entry exists (xnu kern_fork.c:971-974; see the
+            // crate README, Cleanup and ownership).
             unsafe {
                 libc::kill(self.g, libc::SIGKILL);
             }
         }
     }
-    /// The single reap: the last numeric-pid operation (R-10).
-    fn reap(&mut self) {
-        self.rec
-            .line("guardian-reaped", serde_json::json!({ "pid": self.g }));
-        reap(self.g);
+    /// The single reap, bounded by REAP: the last numeric-pid operation
+    /// (R-10). Only record I/O, stderr and this process's own exit follow it.
+    fn reap(&mut self) -> bool {
+        let reaped = reap(self.g, REAP);
+        self.rec.line(
+            "guardian-reaped",
+            serde_json::json!({ "pid": self.g, "reaped": reaped }),
+        );
+        reaped
     }
 
     /// Fail closed: end the guardian if it is still ours to signal, sweep S
@@ -168,14 +185,19 @@ impl Relay {
                 "frozen_at": outcome.frozen_at, "error": outcome.error,
             }),
         );
-        self.reap();
+        let reaped = self.reap();
         let failed = self.rec.failed();
         eprintln!(
-            "umbra: run isolation failed: {reason} (session {g}, relay sweep {}){}",
+            "umbra: run isolation failed: {reason} (session {g}, relay sweep {}){}{}",
             outcome.kind.as_str(),
             failed
                 .map(|e| format!("; isolation record write failed (errno {e})"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if reaped {
+                String::new()
+            } else {
+                format!("; guardian {g} not reaped within {REAP:?}")
+            }
         );
         std::process::exit(1)
     }
@@ -375,11 +397,17 @@ pub(crate) fn run_with(exe: PathBuf, args: Vec<std::ffi::OsString>, dir: PathBuf
         "outcome",
         serde_json::json!({ "supervisor_status": status, "cleanup": kind.as_str(), "guardian_record_errno": guardian_errno }),
     );
-    relay.reap();
+    let reaped = relay.reap();
     let relay_errno = relay.rec.failed();
-    // O5: a cleanup other than COMPLETE, or any record failure, is exit 1.
-    if kind == Kind::Complete && guardian_errno == 0 && relay_errno.is_none() {
+    // O5: a cleanup other than COMPLETE, or any record failure, is exit 1;
+    // so is a guardian that exited but could not be reaped in time.
+    if kind == Kind::Complete && guardian_errno == 0 && relay_errno.is_none() && reaped {
         mirror(status);
+    }
+    if !reaped {
+        eprintln!(
+            "umbra: run isolation guardian {g} not reaped within {REAP:?}; supervisor status {status}"
+        );
     }
     if kind != Kind::Complete {
         eprintln!(
@@ -399,4 +427,29 @@ pub(crate) fn run_with(exe: PathBuf, args: Vec<std::ffi::OsString>, dir: PathBuf
 fn unsafe_getpgrp() -> i32 {
     // SAFETY: getpgrp has no arguments and cannot fail.
     unsafe { libc::getpgrp() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R-6: the relay's reap never blocks past its bound. A child that does
+    /// not exit is reported unreaped within the bound; once it has exited,
+    /// the same call reaps it.
+    #[test]
+    fn the_reap_is_bounded() {
+        let args: Vec<std::ffi::OsString> = ["/bin/sleep", "30"].iter().map(Into::into).collect();
+        let env = spawn::environment(&[], &[]);
+        let g = spawn::spawn(std::path::Path::new("/bin/sleep"), &args, &env, false, &[]).unwrap();
+        let started = Instant::now();
+        assert!(!reap(g, Duration::from_millis(200)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // SAFETY: our own unreaped child.
+        unsafe { libc::kill(g, libc::SIGKILL) };
+        assert!(reap(g, REAP));
+    }
 }

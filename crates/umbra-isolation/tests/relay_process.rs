@@ -188,6 +188,16 @@ fn assert_no_signal_after_reap(r: &Run) {
         "a guardian signal after the reap: {ev:?}"
     );
     assert_eq!(
+        reaped[0],
+        ev.len() - 1,
+        "the reap is the record's last line: {ev:?}"
+    );
+    assert_eq!(
+        r.record[reaped[0]]["reaped"], true,
+        "the bounded reap reaped the guardian: {:?}",
+        r.record[reaped[0]]
+    );
+    assert_eq!(
         ev.first().map(String::as_str),
         Some("relay-start"),
         "R-1: the record starts first"
@@ -212,12 +222,14 @@ fn complete_mirrors_exit_zero() {
 #[test]
 fn complete_mirrors_exit_code() {
     let r = run("exit-3");
+    assert_no_signal_after_reap(&r);
     assert_eq!(r.status.code(), Some(3), "{}", r.stderr);
 }
 
 #[test]
 fn complete_mirrors_a_signal() {
     let r = run("complete-sig9");
+    assert_no_signal_after_reap(&r);
     assert_eq!(
         r.status.signal(),
         Some(libc::SIGKILL),
@@ -230,6 +242,7 @@ fn complete_mirrors_a_signal() {
 #[test]
 fn incomplete_cleanup_is_exit_one_never_zero() {
     let r = run("incomplete");
+    assert_no_signal_after_reap(&r);
     assert_eq!(r.status.code(), Some(1));
     assert!(
         r.stderr.contains("run isolation cleanup INCOMPLETE"),
@@ -241,6 +254,7 @@ fn incomplete_cleanup_is_exit_one_never_zero() {
 #[test]
 fn a_guardian_record_failure_is_exit_one_never_zero() {
     let r = run("record-errno");
+    assert_no_signal_after_reap(&r);
     assert_eq!(r.status.code(), Some(1));
     assert!(
         r.stderr
@@ -253,6 +267,7 @@ fn a_guardian_record_failure_is_exit_one_never_zero() {
 #[test]
 fn a_partial_frame_across_timeouts_is_received() {
     let r = run("partial");
+    assert_no_signal_after_reap(&r);
     assert_eq!(r.status.code(), Some(0), "{}", r.stderr);
 }
 
@@ -285,6 +300,7 @@ fn a_malformed_frame_fails_closed() {
 #[test]
 fn an_unknown_outcome_kind_fails_closed() {
     let r = run("bad-kind");
+    assert_no_signal_after_reap(&r);
     assert_eq!(r.status.code(), Some(1));
     assert!(
         r.stderr.contains("protocol: malformed frame"),
@@ -296,6 +312,7 @@ fn an_unknown_outcome_kind_fails_closed() {
 #[test]
 fn an_oversized_frame_fails_closed() {
     let r = run("oversized");
+    assert_no_signal_after_reap(&r);
     assert_eq!(r.status.code(), Some(1));
     assert!(r.stderr.contains("oversized frame"), "{}", r.stderr);
 }
@@ -312,6 +329,7 @@ fn a_stopped_guardian_is_ended_and_the_run_swept() {
 #[test]
 fn a_wrong_session_claim_fails_closed() {
     let r = run("wrong-sid");
+    assert_no_signal_after_reap(&r);
     assert_eq!(r.status.code(), Some(1));
     assert!(
         r.stderr.contains("guardian did not isolate"),

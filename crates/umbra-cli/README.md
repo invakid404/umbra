@@ -8,8 +8,8 @@ backend into the binary. Exactly two reach the tests — `umbra-journal-file` an
 `umbra-storage-local`, for the reason recorded over `umbra-core` in
 `Cargo.toml`'s `[dev-dependencies]`. `umbra-isolation` is a runtime dependency
 but not a backend: it moves a run started in launchd's session into a session of
-its own (#193, below), and it is the one crate in the binary's tree that permits
-`unsafe`; this crate keeps `#![forbid(unsafe_code)]`.
+its own (#193, below), and it is the one umbra crate in the binary's tree that
+permits `unsafe`; this crate keeps `#![forbid(unsafe_code)]`.
 
 `run` and `resume` are operational. `stop`, `checkpoint` and `inspect` are stubs
 that report `not implemented` on stderr and exit 1; they no longer echo their
@@ -125,8 +125,8 @@ the caller is unimplemented.
 
 A launchd job, or a CI runner, starts `umbra` in launchd's session (session id
 1). There, `main` hands a `run` command to `umbra_isolation::isolate_run()`
-right after argument parsing, before any run is prepared (#193). The process the caller started stays as a
-relay. The run executes in a fresh session, as the same `umbra` binary with the
+right after argument parsing, before any run is prepared (#193). The process
+the caller started stays as a relay. The run executes in a fresh session, as the same `umbra` binary with the
 same arguments, under a guardian process. The relay then exits with the
 supervisor's status, mirrored: the same exit code, or the same signal. All the
 rules above are unchanged.
@@ -134,12 +134,15 @@ rules above are unchanged.
 The relay exits 1 instead when:
 - the run's cleanup was not complete;
 - its isolation record could not be written;
-- the isolation itself failed.
+- the isolation itself failed, including a guardian it could not reap within
+  its 1 s bound.
 
 Each case has a line on stderr, and the record is under
 `~/Library/Logs/umbra/isolation/`. A run's tracee and providers can no longer
 be SIGHUPed through the caller's process group. In every other session, every
-terminal included, nothing changes. `main` also calls
+terminal included, nothing changes, unless the caller itself sets
+`UMBRA_RUN_ISOLATED` to its own session id: that opts in to debugserver's
+`--kill-on-error` and to nothing else (platform README). `main` also calls
 `umbra_isolation::guardian_entry()` first, before argument parsing; it returns
 at once unless this process was started as a guardian. See
 [umbra-isolation](../umbra-isolation/README.md).

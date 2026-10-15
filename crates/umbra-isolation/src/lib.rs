@@ -8,9 +8,10 @@
 //! Topology (README.md): the process the caller started stays where it is as
 //! the **relay**; a **guardian** leads the new session S and runs the
 //! **supervisor** (the same `umbra` binary and arguments) inside it. Cleanup of
-//! S follows `t1-protocol.md` (graph-audits `dg-56gcxqyw-t1-protocol.md`).
+//! S follows the #193 arc's T1 protocol (an external arc record, graph audit
+//! `dg-56gcxqyw`, not in this repository); README.md carries its XNU citations.
 //!
-//! This is the only crate in the CLI's tree that permits `unsafe`; `umbra-cli`
+//! This is the only umbra crate in the CLI's tree that permits `unsafe`; `umbra-cli`
 //! keeps `#![forbid(unsafe_code)]` and calls [`guardian_entry`] and
 //! [`isolate_run`].
 

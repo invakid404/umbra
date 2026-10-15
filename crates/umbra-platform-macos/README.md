@@ -180,7 +180,10 @@ The M1 mechanisms named in the tracker spec are all present:
     debugserver (`lldb-2100.0.17.108`) already kills its inferior when the RSP
     connection is lost, but the public source detaches by default; the flag
     pins the measured behaviour. In every other session, terminals included,
-    the arguments are unchanged. Other detach routes inside debugserver are
+    the arguments are unchanged unless the caller sets `UMBRA_RUN_ISOLATED`
+    to its own session id itself: the providers inherit the supervisor's
+    environment, so that opts in to this flag (kill rather than detach on RSP
+    loss) and to nothing else. Other detach routes inside debugserver are
     unaudited (#200).
 <!-- /memoria:section -->
 

@@ -9,7 +9,8 @@ nothing, and on other platforms it compiles to no-ops. **Scope:** this crate's
 debugserver argument it enables in
 [the platform README](../umbra-platform-macos/README.md).
 
-This is the one crate in the `umbra` binary's tree that permits `unsafe`. Every
+This is the one umbra crate in the `umbra` binary's tree that permits `unsafe`
+(third-party dependencies such as `libc` aside). Every
 `unsafe` block carries a `// SAFETY:` comment, and `unsafe_op_in_unsafe_fn` is
 denied. `umbra-cli` keeps `#![forbid(unsafe_code)]` and calls two safe functions:
 `guardian_entry()` first in `main`, and `isolate_run()` before a run.
@@ -40,6 +41,11 @@ pid). The guardian spawns the **supervisor**, which is the same `umbra` binary
 with the same arguments and `UMBRA_RUN_ISOLATED=S` in its environment. Everything
 the supervisor starts (providers, debugservers, the tracee) is in S. No exit in S
 can count against a group in session 1.
+
+The marker can also be set by a caller. The supervisor passes its environment
+to the providers, so a caller that sets `UMBRA_RUN_ISOLATED` to its own session
+id, in any session, opts in to one effect only: debugserver gets
+`--kill-on-error` (platform README). No relay or guardian is started that way.
 
 ```mermaid
 flowchart LR
@@ -87,11 +93,15 @@ The relay's sweep rests on the **zombie anchor**. The relay never reaps the
 guardian until its sweep and final record line are done. While the guardian is
 unreaped, its pid cannot be allocated again. A session id is its leader's pid.
 So no other process can create a session with id S, and any process with
-session id S belongs to this run. The XNU citations are in the arc's
-`t1-protocol.md` (graph audit `dg-56gcxqyw`):
+session id S belongs to this run. The XNU sources (xnu-12377.121.6), also
+recorded in the #193 arc's T1 protocol (an external arc record, graph audit
+`dg-56gcxqyw`, not in this repository):
 
-- pid allocation skips live and zombie entries (`kern_fork.c:971-974`);
-- `setsid` sets the session id to the caller's pid (`kern_proc.c:2801-2808`);
+- pid allocation skips pids still hashed, zombies included
+  (`kern_fork.c:971-974`);
+- `setsid` makes the caller a session leader (`kern_prot.c:498`,
+  `setsid_internal` → `enterpgrp`), and `session_alloc` sets the session id
+  to the leader's pid (`kern_proc.c:2801-2808`);
 - the pid is released only at reap (`kern_exit.c:2981-2984`).
 
 As defence in depth (`src/sweep.rs`):
@@ -160,28 +170,59 @@ The record is not linked to the run's journal.
 
 ## Bounds
 
-The bounds are operational deadlines on the monotonic clock, not hard real-time
-guarantees:
+The bounds are operational targets on the monotonic clock, not hard real-time
+guarantees (#193 O7). Each wait below is a `WNOHANG` or `poll` loop against a
+deadline:
 
 | Wait | Bound |
 |---|---|
 | each startup handshake phase (`ISOLATED`, then `STARTED`) | 2 s |
-| a sweep (census passes, kills, pauses) | 3 s |
+| a sweep (census passes, kills, pauses) | 3 s, plus the overrun below |
 | the guardian's reap of the supervisor after relay death | 1 s |
 | the guardian's exit after its `OUTCOME` | 1 s |
 | the relay's wait for a SIGKILLed guardian to exit | 1 s |
+| the relay's reap of the guardian | 1 s |
 
-What they cover:
+A sweep checks its deadline in two places: at the top of each pass, and before
+each process of a census (`sweep.rs`, `census.rs`). Each of these steps runs to
+completion once it has started:
 
-- A sweep checks its deadline before every census pass and before every
-  per-process step of a census (the process-table refresh), so it can overrun by
-  at most one in-flight system call.
-- A census that cannot complete is `ERROR`, never read as empty.
-- The bounds do not cover record I/O. It happens after the sweep, as a blocking
-  `write` plus `fsync` to a local disk, so a stalled disk delays the report but
-  not the sweep.
-- Scheduling delay of the relay or the guardian is also outside the bounds.
-- The run's own duration is unbounded, as before: the relay waits for the
+- **the process listing** at the start of each census: up to eight
+  `proc_listallpids` calls (`all_pids`);
+- **one process's census step:** `getsid`, `proc_pidinfo`, `task_name_for_pid`,
+  two `task_info` reads around a second `getsid`, `mach_port_deallocate`, and
+  sometimes a third `getsid` (`MacHost::census`, `verified_token`);
+- **the kill loop:** one `proc_signal_with_audittoken` per owned process still
+  alive, with no deadline check inside it;
+- **the 20 ms pause** after each pass, including a pass whose census failed.
+
+A sweep can therefore end later than its 3 s. The overrun is the step in
+progress at the deadline plus at most one 20 ms pause, or, when a census
+completes just before the deadline, that pass's kill loop and pause. A census
+cut at the deadline counts as failed, never as empty. Only an empty census
+ends a sweep `COMPLETE`; otherwise the result is `UNVERIFIABLE` or
+`INCOMPLETE` from the last complete census, or `ERROR` if none completed.
+
+The relay's reap of the guardian is bounded too. If a SIGKILLed guardian has
+not been reaped within 1 s, for example because it is still inside an
+uninterruptible call, the relay exits 1 without reaping it, saying so on stderr
+and in the record's `guardian-reaped` line (`"reaped": false`), and launchd
+inherits it. The reap still comes last: after the sweep and after the final
+record line, and nothing after it signals or censuses by number (`relay.rs`,
+`Relay::fallback`, end of `run_with`).
+
+Outside every bound:
+
+- **Record I/O.** Each record line is a blocking `write` plus `fsync` to a local
+  disk. It happens outside the sweep: after it in the guardian and in the
+  relay's fallback, and around the handshake in the relay. A stalled disk
+  delays the report and the exit, never a sweep's own deadline checks.
+- **Scheduling delay** of the relay or the guardian.
+- **Pipe writes.** Over a whole run, the guardian writes at most three frames
+  (`ISOLATED`, `STARTED`, then `OUTCOME` or `FAIL`), and the relay writes one
+  (`GO`). Each frame is at most 1025 bytes, well under a pipe's 16 KiB buffer,
+  so no write can block even if the reader never reads.
+- **The run's own duration**, unbounded as before: the relay waits for the
   guardian for as long as the supervisor runs.
 
 ## Spawning and signals
@@ -214,6 +255,16 @@ Stated, not closed here:
 - **Other debugserver detach routes** (#200): only the RSP-loss route is pinned
   (`--kill-on-error`).
 - **No caller plus an unwritable record:** R-4 above.
+- **Session continuity in the relay's fallback** (the design's R-9, as amended
+  by the T1 resolution): continuity of S is proved by the zombie anchor, not by
+  a registry of members. A process found in S without a readable audit token
+  is reported `UNVERIFIABLE` and never signalled, so it can outlive the run.
+- **Only `umbra run` is isolated.** `umbra resume` and `umbra providers` also
+  start provider processes, with no tracee, and stay in the caller's session.
+- **A tracee that leaves S** with its own `setsid()` is cleaned up through its
+  debugserver (`--kill-on-error`; platform README). That route was measured in
+  the #193 design readings; no test in this repository exercises it on the
+  shipped binary.
 
 ## Tests
 
@@ -225,13 +276,27 @@ Stated, not closed here:
     signalled;
   - spawn: no SIGPIPE inheritance, a new session, exact descriptor passing.
 - `tests/t1_kernel.rs`, on the real kernel:
-  - a zombie session leader's id cannot be taken by 200 new sessions;
   - with the anchor forced off, claimants are reported `UNVERIFIABLE` and not
-    signalled, and with it held they are killed;
-  - a stale token is refused.
+    signalled, and with it held they are killed (the frozen-set half of T1);
+  - a stale token is refused;
+  - a sanity check that a zombie leader stays a zombie while new sessions are
+    created. It attempts no pid reuse, so it does not show the anchor.
+- The anchor-held half of T1 (no process can obtain a zombie leader's pid or
+  session id) is not a CI test. It rests on the XNU source cited under
+  Cleanup and ownership, and on one recorded reading of the #193 arc that
+  wrapped the whole pid space past a held zombie.
 - `tests/relay_process.rs`: the real relay against a scripted guardian. It
-  covers the mirrored statuses, O5's exit 1 cases, every fail-closed transition
-  and the bounds. Each case also checks that no signal is sent after the reap.
+  covers:
+  - the mirrored statuses and O5's exit 1 cases;
+  - the fail-closed transitions that a scripted guardian can produce (EOF,
+    malformed, oversized and unknown frames, a stopped, silent, hung or
+    exited guardian, a wrong session claim);
+  - the bounds.
+
+  Every case that starts a guardian also checks that the single reap is the
+  record's last line, that it reaped, and that no signal follows it. Permanent
+  `waitid` and `poll` errors also fail closed in code, but they are not
+  injected.
 - `tests/guardian_process.rs`: the real guardian against a fake relay. It covers
   the sweep on supervisor exit and on relay death, a mid-run record failure in
   `OUTCOME`, and R-4's stderr line.

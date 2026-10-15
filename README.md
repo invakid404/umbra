@@ -13,7 +13,8 @@ product contract, namespace semantics, feasibility plan, and qualification work.
 Its illustrative `fsvirt-*` crate names are superseded by the `umbra-*` topology
 in the architecture document.
 
-M1 and M1.5 have delivered the pluggable workspace (18 crates since #193 added `umbra-isolation`), a working
+M1 and M1.5 have delivered the pluggable workspace (18 crates since #193 added
+`umbra-isolation`), a working
 [Darwin arm64 Rust tracer](crates/umbra-platform-macos/README.md), real local,
 NFS and tar storage backends, and an overlay with copy-up, read-through,
 whiteouts and logical symlinks. All thirteen Rust fixture cases are CAPTURED and

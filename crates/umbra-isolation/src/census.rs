@@ -101,8 +101,9 @@ fn is_zombie(pid: i32) -> Option<bool> {
 
 /// The macOS process table, with a pluggable anchor check.
 pub struct MacHost<A: FnMut() -> bool> {
-    /// The ownership proof (`t1-protocol.md` §2): the relay's checks its
-    /// unreaped guardian; the guardian's own sweep passes `|| true`.
+    /// The ownership proof (the zombie anchor; README, Cleanup and
+    /// ownership): the relay's checks its unreaped guardian; the guardian's
+    /// own sweep passes `|| true`.
     pub anchor: A,
 }
 

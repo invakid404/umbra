@@ -76,6 +76,7 @@ pub fn discover_debugserver() -> Option<std::path::PathBuf> {
                 .join("Library/PrivateFrameworks/LLDB.framework/Resources/debugserver")
         })
 }
+
 /// Whether this provider runs inside an isolated run's session: the
 /// `UMBRA_RUN_ISOLATED` marker set by `umbra-isolation`'s guardian parses to a
 /// session id above 1 that equals this process's own (#193).

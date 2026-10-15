@@ -1,6 +1,13 @@
-//! #193 T1 protocol, real-kernel interleavings (`t1-protocol.md` §5, T1-c).
+//! #193 T1 protocol on the real kernel: the frozen owned set with the anchor
+//! forced off, the audit-token kill, and a sanity check of a zombie leader.
 //! The scripted interleavings (T1-a, T1-b, scripted T1-c) are unit tests in
 //! `src/sweep.rs`.
+//!
+//! The anchor-held half of T1-c (no process can obtain a zombie leader's id)
+//! is not tested here: XNU allocates pids sequentially (`kern_fork.c:955-974`),
+//! so only a full wrap of the pid space could attempt the reuse. It rests on
+//! the XNU source (README, Cleanup and ownership) and on one recorded
+//! wraparound reading of the #193 arc, which is not part of CI.
 #![cfg(target_os = "macos")]
 
 use std::ffi::OsString;
@@ -35,12 +42,13 @@ fn reap(pid: i32) -> i32 {
     st
 }
 
-/// T1-c(i): while a session leader is an unreaped zombie, no process can be
-/// given its pid, so no new session can carry its id. 200 fresh sessions are
-/// created while the anchor is held; none gets pid or sid S, and S stays the
-/// zombie until the reap.
+/// Sanity check only; it attempts no pid reuse. A session leader is left an
+/// unreaped zombie while 200 new sessions are created; none gets its pid or
+/// session id, and it stays a zombie until the reap. Sequential allocation
+/// means 200 spawns cannot come back to its pid, so this cannot show the
+/// anchor-held property (module docs).
 #[test]
-fn t1_c_anchor_held_no_new_session_can_carry_its_id() {
+fn zombie_leader_sanity_check_attempts_no_reuse() {
     let env = environment(&[], &[]);
     let s = spawn(
         Path::new("/usr/bin/true"),
