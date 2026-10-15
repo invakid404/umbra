@@ -8,6 +8,8 @@
  *   c11-05-premise        kernel dup2 onto a live routed descriptor (apparatus)
  *   c11-09                one inherited routed descriptor across spawn
  *   c11-10                E8's pipe launch, as the same C API sequence
+ *   ofd-race              parent and spawned child write one inherited routed
+ *                         descriptor concurrently, unordered (#190)
  *   ledger-escape         apparatus: a SETSID child left running on purpose
  *
  * argv: <mode> <root> <absolute helper>. The helper is always a separate
@@ -416,6 +418,71 @@ static int escape(const char *root, const char *helper) {
     return 0;
 }
 
+/* ofd-race (#190): one inherited routed descriptor written by the parent and
+ * the spawned child at the same time, with nothing ordering the writes. Each
+ * record is ONE write(2), never retried, so a short or failed write is counted
+ * rather than completed. With one shared open file description every record
+ * lands once: 20 records, 120 bytes. With copied positions both writers start
+ * at 0 and overwrite each other. Ten per writer keeps the run inside the
+ * userspace store's replay budget (#196). The child reports ready before the
+ * parent says go, so both writers are live when writing starts. */
+#define RACE_RECORDS 10
+static int race(const char *root, const char *helper) {
+    note("phase=pre-spawn mode=ofd-race\n");
+    identity();
+    char path[4096];
+    path_in(path, sizeof path, root, "out.txt");
+    int output = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (output < 0) return 50;
+    int go[2], ready[2];
+    if (pipe(go) != 0 || pipe(ready) != 0) return 51;
+    if (fcntl(go[1], F_SETFD, FD_CLOEXEC) != 0 || fcntl(ready[0], F_SETFD, FD_CLOEXEC) != 0)
+        return 52;
+    note("descriptors output=%d go-read=%d go-write=%d ready-read=%d ready-write=%d\n", output,
+         go[0], go[1], ready[0], ready[1]);
+    flush(root, "records.pre");
+    char o[16], g[16], r[16];
+    snprintf(o, sizeof o, "%d", output);
+    snprintf(g, sizeof g, "%d", go[0]);
+    snprintf(r, sizeof r, "%d", ready[1]);
+    char *args[] = {(char *)helper, "ofd-race", (char *)root, o, g, r, NULL};
+    pid_t child = -1;
+    if (spawn(&child, helper, NULL, NULL, args)) {
+        flush(root, "records.done");
+        return 10;
+    }
+    close(go[0]);
+    close(ready[1]);
+    char token = 0;
+    ssize_t got;
+    do got = read(ready[0], &token, 1);
+    while (got < 0 && errno == EINTR);
+    note("ready result=%zd token=%c\n", got, got == 1 ? token : '?');
+    if (got != 1 || token != 'R') return 54;
+    if (transfer(go[1], "G", 1) != 1) return 53;
+    int short_writes = 0, first_errno = 0;
+    for (int i = 0; i < RACE_RECORDS; i++) {
+        char record[8];
+        snprintf(record, sizeof record, "P%04d\n", i);
+        errno = 0;
+        ssize_t n = write(output, record, 6);
+        if (n != 6) {
+            short_writes++;
+            if (!first_errno) first_errno = n < 0 ? errno : -1;
+        }
+    }
+    close(go[1]);
+    close(ready[0]);
+    note("write-parent records=%d short=%d first-errno=%d\n", RACE_RECORDS, short_writes,
+         first_errno);
+    int status = 0;
+    int failed = reap(child, &status);
+    note("close output=%d\n", close(output));
+    note("phase=done\n");
+    flush(root, "records.done");
+    return failed || short_writes ? 11 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
@@ -426,6 +493,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "c11-05-premise")) return premise(root);
     if (!strcmp(mode, "c11-09")) return offset(root, helper);
     if (!strcmp(mode, "c11-10")) return e8(root, helper);
+    if (!strcmp(mode, "ofd-race")) return race(root, helper);
     if (!strcmp(mode, "ledger-escape")) return escape(root, helper);
     return 2;
 }

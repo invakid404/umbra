@@ -7,8 +7,8 @@ integration tests bind a real overlay over real storage on tempdirs, and build a
 run's durable journal state directly before reopening it. The suites that spawn
 the real provider executables skip when those are absent, and fail instead under
 `UMBRA_INTEGRATION_REQUIRED` (`tests/reopen.rs:38-67`).
-This crate owns `src/lib.rs`, `src/run.rs`, `src/events.rs`, `src/base.rs`,
-`src/sandbox.rs`, `src/directory.rs` and its manifest. `directory.rs` holds the
+This crate owns `src/lib.rs`, `src/run.rs`, `src/events.rs`, `src/ofd.rs`,
+`src/base.rs`, `src/sandbox.rs`, `src/directory.rs` and its manifest. `directory.rs` holds the
 `DirectoryEncoder` the overlay requires for `FsOp::ReadDir`: the engine resolves
 the merged entries and this side turns them into the native records the tracee's
 `getattrlistbulk` reply expects, using the wire format in `umbra_platform::dirents`
@@ -130,7 +130,7 @@ boundary and scheduled at half the lease interval, with a 100 ms floor.
 Configurations are rejected when the provider timeout consumes half the lease
 or the floored interval leaves no timeout headroom before expiry.
 
-<!-- memoria:section id="event-loop" files="src/events.rs src/lib.rs" -->
+<!-- memoria:section id="event-loop" files="src/events.rs src/lib.rs src/ofd.rs" -->
 ## Event loop
 
 `Supervisor::launch_prepared` takes ownership of the stopped tree.
@@ -225,12 +225,48 @@ and its `unlink` sibling pin it on a plain `local` run with no routing at all.
 A backend that cannot skip the trap still fails closed, because rewriting return
 registers alone would execute the very call the namespace answered. The loop ends when every
 process has exited, not when the root
-does. Fork preserves every inherited descriptor; only Exec drops close-on-exec
-entries. A `posix_spawn` child arrives as the same Child event, not an Exec, so
-it keeps the parent's close-on-exec entries too (measured, #189). Like a forked
-child, it holds copies of the parent's offsets, not shared ones (#172, #190).
-An Exit for an uncaptured task poisons the run without reducing its live
+does. An Exit for an uncaptured task poisons the run without reducing its live
 process count, and duplicate exits do not count twice.
+
+**Routed descriptors across fork, spawn, exec and exit.** A routed descriptor's
+position lives in an *open file description* the supervisor owns (`src/ofd.rs`,
+runtime-only like `ProcessTree`, never serialized). Every routed `open` makes a
+new one; a fork child shares every description its parent's routed descriptors
+refer to, so a write by either moves the position the other sees (#172). A
+`posix_spawn` child arrives as a Child event rather than an Exec, so its
+close-on-exec routed descriptors are swept before it runs -- a write on such a
+number answers `EBADF` (#189) -- and the rest share their parent's
+descriptions (#190). Exec sweeps close-on-exec descriptors and keeps the
+others' descriptions. Exit closes every descriptor the process held: its
+`context.fds` is left empty and each description loses that reference; the
+last reference frees it. `ProcessContext::fds` keeps one `FdState` per
+descriptor as that process's *view*, and the supervisor writes every advance
+through to every view of the description, so `FdState` and its provider-wire
+encoding are unchanged. A `Clone` child is refused rather than treated as a
+fork: `CLONE_FILES` would share the descriptor *table*, which this does not
+model, and no backend emits it today.
+
+What this is not: the whole of a POSIX open file description. It shares the
+regular-file position. A routed directory's enumeration cursor is still kept
+per process by the overlay (#194); `O_CLOFORK` is not decoded, so a
+close-on-fork routed descriptor is still inherited (#195); and the dup family
+is not routed at all (`dup`, `dup2` and `fcntl` reach the kernel and answer
+`EBADF`).
+
+**The ordering contract a shared position depends on.** A routed operation reads
+the position at its entry and advances it at its exit, after the outcome is
+observed, so nothing may be dispatched between the two. The macOS backend
+guarantees that by construction: `next_event` polls only while its queue is
+empty and stops after the first stop that queued anything, a routed entry is
+the only event its stop queues, and `resume` of an emulated entry queues the
+matching exit synchronously -- so the exit is always the next event.
+`admit_during_routed_effect` does not rely on that silently: while a routed
+effect is pending, the only event it admits is the `SyscallExit` of the thread
+that owns it, and anything else stops the run as `InvalidState`. It matches
+thread identity only, so it checks that a correct backend's events arrive in
+the proved order; it is not a validator for a backend that misattributes them.
+A future backend must re-establish the same order, and until it does, a
+violation is refused, never tolerated.
 
 `Supervisor::new` and `with_namespace` take `Option<Box<dyn Agent>>`; a raw
 command run has no adapter. Construction still performs no I/O and starts in

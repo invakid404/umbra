@@ -4,23 +4,22 @@
 //
 // Every other fixture in this directory is one process. This one is two, and the
 // second one is the measurement: `fork` is where umbra's per-process logical
-// state is DUPLICATED rather than shared, and duplication is invisible to any
-// case that only ever asks one process a question. The three cases below each
-// ask what survives the split, and they disagree with each other on purpose --
-// one of them pins a divergence from POSIX and the other two pin invariants that
-// hold.
+// state is split, and what is DUPLICATED versus SHARED there is invisible to
+// any case that only ever asks one process a question. The three cases below
+// each ask what survives the split: one asks that a descriptor's position is
+// SHARED (it was copied until #172 was fixed), and the other two that state
+// which POSIX duplicates stays duplicated.
 //
 // MEASURED DISPOSITION AT THE PIN, and the reason each case exists. Measured
 // against live NFS-Ganesha through `umbra-storage-nfs-userspace`, not predicted:
 //
 //   umbra-userspace-lifecycle sharedofd <path>
-//       THE CASE THIS FIXTURE WAS WRITTEN FOR, and the one that PINS A
-//       DIVERGENCE rather than verifying an invariant. It is GREEN at this
-//       pin, and green is the correct disposition: it asserts the divergent
-//       bytes a routed run actually produces and excludes the POSIX ones. It
-//       turns RED the day shared-offset routing lands, and that is the day to
-//       DELETE it rather than to repair it. One descriptor, three writes, two
-//       processes:
+//       THE CASE THIS FIXTURE WAS WRITTEN FOR, and #172's regression case.
+//       It was written to PIN A DIVERGENCE -- green on the bytes a routed run
+//       produced, with the POSIX ones excluded -- and its harness case was to
+//       be deleted rather than repaired the day shared offsets landed. They
+//       have, and the harness now asserts the POSIX bytes instead. One
+//       descriptor, three writes, two processes:
 //
 //         (a) the parent opens `<path>` and writes `seed`
 //         (b) the parent forks
@@ -28,23 +27,15 @@
 //         (d) the parent reads the handshake byte, then reaps
 //         (e) the parent writes `parent` on the SAME descriptor
 //
-//       POSIX requires (a), (c) and (e) to share ONE Open File Description, so
-//       the three writes would append in sequence and `<path>` would hold
-//       `seedchildparent` -- 15 bytes. MEASURED: it holds `seedparent`, 10
-//       bytes. The parent's third write starts at the offset its FIRST write
-//       left, as though the child's write never happened, and overwrites the
-//       child's bytes in place.
-//
-//       THE MECHANISM IS IN PRODUCTION SOURCE AND IS NOT A ROUNDING ERROR.
-//       `ProcessContext::fds` is a `BTreeMap<TracedFd, FdState>` held BY VALUE
-//       (`umbra-core/src/lib.rs`), `FdState::offset` is a plain `u64` with no
-//       indirection of any kind, and `track_process` in
-//       `umbra-supervisor/src/events.rs` seeds a forked child by CLONING the
-//       parent's `ProcessContext` -- `.map(|p| p.context.clone())`. A clone of
-//       a `u64` is a copy, so the two processes leave with two offsets where
-//       POSIX gives them one. There is no Open File Description object anywhere
-//       in the shadow model to share, which is why this is a model-level gap
-//       and not a missing `&mut`.
+//       POSIX requires (a), (c) and (e) to share ONE open file description,
+//       so the three writes append in sequence and `<path>` holds
+//       `seedchildparent` -- 15 bytes. Before the fix it held `seedparent`,
+//       10 bytes: `track_process` seeded a forked child by CLONING the parent's
+//       `ProcessContext`, so the child got a copy of the offset, and the
+//       parent's third write started where its own first write ended and
+//       overwrote the child's bytes in place. The supervisor now keeps the
+//       position in an open file description that both descriptors share
+//       (`umbra-supervisor/src/ofd.rs`).
 //
 //       WHY THE THIRD WRITE IS THE WHOLE POINT. The shipped
 //       `a_routed_descriptor_survives_a_fork_and_the_child_s_write_reaches_the_store`
@@ -70,8 +61,9 @@
 //       load-bearing for ordering. It is here because it makes the ordering
 //       LOCAL to the write sequence instead of a consequence of process
 //       teardown: the parent blocks until the child says its routed write
-//       returned, so a measurement of `seedparent` cannot be explained by the
-//       child's write having been lost, dropped or still in flight. `pipe`(42)
+//       returned, so a short result (`seedparent`, as #172 measured) cannot
+//       be explained by the child's write having been lost, dropped or still
+//       in flight. `pipe`(42)
 //       is untraced and kernel-backed -- it is a kernel descriptor below the
 //       fence, so the interposer passes it straight to libc -- which is what
 //       lets it carry a signal that routing cannot colour.
@@ -234,7 +226,7 @@
 // different object in each: `<path>` still holding exactly `seed` when (b) or
 // (c) refused, `<path>.d/leaf.txt` absent when `cwdsplit`'s child refused, and
 // `<path>.exec` absent when `execve` returned. A refusal that mutated the store
-// anyway is a far larger defect than the disposition this fixture pins, and no
+// anyway is a far larger defect than anything the bytes of these cases show, and no
 // check that only read the exit status would catch it. Unreached at this pin,
 // and here for the fix.
 //

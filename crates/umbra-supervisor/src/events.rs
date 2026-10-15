@@ -63,6 +63,12 @@ fn error(kind: ErrorKind, operation: &str, context: impl Into<String>) -> UmbraE
     UmbraError::new(kind, operation, context)
 }
 
+/// An open-file-description bookkeeping fault is umbra's own inconsistency,
+/// never something the tracee asked for.
+fn ofd_error(context: &str) -> UmbraError {
+    error(ErrorKind::InvalidState, "supervisor.ofd", context)
+}
+
 /// Whether a descriptor is one umbra issued, rather than one the kernel did.
 ///
 /// **This is the Rust twin of `umbra_owns` in `umbra_interpose.c`, and it is
@@ -203,7 +209,51 @@ impl Supervisor {
         result
     }
 
+    /// Refuse any event that would interleave with a routed operation in flight.
+    ///
+    /// A routed operation resolves at its entry -- reading the position of the
+    /// open file description it names -- and applies its effect at its exit,
+    /// after the outcome has been observed (`apply_routed_effect`, the one place
+    /// a position moves). The entry-through-exit interval must be indivisible
+    /// with respect to every other dispatched event: one dispatched inside it
+    /// could advance, close, sweep or release the description the pending effect
+    /// was resolved against, and a second entry on the same description would
+    /// resolve at the position the first has not yet advanced.
+    ///
+    /// **The contract this relies on, and who must keep it.** The macOS backend
+    /// delivers that order, by construction rather than by luck: its
+    /// `next_event` polls only while its queue is empty and stops polling after
+    /// the first stop that queued anything; a routed entry is the only event its
+    /// stop queues; and `resume` of an emulated entry queues the matching exit
+    /// synchronously, without polling another process. So the exit is always the
+    /// next event. That is a property of that backend, not of the trait. A future
+    /// backend must re-establish it, and until it does this refuses -- the run
+    /// stops, fail-closed -- rather than tolerating an interleaving and sharing a
+    /// stale position.
+    ///
+    /// **What it checks.** While an effect is pending, exactly one may be, and
+    /// the only admitted event is a `SyscallExit` naming the *thread* that owns
+    /// it. It matches thread identity only: it is a check that a correct
+    /// backend's events arrive in the proved order, not a validator for a
+    /// backend that misattributes them.
+    fn admit_during_routed_effect(&self, event: &TraceEvent) -> Result<()> {
+        let Some(owner) = self.routed.keys().next() else {
+            return Ok(());
+        };
+        if self.routed.len() == 1
+            && matches!(event, TraceEvent::SyscallExit { thread, .. } if thread == owner)
+        {
+            return Ok(());
+        }
+        Err(error(
+            ErrorKind::InvalidState,
+            "supervisor.routing",
+            "an event arrived between a routed operation's entry and its exit",
+        ))
+    }
+
     fn dispatch(&mut self, event: TraceEvent) -> Result<()> {
+        self.admit_during_routed_effect(&event)?;
         match event {
             TraceEvent::ThreadStarted { task, thread } => {
                 self.track_thread(task, thread, StopReason::Launch)?;
@@ -216,11 +266,28 @@ impl Supervisor {
                 self.operations.remove(&thread);
                 Ok(())
             }
-            TraceEvent::Child { parent, child, .. } => {
+            TraceEvent::Child {
+                parent,
+                child,
+                kind,
+            } => {
+                // No backend constructs `Clone` today. A Linux `clone` with
+                // `CLONE_FILES` shares the descriptor *table*, not just its open
+                // file descriptions, so treating it as a fork would be wrong in a
+                // way nothing would notice. Refuse it until a backend emits it
+                // and it gets its own arm.
+                if kind == umbra_core::ChildKind::Clone {
+                    return Err(error(
+                        ErrorKind::UnsupportedCapability,
+                        "supervisor.child",
+                        "a clone child's descriptor sharing is not modelled",
+                    ));
+                }
                 // The child is stopped before its first instruction; count it
                 // exactly once even if ThreadStarted arrives for it separately.
                 if !self.state.processes.processes.contains_key(&child.0) {
                     self.track_process(child.0, Some(parent));
+                    self.inherit_descriptors(parent, child.0, kind)?;
                     self.live += 1;
                 }
                 if let Some(process) = self.state.processes.processes.get_mut(&parent) {
@@ -237,9 +304,14 @@ impl Supervisor {
                 process.context.exec_generation = exec_generation;
                 // Close-on-exec descriptors are gone and mappings are replaced;
                 // the backend re-arms interception before exposing this stop.
-                process.context.fds.retain(|_, fd| !fd.flags.close_on_exec);
+                let swept = Self::sweep_close_on_exec(&mut process.context);
                 process.mappings.clear();
                 process.breakpoints.clear();
+                // A swept descriptor's reference to its open file description
+                // goes with it; a description the parent still holds survives.
+                for fd in swept {
+                    self.ofds.release((task, fd)).map_err(ofd_error)?;
+                }
                 self.track_thread(task, thread, StopReason::Exec)?;
                 self.resume_thread(thread)
             }
@@ -264,6 +336,13 @@ impl Supervisor {
                     self.operations.remove(thread);
                 }
                 process.threads.clear();
+                // An exit closes every descriptor the process held, so its table
+                // is emptied and each one's open file description is released. A
+                // description another process still refers to survives. Nothing
+                // can be in flight here: `admit_during_routed_effect` refuses an
+                // exit that arrives while a routed effect is pending.
+                process.context.fds.clear();
+                self.ofds.release_task(task);
                 if Some(ProcessHandle(task)) == self.state.processes.root {
                     self.root_status = Some(status);
                 }
@@ -1215,22 +1294,49 @@ impl Supervisor {
                         "the observed open result is not the descriptor the namespace bound",
                     ));
                 }
+                let position = state.offset;
                 context.fds.insert(fd, state);
+                // Every routed open is a new open file description: two opens of
+                // one object never share a position.
+                self.ofds.open((task, fd), position).map_err(ofd_error)?;
             }
             RoutedEffect::Advanced(fd) => {
-                let state = context.fds.get_mut(&fd).ok_or_else(|| {
-                    error(
+                if !context.fds.contains_key(&fd) {
+                    return Err(error(
                         ErrorKind::InvalidState,
                         "supervisor.routing",
                         "a routed transfer succeeded on a descriptor that is no longer bound",
-                    )
-                })?;
+                    ));
+                }
                 // The observed count, not the requested one. A short transfer
                 // moves the position by what actually moved.
-                state.offset = state.offset.saturating_add(*return_value);
+                //
+                // The position belongs to the open file description, so it moves
+                // for every descriptor that refers to it -- a forked or spawned
+                // relative's view included (#172, #190).
+                let (position, views) = self
+                    .ofds
+                    .advance((task, fd), *return_value)
+                    .map_err(ofd_error)?;
+                for (holder, number) in views {
+                    let view = self
+                        .state
+                        .processes
+                        .processes
+                        .get_mut(&holder)
+                        .and_then(|process| process.context.fds.get_mut(&number))
+                        .ok_or_else(|| {
+                            ofd_error(
+                                "an open file description names a descriptor no process holds",
+                            )
+                        })?;
+                    view.offset = position;
+                }
             }
             RoutedEffect::Closed(fd) => {
-                context.fds.remove(&fd);
+                if context.fds.remove(&fd).is_some() {
+                    self.ofds.release((task, fd)).map_err(ofd_error)?;
+                }
             }
             // **One of the two things that move `ProcessContext::cwd` after
             // launch; `MovedCwd` below is the other.** This one was the first:
@@ -1428,13 +1534,61 @@ impl Supervisor {
         })
     }
 
+    /// What a new child keeps of its parent's routed descriptors, and the open
+    /// file descriptions it shares with it.
+    ///
+    /// `track_process` has already cloned the parent's table into the child.
+    /// A spawned image drops the close-on-exec entries first, because XNU's
+    /// `posix_spawn` execs the new image through `fdt_exec`, which closes them,
+    /// and this child arrives as a `Child` event rather than an `Exec` (#189).
+    /// Every entry left then refers to its parent's description, as XNU's
+    /// `fdt_fork` shares `fp_glob` (#172 for fork, #190 for spawn).
+    ///
+    /// `Vfork` is never constructed by a backend today; it is handled as fork,
+    /// which is vfork's descriptor semantics. `Clone` is refused before this is
+    /// reached (see the `Child` arm).
+    fn inherit_descriptors(
+        &mut self,
+        parent: TaskId,
+        child: TaskId,
+        kind: umbra_core::ChildKind,
+    ) -> Result<()> {
+        let context = &mut self.process_mut(child)?.context;
+        if kind == umbra_core::ChildKind::Spawn {
+            Self::sweep_close_on_exec(context);
+        }
+        let inherited = context.fds.keys().copied().collect::<Vec<_>>();
+        for fd in inherited {
+            self.ofds
+                .share((parent, fd), (child, fd))
+                .map_err(ofd_error)?;
+        }
+        Ok(())
+    }
+
+    /// Drop every close-on-exec descriptor from `context`, returning their
+    /// numbers so the caller can release what they referred to.
+    fn sweep_close_on_exec(context: &mut ProcessContext) -> Vec<umbra_core::TracedFd> {
+        let swept = context
+            .fds
+            .iter()
+            .filter(|(_, fd)| fd.flags.close_on_exec)
+            .map(|(number, _)| *number)
+            .collect::<Vec<_>>();
+        context.fds.retain(|_, fd| !fd.flags.close_on_exec);
+        swept
+    }
+
     fn track_process(&mut self, task: TaskId, parent: Option<TaskId>) {
         let budget = self.budget.clone();
         let inherited = parent
             .and_then(|p| self.state.processes.processes.get(&p))
             .map(|p| p.context.clone());
         let context = match inherited {
-            // Fork clones the parent's logical context and inherited descriptors.
+            // A child starts from a clone of the parent's logical context; the
+            // `Child` arm then drops what a spawn does not inherit and makes every
+            // remaining descriptor share its parent's open file description
+            // (`inherit_descriptors`), so the cloned offsets are views, not copies.
             Some(mut context) => {
                 context.task = task;
                 context.parent = parent;
@@ -2022,10 +2176,267 @@ mod tests {
         );
     }
 
+    /// Bind a routed descriptor exactly as an observed-successful routed open
+    /// does, open file description included.
+    fn open_routed(s: &mut Supervisor, owner: TaskId, fd: TracedFd, state: FdState) {
+        let thread = ThreadId(owner.0);
+        s.routed.insert(thread, RoutedEffect::Opened(fd, state));
+        s.apply_routed_effect(
+            owner,
+            thread,
+            &OperationOutcome::Success {
+                return_value: fd.0 as u64,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Apply one routed effect with the given outcome.
+    fn routed_outcome(
+        s: &mut Supervisor,
+        owner: TaskId,
+        effect: RoutedEffect,
+        outcome: OperationOutcome,
+    ) {
+        let thread = ThreadId(owner.0);
+        s.routed.insert(thread, effect);
+        s.apply_routed_effect(owner, thread, &outcome).unwrap();
+    }
+
+    fn transferred(s: &mut Supervisor, owner: TaskId, fd: i32, count: u64) {
+        routed_outcome(
+            s,
+            owner,
+            RoutedEffect::Advanced(TracedFd(fd)),
+            OperationOutcome::Success {
+                return_value: count,
+            },
+        );
+    }
+
+    fn view(s: &Supervisor, owner: TaskId, fd: i32) -> u64 {
+        s.process(owner).unwrap().context.fds[&TracedFd(fd)].offset
+    }
+
+    fn child_of(s: &mut Supervisor, parent: TaskId, child: TaskId, kind: ChildKind) {
+        s.handle_event(TraceEvent::Child {
+            parent,
+            child: ProcessHandle(child),
+            kind,
+        })
+        .unwrap();
+    }
+
+    fn routed_file(close_on_exec: bool) -> FdState {
+        FdState {
+            flags: OpenFlags {
+                write: true,
+                close_on_exec,
+                ..OpenFlags::default()
+            },
+            ..bound_fd(b"/out.txt")
+        }
+    }
+
+    /// A forked child and its parent share one position, in both directions
+    /// (#172).
+    #[test]
+    fn a_forked_child_and_its_parent_share_one_position() {
+        let mut s = supervisor();
+        open_routed(&mut s, task(1), TracedFd(8), routed_file(false));
+        transferred(&mut s, task(1), 8, 4);
+        child_of(&mut s, task(1), task(2), ChildKind::Fork);
+        transferred(&mut s, task(2), 8, 5);
+        assert_eq!((view(&s, task(1), 8), view(&s, task(2), 8)), (9, 9));
+        transferred(&mut s, task(1), 8, 6);
+        assert_eq!((view(&s, task(1), 8), view(&s, task(2), 8)), (15, 15));
+        assert_eq!(s.ofds.references((task(1), TracedFd(8))), Some(2));
+    }
+
+    /// A spawned child drops close-on-exec entries (#189) and shares the rest
+    /// (#190).
+    #[test]
+    fn a_spawned_child_drops_close_on_exec_and_shares_the_rest() {
+        let mut s = supervisor();
+        open_routed(&mut s, task(1), TracedFd(8), routed_file(true));
+        transferred(&mut s, task(1), 8, 11);
+        open_routed(&mut s, task(1), TracedFd(9), routed_file(false));
+        transferred(&mut s, task(1), 9, 2);
+        child_of(&mut s, task(1), task(2), ChildKind::Spawn);
+        assert_eq!(
+            s.process(task(2))
+                .unwrap()
+                .context
+                .fds
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![TracedFd(9)]
+        );
+        assert_eq!(s.ofds.references((task(1), TracedFd(8))), Some(1));
+        assert_eq!(s.ofds.references((task(1), TracedFd(9))), Some(2));
+        transferred(&mut s, task(2), 9, 3);
+        assert_eq!(view(&s, task(1), 9), 5);
+    }
+
+    /// The exec sweep releases the swept descriptor's reference and leaves the
+    /// parent's view where it was.
+    #[test]
+    fn an_exec_sweep_releases_the_child_s_reference() {
+        let mut s = supervisor();
+        open_routed(&mut s, task(1), TracedFd(8), routed_file(true));
+        transferred(&mut s, task(1), 8, 4);
+        child_of(&mut s, task(1), task(2), ChildKind::Fork);
+        assert_eq!(s.ofds.references((task(1), TracedFd(8))), Some(2));
+        s.handle_event(TraceEvent::Exec {
+            task: task(2),
+            thread: ThreadId(task(2).0),
+            exec_generation: 1,
+        })
+        .unwrap();
+        assert!(s.process(task(2)).unwrap().context.fds.is_empty());
+        assert_eq!(s.ofds.references((task(1), TracedFd(8))), Some(1));
+        assert_eq!(view(&s, task(1), 8), 4);
+    }
+
+    /// Exit releases every reference the process held; the last close frees
+    /// the description.
+    #[test]
+    fn exit_releases_and_the_last_close_frees_the_description() {
+        let mut s = supervisor();
+        open_routed(&mut s, task(1), TracedFd(8), routed_file(false));
+        child_of(&mut s, task(1), task(2), ChildKind::Fork);
+        s.handle_event(TraceEvent::Exit {
+            task: task(2),
+            status: ExitStatus::Code(0),
+        })
+        .unwrap();
+        assert!(s.process(task(2)).unwrap().context.fds.is_empty());
+        assert_eq!(s.ofds.references((task(1), TracedFd(8))), Some(1));
+        routed_outcome(
+            &mut s,
+            task(1),
+            RoutedEffect::Closed(TracedFd(8)),
+            OperationOutcome::Success { return_value: 0 },
+        );
+        assert!(s.ofds.is_empty());
+    }
+
+    /// A refused transfer moves no position and a refused close releases
+    /// nothing.
+    #[test]
+    fn a_refused_routed_operation_changes_no_open_file_description() {
+        let mut s = supervisor();
+        open_routed(&mut s, task(1), TracedFd(8), routed_file(false));
+        transferred(&mut s, task(1), 8, 4);
+        child_of(&mut s, task(1), task(2), ChildKind::Fork);
+        routed_outcome(
+            &mut s,
+            task(2),
+            RoutedEffect::Advanced(TracedFd(8)),
+            OperationOutcome::Failure(Errno(5)),
+        );
+        assert_eq!((view(&s, task(1), 8), view(&s, task(2), 8)), (4, 4));
+        routed_outcome(
+            &mut s,
+            task(1),
+            RoutedEffect::Closed(TracedFd(8)),
+            OperationOutcome::Failure(Errno(9)),
+        );
+        assert_eq!(s.ofds.references((task(1), TracedFd(8))), Some(2));
+        assert!(s
+            .process(task(1))
+            .unwrap()
+            .context
+            .fds
+            .contains_key(&TracedFd(8)));
+    }
+
+    /// Two opens of one object are two descriptions with two positions.
+    #[test]
+    fn independent_opens_of_one_object_do_not_share_a_position() {
+        let mut s = supervisor();
+        let file = routed_file(false);
+        open_routed(&mut s, task(1), TracedFd(8), file.clone());
+        open_routed(&mut s, task(1), TracedFd(9), file);
+        transferred(&mut s, task(1), 8, 7);
+        assert_eq!((view(&s, task(1), 8), view(&s, task(1), 9)), (7, 0));
+    }
+
+    /// While a routed effect is pending, only its own thread's exit is admitted;
+    /// with nothing pending, everything is.
+    #[test]
+    fn only_the_owning_exit_is_admitted_while_a_routed_effect_is_pending() {
+        let mut s = supervisor();
+        let others = |owner: ThreadId| {
+            vec![
+                TraceEvent::SyscallExit {
+                    task: task(2),
+                    thread: ThreadId(task(2).0),
+                    outcome: OperationOutcome::Success { return_value: 0 },
+                },
+                TraceEvent::SyscallEntry {
+                    task: task(2),
+                    thread: ThreadId(task(2).0),
+                    registers: RegisterSet::new(Architecture::Aarch64, vec![]).unwrap(),
+                },
+                TraceEvent::Child {
+                    parent: task(1),
+                    child: ProcessHandle(task(3)),
+                    kind: ChildKind::Fork,
+                },
+                TraceEvent::Exit {
+                    task: task(1),
+                    status: ExitStatus::Code(0),
+                },
+                TraceEvent::Exec {
+                    task: task(1),
+                    thread: owner,
+                    exec_generation: 1,
+                },
+            ]
+        };
+        let owner = ThreadId(task(1).0);
+        let own_exit = TraceEvent::SyscallExit {
+            task: task(1),
+            thread: owner,
+            outcome: OperationOutcome::Success { return_value: 6 },
+        };
+        // Nothing pending: everything is admitted.
+        for event in others(owner).iter().chain([&own_exit]) {
+            assert!(s.admit_during_routed_effect(event).is_ok(), "{event:?}");
+        }
+        s.routed.insert(owner, RoutedEffect::Advanced(TracedFd(8)));
+        assert!(s.admit_during_routed_effect(&own_exit).is_ok());
+        for event in others(owner) {
+            assert_eq!(
+                s.admit_during_routed_effect(&event).unwrap_err().kind,
+                ErrorKind::InvalidState,
+                "{event:?}"
+            );
+        }
+    }
+
+    /// A clone child is refused, not treated as a fork: `CLONE_FILES` would share
+    /// the table, not its descriptions.
+    #[test]
+    fn a_clone_child_is_refused_rather_than_treated_as_a_fork() {
+        let mut s = supervisor();
+        let refused = s.handle_event(TraceEvent::Child {
+            parent: task(1),
+            child: ProcessHandle(task(2)),
+            kind: ChildKind::Clone,
+        });
+        assert_eq!(refused.unwrap_err().kind, ErrorKind::UnsupportedCapability);
+        assert!(s.process(task(2)).is_err());
+    }
+
     #[test]
     fn fork_keeps_cloexec_dirfd_until_child_exec() {
         let mut s = supervisor();
-        s.process_mut(task(1)).unwrap().context.fds.insert(
+        open_routed(
+            &mut s,
+            task(1),
             TracedFd(3),
             FdState {
                 object: ObjectId(Uuid::new_v4()),

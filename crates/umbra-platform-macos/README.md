@@ -104,19 +104,18 @@ The M1 mechanisms named in the tracker spec are all present:
     measured, a child's write through its parent's routed descriptor continues
     the parent's write in the store
     (`a_routed_descriptor_survives_a_fork_and_the_child_s_write_reaches_the_store`).
-    **"Offsets included" means copied, not shared, and this item used to leave
-    that open.** `track_process` clones the parent's `ProcessContext` by value
-    and `FdState::offset` is a plain `u64` with no Open File Description
-    indirection anywhere, so the fork hands out two offsets where POSIX gives
-    one. Measured: with `seed` written before the fork, `child` written by the
-    child through the inherited descriptor and `parent` written by the parent
-    afterwards through the same descriptor, the object holds `seedparent` — the
-    parent's third write lands at the offset its own first write left. POSIX
-    requires `seedchildparent`. The claim above is unaffected; its converse is
-    what fails, and `a_forked_child_s_write_and_its_parent_s_next_write_do_not_share_one_offset`
-    pins the copy. That test is GREEN at this pin, because it asserts the
-    divergent bytes and excludes the POSIX ones; it turns RED when shared-OFD
-    routing lands, and is then the case to delete rather than to repair.
+    **"Offsets included" means shared, as POSIX requires: parent and child
+    refer to one open file description** (#172). With `seed` written before the
+    fork, `child` written by the child through the inherited descriptor and
+    `parent` written by the parent afterwards through the same descriptor, the
+    object holds `seedchildparent`. Until #172 was fixed the supervisor's
+    `track_process` cloned the parent's `ProcessContext` by value, so the fork
+    handed out two copies of the offset and the object held `seedparent`. The
+    position now lives in the supervisor's open-file-description table
+    (`umbra-supervisor/src/ofd.rs`), and
+    `a_forked_child_s_write_and_its_parent_s_next_write_share_one_offset`
+    asserts the POSIX bytes in place of the characterization that pinned the
+    copy.
 11. **Transient signals at a return gate**: a stop whose PC equals a pending
     return gate is a syscall return only when a breakpoint trap produced it, and
     a non-`SIGTRAP` stop there is either noise or the `SIGSYS` of an
