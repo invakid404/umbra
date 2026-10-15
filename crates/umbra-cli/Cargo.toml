@@ -54,6 +54,9 @@ umbra-platform = { path = "../umbra-platform" }
 umbra-storage = { path = "../umbra-storage" }
 umbra-journal = { path = "../umbra-journal" }
 umbra-overlay = { path = "../umbra-overlay" }
+# #193: run isolation in launchd's session. The one crate in this tree that
+# permits `unsafe`; this crate stays `#![forbid(unsafe_code)]`.
+umbra-isolation = { path = "../umbra-isolation" }
 
 [dev-dependencies]
 serde_json.workspace = true

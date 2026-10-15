@@ -168,6 +168,20 @@ The M1 mechanisms named in the tracker spec are all present:
     launchd's session the kernel's orphaned-process-group SIGHUP killed the
     supervisor. The bounds, the timeout warning and the residuals are under
     `Request::Terminate` above.
+
+14. **Kill, never detach, on a lost connection in an isolated run** (#193):
+    `Rsp` starts debugserver with `--reverse-connect <address>`, and adds
+    `--kill-on-error` only when `UMBRA_RUN_ISOLATED` parses to a session id
+    above 1 that equals this provider's own `getsid(0)`. `umbra-isolation`'s
+    guardian sets that marker for a run it moved out of launchd's session
+    ([umbra-isolation](../umbra-isolation/README.md)). There, a tracee that
+    calls `setsid()` leaves the run's session, so the guardian's session sweep
+    does not reach it; it must die with its debugserver. Measured, the shipped
+    debugserver (`lldb-2100.0.17.108`) already kills its inferior when the RSP
+    connection is lost, but the public source detaches by default; the flag
+    pins the measured behaviour. In every other session, terminals included,
+    the arguments are unchanged. Other detach routes inside debugserver are
+    unaudited (#200).
 <!-- /memoria:section -->
 
 <!-- memoria:section id="what-interception-does-not-cover" files="src/abi.rs src/interpose.rs src/native.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->
@@ -528,7 +542,10 @@ Termination tears each session down in order, children first (#186):
 
 Killing debugserver first lets the kernel hand a half-exited tracee to launchd
 without job-control accounting, which orphans the run's process group with
-SIGHUP when it shares launchd's session.
+SIGHUP when it shares launchd's session. Since #193, `umbra run` started in
+launchd's session moves the whole run into a session of its own
+([umbra-isolation](../umbra-isolation/README.md)), so such an exit can no longer
+be counted against a group in launchd's session.
 
 The `k` plus the barrier is bounded at 1.5 s per session, and each reap at
 250 ms (at most 2 s per session). On a timeout the provider writes
@@ -552,13 +569,19 @@ it. The tests pin these cases:
   end state the test cannot read (a lookup error other than ESRCH) fails the
   test. Measured, both are confirmed after the kill.
 
-Residual exposure is tracked in #193:
+These paths can still hand a tracee to launchd uncounted:
 - the timeout path above;
 - a tracer crash while its tracee is mid-exit (the crash itself, before
   `Terminate`);
 - provider death;
 - `SIGKILL` or other cancellation that bypasses `Terminate` and drop;
 - the attach/connect failure fallback, whose tracer kill is not shown safe.
+
+In launchd's session they no longer reach any group there: #193 runs the whole
+run in a session of its own, with session 1 regression tests for the first four
+(`umbra-cli`'s `tests/isolation.rs`). The platform itself is unchanged by that,
+and after an uncontrolled supervisor death it still keeps the run alive until
+its own deadline (#203).
 
 `tests/provider_ipc.rs` exercises the socketpair handshake and real `open-libc`
 capture through these requests, including stopped and running quiescence.

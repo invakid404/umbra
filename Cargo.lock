@@ -614,6 +614,7 @@ dependencies = [
  "tempfile",
  "umbra-agent",
  "umbra-core",
+ "umbra-isolation",
  "umbra-journal",
  "umbra-journal-file",
  "umbra-overlay",
@@ -634,6 +635,16 @@ dependencies = [
  "thiserror",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "umbra-isolation"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mach2",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -6,14 +6,14 @@ mutation reaches the selected shadow or is denied by an independent enforcement
 boundary. Strict remote persistence requires qualified remote storage; local
 storage is an explicit development or local-persistence mode.
 
-Start with [ARCHITECTURE.md](ARCHITECTURE.md) for the 17-crate workspace,
+Start with [ARCHITECTURE.md](ARCHITECTURE.md) for the 18-crate workspace,
 per-trait extension points, runtime provider design, dependency rules, and links
 to crate documentation. The [engineering handoff](docs/handoff.md) explains the
 product contract, namespace semantics, feasibility plan, and qualification work.
 Its illustrative `fsvirt-*` crate names are superseded by the `umbra-*` topology
 in the architecture document.
 
-M1 and M1.5 have delivered the 17-crate pluggable workspace, a working
+M1 and M1.5 have delivered the pluggable workspace (18 crates since #193 added `umbra-isolation`), a working
 [Darwin arm64 Rust tracer](crates/umbra-platform-macos/README.md), real local,
 NFS and tar storage backends, and an overlay with copy-up, read-through,
 whiteouts and logical symlinks. All thirteen Rust fixture cases are CAPTURED and
@@ -57,7 +57,11 @@ the reopen suites spawn them for real. The additional native qualification job
 runs the sandbox, IPC, tracer fixture, local-storage CLI matrix and reopen suites
 on an `umbra-integration` macOS ARM64 runner, with
 `UMBRA_INTEGRATION_REQUIRED=1` so a missing prerequisite fails there instead of
-skipping. It requires debugger permission. The
+skipping. It requires debugger permission. Its jobs run in launchd's session,
+where `umbra run` moves the run into a session of its own
+([umbra-isolation](crates/umbra-isolation/README.md), #193), so the same job also
+runs the isolation suites with `UMBRA_REQUIRE_SID1=1`: a session other than
+launchd's fails them instead of skipping. The
 NFS-backed CLI matrices (`nfs_fixture_matrix` and `nfs_utility_matrix`) are
 opted out of CI via `UMBRA_TEST_SKIP_NFS_MATRIX` because the current storage-nfs
 adapter needs a real NFSv4 kernel mount and macOS Sequoia/Tahoe blocks that path
@@ -116,6 +120,7 @@ Every crate and experiment keeps its own README; this index links all of them.
 - [crates/umbra-agent-codex](crates/umbra-agent-codex/README.md)
 - [crates/umbra-cli](crates/umbra-cli/README.md)
 - [crates/umbra-core](crates/umbra-core/README.md)
+- [crates/umbra-isolation](crates/umbra-isolation/README.md)
 - [crates/umbra-journal](crates/umbra-journal/README.md)
 - [crates/umbra-journal-file](crates/umbra-journal-file/README.md)
 - [crates/umbra-overlay](crates/umbra-overlay/README.md)

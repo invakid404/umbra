@@ -17,14 +17,14 @@ enforcement remain incomplete. Per-crate READMEs describe local implementation s
 
 The [engineering handoff](docs/handoff.md) supplies the product and filesystem
 semantics. Its illustrative `fsvirt-*` decomposition is superseded by the following
-16-member `umbra-*` workspace. [M0 Gate 2](docs/m0/gate-2.md) records the prototype
+18-member `umbra-*` workspace. [M0 Gate 2](docs/m0/gate-2.md) records the prototype
 evidence and outstanding qualification work.
 
 ## Crate topology
 
 Each package lives under `crates/` and owns its README. A backend's
 library and provider binary belong to the same package. Existing
-[fixtures](experiments/fixtures/README.md) are not an eighteenth workspace member.
+[fixtures](experiments/fixtures/README.md) are not a nineteenth workspace member.
 
 | Crate documentation | Responsibility | Allowed direct Umbra dependencies |
 | --- | --- | --- |
@@ -44,7 +44,8 @@ library and provider binary belong to the same package. Existing
 | [umbra-agent-codex](crates/umbra-agent-codex/README.md) | Codex plans, logical state roots and session metadata | `umbra-agent`, `umbra-core` |
 | [umbra-agent-claude](crates/umbra-agent-claude/README.md) | Claude plans, stable project identity and session metadata | `umbra-agent`, `umbra-core` |
 | [umbra-supervisor](crates/umbra-supervisor/README.md) | Ordered event loop, process tree, transactions, recovery and checkpoint/handoff assembly | `umbra-core` and the five trait crates |
-| [umbra-cli](crates/umbra-cli/README.md) | `run`, `stop`, `checkpoint`, `resume`, `inspect`; configuration and provider connections | `umbra-core`, `umbra-supervisor`, the five trait crates as needed |
+| [umbra-cli](crates/umbra-cli/README.md) | `run`, `stop`, `checkpoint`, `resume`, `inspect`; configuration and provider connections | `umbra-core`, `umbra-supervisor`, the five trait crates as needed, `umbra-isolation` |
+| [umbra-isolation](crates/umbra-isolation/README.md) | Moves a run started in launchd's session into a session of its own (relay, guardian, session sweep); inert everywhere else | None |
 
 The five trait crates are platform, storage, overlay, journal, and agent. Overlay
 also owns the backend-independent namespace engine: it receives `dyn Storage` and
@@ -75,7 +76,10 @@ requirement to import every allowed crate.
   closed backend enums are forbidden. Open provider IDs are configuration data;
   operation/event/error enums remain useful.
 - Native OS bindings and target-specific build settings stay in platform and
-  storage backends.
+  storage backends. The one exception is `umbra-isolation` (#193): the CLI must
+  move a run out of launchd's session before any supervisor or provider exists,
+  so that crate holds the process-session bindings and permits `unsafe`, and
+  `umbra-cli` keeps `#![forbid(unsafe_code)]`.
   Shared DTOs belong in core, and per-trait protocols/factories in the trait crate.
 - Conformance helpers belong with contracts and use fakes or injected trait objects.
   Tests obey the same dependency boundaries as production code except for the
@@ -154,6 +158,14 @@ provider-owned resources. Never serialize Rust trait objects, vtables, reference
 or OS pointers. Journal replay uses bounded pages/cursors on the wire. Platform ABI
 decoding requires a separate or multiplexed `TraceMemory` callback lane; keep the
 transport available and never hold a connection lock across a callback.
+
+Process topology: `umbra run` is the supervisor process, and it starts each
+provider as a child; the platform provider starts one debugserver per traced
+process. In launchd's session (session id 1: a launchd job or a CI runner) the
+launched `umbra` instead stays as a relay in its caller's process group and the
+whole run executes in a fresh session under a guardian, so no exit inside the run
+is counted against a group in launchd's session
+([umbra-isolation](crates/umbra-isolation/README.md), #193).
 
 Providers are trusted supervisor components outside the tracee sandbox. Their
 private sockets/pipes and descriptors must never be inherited by tracees. Timeouts,

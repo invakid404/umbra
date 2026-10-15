@@ -1,0 +1,22 @@
+[package]
+name = "umbra-isolation"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+# #193: run isolation for `umbra run` in launchd's session (SID 1). The only
+# crate in the CLI's dependency tree that permits `unsafe`; `umbra-cli` keeps
+# `#![forbid(unsafe_code)]` and calls the safe API in `src/lib.rs`. On every
+# other target the API is a no-op.
+
+[dependencies]
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "=0.2.189"
+mach2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
