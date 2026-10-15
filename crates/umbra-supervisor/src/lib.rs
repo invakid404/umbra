@@ -35,6 +35,8 @@ pub mod base;
 /// The production directory encoder and its per-syscall buffer binding.
 pub mod directory;
 mod events;
+/// Open file descriptions routed descriptors share across fork and spawn.
+mod ofd;
 /// Staged composition of one command run.
 pub mod run;
 /// Runtime rendering of the single Seatbelt policy template.
@@ -57,6 +59,12 @@ pub struct ProcessTree {
 /// Handoff §5.1: context owns task/parent identity, architecture, ABI, exec
 /// generation, logical cwd/root, and fd/directory-fd bindings. Fork clones logical
 /// context; exec retains applicable descriptors and replaces mappings/breakpoints.
+///
+/// A routed descriptor's `FdState` here is this process's *view*: its `offset` is
+/// the position of the open file description it shares with every process that
+/// inherited it across fork or spawn, kept current by the supervisor. A spawned
+/// child does not inherit close-on-exec routed descriptors. An exited process's
+/// `context.fds` is empty: exit closes every descriptor it held.
 #[derive(Clone, Debug)]
 pub struct ProcessState {
     /// Context associated with this value or operation.
@@ -339,6 +347,9 @@ pub struct Supervisor {
     /// an open that the exit reported failed, and a position advanced there would
     /// move for a write that did not happen.
     routed: BTreeMap<ThreadId, RoutedEffect>,
+    /// The open file descriptions routed descriptors refer to, shared by every
+    /// process that inherited one. Runtime-only, like [`ProcessTree`]; see `ofd`.
+    ofds: crate::ofd::OfdTable,
     /// The output buffer of the directory read currently stopped at its entry,
     /// shared with the `DirectoryEncoder` injected into the namespace.
     ///
@@ -448,6 +459,7 @@ impl Supervisor {
             renew_at: None,
             operations: BTreeMap::new(),
             routed: BTreeMap::new(),
+            ofds: Default::default(),
             directory: crate::directory::DirectoryBuffer::default(),
             poisoned: false,
         }

@@ -175,6 +175,34 @@ static int echo(const char *root, int inherited, int decoy) {
     return 0;
 }
 
+/* ofd-race (#190): report ready, wait for the parent's go byte, then write 10
+ * records on the inherited descriptor with nothing ordering them against the
+ * parent's. One write(2) per record, never retried. */
+static int race_write(const char *root, int output, int go, int ready) {
+    identity();
+    if (transfer(ready, "R", 1) != 1) return 23;
+    close(ready);
+    char token = 0;
+    ssize_t got;
+    do got = read(go, &token, 1);
+    while (got < 0 && errno == EINTR);
+    int short_writes = 0, first_errno = 0;
+    for (int i = 0; i < 10; i++) {
+        char record[8];
+        snprintf(record, sizeof record, "C%04d\n", i);
+        errno = 0;
+        ssize_t n = write(output, record, 6);
+        if (n != 6) {
+            short_writes++;
+            if (!first_errno) first_errno = n < 0 ? errno : -1;
+        }
+    }
+    note("go result=%zd token=%c\n", got, got == 1 ? token : '?');
+    note("write-child records=10 short=%d first-errno=%d\n", short_writes, first_errno);
+    flush(root);
+    return got == 1 && token == 'G' && !short_writes ? 0 : 22;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
     const char *mode = argv[1], *root = argv[2];
@@ -184,6 +212,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "c11-09") && argc == 5)
         return inherited_write(root, atoi(argv[3]), atoi(argv[4]));
     if (!strcmp(mode, "c11-10") && argc == 5) return echo(root, atoi(argv[3]), atoi(argv[4]));
+    if (!strcmp(mode, "ofd-race") && argc == 6)
+        return race_write(root, atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
     /* Apparatus: a child that never exits on its own. Only a signal ends it. */
     if (!strcmp(mode, "hold") && argc == 3)
         for (;;) pause();

@@ -7607,52 +7607,39 @@ fn stat_and_lstat_and_the_getdirentries_fallback_are_kernel_bare() {
     }
 }
 
-/// **A forked child's write and its parent's next write do NOT share one
-/// offset.** This case pins a divergence from POSIX rather than verifying an
-/// invariant, so it is GREEN at this pin and green is the correct disposition:
-/// it asserts the divergent bytes a routed run produces today and excludes the
-/// POSIX ones. It turns RED the day shared-offset routing lands, and on that
-/// day it is the case to DELETE -- which is what the assertion below says in
-/// the message it fails with, rather than something to recover here.
+/// **A forked child's write and its parent's next write share one offset**
+/// (#172's regression case).
 ///
 /// One descriptor, three writes, two processes: the parent writes `seed`, forks,
 /// the child writes `child` on the descriptor it inherited, and the parent --
 /// after the handshake and the reap -- writes `parent` on the SAME descriptor.
-/// POSIX gives those three writes one Open File Description, so they would
-/// append in sequence and the object would hold `seedchildparent`. MEASURED: it
-/// holds `seedparent`. The parent's third write starts at the offset its FIRST
-/// write left, as though the child's had never happened, and overwrites the
-/// child's bytes where they lie.
+/// POSIX gives those three writes one open file description, so they append in
+/// sequence and the object holds `seedchildparent` (15 bytes).
 ///
-/// **The mechanism is in production source, and it is a model gap rather than a
-/// missing borrow.** `ProcessContext::fds` is a `BTreeMap<TracedFd, FdState>`
-/// held by value; `FdState::offset` is a plain `u64` with no indirection; and
-/// `track_process` seeds a forked child by cloning the parent's
-/// `ProcessContext` outright. Cloning a `u64` copies it, so two processes leave
-/// the fork with two offsets where POSIX gives them one -- and there is no Open
-/// File Description object anywhere in the shadow model for them to share
-/// instead.
+/// **It replaces a characterization, as that case's own doc directed.** Until
+/// #172 was fixed this sequence produced `seedparent` (10 bytes): a forked
+/// child got a copy of every offset, because `track_process` cloned the
+/// parent's `ProcessContext` by value, so the parent's third write started
+/// where its own first write ended and overwrote the child's bytes. That case
+/// pinned the divergent bytes GREEN and said to delete it, not repair it, the
+/// day shared offsets landed. The supervisor now keeps one shared position per
+/// open file description, and this case asserts the POSIX bytes instead.
 ///
-/// **Why the third write is the whole case.** The shipped
+/// **Why the third write is the whole case.**
 /// `a_routed_descriptor_survives_a_fork_and_the_child_s_write_reaches_the_store`
-/// already measures the first two writes and asserts `seedchild`, and that
-/// sequence cannot tell the two models apart: a copied offset and a shared one
-/// both place the child's write at 4. Only a write issued by the PARENT after
-/// the child has advanced the position discriminates, and nothing before this
-/// case issued one.
+/// measures the first two writes and asserts `seedchild`, and that sequence
+/// cannot tell a copied offset from a shared one: both place the child's write
+/// at 4. Only a write issued by the PARENT after the child has advanced the
+/// position discriminates.
 ///
 /// **Why the verdict is bytes and never `lseek`.** `lseek`(199) is in neither
 /// `abi::TRACED_STUBS` nor the interposer's replaced set, so it is kernel-bare
-/// and answers `EBADF`(9) on a virtual descriptor -- #165's shape, the kernel's
-/// refusal rather than umbra's. A fixture that asked its own descriptor where it
-/// was would measure nothing, so the object is read back out of the export
-/// **through the client**, which shares no resolution code with the run.
-///
-/// The host control below pins that this exact sequence produces
-/// `seedchildparent` where the offset genuinely is shared, which is what makes
-/// the measurement here a divergence rather than a broken fixture.
+/// and answers `EBADF`(9) on a virtual descriptor -- #165's shape. The object is
+/// read back out of the export **through the client**, which shares no
+/// resolution code with the run. The host control below runs the identical
+/// binary unrouted and gets the same 15 bytes.
 #[test]
-fn a_forked_child_s_write_and_its_parent_s_next_write_do_not_share_one_offset() {
+fn a_forked_child_s_write_and_its_parent_s_next_write_share_one_offset() {
     if declared_probe().is_some() {
         eprintln!("SKIP: UMBRA_MUTATION_PROBE names a mutated binary");
         return;
@@ -7672,27 +7659,21 @@ fn a_forked_child_s_write_and_its_parent_s_next_write_do_not_share_one_offset() 
         run.stderr
     );
 
-    // The load-bearing assertion, and the one that inverts when the model is
-    // fixed. `seedparent` is 10 bytes; the POSIX answer is 15.
+    // The load-bearing assertion. `seedparent` (10 bytes) is the copied-offset
+    // answer #172 measured; `seedchildparent` (15) is POSIX.
     let stored = read_through_client(&host, port, &shadow_path(&run))
         .expect("the shadow object exists in the export");
     assert_eq!(
         stored.as_slice(),
-        b"seedparent",
-        "the parent's post-reap write did not land at the offset its own first \
-         write left. If this now reads `seedchildparent` the shadow model has \
-         grown a shared Open File Description and THIS CASE IS THE ONE TO \
-         DELETE -- the divergence it pins is fixed. Any other value is a third \
-         disposition nobody has measured: {:?}",
-        String::from_utf8_lossy(&stored)
-    );
-    // Stated separately so the failure message names the fix rather than a
-    // byte string, because this is the comparison a reader comes here for.
-    assert_ne!(
-        stored.as_slice(),
         b"seedchildparent",
-        "the three writes shared one offset, which is POSIX-correct and is not \
-         what this pin does"
+        "the parent's post-reap write did not land after the child's bytes on the \
+         descriptor they share ({}): {:?}",
+        if stored.as_slice() == b"seedparent" {
+            "#172 regressed: the fork copied the offset instead of sharing it"
+        } else {
+            "a disposition nobody has measured"
+        },
+        String::from_utf8_lossy(&stored)
     );
 
     // The run was routing when it did it. Without this, every assertion above
@@ -7931,13 +7912,11 @@ fn an_exec_with_a_rebuilt_environment_keeps_the_child_mediated() {
 ///
 /// This is what makes the three routed cases above say something about umbra,
 /// and for `sharedofd` it does more than that: it is the POSIX half of the
-/// comparison. The routed measurement is `seedparent`, and on its own that is
-/// equally consistent with a fixture whose child write never happens anywhere.
-/// Run unrouted against a plain tmpdir, where `fork` shares the Open File
-/// Description the way POSIX requires, the identical binary produces
-/// `seedchildparent` -- so the sequence demonstrably CAN append all three
-/// writes, and the routed 10 bytes are a divergence rather than a bug in the
-/// fixture.
+/// comparison. Run unrouted against a plain tmpdir, where `fork` shares the
+/// open file description the way POSIX requires, the identical binary produces
+/// `seedchildparent` -- the 15 bytes the routed case asserts. So a routed
+/// `seedparent` (what #172 measured before shared offsets) is umbra's
+/// divergence, not a fixture that cannot append all three writes.
 ///
 /// **It needs neither Ganesha nor umbra**, so it is not gated on the fixture
 /// endpoint and carries no `declared_probe` skip: a mutated `umbra` binary
@@ -8003,16 +7982,15 @@ fn the_lifecycle_fixture_reaches_its_completion_sentinels_on_the_host() {
         // The per-case contract, which is what the routed halves compare
         // against.
         match case {
-            // THE POSIX CONTROL. Where the Open File Description genuinely is
-            // shared, all three writes append and the object is 15 bytes. This
-            // is the single assertion that makes the routed `seedparent`
-            // measurement a statement about umbra's model.
+            // THE POSIX CONTROL. Where the open file description genuinely is
+            // shared, all three writes append and the object is 15 bytes --
+            // the bytes the routed `sharedofd` case asserts.
             "sharedofd" => assert_eq!(
                 std::fs::read(&destination).expect("the host object exists"),
                 b"seedchildparent",
                 "the three-write sequence does not append on a host where \
-                 `fork` shares the offset, so the routed 10-byte measurement \
-                 is not evidence of a divergence"
+                 `fork` shares the offset, so the routed 15-byte assertion \
+                 measures nothing about umbra's model"
             ),
             // Two anchors, two objects, one relative spelling -- unrouted,
             // where `chdir` plainly works.
@@ -9677,7 +9655,9 @@ fn slate_tokio_records(bytes: &[u8], case: &str) {
 //
 // Classification vocabulary (owner scope S1/S5): SUPPORTED-AND-CORRECT,
 // EXACT KNOWN REFUSAL, DEMONSTRATED SEMANTIC DEFECT (filed separately, open,
-// never fixed here), NOT QUALIFIED.
+// never fixed here, except where a later fix turned the case into its
+// regression test: C11-05, C11-09 and the race case, #189 and #190), NOT
+// QUALIFIED.
 // ---------------------------------------------------------------------------
 
 /// The exact diagnostic `native.rs` emits for trap 244 with a nonzero packed
@@ -10243,16 +10223,18 @@ fn slate_c11_05_collision_premise_apparatus() {
 
 /// C11-05, the null-pointer leaf only (owner scope S1; amendment A2's natural
 /// allocation, no dup2 to make the collision). Does a spawned child keep the
-/// parent's close-on-exec ROUTED descriptor? The spawn's Child event clones
-/// the parent's context (events.rs:219, :1431); only the Exec arm (:231)
-/// drops close-on-exec entries.
+/// parent's close-on-exec ROUTED descriptor? It must not: XNU's `posix_spawn`
+/// execs the new image through `fdt_exec`, which closes it.
 ///
-/// **MEASURED: it does keep it -- #189, a DEMONSTRATED SEMANTIC DEFECT, pinned
-/// GREEN here on today's wrong answer.** The child's `write(V)` returns 16 and
-/// the nonce lands in the parent's victim object, where natively V's number
-/// was closed at exec and the bytes went to whatever the kernel put there. The
-/// day spawn drops close-on-exec routed entries, `write(V)` answers EBADF, the
-/// victim stays `VICTIM-SEED`, and THIS CASE IS THE ONE TO INVERT.
+/// **#189's regression case, inverted from its characterization.** Until #189
+/// was fixed the spawn's `Child` event cloned the parent's whole descriptor
+/// table and only the `Exec` arm swept close-on-exec entries, so the child kept
+/// V: its `write(V)` returned 16 and the nonce landed in the parent's victim
+/// object (`VICTIM-SEEDCOLLISION-c11-05`, a DEMONSTRATED SEMANTIC DEFECT). Now
+/// the supervisor sweeps a spawned child's close-on-exec routed descriptors
+/// before it runs, so `write(V)` answers `EBADF` -- the overlay's answer for a
+/// number the process does not hold -- the victim stays `VICTIM-SEED`, and the
+/// non-close-on-exec control still reaches its object.
 ///
 /// No kernel/virtual collision arises routed, and none can: virtual numbers
 /// start at the RLIMIT_NOFILE fence the tracee is held to (4096), so the
@@ -10317,14 +10299,17 @@ fn slate_c11_05_cloexec_null_spawn() {
         },
     );
     assert!(
-        stale,
-        "the spawned child's write through the parent's close-on-exec routed \
-         descriptor no longer reaches the victim. If it now fails EBADF and the \
-         victim reads VICTIM-SEED, #189 is fixed and THIS CASE IS THE ONE TO \
-         INVERT; any other reading is a third disposition nobody has measured:\n\
+        !stale,
+        "#189 regressed: the spawned child's write through the parent's \
+         close-on-exec routed descriptor reached the victim:\n\
          victim={victim:?}\n{child}"
     );
-    assert_eq!(slate_field(&child, "write-victim", "errno"), "0");
+    assert!(
+        pruned,
+        "the spawned child's write on a close-on-exec routed number must fail \
+         EBADF and leave the victim VICTIM-SEED:\nvictim={victim:?}\n{child}"
+    );
+    assert_eq!(slate_field(&child, "write-victim", "errno"), "9");
     assert_eq!(slate_field(&child, "pipe ", "collision"), "0");
     assert_eq!(
         slate_field(&child, "pipe-read", "errno"),
@@ -10353,15 +10338,16 @@ fn slate_c11_05_cloexec_null_spawn() {
     slate_finish_cleanup();
 }
 
-/// C11-09: the spawn analogue of #172's fork offset finding. Native AABBBC.
+/// C11-09: the spawn analogue of #172's fork offset case. Native `AABBBC`.
 ///
-/// **MEASURED: routed `AACBB` -- #190, a DEMONSTRATED SEMANTIC DEFECT, pinned
-/// GREEN here on today's wrong answer.** The child's `BBB` starts at the
-/// offset it inherited (2), and the parent's `C`, after the acknowledgment and
-/// the reap, starts at the offset its own `AA` left (2), over the child's
-/// first byte: a copied offset, not a shared Open File Description. Every
-/// call reports success. The day a shared-offset model lands this reads
-/// `AABBBC` and THIS CASE IS THE ONE TO DELETE.
+/// **#190's regression case, flipped from its characterization.** The child
+/// writes `BBB` on the descriptor it inherited, and the parent's `C`, after the
+/// acknowledgment and the reap, must land after the child's bytes, because
+/// both descriptors refer to one open file description. Until #190 was fixed
+/// the spawn copied the offset, so the parent's `C` started where its own `AA`
+/// left it and overwrote the child's first byte: routed `AACBB`, every call
+/// reporting success (a DEMONSTRATED SEMANTIC DEFECT). The supervisor now keeps
+/// one shared position per open file description.
 #[test]
 fn slate_c11_09_inherited_offset() {
     let Some(spawn) = slate_spawn("c11-09") else {
@@ -10372,8 +10358,8 @@ fn slate_c11_09_inherited_offset() {
     assert_eq!(std::fs::read(root.join("out.txt")).unwrap(), b"AABBBC");
     let routed = slate_spawn_routed(&spawn, "c11-09", &["out.txt"]);
     let stored = routed.object("out.txt").map(<[u8]>::to_vec);
-    // C-N1: DEMONSTRATED SEMANTIC DEFECT is the measured #190 value from a
-    // completed run, not "anything but AABBBC" -- a stopped or signalled run's
+    // C-N1: DEMONSTRATED SEMANTIC DEFECT is the measured pre-fix #190 value from
+    // a completed run, not "anything but AABBBC" -- a stopped or signalled run's
     // partial file (e.g. `AA`) is NOT QUALIFIED and carries no derived detail.
     let label = match (slate_two_exit_completion(&routed), stored.as_deref()) {
         (true, Some(b"AABBBC")) => "SUPPORTED-AND-CORRECT",
@@ -10396,11 +10382,14 @@ fn slate_c11_09_inherited_offset() {
     );
     assert_eq!(
         stored.as_deref(),
-        Some(b"AACBB".as_slice()),
-        "the parent's post-reap write did not land at the offset its own first \
-         write left. If this now reads AABBBC, #190 is fixed and THIS CASE IS THE \
-         ONE TO DELETE; any other value is a third disposition nobody has \
-         measured: {:?}",
+        Some(b"AABBBC".as_slice()),
+        "the parent's post-reap write did not land after the child's bytes on \
+         the descriptor they share ({}): {:?}",
+        if stored.as_deref() == Some(b"AACBB".as_slice()) {
+            "#190 regressed: the offset was copied, not shared"
+        } else {
+            "a disposition nobody has measured"
+        },
         stored.as_deref().map(String::from_utf8_lossy)
     );
     let child = routed.text("records.child");
@@ -10419,6 +10408,132 @@ fn slate_c11_09_inherited_offset() {
     assert!(journal_records_completion(&routed.run));
     slate_spawn_finish(&spawn, &routed);
     slate_finish_cleanup();
+}
+
+/// A parent and its `posix_spawn`ed child write ONE inherited routed descriptor
+/// at the same time, 10 six-byte records each, one `write(2)` per record, with
+/// nothing ordering the writes against each other (#190).
+///
+/// Natively both descriptors refer to one open file description, so every
+/// record lands exactly once: 20 records, 120 bytes. Routed, that holds only if
+/// the position is shared *and* no second transfer can resolve against it
+/// while a first is in flight -- the supervisor refuses any event between a
+/// routed operation's entry and its exit. With copied positions (before #190)
+/// both writers start at 0 and each overwrites the other's slots: measured 60
+/// bytes, every chunk's index equal to its slot, on a completed run.
+///
+/// **What it does and does not show.** The byte assertion discriminates copied
+/// from shared positions on any schedule. Whether a given reading was actually
+/// contended is recorded, not asserted: the alternation count goes into the
+/// classification record, and only a count of 3 or more shows the two writers'
+/// transfers interleaved (2 is one writer after the other). It exercises the
+/// schedules the scheduler happens to produce, not every schedule. Ten records
+/// a writer, not more, because the userspace store's replay budget ends a run
+/// that issues many more small writes (#196).
+#[test]
+fn a_parent_and_its_spawned_child_writing_one_descriptor_at_once_lose_no_record() {
+    let Some(spawn) = slate_spawn("ofd-race") else {
+        return;
+    };
+    let expected = race_expected();
+    let (root, native) = slate_spawn_native(&spawn, "ofd-race");
+    assert!(native.status.success(), "native control: {}", native.status);
+    let native_out = std::fs::read(root.join("out.txt")).unwrap();
+    assert_eq!(native_out.len(), 120, "native control length");
+    assert_eq!(
+        race_records(&native_out).as_ref(),
+        Some(&expected),
+        "native control records"
+    );
+    let routed = slate_spawn_routed(&spawn, "ofd-race", &["out.txt"]);
+    let stored = routed.object("out.txt").map(<[u8]>::to_vec);
+    let intact = stored.as_deref().and_then(race_records).as_ref() == Some(&expected);
+    let completed = slate_two_exit_completion(&routed);
+    let label = match (completed, intact) {
+        (true, true) => "SUPPORTED-AND-CORRECT",
+        (true, false) => "DEMONSTRATED SEMANTIC DEFECT",
+        _ => "NOT QUALIFIED",
+    };
+    let alternations = stored.as_deref().map(race_alternations);
+    eprintln!(
+        "ofd-race: label={label} routed-length={:?} routed-alternations={alternations:?} \
+         native-alternations={}",
+        stored.as_ref().map(Vec::len),
+        race_alternations(&native_out)
+    );
+    slate_record(
+        &spawn,
+        label,
+        if label == "NOT QUALIFIED" {
+            slate_unqualified_detail(&routed)
+        } else {
+            serde_json::json!({
+                "routed_length": stored.as_ref().map(Vec::len),
+                "routed_alternations": alternations,
+                "native_alternations": race_alternations(&native_out),
+                "routed_out": stored.as_deref().map(String::from_utf8_lossy),
+                "records_done": routed.objects["records.done"].as_deref().map(String::from_utf8_lossy),
+                "records_child": routed.objects["records.child"].as_deref().map(String::from_utf8_lossy),
+                "run_id": routed.run.run_id.0.to_string(),
+            })
+        },
+    );
+    assert!(
+        completed,
+        "the routed race did not complete:\n{}",
+        routed.run.stderr
+    );
+    assert_eq!(
+        stored.as_ref().map(Vec::len),
+        Some(120),
+        "two writers on one shared open file description lost or overwrote records"
+    );
+    assert!(
+        intact,
+        "the 120 routed bytes are not the 20 records once each"
+    );
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+fn race_expected() -> Vec<Vec<u8>> {
+    let mut all = (0..10)
+        .flat_map(|i| [format!("P{i:04}\n"), format!("C{i:04}\n")])
+        .map(String::into_bytes)
+        .collect::<Vec<_>>();
+    all.sort();
+    all
+}
+
+/// Every 6-byte chunk a well-formed record, sorted; `None` for anything else.
+fn race_records(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if !bytes.len().is_multiple_of(6) {
+        return None;
+    }
+    let mut records = Vec::new();
+    for chunk in bytes.chunks(6) {
+        let well_formed = matches!(chunk[0], b'P' | b'C')
+            && chunk[1..5].iter().all(u8::is_ascii_digit)
+            && chunk[5] == b'\n';
+        if !well_formed {
+            return None;
+        }
+        records.push(chunk.to_vec());
+    }
+    records.sort();
+    Some(records)
+}
+
+/// Maximal runs of same-writer records in file order. With both writers'
+/// records present, 2 means one wrote all of its records before the other
+/// started; 3 or more means their transfers interleaved.
+fn race_alternations(bytes: &[u8]) -> usize {
+    let writers = bytes.chunks(6).map(|chunk| chunk[0]).collect::<Vec<_>>();
+    if writers.is_empty() {
+        return 0;
+    }
+    1 + writers.windows(2).filter(|pair| pair[0] != pair[1]).count()
 }
 
 /// C11-10: E8's full pipe launch in single-threaded C. Natively the whole

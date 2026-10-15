@@ -785,6 +785,11 @@ pub struct FdState {
     /// placed at all. Advanced only after an operation's outcome has been
     /// observed successful, like every other field of a [`ProcessContext`]:
     /// a refused write must not move the position POSIX says it did not move.
+    ///
+    /// The position belongs to the open file description, which processes that
+    /// inherited the descriptor across fork or spawn share; this field is this
+    /// process's view of it. The supervisor that owns the context keeps every
+    /// view of one description equal, so the value here is never a private copy.
     pub offset: u64,
 }
 
@@ -878,7 +883,8 @@ pub struct ProcessContext {
     pub cwd: BytePath,
     /// Root.
     pub root: BytePath,
-    /// Fds.
+    /// Routed descriptors this process holds, by number. Each entry is a view:
+    /// see [`FdState::offset`] for the position it shares with relatives.
     pub fds: BTreeMap<TracedFd, FdState>,
 }
 
