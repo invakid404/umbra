@@ -9655,7 +9655,9 @@ fn slate_tokio_records(bytes: &[u8], case: &str) {
 //
 // Classification vocabulary (owner scope S1/S5): SUPPORTED-AND-CORRECT,
 // EXACT KNOWN REFUSAL, DEMONSTRATED SEMANTIC DEFECT (filed separately, open,
-// never fixed here), NOT QUALIFIED.
+// never fixed here, except where a later fix turned the case into its
+// regression test: C11-05, C11-09 and the race case, #189 and #190), NOT
+// QUALIFIED.
 // ---------------------------------------------------------------------------
 
 /// The exact diagnostic `native.rs` emits for trap 244 with a nonzero packed

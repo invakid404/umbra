@@ -2431,6 +2431,39 @@ mod tests {
         assert!(s.process(task(2)).is_err());
     }
 
+    /// The guard is wired into `dispatch`, not only correct in isolation: an
+    /// event that arrives while a routed effect is pending is refused through
+    /// `handle_event`, poisons the run, and changes no descriptor state. The
+    /// test above pins the predicate; this one pins its use, so removing the
+    /// call from `dispatch` turns it red.
+    #[test]
+    fn an_event_between_a_routed_entry_and_its_exit_is_refused_by_dispatch() {
+        let mut s = supervisor();
+        open_routed(&mut s, task(1), TracedFd(8), routed_file(false));
+        s.routed
+            .insert(ThreadId(task(1).0), RoutedEffect::Advanced(TracedFd(8)));
+        let refused = s.handle_event(TraceEvent::Child {
+            parent: task(1),
+            child: ProcessHandle(task(2)),
+            kind: ChildKind::Fork,
+        });
+        assert_eq!(refused.unwrap_err().kind, ErrorKind::InvalidState);
+        assert!(s.poisoned);
+        assert!(s.process(task(2)).is_err());
+        let refused = s.handle_event(TraceEvent::Exit {
+            task: task(1),
+            status: ExitStatus::Code(0),
+        });
+        assert_eq!(refused.unwrap_err().kind, ErrorKind::InvalidState);
+        assert!(s
+            .process(task(1))
+            .unwrap()
+            .context
+            .fds
+            .contains_key(&TracedFd(8)));
+        assert_eq!(s.ofds.references((task(1), TracedFd(8))), Some(1));
+    }
+
     #[test]
     fn fork_keeps_cloexec_dirfd_until_child_exec() {
         let mut s = supervisor();
