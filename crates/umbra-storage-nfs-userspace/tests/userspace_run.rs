@@ -8187,6 +8187,119 @@ fn slate_group_members(group: u32, deadline: std::time::Instant) -> Result<Strin
     Err(error)
 }
 
+/// #193 (O8): in launchd's session a supervised `umbra run` stays in the launch
+/// group only as a relay; the run itself lives in the session S that the
+/// relay's guardian leads. `seen` is the latest instant when the guardian was
+/// observed as the living relay's child, so S was this run's session then: a process in
+/// S that started before `seen` was in S at `seen` (a session id changes only
+/// by `setsid`, which cannot yield S, and `setpgid` cannot cross sessions), and
+/// so belongs to this run (L39). Outside launchd's session there is no relay.
+#[derive(Clone, Copy, Debug)]
+struct SlateRunSession {
+    sid: i32,
+    seen: (u64, u64),
+}
+
+/// The run's session, found by parentage: the one `umbra` child of the
+/// launched `umbra` (the group's leader) that leads its own session. Native
+/// fixtures, whose own children may lead sessions, are never matched.
+fn slate_run_session(group: u32) -> Result<Option<SlateRunSession>, String> {
+    // SAFETY: getsid reads no memory of ours.
+    if unsafe { libc::getsid(0) } != 1 {
+        return Ok(None);
+    }
+    let Some(leader) = slate_process(group as i32)?.filter(|p| p.command == "umbra") else {
+        return Ok(None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let seen = (now.as_secs(), u64::from(now.subsec_micros()));
+    let guardian = slate_processes()?.into_iter().find(|p| {
+        p.ppid == leader.pid
+            && p.sid == p.pid
+            && p.pid > 1
+            && p.command == "umbra"
+            && p.start < seen
+    });
+    // The relay still alive afterwards: the guardian was its unreaped child.
+    let still = slate_process(leader.pid)?.is_some_and(|p| p.start == leader.start);
+    Ok(guardian
+        .filter(|_| still)
+        .map(|g| SlateRunSession { sid: g.pid, seen }))
+}
+
+/// The run's live session members as census lines in the group census's
+/// columns (`pid ppid pgid stat command`), recorded as a SESSION_READING: a
+/// witness separate from the group's READING rows and from the ledger's
+/// escaped-session census.
+fn slate_session_members(session: SlateRunSession) -> Result<String, String> {
+    use std::io::Write;
+    let lines = slate_processes()?
+        .into_iter()
+        .filter(|p| p.sid == session.sid && p.start < session.seen)
+        .map(|p| {
+            let stat = match p.status {
+                1 => "I",
+                2 => "R",
+                3 => "S",
+                4 => "T",
+                5 => "Z",
+                _ => "?",
+            };
+            format!("{} {} {} {stat} {}", p.pid, p.ppid, p.pgid, p.command)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    SLATE_CENSUS_EVIDENCE.with(|slot| {
+        if let Some(path) = slot.borrow().as_ref() {
+            let row = serde_json::json!({"kind": "SESSION_READING", "sid": session.sid,
+                "seen_sec": session.seen.0, "seen_usec": session.seen.1, "stdout": lines});
+            writeln!(
+                std::fs::OpenOptions::new().append(true).open(path).unwrap(),
+                "{row}"
+            )
+            .unwrap();
+        }
+    });
+    Ok(lines)
+}
+
+/// The group census plus, once the run's session is known, its members. The
+/// guardian is looked for again on every pass while the relay lives: each
+/// verified sighting of the same session advances `seen`, so members the run
+/// starts later (providers, debugservers, the tracee) are covered too. Once the
+/// relay is gone, the last sighting stands.
+fn slate_run_members(
+    group: u32,
+    deadline: std::time::Instant,
+    session: &mut Option<SlateRunSession>,
+) -> Result<String, String> {
+    let mut members = slate_group_members(group, deadline)?;
+    match (slate_run_session(group)?, *session) {
+        (Some(found), None) => {
+            slate_census_event("RUN_SESSION", &format!("{found:?}"));
+            *session = Some(found);
+        }
+        (Some(found), Some(known)) if found.sid == known.sid => *session = Some(found),
+        (Some(found), Some(known)) => {
+            // The relay spawns one guardian; a second is a different run.
+            return Err(format!("run session changed from {known:?} to {found:?}"));
+        }
+        (None, _) => {}
+    }
+    if let Some(found) = *session {
+        let in_session = slate_session_members(found)?;
+        if !in_session.is_empty() {
+            if !members.is_empty() {
+                members.push('\n');
+            }
+            members.push_str(&in_session);
+        }
+    }
+    Ok(members)
+}
+
 /// `slate_bounded` with a rank-11 watch: same 60-second deadline.
 fn slate_watched(command: &mut Command, evidence: &Path, watch: &SlateWatch) -> SlateOutput {
     let (output, timed_out) = slate_launch(
@@ -8298,13 +8411,14 @@ fn slate_launch(
     let mut census = String::new();
     let mut timed_out = false;
     let mut members = String::new();
+    let mut run_session = None;
     let status = loop {
         if Instant::now() >= deadline {
             timed_out = true;
             break None;
         }
         if deadline.saturating_duration_since(Instant::now()) > Duration::from_millis(400) {
-            match slate_group_members(group, deadline) {
+            match slate_run_members(group, deadline, &mut run_session) {
                 Ok(found) => {
                     census.push_str(&found);
                     census.push('\n');
@@ -8317,6 +8431,7 @@ fn slate_launch(
             }
         }
         if let Some(watch) = watch {
+            watched.session = run_session;
             let stdout = collected.lock().unwrap()[0].clone();
             if let Err(error) = watched.poll(watch, group, &stdout, &members) {
                 census_error = Some(error);
@@ -8371,7 +8486,7 @@ fn slate_launch(
                 Some("cleanup UNMEASURABLE: insufficient remaining census/reap budget".into());
             break;
         }
-        let members = match slate_group_members(group, grace) {
+        let members = match slate_run_members(group, grace, &mut run_session) {
             Ok(members) => members,
             Err(error) => {
                 cleanup_failure = Some(format!("cleanup UNMEASURABLE: {error}"));
@@ -8533,6 +8648,8 @@ struct SlateWatchState {
     launched: bool,
     members: std::collections::BTreeSet<i32>,
     snapshots: Vec<serde_json::Value>,
+    /// #193 (O8): the run's session in launchd's session, once found.
+    session: Option<SlateRunSession>,
 }
 impl SlateWatchState {
     fn poll(
@@ -8631,7 +8748,8 @@ impl SlateWatchState {
             Ok(all) => serde_json::json!({"phase": phase, "unix_us": at, "processes": all
                 .iter()
                 .filter(|p| p.pgid == group as i32 || owners.contains(&p.pid)
-                    || owners.contains(&p.pgid) || owners.contains(&p.sid))
+                    || owners.contains(&p.pgid) || owners.contains(&p.sid)
+                    || self.session.is_some_and(|s| p.sid == s.sid && p.start < s.seen))
                 .map(SlateProcess::json)
                 .collect::<Vec<_>>()}),
             Err(error) => serde_json::json!({"phase": phase, "unix_us": at,
@@ -9940,13 +10058,15 @@ fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
 /// while it still held the tracee, so the tracee went to launchd uncounted
 /// (xnu-12377.121.6 `kern_exit.c:2610-2614`). In launchd's own session that
 /// orphans the whole group with SIGHUP. Every census reading and every watched
-/// snapshot of the group is checked, not just the last one.
+/// snapshot of the group is checked, not just the last one. In launchd's
+/// session (#193) the run lives in its guardian's session, so the session's
+/// readings (SESSION_READING) are checked the same way.
 fn slate_assert_tracee_not_orphaned(evidence: &Path) {
     let census = std::fs::read_to_string(evidence.with_extension("census.jsonl")).unwrap();
     let mut readings = 0;
     for line in census.lines() {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
-        if row["kind"] != "READING" {
+        if row["kind"] != "READING" && row["kind"] != "SESSION_READING" {
             continue;
         }
         readings += 1;

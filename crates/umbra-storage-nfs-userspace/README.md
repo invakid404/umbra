@@ -809,6 +809,21 @@ a PPID-1 zombie: 21/21 runs in the arc's E1/E2, and 3 of 4 cases on the pre-fix
 readings of this assertion. In launchd's session that orphaned the group with
 SIGHUP.
 
+In launchd's session (CI's self-hosted runner) a supervised `umbra run` stays
+in the launched group only as a relay; the run itself is in the session its
+guardian leads ([umbra-isolation](../umbra-isolation/README.md), #193). So the
+launcher also censuses that session. It finds the guardian by parentage, the one
+`umbra` child of the launched `umbra` that leads its own session, and confirms
+that sighting on every census pass while the relay is alive. Every pass also
+records the session's live members that started before the latest sighting, as
+separate `SESSION_READING` rows. Those
+members count toward cleanup exactly as group members do, the watch's snapshots
+include them, and `slate_assert_tracee_not_orphaned` reads those rows too.
+Ownership is by session and start time, never by name (a process cannot enter an
+existing session, and a session id cannot be reused while the guardian is
+unreaped). Native fixtures, and any run outside launchd's session, are censused
+exactly as before.
+
 The rank-11 spawn cases and C10-10 launch their native and routed runs through
 `slate_launch` with a watch, which adds three things and changes none of the
 above:

@@ -45,4 +45,11 @@ impl Cli {
     pub fn execute(self) -> Result<()> {
         self.command.execute(&self.storage)
     }
+
+    /// Whether this invocation starts a supervised run (the only command that
+    /// starts a traced run, and so the only one #193's run isolation applies
+    /// to).
+    pub fn starts_a_supervised_run(&self) -> bool {
+        matches!(self.command, commands::Command::Run(_))
+    }
 }

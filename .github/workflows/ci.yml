@@ -264,6 +264,17 @@ jobs:
           cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures -- --nocapture --test-threads=1
           cargo test -p umbra-cli --test run_fixtures --test resume_cli -- --nocapture --test-threads=1
           cargo test -p umbra-supervisor --test reopen -- --nocapture --test-threads=1
+      # #193: this runner's jobs run in launchd's session (SID 1), the one place
+      # `umbra run` isolates itself. The isolation suite's SID-1 cases (P1-P4,
+      # topology, cleanup) skip in any other session, so here a different
+      # session is a failure, not a skip. The pty cases pin today's terminal
+      # semantics, which the isolation must leave alone.
+      - name: Qualify run isolation in launchd's session
+        env:
+          UMBRA_REQUIRE_SID1: "1"
+        run: |
+          cargo test -p umbra-isolation -- --nocapture --test-threads=1
+          cargo test -p umbra-cli --test isolation -- --nocapture --test-threads=1
 
   native-userspace-routing:
     name: Userspace-routed run over the live NFSv4 client

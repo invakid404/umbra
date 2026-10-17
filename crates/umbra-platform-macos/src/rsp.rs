@@ -152,7 +152,15 @@ impl Rsp {
         r.request("qSupported:xmlRegisters=arm64")?;
         r.ok("QThreadSuffixSupported")?;
         r.request("QListThreadsInStopReply")?;
-        r.request("QSetDetachOnError:0")?;
+        // Kill, never detach, the inferior if this connection is lost
+        // (#193). debugserver's default is detach (`g_detach_on_error =
+        // true`, debugserver.cpp:67); this packet clears it at runtime and the
+        // handler answers `OK` (RNBRemote.cpp:2429-2447, swift-6.3.2), and on a
+        // lost connection a running inferior is then killed rather than
+        // detached (debugserver.cpp:589-606). Sent before any `vAttach`, so it
+        // governs every inferior; any other reply fails `connect`, rather
+        // than leaving a traced process able to outlive its tracer.
+        r.ok("QSetDetachOnError:0")?;
         Ok(r)
     }
     pub fn send(&mut self, body: &str) -> Result<()> {

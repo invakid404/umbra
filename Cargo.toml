@@ -18,6 +18,7 @@ members = [
     "crates/umbra-agent-claude",
     "crates/umbra-supervisor",
     "crates/umbra-cli",
+    "crates/umbra-isolation",
 ]
 
 [workspace.package]

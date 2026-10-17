@@ -6,7 +6,10 @@ turns an explicit provider registry into a run request. This crate owns
 the CLI tests; `[dependencies]` names no implementation crate, so nothing links a
 backend into the binary. Exactly two reach the tests — `umbra-journal-file` and
 `umbra-storage-local`, for the reason recorded over `umbra-core` in
-`Cargo.toml`'s `[dev-dependencies]`.
+`Cargo.toml`'s `[dev-dependencies]`. `umbra-isolation` is a runtime dependency
+but not a backend: it moves a run started in launchd's session into a session of
+its own (#193, below), and it is the one umbra crate in the binary's tree that
+permits `unsafe`; this crate keeps `#![forbid(unsafe_code)]`.
 
 `run` and `resume` are operational. `stop`, `checkpoint` and `inspect` are stubs
 that report `not implemented` on stderr and exit 1; they no longer echo their
@@ -117,6 +120,30 @@ stdin and stdout on `/dev/null` and stderr inherited
 therefore reaches the caller and its stdout is discarded — `/bin/cat` under
 `umbra run` exits 0 and prints nothing. Plumbing the tracee's stdout through to
 the caller is unimplemented.
+
+### In launchd's session
+
+A launchd job, or a CI runner, starts `umbra` in launchd's session (session id
+1). There, `main` hands a `run` command to `umbra_isolation::isolate_run()`
+right after argument parsing, before any run is prepared (#193). The process
+the caller started stays as a relay. The run executes in a fresh session, as
+the same `umbra` binary with the same arguments, under a guardian process. The
+relay then exits with the supervisor's status, mirrored: the same exit code,
+or the same signal. All the rules above are unchanged.
+
+The relay exits 1 instead when:
+- the run's cleanup was not complete;
+- its isolation record could not be written;
+- the isolation itself failed, including a guardian it could not reap within
+  its 1 s bound.
+
+Each case has a line on stderr, and the record is under
+`~/Library/Logs/umbra/isolation/`. A run's tracee and providers can no longer
+be SIGHUPed through the caller's process group. In every other session, every
+terminal included, nothing changes. `main` also calls
+`umbra_isolation::guardian_entry()` first, before argument parsing; it returns
+at once unless this process was started as a guardian. See
+[umbra-isolation](../umbra-isolation/README.md).
 <!-- /memoria:section -->
 
 ## Compatibility changes
@@ -159,6 +186,33 @@ Required mode fails on missing inputs; ordinary developer tests may skip. Failed
 commands report their captured stderr before any required run-ID parse. Cleanup
 uses an emitted prepared ID even when that status assertion fails; without one,
 it touches no directory in the shared NFS mount.
+
+`tests/isolation.rs` pins #193 on the production path. It compiles
+`experiments/fixtures/umbra-isolation-fixture.c` and the signal observer at test
+time, and runs when `UMBRA_TEST_ISOLATION` or `UMBRA_INTEGRATION_REQUIRED` is set.
+Its cases fall into two groups:
+
+- **`sid1_` cases.** They need launchd's session: CI's self-hosted runner, or
+  locally a `launchctl submit` of the test binary. Anywhere else they skip,
+  unless `UMBRA_REQUIRE_SID1` is set, which makes another session a failure.
+  Each drives `umbra run` from a launcher in its own process group. That group
+  also holds a passive sentinel, and a sampler outside it records the group's
+  `pg_jobc`. The cases are:
+  - P1 to P4 (no SIGHUP to `umbra`, its providers or the caller's group, the
+    group never orphaned, nothing left);
+  - the run's topology, the mirrored status, the isolation record, and
+    debugserver's arguments left as on master (no `--kill-on-error`);
+  - a descendant refused entry to the caller's group, and the tracee's own
+    `setsid`;
+  - cleanup after a `killpg` of the caller's group, a SIGTERM to the relay, and
+    a same-named process outside the run left untouched.
+- **Other cases.** A fresh-session run (no relay) and ten pty cases run
+  in any session. The pty cases put `umbra run` under a mini job-control shell
+  and pin today's terminal semantics: Ctrl-C, Ctrl-Z then `fg`, Ctrl-\,
+  TOSTOP, SIGWINCH, hangup, exit status and terminal ioctls.
+
+The harness signals only pids it found by parentage from its own launcher, and
+cleans up by the run's session.
 
 The same file's `local_utility_matrix` and `nfs_utility_matrix` run standard
 utilities behind the same gating — `/usr/bin/touch`, `/bin/mkdir`, `/bin/rm`,
