@@ -15,7 +15,7 @@ publish = false
 serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-libc = "=0.2.189"
+libc = "=0.2.191"
 mach2.workspace = true
 
 [dev-dependencies]
