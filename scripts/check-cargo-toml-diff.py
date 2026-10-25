@@ -74,9 +74,12 @@ def diff_dep_table(base: dict[str, Any], head: dict[str, Any]) -> str | None:
             # Bare-string dep. Any diff is a version bump — accept.
             continue
         if isinstance(b, dict):
-            # Table dep. Only the `version` field may differ; every other
-            # field (features, default-features, optional, path, git, rev,
-            # branch, tag, package, …) must be byte-equal.
+            # Table dep. Only the `version` field's value may differ; every
+            # other field (features, default-features, optional, path, git,
+            # rev, branch, tag, package, …) must be byte-equal, and adding or
+            # removing `version` itself is not a bump.
+            if ("version" in b) != ("version" in h):
+                return f"dep {key!r}: version field added or removed"
             b_rest = {k: v for k, v in b.items() if k != "version"}
             h_rest = {k: v for k, v in h.items() if k != "version"}
             if b_rest != h_rest:
