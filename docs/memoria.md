@@ -49,12 +49,22 @@ installs the CLI with the first-party `setup-memoria` Action and runs
 label is exact on purpose: the Action supports **Ubuntu 24.04 only** and refuses
 every other platform and release, so `ubuntu-latest` would break the job the day
 GitHub moves that alias to a newer image. Pin the label, and change it in step
-with the Action. The gate therefore does not run on `macos-14` — but
+with the Action; `renovate.json` disables Renovate's runner-label update for both
+memoria workflows for that reason. The gate therefore does not run on `macos-14` — but
 `memoria check` hashes tracked files and reads the lock, so its result does not
 depend on the operating system. A pending-review diagnostic means
 a README has not been reviewed against its current inputs; it does not by itself
 prove the prose is wrong. Read the diagnostics for outdated imports or structural
 errors too. Passing the gate validates recorded reviews, not proof of prose accuracy.
+
+A Renovate PR whose only changes are dependency version literals or workflow
+action pins (`uses:`) is acknowledged by the auto-ack workflow, which commits the
+refreshed `memoria.lock` onto the Renovate branch. `scripts/check-cargo-toml-diff.py`
+decides what counts for a manifest: version literals in `[dependencies]`, `[dev-dependencies]`,
+`[build-dependencies]`, `[workspace.dependencies]`, or their
+`[target.<cfg>.…]` forms. Any other change needs a human ack. `renovate.json`
+lists the workflow's bot author in `gitIgnoredAuthors`, so that commit does not
+stop Renovate from rebasing the PR when it conflicts.
 
 That workflow pins the Action to a commit SHA and asks it for an exact CLI
 version. Memoria generates and owns the file, recording the expected text in

@@ -3,7 +3,9 @@
 
 Safe means: every difference between BASE and HEAD is a version literal
 inside one of the dependency tables (`[dependencies]`,
-`[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`).
+`[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]`,
+and the platform-specific `[target.<cfg>.dependencies]` family, where
+members such as `umbra-isolation` and `umbra-platform-macos` pin `libc`).
 Anything else — a dep added or removed, a `path`/`git`/`branch`/`rev` field
 flipped, a feature set changed, or any content outside those tables —
 exits non-zero and the caller MUST fall back to a human ack.
@@ -47,6 +49,14 @@ def dep_tables(data: dict[str, Any]) -> Iterator[tuple[tuple[str, ...], dict[str
             v = ws.get(name)
             if isinstance(v, dict):
                 yield ("workspace", name), v
+    target = data.get("target")
+    if isinstance(target, dict):
+        for spec, tv in target.items():
+            if isinstance(tv, dict):
+                for name in DEP_TABLES:
+                    v = tv.get(name)
+                    if isinstance(v, dict):
+                        yield ("target", spec, name), v
 
 
 def diff_dep_table(base: dict[str, Any], head: dict[str, Any]) -> str | None:
@@ -86,6 +96,20 @@ def strip_dep_tables(data: dict[str, Any]) -> dict[str, Any]:
             out[k] = {
                 ik: ("<stripped>" if ik in DEP_TABLES else iv)
                 for ik, iv in v.items()
+            }
+        elif k == "target" and isinstance(v, dict):
+            # A cfg spec added or removed, or a dep table added to one, still
+            # shows up here as a key difference and fails the comparison.
+            out[k] = {
+                spec: (
+                    {
+                        ik: ("<stripped>" if ik in DEP_TABLES else iv)
+                        for ik, iv in tv.items()
+                    }
+                    if isinstance(tv, dict)
+                    else tv
+                )
+                for spec, tv in v.items()
             }
         else:
             out[k] = v
