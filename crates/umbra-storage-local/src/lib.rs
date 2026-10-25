@@ -1113,7 +1113,7 @@ fn bounded_with(
     // concurrent callers can never collectively exceed it -- closing the
     // check-then-spawn gap a separate load would leave. Over budget fails closed.
     if live
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < budget).then_some(n + 1)
         })
         .is_err()
@@ -1245,7 +1245,7 @@ fn bounded_layout_with<T: Send + 'static>(
     // Reserve one of the `budget` live-thread slots atomically before spawning, so
     // concurrent callers can never collectively exceed it. Over budget fails closed.
     if live
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < budget).then_some(n + 1)
         })
         .is_err()
