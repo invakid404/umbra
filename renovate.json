@@ -3,5 +3,20 @@
   "extends": [
     "local>invakid404/renovate-config",
     "helpers:pinGitHubActionDigests"
+  ],
+  "gitIgnoredAuthors": [
+    "41898282+github-actions[bot]@users.noreply.github.com"
+  ],
+  "packageRules": [
+    {
+      "description": "The two memoria workflows pin ubuntu-24.04 because the setup-memoria Action supports only that release; move the label in step with the Action, not through Renovate.",
+      "matchDatasources": ["github-runners"],
+      "matchDepNames": ["ubuntu"],
+      "matchFileNames": [
+        ".github/workflows/memoria.yml",
+        ".github/workflows/memoria-auto-ack.yml"
+      ],
+      "enabled": false
+    }
   ]
 }
