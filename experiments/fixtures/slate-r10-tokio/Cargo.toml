@@ -11,4 +11,4 @@ name = "slate-r10-tokio"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "=1.48.0", default-features = false, features = ["rt-multi-thread", "sync", "fs"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "sync", "fs"] }
