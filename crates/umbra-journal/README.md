@@ -4,7 +4,7 @@ Pure synchronous journal contract, depending only on `umbra-core`. Shared reques
 record, recovery and checkpoint types are owned by core. This crate contains no
 journal-file I/O, CRC implementation, storage backend or lease service.
 Its `provider` module implements the journal server harness and IPC proxy.
-The workspace uses edition 2021 and pins Rust 1.98.1 for build validation.
+The workspace uses edition 2021 and pins Rust 1.99.1 for build validation.
 
 <!-- memoria:section id="public-contract" files="src/lib.rs" -->
 ## Public contract

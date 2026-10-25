@@ -538,7 +538,7 @@ mod c_boundary {
     //!
     //! # Why this and not ASan
     //!
-    //! The workspace pins stable 1.98.1 (`rust-toolchain.toml`), and
+    //! The workspace pins a stable toolchain (`rust-toolchain.toml`), and
     //! `-Zsanitizer=address` is nightly-only. The review permits "an equivalent
     //! deterministic harness with observable allocation/disposal ordering", which
     //! is what `args::live_arenas()` provides: the arena count is the observable,
