@@ -1,9 +1,11 @@
 //! #193: `umbra run` started in launchd's session (SID 1), on the production
 //! path, and today's terminal semantics, pinned.
 //!
-//! **Where these run.** Every case starts real runs, so it needs the qualified
-//! host (debugger permission). It runs when `UMBRA_INTEGRATION_REQUIRED` or
-//! `UMBRA_TEST_ISOLATION` is set and is skipped otherwise. The `sid1_` cases
+//! **Where these run.** The two `jobc_` cases check the sampler's selection and
+//! its log's line kinds without a run, and run anywhere. Every other case
+//! starts real runs, so it needs the qualified host (debugger permission). It
+//! runs when `UMBRA_INTEGRATION_REQUIRED` or `UMBRA_TEST_ISOLATION` is set and
+//! is skipped otherwise. The `sid1_` cases
 //! also need launchd's session: CI's self-hosted runner, or locally a
 //! `launchctl submit` of this test binary. Elsewhere they skip, unless
 //! `UMBRA_REQUIRE_SID1` is set, which makes a session other than 1 a failure.
@@ -13,7 +15,10 @@
 //! **Topology** (the #193 design harness, `dg-56gcxqyw`): a launcher, spawned
 //! into its own group G0 (`process_group(0)`, the harness shape), starts a
 //! passive sentinel and `umbra run` in G0. A sampler in its own session records
-//! G0's `pg_jobc`. Before #193, a SID-1 run's exits were counted against G0:
+//! G0's `pg_jobc` from each `KERN_PROC_PGRP` listing's entries whose own group
+//! is G0. An entry the kernel listed in G0 but filled after it left, such as
+//! the guardian just after its `setsid`, is logged as moved and never read
+//! (#209). Before #193, a SID-1 run's exits were counted against G0:
 //! P1/P2 SIGHUPed umbra, its providers and the sentinel; P3 drove G0's
 //! `pg_jobc` to 0; P4 (a stopped provider, then the supervisor killed) SIGHUPed
 //! the providers and the sentinel.
@@ -314,10 +319,8 @@ struct Outcome {
     survivors: Vec<Proc>,
     /// Signals the sentinel in the caller's group received: (signal, sender).
     sentinel: Vec<(i32, i32)>,
-    /// The smallest `pg_jobc` of the caller's group seen while sampling.
-    jobc_min: Option<i32>,
-    /// The sampler's change-log lines with `pg_jobc` at or below 0.
-    jobc_orphaned: Vec<String>,
+    /// The sampler's readings of the caller's group's `pg_jobc`.
+    jobc: Jobc,
     /// Observer deliveries: (image, signal, sender).
     delivered: Vec<(String, i32, i32)>,
     /// The isolation record of session S, if any.
@@ -587,15 +590,8 @@ impl Run {
             .lines()
             .filter_map(|l| Some((kv(l, "sig")?, kv(l, "si_pid")?)))
             .collect();
-        let jobc_log = std::fs::read_to_string(self.dir.join("jobc.log")).unwrap_or_default();
-        let jobc_min = jobc_log
-            .lines()
-            .find_map(|l| l.strip_prefix("MIN ").and_then(|v| v.parse().ok()));
-        let jobc_orphaned = jobc_log
-            .lines()
-            .filter(|l| kv(l, "jobc").is_some_and(|j| j <= 0))
-            .map(str::to_string)
-            .collect();
+        let jobc =
+            parse_jobc(&std::fs::read_to_string(self.dir.join("jobc.log")).unwrap_or_default());
         let delivered = observer_deliveries(&self.dir.join("signals"));
         let record = self
             .session
@@ -609,8 +605,7 @@ impl Run {
             status,
             survivors,
             sentinel,
-            jobc_min,
-            jobc_orphaned,
+            jobc,
             delivered,
             record,
             stderr,
@@ -734,6 +729,63 @@ fn isolation_record(sid: i32) -> Vec<Value> {
         .collect()
 }
 
+/// The `jobc` sampler's log (fixture `jobc` mode), by line kind.
+#[derive(Debug, Default)]
+struct Jobc {
+    /// `MIN`: the smallest reading of G0's own entries, or `None` when the run
+    /// produced no valid reading ("MIN none", or no `MIN` line at all).
+    min: Option<i32>,
+    /// Readings (`jobc=` lines) at or below 0.
+    orphaned: Vec<String>,
+    /// Instrument errors, never readings: a failed listing (`ERR`), or own
+    /// entries that disagree (`DISAGREE`).
+    errors: Vec<String>,
+    /// Entries listed for G0 but filled in another group (`moved`, #209): a
+    /// process that left G0 while the kernel built the listing. Never readings.
+    moved: Vec<String>,
+}
+
+fn parse_jobc(log: &str) -> Jobc {
+    let mut jobc = Jobc::default();
+    for line in log.lines() {
+        if let Some(min) = line.strip_prefix("MIN ") {
+            jobc.min = min.parse().ok();
+        }
+        match line.split_whitespace().nth(1) {
+            Some("ERR" | "DISAGREE") => jobc.errors.push(line.to_string()),
+            Some("moved") => jobc.moved.push(line.to_string()),
+            _ if kv(line, "jobc").is_some_and(|j| j <= 0) => jobc.orphaned.push(line.to_string()),
+            _ => {}
+        }
+    }
+    jobc
+}
+
+/// G0's `pg_jobc` never reached 0: every reading of its own entries was at
+/// least 1, there was at least one, and the sampler never failed.
+fn jobc_verdict(jobc: &Jobc) -> Result<(), String> {
+    if !jobc.min.is_some_and(|m| m >= 1) || !jobc.orphaned.is_empty() {
+        if jobc.min.is_none() && jobc.orphaned.is_empty() {
+            return Err(format!(
+                "the pg_jobc sampler produced no valid reading of the caller's group; \
+                 instrument errors: {:?}",
+                jobc.errors
+            ));
+        }
+        return Err(format!(
+            "pg_jobc of the caller's group reached {:?} (orphaned): {:?}",
+            jobc.min, jobc.orphaned
+        ));
+    }
+    if !jobc.errors.is_empty() {
+        return Err(format!(
+            "the pg_jobc sampler failed (an instrument error, not a reading): {:?}",
+            jobc.errors
+        ));
+    }
+    Ok(())
+}
+
 /// The caller's group was never touched by the run: the sentinel received
 /// nothing, and G0's `pg_jobc` never reached 0.
 fn assert_caller_group_untouched(o: &Outcome) {
@@ -742,12 +794,92 @@ fn assert_caller_group_untouched(o: &Outcome) {
         "the caller's group received signals {:?}",
         o.sentinel
     );
+    if let Err(e) = jobc_verdict(&o.jobc) {
+        panic!("{e}");
+    }
+}
+
+/// #209: every line kind of the sampler's log, read and judged with no run,
+/// so it runs anywhere (no launchd session, no debugger permission).
+#[test]
+fn jobc_log_line_kinds_are_judged_as_the_assertion_needs() {
+    let judge = |log: &str| jobc_verdict(&parse_jobc(log));
+    // A clean run: G0's own readings stay at 1.
+    assert_eq!(judge("START pid=9 pgid=4\n1 jobc=1 n=3\nMIN 1\n"), Ok(()));
+    // An own reading of 0 is the orphaning the assertion exists for.
+    let zero = judge("1 jobc=1 n=3\n2 jobc=0 n=3\nMIN 0\n").unwrap_err();
     assert!(
-        o.jobc_min.is_some_and(|m| m >= 1),
-        "pg_jobc of the caller's group reached {:?} (orphaned): {:?}",
-        o.jobc_min,
-        o.jobc_orphaned
+        zero.contains("reached Some(0)") && zero.contains("2 jobc=0 n=3"),
+        "{zero}"
     );
+    // A moved entry, the guardian filled in its new group with pg_jobc 0, is
+    // never a reading.
+    let moved = parse_jobc("1 jobc=1 n=3\n2 moved pid=9 pgid=9 ej=0 n=4\n3 jobc=1 n=3\nMIN 1\n");
+    assert_eq!(moved.moved.len(), 1);
+    assert!(moved.orphaned.is_empty() && moved.errors.is_empty());
+    assert_eq!(jobc_verdict(&moved), Ok(()));
+    // No own entry across the whole run: no valid reading, which fails.
+    let none = judge("1 none n=0\n2 moved pid=9 pgid=9 ej=0 n=1\n3 none n=1\nMIN none\n");
+    assert!(none.unwrap_err().contains("no valid reading"));
+    assert!(judge("START pid=9 pgid=4\n").is_err(), "no MIN line at all");
+    // Own entries that disagree fail loudly, as an instrument error.
+    let disagree = judge("1 jobc=1 n=3\n2 DISAGREE n=3 own=5:1,4:0\nMIN 1\n").unwrap_err();
+    assert!(
+        disagree.contains("instrument error") && disagree.contains("DISAGREE"),
+        "{disagree}"
+    );
+    // A failed listing is never a successful sample.
+    let err = judge("1 jobc=1 n=3\n2 ERR errno=12\nMIN 1\n").unwrap_err();
+    assert!(
+        err.contains("instrument error") && err.contains("ERR errno=12"),
+        "{err}"
+    );
+    assert!(judge("1 ERR errno=12\nMIN none\n").is_err());
+}
+
+/// #209: the fixture's selection of G0's own entries, on canned listings
+/// (`jobc-select`, the same code as the sampler's). Needs only clang.
+#[test]
+fn jobc_selection_reads_only_the_groups_own_entries() {
+    let select = |listing: &str| {
+        let mut child = Command::new(fixture())
+            .args(["jobc-select", "4"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(listing.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        parse_jobc(&String::from_utf8_lossy(&out.stdout))
+    };
+    // kp[0] is the guardian, filled in its new group 9 with pg_jobc 0 (the
+    // #209 listing): it is moved, and G0's own entries read 1.
+    let guardian = select("9 9 0\n5 4 1\n4 4 1\n");
+    assert_eq!(guardian.moved.len(), 1, "{guardian:?}");
+    assert!(
+        guardian.orphaned.is_empty() && guardian.errors.is_empty(),
+        "{guardian:?}"
+    );
+    // G0's own entries at 0: a reading of 0.
+    let orphaned = select("5 4 0\n4 4 0\n");
+    assert_eq!(orphaned.orphaned.len(), 1, "{orphaned:?}");
+    // Only moved entries: no reading.
+    let none = select("9 9 0\n");
+    assert!(
+        none.orphaned.is_empty() && none.moved.len() == 1,
+        "{none:?}"
+    );
+    // Own entries that disagree: an instrument error, not a reading.
+    let disagree = select("5 4 1\n4 4 0\n");
+    assert_eq!(disagree.errors.len(), 1, "{disagree:?}");
+    assert!(disagree.orphaned.is_empty(), "{disagree:?}");
 }
 
 fn assert_nothing_survives(o: &Outcome) {

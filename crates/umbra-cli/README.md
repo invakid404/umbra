@@ -190,14 +190,22 @@ it touches no directory in the shared NFS mount.
 `tests/isolation.rs` pins #193 on the production path. It compiles
 `experiments/fixtures/umbra-isolation-fixture.c` and the signal observer at test
 time, and runs when `UMBRA_TEST_ISOLATION` or `UMBRA_INTEGRATION_REQUIRED` is set.
-Its cases fall into two groups:
+Two `jobc_` cases run anywhere: they check, without a run, how the sampler below
+selects its readings and how the harness judges its log. The other cases fall
+into two groups:
 
 - **`sid1_` cases.** They need launchd's session: CI's self-hosted runner, or
   locally a `launchctl submit` of the test binary. Anywhere else they skip,
   unless `UMBRA_REQUIRE_SID1` is set, which makes another session a failure.
   Each drives `umbra run` from a launcher in its own process group. That group
   also holds a passive sentinel, and a sampler outside it records the group's
-  `pg_jobc`. The cases are:
+  `pg_jobc`. It reads only the entries of each listing whose own group is that
+  group: the kernel can list a process in the group and fill its entry after it
+  has left, as the relay's guardian does around its `setsid`, and such an entry
+  is logged as moved, never read
+  ([#209](https://github.com/invakid404/umbra/issues/209)). A run with no valid
+  reading, a failed listing, or own entries that disagree fail the case. The
+  cases are:
   - P1 to P4 (no SIGHUP to `umbra`, its providers or the caller's group, the
     group never orphaned, nothing left);
   - the run's topology, the mirrored status, the isolation record, and
@@ -214,10 +222,10 @@ Its cases fall into two groups:
 The harness signals only pids it found by parentage from its own launcher, and
 cleans up by the run's session.
 
-The same file's `local_utility_matrix` and `nfs_utility_matrix` run standard
-utilities behind the same gating — `/usr/bin/touch`, `/bin/mkdir`, `/bin/rm`,
-`/bin/cat` and `/bin/ls` — one `umbra run` per invocation, each against its own
-freshly seeded workspace.
+`tests/run_fixtures.rs`'s `local_utility_matrix` and `nfs_utility_matrix` run
+standard utilities behind the same gating as its fixture cases — `/usr/bin/touch`,
+`/bin/mkdir`, `/bin/rm`, `/bin/cat` and `/bin/ls` — one `umbra run` per
+invocation, each against its own freshly seeded workspace.
 
 `/bin/mkdir` **now succeeds and is captured as a directory in the shadow**
 ([#114](https://github.com/invakid404/umbra/issues/114)). Bare `mkdir(2)` joined

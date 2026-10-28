@@ -27,9 +27,18 @@
  *                 HUP CONT INT TERM QUIT TSTP TTIN TTOU WINCH it receives
  *                 ("sig=<n> si_pid=<p>" lines), never stops itself.
  *   jobc <pgid> <out> <stop-file> <max-s>
- *                 setsid(), then sample pg_jobc of <pgid> (sysctl
- *                 KERN_PROC_PGRP, kp_eproc.e_jobc) every 500 us; write a line
- *                 per change and "MIN <n>" (or "MIN none") at the end.
+ *                 setsid(), then sample pg_jobc of <pgid> every 500 us from a
+ *                 sysctl KERN_PROC_PGRP listing, reading only the entries
+ *                 whose own e_pgid is <pgid> (see jobc_record; #209). Lines:
+ *                 "jobc=<n> n=<n>" (a reading, on change), "moved ..." (an
+ *                 entry filled in another group, never a reading), "none n=<n>"
+ *                 (no own entry, on change), "DISAGREE ..." and "ERR ..."
+ *                 (instrument errors); "MIN <n>" over the readings at the
+ *                 end, or "MIN none" when the run produced no valid reading.
+ *   jobc-select <pgid>
+ *                 one listing from stdin ("pid pgid jobc" per line, kp[0]
+ *                 first), classified exactly as the jobc mode classifies a
+ *                 sysctl listing; stdout gets the lines jobc would write.
  *   launch <dir> <fresh|group> -- <argv...>
  *                 fresh: setsid() first. Fork the sentinel, then the program
  *                 (stdin and stdout /dev/null, stderr inherited); LAUNCH line;
@@ -300,21 +309,70 @@ static int sentinel(char **argv) {
 
 /* -------------------------------------------------------------------- jobc */
 
-static int jobc_of(int pgid, int *jobc) {
+/* G0's listing: every process whose group was <pgid> when the kernel filtered
+ * it. Returns the entry count (into *kp, which the caller frees), or -1 with
+ * errno set. */
+static int jobc_listing(int pgid, struct kinfo_proc **kp) {
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PGRP, pgid};
     size_t len = 0;
+    *kp = NULL;
     if (sysctl(mib, 4, NULL, &len, NULL, 0) < 0) return -1;
     len += 8 * sizeof(struct kinfo_proc);
-    struct kinfo_proc *kp = malloc(len);
-    if (!kp) return -1;
-    if (sysctl(mib, 4, kp, &len, NULL, 0) < 0) {
-        free(kp);
-        return -1;
+    *kp = malloc(len);
+    if (!*kp) return -1;
+    if (sysctl(mib, 4, *kp, &len, NULL, 0) < 0) return -1;
+    return (int)(len / sizeof(struct kinfo_proc));
+}
+
+struct jobc_state {
+    int last, lastn, min, none;
+};
+
+/* Classify one listing and write its lines (#209). xnu admits an entry on its
+ * group at filter time but fills e_pgid and e_jobc later, from the group it is
+ * in then (xnu-12377.121.6 kern_sysctl.c:736-743, :1083-1087; kern_proc.c
+ * :4264-4277). A process spawned with POSIX_SPAWN_SETSID is listed in G0 until
+ * its setsid, so it can be filled with its new group's pg_jobc of 0: listed
+ * first as the newest process, it was the old reading (kp[0].e_jobc). Only
+ * entries whose own e_pgid is <pgid> are read; any other entry is logged as
+ * "moved" and never read. The own entries share G0's pgrp, but the listing is
+ * not atomic: entries that disagree fail conservatively ("DISAGREE"), never
+ * a reading. */
+static void jobc_record(FILE *out, long long t, int pgid, const struct kinfo_proc *kp, int n,
+                        struct jobc_state *st) {
+    int own = 0, jobc = 0, disagree = 0;
+    for (int i = 0; i < n; i++) {
+        int g = kp[i].kp_eproc.e_pgid, j = kp[i].kp_eproc.e_jobc;
+        if (g != pgid) {
+            fprintf(out, "%lld moved pid=%d pgid=%d ej=%d n=%d\n", t, kp[i].kp_proc.p_pid, g, j, n);
+            continue;
+        }
+        if (own && j != jobc) disagree = 1;
+        if (!own) jobc = j;
+        own++;
     }
-    size_t n = len / sizeof(struct kinfo_proc);
-    if (n > 0) *jobc = kp[0].kp_eproc.e_jobc;
-    free(kp);
-    return (int)n;
+    if (disagree) {
+        fprintf(out, "%lld DISAGREE n=%d own=", t, n);
+        for (int i = 0, first = 1; i < n; i++)
+            if (kp[i].kp_eproc.e_pgid == pgid) {
+                fprintf(out, "%s%d:%d", first ? "" : ",", kp[i].kp_proc.p_pid, kp[i].kp_eproc.e_jobc);
+                first = 0;
+            }
+        fprintf(out, "\n");
+        st->lastn = -1;
+        return;
+    }
+    if (!own) {
+        if (!st->none || n != st->lastn) fprintf(out, "%lld none n=%d\n", t, n);
+        st->none = 1;
+        st->lastn = n;
+        return;
+    }
+    if (jobc < st->min) st->min = jobc;
+    if (st->none || jobc != st->last || n != st->lastn) fprintf(out, "%lld jobc=%d n=%d\n", t, jobc, n);
+    st->none = 0;
+    st->last = jobc;
+    st->lastn = n;
 }
 
 static int jobc_main(char **argv) {
@@ -325,26 +383,43 @@ static int jobc_main(char **argv) {
     if (!out) return 3;
     setvbuf(out, NULL, _IOLBF, 0);
     long long end = now_us() + atoll(argv[5]) * 1000000LL;
-    int last = -1000, min = 1 << 30, lastn = -1;
+    struct jobc_state st = {-1000, -1, 1 << 30, 0};
     fprintf(out, "START pid=%d pgid=%d\n", getpid(), pgid);
     while (now_us() < end && !exists(argv[4])) {
-        int j = -1;
-        int n = jobc_of(pgid, &j);
-        if (n > 0) {
-            if (j < min) min = j;
-            if (j != last || n != lastn) fprintf(out, "%lld jobc=%d n=%d\n", now_us(), j, n);
-            last = j;
-            lastn = n;
-        } else if (n != lastn) {
-            fprintf(out, "%lld n=%d\n", now_us(), n);
-            lastn = n;
+        struct kinfo_proc *kp;
+        int n = jobc_listing(pgid, &kp);
+        if (n < 0) {
+            int e = errno;
+            fprintf(out, "%lld ERR errno=%d\n", now_us(), e);
+            st.lastn = -1;
+        } else {
+            jobc_record(out, now_us(), pgid, kp, n, &st);
         }
+        free(kp);
         usleep(500);
     }
-    if (min == 1 << 30)
+    /* "MIN none": the run produced no valid reading of G0's own entries. */
+    if (st.min == 1 << 30)
         fprintf(out, "MIN none\n");
     else
-        fprintf(out, "MIN %d\n", min);
+        fprintf(out, "MIN %d\n", st.min);
+    return 0;
+}
+
+/* jobc-select: classify one listing read from stdin, as jobc_main would. */
+static int jobc_select(char **argv) {
+    int pgid = atoi(argv[2]), n = 0;
+    struct kinfo_proc kp[64];
+    memset(kp, 0, sizeof kp);
+    int pid, g, j;
+    while (n < 64 && scanf("%d %d %d", &pid, &g, &j) == 3) {
+        kp[n].kp_proc.p_pid = pid;
+        kp[n].kp_eproc.e_pgid = g;
+        kp[n].kp_eproc.e_jobc = (short)j;
+        n++;
+    }
+    struct jobc_state st = {-1000, -1, 1 << 30, 0};
+    jobc_record(stdout, 0, pgid, kp, n, &st);
     return 0;
 }
 
@@ -702,6 +777,7 @@ int main(int argc, char **argv) {
     const char *mode = argv[1];
     if (!strcmp(mode, "sentinel") && argc == 5) return sentinel(argv);
     if (!strcmp(mode, "jobc") && argc == 6) return jobc_main(argv);
+    if (!strcmp(mode, "jobc-select") && argc == 3) return jobc_select(argv);
     if (!strcmp(mode, "launch")) return launch(argc, argv);
     if (!strcmp(mode, "procs")) return procs();
     if (!strcmp(mode, "kill-session") && argc == 4) {
