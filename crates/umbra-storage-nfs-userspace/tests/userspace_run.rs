@@ -12031,6 +12031,16 @@ fn r14_read_exact(
 impl R14Observer {
     fn start(
         evidence: PathBuf,
+        inspect: impl FnMut(&serde_json::Value, std::time::Instant) -> Result<serde_json::Value, String>
+            + Send
+            + 'static,
+    ) -> Self {
+        Self::start_with_nonce(evidence, uuid::Uuid::new_v4().to_string(), inspect)
+    }
+
+    fn start_with_nonce(
+        evidence: PathBuf,
+        nonce: String,
         mut inspect: impl FnMut(&serde_json::Value, std::time::Instant) -> Result<serde_json::Value, String>
             + Send
             + 'static,
@@ -12042,7 +12052,6 @@ impl R14Observer {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
-        let nonce = uuid::Uuid::new_v4().to_string();
         let token = nonce.clone();
         let worker = std::thread::spawn(move || {
             std::fs::create_dir_all(&evidence).map_err(|e| e.to_string())?;
@@ -12157,9 +12166,9 @@ impl R14Observer {
                     let done = record["kind"] == "TERMINAL";
                     records.push(record);
                     if done {
-                        socket
-                            .shutdown(std::net::Shutdown::Both)
-                            .map_err(|e| e.to_string())?;
+                        // TERMINAL was received and its ACK fully written above.
+                        // Drop closes our descriptor; peer teardown is not another
+                        // protocol obligation (shutdown can report ENOTCONN).
                         return Ok(records);
                     }
                 }
@@ -12712,6 +12721,22 @@ fn r14_case(seeded: bool) {
         &native.as_path().join("codex-home"),
         &evidence.join("native-artifacts"),
     );
+    let verify_root = evidence.join("native-artifacts-verify-root");
+    r14_copy_seed(
+        &evidence.join("native-artifacts"),
+        &verify_root.join("codex-home"),
+    );
+    let (verified, records) = r14_native(
+        "verify",
+        &verify_root,
+        &evidence.join("native-artifacts-verify"),
+    );
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    r14_assert_rows(&records.unwrap(), expected);
     let before = r14_snapshot(&approved);
     let (run, records) = r14_routed(mode, routed.as_path(), &evidence.join("routed-reading"));
     let after = r14_snapshot(&approved);
@@ -12883,4 +12908,68 @@ fn slate_r14_instrument_repair_replay() {
         PathBuf::from(std::env::var_os("UMBRA_SLATE_R14_EVIDENCE").expect("evidence required"));
     std::fs::create_dir_all(&evidence).unwrap();
     std::fs::write(evidence.join("instrument-replay.txt"),"original EAGAIN=35 reproduced before data release; identical retained HELLO bytes delivered after blocking-mode repair; peer EOF still rejected; original cleanup false reading removed; nonempty zombies and ZOMBIES_ONLY still rejected\n").unwrap();
+}
+
+// Replay reviewer bytes unchanged, including nonce and sequence. The second
+// exchange omits TERMINAL to prove that dropping shutdown did not mask EOF.
+#[test]
+fn slate_r14_terminal_repair_replay() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let source = PathBuf::from(
+        std::env::var_os("UMBRA_SLATE_R14_REPLAY").expect("retained observer directory required"),
+    );
+    let evidence =
+        PathBuf::from(std::env::var_os("UMBRA_SLATE_R14_EVIDENCE").expect("evidence required"));
+    let raw = std::fs::read_to_string(source.join("phases.jsonl")).unwrap();
+    let failure = std::fs::read_to_string(source.join("apparatus-failure.txt")).unwrap();
+    assert!(failure.contains("Socket is not connected (os error 57)"));
+    let lines: Vec<_> = raw.lines().collect();
+    let original: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(original.last().unwrap()["kind"], "TERMINAL");
+    assert_eq!(original.last().unwrap()["data"]["ok"], true);
+    for complete in [true, false] {
+        let dir = evidence.join(if complete { "complete" } else { "incomplete" });
+        let retained = source.clone();
+        let observer = R14Observer::start_with_nonce(
+            dir.clone(),
+            original[0]["nonce"].as_str().unwrap().to_owned(),
+            move |record, _| {
+                let bytes =
+                    std::fs::read(retained.join(format!("sidecars-{}.json", record["seq"])))
+                        .map_err(|e| e.to_string())?;
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+            },
+        );
+        let mut peer = std::net::TcpStream::connect(observer.address).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let count = lines.len() - usize::from(!complete);
+        for line in &lines[..count] {
+            peer.write_all(&(line.len() as u32).to_be_bytes()).unwrap();
+            peer.write_all(line.as_bytes()).unwrap();
+            let end = Instant::now() + Duration::from_secs(3);
+            let mut size = [0; 4];
+            r14_read_exact(&mut peer, &mut size, end).unwrap();
+            let mut ack = vec![0; u32::from_be_bytes(size) as usize];
+            r14_read_exact(&mut peer, &mut ack, end).unwrap();
+            let ack: serde_json::Value = serde_json::from_slice(&ack).unwrap();
+            assert_eq!(ack["kind"], "ACK");
+        }
+        drop(peer);
+        let result = observer.worker.join().unwrap();
+        if complete {
+            assert_eq!(result.unwrap(), original);
+            assert_eq!(
+                std::fs::read(dir.join("phases.jsonl")).unwrap(),
+                raw.as_bytes()
+            );
+        } else {
+            assert_eq!(result.unwrap_err(), "EOF before terminal exchange");
+        }
+    }
+    std::fs::write(evidence.join("result.txt"), "retained ENOTCONN false reading removed on identical phase bytes; incomplete exchange rejected as EOF before terminal exchange\n").unwrap();
 }
