@@ -12003,16 +12003,26 @@ struct R14Observer {
     nonce: String,
     worker: std::thread::JoinHandle<Result<Vec<serde_json::Value>, String>>,
 }
-fn r14_read_exact(socket: &mut std::net::TcpStream, mut bytes: &mut [u8], end: std::time::Instant) -> Result<(), String> {
+fn r14_read_exact(
+    socket: &mut std::net::TcpStream,
+    mut bytes: &mut [u8],
+    end: std::time::Instant,
+) -> Result<(), String> {
     use std::io::Read;
     while !bytes.is_empty() {
         let left = end.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() { return Err("frame deadline".into()); }
-        socket.set_read_timeout(Some(left)).map_err(|e|e.to_string())?;
+        if left.is_zero() {
+            return Err("frame deadline".into());
+        }
+        socket
+            .set_read_timeout(Some(left))
+            .map_err(|e| e.to_string())?;
         match socket.read(bytes) {
             Ok(0) => return Err("EOF before terminal exchange".into()),
-            Ok(n) => { bytes = &mut bytes[n..]; }
-            Err(e) if e.kind()==std::io::ErrorKind::Interrupted => {}
+            Ok(n) => {
+                bytes = &mut bytes[n..];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -12021,281 +12031,682 @@ fn r14_read_exact(socket: &mut std::net::TcpStream, mut bytes: &mut [u8], end: s
 impl R14Observer {
     fn start(
         evidence: PathBuf,
-        mut inspect: impl FnMut(&serde_json::Value, std::time::Instant) -> Result<serde_json::Value,String> + Send + 'static,
+        mut inspect: impl FnMut(
+            &serde_json::Value,
+            std::time::Instant,
+        ) -> Result<serde_json::Value, String>
+        + Send
+        + 'static,
     ) -> Self {
-        use std::{io::Write, time::{Duration,Instant}};
-        let listener=std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).unwrap();
+        use std::{
+            io::Write,
+            time::{Duration, Instant},
+        };
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let address=listener.local_addr().unwrap();
-        let nonce=uuid::Uuid::new_v4().to_string();
-        let token=nonce.clone();
-        let worker=std::thread::spawn(move || {
-            std::fs::create_dir_all(&evidence).map_err(|e|e.to_string())?;
-            let mut log=std::fs::File::create(evidence.join("phases.jsonl")).map_err(|e|e.to_string())?;
-            let result=(|| {
-                let ready=Instant::now()+Duration::from_secs(5);
-                let (mut socket,_)=loop {
+        let address = listener.local_addr().unwrap();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let token = nonce.clone();
+        let worker = std::thread::spawn(move || {
+            std::fs::create_dir_all(&evidence).map_err(|e| e.to_string())?;
+            let mut log =
+                std::fs::File::create(evidence.join("phases.jsonl")).map_err(|e| e.to_string())?;
+            let result = (|| {
+                let ready = Instant::now() + Duration::from_secs(5);
+                let (mut socket, _) = loop {
                     match listener.accept() {
                         Ok(s) => break s,
-                        Err(e) if e.kind()==std::io::ErrorKind::WouldBlock && Instant::now()<ready => std::thread::sleep(Duration::from_millis(5)),
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < ready =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
                         Err(e) => return Err(format!("readiness: {e}")),
                     }
                 };
-                socket.set_nonblocking(false).map_err(|e|e.to_string())?;
-                let end=Instant::now()+Duration::from_secs(45);
-                let mut records=Vec::new();
+                socket.set_nonblocking(false).map_err(|e| e.to_string())?;
+                let end = Instant::now() + Duration::from_secs(45);
+                let mut records = Vec::new();
                 loop {
                     // Waiting for SQLite is bounded by the run deadline, not the
                     // frame deadline (the configured SQLite busy timeout is 5s).
-                    let mut size=[0;4]; r14_read_exact(&mut socket,&mut size[..1],end)?;
-                    let frame_end=end.min(Instant::now()+Duration::from_secs(3));
-                    r14_read_exact(&mut socket,&mut size[1..],frame_end)?;
-                    let n=u32::from_be_bytes(size) as usize;
-                    if n>65536 {return Err("oversize frame".into());}
-                    let mut bytes=vec![0;n];r14_read_exact(&mut socket,&mut bytes,frame_end)?;
-                    let record:serde_json::Value=serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
-                    let seq=records.len() as u64+1;
-                    if record["nonce"]!=token || record["seq"]!=seq {return Err("nonce/sequence mismatch".into());}
-                    if (seq==1 && record["kind"]!="HELLO") || (seq==2 && record["kind"]!="PING") {return Err("invalid handshake".into());}
-                    log.write_all(&bytes).and_then(|_|log.write_all(b"\n")).and_then(|_|log.flush()).map_err(|e|e.to_string())?;
-                    if record["kind"]=="ERROR" || (record["kind"]=="AFTER" && ["connect","commit","close"].iter().any(|p|record["phase"]==*p)) {
-                        let observation=inspect(&record,frame_end.min(Instant::now()+Duration::from_secs(2)))?;
-                        std::fs::write(evidence.join(format!("sidecars-{seq}.json")),serde_json::to_vec_pretty(&observation).unwrap()).map_err(|e|e.to_string())?;
+                    let mut size = [0; 4];
+                    r14_read_exact(&mut socket, &mut size[..1], end)?;
+                    let frame_end = end.min(Instant::now() + Duration::from_secs(3));
+                    r14_read_exact(&mut socket, &mut size[1..], frame_end)?;
+                    let n = u32::from_be_bytes(size) as usize;
+                    if n > 65536 {
+                        return Err("oversize frame".into());
                     }
-                    let ack=serde_json::to_vec(&serde_json::json!({"nonce":token,"seq":seq,"kind":"ACK"})).unwrap();
-                    let mut reply=(ack.len() as u32).to_be_bytes().to_vec(); reply.extend(ack);
-                    let mut left=reply.as_slice();
+                    let mut bytes = vec![0; n];
+                    r14_read_exact(&mut socket, &mut bytes, frame_end)?;
+                    let record: serde_json::Value =
+                        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                    let seq = records.len() as u64 + 1;
+                    if record["nonce"] != token || record["seq"] != seq {
+                        return Err("nonce/sequence mismatch".into());
+                    }
+                    if (seq == 1 && record["kind"] != "HELLO")
+                        || (seq == 2 && record["kind"] != "PING")
+                    {
+                        return Err("invalid handshake".into());
+                    }
+                    log.write_all(&bytes)
+                        .and_then(|_| log.write_all(b"\n"))
+                        .and_then(|_| log.flush())
+                        .map_err(|e| e.to_string())?;
+                    if record["kind"] == "ERROR"
+                        || (record["kind"] == "AFTER"
+                            && ["connect", "commit", "close"]
+                                .iter()
+                                .any(|p| record["phase"] == *p))
+                    {
+                        let observation = inspect(
+                            &record,
+                            frame_end.min(Instant::now() + Duration::from_secs(2)),
+                        )?;
+                        std::fs::write(
+                            evidence.join(format!("sidecars-{seq}.json")),
+                            serde_json::to_vec_pretty(&observation).unwrap(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    let ack = serde_json::to_vec(
+                        &serde_json::json!({"nonce":token,"seq":seq,"kind":"ACK"}),
+                    )
+                    .unwrap();
+                    let mut reply = (ack.len() as u32).to_be_bytes().to_vec();
+                    reply.extend(ack);
+                    let mut left = reply.as_slice();
                     while !left.is_empty() {
-                        let budget=frame_end.saturating_duration_since(Instant::now());
-                        if budget.is_zero(){return Err("ACK deadline".into());}
-                        socket.set_write_timeout(Some(budget)).map_err(|e|e.to_string())?;
-                        let n=socket.write(left).map_err(|e|e.to_string())?;
-                        if n==0{return Err("ACK write zero".into());} left=&left[n..];
+                        let budget = frame_end.saturating_duration_since(Instant::now());
+                        if budget.is_zero() {
+                            return Err("ACK deadline".into());
+                        }
+                        socket
+                            .set_write_timeout(Some(budget))
+                            .map_err(|e| e.to_string())?;
+                        let n = socket.write(left).map_err(|e| e.to_string())?;
+                        if n == 0 {
+                            return Err("ACK write zero".into());
+                        }
+                        left = &left[n..];
                     }
-                    let done=record["kind"]=="TERMINAL";
+                    let done = record["kind"] == "TERMINAL";
                     records.push(record);
-                    if done {socket.shutdown(std::net::Shutdown::Both).map_err(|e|e.to_string())?;return Ok(records);}
+                    if done {
+                        socket
+                            .shutdown(std::net::Shutdown::Both)
+                            .map_err(|e| e.to_string())?;
+                        return Ok(records);
+                    }
                 }
             })();
-            if let Err(error)=&result {
-                std::fs::write(evidence.join("apparatus-failure.txt"),format!("APPARATUS_FAILURE: {error}\n")).map_err(|e|e.to_string())?;
+            if let Err(error) = &result {
+                std::fs::write(
+                    evidence.join("apparatus-failure.txt"),
+                    format!("APPARATUS_FAILURE: {error}\n"),
+                )
+                .map_err(|e| e.to_string())?;
             }
             result
         });
-        Self {address,nonce,worker}
+        Self {
+            address,
+            nonce,
+            worker,
+        }
     }
 }
 
-fn r14_native_sidecars(directory: &Path, end: std::time::Instant) -> Result<serde_json::Value,String> {
-    let mut objects=serde_json::Map::new();
-    for name in ["state.sqlite","state.sqlite-wal","state.sqlite-shm"] {
-        if std::time::Instant::now()>=end {return Err("sidecar deadline".into());}
+fn r14_native_sidecars(
+    directory: &Path,
+    end: std::time::Instant,
+) -> Result<serde_json::Value, String> {
+    let mut objects = serde_json::Map::new();
+    for name in ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm"] {
+        if std::time::Instant::now() >= end {
+            return Err("sidecar deadline".into());
+        }
         match std::fs::read(directory.join(name)) {
-            Ok(bytes) => {objects.insert(name.into(),serde_json::json!({"bytes":bytes,"size":bytes.len()}));}
-            Err(e) if e.kind()==std::io::ErrorKind::NotFound => {objects.insert(name.into(),serde_json::Value::Null);}
+            Ok(bytes) => {
+                objects.insert(
+                    name.into(),
+                    serde_json::json!({"bytes":bytes,"size":bytes.len()}),
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                objects.insert(name.into(), serde_json::Value::Null);
+            }
             Err(e) => return Err(e.to_string()),
         }
     }
     Ok(serde_json::Value::Object(objects))
 }
 fn r14_program() -> PathBuf {
-    let path=std::env::var_os("UMBRA_SLATE_R14_PATH").map(PathBuf::from)
+    let path = std::env::var_os("UMBRA_SLATE_R14_PATH")
+        .map(PathBuf::from)
         .expect("UMBRA_SLATE_R14_PATH must name the prebuilt pinned fixture");
-    assert!(path.is_file()); path
+    assert!(path.is_file());
+    path
 }
-fn r14_native(mode: &str, root: &Path, evidence: &Path) -> (SlateOutput, Result<Vec<serde_json::Value>,String>) {
+fn r14_native(
+    mode: &str,
+    root: &Path,
+    evidence: &Path,
+) -> (SlateOutput, Result<Vec<serde_json::Value>, String>) {
     std::fs::create_dir_all(evidence).unwrap();
-    let state=root.join("codex-home");std::fs::create_dir_all(&state).unwrap();
+    let state = root.join("codex-home");
+    std::fs::create_dir_all(&state).unwrap();
     std::fs::create_dir_all(root.join("project")).unwrap();
-    let watch=SlateWatch::new(root,evidence,true);
-    let inspect=state.clone();
-    let observer=R14Observer::start(evidence.join("observer"),move |_,end|r14_native_sidecars(&inspect,end));
-    let output=slate_watched(Command::new(r14_program()).arg(mode).arg(state.join("state.sqlite"))
-        .arg(observer.address.to_string()).arg(&observer.nonce).current_dir(root.join("project")),
-        &evidence.join("native"),&watch);
-    let records=observer.worker.join().expect("observer panicked");
-    let cleanup=std::fs::read_to_string(evidence.join("native.cleanup")).unwrap();
-    assert!(cleanup.contains("cleanup CLEAN") && cleanup.contains("zombies=\"\""),"{cleanup}");
-    (output,records)
+    let watch = SlateWatch::new(root, evidence, true);
+    let inspect = state.clone();
+    let observer = R14Observer::start(evidence.join("observer"), move |_, end| {
+        r14_native_sidecars(&inspect, end)
+    });
+    let output = slate_watched(
+        Command::new(r14_program())
+            .arg(mode)
+            .arg(state.join("state.sqlite"))
+            .arg(observer.address.to_string())
+            .arg(&observer.nonce)
+            .current_dir(root.join("project")),
+        &evidence.join("native"),
+        &watch,
+    );
+    let records = observer.worker.join().expect("observer panicked");
+    let cleanup = std::fs::read_to_string(evidence.join("native.cleanup")).unwrap();
+    assert!(r14_cleanup_clean(&cleanup), "{cleanup}");
+    (output, records)
 }
 // Instrument prerequisite only; these synthetic records are never SQL readings.
 #[test]
 fn slate_r14_observer_native_qualification() {
-    let evidence=std::env::var_os("UMBRA_SLATE_R14_EVIDENCE").map(PathBuf::from)
-        .expect("rank-14 evidence directory required").join("apparatus-native");
-    for mode in ["qualify-ok","qualify-error","qualify-disconnect"] {
-        let scratch=tempfile::tempdir().unwrap();
-        let (output,records)=r14_native(mode,scratch.path(),&evidence.join(mode));
+    let evidence = std::env::var_os("UMBRA_SLATE_R14_EVIDENCE")
+        .map(PathBuf::from)
+        .expect("rank-14 evidence directory required")
+        .join("apparatus-native");
+    for mode in ["qualify-ok", "qualify-error", "qualify-disconnect"] {
+        let scratch = tempfile::tempdir().unwrap();
+        let (output, records) = r14_native(mode, scratch.path(), &evidence.join(mode));
         assert!(output.status.success());
-        if mode=="qualify-disconnect" {
-            assert!(records.unwrap_err().contains("EOF before terminal exchange"));
-            let persisted=std::fs::read_to_string(evidence.join(mode).join("observer/phases.jsonl")).unwrap();
+        if mode == "qualify-disconnect" {
+            assert!(
+                records
+                    .unwrap_err()
+                    .contains("EOF before terminal exchange")
+            );
+            let persisted =
+                std::fs::read_to_string(evidence.join(mode).join("observer/phases.jsonl")).unwrap();
             assert!(persisted.lines().last().unwrap().contains("BEFORE"));
         } else {
-            let records=records.unwrap();
-            assert_eq!(records.last().unwrap()["kind"],"TERMINAL");
-            assert_eq!(records.iter().filter(|v|v["kind"]=="ERROR").count(),usize::from(mode=="qualify-error"));
+            let records = records.unwrap();
+            assert_eq!(records.last().unwrap()["kind"], "TERMINAL");
+            assert_eq!(
+                records.iter().filter(|v| v["kind"] == "ERROR").count(),
+                usize::from(mode == "qualify-error")
+            );
         }
     }
     slate_finish_cleanup();
 }
 
-fn r14_deadline(end: std::time::Instant) -> Result<Deadline,String> {
-    let millis=end.saturating_duration_since(std::time::Instant::now()).as_millis();
-    if millis==0{return Err("sidecar deadline exhausted".into());}
-    Ok(Deadline{millis:millis as u64})
+fn r14_deadline(end: std::time::Instant) -> Result<Deadline, String> {
+    let millis = end
+        .saturating_duration_since(std::time::Instant::now())
+        .as_millis();
+    if millis == 0 {
+        return Err("sidecar deadline exhausted".into());
+    }
+    Ok(Deadline {
+        millis: millis as u64,
+    })
 }
-fn r14_nfs_object(host:&str,port:u16,components:&[Vec<u8>],end:std::time::Instant) -> Result<serde_json::Value,String> {
+fn r14_nfs_object(
+    host: &str,
+    port: u16,
+    components: &[Vec<u8>],
+    end: std::time::Instant,
+) -> Result<serde_json::Value, String> {
     use umbra_storage_nfs_userspace::error::Nfs4Status;
-    let mut config=RawTransportConfig::loopback(port); config.host=host.into();
-    config.limits.default_deadline=r14_deadline(end)?;
-    let mut client=LibnfsRawTransport::connect(config).map_err(|e|e.to_string())?;
-    let mut handle=client.root_filehandle(r14_deadline(end)?).map_err(|e|e.to_string())?;
+    let mut config = RawTransportConfig::loopback(port);
+    config.host = host.into();
+    config.limits.default_deadline = r14_deadline(end)?;
+    let mut client = LibnfsRawTransport::connect(config).map_err(|e| e.to_string())?;
+    let mut handle = client
+        .root_filehandle(r14_deadline(end)?)
+        .map_err(|e| e.to_string())?;
     for component in components {
-        match client.lookup(&handle,&ComponentName::new(component.clone()).map_err(|e|e.to_string())?,AttrMask::STAT,r14_deadline(end)?) {
-            Ok((next,_))=>handle=next,
-            Err(e) if e.status()==Some(Nfs4Status::NOENT)=>return Ok(serde_json::Value::Null),
-            Err(e)=>return Err(e.to_string()),
+        match client.lookup(
+            &handle,
+            &ComponentName::new(component.clone()).map_err(|e| e.to_string())?,
+            AttrMask::STAT,
+            r14_deadline(end)?,
+        ) {
+            Ok((next, _)) => handle = next,
+            Err(e) if e.status() == Some(Nfs4Status::NOENT) => return Ok(serde_json::Value::Null),
+            Err(e) => return Err(e.to_string()),
         }
     }
-    let before=client.getattr(&handle,AttrMask::STAT,r14_deadline(end)?).map_err(|e|e.to_string())?;
-    if before.file_type!=Some(Nfs4Type::Regular){return Err("sidecar is not regular".into());}
-    let size=before.size.ok_or("missing size")?;
-    if size>16*1024*1024{return Err("toy sidecar exceeds 16 MiB observation budget".into());}
-    let mut bytes=Vec::new();
-    while (bytes.len() as u64)<size {
-        let reply=client.read(&handle,umbra_storage_nfs_userspace::handle::Stateid::ANONYMOUS,bytes.len() as u64,(size-bytes.len() as u64).min(65536) as u32,r14_deadline(end)?).map_err(|e|e.to_string())?;
-        if reply.data.is_empty(){return Err("short sidecar read".into());} bytes.extend(reply.data);
+    let before = client
+        .getattr(&handle, AttrMask::STAT, r14_deadline(end)?)
+        .map_err(|e| e.to_string())?;
+    if before.file_type != Some(Nfs4Type::Regular) {
+        return Err("sidecar is not regular".into());
     }
-    let after=client.getattr(&handle,AttrMask::STAT,r14_deadline(end)?).map_err(|e|e.to_string())?;
-    Ok(serde_json::json!({"bytes":bytes,"before":format!("{before:?}"),"after":format!("{after:?}"),"stable":before==after}))
+    let size = before.size.ok_or("missing size")?;
+    if size > 16 * 1024 * 1024 {
+        return Err("toy sidecar exceeds 16 MiB observation budget".into());
+    }
+    let mut bytes = Vec::new();
+    while (bytes.len() as u64) < size {
+        let reply = client
+            .read(
+                &handle,
+                umbra_storage_nfs_userspace::handle::Stateid::ANONYMOUS,
+                bytes.len() as u64,
+                (size - bytes.len() as u64).min(65536) as u32,
+                r14_deadline(end)?,
+            )
+            .map_err(|e| e.to_string())?;
+        if reply.data.is_empty() {
+            return Err("short sidecar read".into());
+        }
+        bytes.extend(reply.data);
+    }
+    let after = client
+        .getattr(&handle, AttrMask::STAT, r14_deadline(end)?)
+        .map_err(|e| e.to_string())?;
+    Ok(
+        serde_json::json!({"bytes":bytes,"before":format!("{before:?}"),"after":format!("{after:?}"),"stable":before==after}),
+    )
 }
-fn r14_run_id(state:&Path)->Result<uuid::Uuid,String> {
-    let ids=std::fs::read_dir(state).map_err(|e|e.to_string())?.filter_map(|e|e.ok())
-        .filter_map(|e|e.file_name().to_str().and_then(|s|uuid::Uuid::parse_str(s).ok())).collect::<Vec<_>>();
-    if ids.len()!=1{return Err(format!("expected exactly one run directory: {ids:?}"));} Ok(ids[0])
+fn r14_run_id(state: &Path) -> Result<uuid::Uuid, String> {
+    let ids = std::fs::read_dir(state)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        })
+        .collect::<Vec<_>>();
+    if ids.len() != 1 {
+        return Err(format!("expected exactly one run directory: {ids:?}"));
+    }
+    Ok(ids[0])
 }
-fn r14_routed(mode:&str,root:&Path,evidence:&Path)->(Run,Result<Vec<serde_json::Value>,String>) {
-    let (host,port)=fixture().expect("Ganesha required");
+fn r14_routed(
+    mode: &str,
+    root: &Path,
+    evidence: &Path,
+) -> (Run, Result<Vec<serde_json::Value>, String>) {
+    let (host, port) = fixture().expect("Ganesha required");
     std::fs::create_dir_all(evidence).unwrap();
-    let workspace=root.join("approved");let state=root.join("journal");
+    let workspace = root.join("approved");
+    let state = root.join("journal");
     std::fs::create_dir_all(workspace.join("project")).unwrap();
-    std::fs::create_dir_all(workspace.join("codex-home")).unwrap();std::fs::create_dir_all(&state).unwrap();
-    let workspace=workspace.canonicalize().unwrap();
-    let database=workspace.join("codex-home/state.sqlite");
-    let registry=registry(root,&host,port);
-    let mut config:serde_json::Value=serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
-    config["providers"]["platform"]["options"]=serde_json::json!(serde_json::to_vec(&serde_json::json!({"timeout_ms":45000})).unwrap());
-    std::fs::write(&registry,serde_json::to_vec(&config).unwrap()).unwrap();
-    let watch=SlateWatch::new(root,evidence,true);
-    let seen_state=state.clone();let seen_database=database.clone();let seen_host=host.clone();
-    let observer=R14Observer::start(evidence.join("observer"),move |_,end| {
-        let id=r14_run_id(&seen_state)?;let mut objects=serde_json::Map::new();
-        for suffix in ["","-wal","-shm"] {
-            let mut path=vec![EXPORT.to_vec(),RUN_PARENT.to_vec(),id.to_string().into_bytes(),b"root".to_vec()];
-            let logical=format!("{}{suffix}",seen_database.display());
-            path.extend(logical.as_bytes().split(|b|*b==b'/').filter(|p|!p.is_empty()).map(|p|p.to_vec()));
-            objects.insert(format!("state.sqlite{suffix}"),r14_nfs_object(&seen_host,port,&path,end)?);
+    std::fs::create_dir_all(workspace.join("codex-home")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let database = workspace.join("codex-home/state.sqlite");
+    let registry = registry(root, &host, port);
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+    config["providers"]["platform"]["options"] =
+        serde_json::json!(serde_json::to_vec(&serde_json::json!({"timeout_ms":45000})).unwrap());
+    std::fs::write(&registry, serde_json::to_vec(&config).unwrap()).unwrap();
+    let watch = SlateWatch::new(root, evidence, true);
+    let seen_state = state.clone();
+    let seen_database = database.clone();
+    let seen_host = host.clone();
+    let observer = R14Observer::start(evidence.join("observer"), move |_, end| {
+        let id = r14_run_id(&seen_state)?;
+        let mut objects = serde_json::Map::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = vec![
+                EXPORT.to_vec(),
+                RUN_PARENT.to_vec(),
+                id.to_string().into_bytes(),
+                b"root".to_vec(),
+            ];
+            let logical = format!("{}{suffix}", seen_database.display());
+            path.extend(
+                logical
+                    .as_bytes()
+                    .split(|b| *b == b'/')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_vec()),
+            );
+            objects.insert(
+                format!("state.sqlite{suffix}"),
+                r14_nfs_object(&seen_host, port, &path, end)?,
+            );
         }
         Ok(serde_json::Value::Object(objects))
     });
-    assert_no_nfs_mount(&host,port,&[&workspace],"rank-14 before");
-    let output=slate_watched(Command::new(binaries().join("umbra")).args(["run","--registry"]).arg(&registry)
-        .arg("--workspace").arg(&workspace).arg("--state-dir").arg(&state)
-        .arg("--env").arg(format!("CODEX_HOME={}",workspace.join("codex-home").display()))
-        .args(["--experimental","--"]).arg(r14_program()).arg(mode).arg(&database)
-        .arg(observer.address.to_string()).arg(&observer.nonce),&evidence.join("routed"),&watch);
-    let records=observer.worker.join().expect("observer panic");
-    let run=Run{run_id:RunId(r14_run_id(&state).unwrap()),status:output.status.code(),stderr:String::from_utf8(output.stderr).unwrap(),destination:database,state,workspace,registry};
-    let cleanup=std::fs::read_to_string(evidence.join("routed.cleanup")).unwrap();
-    assert!(cleanup.contains("cleanup CLEAN") && cleanup.contains("zombies=\"\""),"{cleanup}");
-    assert_no_nfs_mount(&host,port,&[&run.workspace],"rank-14 after");
-    (run,records)
+    assert_no_nfs_mount(&host, port, &[&workspace], "rank-14 before");
+    let output = slate_watched(
+        Command::new(binaries().join("umbra"))
+            .args(["run", "--registry"])
+            .arg(&registry)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("--env")
+            .arg(format!(
+                "CODEX_HOME={}",
+                workspace.join("codex-home").display()
+            ))
+            .args(["--experimental", "--"])
+            .arg(r14_program())
+            .arg(mode)
+            .arg(&database)
+            .arg(observer.address.to_string())
+            .arg(&observer.nonce),
+        &evidence.join("routed"),
+        &watch,
+    );
+    let records = observer.worker.join().expect("observer panic");
+    let run = Run {
+        run_id: RunId(r14_run_id(&state).unwrap()),
+        status: output.status.code(),
+        stderr: String::from_utf8(output.stderr).unwrap(),
+        destination: database,
+        state,
+        workspace,
+        registry,
+    };
+    let cleanup = std::fs::read_to_string(evidence.join("routed.cleanup")).unwrap();
+    assert!(r14_cleanup_clean(&cleanup), "{cleanup}");
+    assert_no_nfs_mount(&host, port, &[&run.workspace], "rank-14 after");
+    (run, records)
 }
 #[test]
 fn slate_r14_observer_routed_qualification() {
-    let evidence=PathBuf::from(std::env::var_os("UMBRA_SLATE_R14_EVIDENCE").expect("evidence required")).join("apparatus-routed");
-    for mode in ["qualify-ok","qualify-error","qualify-disconnect"] {
-        let scratch=tempfile::tempdir().unwrap();
-        let (run,records)=r14_routed(mode,scratch.path(),&evidence.join(mode));
-        assert_eq!(run.status,Some(0),"{}",run.stderr);assert_eq!(run.child_exit(),0);
-        if mode=="qualify-disconnect" {assert!(records.unwrap_err().contains("EOF before terminal exchange"));}
-        else {let records=records.unwrap();assert_eq!(records.last().unwrap()["kind"],"TERMINAL");
-            assert_eq!(records.iter().filter(|v|v["kind"]=="ERROR").count(),usize::from(mode=="qualify-error"));}
-        assert!(journal_records_completion(&run));assert_host_write_root_empty(&run);
+    let evidence =
+        PathBuf::from(std::env::var_os("UMBRA_SLATE_R14_EVIDENCE").expect("evidence required"))
+            .join("apparatus-routed");
+    for mode in ["qualify-ok", "qualify-error", "qualify-disconnect"] {
+        let scratch = tempfile::tempdir().unwrap();
+        let (run, records) = r14_routed(mode, scratch.path(), &evidence.join(mode));
+        assert_eq!(run.status, Some(0), "{}", run.stderr);
+        assert_eq!(run.child_exit(), 0);
+        if mode == "qualify-disconnect" {
+            assert!(
+                records
+                    .unwrap_err()
+                    .contains("EOF before terminal exchange")
+            );
+        } else {
+            let records = records.unwrap();
+            assert_eq!(records.last().unwrap()["kind"], "TERMINAL");
+            assert_eq!(
+                records.iter().filter(|v| v["kind"] == "ERROR").count(),
+                usize::from(mode == "qualify-error")
+            );
+        }
+        assert!(journal_records_completion(&run));
+        assert_host_write_root_empty(&run);
     }
     slate_finish_cleanup();
 }
 
-fn r14_value(records:&[serde_json::Value],phase:&str)->serde_json::Value {
-    let values=records.iter().filter(|r|r["phase"]==phase && r["kind"]=="AFTER").collect::<Vec<_>>();
-    assert_eq!(values.len(),1,"{phase}: {records:?}");
+fn r14_value(records: &[serde_json::Value], phase: &str) -> serde_json::Value {
+    let values = records
+        .iter()
+        .filter(|r| r["phase"] == phase && r["kind"] == "AFTER")
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), 1, "{phase}: {records:?}");
     serde_json::from_str(values[0]["data"]["result"].as_str().unwrap()).unwrap()
 }
-fn r14_assert_rows(records:&[serde_json::Value],rows:&[&str]) {
-    assert_eq!(r14_value(records,"rows"),serde_json::json!(rows));
-    assert_eq!(r14_value(records,"integrity"),serde_json::json!(["ok"]));
-    assert_eq!(records.last().unwrap()["data"]["ok"],true);
+fn r14_assert_rows(records: &[serde_json::Value], rows: &[&str]) {
+    assert_eq!(r14_value(records, "rows"), serde_json::json!(rows));
+    assert_eq!(r14_value(records, "integrity"), serde_json::json!(["ok"]));
+    assert_eq!(records.last().unwrap()["data"]["ok"], true);
 }
-fn r14_assert_options(records:&[serde_json::Value]) {
-    for (key,value) in [("journal_mode","wal"),("synchronous","1"),("auto_vacuum","2"),("busy_timeout","5000")] {
-        assert_eq!(r14_value(records,key),serde_json::json!([value]),"{key}");
+fn r14_assert_options(records: &[serde_json::Value]) {
+    for (key, value) in [
+        ("journal_mode", "wal"),
+        ("synchronous", "1"),
+        ("auto_vacuum", "2"),
+        ("busy_timeout", "5000"),
+    ] {
+        assert_eq!(r14_value(records, key), serde_json::json!([value]), "{key}");
     }
 }
-fn r14_copy_seed(source:&Path,destination:&Path) {
+fn r14_copy_seed(source: &Path, destination: &Path) {
     std::fs::create_dir_all(destination).unwrap();
     for entry in std::fs::read_dir(source).unwrap() {
-        let entry=entry.unwrap();assert!(entry.file_type().unwrap().is_file());
-        std::fs::copy(entry.path(),destination.join(entry.file_name())).unwrap();
+        let entry = entry.unwrap();
+        assert!(entry.file_type().unwrap().is_file());
+        std::fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
     }
 }
-fn r14_snapshot(root:&Path)->std::collections::BTreeMap<PathBuf,Vec<u8>> {
-    fn walk(root:&Path,path:&Path,out:&mut std::collections::BTreeMap<PathBuf,Vec<u8>>) {
+fn r14_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(root: &Path, path: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
         for entry in std::fs::read_dir(path).unwrap() {
-            let e=entry.unwrap();let p=e.path();
-            if e.file_type().unwrap().is_dir() {out.insert(p.strip_prefix(root).unwrap().to_owned(),Vec::new());walk(root,&p,out);}
-            else {assert!(e.file_type().unwrap().is_file());out.insert(p.strip_prefix(root).unwrap().to_owned(),std::fs::read(p).unwrap());}
+            let e = entry.unwrap();
+            let p = e.path();
+            if e.file_type().unwrap().is_dir() {
+                out.insert(p.strip_prefix(root).unwrap().to_owned(), Vec::new());
+                walk(root, &p, out);
+            } else {
+                assert!(e.file_type().unwrap().is_file());
+                out.insert(
+                    p.strip_prefix(root).unwrap().to_owned(),
+                    std::fs::read(p).unwrap(),
+                );
+            }
         }
     }
-    let mut out=std::collections::BTreeMap::new();walk(root,root,&mut out);out
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
 }
-fn r14_case(seeded:bool) {
-    let case=if seeded {"C14-02"}else{"C14-01"};
-    let evidence=PathBuf::from(std::env::var_os("UMBRA_SLATE_R14_EVIDENCE").expect("evidence required")).join(case);
-    assert!(!evidence.exists(),"refusing to overwrite an earlier reading");std::fs::create_dir_all(&evidence).unwrap();
-    let native=tempfile::tempdir().unwrap();let routed=tempfile::tempdir().unwrap();
-    let approved=routed.path().join("approved");
-    std::fs::create_dir_all(approved.join("codex-home")).unwrap();std::fs::create_dir_all(approved.join("project")).unwrap();
+fn r14_case(seeded: bool) {
+    let case = if seeded { "C14-02" } else { "C14-01" };
+    let evidence =
+        PathBuf::from(std::env::var_os("UMBRA_SLATE_R14_EVIDENCE").expect("evidence required"))
+            .join(case);
+    assert!(
+        !evidence.exists(),
+        "refusing to overwrite an earlier reading"
+    );
+    std::fs::create_dir_all(&evidence).unwrap();
+    // Keep journal/base data even when an assertion fails; first readings lost
+    // these tempdirs, so subsequent qualification must retain them explicitly.
+    let native = tempfile::tempdir_in(&evidence).unwrap();
+    let routed = tempfile::tempdir_in(&evidence).unwrap();
+    let native = native.keep();
+    let routed = routed.keep();
+    let approved = routed.as_path().join("approved");
+    std::fs::create_dir_all(approved.join("codex-home")).unwrap();
+    std::fs::create_dir_all(approved.join("project")).unwrap();
     if seeded {
-        let seed=tempfile::tempdir().unwrap();
-        let (out,records)=r14_native("seed",seed.path(),&evidence.join("seed-create"));
-        assert!(out.status.success());let records=records.unwrap();r14_assert_options(&records);r14_assert_rows(&records,&["r14-seed"]);
-        let (out,records)=r14_native("verify",seed.path(),&evidence.join("seed-verify"));
-        assert!(out.status.success());r14_assert_rows(&records.unwrap(),&["r14-seed"]);
-        r14_copy_seed(&seed.path().join("codex-home"),&native.path().join("codex-home"));
-        r14_copy_seed(&seed.path().join("codex-home"),&approved.join("codex-home"));
-        r14_copy_seed(&seed.path().join("codex-home"),&evidence.join("seed-artifacts"));
+        let seed = tempfile::tempdir().unwrap();
+        let (out, records) = r14_native("seed", seed.path(), &evidence.join("seed-create"));
+        assert!(out.status.success());
+        let records = records.unwrap();
+        r14_assert_options(&records);
+        r14_assert_rows(&records, &["r14-seed"]);
+        let (out, records) = r14_native("verify", seed.path(), &evidence.join("seed-verify"));
+        assert!(out.status.success());
+        r14_assert_rows(&records.unwrap(), &["r14-seed"]);
+        r14_copy_seed(
+            &seed.path().join("codex-home"),
+            &native.as_path().join("codex-home"),
+        );
+        r14_copy_seed(
+            &seed.path().join("codex-home"),
+            &approved.join("codex-home"),
+        );
+        r14_copy_seed(
+            &seed.path().join("codex-home"),
+            &evidence.join("seed-artifacts"),
+        );
     }
-    let mode=if seeded {"existing"}else{"fresh"};
-    let expected: &[&str]=if seeded {&["r14-new","r14-seed"]}else{&["r14-new"]};
-    let (out,records)=r14_native(mode,native.path(),&evidence.join("native-control"));
-    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
-    let records=records.unwrap();r14_assert_options(&records);r14_assert_rows(&records,expected);
-    assert_eq!(r14_value(&records,"initial-rows"),if seeded{serde_json::json!(["r14-seed"])}else{serde_json::json!([])});
-    r14_copy_seed(&native.path().join("codex-home"),&evidence.join("native-artifacts"));
-    let before=r14_snapshot(&approved);
-    let (run,records)=r14_routed(mode,routed.path(),&evidence.join("routed-reading"));
-    let after=r14_snapshot(&approved);
+    let mode = if seeded { "existing" } else { "fresh" };
+    let expected: &[&str] = if seeded {
+        &["r14-new", "r14-seed"]
+    } else {
+        &["r14-new"]
+    };
+    let (out, records) = r14_native(mode, native.as_path(), &evidence.join("native-control"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let records = records.unwrap();
+    r14_assert_options(&records);
+    r14_assert_rows(&records, expected);
+    assert_eq!(
+        r14_value(&records, "initial-rows"),
+        if seeded {
+            serde_json::json!(["r14-seed"])
+        } else {
+            serde_json::json!([])
+        }
+    );
+    r14_copy_seed(
+        &native.as_path().join("codex-home"),
+        &evidence.join("native-artifacts"),
+    );
+    let before = r14_snapshot(&approved);
+    let (run, records) = r14_routed(mode, routed.as_path(), &evidence.join("routed-reading"));
+    let after = r14_snapshot(&approved);
     std::fs::write(evidence.join("disposition.txt"),format!("case={case} expected=supported-and-correct supervisor={:?} records={records:?} host_unchanged={}\n{}",run.status,before==after,run.stderr)).unwrap();
-    assert_eq!(before,after,"routed run changed host roots");assert_host_write_root_empty(&run);
-    // Preregistered positive assertion. Preserve its first failure before any
-    // later exact measured-refusal characterization is reviewed and committed.
-    assert_eq!(run.status,Some(0),"{}",run.stderr);assert_eq!(run.child_exit(),0);
-    let records=records.unwrap();r14_assert_options(&records);r14_assert_rows(&records,expected);
+    assert_eq!(before, after, "routed run changed host roots");
+    assert_host_write_root_empty(&run);
+    // Exact measured refusal, never compatibility: original afed50b9 positive
+    // assertions failed for both cases and remain in the first-reading evidence.
+    assert_eq!(run.status, Some(1), "{}", run.stderr);
+    assert_eq!(run.child_exit(), 20);
+    assert!(run.stderr.contains("ProcessFailed during run.child"));
+    let records = records.unwrap();
+    let errors = records
+        .iter()
+        .filter(|r| r["kind"] == "ERROR")
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["phase"], "connect");
+    assert_eq!(errors[0]["data"]["code"], "3338");
+    assert_eq!(
+        errors[0]["data"]["variant"],
+        "Database(SqliteError { code: 3338, message: \"disk I/O error\" })"
+    );
+    assert_eq!(records.last().unwrap()["data"]["ok"], false);
+    assert!(!records.iter().any(|r| r["phase"] == "schema"));
+    let sidecars: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(evidence.join("routed-reading/observer/sidecars-5.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sidecars["state.sqlite"]["stable"], true);
+    let bytes: Vec<u8> = serde_json::from_value(sidecars["state.sqlite"]["bytes"].clone()).unwrap();
+    let expected_bytes = if seeded {
+        std::fs::read(evidence.join("seed-artifacts/state.sqlite")).unwrap()
+    } else {
+        Vec::new()
+    };
+    assert_eq!(bytes, expected_bytes);
+    assert!(sidecars["state.sqlite-wal"].is_null());
+    assert!(sidecars["state.sqlite-shm"].is_null());
     assert!(journal_records_completion(&run));
+    let release = slate_bounded(
+        Command::new(binaries().join("umbra"))
+            .args(["resume", "--registry"])
+            .arg(&run.registry)
+            .arg("--workspace")
+            .arg(&run.workspace)
+            .arg("--state-dir")
+            .arg(&run.state)
+            .arg(run.run_id.0.to_string()),
+        &evidence.join("writer-authority"),
+    );
+    assert!(
+        release.status.success(),
+        "{}",
+        String::from_utf8_lossy(&release.stderr)
+    );
+    assert!(String::from_utf8_lossy(&release.stderr).contains("requires no reconciliation"));
     slate_finish_cleanup();
 }
 #[test]
-fn slate_r14_01_fresh_sqlite_wal() {r14_case(false);}
+fn slate_r14_01_fresh_sqlite_wal() {
+    r14_case(false);
+}
 #[test]
-fn slate_r14_02_existing_sqlite_wal() {r14_case(true);}
+fn slate_r14_02_existing_sqlite_wal() {
+    r14_case(true);
+}
+
+fn r14_cleanup_clean(text: &str) -> bool {
+    text.lines()
+        .next()
+        .is_some_and(|line| line.starts_with("cleanup CLEAN;") && line.contains("zombies=\"\""))
+}
+#[test]
+fn slate_r14_instrument_repair_replay() {
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        time::{Duration, Instant},
+    };
+    let fixture = repository().join("experiments/fixtures/umbra-slate-r14-sqlite");
+    let hello = std::fs::read(fixture.join("repair-hello.jsonl")).unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&hello).unwrap();
+    assert_eq!(record["kind"], "HELLO");
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut receiver, _) = listener.accept().unwrap();
+    // Exact original transport fault, deterministically before releasing data.
+    // On Darwin an accepted socket inherits the listener's nonblocking flag.
+    let mut byte = [0];
+    let error = receiver.read(&mut byte).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(error.raw_os_error(), Some(35));
+    receiver.set_nonblocking(false).unwrap();
+    sender.write_all(&hello).unwrap();
+    let mut replay = vec![0; hello.len()];
+    r14_read_exact(
+        &mut receiver,
+        &mut replay,
+        Instant::now() + Duration::from_secs(3),
+    )
+    .unwrap();
+    assert_eq!(
+        replay, hello,
+        "the repaired reader changed the retained raw bytes"
+    );
+    // Known true failure: peer closure remains an error, not empty success.
+    sender.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(
+        r14_read_exact(
+            &mut receiver,
+            &mut byte,
+            Instant::now() + Duration::from_secs(3)
+        )
+        .unwrap_err(),
+        "EOF before terminal exchange"
+    );
+    let cleanup = std::fs::read_to_string(fixture.join("repair-cleanup.txt")).unwrap();
+    assert!(
+        !cleanup.contains("zombies=[]"),
+        "old predicate must reproduce the false reading"
+    );
+    assert!(r14_cleanup_clean(&cleanup));
+    assert!(!r14_cleanup_clean(
+        &cleanup.replace("zombies=\"\"", "zombies=\"19571\"")
+    ));
+    assert!(!r14_cleanup_clean(
+        &cleanup.replace("cleanup CLEAN", "cleanup ZOMBIES_ONLY")
+    ));
+    let evidence =
+        PathBuf::from(std::env::var_os("UMBRA_SLATE_R14_EVIDENCE").expect("evidence required"));
+    std::fs::create_dir_all(&evidence).unwrap();
+    std::fs::write(evidence.join("instrument-replay.txt"),"original EAGAIN=35 reproduced before data release; identical retained HELLO bytes delivered after blocking-mode repair; peer EOF still rejected; original cleanup false reading removed; nonempty zombies and ZOMBIES_ONLY still rejected\n").unwrap();
+}
