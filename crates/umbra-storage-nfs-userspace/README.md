@@ -780,6 +780,23 @@ missing-evidence refusal back into a clean verdict.
 
 ### Proving it
 
+The rank-13 `slate_c13_` cases independently probe Rust `File::try_lock`,
+nonblocking `flock`, `fcntl(F_SETLK)`, shared file-backed mapping and anonymous
+mapping. Kernel-pipe transport is checked before and after each file primitive.
+These cases currently encode pre-registered expectations; they have not yet
+received a native/live-server qualification reading in this branch.
+
+They require prebuilt fixtures at `UMBRA_C13_C_PATH` and
+`UMBRA_C13_RUST_PATH`, plus the live-server and evidence variables below. CI
+builds the C fixture normally and once with `C13_RUST_BRIDGE`, linking that
+object into the Rust fixture. Each case runs its disposable native control
+before its routed comparison, with a 30-second execution deadline and a
+five-second cleanup grace. The report and sentinel are separately named shadow
+objects, read through the client; the probe seed and the host routing root must
+remain unchanged on a refusal. A reported success never substitutes for exact
+stored bytes, pipe EOF, journal completion and writer-authority reopen.
+
+
 The slate thread/fork/spawn tests also require `UMBRA_SLATE_EVIDENCE`, an absolute
 writable evidence directory, and so does
 `a_parent_and_its_spawned_child_writing_one_descriptor_at_once_lose_no_record`,

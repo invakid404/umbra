@@ -11332,3 +11332,646 @@ fn slate_c12_provider_handshake() {
     let proxy = umbra_storage::provider::Proxy::connect(&descriptor, 12_000).unwrap();
     assert!(proxy.capabilities().features.contains("userspace-nfsv4-v1"));
 }
+
+// ---- slate-r13: file locks and mappings; accepted ideation at e98fc2d7 ----
+// Kept contiguous because the live client and lifecycle helpers are private.
+// This launcher copy preserves the shared instrument while enforcing C13's
+// independently pre-registered five-second cleanup grace.
+fn c13_launch(
+    command: &mut Command,
+    evidence: &Path,
+    timeout: std::time::Duration,
+    watch: Option<&SlateWatch>,
+) -> (SlateOutput, bool) {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    SLATE_CENSUS_EVIDENCE
+        .with(|slot| *slot.borrow_mut() = Some(evidence.with_extension("census.jsonl")));
+    std::fs::write(evidence.with_extension("census.jsonl"), "").unwrap();
+    let mut watched = SlateWatchState::default();
+    if let Some(watch) = watch {
+        // The observer appends and every reader decodes the whole directory,
+        // so records left by an earlier launch against this evidence root
+        // would count as this one's.
+        slate_fresh_dir(&watch.signals);
+        if let Some(observer) = &watch.observer {
+            command
+                .env("DYLD_INSERT_LIBRARIES", observer)
+                .env("UMBRA_SLATE_SIGNAL_DIR", &watch.signals);
+        }
+    }
+    let collected =
+        std::sync::Arc::new(std::sync::Mutex::new([Vec::<u8>::new(), Vec::<u8>::new()]));
+    let retain = |detail: &str| {
+        let bytes = collected.lock().unwrap();
+        std::fs::write(evidence.with_extension("stdout"), &bytes[0]).unwrap();
+        std::fs::write(evidence.with_extension("stderr"), &bytes[1]).unwrap();
+        let stderr = String::from_utf8_lossy(&bytes[1]);
+        let tracee = stderr
+            .lines()
+            .find(|line| line.contains("finished:"))
+            .unwrap_or("tracee_status=NOT AVAILABLE");
+        std::fs::write(
+            evidence.with_extension("cleanup"),
+            format!("{detail}\n{tracee}\n"),
+        )
+        .unwrap();
+    };
+    let ledgered = watch.is_some_and(|w| w.ledger);
+    command
+        .process_group(0)
+        .stdin(if ledgered {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("bounded launch");
+    let group = child.id();
+    std::fs::write(evidence.with_extension("direct-pid"), group.to_string()).unwrap();
+    watched.input = child.stdin.take();
+    let out = child.stdout.take().unwrap();
+    let err = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (which, mut pipe) in [
+        (0, Box::new(out) as Box<dyn Read + Send>),
+        (1, Box::new(err) as Box<dyn Read + Send>),
+    ] {
+        let tx = tx.clone();
+        let collected = collected.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            let result = loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break Ok(collected.lock().unwrap()[which].clone()),
+                    Ok(n) => collected.lock().unwrap()[which].extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => break Err(e),
+                }
+            };
+            let _ = tx.send((which, result));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + timeout;
+    let mut census_error = None;
+    let mut group_kills = 0;
+    let mut census = String::new();
+    let mut timed_out = false;
+    let mut members = String::new();
+    let mut run_session = None;
+    let status = loop {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break None;
+        }
+        if deadline.saturating_duration_since(Instant::now()) > Duration::from_millis(400) {
+            match slate_run_members(group, deadline, &mut run_session) {
+                Ok(found) => {
+                    census.push_str(&found);
+                    census.push('\n');
+                    members = found;
+                }
+                Err(error) => {
+                    census_error = Some(error);
+                    break None;
+                }
+            }
+        }
+        if let Some(watch) = watch {
+            watched.session = run_session;
+            let stdout = collected.lock().unwrap()[0].clone();
+            if let Err(error) = watched.poll(watch, group, &stdout, &members) {
+                census_error = Some(error);
+                break None;
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20)); // polling, never fixture ordering
+    };
+    if watch.is_some() {
+        watched.snapshot(group, "direct-exit-or-deadline");
+    }
+    // The ledger's stdin is closed here, so a fixture still waiting for an
+    // acknowledgment reads EOF rather than blocking past its own process.
+    drop(watched.input.take());
+    let grace = Instant::now() + Duration::from_secs(5);
+    if timed_out || census_error.is_some() {
+        // SAFETY: this child was launched as leader of its own process group.
+        unsafe {
+            libc::kill(-(group as i32), libc::SIGKILL);
+            group_kills += 1;
+        }
+    }
+    let mut status = status;
+
+    let mut pipes: [Option<Vec<u8>>; 2] = [None, None];
+    let mut cleanup_failure = None;
+    let mut zombies = String::new();
+    loop {
+        if status.is_none() {
+            status = child.try_wait().unwrap();
+        }
+        while let Ok((which, bytes)) = rx.try_recv() {
+            match bytes {
+                Ok(bytes) => pipes[which] = Some(bytes),
+                Err(e) => {
+                    cleanup_failure = Some(format!("cleanup FAILED: pipe read: {e}"));
+                }
+            }
+        }
+        if cleanup_failure.is_some() {
+            break;
+        }
+        if grace.saturating_duration_since(Instant::now()) <= Duration::from_millis(100) {
+            cleanup_failure =
+                Some("cleanup UNMEASURABLE: insufficient remaining census/reap budget".into());
+            break;
+        }
+        let members = match slate_run_members(group, grace, &mut run_session) {
+            Ok(members) => members,
+            Err(error) => {
+                cleanup_failure = Some(format!("cleanup UNMEASURABLE: {error}"));
+                break;
+            }
+        };
+        census.push_str(&members);
+        census.push('\n');
+        zombies = members
+            .lines()
+            .filter(|line| {
+                line.split_whitespace()
+                    .nth(3)
+                    .is_some_and(|v| v.starts_with('Z'))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let live = members
+            .lines()
+            .filter(|line| {
+                !line
+                    .split_whitespace()
+                    .nth(3)
+                    .is_some_and(|v| v.starts_with('Z'))
+            })
+            .collect::<Vec<_>>();
+        // Ledger census: every announced child by birth identity, whatever
+        // session or group it is in now (R3). No reading is UNMEASURABLE.
+        let (escaped, unannounced) = match watched.ledger_census(group) {
+            Ok(found) => found,
+            Err(error) => {
+                cleanup_failure = Some(format!("cleanup UNMEASURABLE: ledger: {error}"));
+                break;
+            }
+        };
+        if !unannounced.is_empty() {
+            cleanup_failure = Some(format!(
+                "cleanup FAILED: unannounced descendant(s) outside the group: {unannounced:?}"
+            ));
+            break;
+        }
+        if status.is_some()
+            && live.is_empty()
+            && escaped.is_empty()
+            && pipes.iter().all(Option::is_some)
+        {
+            break;
+        }
+        if grace.saturating_duration_since(Instant::now()) <= Duration::from_millis(400) {
+            cleanup_failure = Some(format!(
+                "cleanup FAILED: grace exhausted with live={live:?}, escaped={escaped:?}, direct_status={status:?}, pipes_complete={}",
+                pipes.iter().all(Option::is_some)
+            ));
+            break;
+        }
+        slate_census_event(
+            "PROGRESS",
+            "poll/reap direct child, drain pipes and signal survivors with grace remaining",
+        );
+        // An escaped child is signalled only by the PID whose birth identity
+        // the census above just matched, so a recycled PID is never touched.
+        for birth in &escaped {
+            slate_census_event("LEDGER_KILL", &format!("{birth:?}"));
+            unsafe {
+                libc::kill(birth.pid, libc::SIGKILL);
+            }
+            group_kills += 1;
+        }
+        // Signal live PIDs only. Zombies are already dead and cannot be killed.
+        if status.is_some() {
+            for line in &live {
+                let pid = line
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap();
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                group_kills += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Some(error) = census_error.as_ref() {
+        cleanup_failure = Some(format!("cleanup UNMEASURABLE during execution: {error}"));
+    }
+    if let Some(watch) = watch {
+        watched.snapshot(group, "after-cleanup");
+        watched.retain(watch, evidence);
+    }
+    let buffered = collected.lock().unwrap();
+    let output = SlateOutput {
+        status: SlateStatus(status),
+        stdout: pipes[0].take().unwrap_or_else(|| buffered[0].clone()),
+        stderr: pipes[1].take().unwrap_or_else(|| buffered[1].clone()),
+    };
+    drop(buffered);
+    std::fs::write(evidence.with_extension("stdout"), &output.stdout).unwrap();
+    std::fs::write(evidence.with_extension("stderr"), &output.stderr).unwrap();
+    if let Some(error) = cleanup_failure {
+        slate_census_event(
+            if error.contains("UNMEASURABLE") {
+                "NO_READING_EXHAUSTED"
+            } else {
+                "TERMINAL_FAILURE"
+            },
+            &error,
+        );
+        retain(&format!(
+            "{error}; supervisor_status={:?} timed_out={timed_out} group={group} zombies={zombies:?}\n{census}",
+            output.status
+        ));
+        slate_cleanup_failure(format!("{}: {error}", evidence.display()));
+    } else {
+        let disposition = if zombies.is_empty() {
+            "cleanup CLEAN"
+        } else {
+            "cleanup ZOMBIES_ONLY: no live survivors; accepted dead-table residue"
+        };
+        std::fs::write(evidence.with_extension("cleanup"),format!("{disposition}; status={} timed_out={timed_out} group_kills={group_kills} group={group} final_live_members=0 pipes=EOF direct_child=reaped zombies={zombies:?}\n{census}",output.status)).unwrap();
+    }
+    (output, timed_out)
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct C13Report {
+    version: serde_json::Value,
+    case: serde_json::Value,
+    mode: serde_json::Value,
+    nonce: serde_json::Value,
+    pid: serde_json::Value,
+    phase: serde_json::Value,
+    probe_fd: serde_json::Value,
+    seed_read_ok: serde_json::Value,
+    operation: serde_json::Value,
+    result: serde_json::Value,
+    error: serde_json::Value,
+    memory_check: serde_json::Value,
+    unlock: serde_json::Value,
+    unmap: serde_json::Value,
+    probe_close: serde_json::Value,
+    pipe: Option<C13Pipe>,
+    sentinel_written: serde_json::Value,
+    intended_exit: serde_json::Value,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct C13Pipe {
+    read_fd: i32,
+    write_fd: i32,
+    before: String,
+    after: String,
+    eof: bool,
+    writer_close: i32,
+    reader_close: i32,
+}
+fn c13_report(bytes: &[u8], case: usize, mode: &str, nonce: &str, evidence: &Path) {
+    use serde_json::{Value, json};
+    assert_eq!(bytes.last(), Some(&b'\n'));
+    // Typed deserialization rejects duplicate fields, including nested pipe keys.
+    let report: C13Report = serde_json::from_slice(bytes).expect("complete C13 report");
+    let value = serde_json::to_value(report).unwrap();
+    let raw: Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(
+        raw, value,
+        "missing keys must not become default null fields"
+    );
+    let native = mode == "native";
+    let positive = native || case == 5;
+    let fd = value["probe_fd"].clone();
+    if case != 5 {
+        assert!(fd.as_i64().unwrap() >= 0);
+    } else {
+        assert_eq!(fd, Value::Null);
+    }
+    let pid = value["pid"].as_i64().expect("numeric PID");
+    let snapshots = std::fs::read_to_string(evidence.with_extension("snapshots.jsonl")).unwrap();
+    let direct_pid: i64 = std::fs::read_to_string(evidence.with_extension("direct-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (mode == "native" && direct_pid == pid)
+            || snapshots.lines().any(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                v["processes"]
+                    .as_array()
+                    .is_some_and(|ps| ps.iter().any(|p| p["pid"] == pid))
+            }),
+        "tracee PID absent from independent census"
+    );
+    let pipe = if case != 5 {
+        let r = value["pipe"]["read_fd"].as_i64().unwrap();
+        let w = value["pipe"]["write_fd"].as_i64().unwrap();
+        assert!(r >= 0 && w >= 0 && r != w && json!(r) != fd && json!(w) != fd);
+        json!({"read_fd":r,"write_fd":w,"before":format!("C13-PIPE {nonce} before\n"),
+            "after":format!("C13-PIPE {nonce} after\n"),"eof":true,"writer_close":0,"reader_close":0})
+    } else {
+        Value::Null
+    };
+    let operation = [
+        "",
+        "File::try_lock",
+        "flock",
+        "F_SETLK",
+        "mmap_shared",
+        "mmap_anon",
+    ][case];
+    let result = match case {
+        1 => {
+            if positive {
+                "ok"
+            } else {
+                "os_error"
+            }
+        }
+        2 | 3 => {
+            if positive {
+                "0"
+            } else {
+                "-1"
+            }
+        }
+        _ => {
+            if positive {
+                "mapped"
+            } else {
+                "MAP_FAILED"
+            }
+        }
+    };
+    assert_eq!(
+        value,
+        json!({"version":1,"case":format!("C13-{case:02}"),"mode":mode,"nonce":nonce,
+        "pid":pid,"phase":"complete","probe_fd":fd,"seed_read_ok":if case!=5 {json!(true)} else {Value::Null},
+        "operation":operation,"result":result,"error":if positive {Value::Null} else {json!(libc::EBADF)},
+        "memory_check":if case>=4 && positive {json!(true)} else {Value::Null},
+        "unlock":if case<=3 && native {json!(0)} else {Value::Null},
+        "unmap":if case>=4 && positive {json!(0)} else {Value::Null},
+        "probe_close":if case!=5 {json!(0)} else {Value::Null},"pipe":pipe,
+        "sentinel_written":true,"intended_exit":if positive {0} else {9}})
+    );
+}
+fn c13_case(case: usize) {
+    // Existing mutation invocations characterize other primitives; C13 runs
+    // only against unmutated binaries, like the existing slate families.
+    if declared_probe().is_some() {
+        return;
+    }
+    let (host, port) = fixture().expect("C13 requires live Ganesha");
+    let evidence = PathBuf::from(input("UMBRA_SLATE_EVIDENCE").expect("C13 evidence required"))
+        .join(format!("c13-{case:02}"));
+    std::fs::create_dir_all(&evidence).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let variable = if case == 1 {
+        "UMBRA_C13_RUST_PATH"
+    } else {
+        "UMBRA_C13_C_PATH"
+    };
+    let program = PathBuf::from(std::env::var_os(variable).expect("prebuilt C13 fixture required"));
+    assert!(program.is_file());
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(page > 0);
+    let seed = vec![0x53; page as usize];
+    for mode in ["native", "routed"] {
+        let root = scratch.path().join(mode);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("seed.txt"), &seed).unwrap();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        std::fs::write(evidence.join(format!("{mode}-nonce")), &nonce).unwrap();
+        let side = evidence.join(mode);
+        let mut command;
+        let state = scratch.path().join("state");
+        let registry = registry(scratch.path(), &host, port);
+        if mode == "native" {
+            command = Command::new(&program);
+        } else {
+            std::fs::create_dir(&state).unwrap();
+            assert_no_nfs_mount(&host, port, &[&root], "C13 before");
+            command = Command::new(binaries().join("umbra"));
+            command
+                .args(["run", "--registry"])
+                .arg(&registry)
+                .arg("--workspace")
+                .arg(&root)
+                .arg("--state-dir")
+                .arg(&state)
+                .args(["--experimental", "--"])
+                .arg(&program);
+        }
+        command
+            .arg(format!("C13-{case:02}"))
+            .arg(&root)
+            .arg(mode)
+            .arg(&nonce);
+        let watch = SlateWatch {
+            observer: None,
+            signals: side.with_extension("signals"),
+            ledger: false,
+        };
+        let (output, timeout) = c13_launch(
+            &mut command,
+            &side,
+            std::time::Duration::from_secs(30),
+            Some(&watch),
+        );
+        assert!(!timeout, "C13 deadline exceeded");
+        let mut objects = std::collections::BTreeMap::new();
+        let names = ["seed.txt", "c13-report.json", "c13-sentinel.txt"];
+        if mode == "native" {
+            for name in names {
+                objects.insert(name, std::fs::read(root.join(name)).unwrap());
+            }
+            let mut names: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            assert_eq!(
+                names,
+                vec![
+                    std::ffi::OsString::from("c13-report.json"),
+                    "c13-sentinel.txt".into(),
+                    "seed.txt".into()
+                ]
+            );
+            assert_eq!(output.status.code(), Some(0));
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let id = stderr
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("umbra: run ")
+                        .and_then(|v| v.strip_suffix(" prepared"))
+                })
+                .expect("prepared run");
+            let run = Run {
+                run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+                status: output.status.code(),
+                stderr,
+                destination: root.join("seed.txt"),
+                state,
+                workspace: root.clone(),
+                registry,
+            };
+            for name in names {
+                let mut path = shadow_path(&run);
+                *path.last_mut().unwrap() = name.as_bytes().to_vec();
+                let bytes = read_whole_object_through_client(&host, port, &path);
+                std::fs::write(
+                    evidence.join(format!("routed-{name}.observation")),
+                    format!("{bytes:?}"),
+                )
+                .unwrap();
+                objects.insert(name, bytes.expect("required shadow object"));
+            }
+            assert_eq!(
+                c13_shadow_names(&host, port, &run),
+                vec![
+                    b"c13-report.json".to_vec(),
+                    b"c13-sentinel.txt".to_vec(),
+                    b"seed.txt".to_vec()
+                ]
+            );
+            assert_eq!(run.child_exit(), if case == 5 { 0 } else { 9 });
+            assert_eq!(run.status == Some(0), case == 5);
+            assert!(journal_records_completion(&run));
+            assert_workspace_pristine(&run);
+            assert_host_write_root_empty(&run);
+            assert_eq!(std::fs::read(root.join("seed.txt")).unwrap(), seed);
+            let (reopen, timed) = c13_launch(
+                Command::new(binaries().join("umbra"))
+                    .args(["resume", "--registry"])
+                    .arg(&run.registry)
+                    .arg("--workspace")
+                    .arg(&root)
+                    .arg("--state-dir")
+                    .arg(&run.state)
+                    .arg(run.run_id.0.to_string()),
+                &evidence.join("reopen"),
+                std::time::Duration::from_secs(30),
+                None,
+            );
+            assert!(!timed && reopen.status.success(), "writer authority reopen");
+            assert_no_nfs_mount(&host, port, &[&root], "C13 after");
+        }
+        for (name, bytes) in &objects {
+            std::fs::write(evidence.join(format!("{mode}-{name}")), bytes).unwrap();
+        }
+        c13_report(&objects["c13-report.json"], case, mode, &nonce, &side);
+        assert_eq!(
+            objects["c13-sentinel.txt"],
+            format!("C13-SENTINEL C13-{case:02} {mode} {nonce}\n").as_bytes()
+        );
+        let mut expected = seed.clone();
+        if mode == "native" && case == 4 {
+            expected[..4].copy_from_slice(b"C13!");
+        }
+        assert_eq!(objects["seed.txt"], expected);
+        slate_finish_cleanup();
+    }
+    eprintln!(
+        "C13-{case:02} qualified; C13-06 paired control={}",
+        case != 5
+    );
+}
+#[test]
+fn slate_c13_01_rust_lock() {
+    c13_case(1);
+}
+#[test]
+fn slate_c13_02_flock() {
+    c13_case(2);
+}
+#[test]
+fn slate_c13_03_record_lock() {
+    c13_case(3);
+}
+#[test]
+fn slate_c13_04_shared_mapping() {
+    c13_case(4);
+}
+#[test]
+fn slate_c13_05_anonymous_mapping() {
+    c13_case(5);
+}
+
+fn c13_shadow_names(host: &str, port: u16, run: &Run) -> Vec<Vec<u8>> {
+    use umbra_storage_nfs_userspace::transport::{DirCookie, DirVerifier, ReadDirRequest};
+    let mut config = RawTransportConfig::loopback(port);
+    config.host = host.to_owned();
+    let deadline = Deadline { millis: 5000 };
+    let mut transport = LibnfsRawTransport::connect(config).unwrap();
+    let mut handle = transport.root_filehandle(deadline).unwrap();
+    let mut path = shadow_path(run);
+    path.pop();
+    for part in path {
+        handle = transport
+            .lookup(
+                &handle,
+                &ComponentName::new(part).unwrap(),
+                AttrMask::STAT,
+                deadline,
+            )
+            .unwrap()
+            .0;
+    }
+    let mut request = ReadDirRequest {
+        cookie: DirCookie(0),
+        verifier: DirVerifier([0; 8]),
+        dir_count: 4096,
+        max_count: 8192,
+        attrs: AttrMask::STAT,
+    };
+    let mut names = Vec::new();
+    for _ in 0..16 {
+        let page = transport.readdir(&handle, request, deadline).unwrap();
+        for entry in &page.entries {
+            names.push(entry.name.as_bytes().to_vec());
+        }
+        if page.eof {
+            names.sort();
+            return names;
+        }
+        let next = page
+            .entries
+            .last()
+            .expect("nonterminal page must progress")
+            .cookie;
+        assert_ne!(next, request.cookie);
+        request.cookie = next;
+        request.verifier = page.verifier;
+    }
+    panic!("directory census exceeded bounded page budget");
+}

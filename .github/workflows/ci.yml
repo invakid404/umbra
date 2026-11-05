@@ -421,6 +421,15 @@ jobs:
             -o "$fixture_dir/umbra-userspace-lifecycle"
           rustc --edition 2021 -O experiments/fixtures/umbra-userspace-envwriter.rs \
             -o "$fixture_dir/umbra-userspace-envwriter"
+          # Rank 13: C primitives and Rust File::try_lock share reporting only.
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          clang -arch arm64 -O1 experiments/fixtures/umbra-slate-r13-primitives.c -o "$fixture_dir/c13-primitives"
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          clang -arch arm64 -O1 -DC13_RUST_BRIDGE -c experiments/fixtures/umbra-slate-r13-primitives.c -o "$fixture_dir/c13-bridge.o"
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          rustc --edition 2021 -O experiments/fixtures/umbra-slate-r13-lock.rs -C "link-arg=$fixture_dir/c13-bridge.o" -o "$fixture_dir/c13-rust-lock"
+          echo "UMBRA_C13_C_PATH=$fixture_dir/c13-primitives" >> "$GITHUB_ENV"
+          echo "UMBRA_C13_RUST_PATH=$fixture_dir/c13-rust-lock" >> "$GITHUB_ENV"
           mkdir -p "/tmp/slate-evidence-$GITHUB_RUN_ID"
           echo "UMBRA_SLATE_EVIDENCE=/tmp/slate-evidence-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
           echo "UMBRA_USERSPACE_TOY_PATH=$fixture_dir/umbra-userspace-toy" >> "$GITHUB_ENV"
