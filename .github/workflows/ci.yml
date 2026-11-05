@@ -488,6 +488,15 @@ jobs:
       # reason (see its comment); this job stays green only because
       # `--test userspace_run` never reaches it. Widening the selector without
       # the skip reddens the job on a fixture gap this change did not cause.
+      - name: Build rank-12 publication fixtures
+        run: |
+          df -h /System/Volumes/Data
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build -p umbra-core -p umbra-storage -p umbra-storage-nfs-userspace --features umbra-storage-nfs-userspace/transport-raw --lib
+          python3 experiments/fixtures/umbra-slate-r12-build.py
+          echo "UMBRA_R12_PATH=$GITHUB_WORKSPACE/target/debug/slate-r12/publication" >> "$GITHUB_ENV"
+          echo "UMBRA_R12_PROVIDER=$GITHUB_WORKSPACE/target/debug/slate-r12/provider" >> "$GITHUB_ENV"
+
       - name: Proof 1 -- end to end, the toy and the Rust I/O fixture must exit 0
         run: |
           cargo build --workspace --bins
@@ -578,6 +587,14 @@ jobs:
         if: failure()
         run: |
           docker logs "$UMBRA_NFS_FIXTURE_CONTAINER" 2>&1 | tail -200 || true
+
+      - name: Upload rank-12 readings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: slate-r12-readings-${{ github.run_id }}
+          path: /tmp/slate-evidence-${{ github.run_id }}/C12-*
+          if-no-files-found: error
 
       - name: Upload userspace slate evidence on failure
         if: failure()

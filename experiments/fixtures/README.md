@@ -103,3 +103,21 @@ Limitations and integration notes:
   `umbra-platform-macos`.
 - These are untraced fixture checks. Descendant capture, signing/attach access,
   syscall redirection, and NFS behavior remain the Track A tracer's tests.
+
+## Rank-12 publication fixtures
+
+The build/smoke instructions and command table above describe `umbra-test-child`.
+They do not build or run these rank-12 fixtures:
+
+- `umbra-slate-r12-publication.c`: modes 1 and 3 replace a destination with it
+  closed or held open; modes 2 and 4 unlink a source with it closed or held open.
+- `umbra-slate-r12-provider.rs`: forwards to the real NFS backend and records
+  same-authority write, flush, release and close probes after uncertain REMOVE.
+- `umbra-slate-r12-build.py`: builds both executables under
+  `target/debug/slate-r12` using this checkout's prebuilt debug libraries.
+
+See the [userspace NFS README](../../crates/umbra-storage-nfs-userspace/README.md)
+for preparation and measured statuses, and [CI](../../.github/workflows/ci.yml)
+for provisioning. Native controls succeed; routed cases characterize pre-effect
+rename refusal and post-effect unlink failure. They do not qualify routed
+publication or retained-descriptor semantics after successful publication.
