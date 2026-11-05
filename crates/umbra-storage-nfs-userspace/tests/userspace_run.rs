@@ -12662,7 +12662,16 @@ fn slate_r14_instrument_repair_replay() {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (mut receiver, _) = listener.accept().unwrap();
+    let ready = Instant::now() + Duration::from_secs(3);
+    let (mut receiver, _) = loop {
+        match listener.accept() {
+            Ok(pair) => break pair,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < ready => {
+                std::thread::yield_now();
+            }
+            Err(e) => panic!("replay listener readiness: {e}"),
+        }
+    };
     // Exact original transport fault, deterministically before releasing data.
     // On Darwin an accepted socket inherits the listener's nonblocking flag.
     let mut byte = [0];
