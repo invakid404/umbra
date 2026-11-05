@@ -588,8 +588,10 @@ verifier-compare probe succeeded against the run's own `.provider` — and
 `Durability::Local` otherwise, including on a read-only run, on a transport that
 declares nothing, and when the probe did not succeed. `Fencing::ReadOnly` stays: no independent
 termination verifier exists, and the barrier says nothing about fencing. The
-binding advertises exactly two `features` names,
-`ownership-fidelity-v1` and `timestamp-fidelity-v1`, both corroborated by the
+binding includes the `features` names `ownership-fidelity-v1` and
+`timestamp-fidelity-v1`. A validated live binding also carries `userspace-nfsv4-v1`
+and `experimental-userspace-routing-v1` from the transport probe. The ownership
+and timestamp claims are corroborated by the
 same two places: `SetMetadata` is `Support::Supported` in the capability table,
 and `NamespaceMutation::SetAttributes` maps `update.uid`/`update.gid` onto
 `FATTR4_OWNER`/`FATTR4_OWNER_GROUP` as stringified numeric ids and
