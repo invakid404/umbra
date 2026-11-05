@@ -11657,7 +11657,7 @@ struct C13Pipe {
     reader_close: i32,
 }
 fn c13_report(bytes: &[u8], case: usize, mode: &str, nonce: &str, evidence: &Path) {
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     assert_eq!(bytes.last(), Some(&b'\n'));
     // Typed deserialization rejects duplicate fields, including nested pipe keys.
     let report: C13Report = serde_json::from_slice(bytes).expect("complete C13 report");
