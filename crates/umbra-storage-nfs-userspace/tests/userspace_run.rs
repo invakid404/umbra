@@ -11868,7 +11868,7 @@ fn c13_case(case: usize) {
                 ]
             );
             assert_eq!(run.child_exit(), if case == 5 { 0 } else { 9 });
-            assert_eq!(run.status == Some(0), case == 5);
+            assert_eq!(run.status, Some(if case == 5 { 0 } else { 1 }));
             assert!(journal_records_completion(&run));
             assert_workspace_pristine(&run);
             assert_host_write_root_empty(&run);
