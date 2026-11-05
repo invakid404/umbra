@@ -11767,6 +11767,9 @@ fn c13_case(case: usize) {
     for mode in ["native", "routed"] {
         let root = scratch.path().join(mode);
         std::fs::create_dir(&root).unwrap();
+        // macOS temp dirs sit behind the /var -> /private/var symlink; the
+        // routed workspace and the shadow path need the resolved spelling.
+        let root = root.canonicalize().unwrap();
         std::fs::write(root.join("seed.txt"), &seed).unwrap();
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         std::fs::write(evidence.join(format!("{mode}-nonce")), &nonce).unwrap();
