@@ -41,8 +41,11 @@ rather than emulated with a check-then-rename. An open run advertises `durabilit
 `COMMIT` barrier `flush` certifies is what is qualified — no termination verifier is — and
 `flush` issues a `Durability::Remote` receipt over already-committed writes rather than
 reporting a gate. `require_strict_remote_persistence`, a stronger promise than that barrier,
-is still refused. It exposes opaque handles and no physical path, so
-`umbra run` cannot select it. Its live transport is behind the off-by-default `transport-raw`
+is still refused. It exposes opaque handles and no physical path. `umbra run` selects it through
+the experimental userspace-routing capability with the interposing macOS platform;
+the host-side journal must be retained under `--state-dir` for resume. This path
+qualifies individual operations and refusals, not arbitrary application support:
+the rank-14 SQLx WAL cases fail at connection setup with `SQLITE_IOERR_ACCESS`. Its live transport is behind the off-by-default `transport-raw`
 feature; a default build binds none. See its
 [README](../crates/umbra-storage-nfs-userspace/README.md).
 
@@ -70,7 +73,7 @@ it implements experimental arm64 tracing and advertises `darwin-arm64-abi-v1`.
 Descriptor capabilities are required open
 capability names, verified against the provider handshake. Stubs advertise no runtime
 support. An empty capability requirement permits connection testing, never authorization
-to run a tracee. The supervisor's operational methods still return NotImplemented.
+to run a tracee. The supervisor runs and reopens qualified routed workloads; unqualified operations remain refused.
 
 Each role's `provider` module owns Request/Response types, a generic `serve_provider`
 harness and a proxy (`connect` returns paired platform proxies). A new backend package
@@ -104,7 +107,8 @@ the cursor on early iterator drop. Records never accumulate unboundedly in the p
 CI checks Rust targets and doctests on Linux and macOS. These checks do not qualify
 production tracing coverage, kernel enforcement, remote NFS durability or vendor
 agent behavior. The Rust macOS tracer and NFS/local storage are implemented;
-the Linux tracer, file journal and agent adapters remain stubs. Environment-gated
+the Linux tracer remains a stub. The file journal supports the routed lifecycle;
+agent workflow qualification remains separate. Environment-gated
 fixture and mounted-NFS tests require explicit executed verdicts for qualification.
 
 The common transport is version 3. Installation descriptors must set

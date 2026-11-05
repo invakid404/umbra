@@ -11,8 +11,9 @@ This document describes the required buildout architecture and current M1/M1.5
 implementation. Provider harnesses/proxies, Darwin arm64 tracing, local and NFS
 storage, and overlay transactions with logical symlinks are implemented. Six of
 seven Rust tracer fixtures are CAPTURED; `exec-write` remains the documented M2
-gap. End-to-end CLI/supervisor execution, file-journal persistence and vendor agent
-plans remain unimplemented. Backend qualification, recovery and production
+gap. End-to-end CLI/supervisor execution and file-journal persistence are implemented
+and exercised by the userspace-routing suite. Vendor agent workflows remain
+unqualified. Backend qualification, recovery and production
 enforcement remain incomplete. Per-crate READMEs describe local implementation status.
 
 The [engineering handoff](docs/handoff.md) supplies the product and filesystem
@@ -34,7 +35,7 @@ library and provider binary belong to the same package. Existing
 | [umbra-platform-linux](crates/umbra-platform-linux/README.md) | Linux ptrace, aarch64/x86-64 ABIs and enforcement | `umbra-platform`, `umbra-core` |
 | [umbra-storage](crates/umbra-storage/README.md) | Run storage operations, capabilities, durability and writer authority; storage protocol | `umbra-core` |
 | [umbra-storage-nfs](crates/umbra-storage-nfs/README.md) | Validated mounted NFS layout, shadow primitives, remote durability and fencing | `umbra-storage`, `umbra-core` |
-| [umbra-storage-nfs-userspace](crates/umbra-storage-nfs-userspace/README.md) | Frozen userspace NFSv4.0 facade interfaces and a provider scaffold; no I/O is wired | `umbra-storage`, `umbra-core` |
+| [umbra-storage-nfs-userspace](crates/umbra-storage-nfs-userspace/README.md) | Userspace NFSv4.0 client, anchored storage operations, cooperative writer authority and routed I/O | `umbra-storage`, `umbra-core` |
 | [umbra-storage-local](crates/umbra-storage-local/README.md) | Equivalent semantic API for development and local persistence | `umbra-storage`, `umbra-core` |
 | [umbra-storage-tar](crates/umbra-storage-tar/README.md) | Indexed tar snapshots, persistent staging and local durability for small runs | `umbra-storage`, `umbra-core` |
 | [umbra-overlay](crates/umbra-overlay/README.md) | Namespace contracts and shared copy-up, read-through and whiteout engine; namespace protocol | `umbra-core`, `umbra-storage`, `umbra-journal` |
@@ -207,8 +208,10 @@ Storage owns fenced single-writer authority; the journal records its evidence.
 Lease expiry alone cannot permit takeover while old descriptors or mappings remain
 writable. Renewal must not depend on indefinitely blocked trace-event reads. Lease
 loss prevents mutation and requests quiescence. The file journal is required to
-store framed, checksummed records in the injected control directory on the selected
-backing store; its runtime methods currently return `NotImplemented`. A torn final
+store framed, checksummed records in its injected control directory. For
+userspace-routed runs that directory lives on the host under `--state-dir`, since
+the storage provider exposes no physical path; resume requires the retained log.
+This is single-host recovery, not cross-machine handoff. A torn final
 frame may be recovered under documented rules; interior corruption is an error.
 
 For checkpoint/handoff, reject new mutations and children, quiesce the whole tree,
@@ -225,15 +228,17 @@ using its stable recorded session. External credentials remain external.
 26.5.1 arm64 with SIP enabled and permits moving to M1. It used a local NFS stub.
 M1/M1.5 subsequently implemented the Rust tracer (six of seven fixture cases
 CAPTURED), storage backends and overlay copy-up/read-through, byte path/dirfd
-resolution and logical symlinks. These components are not yet wired into an
-end-to-end CLI. Outstanding qualification includes the Rust `exec-write` gap,
+resolution and logical symlinks. The userspace-routing suite now exercises the end-to-end CLI with live Ganesha,
+independent NFS readback and a host journal. The rank-14 SQLx workload still fails
+at SQLite connection setup with `SQLITE_IOERR_ACCESS`; a completed journal and
+clean writer release do not imply application success. Outstanding qualification includes the Rust `exec-write` gap,
 multithreaded fork, raw vfork, non-null spawn attributes/file actions, broader
 wait semantics, exec argv[0], native namespace/descriptor integration, hard links,
 Rosetta/JIT, real NFS durability and independent fail-closed sandbox composition.
 
 [CI](.github/workflows/ci.yml) runs the four workspace formatting/lint/check/test
 commands plus doctests on pushes to `master` and pull requests, on `macos-14` and
-`ubuntu-latest`, using the pinned toolchain and cached Cargo registry/build
+`ubuntu-latest`, using the pinned toolchain and cached Cargo registry and dependency source
 directories. This runner label maps to Apple Silicon in the
 [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners);
 the workflow also checks the host architecture. Each matrix job builds on its native host. CI compilation does not reproduce
