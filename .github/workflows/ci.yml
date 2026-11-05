@@ -505,6 +505,13 @@ jobs:
           python3 experiments/fixtures/umbra-slate-r12-build.py
           echo "UMBRA_R12_PATH=$GITHUB_WORKSPACE/target/debug/slate-r12/publication" >> "$GITHUB_ENV"
           echo "UMBRA_R12_PROVIDER=$GITHUB_WORKSPACE/target/debug/slate-r12/provider" >> "$GITHUB_ENV"
+      - name: Build pinned rank-14 SQLite fixture
+        run: |
+          df -h /System/Volumes/Data
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build --locked --manifest-path experiments/fixtures/umbra-slate-r14-sqlite/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
+          echo "UMBRA_SLATE_R14_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r14-sqlite" >> "$GITHUB_ENV"
+          echo "UMBRA_SLATE_R14_EVIDENCE=/tmp/slate-evidence-$GITHUB_RUN_ID/rank14" >> "$GITHUB_ENV"
 
       - name: Proof 1 -- end to end, the toy and the Rust I/O fixture must exit 0
         run: |
@@ -604,6 +611,14 @@ jobs:
           name: slate-r12-readings-${{ github.run_id }}
           path: /tmp/slate-evidence-${{ github.run_id }}/C12-*
           if-no-files-found: error
+      - name: Upload rank-14 readings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rank14-sqlite-readings-${{ github.run_id }}
+          path: /tmp/slate-evidence-${{ github.run_id }}/rank14
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload userspace slate evidence on failure
         if: failure()
