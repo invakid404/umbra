@@ -10986,12 +10986,16 @@ fn c12_case(mode: u8) {
     let Some(evidence_root) = slate_evidence() else {
         return;
     };
+    let Some(program) = input("UMBRA_R12_PATH") else {
+        return;
+    };
+    let Some(provider) = input("UMBRA_R12_PROVIDER") else {
+        return;
+    };
+    let program = PathBuf::from(program);
+    let provider = PathBuf::from(provider);
     let evidence = evidence_root.join(format!("C12-{mode:02}"));
     std::fs::create_dir(&evidence).expect("fresh evidence directory: never overwrite a reading");
-    let program = PathBuf::from(std::env::var_os("UMBRA_R12_PATH").expect("prebuilt C12 fixture"));
-    let provider = PathBuf::from(
-        std::env::var_os("UMBRA_R12_PROVIDER").expect("prebuilt C12 observer provider"),
-    );
     let mut hashes = String::new();
     for path in [
         &program,
@@ -11106,6 +11110,7 @@ fn c12_case(mode: u8) {
     // Preserve the storage journal independently from the supervisor journal.
     // Names are pinned by journal.rs key_name/precondition_name/operation_name.
     let mut journal = serde_json::Map::new();
+    let mut retained_intents = Vec::new();
     let mut private = src_path[..3].to_vec();
     private.extend([b".provider".to_vec(), b"retries".to_vec()]);
     for record in &records {
@@ -11138,20 +11143,7 @@ fn c12_case(mode: u8) {
                 umbra_core::StorageOperation::Unlink { .. }
             ) && name.starts_with("key-")
             {
-                let retained: (
-                    umbra_core::StorageRequest,
-                    Option<umbra_core::Result<umbra_core::StorageResponse>>,
-                ) = serde_json::from_slice(bytes.as_ref().expect("retained unlink intent"))
-                    .unwrap();
-                assert_eq!(retained.0, request);
-                let failure = retained
-                    .1
-                    .expect("recorded failure")
-                    .expect_err("uncertain removal is never recorded as success");
-                assert_eq!(
-                    serde_json::to_value(&failure).unwrap(),
-                    record["value"]["result"]["Err"]
-                );
+                retained_intents.push((bytes.clone(), request.clone(), record));
             }
             journal.insert(name, serde_json::json!(bytes));
         }
@@ -11167,6 +11159,21 @@ fn c12_case(mode: u8) {
         serde_json::to_vec_pretty(&result).unwrap(),
     )
     .unwrap();
+    for (bytes, request, record) in retained_intents {
+        let retained: (
+            umbra_core::StorageRequest,
+            Option<umbra_core::Result<umbra_core::StorageResponse>>,
+        ) = serde_json::from_slice(bytes.as_ref().expect("retained unlink intent")).unwrap();
+        assert_eq!(retained.0, request);
+        let failure = retained
+            .1
+            .expect("recorded failure")
+            .expect_err("uncertain removal is never recorded as success");
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            record["value"]["result"]["Err"]
+        );
+    }
     // Capture before assertions so a falsified prediction retains the reading.
     assert_workspace_pristine(&run);
     assert_host_write_root_empty(&run);
@@ -11309,18 +11316,16 @@ fn slate_c12_provider_handshake() {
     let Some((host, port)) = fixture() else {
         return;
     };
+    let Some(provider) = input("UMBRA_R12_PROVIDER") else {
+        return;
+    };
     let scratch = tempfile::tempdir().unwrap();
     let path = registry(scratch.path(), &host, port);
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let mut descriptor: umbra_core::provider::ProviderDescriptor =
         serde_json::from_value(value["providers"]["storage"].clone()).unwrap();
-    descriptor.executable = BytePath::new(
-        PathBuf::from(std::env::var_os("UMBRA_R12_PROVIDER").unwrap())
-            .as_os_str()
-            .as_bytes()
-            .to_vec(),
-    )
-    .unwrap();
+    descriptor.executable =
+        BytePath::new(PathBuf::from(provider).as_os_str().as_bytes().to_vec()).unwrap();
     let mut options: serde_json::Value = serde_json::from_slice(&descriptor.options).unwrap();
     options["c12_log"] = serde_json::json!(scratch.path().join("handshake.jsonl"));
     descriptor.options = serde_json::to_vec(&options).unwrap();
