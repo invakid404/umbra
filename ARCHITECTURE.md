@@ -9,9 +9,9 @@ explicit development or local-persistence choice and cannot satisfy that claim.
 
 This document describes the required buildout architecture and current M1/M1.5
 implementation. Provider harnesses/proxies, Darwin arm64 tracing, local and NFS
-storage, and overlay transactions with logical symlinks are implemented. Six of
-seven Rust tracer fixtures are CAPTURED; `exec-write` remains the documented M2
-gap. End-to-end CLI/supervisor execution and file-journal persistence are implemented
+storage, and overlay transactions with logical symlinks are implemented. The Rust
+tracer fixture suite includes the repaired `exec-write` path; its qualification
+boundaries are recorded in the platform README. End-to-end CLI/supervisor execution and file-journal persistence are implemented
 and exercised by the userspace-routing suite. Vendor agent workflows remain
 unqualified. Backend qualification, recovery and production
 enforcement remain incomplete. Per-crate READMEs describe local implementation status.
@@ -226,12 +226,12 @@ using its stable recorded session. External credentials remain external.
 
 [Gate 2](docs/m0/gate-2.md) passed six disposable Python fixture cases on macOS
 26.5.1 arm64 with SIP enabled and permits moving to M1. It used a local NFS stub.
-M1/M1.5 subsequently implemented the Rust tracer (six of seven fixture cases
-CAPTURED), storage backends and overlay copy-up/read-through, byte path/dirfd
+M1/M1.5 subsequently implemented the Rust tracer, storage backends and overlay copy-up/read-through, byte path/dirfd
 resolution and logical symlinks. The userspace-routing suite now exercises the end-to-end CLI with live Ganesha,
 independent NFS readback and a host journal. The rank-14 SQLx workload still fails
 at SQLite connection setup with `SQLITE_IOERR_ACCESS`; a completed journal and
-clean writer release do not imply application success. Outstanding qualification includes the Rust `exec-write` gap,
+clean writer release do not imply application success. The platform README records
+the repaired `exec-write` path and current qualification boundaries. Remaining work includes
 multithreaded fork, raw vfork, non-null spawn attributes/file actions, broader
 wait semantics, exec argv[0], native namespace/descriptor integration, hard links,
 Rosetta/JIT, real NFS durability and independent fail-closed sandbox composition.
