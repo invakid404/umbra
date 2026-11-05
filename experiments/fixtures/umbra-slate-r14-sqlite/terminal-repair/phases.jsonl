@@ -1,0 +1,36 @@
+{"data":{"pid":7041,"version":1},"kind":"HELLO","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"ready","seq":1}
+{"data":"r14-ping","kind":"PING","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"ready","seq":2}
+{"data":{"compile_options":["ATOMIC_INTRINSICS=1","COMPILER=clang-21.0.0","DEFAULT_AUTOVACUUM","DEFAULT_CACHE_SIZE=-2000","DEFAULT_FILE_FORMAT=4","DEFAULT_FOREIGN_KEYS","DEFAULT_JOURNAL_SIZE_LIMIT=-1","DEFAULT_MMAP_SIZE=0","DEFAULT_PAGE_SIZE=4096","DEFAULT_PCACHE_INITSZ=20","DEFAULT_RECURSIVE_TRIGGERS","DEFAULT_SECTOR_SIZE=4096","DEFAULT_SYNCHRONOUS=2","DEFAULT_WAL_AUTOCHECKPOINT=1000","DEFAULT_WAL_SYNCHRONOUS=2","DEFAULT_WORKER_THREADS=0","DIRECT_OVERFLOW_READ","ENABLE_API_ARMOR","ENABLE_COLUMN_METADATA","ENABLE_DBSTAT_VTAB","ENABLE_FTS3","ENABLE_FTS3_PARENTHESIS","ENABLE_FTS5","ENABLE_LOAD_EXTENSION","ENABLE_MEMORY_MANAGEMENT","ENABLE_RTREE","ENABLE_STAT4","HAVE_ISNAN","MALLOC_SOFT_LIMIT=1024","MAX_ATTACHED=10","MAX_COLUMN=2000","MAX_COMPOUND_SELECT=500","MAX_DEFAULT_PAGE_SIZE=8192","MAX_EXPR_DEPTH=1000","MAX_FUNCTION_ARG=1000","MAX_LENGTH=1000000000","MAX_LIKE_PATTERN_LENGTH=50000","MAX_MMAP_SIZE=0x7fff0000","MAX_PAGE_COUNT=0xfffffffe","MAX_PAGE_SIZE=65536","MAX_SQL_LENGTH=1000000000","MAX_TRIGGER_DEPTH=1000","MAX_VARIABLE_NUMBER=32766","MAX_VDBE_OP=250000000","MAX_WORKER_THREADS=8","MUTEX_PTHREADS","SOUNDEX","SYSTEM_MALLOC","TEMP_STORE=1","THREADSAFE=1","USE_URI"],"fixture":"slate-r14-v1","version":"3.51.3"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"engine","seq":3}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"connect","seq":4}
+{"data":{"result":"Pool { size: 1, num_idle: 1, is_closed: false, options: PoolOptions { max_connections: 1, min_connections: 0, connect_timeout: 30s, max_lifetime: Some(1800s), idle_timeout: Some(600s), test_before_acquire: true } }"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"connect","seq":5}
+{"data":{"result":"PoolConnection"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"acquire","seq":6}
+{"data":{"name":"unix","rc":0},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"vfs","seq":7}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"journal_mode","seq":8}
+{"data":{"result":"[\"wal\"]"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"journal_mode","seq":9}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"synchronous","seq":10}
+{"data":{"result":"[\"1\"]"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"synchronous","seq":11}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"auto_vacuum","seq":12}
+{"data":{"result":"[\"2\"]"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"auto_vacuum","seq":13}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"busy_timeout","seq":14}
+{"data":{"result":"[\"5000\"]"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"busy_timeout","seq":15}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"compile_options","seq":16}
+{"data":{"result":"[\"ATOMIC_INTRINSICS=1\", \"COMPILER=clang-21.0.0\", \"DEFAULT_AUTOVACUUM\", \"DEFAULT_CACHE_SIZE=-2000\", \"DEFAULT_FILE_FORMAT=4\", \"DEFAULT_FOREIGN_KEYS\", \"DEFAULT_JOURNAL_SIZE_LIMIT=-1\", \"DEFAULT_MMAP_SIZE=0\", \"DEFAULT_PAGE_SIZE=4096\", \"DEFAULT_PCACHE_INITSZ=20\", \"DEFAULT_RECURSIVE_TRIGGERS\", \"DEFAULT_SECTOR_SIZE=4096\", \"DEFAULT_SYNCHRONOUS=2\", \"DEFAULT_WAL_AUTOCHECKPOINT=1000\", \"DEFAULT_WAL_SYNCHRONOUS=2\", \"DEFAULT_WORKER_THREADS=0\", \"DIRECT_OVERFLOW_READ\", \"ENABLE_API_ARMOR\", \"ENABLE_COLUMN_METADATA\", \"ENABLE_DBSTAT_VTAB\", \"ENABLE_FTS3\", \"ENABLE_FTS3_PARENTHESIS\", \"ENABLE_FTS5\", \"ENABLE_LOAD_EXTENSION\", \"ENABLE_MEMORY_MANAGEMENT\", \"ENABLE_RTREE\", \"ENABLE_STAT4\", \"HAVE_ISNAN\", \"MALLOC_SOFT_LIMIT=1024\", \"MAX_ATTACHED=10\", \"MAX_COLUMN=2000\", \"MAX_COMPOUND_SELECT=500\", \"MAX_DEFAULT_PAGE_SIZE=8192\", \"MAX_EXPR_DEPTH=1000\", \"MAX_FUNCTION_ARG=1000\", \"MAX_LENGTH=1000000000\", \"MAX_LIKE_PATTERN_LENGTH=50000\", \"MAX_MMAP_SIZE=0x7fff0000\", \"MAX_PAGE_COUNT=0xfffffffe\", \"MAX_PAGE_SIZE=65536\", \"MAX_SQL_LENGTH=1000000000\", \"MAX_TRIGGER_DEPTH=1000\", \"MAX_VARIABLE_NUMBER=32766\", \"MAX_VDBE_OP=250000000\", \"MAX_WORKER_THREADS=8\", \"MUTEX_PTHREADS\", \"SOUNDEX\", \"SYSTEM_MALLOC\", \"TEMP_STORE=1\", \"THREADSAFE=1\", \"USE_URI\"]"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"compile_options","seq":17}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"version","seq":18}
+{"data":{"result":"\"3.51.3\""},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"version","seq":19}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"schema","seq":20}
+{"data":{"result":"SqliteQueryResult { changes: 0, last_insert_rowid: 0 }"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"schema","seq":21}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"initial-rows","seq":22}
+{"data":{"result":"[]"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"initial-rows","seq":23}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"begin","seq":24}
+{"data":{"result":"SqliteQueryResult { changes: 0, last_insert_rowid: 0 }"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"begin","seq":25}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"insert","seq":26}
+{"data":{"result":"SqliteQueryResult { changes: 1, last_insert_rowid: 1 }"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"insert","seq":27}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"commit","seq":28}
+{"data":{"result":"SqliteQueryResult { changes: 1, last_insert_rowid: 1 }"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"commit","seq":29}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"rows","seq":30}
+{"data":{"result":"[\"r14-new\"]"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"rows","seq":31}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"integrity","seq":32}
+{"data":{"result":"[\"ok\"]"},"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"integrity","seq":33}
+{"data":null,"kind":"BEFORE","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"close","seq":34}
+{"data":null,"kind":"AFTER","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"close","seq":35}
+{"data":{"ok":true},"kind":"TERMINAL","nonce":"90df765e-7849-4199-aacb-2f15b6e5f235","phase":"done","seq":36}

@@ -1,0 +1,1 @@
+APPARATUS_FAILURE: Socket is not connected (os error 57)

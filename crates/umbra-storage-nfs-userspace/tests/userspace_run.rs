@@ -12916,11 +12916,15 @@ fn slate_r14_instrument_repair_replay() {
 fn slate_r14_terminal_repair_replay() {
     use std::io::Write;
     use std::time::{Duration, Instant};
-    let source = PathBuf::from(
-        std::env::var_os("UMBRA_SLATE_R14_REPLAY").expect("retained observer directory required"),
-    );
-    let evidence =
-        PathBuf::from(std::env::var_os("UMBRA_SLATE_R14_EVIDENCE").expect("evidence required"));
+    let source = std::env::var_os("UMBRA_SLATE_R14_REPLAY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            repository().join("experiments/fixtures/umbra-slate-r14-sqlite/terminal-repair")
+        });
+    let temporary = tempfile::tempdir().unwrap();
+    let evidence = std::env::var_os("UMBRA_SLATE_R14_EVIDENCE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| temporary.path().to_path_buf());
     let raw = std::fs::read_to_string(source.join("phases.jsonl")).unwrap();
     let failure = std::fs::read_to_string(source.join("apparatus-failure.txt")).unwrap();
     assert!(failure.contains("Socket is not connected (os error 57)"));
