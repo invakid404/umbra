@@ -1,0 +1,14 @@
+[package]
+name = "umbra-slate-r14-sqlite"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
+libsqlite3-sys = { version = "=0.37.0", default-features = false }
+tokio = { version = "=1.52.3", features = ["rt", "time"] }
+serde_json = "1"
+log = "0.4"
