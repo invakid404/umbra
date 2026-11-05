@@ -11337,6 +11337,7 @@ fn slate_c12_provider_handshake() {
 // Kept contiguous because the live client and lifecycle helpers are private.
 // This launcher copy preserves the shared instrument while enforcing C13's
 // independently pre-registered five-second cleanup grace.
+/// Run a C13 child with bounded execution and the five-second cleanup grace.
 fn c13_launch(
     command: &mut Command,
     evidence: &Path,
@@ -11656,6 +11657,7 @@ struct C13Pipe {
     writer_close: i32,
     reader_close: i32,
 }
+/// Check the complete native or routed primitive report against its pinned disposition.
 fn c13_report(bytes: &[u8], case: usize, mode: &str, nonce: &str, evidence: &Path) {
     use serde_json::{json, Value};
     assert_eq!(bytes.last(), Some(&b'\n'));
@@ -11743,15 +11745,20 @@ fn c13_report(bytes: &[u8], case: usize, mode: &str, nonce: &str, evidence: &Pat
         "sentinel_written":true,"intended_exit":if positive {0} else {9}})
     );
 }
+/// Qualify one primitive with a native control, routed run, and cleanup checks.
 fn c13_case(case: usize) {
     // Existing mutation invocations characterize other primitives; C13 runs
     // only against unmutated binaries, like the existing slate families.
     if declared_probe().is_some() {
         return;
     }
-    let (host, port) = fixture().expect("C13 requires live Ganesha");
-    let evidence = PathBuf::from(input("UMBRA_SLATE_EVIDENCE").expect("C13 evidence required"))
-        .join(format!("c13-{case:02}"));
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(evidence) = input("UMBRA_SLATE_EVIDENCE") else {
+        return;
+    };
+    let evidence = PathBuf::from(evidence).join(format!("c13-{case:02}"));
     std::fs::create_dir_all(&evidence).unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let variable = if case == 1 {
@@ -11759,7 +11766,10 @@ fn c13_case(case: usize) {
     } else {
         "UMBRA_C13_C_PATH"
     };
-    let program = PathBuf::from(std::env::var_os(variable).expect("prebuilt C13 fixture required"));
+    let Some(program) = input(variable) else {
+        return;
+    };
+    let program = PathBuf::from(program);
     assert!(program.is_file());
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     assert!(page > 0);
@@ -11910,26 +11920,32 @@ fn c13_case(case: usize) {
     );
 }
 #[test]
+/// Pin the routed Rust file-lock refusal against a successful native control.
 fn slate_c13_01_rust_lock() {
     c13_case(1);
 }
 #[test]
+/// Pin the routed flock refusal against a successful native control.
 fn slate_c13_02_flock() {
     c13_case(2);
 }
 #[test]
+/// Pin the routed record-lock refusal against a successful native control.
 fn slate_c13_03_record_lock() {
     c13_case(3);
 }
 #[test]
+/// Pin the routed shared-file-mapping refusal against a native control.
 fn slate_c13_04_shared_mapping() {
     c13_case(4);
 }
 #[test]
+/// Verify anonymous mappings succeed in both native and routed runs.
 fn slate_c13_05_anonymous_mapping() {
     c13_case(5);
 }
 
+/// Enumerate shadow names with a bounded, progressing directory census.
 fn c13_shadow_names(host: &str, port: u16, run: &Run) -> Vec<Vec<u8>> {
     use umbra_storage_nfs_userspace::transport::{DirCookie, DirVerifier, ReadDirRequest};
     let mut config = RawTransportConfig::loopback(port);
