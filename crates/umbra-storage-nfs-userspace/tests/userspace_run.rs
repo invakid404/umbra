@@ -12977,3 +12977,293 @@ fn slate_r14_terminal_repair_replay() {
     }
     std::fs::write(evidence.join("result.txt"), "retained ENOTCONN false reading removed on identical phase bytes; incomplete exchange rejected as EOF before terminal exchange\n").unwrap();
 }
+
+
+// ---- slate-r17: native watcher failure and degraded behavior ----
+fn r17_records(bytes: &[u8], nonce: &str) -> Vec<serde_json::Value> {
+    let mut tail = bytes;
+    let mut records = Vec::new();
+    while !tail.is_empty() {
+        let colon = tail.iter().position(|b| *b == b':').expect("frame length");
+        let len: usize = std::str::from_utf8(&tail[..colon])
+            .unwrap()
+            .parse()
+            .unwrap();
+        tail = &tail[colon + 1..];
+        assert!(tail.len() > len, "incomplete frame");
+        let record: serde_json::Value = serde_json::from_slice(&tail[..len]).unwrap();
+        assert_eq!(record["version"], 1);
+        assert_eq!(record["nonce"], nonce);
+        assert_eq!(record["seq"], records.len());
+        assert!(record["pid"].as_u64().unwrap() > 0);
+        assert!(record["us"].is_u64());
+        assert_eq!(tail[len], b'\n');
+        tail = &tail[len + 1..];
+        records.push(record);
+    }
+    assert_eq!(records.first().unwrap()["phase"], "BEGIN");
+    assert_eq!(records.last().unwrap()["phase"], "COMPLETE");
+    assert_eq!(records.last().unwrap()["data"]["records"], records.len());
+    assert_eq!(
+        r17_phase(&records, "channel"),
+        &serde_json::json!("C17-CHANNEL")
+    );
+    records
+}
+fn r17_phase<'a>(records: &'a [serde_json::Value], phase: &str) -> &'a serde_json::Value {
+    let found: Vec<_> = records.iter().filter(|r| r["phase"] == phase).collect();
+    assert_eq!(found.len(), 1, "{phase}: {records:?}");
+    &found[0]["data"]
+}
+fn r17_assert(records: &[serde_json::Value], case: usize, native: bool, nonce: &str) {
+    use serde_json::json;
+    if case == 3 {
+        let receipt = r17_phase(records, "registration");
+        assert_eq!(receipt["return"], 1);
+        assert_eq!(
+            receipt["flags"].as_u64().unwrap() & libc::EV_ERROR as u64,
+            libc::EV_ERROR as u64
+        );
+        assert_eq!(receipt["data"], if native { 0 } else { libc::EBADF });
+        assert_eq!(
+            r17_phase(records, "read"),
+            &json!(if native { nonce } else { "SEED" })
+        );
+        assert_eq!(r17_phase(records, "list"), &json!(["seed"]));
+        if native {
+            let event = r17_phase(records, "event");
+            assert_eq!(event["return"], 1);
+            assert_eq!(event["filter"], libc::EVFILT_VNODE);
+            assert_ne!(
+                event["fflags"].as_u64().unwrap() & libc::NOTE_WRITE as u64,
+                0
+            );
+            assert_eq!(event["ident"], event["expected_fd"]);
+        } else {
+            assert_eq!(r17_phase(records, "mutation"), &json!("NOT_APPLICABLE"));
+        }
+        assert_eq!(r17_phase(records, "teardown"), &json!(true));
+        return;
+    }
+    assert_eq!(r17_phase(records, "constructor")["ok"], true);
+    assert_eq!(r17_phase(records, "teardown")["overflow"], false);
+    let callbacks: Vec<_> = records
+        .iter()
+        .filter(|r| r["phase"] == "callback")
+        .collect();
+    assert!(callbacks.iter().all(|r| r["data"].get("error").is_none()));
+    if case == 1 {
+        assert!(callbacks.is_empty());
+        return;
+    }
+    assert_eq!(r17_phase(records, "registration")["ok"], true);
+    assert_eq!(r17_phase(records, "read"), &json!(nonce.as_bytes()));
+    assert_eq!(r17_phase(records, "list"), &json!([format!("{nonce}.txt")]));
+    let begin = r17_phase(records, "observation-start").as_u64().unwrap();
+    let end = r17_phase(records, "observation-end").as_u64().unwrap();
+    assert!(end >= begin + 5_000_000);
+    let matching = callbacks
+        .iter()
+        .filter(|r| {
+            let data = &r["data"];
+            let us = data["us"].as_u64().unwrap();
+            us >= begin
+                && us <= end
+                && data["paths"].as_array().unwrap().iter().any(|p| {
+                    Path::new(p.as_str().unwrap()).file_name().unwrap()
+                        == format!("{nonce}.txt").as_str()
+                })
+        })
+        .count();
+    assert_eq!(matching > 0, native, "bounded callback prediction");
+}
+fn r17_case(case: usize) {
+    if declared_probe().is_some() {
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(evidence) = input("UMBRA_SLATE_R17_EVIDENCE") else {
+        return;
+    };
+    let Some(program) = input(if case == 3 {
+        "UMBRA_R17_VNODE_PATH"
+    } else {
+        "UMBRA_R17_NOTIFY_PATH"
+    }) else {
+        return;
+    };
+    let evidence = PathBuf::from(evidence).join(format!("C17-{case:02}"));
+    assert!(!evidence.exists(), "never overwrite a reading");
+    std::fs::create_dir_all(&evidence).unwrap();
+    let program = PathBuf::from(program);
+    std::fs::write(
+        evidence.join("fixture.sha256"),
+        r14_sha256(&std::fs::read(&program).unwrap()),
+    )
+    .unwrap();
+    for (name, path) in [
+        (
+            "notify-lock",
+            repository().join("experiments/fixtures/umbra-slate-r17-notify/Cargo.lock"),
+        ),
+        ("umbra", binaries().join("umbra")),
+        ("platform", binaries().join("umbra-platform-macos")),
+        ("storage", binaries().join("umbra-storage-nfs-userspace")),
+    ] {
+        std::fs::write(
+            evidence.join(format!("{name}.sha256")),
+            r14_sha256(&std::fs::read(path).unwrap()),
+        )
+        .unwrap();
+    }
+
+    for (key, executable, args) in [
+        ("commit", "git", vec!["rev-parse", "HEAD"]),
+        ("os", "uname", vec!["-a"]),
+        ("toolchain", "rustc", vec!["-Vv"]),
+    ] {
+        let output = Command::new(executable).args(args).output().unwrap();
+        assert!(output.status.success());
+        std::fs::write(evidence.join(key), output.stdout).unwrap();
+    }
+    for native in [true, false] {
+        let side = if native { "native" } else { "routed" };
+        let scratch = evidence.join(side);
+        std::fs::create_dir(&scratch).unwrap();
+        let scratch = scratch.canonicalize().unwrap();
+        let root = scratch.join("root");
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        std::fs::create_dir(root.join("evidence")).unwrap();
+        if case == 3 {
+            std::fs::write(root.join("work/seed"), b"SEED").unwrap();
+        }
+        let before = r14_snapshot(&root);
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        std::fs::write(scratch.join("nonce"), &nonce).unwrap();
+        let state = scratch.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let registry = registry(&scratch, &host, port);
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        config["timeout_ms"] = serde_json::json!(45000);
+        std::fs::write(&registry, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let mut command = if native {
+            Command::new(&program)
+        } else {
+            assert_no_nfs_mount(&host, port, &[&root], "C17 before");
+            let mut c = Command::new(binaries().join("umbra"));
+            c.args(["run", "--registry"])
+                .arg(&registry)
+                .arg("--workspace")
+                .arg(&root)
+                .arg("--state-dir")
+                .arg(&state)
+                .args(["--experimental", "--"])
+                .arg(&program);
+            c
+        };
+        command
+            .arg(if case == 1 {
+                "construct"
+            } else if case == 2 {
+                "register"
+            } else {
+                "vnode"
+            })
+            .arg(&root)
+            .arg(&nonce);
+        let (output, timed) = slate_launch(
+            &mut command,
+            &scratch.join("launch"),
+            std::time::Duration::from_secs(60),
+            None,
+        );
+        let bytes;
+        if native {
+            bytes = std::fs::read(root.join("evidence/result")).unwrap();
+            if case == 1 {
+                assert_eq!(
+                    r14_snapshot(&root.join("work")),
+                    std::collections::BTreeMap::new()
+                );
+            }
+            if case == 2 {
+                assert_eq!(
+                    std::fs::read(root.join("work").join(format!("{nonce}.txt"))).unwrap(),
+                    nonce.as_bytes()
+                );
+            }
+            if case == 3 {
+                assert_eq!(
+                    std::fs::read(root.join("work/seed")).unwrap(),
+                    nonce.as_bytes()
+                );
+            }
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let id = stderr
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("umbra: run ")
+                        .and_then(|v| v.strip_suffix(" prepared"))
+                })
+                .expect("run id");
+            let mut run = Run {
+                run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+                status: output.status.code(),
+                stderr,
+                destination: root.join("evidence/result"),
+                state,
+                workspace: root.clone(),
+                registry,
+            };
+            let observed = read_whole_object_through_client(&host, port, &shadow_path(&run));
+            std::fs::write(scratch.join("report-observation"), format!("{observed:?}")).unwrap();
+            assert_eq!(before, r14_snapshot(&root), "host roots changed");
+            assert_host_write_root_empty(&run);
+            bytes = observed.expect("required result channel");
+            std::fs::write(scratch.join("result.frames"), &bytes).unwrap();
+            if case == 2 {
+                run.destination = root.join("work").join(format!("{nonce}.txt"));
+                assert_eq!(
+                    read_whole_object_through_client(&host, port, &shadow_path(&run)).unwrap(),
+                    nonce.as_bytes()
+                );
+            }
+            assert_eq!(run.child_exit(), 0, "{}", run.stderr);
+            assert!(journal_records_completion(&run));
+            assert_no_nfs_mount(&host, port, &[&root], "C17 after");
+        }
+        std::fs::write(scratch.join("result.frames"), &bytes).unwrap();
+        assert!(!timed, "deadline");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records = r17_records(&bytes, &nonce);
+        std::fs::write(
+            scratch.join("records.json"),
+            serde_json::to_vec_pretty(&records).unwrap(),
+        )
+        .unwrap();
+        slate_finish_cleanup();
+        let cleanup = std::fs::read_to_string(scratch.join("launch.cleanup")).unwrap();
+        assert!(r14_cleanup_clean(&cleanup), "{cleanup}");
+        r17_assert(&records, case, native, &nonce);
+    }
+}
+#[test]
+fn slate_r17_01_notify_constructor() {
+    r17_case(1);
+}
+#[test]
+fn slate_r17_02_notify_registration() {
+    r17_case(2);
+}
+#[test]
+fn slate_r17_03_vnode_receipt() {
+    r17_case(3);
+}

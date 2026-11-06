@@ -514,6 +514,16 @@ jobs:
           echo "UMBRA_SLATE_R14_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r14-sqlite" >> "$GITHUB_ENV"
           echo "UMBRA_SLATE_R14_EVIDENCE=/tmp/slate-evidence-$GITHUB_RUN_ID/rank14-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
+      - name: Build rank-17 native watcher fixtures
+        run: |
+          df -h /System/Volumes/Data
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build --locked --manifest-path experiments/fixtures/umbra-slate-r17-notify/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
+          cc -Wall -Wextra -Werror experiments/fixtures/umbra-slate-r17-vnode.c -o "$GITHUB_WORKSPACE/target/debug/umbra-slate-r17-vnode"
+          echo "UMBRA_R17_NOTIFY_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r17-notify" >> "$GITHUB_ENV"
+          echo "UMBRA_R17_VNODE_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r17-vnode" >> "$GITHUB_ENV"
+          echo "UMBRA_SLATE_R17_EVIDENCE=/tmp/slate-evidence-$GITHUB_RUN_ID/rank17-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
       - name: Proof 1 -- end to end, the toy and the Rust I/O fixture must exit 0
         run: |
           cargo build --workspace --bins
