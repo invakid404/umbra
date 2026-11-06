@@ -83,7 +83,7 @@ a run, a supervised command over it cannot have its file operations serviced by
 rewriting a syscall's path operand, so umbra loads an interposer into the tracee
 and services `open`, `read`, `write` and `close` itself, through the overlay and
 that client. `touch`, `cat`, `mkdir` and `ls` work over it too, routed through
-the tracer rather than the interposer. A third CI job proves all of it against
+the tracer rather than the interposer. The userspace-routing CI job proves all of it against
 the same Ganesha container on the macOS runner: an end-to-end
 create/write/close/reopen/read/compare for the toy, the four standard utilities
 against the store read back through the client, and seven mutation probes that
@@ -101,7 +101,7 @@ path does **not** claim, and why, is enumerated in that crate's README. The
 `UMBRA_TEST_SKIP_NFS_MATRIX` opt-out above is unaffected: it is about the mounted
 `storage-nfs` adapter, which the routed path does not replace.
 
-Fork pull requests cannot run either self-hosted job -- the `m1-transport-raw`
+Fork pull requests cannot run either self-hosted job -- the `native-qualification`
 qualification job or the `native-userspace-routing` routing job -- and neither
 checkout persists job credentials. A labeled runner must be provisioned before
 those checks can supply a CI signal; a queued job is not enforcement evidence.

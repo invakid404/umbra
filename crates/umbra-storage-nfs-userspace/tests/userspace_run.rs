@@ -10921,3 +10921,414 @@ fn slate_c11_signal_observer_qualification() {
     }
     assert_eq!(statuses, [Some(libc::SIGHUP), Some(libc::SIGHUP)]);
 }
+
+// ---- slate-r12: temporary-file publication and deletion ----
+const C12_SRC: &[u8] = b"C12 complete source\n";
+const C12_DST: &[u8] = b"C12 original destination, deliberately longer\n";
+
+// Only NOENT is absence. Every transport/protocol failure is unavailable evidence.
+fn c12_read(host: &str, port: u16, path: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut config = RawTransportConfig::loopback(port);
+    config.host = host.into();
+    let deadline = Deadline { millis: 10_000 };
+    let mut transport = LibnfsRawTransport::connect(config).unwrap();
+    let mut handle = transport.root_filehandle(deadline).unwrap();
+    let mut size = None;
+    for component in path {
+        match transport.lookup(
+            &handle,
+            &ComponentName::new(component.clone()).unwrap(),
+            AttrMask::STAT,
+            deadline,
+        ) {
+            Ok((next, attr)) => {
+                handle = next;
+                size = attr.size;
+            }
+            Err(e) if e.status() == Some(umbra_storage_nfs_userspace::error::Nfs4Status::NOENT) => {
+                return None
+            }
+            Err(e) => panic!("C12 independent lookup unavailable: {e:?}"),
+        }
+    }
+    let size = size.expect("server size");
+    assert!(size < 1_048_576);
+    let mut bytes = Vec::new();
+    while bytes.len() < size as usize {
+        let read = transport
+            .read(
+                &handle,
+                umbra_storage_nfs_userspace::handle::Stateid::ANONYMOUS,
+                bytes.len() as u64,
+                (size as usize - bytes.len()).min(4096) as u32,
+                deadline,
+            )
+            .unwrap();
+        assert!(!read.data.is_empty(), "premature EOF");
+        bytes.extend(read.data);
+    }
+    Some(bytes)
+}
+fn c12_launch(command: &mut Command, evidence: &Path) -> SlateOutput {
+    let (out, timed_out) =
+        slate_launch(command, evidence, std::time::Duration::from_secs(30), None);
+    assert!(!timed_out, "C12 run deadline expired");
+    out
+}
+fn c12_case(mode: u8) {
+    // Mutation jobs exercise other preregistrations; C12 runs on baseline only.
+    if declared_probe().is_some() {
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(evidence_root) = slate_evidence() else {
+        return;
+    };
+    let Some(program) = input("UMBRA_R12_PATH") else {
+        return;
+    };
+    let Some(provider) = input("UMBRA_R12_PROVIDER") else {
+        return;
+    };
+    let program = PathBuf::from(program);
+    let provider = PathBuf::from(provider);
+    let evidence = evidence_root.join(format!("C12-{mode:02}"));
+    std::fs::create_dir(&evidence).expect("fresh evidence directory: never overwrite a reading");
+    let mut hashes = String::new();
+    for path in [
+        &program,
+        &provider,
+        &binaries().join("umbra"),
+        &binaries().join("umbra-platform-macos"),
+    ] {
+        let out = Command::new("/usr/bin/shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        hashes.push_str(&String::from_utf8(out.stdout).unwrap());
+    }
+    std::fs::write(evidence.join("SHA256SUMS"), hashes).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let native = scratch.path().join("native");
+    std::fs::create_dir(&native).unwrap();
+    let native_out = c12_launch(
+        Command::new(&program).arg(mode.to_string()).arg(&native),
+        &evidence.join("native"),
+    );
+    assert!(
+        native_out.status.success(),
+        "native control: {:?}",
+        native_out.stderr
+    );
+    assert!(!native.join("src").exists());
+    assert_eq!(
+        std::fs::read(native.join("dst")).unwrap(),
+        if mode % 2 == 1 { C12_SRC } else { C12_DST }
+    );
+    std::fs::copy(native.join("dst"), evidence.join("native-dst")).unwrap();
+    slate_finish_cleanup();
+
+    let workspace = scratch.path().join("workspace");
+    let state = scratch.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed\n").unwrap();
+    let registry = registry(scratch.path(), &host, port);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+    value["providers"]["storage"]["executable"] =
+        serde_json::json!(provider.as_os_str().as_bytes());
+    std::fs::write(&registry, serde_json::to_vec(&value).unwrap()).unwrap();
+    std::fs::copy(&registry, evidence.join("registry.json")).unwrap();
+    let dst = umbra_core::StoragePath::new(
+        umbra_core::StorageAnchor::Root,
+        workspace.join("dst").as_os_str().as_bytes()[1..].to_vec(),
+    )
+    .unwrap();
+    assert_no_nfs_mount(&host, port, &[&workspace], "C12 before");
+    let output = c12_launch(
+        Command::new(binaries().join("umbra"))
+            .env("UMBRA_R12_PROVIDER_LOG", evidence.join("provider.jsonl"))
+            .env("UMBRA_R12_DST", serde_json::to_string(&dst).unwrap())
+            .args(["run", "--registry"])
+            .arg(&registry)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["--experimental", "--"])
+            .arg(&program)
+            .arg(mode.to_string())
+            .arg(&workspace),
+        &evidence.join("routed"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let id = stderr
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("umbra: run ")
+                .and_then(|l| l.strip_suffix(" prepared"))
+        })
+        .expect("prepared run");
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+        status: output.status.code(),
+        stderr,
+        destination: workspace.join("src"),
+        workspace,
+        state,
+        registry,
+    };
+    let src_path = shadow_path(&run);
+    let mut dst_path = src_path.clone();
+    *dst_path.last_mut().unwrap() = b"dst".to_vec();
+    let src = c12_read(&host, port, &src_path);
+    let dst = c12_read(&host, port, &dst_path);
+    fn keep_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for item in std::fs::read_dir(from).unwrap() {
+            let item = item.unwrap();
+            if item.file_type().unwrap().is_dir() {
+                keep_tree(&item.path(), &to.join(item.file_name()));
+            } else if item.file_type().unwrap().is_file() {
+                std::fs::copy(item.path(), to.join(item.file_name())).unwrap();
+            }
+        }
+    }
+    keep_tree(&run.state_root(), &evidence.join("state"));
+    let complete = journal_records_completion(&run);
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(evidence.join("provider.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    // Preserve the storage journal independently from the supervisor journal.
+    // Names are pinned by journal.rs key_name/precondition_name/operation_name.
+    let mut journal = serde_json::Map::new();
+    let mut retained_intents = Vec::new();
+    let mut private = src_path[..3].to_vec();
+    private.extend([b".provider".to_vec(), b"retries".to_vec()]);
+    for record in &records {
+        if record["stage"] != "execute" {
+            continue;
+        }
+        let request: umbra_core::StorageRequest =
+            serde_json::from_value(record["value"]["request"].clone()).unwrap();
+        if !request.operation.is_mutation() {
+            continue;
+        }
+        let hex: String = request
+            .context
+            .idempotency_key
+            .0
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        for name in [
+            format!("key-{hex}"),
+            format!("pre-{hex}"),
+            format!("op-{}", request.context.operation_id.0),
+        ] {
+            let mut path = private.clone();
+            path.push(name.as_bytes().to_vec());
+            let bytes = c12_read(&host, port, &path);
+            if matches!(
+                request.operation,
+                umbra_core::StorageOperation::Unlink { .. }
+            ) && name.starts_with("key-")
+            {
+                retained_intents.push((bytes.clone(), request.clone(), record));
+            }
+            journal.insert(name, serde_json::json!(bytes));
+        }
+    }
+    std::fs::write(
+        evidence.join("storage-journal.json"),
+        serde_json::to_vec_pretty(&journal).unwrap(),
+    )
+    .unwrap();
+    let result = serde_json::json!({"case":mode,"run_id":run.run_id,"status":run.status,"src":src,"dst":dst,"completed":complete,"provider":records});
+    std::fs::write(
+        evidence.join("reading.json"),
+        serde_json::to_vec_pretty(&result).unwrap(),
+    )
+    .unwrap();
+    for (bytes, request, record) in retained_intents {
+        let retained: (
+            umbra_core::StorageRequest,
+            Option<umbra_core::Result<umbra_core::StorageResponse>>,
+        ) = serde_json::from_slice(bytes.as_ref().expect("retained unlink intent")).unwrap();
+        assert_eq!(retained.0, request);
+        let failure = retained
+            .1
+            .expect("recorded failure")
+            .expect_err("uncertain removal is never recorded as success");
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            record["value"]["result"]["Err"]
+        );
+    }
+    // Capture before assertions so a falsified prediction retains the reading.
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+    assert_no_nfs_mount(&host, port, &[&run.workspace], "C12 after");
+    slate_finish_cleanup();
+    assert_eq!(dst.as_deref(), Some(C12_DST));
+    if mode % 2 == 1 {
+        // C12-01/03 measured refusal: engine.rs's routed rewrite guard,
+        // before storage dispatch. A future implementation must change this
+        // characterization to complete publication and retained-fd identity.
+        assert_eq!(src.as_deref(), Some(C12_SRC));
+        assert_eq!(run.status, Some(1), "{}", run.stderr);
+        assert_eq!(run.child_exit(), 69);
+        assert!(run
+            .stderr
+            .contains(&format!("C12 mode={mode} result=-1 errno=45")));
+        assert!(complete, "ordinary refusal must allow run finalization");
+        assert!(
+            !records
+                .iter()
+                .any(|r| r["value"]["request"]["operation"].get("Rename").is_some()),
+            "refusal must precede storage rename dispatch"
+        );
+        for stage in ["release", "close"] {
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r["stage"] == stage && r["value"].get("Ok").is_some()),
+                "clean {stage} missing"
+            );
+        }
+    } else {
+        assert_eq!(src, None, "post-effect removal must leave source absent");
+        assert_eq!(run.status, Some(1));
+        assert!(!complete);
+        assert!(
+            run.stderr.contains("BLOCKED_RECOVERABLE:"),
+            "{}",
+            run.stderr
+        );
+        let removals: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r["stage"] == "execute"
+                    && r["value"]["request"]["operation"].get("Unlink").is_some()
+            })
+            .collect();
+        assert_eq!(removals.len(), 1, "one focal removal, no retry");
+        let original = &removals[0]["value"]["result"]["Err"];
+        assert_eq!(original["kind"], "LeaseLost");
+        let diagnosis = original["context"].as_str().unwrap();
+        assert!(diagnosis.contains("the REMOVE of src succeeded"));
+        assert!(diagnosis.contains("the server did not report atomic change info"));
+        let write = records
+            .iter()
+            .find(|r| r["stage"] == "probe-write")
+            .expect("same-authority write observation");
+        assert_eq!(
+            write["value"]["context"]["run_id"],
+            removals[0]["value"]["request"]["context"]["run_id"]
+        );
+        assert_eq!(
+            write["value"]["context"]["writer_epoch"],
+            removals[0]["value"]["request"]["context"]["writer_epoch"]
+        );
+        let err = &write["value"]["result"]["Err"];
+        assert_eq!(err["kind"], "InvalidState");
+        assert!(err["context"].as_str().unwrap().contains(diagnosis));
+        for stage in ["probe-flush", "probe-release", "probe-close"] {
+            let r = records
+                .iter()
+                .find(|r| r["stage"] == stage)
+                .expect("authority stage");
+            let v = if stage == "probe-release" {
+                &r["value"]["result"]
+            } else {
+                &r["value"]
+            };
+            assert!(v.get("Err").is_some(), "{stage}: {r}");
+            assert_eq!(
+                v["Err"]["kind"],
+                if stage == "probe-flush" {
+                    "InvalidState"
+                } else {
+                    "LeaseLost"
+                }
+            );
+            assert!(v["Err"]["context"].as_str().unwrap().contains(diagnosis));
+        }
+        let marker = |stage: &str| -> Vec<u8> {
+            serde_json::from_value(
+                records
+                    .iter()
+                    .find(|r| r["stage"] == stage)
+                    .expect("persisted marker observation")["value"]
+                    .clone(),
+            )
+            .unwrap()
+        };
+        let before = marker("marker-before");
+        let after = marker("marker-after");
+        assert_eq!(before, after, "failed authority changed persisted marker");
+        let decoded =
+            umbra_storage_nfs_userspace::authority::marker::AdmissionMarker::decode(&after)
+                .unwrap();
+        assert_eq!(
+            decoded.phase(),
+            umbra_storage_nfs_userspace::authority::marker::AdmissionPhase::Held
+        );
+        assert!(records.iter().any(|r| r["stage"] == "probe-complete"));
+        assert!(!records
+            .iter()
+            .any(|r| matches!(r["stage"].as_str(), Some("release" | "close"))
+                && r["value"].get("Ok").is_some()));
+    }
+}
+#[test]
+fn slate_c12_01_closed_replacement() {
+    c12_case(1);
+}
+#[test]
+fn slate_c12_02_closed_unlink() {
+    c12_case(2);
+}
+#[test]
+fn slate_c12_03_open_destination_replacement() {
+    c12_case(3);
+}
+#[test]
+fn slate_c12_04_open_source_unlink() {
+    c12_case(4);
+}
+
+#[test]
+fn slate_c12_provider_handshake() {
+    use umbra_storage::Storage;
+    if declared_probe().is_some() {
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(provider) = input("UMBRA_R12_PROVIDER") else {
+        return;
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let path = registry(scratch.path(), &host, port);
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let mut descriptor: umbra_core::provider::ProviderDescriptor =
+        serde_json::from_value(value["providers"]["storage"].clone()).unwrap();
+    descriptor.executable =
+        BytePath::new(PathBuf::from(provider).as_os_str().as_bytes().to_vec()).unwrap();
+    let mut options: serde_json::Value = serde_json::from_slice(&descriptor.options).unwrap();
+    options["c12_log"] = serde_json::json!(scratch.path().join("handshake.jsonl"));
+    descriptor.options = serde_json::to_vec(&options).unwrap();
+    let proxy = umbra_storage::provider::Proxy::connect(&descriptor, 12_000).unwrap();
+    assert!(proxy.capabilities().features.contains("userspace-nfsv4-v1"));
+}

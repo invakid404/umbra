@@ -560,6 +560,9 @@ nothing here pretends otherwise.
 <!-- memoria:section id="configuration-and-registration" files="src/lib.rs src/main.rs src/storage.rs" guidance="../../docs/guides/reviewing-provider-binary.md" -->
 ## Configuration and registration
 
+See [provider lifecycle](../../docs/providers.md) for installation, registration
+and cleanup.
+
 `NfsUserspaceConfig` carries the server host and port, a server-relative `export`
 and `run_parent`, the two anchor components, and a per-COMPOUND deadline. Export
 and run parent are validated with the storage contract's own path rule, so neither
@@ -585,8 +588,10 @@ verifier-compare probe succeeded against the run's own `.provider` — and
 `Durability::Local` otherwise, including on a read-only run, on a transport that
 declares nothing, and when the probe did not succeed. `Fencing::ReadOnly` stays: no independent
 termination verifier exists, and the barrier says nothing about fencing. The
-binding advertises exactly two `features` names,
-`ownership-fidelity-v1` and `timestamp-fidelity-v1`, both corroborated by the
+binding includes the `features` names `ownership-fidelity-v1` and
+`timestamp-fidelity-v1`. A validated live binding also carries `userspace-nfsv4-v1`
+and `experimental-userspace-routing-v1` from the transport probe. The ownership
+and timestamp claims are corroborated by the
 same two places: `SetMetadata` is `Support::Supported` in the capability table,
 and `NamespaceMutation::SetAttributes` maps `update.uid`/`update.gid` onto
 `FATTR4_OWNER`/`FATTR4_OWNER_GROUP` as stringified numeric ids and
@@ -684,7 +689,7 @@ sufficient, because umbra must be able to represent it too.
 | --- | --- |
 | **A syscall the tracee issues from memory it wrote itself** | **Not mediated, and not mediable by this architecture.** Measured: a process can allocate memory, write `svc #0x80` into it, flip the page to `r-x` with no entitlement, and execute it. umbra breakpoints `svc` sites in the main image and in its own interposer, so an instruction at neither site is never trapped — under interposition and under syscall-breakpoint tracing alike. What fail-closes host writes is the **kernel-enforced Seatbelt profile** installed before the target's first instruction, not the interception. Closing this needs kernel-assisted whole-process syscall filtering, which is outside the accepted setup. |
 | Writable shared file mappings (`mmap` `MAP_SHARED` with `PROT_WRITE`) | **Permanently unsupported by any syscall- or call-level interception.** A store to a resident page is not a call of any kind. Needs a pager. |
-| `unlink` | **A routed run cannot delete a file at all against a server that does not report atomic `change_info4` for REMOVE, and it does not refuse — it stops.** Measured against the Ganesha fixture, with the descriptor open *and* after closing it: `LeaseLost during namespace.remove: authority: object identity unproven: BLOCKED_RECOVERABLE: the REMOVE of <name> succeeded, but the server did not report atomic change info`, the run left recovery-required, and the writer release withheld. This is **this provider's own authority layer**, pre-existing and unrelated to routing — the same refusal a non-routed caller of `unlink` meets. It is listed here because the slice's own docs previously said "unlink or rename *while open*" and pointed at `engine.rs::routed_binding`, which implied unlink-while-closed worked and named a mechanism that is never reached. |
+| `unlink` | **A routed run cannot complete unlink successfully against a server that does not report atomic `change_info4` for REMOVE: the server name is deleted, then the provider stops.** Measured against the Ganesha fixture, with the descriptor open *and* after closing it: `LeaseLost during namespace.remove: authority: object identity unproven: BLOCKED_RECOVERABLE: the REMOVE of <name> succeeded, but the server did not report atomic change info`, the run left recovery-required, and the writer release withheld. This is **this provider's own authority layer**, pre-existing and unrelated to routing — the same refusal a non-routed caller of `unlink` meets. It is listed here because the slice's own docs previously said "unlink or rename *while open*" and pointed at `engine.rs::routed_binding`, which implied unlink-while-closed worked and named a mechanism that is never reached. |
 | `rename`, and any other path operation, on an object **this run created or copied up** | Refused with **`ENOTSUP`** (`Errno(45)`), visibly, and the run survives. `rewrite` needs a kernel path this backend does not have, so `resolve` answers the tracee instead — see the row below. |
 | A descriptor whose **name stops resolving** while it is open | `ENOENT`. A routed descriptor is bound to a logical *path* and re-resolved on every operation, so an object that loses its name has nothing left to route to; closing that needs handle-based `Storage` operations the surface does not have. Not reachable against this fixture, because `unlink` stops the run first (above). |
 | **Every other intercepted path operation on an object this run created or copied up** — `fstatat`, `faccessat`, `renameat`, `linkat`, `fchownat` | Refused with **`ENOTSUP`** (`Errno(45)` — Darwin's value; routing exists on Darwin only). `rewrite` would have to name a kernel path this backend does not have, so `resolve` answers the tracee instead of stopping the run. The same operation on an object the run did *not* touch still rewrites to the read-only base's host path and works. This is a visible refusal, not a supported operation: `create a file then stat it` is what `cp`, `install` and both the Rust and Go standard libraries do, and on a routed run it fails. Routing these properly means answering `Stat`/`Access` through an ABI encoder the way **`Fstat`** already is — the engine resolves the metadata, the ABI encodes it — and that routing deliberately did **not** widen this row: an `fstat` names a descriptor, so it never reaches path resolution, and `Stat`/`Access` on a shadow object are still refused here. **This row previously offered `ReadLink` as that same precedent, and `ReadLink` is the one named here that does not work.** Measured on both decoder arms against the live fixture: a routed `readlink`(58) or `readlinkat`(473) on a symlink in the run's own shadow answers the tracee nothing at all — it **ends the run**, `UnsupportedCapability during overlay: ReadLink requires set_readlink_buffer`, with no tracee errno and no `finished:` line. `FsOp::ReadLink`'s engine arm is unconditional and resolves the link's target correctly, then requires a buffer only `Overlay::set_readlink_buffer` can bind — and no production caller on the routed path binds one: `routing_for` binds `Open`/`Read`/`Write`, the stat buffer for `Fstat` and the directory buffer for `ReadDir`, while `FsOp::ReadLink` appears nowhere in `umbra-supervisor/src/events.rs`'s `FsOp` set. So copying `ReadLink` as the template would wire `Stat`/`Access` after something that never reaches the tracee; **`Fstat` is the worked precedent to copy.** Characterized by the two `readlink` cases in `userspace_run.rs`, which assert the run-ending shape and go red when the binding lands; the binding itself is a separate slice. |
@@ -1117,9 +1122,11 @@ through [`journal`](src/journal.rs) first: the exact request is recorded in
 `.provider/retries/key-<hex>` before the operation reaches the wire, and the
 exact settled result is written back afterwards, in the byte encoding the mounted
 adapter uses and `tests/goldens/retry-*.json` pins. An exact-key retry is
-answered from its record and never re-dispatched; an outcome whose server-side
-disposition is unknown is left unsettled rather than recorded as a failure a
-later retry would trust. Reads are not journalled.
+answered from its record and never re-dispatched. An unresolved wire outcome
+can leave an unfinished intent. The post-effect REMOVE identity refusal is
+different: its BLOCKED_RECOVERABLE error is recorded durably, while the provider
+keeps authority stopped and withholds release. A recorded error is not evidence
+that the mutation had no effect. Reads are not journalled.
 
 An **interrupted** intent is recovered rather than stalled. Beside each record,
 `.provider/retries/pre-<hex>` holds the object and parent identities the mutation
@@ -1287,3 +1294,32 @@ qualification is per `open_run` and is dropped with the run, so a reopened run i
 probed again. A build with no live transport linked — the default, since the live
 backend sits behind the off-by-default `transport-raw` feature — therefore ships
 `Local`, never an unproven `Remote`.
+
+### Rank-12 publication and deletion characterization
+
+The C12-01 through C12-04 cases in `tests/userspace_run.rs` run native controls
+before enforced userspace-registry runs against live Ganesha. Closed replacement
+and replacement with an open destination currently return tracee ENOTSUP before
+storage dispatch, preserving both files. The run can finalize and release its
+writer despite the fixture's nonzero exit. These cases do not qualify successful
+publication or routed old-descriptor identity.
+
+Regular-file unlink, with and without an open descriptor, removes the server
+name and then stops with BLOCKED_RECOVERABLE because Ganesha did not supply
+atomic change evidence. The tests independently inspect server bytes and use a
+test-only forwarding provider to verify that the same failed backend rejects a
+subsequent write, flush, release and close. Persisted admission stays Held;
+absence of RunCompleted is checked separately. A failed run is not evidence of
+rollback. All four statuses are exact refusal characterizations, not production
+fixes or permission to accept arbitrary failures.
+
+Build the libraries together with `cargo build -p umbra-core -p umbra-storage
+-p umbra-storage-nfs-userspace --features umbra-storage-nfs-userspace/transport-raw
+--lib`, then run `python3 experiments/fixtures/umbra-slate-r12-build.py` from the
+repository root. Set `UMBRA_R12_PATH` and `UMBRA_R12_PROVIDER` to the resulting
+`target/debug/slate-r12/publication` and `provider` executables. The existing
+live-fixture and `UMBRA_SLATE_EVIDENCE` variables are required; use a fresh
+evidence directory. CI builds these fixtures and includes the cases in its
+baseline userspace test invocation. Mutation-probe invocations do not qualify
+these baseline statuses. Follow the shared-host serialization and disk rules
+when running locally.
