@@ -108,8 +108,11 @@ NOENT. The host workspace must remain empty.
 Build `experiments/fixtures/umbra-slate-r15-alias.c` normally and with
 `-DC15_HELPER`, and provide the resulting absolute paths through `UMBRA_C15_PATH`
 and `UMBRA_C15_HELPER`. The test also needs the usual live-server, provider and
-`UMBRA_SLATE_EVIDENCE` inputs; the evidence directory must not already contain
-`C15-01`. `UMBRA_INTEGRATION_REQUIRED=1` makes missing prerequisites fail.
+`UMBRA_SLATE_EVIDENCE` inputs. Optional `UMBRA_SLATE_R15_EVIDENCE` overrides the
+C15 evidence root; CI sets it to a run-and-attempt-specific directory and uploads
+that same path. The selected root must not already contain `C15-01`. Missing
+optional prerequisites return before creating it; `UMBRA_INTEGRATION_REQUIRED=1`
+makes missing prerequisites fail.
 Run the named case through the serial-test wrapper while the runner is idle.
 It reuses the 60-second slate launcher and 10-second cleanup grace, requires
 clean reap with no zombies, and retains source/binary identities, stdout/stderr,

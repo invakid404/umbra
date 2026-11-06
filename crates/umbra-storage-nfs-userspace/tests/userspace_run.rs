@@ -13550,15 +13550,23 @@ fn slate_c15_01_shadow_alias_exec() {
     let Some(evidence) = slate_evidence() else {
         return;
     };
-    let evidence = evidence.join("C15-01");
+    let Some(program) = input("UMBRA_C15_PATH") else {
+        return;
+    };
+    let Some(helper) = input("UMBRA_C15_HELPER") else {
+        return;
+    };
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let program = PathBuf::from(program).canonicalize().unwrap();
+    let helper = PathBuf::from(helper).canonicalize().unwrap();
+    let evidence = std::env::var_os("UMBRA_SLATE_R15_EVIDENCE")
+        .map(PathBuf::from)
+        .unwrap_or(evidence)
+        .join("C15-01");
     assert!(!evidence.exists(), "never overwrite a reading");
     std::fs::create_dir_all(&evidence).unwrap();
-    let program = PathBuf::from(input("UMBRA_C15_PATH").expect("C15 launcher required"))
-        .canonicalize()
-        .unwrap();
-    let helper = PathBuf::from(input("UMBRA_C15_HELPER").expect("C15 helper required"))
-        .canonicalize()
-        .unwrap();
     let mut identities = serde_json::Map::new();
     for (name, command, args) in [
         ("source", "git", vec!["rev-parse", "HEAD"]),
@@ -13585,7 +13593,6 @@ fn slate_c15_01_shadow_alias_exec() {
             serde_json::json!({"path":path,"sha256":r14_sha256(&std::fs::read(&path).unwrap())}),
         );
     }
-    let (host, port) = fixture().expect("live Ganesha required");
     identities.insert("fixture".into(), serde_json::json!({"host":host,"port":port,"deadline_seconds":60,"cleanup_grace_seconds":10}));
     std::fs::write(
         evidence.join("identities.json"),
