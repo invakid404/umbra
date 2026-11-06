@@ -1497,7 +1497,13 @@ still bounds and cleans up the process tree. This companion requires `docker`
 and the standard `umbra-m1-transport-raw-ganesha` fixture container. Source
 creation and writing remain routed. This deliberately sidesteps #227; it does
 not fix it. C16-05 separately pins the exact routed write-plus-drop abort with
-a passing native control. Revised readings are pending.
+a passing native control. Revised local readings pass all five cases: C16-01/02
+reach the exact Link resolver refusal, C16-03/04 reach the exact
+`renameatx_np` flags `0x4` refusal, and C16-05 demonstrates #227.
+The publication cases preserve source bytes and any incumbent; all five
+qualify host invariance and owned-process cleanup. Earlier reporting and
+incumbent-path preparation failures remain separate instrument evidence;
+they do not qualify publication. These local readings do not replace CI.
 
 Build the isolated `experiments/fixtures/umbra-slate-r16-publication` package
 with its lockfile into the workspace target and set `UMBRA_SLATE_R16_PATH`.
