@@ -12978,7 +12978,6 @@ fn slate_r14_terminal_repair_replay() {
     std::fs::write(evidence.join("result.txt"), "retained ENOTCONN false reading removed on identical phase bytes; incomplete exchange rejected as EOF before terminal exchange\n").unwrap();
 }
 
-
 // ---- slate-r17: native watcher failure and degraded behavior ----
 fn r17_records(bytes: &[u8], nonce: &str, complete: bool) -> Vec<serde_json::Value> {
     let mut tail = bytes;
@@ -13124,11 +13123,9 @@ fn r17_defect(
         let start = r17_phase(records, "observation-start").as_u64().unwrap();
         assert_eq!(r17_phase(records, "mutation")["ack_us"], start);
         assert!(r17_phase(records, "observation-end").as_u64().unwrap() >= start + 5_000_000);
-        assert!(stderr.contains("panicked at src/main.rs:101:23:"));
-        assert!(
-            stderr
-                .contains("Os { code: 9, kind: Uncategorized, message: \"Bad file descriptor\" }")
-        );
+        assert!(stderr.contains("panicked at src/main.rs:112:24:"));
+        assert!(stderr
+            .contains("Os { code: 9, kind: Uncategorized, message: \"Bad file descriptor\" }"));
         assert!(stderr.contains("finished: Some(Code(101)) after 1 process exits"));
         assert!(stderr.contains("ProcessFailed during run.child:"));
         assert!(!stderr.contains("fatal signal/exception"));
@@ -13235,9 +13232,10 @@ fn r17_case(case: usize) {
             serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
         // Keep the 12-second IPC deadline below half the writer lease.
         // The platform's whole-session watchdog is a separate budget.
-        config["providers"]["platform"]["options"] = serde_json::json!(
-            serde_json::to_vec(&serde_json::json!({"timeout_ms": 45000})).unwrap()
-        );
+        config["providers"]["platform"]["options"] = serde_json::json!(serde_json::to_vec(
+            &serde_json::json!({"timeout_ms": 45000})
+        )
+        .unwrap());
         std::fs::write(&registry, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
         let mut command = if native {
             Command::new(&program)
@@ -13405,35 +13403,35 @@ fn slate_r17_retained_readings_validate_exact_defects() {
                 // The original prediction still rejects the same bytes. This
                 // is offline classification, never a retake of a failed run.
                 assert!(std::panic::catch_unwind(|| r17_records(&bytes, &nonce, true)).is_err());
-                assert!(
-                    std::panic::catch_unwind(|| r17_defect(
-                        &records,
-                        case,
-                        &nonce,
-                        Some(0),
-                        &stderr
-                    ))
-                    .is_err()
-                );
+                assert!(std::panic::catch_unwind(|| r17_defect(
+                    &records,
+                    case,
+                    &nonce,
+                    Some(0),
+                    &stderr
+                ))
+                .is_err());
                 let mut wrong = records.clone();
                 wrong
                     .iter_mut()
                     .find(|r| r["phase"] == "registration")
                     .unwrap()["data"] = serde_json::json!({"ok":false,"data":0});
-                assert!(
-                    std::panic::catch_unwind(|| r17_defect(&wrong, case, &nonce, Some(1), &stderr))
-                        .is_err()
-                );
-                assert!(
-                    std::panic::catch_unwind(|| r17_defect(
-                        &records,
-                        case,
-                        &nonce,
-                        Some(1),
-                        "unrelated failure"
-                    ))
-                    .is_err()
-                );
+                assert!(std::panic::catch_unwind(|| r17_defect(
+                    &wrong,
+                    case,
+                    &nonce,
+                    Some(1),
+                    &stderr
+                ))
+                .is_err());
+                assert!(std::panic::catch_unwind(|| r17_defect(
+                    &records,
+                    case,
+                    &nonce,
+                    Some(1),
+                    "unrelated failure"
+                ))
+                .is_err());
             }
         }
     }
