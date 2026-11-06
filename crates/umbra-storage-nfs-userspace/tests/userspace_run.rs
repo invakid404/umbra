@@ -13539,6 +13539,9 @@ fn slate_c15_01_shadow_alias_exec() {
             std::fs::read_link(native.join("helpers/helper")).unwrap(),
             helper
         );
+        let native_cleanup =
+            std::fs::read_to_string(evidence.join(format!("native-{mode}.cleanup"))).unwrap();
+        assert!(r14_cleanup_clean(&native_cleanup), "{native_cleanup}");
         slate_finish_cleanup();
         let root = evidence.join(format!("routed-{mode}-root"));
         std::fs::create_dir(&root).unwrap();
@@ -13649,6 +13652,10 @@ fn slate_c15_01_shadow_alias_exec() {
             assert!(!out.status.success());
         }
         assert_no_nfs_mount(&host, port, &[&run.workspace], "C15 after");
+        slate_assert_tracee_not_orphaned(&evidence.join(format!("routed-{mode}")));
+        let cleanup =
+            std::fs::read_to_string(evidence.join(format!("routed-{mode}.cleanup"))).unwrap();
+        assert!(r14_cleanup_clean(&cleanup), "{cleanup}");
         slate_finish_cleanup();
     }
 }

@@ -633,6 +633,15 @@ jobs:
           path: /tmp/slate-evidence-${{ github.run_id }}/C12-*
           if-no-files-found: error
 
+      - name: Upload rank-15 alias readings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rank15-alias-readings-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/slate-evidence-${{ github.run_id }}/C15-01
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload rank-14 readings
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
