@@ -13147,7 +13147,11 @@ fn r17_case(case: usize) {
         let registry = registry(&scratch, &host, port);
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
-        config["timeout_ms"] = serde_json::json!(45000);
+        // Keep the 12-second IPC deadline below half the writer lease.
+        // The platform's whole-session watchdog is a separate budget.
+        config["providers"]["platform"]["options"] = serde_json::json!(
+            serde_json::to_vec(&serde_json::json!({"timeout_ms": 45000})).unwrap()
+        );
         std::fs::write(&registry, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
         let mut command = if native {
             Command::new(&program)

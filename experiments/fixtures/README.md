@@ -135,3 +135,23 @@ refusal, not WAL support. The two `repair-*` inputs preserve original instrument
 failure data for the checked-in L46 replay test. See the
 [userspace-storage README](../../crates/umbra-storage-nfs-userspace/README.md#codex-configured-sqlite-characterization)
 for prerequisites, evidence and limitations.
+
+## Rank-17 watcher fixtures
+
+`umbra-slate-r17-notify/` pins notify 8.2.0 and separates construction from
+non-recursive registration. `umbra-slate-r17-vnode.c` submits one
+EVFILT_VNODE registration with EV_RECEIPT before a same-thread native writer.
+Both emit framed records through raw writes to `evidence/result`, outside the
+watched `work/` directory. The harness reads routed records through the NFS
+client; provider stdout is not the evidence channel. Missing terminal records
+are incomplete evidence, never proof of zero callbacks.
+
+Build the Rust package with `cargo build --locked --manifest-path
+experiments/fixtures/umbra-slate-r17-notify/Cargo.toml --target-dir target` and
+the C fixture with `cc -Wall -Wextra -Werror
+experiments/fixtures/umbra-slate-r17-vnode.c -o target/debug/umbra-slate-r17-vnode`.
+The `slate_r17_*` cases in `userspace_run.rs` require `UMBRA_R17_NOTIFY_PATH`,
+`UMBRA_R17_VNODE_PATH`, a fresh `UMBRA_SLATE_R17_EVIDENCE` directory, and the
+usual enforced userspace/Ganesha inputs. They use the existing bounded slate
+launcher. Construction, registration and remote event delivery are distinct
+claims; these fixtures do not implement remote notifications or polling.
