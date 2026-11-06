@@ -13474,3 +13474,181 @@ fn slate_r17_retained_readings_validate_exact_defects() {
     let records = r17_records(&bytes, &nonce, false);
     r17_defect(&records, 2, &nonce, Some(1), &stderr);
 }
+
+// ---- slate-r15: absolute shadow-only helper alias ----
+#[test]
+fn slate_c15_01_shadow_alias_exec() {
+    let Some(evidence) = slate_evidence() else {
+        return;
+    };
+    let evidence = evidence.join("C15-01");
+    assert!(!evidence.exists(), "never overwrite a reading");
+    std::fs::create_dir_all(&evidence).unwrap();
+    let program = PathBuf::from(input("UMBRA_C15_PATH").expect("C15 launcher required"))
+        .canonicalize()
+        .unwrap();
+    let helper = PathBuf::from(input("UMBRA_C15_HELPER").expect("C15 helper required"))
+        .canonicalize()
+        .unwrap();
+    let mut identities = serde_json::Map::new();
+    for (name, command, args) in [
+        ("source", "git", vec!["rev-parse", "HEAD"]),
+        ("os", "uname", vec!["-a"]),
+        ("rust", "rustc", vec!["-Vv"]),
+        ("clang", "clang", vec!["--version"]),
+    ] {
+        let out = Command::new(command).args(args).output().unwrap();
+        assert!(out.status.success());
+        identities.insert(
+            name.into(),
+            serde_json::json!(String::from_utf8_lossy(&out.stdout)),
+        );
+    }
+    for (name, path) in [
+        ("launcher", program.clone()),
+        ("helper", helper.clone()),
+        ("umbra", binaries().join("umbra")),
+        ("platform", binaries().join("umbra-platform-macos")),
+        ("storage", binaries().join("umbra-storage-nfs-userspace")),
+    ] {
+        identities.insert(
+            name.into(),
+            serde_json::json!({"path":path,"sha256":r14_sha256(&std::fs::read(&path).unwrap())}),
+        );
+    }
+    let (host, port) = fixture().expect("live Ganesha required");
+    identities.insert("fixture".into(), serde_json::json!({"host":host,"port":port,"deadline_seconds":60,"cleanup_grace_seconds":10}));
+    std::fs::write(
+        evidence.join("identities.json"),
+        serde_json::to_vec_pretty(&identities).unwrap(),
+    )
+    .unwrap();
+    for mode in ["direct", "alias"] {
+        let native = evidence.join(format!("native-{mode}-root"));
+        std::fs::create_dir(&native).unwrap();
+        let out = slate_bounded(
+            Command::new(&program).arg(mode).arg(&native).arg(&helper),
+            &evidence.join(format!("native-{mode}")),
+        );
+        assert!(out.status.success(), "native {mode}: {:?}", out.status);
+        assert_eq!(
+            std::fs::read(native.join("out.txt")).unwrap(),
+            b"C15-01 intended helper\n"
+        );
+        assert_eq!(
+            std::fs::read_link(native.join("helpers/helper")).unwrap(),
+            helper
+        );
+        slate_finish_cleanup();
+        let root = evidence.join(format!("routed-{mode}-root"));
+        std::fs::create_dir(&root).unwrap();
+        let workspace = root.join("workspace");
+        let state = root.join("state");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let registry = registry(&root, &host, port);
+        assert_no_nfs_mount(&host, port, &[&workspace], "C15 before");
+        let out = slate_bounded(
+            Command::new(binaries().join("umbra"))
+                .args(["run", "--registry"])
+                .arg(&registry)
+                .arg("--workspace")
+                .arg(&workspace)
+                .arg("--state-dir")
+                .arg(&state)
+                .args(["--experimental", "--"])
+                .arg(&program)
+                .arg(mode)
+                .arg(&workspace)
+                .arg(&helper),
+            &evidence.join(format!("routed-{mode}")),
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        let id = stderr
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("umbra: run ")
+                    .and_then(|s| s.strip_suffix(" prepared"))
+            })
+            .expect("prepared run");
+        let run = Run {
+            run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+            status: out.status.code(),
+            stderr,
+            destination: workspace.join("out.txt"),
+            workspace,
+            state,
+            registry,
+        };
+        let mut ready = shadow_path(&run);
+        *ready.last_mut().unwrap() = b"ready".to_vec();
+        let ready = read_through_client(&host, port, &ready);
+        // Logical links are regular placeholders plus overlay-owned control records.
+        let alias = utility_shadow(&run, &run.workspace.join("helpers/helper"));
+        let attrs = attributes_through_client(&host, port, &alias).expect("alias placeholder");
+        assert_eq!(attrs.file_type, Some(Nfs4Type::Regular));
+        let identity = umbra_storage_nfs_userspace::handle::ObjectIdentity {
+            fsid: attrs.fsid.expect("fsid"),
+            fileid: attrs.fileid.expect("fileid"),
+        };
+        let object = umbra_storage_nfs_userspace::identity::object_id(identity);
+        let control = vec![
+            EXPORT.to_vec(),
+            RUN_PARENT.to_vec(),
+            run.run_id.0.to_string().into_bytes(),
+            b"control".to_vec(),
+            b"symlinks".to_vec(),
+        ];
+        let mut index = control.clone();
+        index.extend([b"objects".to_vec(), object.0.to_string().into_bytes()]);
+        let logical = read_through_client(&host, port, &index).expect("logical identity index");
+        let logical = uuid::Uuid::parse_str(std::str::from_utf8(&logical).unwrap()).unwrap();
+        let mut target = control;
+        target.extend([b"targets".to_vec(), logical.to_string().into_bytes()]);
+        let target = read_through_client(&host, port, &target).expect("logical link target");
+        std::fs::write(evidence.join(format!("{mode}-link-target")), &target).unwrap();
+        assert_eq!(target, helper.as_os_str().as_bytes());
+        let output = read_through_client(&host, port, &shadow_path(&run));
+        std::fs::write(
+            evidence.join(format!("{mode}-disposition.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "supervisor":run.status,"stderr":run.stderr,"ready":ready,"output":output,
+                "journal_completed":journal_records_completion(&run)
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ready.as_deref(),
+            Some(b"C15-01 alias created; exec next\n".as_slice())
+        );
+        assert_eq!(
+            std::fs::read_dir(&run.workspace).unwrap().count(),
+            0,
+            "host changed"
+        );
+        assert_host_write_root_empty(&run);
+        if mode == "direct" {
+            assert_eq!(run.status, Some(0), "{}", run.stderr);
+            assert_eq!(run.child_exit(), 0);
+            assert_eq!(
+                output.as_deref(),
+                Some(b"C15-01 intended helper\n".as_slice())
+            );
+            assert!(journal_records_completion(&run));
+        } else {
+            assert!(run.stderr.contains("twin source"), "{}", run.stderr);
+            assert!(
+                run.stderr.contains("No such file or directory"),
+                "{}",
+                run.stderr
+            );
+            assert!(!run.stderr.contains("finished:"));
+            assert!(output.is_none());
+            assert!(!out.status.success());
+        }
+        assert_no_nfs_mount(&host, port, &[&run.workspace], "C15 after");
+        slate_finish_cleanup();
+    }
+}

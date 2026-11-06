@@ -506,6 +506,16 @@ jobs:
           echo "UMBRA_R12_PATH=$GITHUB_WORKSPACE/target/debug/slate-r12/publication" >> "$GITHUB_ENV"
           echo "UMBRA_R12_PROVIDER=$GITHUB_WORKSPACE/target/debug/slate-r12/provider" >> "$GITHUB_ENV"
 
+      - name: Build rank-15 alias fixtures
+        run: |
+          df -h /System/Volumes/Data
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          clang -arch arm64 -O1 experiments/fixtures/umbra-slate-r15-alias.c -o "$GITHUB_WORKSPACE/target/debug/c15-alias"
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          clang -arch arm64 -O1 -DC15_HELPER experiments/fixtures/umbra-slate-r15-alias.c -o "$GITHUB_WORKSPACE/target/debug/c15-helper"
+          echo "UMBRA_C15_PATH=$GITHUB_WORKSPACE/target/debug/c15-alias" >> "$GITHUB_ENV"
+          echo "UMBRA_C15_HELPER=$GITHUB_WORKSPACE/target/debug/c15-helper" >> "$GITHUB_ENV"
+
       - name: Build pinned rank-14 SQLite fixture
         run: |
           df -h /System/Volumes/Data
