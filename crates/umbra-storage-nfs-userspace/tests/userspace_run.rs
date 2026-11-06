@@ -13383,6 +13383,24 @@ fn slate_r17_03_vnode_receipt() {
 }
 
 #[test]
+fn slate_r17_provenance_matches_fixture_inputs() {
+    let fixture = repository().join("experiments/fixtures/umbra-slate-r17-notify");
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("readings/provenance.json")).unwrap())
+            .unwrap();
+    for (field, path) in [
+        ("source_sha256", "src/main.rs"),
+        ("lock_sha256", "Cargo.lock"),
+    ] {
+        assert_eq!(
+            record["notify"][field],
+            r14_sha256(&std::fs::read(fixture.join(path)).unwrap()),
+            "retained notify provenance differs from {path}"
+        );
+    }
+}
+
+#[test]
 fn slate_r17_retained_readings_validate_exact_defects() {
     let root = repository().join("experiments/fixtures/umbra-slate-r17-notify/readings");
     for case in 1..=3 {
