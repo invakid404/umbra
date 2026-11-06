@@ -13762,7 +13762,9 @@ fn slate_c15_01_shadow_alias_exec() {
 
 // ---- slate-r16: hard-link/no-clobber publication (Refs #79) ----
 // Revised preparation retains the source File across publication; C16-05
-// separately pins the original setup defect (Refs #227).
+// separately pins the original setup defect (Refs #227), per anchor-ruling-b1.md.
+// This reuses the ideation's deferred forced-secondary-link-fallback identifier;
+// that forced-fallback case remains deferred.
 const C16_SOURCE: &[u8] = b"C16 complete temporary payload\n";
 const C16_INCUMBENT: &[u8] = b"C16 incumbent must survive unchanged\n";
 fn c16_case(mode: u8) {
@@ -13876,7 +13878,7 @@ fn c16_case(mode: u8) {
             line.strip_prefix("umbra: run ")
                 .and_then(|s| s.strip_suffix(" prepared"))
         })
-        .expect("prepared run");
+        .unwrap_or_else(|| panic!("no prepared line in:\n{stderr}"));
     let run = Run {
         run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
         status: out.status.code(),
