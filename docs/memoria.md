@@ -50,7 +50,7 @@ label is exact on purpose: the Action supports **Ubuntu 24.04 only** and refuses
 every other platform and release, so `ubuntu-latest` would break the job the day
 GitHub moves that alias to a newer image. Pin the label, and change it in step
 with the Action; `renovate.json` disables Renovate's runner-label update for both
-memoria workflows for that reason. The gate therefore does not run on `macos-14` — but
+memoria workflows for that reason. The gate therefore does not run on `macos-15` — but
 `memoria check` hashes tracked files and reads the lock, so its result does not
 depend on the operating system. A pending-review diagnostic means
 a README has not been reviewed against its current inputs; it does not by itself

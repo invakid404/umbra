@@ -237,7 +237,7 @@ wait semantics, exec argv[0], native namespace/descriptor integration, hard link
 Rosetta/JIT, real NFS durability and independent fail-closed sandbox composition.
 
 [CI](.github/workflows/ci.yml) runs the four workspace formatting/lint/check/test
-commands plus doctests on pushes to `master` and pull requests, on `macos-14` and
+commands plus doctests on pushes to `master` and pull requests, on `macos-15` and
 `ubuntu-latest`, using the pinned toolchain and cached Cargo registry and dependency source
 directories. This runner label maps to Apple Silicon in the
 [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners);
