@@ -78,6 +78,48 @@ journal completion and writer-authority release; they never accept an arbitrary
 failure as support. The original failed positive-target readings remain in the
 rank-14 graph evidence, separate from subsequent refusal qualification.
 
+## Shadow-only executable aliases
+
+The direct-host-image exec coverage below does not establish executable lookup
+through a logical shadow alias. The macOS exec handler passes the requested
+absolute pathname to the host-side signed-twin cache; that cache canonicalizes
+it in the host filesystem (`umbra-platform-macos/src/native.rs`, Exec delivery;
+`src/cache.rs`, `resign`). Logical symlink visibility in the overlay alone does
+not make that pathname available to the cache.
+
+`slate_c15_01_shadow_alias_exec` isolates this boundary. The launcher creates the
+same directory, alias and pre-exec sentinel in both modes; only the exec pathname
+changes between the absolute host helper and its logical alias. Each mode has a
+disposable native control before the routed comparison. The first live reading at
+`fe47e2a6` confirmed the expected explicit supervisor `twin source` ENOENT
+refusal (status 1), before helper effects and without a completed-run journal
+record. Native direct/alias and routed direct controls exited 0 with the exact
+helper bytes; all four launches reaped cleanly without survivors or zombies.
+This characterizes an unsupported alias-exec boundary, not successful alias
+execution. Independent NFS reads verify
+the placeholder identity, logical-link index and exact target bytes, plus the
+pre-exec and helper sentinels. For the refused alias, every output-parent
+lookup must succeed and the final leaf LOOKUP must return exact NFS NOENT;
+timeouts and other lookup failures fail the observation. The leaf result is
+retained in `alias-output-lookup.json`. A focused classifier check rejects
+success, deadline expiry, connection failure, access denial and parent-operation
+NOENT. The host workspace must remain empty.
+
+Build `experiments/fixtures/umbra-slate-r15-alias.c` normally and with
+`-DC15_HELPER`, and provide the resulting absolute paths through `UMBRA_C15_PATH`
+and `UMBRA_C15_HELPER`. The test also needs the usual live-server, provider and
+`UMBRA_SLATE_EVIDENCE` inputs. Optional `UMBRA_SLATE_R15_EVIDENCE` overrides the
+C15 evidence root; CI sets it to a run-and-attempt-specific directory and uploads
+that same path. The selected root must not already contain `C15-01`. Missing
+optional prerequisites return before creating it; `UMBRA_INTEGRATION_REQUIRED=1`
+makes missing prerequisites fail.
+Run the named case through the serial-test wrapper while the runner is idle.
+It reuses the 60-second slate launcher and 10-second cleanup grace, requires
+clean reap with no zombies, and retains source/binary identities, stdout/stderr,
+census, cleanup and disposition records. CI builds both binaries, runs the case
+in its baseline suite and uploads the evidence. Locking, readlink, PATH search
+and host-spelling collisions are outside this first cut.
+
 ## Why a second NFS provider
 
 [umbra-storage-nfs](../umbra-storage-nfs/README.md) needs an NFSv4 mount that

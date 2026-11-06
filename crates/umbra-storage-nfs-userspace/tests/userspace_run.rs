@@ -13474,3 +13474,288 @@ fn slate_r17_retained_readings_validate_exact_defects() {
     let records = r17_records(&bytes, &nonce, false);
     r17_defect(&records, 2, &nonce, Some(1), &stderr);
 }
+
+// ---- slate-r15: absolute shadow-only helper alias ----
+
+fn c15_exact_leaf_noent(
+    result: &Result<(), umbra_storage_nfs_userspace::error::FacadeError>,
+) -> bool {
+    use umbra_storage_nfs_userspace::error::{FacadeError, Nfs4Status};
+    use umbra_storage_nfs_userspace::transport::OpCode;
+    matches!(result, Err(FacadeError::Protocol(error))
+        if error.status == Nfs4Status::NOENT && error.op == OpCode::Lookup && error.index == 1)
+}
+
+#[test]
+fn slate_c15_absence_oracle_rejects_observation_failures() {
+    use umbra_storage_nfs_userspace::error::{FacadeError, Nfs4Status, TransportError};
+    use umbra_storage_nfs_userspace::transport::{OpCode, Retirement};
+    let noent = Err(FacadeError::protocol(Nfs4Status::NOENT, OpCode::Lookup, 1));
+    assert!(c15_exact_leaf_noent(&noent));
+    // Synthetic retired deadline: only exercises classification, never an RPC.
+    let retirement: Retirement =
+        serde_json::from_value(serde_json::json!({"token":1,"drained":true})).unwrap();
+    for result in [
+        Ok(()),
+        Err(FacadeError::Transport(TransportError::DeadlineExpired {
+            retirement,
+        })),
+        Err(FacadeError::Transport(TransportError::Connect(
+            "unreachable".into(),
+        ))),
+        Err(FacadeError::protocol(Nfs4Status::ACCESS, OpCode::Lookup, 1)),
+        Err(FacadeError::protocol(Nfs4Status::NOENT, OpCode::PutFh, 0)),
+    ] {
+        assert!(!c15_exact_leaf_noent(&result), "false absence: {result:?}");
+    }
+}
+
+fn c15_assert_output_absent(host: &str, port: u16, path: &[Vec<u8>], evidence: &Path) {
+    let (leaf, parents) = path.split_last().expect("output leaf");
+    let mut config = RawTransportConfig::loopback(port);
+    config.host = host.to_owned();
+    config.limits.default_deadline = Deadline { millis: 10_000 };
+    let deadline = config.limits.default_deadline;
+    let mut transport = LibnfsRawTransport::connect(config).expect("C15 absence connection");
+    let mut parent = transport
+        .root_filehandle(deadline)
+        .expect("C15 absence root");
+    for component in parents {
+        let name = ComponentName::new(component.clone()).expect("parent component");
+        parent = transport
+            .lookup(&parent, &name, AttrMask::STAT, deadline)
+            .unwrap_or_else(|error| panic!("C15 absence parent {component:?}: {error:?}"))
+            .0;
+    }
+    let name = ComponentName::new(leaf.clone()).expect("output component");
+    let result = transport
+        .lookup(&parent, &name, AttrMask::STAT, deadline)
+        .map(|_| ());
+    std::fs::write(
+        evidence,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "parents_resolved":true,"leaf":leaf,"lookup":result
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        c15_exact_leaf_noent(&result),
+        "C15 output absence not proven: {result:?}"
+    );
+}
+#[test]
+fn slate_c15_01_shadow_alias_exec() {
+    slate_c15_absence_oracle_rejects_observation_failures();
+    let Some(evidence) = slate_evidence() else {
+        return;
+    };
+    let Some(program) = input("UMBRA_C15_PATH") else {
+        return;
+    };
+    let Some(helper) = input("UMBRA_C15_HELPER") else {
+        return;
+    };
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let program = PathBuf::from(program).canonicalize().unwrap();
+    let helper = PathBuf::from(helper).canonicalize().unwrap();
+    let evidence = std::env::var_os("UMBRA_SLATE_R15_EVIDENCE")
+        .map(PathBuf::from)
+        .unwrap_or(evidence)
+        .join("C15-01");
+    assert!(!evidence.exists(), "never overwrite a reading");
+    std::fs::create_dir_all(&evidence).unwrap();
+    let mut identities = serde_json::Map::new();
+    for (name, command, args) in [
+        ("source", "git", vec!["rev-parse", "HEAD"]),
+        ("os", "uname", vec!["-a"]),
+        ("rust", "rustc", vec!["-Vv"]),
+        ("clang", "clang", vec!["--version"]),
+    ] {
+        let out = Command::new(command).args(args).output().unwrap();
+        assert!(out.status.success());
+        identities.insert(
+            name.into(),
+            serde_json::json!(String::from_utf8_lossy(&out.stdout)),
+        );
+    }
+    for (name, path) in [
+        ("launcher", program.clone()),
+        ("helper", helper.clone()),
+        ("umbra", binaries().join("umbra")),
+        ("platform", binaries().join("umbra-platform-macos")),
+        ("storage", binaries().join("umbra-storage-nfs-userspace")),
+    ] {
+        identities.insert(
+            name.into(),
+            serde_json::json!({"path":path,"sha256":r14_sha256(&std::fs::read(&path).unwrap())}),
+        );
+    }
+    identities.insert("fixture".into(), serde_json::json!({"host":host,"port":port,"deadline_seconds":60,"cleanup_grace_seconds":10}));
+    std::fs::write(
+        evidence.join("identities.json"),
+        serde_json::to_vec_pretty(&identities).unwrap(),
+    )
+    .unwrap();
+    for mode in ["direct", "alias"] {
+        let native = evidence.join(format!("native-{mode}-root"));
+        std::fs::create_dir(&native).unwrap();
+        let out = slate_bounded(
+            Command::new(&program).arg(mode).arg(&native).arg(&helper),
+            &evidence.join(format!("native-{mode}")),
+        );
+        assert!(out.status.success(), "native {mode}: {:?}", out.status);
+        assert_eq!(
+            std::fs::read(native.join("out.txt")).unwrap(),
+            b"C15-01 intended helper\n"
+        );
+        assert_eq!(
+            std::fs::read_link(native.join("helpers/helper")).unwrap(),
+            helper
+        );
+        // Artifact uploads dereference symlinks; retain the native target bytes separately.
+        std::fs::write(
+            evidence.join(format!("native-{mode}-link-target")),
+            std::fs::read_link(native.join("helpers/helper"))
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+        )
+        .unwrap();
+        let native_cleanup =
+            std::fs::read_to_string(evidence.join(format!("native-{mode}.cleanup"))).unwrap();
+        assert!(r14_cleanup_clean(&native_cleanup), "{native_cleanup}");
+        slate_finish_cleanup();
+        let root = evidence.join(format!("routed-{mode}-root"));
+        std::fs::create_dir(&root).unwrap();
+        let workspace = root.join("workspace");
+        let state = root.join("state");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let registry = registry(&root, &host, port);
+        assert_no_nfs_mount(&host, port, &[&workspace], "C15 before");
+        let out = slate_bounded(
+            Command::new(binaries().join("umbra"))
+                .args(["run", "--registry"])
+                .arg(&registry)
+                .arg("--workspace")
+                .arg(&workspace)
+                .arg("--state-dir")
+                .arg(&state)
+                .args(["--experimental", "--"])
+                .arg(&program)
+                .arg(mode)
+                .arg(&workspace)
+                .arg(&helper),
+            &evidence.join(format!("routed-{mode}")),
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        let id = stderr
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("umbra: run ")
+                    .and_then(|s| s.strip_suffix(" prepared"))
+            })
+            .expect("prepared run");
+        let run = Run {
+            run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+            status: out.status.code(),
+            stderr,
+            destination: workspace.join("out.txt"),
+            workspace,
+            state,
+            registry,
+        };
+        let mut ready = shadow_path(&run);
+        *ready.last_mut().unwrap() = b"ready".to_vec();
+        let ready = read_through_client(&host, port, &ready);
+        // Logical links are regular placeholders plus overlay-owned control records.
+        let alias = utility_shadow(&run, &run.workspace.join("helpers/helper"));
+        let attrs = attributes_through_client(&host, port, &alias).expect("alias placeholder");
+        assert_eq!(attrs.file_type, Some(Nfs4Type::Regular));
+        let identity = umbra_storage_nfs_userspace::handle::ObjectIdentity {
+            fsid: attrs.fsid.expect("fsid"),
+            fileid: attrs.fileid.expect("fileid"),
+        };
+        let object = umbra_storage_nfs_userspace::identity::object_id(identity);
+        let control = vec![
+            EXPORT.to_vec(),
+            RUN_PARENT.to_vec(),
+            run.run_id.0.to_string().into_bytes(),
+            b"control".to_vec(),
+            b"symlinks".to_vec(),
+        ];
+        let mut index = control.clone();
+        index.extend([b"objects".to_vec(), object.0.to_string().into_bytes()]);
+        let logical = read_through_client(&host, port, &index).expect("logical identity index");
+        let logical = uuid::Uuid::parse_str(std::str::from_utf8(&logical).unwrap()).unwrap();
+        let mut target = control;
+        target.extend([b"targets".to_vec(), logical.to_string().into_bytes()]);
+        let target = read_through_client(&host, port, &target).expect("logical link target");
+        std::fs::write(evidence.join(format!("{mode}-link-target")), &target).unwrap();
+        assert_eq!(target, helper.as_os_str().as_bytes());
+        let output = if mode == "alias" {
+            c15_assert_output_absent(
+                &host,
+                port,
+                &shadow_path(&run),
+                &evidence.join("alias-output-lookup.json"),
+            );
+            None
+        } else {
+            read_through_client(&host, port, &shadow_path(&run))
+        };
+        std::fs::write(
+            evidence.join(format!("{mode}-disposition.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "supervisor":run.status,"stderr":run.stderr,"ready":ready,"output":output,
+                "journal_completed":journal_records_completion(&run)
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ready.as_deref(),
+            Some(b"C15-01 alias created; exec next\n".as_slice())
+        );
+        assert_eq!(
+            std::fs::read_dir(&run.workspace).unwrap().count(),
+            0,
+            "host changed"
+        );
+        assert_host_write_root_empty(&run);
+        if mode == "direct" {
+            assert_eq!(run.status, Some(0), "{}", run.stderr);
+            assert_eq!(run.child_exit(), 0);
+            assert_eq!(
+                output.as_deref(),
+                Some(b"C15-01 intended helper\n".as_slice())
+            );
+            assert!(journal_records_completion(&run));
+        } else {
+            assert!(run.stderr.contains("twin source"), "{}", run.stderr);
+            assert!(
+                run.stderr.contains("No such file or directory"),
+                "{}",
+                run.stderr
+            );
+            assert!(!run.stderr.contains("finished:"));
+            assert!(output.is_none());
+            assert_eq!(run.status, Some(1));
+            assert_eq!(
+                run.stderr.lines().last(),
+                Some("Io during twin source: No such file or directory (os error 2) (errno: None)")
+            );
+            assert!(!journal_records_completion(&run));
+        }
+        assert_no_nfs_mount(&host, port, &[&run.workspace], "C15 after");
+        slate_assert_tracee_not_orphaned(&evidence.join(format!("routed-{mode}")));
+        let cleanup =
+            std::fs::read_to_string(evidence.join(format!("routed-{mode}.cleanup"))).unwrap();
+        assert!(r14_cleanup_clean(&cleanup), "{cleanup}");
+        slate_finish_cleanup();
+    }
+}
