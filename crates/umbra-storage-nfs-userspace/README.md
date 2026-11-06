@@ -1477,7 +1477,7 @@ resolution and the nonzero renameatx_np flags boundary respectively. These
 expectations are not positive publication support or evidence that E13 reaches
 the fallback after an abort. Refs #79.
 
-Local readings on Darwin 25.5.0 with rustc 1.99.1 did not reach either
+Original instrument readings on Darwin 25.5.0 with rustc 1.99.1 did not reach either
 publication boundary. All four native controls passed, but each routed run
 aborted during seed preparation with Rust's `IO Safety violation: owned file
 descriptor already closed`. Independent server reads found the complete source,
@@ -1485,15 +1485,25 @@ no destination (including in the intended incumbent cases), and no readiness
 file. The supervisor exited 1 without journal completion; cleanup passed.
 The later host-invariance assertions were not reached, so these readings do
 not certify an unchanged host namespace.
-The exact-refusal assertions remain failing, preserving the mismatch with the
-preregistration. Neither Link nor no-clobber publication is qualified by these
+Neither Link nor no-clobber publication is qualified by those original
 readings. The setup defect is tracked as #227.
+
+The revised instrument retains the source File across publication, reports
+through stdout, and exits explicitly to avoid its teardown. For modes 2/4,
+`umbra-slate-r16-prepared` uses the supervisor’s prepared observer to write the
+incumbent natively in the loopback Ganesha export before tracee launch. It uses
+the existing CLI composition and isolation entry points; the slate launcher
+still bounds and cleans up the process tree. This companion requires `docker`
+and the standard `umbra-m1-transport-raw-ganesha` fixture container. Source
+creation and writing remain routed. This deliberately sidesteps #227; it does
+not fix it. C16-05 separately pins the exact routed write-plus-drop abort with
+a passing native control. Revised readings are pending.
 
 Build the isolated `experiments/fixtures/umbra-slate-r16-publication` package
 with its lockfile into the workspace target and set `UMBRA_SLATE_R16_PATH`.
 The existing live-server configuration, `UMBRA_SLATE_EVIDENCE`, and
 `UMBRA_INTEGRATION_REQUIRED=1` are required for qualification. CI builds the
-fixture and includes all four cases in the baseline userspace invocation.
+fixture and includes all five cases in the baseline userspace invocation.
 Each case uses the existing slate launcher with a 30-second execution deadline
 and 10-second cleanup grace, retains logs and journal evidence, and independently
 checks server bytes and the unchanged host namespace. Evidence directories must

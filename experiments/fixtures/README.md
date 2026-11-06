@@ -182,3 +182,11 @@ experiments/fixtures/umbra-slate-r16-publication/Cargo.toml --target-dir target`
 Set `UMBRA_SLATE_R16_PATH` to the resulting executable and use the `c16_*`
 userspace tests, which run disposable native controls before enforced routing.
 See the userspace-storage README for evidence and prerequisites.
+
+The rank-16 package also builds `umbra-slate-r16-prepared`, which uses the
+supervisor’s prepared observer to seed an incumbent natively in the standard
+Ganesha container before tracee launch. Keep it beside the publication binary.
+The revised fixture retains its written source File across publication, reports
+through stdout and exits explicitly to sidestep #227. Mode 5 independently
+executes write-plus-drop to pin that defect. The incumbent companion requires
+`docker` on the harness PATH and the loopback fixture container.

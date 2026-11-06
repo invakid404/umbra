@@ -13761,8 +13761,8 @@ fn slate_c15_01_shadow_alias_exec() {
 }
 
 // ---- slate-r16: hard-link/no-clobber publication (Refs #79) ----
-// Measured setup abort: #227. Keep the preregistered
-// assertions strict: the IO Safety abort does not qualify either publication path.
+// Revised preparation retains the source File across publication; C16-05
+// separately pins the original setup defect (Refs #227).
 const C16_SOURCE: &[u8] = b"C16 complete temporary payload\n";
 const C16_INCUMBENT: &[u8] = b"C16 incumbent must survive unchanged\n";
 fn c16_case(mode: u8) {
@@ -13778,11 +13778,14 @@ fn c16_case(mode: u8) {
     let Some(program) = input("UMBRA_SLATE_R16_PATH") else {
         return;
     };
+    let prepared = PathBuf::from(&program).with_file_name("umbra-slate-r16-prepared");
+    assert!(prepared.is_file(), "build the rank-16 companion fixture");
     let evidence = root.join(format!("C16-{mode:02}"));
     std::fs::create_dir(&evidence).expect("fresh reading, never overwrite");
     let mut hashes = String::new();
     for file in [
         PathBuf::from(&program),
+        prepared.clone(),
         binaries().join("umbra"),
         binaries().join("umbra-platform-macos"),
         binaries().join("umbra-storage-nfs-userspace"),
@@ -13797,6 +13800,9 @@ fn c16_case(mode: u8) {
     let scratch = tempfile::tempdir().unwrap();
     let native = scratch.path().join("native");
     std::fs::create_dir(&native).unwrap();
+    if mode % 2 == 0 {
+        std::fs::write(native.join("dst"), C16_INCUMBENT).unwrap();
+    }
     let (out, timeout) = slate_launch(
         Command::new(&program).arg(mode.to_string()).arg(&native),
         &evidence.join("native"),
@@ -13806,26 +13812,33 @@ fn c16_case(mode: u8) {
     slate_finish_cleanup();
     assert!(!timeout);
     assert!(out.status.success(), "native: {:?}", out.stderr);
-    let native_stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(native_stderr.contains("C16 decision-return Ok"));
-    let operation = if mode <= 2 { "link" } else { "persist" };
-    let result = if mode % 2 == 0 { "AlreadyExists" } else { "Ok" };
-    assert!(native_stderr.contains(&format!("C16 {operation}-return {result}")));
-    assert_eq!(
-        std::fs::read(native.join("dst")).unwrap(),
-        if mode % 2 == 0 {
-            C16_INCUMBENT
-        } else {
-            C16_SOURCE
-        }
-    );
-    if mode <= 2 {
+    let native_stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(native_stdout.contains("C16 decision-return Ok"));
+    if mode == 5 {
+        assert!(native_stdout.contains("C16 drop-enter"));
+        assert!(native_stdout.contains("C16 drop-return Ok"));
         assert_eq!(std::fs::read(native.join("src")).unwrap(), C16_SOURCE);
+        assert!(!native.join("dst").exists());
     } else {
-        assert!(
-            !native.join("src").exists(),
-            "TempPath publication/drop removes native source"
+        let operation = if mode <= 2 { "link" } else { "persist" };
+        let result = if mode % 2 == 0 { "AlreadyExists" } else { "Ok" };
+        assert!(native_stdout.contains(&format!("C16 {operation}-return {result}")));
+        assert_eq!(
+            std::fs::read(native.join("dst")).unwrap(),
+            if mode % 2 == 0 {
+                C16_INCUMBENT
+            } else {
+                C16_SOURCE
+            }
         );
+        if mode <= 2 {
+            assert_eq!(std::fs::read(native.join("src")).unwrap(), C16_SOURCE);
+        } else {
+            assert!(
+                !native.join("src").exists(),
+                "TempPath publication/drop removes native source"
+            );
+        }
     }
     let workspace = scratch.path().join("workspace");
     let state = scratch.path().join("state");
@@ -13837,21 +13850,26 @@ fn c16_case(mode: u8) {
     std::fs::copy(&registry, evidence.join("registry.json")).unwrap();
     assert_no_nfs_mount(&host, port, &[&workspace], "C16 before");
     let (out, timeout) = slate_launch(
-        Command::new(binaries().join("umbra"))
-            .args(["run", "--registry"])
-            .arg(&registry)
-            .arg("--workspace")
-            .arg(&workspace)
-            .arg("--state-dir")
-            .arg(&state)
-            .args(["--experimental", "--"])
-            .arg(&program)
-            .arg(mode.to_string())
-            .arg(&workspace),
+        Command::new(if mode % 2 == 0 {
+            prepared
+        } else {
+            binaries().join("umbra")
+        })
+        .args(["run", "--registry"])
+        .arg(&registry)
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--experimental", "--"])
+        .arg(&program)
+        .arg(mode.to_string())
+        .arg(&workspace),
         &evidence.join("routed"),
         std::time::Duration::from_secs(30),
         None,
     );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let id = stderr
         .lines()
@@ -13893,22 +13911,35 @@ fn c16_case(mode: u8) {
     assert!(!timeout);
     assert_eq!(run.status, Some(1));
     assert!(!completed);
-    let diagnostic = if mode <= 2 {
+    let diagnostic = if mode == 5 {
+        "IO Safety violation: owned file descriptor already closed"
+    } else if mode <= 2 {
         "operation requires descriptor or metadata support beyond MVP"
     } else {
         "renameatx_np flags 0x4"
     };
     assert!(run.stderr.contains(diagnostic), "{}", run.stderr);
     assert!(!run.stderr.contains("finished:"));
-    assert!(run.stderr.contains(&format!("C16 ready mode={mode}")));
-    assert!(!run.stderr.contains("C16 decision-return"));
-    assert!(!run.stderr.contains("C16 link-return"));
-    assert!(!run.stderr.contains("C16 persist-return"));
-    if mode <= 2 {
-        assert!(run.stderr.contains("C16 link-enter"));
-        assert!(!run.stderr.contains("C16 fallback-enter"));
+    assert!(!stdout.contains("C16 decision-return"));
+    assert!(!stdout.contains("C16 link-return"));
+    assert!(!stdout.contains("C16 persist-return"));
+    if mode == 5 {
+        assert!(stdout.contains("C16 drop-enter"));
+        assert!(!stdout.contains("C16 drop-return"));
+        assert!(!stdout.contains("C16 ready"));
+        assert!(run.stderr.contains("fatal signal/exception: T06"));
     } else {
-        assert!(run.stderr.contains("C16 fallback-enter"));
+        assert!(stdout.contains(&format!("C16 ready mode={mode}")));
+        assert!(!run.stderr.contains("IO Safety violation"));
+        if mode <= 2 {
+            assert!(stdout.contains("C16 link-enter"));
+            assert!(!stdout.contains("C16 fallback-enter"));
+        } else {
+            assert!(stdout.contains("C16 fallback-enter"));
+        }
+        if mode % 2 == 0 {
+            assert!(run.stderr.contains("C16 incumbent seeded before launch:"));
+        }
     }
     assert_eq!(src.as_deref(), Some(C16_SOURCE));
     assert_eq!(
@@ -13919,7 +13950,10 @@ fn c16_case(mode: u8) {
             None
         }
     );
-    assert_eq!(ready.as_deref(), Some(b"C16 ready\n".as_slice()));
+    assert!(
+        ready.is_none(),
+        "readiness is pipe-only, never a routed marker"
+    );
     assert_eq!(
         std::fs::read(run.workspace.join("seed.txt")).unwrap(),
         b"seed\n"
@@ -13931,7 +13965,7 @@ fn c16_case(mode: u8) {
     );
     assert_no_nfs_mount(&host, port, &[&run.workspace], "C16 after");
     scratch.close().unwrap();
-    std::fs::write(evidence.join("result.txt"), format!("C16-{mode:02}: native passed; exact refusal: {diagnostic}; host unchanged; disposable host data removed; owned process cleanup passed\n")).unwrap();
+    std::fs::write(evidence.join("result.txt"), format!("C16-{mode:02}: native passed; exact expected outcome: {diagnostic}; host unchanged; disposable host data removed; owned process cleanup passed\n")).unwrap();
 }
 #[test]
 fn c16_01_e13_absent() {
@@ -13948,4 +13982,9 @@ fn c16_03_noclobber_absent() {
 #[test]
 fn c16_04_noclobber_incumbent() {
     c16_case(4);
+}
+
+#[test]
+fn c16_05_written_file_drop_defect() {
+    c16_case(5);
 }
