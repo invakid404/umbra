@@ -155,3 +155,10 @@ The `slate_r17_*` cases in `userspace_run.rs` require `UMBRA_R17_NOTIFY_PATH`,
 usual enforced userspace/Ganesha inputs. They use the existing bounded slate
 launcher. Construction, registration and remote event delivery are distinct
 claims; these fixtures do not implement remote notifications or polling.
+
+The rank-17 `readings/` directory retains the six original framed reports and
+nonces, plus the two failing routed stderr logs, for an offline assertion test.
+C17-02 stops on Rust directory iteration with EBADF; C17-03 aborts on the libc
+readdir error after the expected vnode refusal. Neither failing report has a
+COMPLETE frame. The offline test preserves that fact and rejects missing frames
+as successful event observations. Refs ISSUE-TBD(watcher-directory-enumeration).

@@ -1,0 +1,9 @@
+147:{"data":{"backend":"Fsevent","mode":"register"},"nonce":"a11a20b76b324d3d9703b47daaaa717a","phase":"BEGIN","pid":32339,"seq":0,"us":49,"version":1}
+127:{"data":"C17-CHANNEL","nonce":"a11a20b76b324d3d9703b47daaaa717a","phase":"channel","pid":32339,"seq":1,"us":175213,"version":1}
+142:{"data":{"error":null,"ok":true},"nonce":"a11a20b76b324d3d9703b47daaaa717a","phase":"constructor","pid":32339,"seq":2,"us":352195,"version":1}
+144:{"data":{"error":null,"ok":true},"nonce":"a11a20b76b324d3d9703b47daaaa717a","phase":"registration","pid":32339,"seq":3,"us":1752795,"version":1}
+117:{"data":true,"nonce":"a11a20b76b324d3d9703b47daaaa717a","phase":"READY","pid":32339,"seq":4,"us":1885493,"version":1}
+177:{"data":{"ack_us":2160360,"bytes":"a11a20b76b324d3d9703b47daaaa717a"},"nonce":"a11a20b76b324d3d9703b47daaaa717a","phase":"mutation","pid":32339,"seq":5,"us":2160372,"version":1}
+132:{"data":2160360,"nonce":"a11a20b76b324d3d9703b47daaaa717a","phase":"observation-start","pid":32339,"seq":6,"us":2293677,"version":1}
+130:{"data":7485366,"nonce":"a11a20b76b324d3d9703b47daaaa717a","phase":"observation-end","pid":32339,"seq":7,"us":7485386,"version":1}
+212:{"data":[97,49,49,97,50,48,98,55,54,98,51,50,52,100,51,100,57,55,48,51,98,52,55,100,97,97,97,97,55,49,55,97],"nonce":"a11a20b76b324d3d9703b47daaaa717a","phase":"read","pid":32339,"seq":8,"us":7862226,"version":1}

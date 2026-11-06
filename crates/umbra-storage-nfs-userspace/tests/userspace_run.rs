@@ -12980,7 +12980,7 @@ fn slate_r14_terminal_repair_replay() {
 
 
 // ---- slate-r17: native watcher failure and degraded behavior ----
-fn r17_records(bytes: &[u8], nonce: &str) -> Vec<serde_json::Value> {
+fn r17_records(bytes: &[u8], nonce: &str, complete: bool) -> Vec<serde_json::Value> {
     let mut tail = bytes;
     let mut records = Vec::new();
     while !tail.is_empty() {
@@ -13002,8 +13002,10 @@ fn r17_records(bytes: &[u8], nonce: &str) -> Vec<serde_json::Value> {
         records.push(record);
     }
     assert_eq!(records.first().unwrap()["phase"], "BEGIN");
-    assert_eq!(records.last().unwrap()["phase"], "COMPLETE");
-    assert_eq!(records.last().unwrap()["data"]["records"], records.len());
+    if complete {
+        assert_eq!(records.last().unwrap()["phase"], "COMPLETE");
+        assert_eq!(records.last().unwrap()["data"]["records"], records.len());
+    }
     assert_eq!(
         r17_phase(&records, "channel"),
         &serde_json::json!("C17-CHANNEL")
@@ -13076,6 +13078,90 @@ fn r17_assert(records: &[serde_json::Value], case: usize, native: bool, nonce: &
         })
         .count();
     assert_eq!(matching > 0, native, "bounded callback prediction");
+}
+// ISSUE-TBD(watcher-directory-enumeration): these are exact terminal defect
+// signatures, not completed event observations. Fixtures remain byte-identical
+// to the first readings; absence of serialized callbacks certifies nothing.
+fn r17_defect(
+    records: &[serde_json::Value],
+    case: usize,
+    nonce: &str,
+    status: Option<i32>,
+    stderr: &str,
+) {
+    use serde_json::json;
+    assert_eq!(status, Some(1));
+    let phases: Vec<_> = records
+        .iter()
+        .map(|r| r["phase"].as_str().unwrap())
+        .collect();
+    if case == 2 {
+        assert_eq!(
+            phases,
+            [
+                "BEGIN",
+                "channel",
+                "constructor",
+                "registration",
+                "READY",
+                "mutation",
+                "observation-start",
+                "observation-end",
+                "read"
+            ]
+        );
+        assert_eq!(
+            r17_phase(records, "constructor"),
+            &json!({"ok":true,"error":null})
+        );
+        assert_eq!(
+            r17_phase(records, "registration"),
+            &json!({"ok":true,"error":null})
+        );
+        assert_eq!(r17_phase(records, "READY"), &json!(true));
+        assert_eq!(r17_phase(records, "mutation")["bytes"], nonce);
+        assert_eq!(r17_phase(records, "read"), &json!(nonce.as_bytes()));
+        let start = r17_phase(records, "observation-start").as_u64().unwrap();
+        assert_eq!(r17_phase(records, "mutation")["ack_us"], start);
+        assert!(r17_phase(records, "observation-end").as_u64().unwrap() >= start + 5_000_000);
+        assert!(stderr.contains("panicked at src/main.rs:101:23:"));
+        assert!(
+            stderr
+                .contains("Os { code: 9, kind: Uncategorized, message: \"Bad file descriptor\" }")
+        );
+        assert!(stderr.contains("finished: Some(Code(101)) after 1 process exits"));
+        assert!(stderr.contains("ProcessFailed during run.child:"));
+        assert!(!stderr.contains("fatal signal/exception"));
+    } else {
+        assert_eq!(case, 3);
+        assert_eq!(
+            phases,
+            [
+                "BEGIN",
+                "channel",
+                "initial-read",
+                "queue",
+                "registration",
+                "mutation",
+                "observation",
+                "read"
+            ]
+        );
+        assert_eq!(r17_phase(records, "initial-read"), &json!("SEED"));
+        assert_eq!(r17_phase(records, "queue"), &json!(true));
+        assert_eq!(
+            r17_phase(records, "registration"),
+            &json!({"return":1,"errno":0,"flags":16481,"data":9})
+        );
+        assert_eq!(r17_phase(records, "mutation"), &json!("NOT_APPLICABLE"));
+        assert_eq!(r17_phase(records, "observation"), &json!("NOT_APPLICABLE"));
+        assert_eq!(r17_phase(records, "read"), &json!("SEED"));
+        assert!(stderr.contains(
+            "Assertion failed: (errno==0), function main, file umbra-slate-r17-vnode.c, line 64."
+        ));
+        assert!(stderr.contains("Io during tracee stop: fatal signal/exception: T06"));
+        assert!(!stderr.contains("finished: Some(Code(0))"));
+    }
 }
 fn r17_case(case: usize) {
     if declared_probe().is_some() {
@@ -13236,18 +13322,26 @@ fn r17_case(case: usize) {
                     nonce.as_bytes()
                 );
             }
-            assert_eq!(run.child_exit(), 0, "{}", run.stderr);
-            assert!(journal_records_completion(&run));
+            if case == 1 {
+                assert_eq!(run.child_exit(), 0, "{}", run.stderr);
+                assert!(journal_records_completion(&run));
+            } else if case == 2 {
+                assert_eq!(run.child_exit(), 101, "{}", run.stderr);
+                assert!(journal_records_completion(&run));
+            }
             assert_no_nfs_mount(&host, port, &[&root], "C17 after");
         }
         std::fs::write(scratch.join("result.frames"), &bytes).unwrap();
         assert!(!timed, "deadline");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let records = r17_records(&bytes, &nonce);
+        let complete = native || case == 1;
+        if complete {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let records = r17_records(&bytes, &nonce, complete);
         std::fs::write(
             scratch.join("records.json"),
             serde_json::to_vec_pretty(&records).unwrap(),
@@ -13256,7 +13350,25 @@ fn r17_case(case: usize) {
         slate_finish_cleanup();
         let cleanup = std::fs::read_to_string(scratch.join("launch.cleanup")).unwrap();
         assert!(r14_cleanup_clean(&cleanup), "{cleanup}");
-        r17_assert(&records, case, native, &nonce);
+        if complete {
+            r17_assert(&records, case, native, &nonce);
+        } else {
+            r17_defect(
+                &records,
+                case,
+                &nonce,
+                output.status.code(),
+                &String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        eprintln!(
+            "C17-{case:02} {side}: {}",
+            if complete {
+                "supported control/constructor"
+            } else {
+                "known directory enumeration defect; event completion unqualified"
+            }
+        );
     }
 }
 #[test]
@@ -13270,4 +13382,59 @@ fn slate_r17_02_notify_registration() {
 #[test]
 fn slate_r17_03_vnode_receipt() {
     r17_case(3);
+}
+
+#[test]
+fn slate_r17_retained_readings_validate_exact_defects() {
+    let root = repository().join("experiments/fixtures/umbra-slate-r17-notify/readings");
+    for case in 1..=3 {
+        for native in [true, false] {
+            let dir = root.join(format!(
+                "C17-{case:02}/{}",
+                if native { "native" } else { "routed" }
+            ));
+            let nonce = std::fs::read_to_string(dir.join("nonce")).unwrap();
+            let bytes = std::fs::read(dir.join("result.frames")).unwrap();
+            let complete = native || case == 1;
+            let records = r17_records(&bytes, &nonce, complete);
+            if complete {
+                r17_assert(&records, case, native, &nonce);
+            } else {
+                let stderr = std::fs::read_to_string(dir.join("launch.stderr")).unwrap();
+                r17_defect(&records, case, &nonce, Some(1), &stderr);
+                // The original prediction still rejects the same bytes. This
+                // is offline classification, never a retake of a failed run.
+                assert!(std::panic::catch_unwind(|| r17_records(&bytes, &nonce, true)).is_err());
+                assert!(
+                    std::panic::catch_unwind(|| r17_defect(
+                        &records,
+                        case,
+                        &nonce,
+                        Some(0),
+                        &stderr
+                    ))
+                    .is_err()
+                );
+                let mut wrong = records.clone();
+                wrong
+                    .iter_mut()
+                    .find(|r| r["phase"] == "registration")
+                    .unwrap()["data"] = serde_json::json!({"ok":false,"data":0});
+                assert!(
+                    std::panic::catch_unwind(|| r17_defect(&wrong, case, &nonce, Some(1), &stderr))
+                        .is_err()
+                );
+                assert!(
+                    std::panic::catch_unwind(|| r17_defect(
+                        &records,
+                        case,
+                        &nonce,
+                        Some(1),
+                        "unrelated failure"
+                    ))
+                    .is_err()
+                );
+            }
+        }
+    }
 }

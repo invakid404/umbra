@@ -1,0 +1,14 @@
+147:{"data":{"backend":"Fsevent","mode":"register"},"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"BEGIN","pid":32209,"seq":0,"us":41,"version":1}
+123:{"data":"C17-CHANNEL","nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"channel","pid":32209,"seq":1,"us":97,"version":1}
+139:{"data":{"error":null,"ok":true},"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"constructor","pid":32209,"seq":2,"us":134,"version":1}
+141:{"data":{"error":null,"ok":true},"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"registration","pid":32209,"seq":3,"us":1701,"version":1}
+114:{"data":true,"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"READY","pid":32209,"seq":4,"us":1722,"version":1}
+171:{"data":{"ack_us":1826,"bytes":"6625e7df1b37414ebcb204bfe0d1baef"},"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"mutation","pid":32209,"seq":5,"us":1829,"version":1}
+126:{"data":1826,"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"observation-start","pid":32209,"seq":6,"us":1846,"version":1}
+130:{"data":5047502,"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"observation-end","pid":32209,"seq":7,"us":5047566,"version":1}
+218:{"data":[54,54,50,53,101,55,100,102,49,98,51,55,52,49,52,101,98,99,98,50,48,52,98,102,101,48,100,49,98,97,101,102],"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"read","pid":32209,"seq":8,"us":5047761,"version":1}
+152:{"data":["6625e7df1b37414ebcb204bfe0d1baef.txt"],"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"list","pid":32209,"seq":9,"us":5047921,"version":1}
+273:{"data":{"kind":"Create(File)","paths":["/private/tmp/graph-dg-ktyhpe5w/evidence/reading-1/C17-02/native/root/work/6625e7df1b37414ebcb204bfe0d1baef.txt"],"us":5586},"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"callback","pid":32209,"seq":10,"us":5049067,"version":1}
+282:{"data":{"kind":"Modify(Data(Content))","paths":["/private/tmp/graph-dg-ktyhpe5w/evidence/reading-1/C17-02/native/root/work/6625e7df1b37414ebcb204bfe0d1baef.txt"],"us":5586},"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"callback","pid":32209,"seq":11,"us":5049187,"version":1}
+150:{"data":{"dropped":true,"overflow":false},"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"teardown","pid":32209,"seq":12,"us":5049255,"version":1}
+131:{"data":{"records":14},"nonce":"6625e7df1b37414ebcb204bfe0d1baef","phase":"COMPLETE","pid":32209,"seq":13,"us":5049298,"version":1}
