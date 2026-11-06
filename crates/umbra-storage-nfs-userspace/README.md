@@ -1403,7 +1403,7 @@ separate claims.
 | C17-03 | EVFILT_VNODE returns one EV_ERROR receipt with data EBADF; ordinary read still returns SEED. The subsequent libc directory iteration sets errno and the fixture aborts, reported as signal 6 by supervision. Continued list usability is not qualified. |
 
 C17-02 and C17-03 pin known terminal defects with exact ordered partial records
-and diagnostic assertions: ISSUE-TBD(watcher-directory-enumeration). These are
+and diagnostic assertions: #225. These are
 not passing no-event observations or a claim that both failures share a cause.
 All three native controls complete successfully; the recorded native registration
 case delivers matching events, and the native vnode case receives NOTE_WRITE.

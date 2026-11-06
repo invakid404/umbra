@@ -13079,7 +13079,7 @@ fn r17_assert(records: &[serde_json::Value], case: usize, native: bool, nonce: &
         .count();
     assert_eq!(matching > 0, native, "bounded callback prediction");
 }
-// ISSUE-TBD(watcher-directory-enumeration): these are exact terminal defect
+// #225: these are exact terminal defect
 // signatures, not completed event observations. Fixtures remain byte-identical
 // to the first readings; absence of serialized callbacks certifies nothing.
 fn r17_defect(

@@ -95,7 +95,7 @@ callback serialization did not complete, so no remote-event result is qualified.
 The vnode probe received the expected EBADF receipt and could still read its file,
 then aborted during libc directory iteration. Explicit vnode refusal therefore
 does not establish continued listing usability. These two terminal outcomes are
-tracked by ISSUE-TBD(watcher-directory-enumeration); the cases and exact assertions
+tracked by #225; the cases and exact assertions
 are documented in `crates/umbra-storage-nfs-userspace/README.md` and implemented in
 its `tests/userspace_run.rs`. Native controls succeeded. These observations do not
 change the design requirement for explicit degraded or preflight behavior.

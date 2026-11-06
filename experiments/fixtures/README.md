@@ -161,4 +161,4 @@ nonces, plus the two failing routed stderr logs, for an offline assertion test.
 C17-02 stops on Rust directory iteration with EBADF; C17-03 aborts on the libc
 readdir error after the expected vnode refusal. Neither failing report has a
 COMPLETE frame. The offline test preserves that fact and rejects missing frames
-as successful event observations. Refs ISSUE-TBD(watcher-directory-enumeration).
+as successful event observations. Refs #225.
