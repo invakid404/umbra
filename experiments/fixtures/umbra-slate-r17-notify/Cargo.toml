@@ -8,5 +8,5 @@ publish = false
 
 [dependencies]
 notify = "=8.2.0"
-libc = "0.2"
-serde_json = "1"
+libc = "=0.2.191"
+serde_json = "=1.0.154"
