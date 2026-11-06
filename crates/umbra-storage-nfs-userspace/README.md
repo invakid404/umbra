@@ -1408,7 +1408,11 @@ not passing no-event observations or a claim that both failures share a cause.
 All three native controls complete successfully; the recorded native registration
 case delivers matching events, and the native vnode case receives NOTE_WRITE.
 The preregistered Expected values remain in the unchanged rank-17 ideation.
-The fixture bytes used for these readings are unchanged; the final assertion
-classification is checked offline against retained records, with negative
-controls for wrong exits, wrong registration results, and unrelated diagnostics.
+C17-01/02 use newly identified readings from a clean build of the committed
+notify source. The earlier local binary predated source formatting, so its
+claimed committed-source provenance is withdrawn. The identified C17-02 panic
+is at `src/main.rs:112:24`, matching the runner, rather than the old `101:23`.
+C17-03's fixture and reading are unchanged. Offline replay checks the retained
+identified local and original runner bytes, rejecting the stale location, wrong
+exits, wrong registration results, and unrelated diagnostics.
 CI must still run the final live assertions on the reviewed head. Refs #217.

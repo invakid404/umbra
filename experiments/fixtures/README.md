@@ -156,9 +156,17 @@ usual enforced userspace/Ganesha inputs. They use the existing bounded slate
 launcher. Construction, registration and remote event delivery are distinct
 claims; these fixtures do not implement remote notifications or polling.
 
-The rank-17 `readings/` directory retains the six original framed reports and
+The rank-17 `readings/` directory retains six qualified framed reports and
 nonces, plus the two failing routed stderr logs, for an offline assertion test.
 C17-02 stops on Rust directory iteration with EBADF; C17-03 aborts on the libc
 readdir error after the expected vnode refusal. Neither failing report has a
 COMPLETE frame. The offline test preserves that fact and rejects missing frames
 as successful event observations. Refs #225.
+
+C17-01/02 now use a clean rebuilt notify binary identified against the committed
+source. Their earlier local binary predated source formatting; those earlier
+readings do not qualify the committed fixture. `provenance.json` records the
+source, lock and rebuilt binary hashes. `ci-C17-02/` retains the runner's exact
+report and stderr: the corrected `112:24` panic pin accepts those original bytes.
+`unidentified-C17-02.stderr` is retained only as a rejected `101:23` provenance
+control. The independent C17-03 fixture and its reading remain unchanged.

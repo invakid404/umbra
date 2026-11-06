@@ -1,0 +1,7 @@
+umbra: run cccb2df6-5075-48b6-9296-b1723f59568c prepared
+
+thread 'main' (116215092) panicked at src/main.rs:112:24:
+called `Result::unwrap()` on an `Err` value: Os { code: 9, kind: Uncategorized, message: "Bad file descriptor" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+umbra: run cccb2df6-5075-48b6-9296-b1723f59568c finished: Some(Code(101)) after 1 process exits
+ProcessFailed during run.child: supervised command finished with Code(101) (errno: None)

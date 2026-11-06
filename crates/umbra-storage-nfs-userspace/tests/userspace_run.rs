@@ -13079,8 +13079,8 @@ fn r17_assert(records: &[serde_json::Value], case: usize, native: bool, nonce: &
     assert_eq!(matching > 0, native, "bounded callback prediction");
 }
 // #225: these are exact terminal defect
-// signatures, not completed event observations. Fixtures remain byte-identical
-// to the first readings; absence of serialized callbacks certifies nothing.
+// signatures, not completed event observations. Notify records use an identified
+// clean build; absence of serialized callbacks certifies nothing.
 fn r17_defect(
     records: &[serde_json::Value],
     case: usize,
@@ -13400,6 +13400,19 @@ fn slate_r17_retained_readings_validate_exact_defects() {
             } else {
                 let stderr = std::fs::read_to_string(dir.join("launch.stderr")).unwrap();
                 r17_defect(&records, case, &nonce, Some(1), &stderr);
+                if case == 2 {
+                    let stale =
+                        std::fs::read_to_string(root.join("unidentified-C17-02.stderr")).unwrap();
+                    assert!(stale.contains("src/main.rs:101:23:"));
+                    assert!(std::panic::catch_unwind(|| r17_defect(
+                        &records,
+                        case,
+                        &nonce,
+                        Some(1),
+                        &stale
+                    ))
+                    .is_err());
+                }
                 // The original prediction still rejects the same bytes. This
                 // is offline classification, never a retake of a failed run.
                 assert!(std::panic::catch_unwind(|| r17_records(&bytes, &nonce, true)).is_err());
@@ -13435,4 +13448,11 @@ fn slate_r17_retained_readings_validate_exact_defects() {
             }
         }
     }
+    let ci = root.join("ci-C17-02");
+    let nonce = std::fs::read_to_string(ci.join("nonce")).unwrap();
+    let bytes = std::fs::read(ci.join("result.frames")).unwrap();
+    let stderr = std::fs::read_to_string(ci.join("launch.stderr")).unwrap();
+    assert!(!stderr.contains("panicked at src/main.rs:101:23:"));
+    let records = r17_records(&bytes, &nonce, false);
+    r17_defect(&records, 2, &nonce, Some(1), &stderr);
 }

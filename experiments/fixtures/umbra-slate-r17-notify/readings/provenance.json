@@ -1,0 +1,12 @@
+{
+  "notify": {
+    "source_commit": "aa2f9220782e0692ee75bf785a68d960ba847446",
+    "source_sha256": "d217fd9f58b824f462d4f9640ecaad3d31c4cda534094c28546cbe5f673bdb2c",
+    "binary_sha256": "3ba3b6f3e09957266482039af28e5b31de5349b8db6920c1f30eea413f1fa1cb",
+    "lock_sha256": "4be0c43ba5d209cecdd0953dbde4fa4aa49c7563bc779f2ee4c8861d82704b29",
+    "identity_method": "cargo clean -p umbra-slate-r17-notify followed by locked verbose build; source byte-identical to git blob; see fixture-clean-build.log",
+    "expected_panic_location": "src/main.rs:112:24"
+  },
+  "reading_commit": "ae6cde6",
+  "notes": "C17-01/02 replaced by identified local readings. C17-03 unchanged. ci-C17-02 retains exact runner inputs. unidentified-C17-02.stderr is a negative provenance control only. Original raw readings remain archived outside the tree."
+}
