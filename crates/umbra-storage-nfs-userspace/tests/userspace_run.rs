@@ -13759,3 +13759,181 @@ fn slate_c15_01_shadow_alias_exec() {
         slate_finish_cleanup();
     }
 }
+
+// ---- slate-r16: hard-link/no-clobber publication (Refs #79) ----
+const C16_SOURCE: &[u8] = b"C16 complete temporary payload\n";
+const C16_INCUMBENT: &[u8] = b"C16 incumbent must survive unchanged\n";
+fn c16_case(mode: u8) {
+    if declared_probe().is_some() {
+        return;
+    }
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(root) = slate_evidence() else {
+        return;
+    };
+    let Some(program) = input("UMBRA_SLATE_R16_PATH") else {
+        return;
+    };
+    let evidence = root.join(format!("C16-{mode:02}"));
+    std::fs::create_dir(&evidence).expect("fresh reading, never overwrite");
+    let mut hashes = String::new();
+    for file in [
+        PathBuf::from(&program),
+        binaries().join("umbra"),
+        binaries().join("umbra-platform-macos"),
+        binaries().join("umbra-storage-nfs-userspace"),
+    ] {
+        hashes.push_str(&format!(
+            "{}  {}\n",
+            r14_sha256(&std::fs::read(&file).unwrap()),
+            file.display()
+        ));
+    }
+    std::fs::write(evidence.join("SHA256SUMS"), hashes).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let native = scratch.path().join("native");
+    std::fs::create_dir(&native).unwrap();
+    let (out, timeout) = slate_launch(
+        Command::new(&program).arg(mode.to_string()).arg(&native),
+        &evidence.join("native"),
+        std::time::Duration::from_secs(30),
+        None,
+    );
+    slate_finish_cleanup();
+    assert!(!timeout);
+    assert!(out.status.success(), "native: {:?}", out.stderr);
+    let native_stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(native_stderr.contains("C16 decision-return Ok"));
+    let operation = if mode <= 2 { "link" } else { "persist" };
+    let result = if mode % 2 == 0 { "AlreadyExists" } else { "Ok" };
+    assert!(native_stderr.contains(&format!("C16 {operation}-return {result}")));
+    assert_eq!(
+        std::fs::read(native.join("dst")).unwrap(),
+        if mode % 2 == 0 {
+            C16_INCUMBENT
+        } else {
+            C16_SOURCE
+        }
+    );
+    if mode <= 2 {
+        assert_eq!(std::fs::read(native.join("src")).unwrap(), C16_SOURCE);
+    } else {
+        assert!(
+            !native.join("src").exists(),
+            "TempPath publication/drop removes native source"
+        );
+    }
+    let workspace = scratch.path().join("workspace");
+    let state = scratch.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed\n").unwrap();
+    let registry = registry(scratch.path(), &host, port);
+    std::fs::copy(&registry, evidence.join("registry.json")).unwrap();
+    assert_no_nfs_mount(&host, port, &[&workspace], "C16 before");
+    let (out, timeout) = slate_launch(
+        Command::new(binaries().join("umbra"))
+            .args(["run", "--registry"])
+            .arg(&registry)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["--experimental", "--"])
+            .arg(&program)
+            .arg(mode.to_string())
+            .arg(&workspace),
+        &evidence.join("routed"),
+        std::time::Duration::from_secs(30),
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let id = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("umbra: run ")
+                .and_then(|s| s.strip_suffix(" prepared"))
+        })
+        .expect("prepared run");
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+        status: out.status.code(),
+        stderr,
+        destination: workspace.join("src"),
+        workspace,
+        state,
+        registry,
+    };
+    let mut path = shadow_path(&run);
+    let src = c12_read(&host, port, &path);
+    *path.last_mut().unwrap() = b"dst".to_vec();
+    let dst = c12_read(&host, port, &path);
+    *path.last_mut().unwrap() = b"ready".to_vec();
+    let ready = c12_read(&host, port, &path);
+    let completed = journal_records_completion(&run);
+    std::fs::write(evidence.join("observed.json"), serde_json::to_vec_pretty(&serde_json::json!({"status":run.status,"timeout":timeout,"completed":completed,"src":src,"dst":dst,"ready":ready})).unwrap()).unwrap();
+    fn retain(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                retain(&entry.path(), &to.join(entry.file_name()));
+            } else {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    retain(&run.state, &evidence.join("state"));
+    slate_finish_cleanup();
+    assert!(!timeout);
+    assert_eq!(run.status, Some(1));
+    assert!(!completed);
+    let diagnostic = if mode <= 2 {
+        "operation requires descriptor or metadata support beyond MVP"
+    } else {
+        "renameatx_np flags 0x4"
+    };
+    assert!(run.stderr.contains(diagnostic), "{}", run.stderr);
+    assert!(!run.stderr.contains("finished:"));
+    assert_eq!(src.as_deref(), Some(C16_SOURCE));
+    assert_eq!(
+        dst.as_deref(),
+        if mode % 2 == 0 {
+            Some(C16_INCUMBENT)
+        } else {
+            None
+        }
+    );
+    assert_eq!(ready.as_deref(), Some(b"C16 ready\n".as_slice()));
+    assert_eq!(
+        std::fs::read(run.workspace.join("seed.txt")).unwrap(),
+        b"seed\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(&run.workspace).unwrap().count(),
+        1,
+        "host namespace unchanged"
+    );
+    assert_no_nfs_mount(&host, port, &[&run.workspace], "C16 after");
+    scratch.close().unwrap();
+    std::fs::write(evidence.join("result.txt"), format!("C16-{mode:02}: native passed; exact refusal: {diagnostic}; host unchanged; disposable host data removed; owned process cleanup passed\n")).unwrap();
+}
+#[test]
+fn c16_01_e13_absent() {
+    c16_case(1);
+}
+#[test]
+fn c16_02_e13_incumbent() {
+    c16_case(2);
+}
+#[test]
+fn c16_03_noclobber_absent() {
+    c16_case(3);
+}
+#[test]
+fn c16_04_noclobber_incumbent() {
+    c16_case(4);
+}

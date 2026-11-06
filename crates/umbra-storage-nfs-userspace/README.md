@@ -1458,3 +1458,23 @@ C17-03's fixture and reading are unchanged. Offline replay checks the retained
 identified local and original runner bytes, rejecting the stale location, wrong
 exits, wrong registration results, and unrelated diagnostics.
 CI must still run the final live assertions on the reviewed head. Refs #217.
+
+### Rank-16 hard-link/no-clobber publication characterization
+
+The `c16_*` cases in `tests/userspace_run.rs` compare native publication with
+userspace routing for absent and occupied destinations. C16-01/02 reproduce
+the Codex E13 hard-link decision; C16-03/04 enter its pinned tempfile helper
+independently. The preregistered expectations are supervisor refusals at Link
+resolution and the nonzero renameatx_np flags boundary respectively. These
+expectations are not positive publication support or evidence that E13 reaches
+the fallback after an abort. Refs #79.
+
+Build the isolated `experiments/fixtures/umbra-slate-r16-publication` package
+with its lockfile into the workspace target and set `UMBRA_SLATE_R16_PATH`.
+The existing live-server configuration, `UMBRA_SLATE_EVIDENCE`, and
+`UMBRA_INTEGRATION_REQUIRED=1` are required for qualification. CI builds the
+fixture and includes all four cases in the baseline userspace invocation.
+Each case uses the existing slate launcher with a 30-second execution deadline
+and 10-second cleanup grace, retains logs and journal evidence, and independently
+checks server bytes and the unchanged host namespace. Evidence directories must
+be fresh. Mutation-probe invocations do not qualify these baseline statuses.

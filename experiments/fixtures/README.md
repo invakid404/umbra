@@ -170,3 +170,15 @@ source, lock and rebuilt binary hashes. `ci-C17-02/` retains the runner's exact
 report and stderr: the corrected `112:24` panic pin accepts those original bytes.
 `unidentified-C17-02.stderr` is retained only as a rejected `101:23` provenance
 control. The independent C17-03 fixture and its reading remain unchanged.
+
+## Rank-16 publication fixture
+
+`umbra-slate-r16-publication/` is an isolated Cargo package pinning tempfile
+3.27.0 and rustix 1.1.4. Modes 1/2 reproduce Codex's hard-link publication
+choice with absent/existing destinations; modes 3/4 enter its no-clobber helper
+directly. Sync, timestamps and decompression are excluded so publication has
+its own reading. Build with `cargo build --locked --manifest-path
+experiments/fixtures/umbra-slate-r16-publication/Cargo.toml --target-dir target`.
+Set `UMBRA_SLATE_R16_PATH` to the resulting executable and use the `c16_*`
+userspace tests, which run disposable native controls before enforced routing.
+See the userspace-storage README for evidence and prerequisites.

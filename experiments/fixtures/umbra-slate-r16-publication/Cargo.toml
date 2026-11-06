@@ -1,0 +1,11 @@
+[package]
+name = "umbra-slate-r16-publication"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+tempfile = "=3.27.0"
+rustix = "=1.1.4"

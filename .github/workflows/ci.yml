@@ -535,6 +535,13 @@ jobs:
           echo "UMBRA_R17_VNODE_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r17-vnode" >> "$GITHUB_ENV"
           echo "UMBRA_SLATE_R17_EVIDENCE=/tmp/slate-evidence-$GITHUB_RUN_ID/rank17-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
+      - name: Build pinned rank-16 publication fixture
+        run: |
+          df -h /System/Volumes/Data
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build --locked --manifest-path experiments/fixtures/umbra-slate-r16-publication/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
+          echo "UMBRA_SLATE_R16_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r16-publication" >> "$GITHUB_ENV"
+
       - name: Proof 1 -- end to end, the toy and the Rust I/O fixture must exit 0
         run: |
           cargo build --workspace --bins
