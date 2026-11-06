@@ -98,7 +98,12 @@ helper bytes; all four launches reaped cleanly without survivors or zombies.
 This characterizes an unsupported alias-exec boundary, not successful alias
 execution. Independent NFS reads verify
 the placeholder identity, logical-link index and exact target bytes, plus the
-pre-exec and helper sentinels. The host workspace must remain empty.
+pre-exec and helper sentinels. For the refused alias, every output-parent
+lookup must succeed and the final leaf LOOKUP must return exact NFS NOENT;
+timeouts and other lookup failures fail the observation. The leaf result is
+retained in `alias-output-lookup.json`. A focused classifier check rejects
+success, deadline expiry, connection failure, access denial and parent-operation
+NOENT. The host workspace must remain empty.
 
 Build `experiments/fixtures/umbra-slate-r15-alias.c` normally and with
 `-DC15_HELPER`, and provide the resulting absolute paths through `UMBRA_C15_PATH`

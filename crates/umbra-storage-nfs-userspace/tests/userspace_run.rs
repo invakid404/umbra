@@ -13476,8 +13476,77 @@ fn slate_r17_retained_readings_validate_exact_defects() {
 }
 
 // ---- slate-r15: absolute shadow-only helper alias ----
+
+fn c15_exact_leaf_noent(
+    result: &Result<(), umbra_storage_nfs_userspace::error::FacadeError>,
+) -> bool {
+    use umbra_storage_nfs_userspace::error::{FacadeError, Nfs4Status};
+    use umbra_storage_nfs_userspace::transport::OpCode;
+    matches!(result, Err(FacadeError::Protocol(error))
+        if error.status == Nfs4Status::NOENT && error.op == OpCode::Lookup && error.index == 1)
+}
+
+#[test]
+fn slate_c15_absence_oracle_rejects_observation_failures() {
+    use umbra_storage_nfs_userspace::error::{FacadeError, Nfs4Status, TransportError};
+    use umbra_storage_nfs_userspace::transport::{OpCode, Retirement};
+    let noent = Err(FacadeError::protocol(Nfs4Status::NOENT, OpCode::Lookup, 1));
+    assert!(c15_exact_leaf_noent(&noent));
+    // Synthetic retired deadline: only exercises classification, never an RPC.
+    let retirement: Retirement =
+        serde_json::from_value(serde_json::json!({"token":1,"drained":true})).unwrap();
+    for result in [
+        Ok(()),
+        Err(FacadeError::Transport(TransportError::DeadlineExpired {
+            retirement,
+        })),
+        Err(FacadeError::Transport(TransportError::Connect(
+            "unreachable".into(),
+        ))),
+        Err(FacadeError::protocol(Nfs4Status::ACCESS, OpCode::Lookup, 1)),
+        Err(FacadeError::protocol(Nfs4Status::NOENT, OpCode::PutFh, 0)),
+    ] {
+        assert!(!c15_exact_leaf_noent(&result), "false absence: {result:?}");
+    }
+}
+
+fn c15_assert_output_absent(host: &str, port: u16, path: &[Vec<u8>], evidence: &Path) {
+    let (leaf, parents) = path.split_last().expect("output leaf");
+    let mut config = RawTransportConfig::loopback(port);
+    config.host = host.to_owned();
+    config.limits.default_deadline = Deadline { millis: 10_000 };
+    let deadline = config.limits.default_deadline;
+    let mut transport = LibnfsRawTransport::connect(config).expect("C15 absence connection");
+    let mut parent = transport
+        .root_filehandle(deadline)
+        .expect("C15 absence root");
+    for component in parents {
+        let name = ComponentName::new(component.clone()).expect("parent component");
+        parent = transport
+            .lookup(&parent, &name, AttrMask::STAT, deadline)
+            .unwrap_or_else(|error| panic!("C15 absence parent {component:?}: {error:?}"))
+            .0;
+    }
+    let name = ComponentName::new(leaf.clone()).expect("output component");
+    let result = transport
+        .lookup(&parent, &name, AttrMask::STAT, deadline)
+        .map(|_| ());
+    std::fs::write(
+        evidence,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "parents_resolved":true,"leaf":leaf,"lookup":result
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        c15_exact_leaf_noent(&result),
+        "C15 output absence not proven: {result:?}"
+    );
+}
 #[test]
 fn slate_c15_01_shadow_alias_exec() {
+    slate_c15_absence_oracle_rejects_observation_failures();
     let Some(evidence) = slate_evidence() else {
         return;
     };
@@ -13612,7 +13681,17 @@ fn slate_c15_01_shadow_alias_exec() {
         let target = read_through_client(&host, port, &target).expect("logical link target");
         std::fs::write(evidence.join(format!("{mode}-link-target")), &target).unwrap();
         assert_eq!(target, helper.as_os_str().as_bytes());
-        let output = read_through_client(&host, port, &shadow_path(&run));
+        let output = if mode == "alias" {
+            c15_assert_output_absent(
+                &host,
+                port,
+                &shadow_path(&run),
+                &evidence.join("alias-output-lookup.json"),
+            );
+            None
+        } else {
+            read_through_client(&host, port, &shadow_path(&run))
+        };
         std::fs::write(
             evidence.join(format!("{mode}-disposition.json")),
             serde_json::to_vec_pretty(&serde_json::json!({
