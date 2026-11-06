@@ -13812,17 +13812,17 @@ fn c16_case(mode: u8) {
     slate_finish_cleanup();
     assert!(!timeout);
     assert!(out.status.success(), "native: {:?}", out.stderr);
-    let native_stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(native_stdout.contains("C16 decision-return Ok"));
+    let native_stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(native_stderr.contains("C16 decision-return Ok"));
     if mode == 5 {
-        assert!(native_stdout.contains("C16 drop-enter"));
-        assert!(native_stdout.contains("C16 drop-return Ok"));
+        assert!(native_stderr.contains("C16 drop-enter"));
+        assert!(native_stderr.contains("C16 drop-return Ok"));
         assert_eq!(std::fs::read(native.join("src")).unwrap(), C16_SOURCE);
         assert!(!native.join("dst").exists());
     } else {
         let operation = if mode <= 2 { "link" } else { "persist" };
         let result = if mode % 2 == 0 { "AlreadyExists" } else { "Ok" };
-        assert!(native_stdout.contains(&format!("C16 {operation}-return {result}")));
+        assert!(native_stderr.contains(&format!("C16 {operation}-return {result}")));
         assert_eq!(
             std::fs::read(native.join("dst")).unwrap(),
             if mode % 2 == 0 {
@@ -13869,7 +13869,6 @@ fn c16_case(mode: u8) {
         std::time::Duration::from_secs(30),
         None,
     );
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let id = stderr
         .lines()
@@ -13920,22 +13919,22 @@ fn c16_case(mode: u8) {
     };
     assert!(run.stderr.contains(diagnostic), "{}", run.stderr);
     assert!(!run.stderr.contains("finished:"));
-    assert!(!stdout.contains("C16 decision-return"));
-    assert!(!stdout.contains("C16 link-return"));
-    assert!(!stdout.contains("C16 persist-return"));
+    assert!(!run.stderr.contains("C16 decision-return"));
+    assert!(!run.stderr.contains("C16 link-return"));
+    assert!(!run.stderr.contains("C16 persist-return"));
     if mode == 5 {
-        assert!(stdout.contains("C16 drop-enter"));
-        assert!(!stdout.contains("C16 drop-return"));
-        assert!(!stdout.contains("C16 ready"));
+        assert!(run.stderr.contains("C16 drop-enter"));
+        assert!(!run.stderr.contains("C16 drop-return"));
+        assert!(!run.stderr.contains("C16 ready"));
         assert!(run.stderr.contains("fatal signal/exception: T06"));
     } else {
-        assert!(stdout.contains(&format!("C16 ready mode={mode}")));
+        assert!(run.stderr.contains(&format!("C16 ready mode={mode}")));
         assert!(!run.stderr.contains("IO Safety violation"));
         if mode <= 2 {
-            assert!(stdout.contains("C16 link-enter"));
-            assert!(!stdout.contains("C16 fallback-enter"));
+            assert!(run.stderr.contains("C16 link-enter"));
+            assert!(!run.stderr.contains("C16 fallback-enter"));
         } else {
-            assert!(stdout.contains("C16 fallback-enter"));
+            assert!(run.stderr.contains("C16 fallback-enter"));
         }
         if mode % 2 == 0 {
             assert!(run.stderr.contains("C16 incumbent seeded before launch:"));

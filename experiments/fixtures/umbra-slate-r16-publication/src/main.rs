@@ -14,19 +14,19 @@ fn seed(path: &Path, bytes: &[u8]) -> io::Result<fs::File> {
     Ok(file)
 }
 fn persist(src: &Path, dst: &Path) -> io::Result<()> {
-    println!("C16 fallback-enter");
+    eprintln!("C16 fallback-enter");
     let temporary = tempfile::TempPath::try_from_path(src)?;
     match temporary.persist_noclobber(dst) {
         Ok(()) => {
-            println!("C16 persist-return Ok");
+            eprintln!("C16 persist-return Ok");
             Ok(())
         }
         Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => {
-            println!("C16 persist-return AlreadyExists");
+            eprintln!("C16 persist-return AlreadyExists");
             Ok(())
         }
         Err(err) => {
-            println!("C16 persist-return {:?}", err.error);
+            eprintln!("C16 persist-return {:?}", err.error);
             Err(err.error)
         }
     }
@@ -41,35 +41,35 @@ fn main() -> io::Result<()> {
     let dst = root.join("dst");
     let source = seed(&src, SOURCE)?;
     if mode == 5 {
-        println!("C16 drop-enter");
-        io::stdout().flush()?;
+        eprintln!("C16 drop-enter");
+        io::stderr().flush()?;
         drop(source);
-        println!("C16 drop-return Ok");
-        println!("C16 decision-return Ok");
-        io::stdout().flush()?;
+        eprintln!("C16 drop-return Ok");
+        eprintln!("C16 decision-return Ok");
+        io::stderr().flush()?;
         std::process::exit(0);
     }
     // Keep the source open across publication, matching Codex compression.rs.
     // Incumbents are supplied by the harness; no routed marker write/drop.
 
-    println!("C16 ready mode={mode} pid={}", std::process::id());
+    eprintln!("C16 ready mode={mode} pid={}", std::process::id());
     if mode <= 2 {
-        println!("C16 link-enter");
+        eprintln!("C16 link-enter");
         match fs::hard_link(&src, &dst) {
-            Ok(()) => println!("C16 link-return Ok"),
+            Ok(()) => eprintln!("C16 link-return Ok"),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                println!("C16 link-return AlreadyExists")
+                eprintln!("C16 link-return AlreadyExists")
             }
             Err(err) => {
-                println!("C16 link-return {err:?}");
+                eprintln!("C16 link-return {err:?}");
                 persist(&src, &dst)?;
             }
         }
     } else {
         persist(&src, &dst)?;
     }
-    println!("C16 decision-return Ok");
-    io::stdout().flush()?;
+    eprintln!("C16 decision-return Ok");
+    io::stderr().flush()?;
     // Deliberately avoid File teardown (#227) after observing publication.
     std::process::exit(0);
 }

@@ -1489,7 +1489,7 @@ Neither Link nor no-clobber publication is qualified by those original
 readings. The setup defect is tracked as #227.
 
 The revised instrument retains the source File across publication, reports
-through stdout, and exits explicitly to avoid its teardown. For modes 2/4,
+through the inherited stderr pipe, and exits explicitly to avoid its teardown. For modes 2/4,
 `umbra-slate-r16-prepared` uses the supervisor’s prepared observer to write the
 incumbent natively in the loopback Ganesha export before tracee launch. It uses
 the existing CLI composition and isolation entry points; the slate launcher

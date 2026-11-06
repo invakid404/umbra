@@ -187,6 +187,6 @@ The rank-16 package also builds `umbra-slate-r16-prepared`, which uses the
 supervisor’s prepared observer to seed an incumbent natively in the standard
 Ganesha container before tracee launch. Keep it beside the publication binary.
 The revised fixture retains its written source File across publication, reports
-through stdout and exits explicitly to sidestep #227. Mode 5 independently
+through the inherited stderr pipe and exits explicitly to sidestep #227. Mode 5 independently
 executes write-plus-drop to pin that defect. The incumbent companion requires
 `docker` on the harness PATH and the loopback fixture container.
