@@ -90,9 +90,13 @@ not make that pathname available to the cache.
 `slate_c15_01_shadow_alias_exec` isolates this boundary. The launcher creates the
 same directory, alias and pre-exec sentinel in both modes; only the exec pathname
 changes between the absolute host helper and its logical alias. Each mode has a
-disposable native control before the routed comparison. The alias prediction is
-an explicit supervisor `twin source` ENOENT refusal, before helper effects; this
-source prediction is not a runtime qualification. Independent NFS reads verify
+disposable native control before the routed comparison. The first live reading at
+`fe47e2a6` confirmed the expected explicit supervisor `twin source` ENOENT
+refusal (status 1), before helper effects and without a completed-run journal
+record. Native direct/alias and routed direct controls exited 0 with the exact
+helper bytes; all four launches reaped cleanly without survivors or zombies.
+This characterizes an unsupported alias-exec boundary, not successful alias
+execution. Independent NFS reads verify
 the placeholder identity, logical-link index and exact target bytes, plus the
 pre-exec and helper sentinels. The host workspace must remain empty.
 

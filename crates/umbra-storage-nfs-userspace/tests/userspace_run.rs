@@ -13649,7 +13649,12 @@ fn slate_c15_01_shadow_alias_exec() {
             );
             assert!(!run.stderr.contains("finished:"));
             assert!(output.is_none());
-            assert!(!out.status.success());
+            assert_eq!(run.status, Some(1));
+            assert_eq!(
+                run.stderr.lines().last(),
+                Some("Io during twin source: No such file or directory (os error 2) (errno: None)")
+            );
+            assert!(!journal_records_completion(&run));
         }
         assert_no_nfs_mount(&host, port, &[&run.workspace], "C15 after");
         slate_assert_tracee_not_orphaned(&evidence.join(format!("routed-{mode}")));
