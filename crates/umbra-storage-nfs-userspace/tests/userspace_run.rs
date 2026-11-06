@@ -13615,6 +13615,15 @@ fn slate_c15_01_shadow_alias_exec() {
             std::fs::read_link(native.join("helpers/helper")).unwrap(),
             helper
         );
+        // Artifact uploads dereference symlinks; retain the native target bytes separately.
+        std::fs::write(
+            evidence.join(format!("native-{mode}-link-target")),
+            std::fs::read_link(native.join("helpers/helper"))
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+        )
+        .unwrap();
         let native_cleanup =
             std::fs::read_to_string(evidence.join(format!("native-{mode}.cleanup"))).unwrap();
         assert!(r14_cleanup_clean(&native_cleanup), "{native_cleanup}");
