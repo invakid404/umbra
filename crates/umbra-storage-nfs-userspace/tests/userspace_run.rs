@@ -13898,6 +13898,16 @@ fn c16_case(mode: u8) {
     };
     assert!(run.stderr.contains(diagnostic), "{}", run.stderr);
     assert!(!run.stderr.contains("finished:"));
+    assert!(run.stderr.contains(&format!("C16 ready mode={mode}")));
+    assert!(!run.stderr.contains("C16 decision-return"));
+    assert!(!run.stderr.contains("C16 link-return"));
+    assert!(!run.stderr.contains("C16 persist-return"));
+    if mode <= 2 {
+        assert!(run.stderr.contains("C16 link-enter"));
+        assert!(!run.stderr.contains("C16 fallback-enter"));
+    } else {
+        assert!(run.stderr.contains("C16 fallback-enter"));
+    }
     assert_eq!(src.as_deref(), Some(C16_SOURCE));
     assert_eq!(
         dst.as_deref(),
