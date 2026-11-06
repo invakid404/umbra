@@ -1487,7 +1487,7 @@ The later host-invariance assertions were not reached, so these readings do
 not certify an unchanged host namespace.
 The exact-refusal assertions remain failing, preserving the mismatch with the
 preregistration. Neither Link nor no-clobber publication is qualified by these
-readings. The setup defect is tracked as ISSUE-TBD(rust-file-drop-abort).
+readings. The setup defect is tracked as #227.
 
 Build the isolated `experiments/fixtures/umbra-slate-r16-publication` package
 with its lockfile into the workspace target and set `UMBRA_SLATE_R16_PATH`.
