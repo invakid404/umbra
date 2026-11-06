@@ -78,6 +78,36 @@ journal completion and writer-authority release; they never accept an arbitrary
 failure as support. The original failed positive-target readings remain in the
 rank-14 graph evidence, separate from subsequent refusal qualification.
 
+## Shadow-only executable aliases
+
+The direct-host-image exec coverage below does not establish executable lookup
+through a logical shadow alias. The macOS exec handler passes the requested
+absolute pathname to the host-side signed-twin cache; that cache canonicalizes
+it in the host filesystem (`umbra-platform-macos/src/native.rs`, Exec delivery;
+`src/cache.rs`, `resign`). Logical symlink visibility in the overlay alone does
+not make that pathname available to the cache.
+
+`slate_c15_01_shadow_alias_exec` isolates this boundary. The launcher creates the
+same directory, alias and pre-exec sentinel in both modes; only the exec pathname
+changes between the absolute host helper and its logical alias. Each mode has a
+disposable native control before the routed comparison. The alias prediction is
+an explicit supervisor `twin source` ENOENT refusal, before helper effects; this
+source prediction is not a runtime qualification. Independent NFS reads verify
+the placeholder identity, logical-link index and exact target bytes, plus the
+pre-exec and helper sentinels. The host workspace must remain empty.
+
+Build `experiments/fixtures/umbra-slate-r15-alias.c` normally and with
+`-DC15_HELPER`, and provide the resulting absolute paths through `UMBRA_C15_PATH`
+and `UMBRA_C15_HELPER`. The test also needs the usual live-server, provider and
+`UMBRA_SLATE_EVIDENCE` inputs; the evidence directory must not already contain
+`C15-01`. `UMBRA_INTEGRATION_REQUIRED=1` makes missing prerequisites fail.
+Run the named case through the serial-test wrapper while the runner is idle.
+It reuses the 60-second slate launcher and 10-second cleanup grace, requires
+clean reap with no zombies, and retains source/binary identities, stdout/stderr,
+census, cleanup and disposition records. CI builds both binaries, runs the case
+in its baseline suite and uploads the evidence. Locking, readlink, PATH search
+and host-spelling collisions are outside this first cut.
+
 ## Why a second NFS provider
 
 [umbra-storage-nfs](../umbra-storage-nfs/README.md) needs an NFSv4 mount that
