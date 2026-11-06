@@ -86,3 +86,16 @@ M2 design artifact must select a mechanism feasible on supported macOS with the 
 - M2 contract design must supply provider-owned open-object tokens and handle-based I/O/metadata/close, with bounded IPC lifetimes. Today's pathname-only Storage convenience methods cannot represent an unlinked open object. Prefer new typed operations under `execute` while preserving the synchronous object-safe trait shape; generic core/storage contracts and overlay consumers own this extension, never a backend-specific CLI branch. M1's internal pinned handles are preparation, not a claim that this public M2 contract already exists.
 - Add missing operations found by a source/trace audit before implementing: `readv/writev/preadv/pwritev`, truncate/ftruncate, fcntl subcommands, Darwin `renameatx_np`/`renamex_np`, copy/sendfile, `mprotect`, fork/exec/spawn, FD passing and poll/select readiness. Unknown regular-filesystem access fails closed. Required TODOs (locking, mmap, executable files) must resolve before declaring M2 complete.
 - External-client acceptance cases: modify/truncate an open file, atomic pathname replacement, add/remove/rename a directory entry, and change metadata. Verify fresh typed Storage results in M1, then actual tracee syscalls and overlay caches in M2. These are future tests; none runs during design.
+
+### Native notification characterization boundary
+
+Rank-17's userspace-registry measurements qualify notify construction only.
+Registration returned Ok, but its probe later failed in Rust directory iteration;
+callback serialization did not complete, so no remote-event result is qualified.
+The vnode probe received the expected EBADF receipt and could still read its file,
+then aborted during libc directory iteration. Explicit vnode refusal therefore
+does not establish continued listing usability. These two terminal outcomes are
+tracked by #225; the cases and exact assertions
+are documented in `crates/umbra-storage-nfs-userspace/README.md` and implemented in
+its `tests/userspace_run.rs`. Native controls succeeded. These observations do not
+change the design requirement for explicit degraded or preflight behavior.

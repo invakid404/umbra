@@ -1,0 +1,14 @@
+126:{"version":1,"seq":0,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094575686,"phase":"BEGIN","data":"vnode"}
+134:{"version":1,"seq":1,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094575706,"phase":"channel","data":"C17-CHANNEL"}
+132:{"version":1,"seq":2,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094575728,"phase":"initial-read","data":"SEED"}
+123:{"version":1,"seq":3,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094575736,"phase":"queue","data":true}
+171:{"version":1,"seq":4,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094575745,"phase":"registration","data":{"return":1,"errno":0,"flags":16481,"data":0}}
+123:{"version":1,"seq":5,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094575752,"phase":"READY","data":true}
+126:{"version":1,"seq":6,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094575854,"phase":"mutation","data":true}
+135:{"version":1,"seq":7,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094575861,"phase":"observation-start","data":true}
+190:{"version":1,"seq":8,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094575869,"phase":"event","data":{"return":1,"errno":0,"filter":-4,"fflags":2,"ident":4,"expected_fd":4}}
+133:{"version":1,"seq":9,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094575876,"phase":"observation-end","data":true}
+153:{"version":1,"seq":10,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094576037,"phase":"read","data":"89336aaf0aac44378633316bc0e15975"}
+127:{"version":1,"seq":11,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094576063,"phase":"list","data":["seed"]}
+127:{"version":1,"seq":12,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094576070,"phase":"teardown","data":true}
+137:{"version":1,"seq":13,"nonce":"89336aaf0aac44378633316bc0e15975","pid":33760,"us":1605094576074,"phase":"COMPLETE","data":{"records":14}}

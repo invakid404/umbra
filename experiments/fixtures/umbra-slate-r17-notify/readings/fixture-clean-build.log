@@ -1,0 +1,16 @@
+       Fresh same-file v1.0.6
+       Fresh bitflags v2.13.2
+       Fresh itoa v1.0.18
+       Fresh log v0.4.35
+       Fresh memchr v2.8.3
+       Fresh libc v0.2.191
+       Fresh walkdir v2.5.0
+       Fresh notify-types v2.2.0
+       Fresh zmij v1.0.23
+       Fresh fsevent-sys v4.1.0
+       Fresh serde_core v1.0.229
+       Fresh notify v8.2.0
+       Fresh serde_json v1.0.154
+   Compiling umbra-slate-r17-notify v0.1.0 (/Users/inva/Coding/umbra-worktrees/slate-r17/experiments/fixtures/umbra-slate-r17-notify)
+     Running `/Users/inva/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/rustc --crate-name umbra_slate_r17_notify --edition=2024 src/main.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=3cf6791839c67530 -C extra-filename=-eb9b71fa40130243 --out-dir /Users/inva/Coding/umbra-worktrees/slate-r17/target/debug/deps -C incremental=/Users/inva/Coding/umbra-worktrees/slate-r17/target/debug/incremental -L dependency=/Users/inva/Coding/umbra-worktrees/slate-r17/target/debug/deps --extern libc=/Users/inva/Coding/umbra-worktrees/slate-r17/target/debug/deps/liblibc-214115e53ce28489.rlib --extern notify=/Users/inva/Coding/umbra-worktrees/slate-r17/target/debug/deps/libnotify-1b724e490d0ac390.rlib --extern serde_json=/Users/inva/Coding/umbra-worktrees/slate-r17/target/debug/deps/libserde_json-93c669fd3870f69a.rlib`
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.03s

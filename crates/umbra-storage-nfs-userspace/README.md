@@ -1387,3 +1387,32 @@ evidence directory. CI builds these fixtures and includes the cases in its
 baseline userspace test invocation. Mutation-probe invocations do not qualify
 these baseline statuses. Follow the shared-host serialization and disk rules
 when running locally.
+
+## Rank-17 native watcher characterization
+
+The `slate_r17_*` cases use the bounded slate launcher and the fixtures documented
+in `experiments/fixtures/README.md`. They take a native control before each routed
+run; framed evidence is read independently through the NFS client. Constructor,
+registration, callback delivery, and post-operation directory enumeration are
+separate claims.
+
+| Case | Measured routed status |
+| --- | --- |
+| C17-01 | notify 8.2.0 FSEvents constructor returns Ok and tears down with complete evidence. This qualifies construction only. |
+| C17-02 | Registration succeeds, the shadow nonce is committed and read back, then Rust directory iteration returns EBADF and the fixture exits 101. Callback/teardown records are incomplete, so remote event delivery remains unqualified. |
+| C17-03 | EVFILT_VNODE returns one EV_ERROR receipt with data EBADF; ordinary read still returns SEED. The subsequent libc directory iteration sets errno and the fixture aborts, reported as signal 6 by supervision. Continued list usability is not qualified. |
+
+C17-02 and C17-03 pin known terminal defects with exact ordered partial records
+and diagnostic assertions: #225. These are
+not passing no-event observations or a claim that both failures share a cause.
+All three native controls complete successfully; the recorded native registration
+case delivers matching events, and the native vnode case receives NOTE_WRITE.
+The preregistered Expected values remain in the unchanged rank-17 ideation.
+C17-01/02 use newly identified readings from a clean build of the committed
+notify source. The earlier local binary predated source formatting, so its
+claimed committed-source provenance is withdrawn. The identified C17-02 panic
+is at `src/main.rs:112:24`, matching the runner, rather than the old `101:23`.
+C17-03's fixture and reading are unchanged. Offline replay checks the retained
+identified local and original runner bytes, rejecting the stale location, wrong
+exits, wrong registration results, and unrelated diagnostics.
+CI must still run the final live assertions on the reviewed head. Refs #217.

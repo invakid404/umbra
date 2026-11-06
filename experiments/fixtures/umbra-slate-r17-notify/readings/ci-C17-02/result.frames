@@ -1,0 +1,9 @@
+146:{"data":{"backend":"Fsevent","mode":"register"},"nonce":"c78e0b104fb04b188d24b6f7d72a31a4","phase":"BEGIN","pid":7151,"seq":0,"us":10,"version":1}
+126:{"data":"C17-CHANNEL","nonce":"c78e0b104fb04b188d24b6f7d72a31a4","phase":"channel","pid":7151,"seq":1,"us":118803,"version":1}
+141:{"data":{"error":null,"ok":true},"nonce":"c78e0b104fb04b188d24b6f7d72a31a4","phase":"constructor","pid":7151,"seq":2,"us":246871,"version":1}
+143:{"data":{"error":null,"ok":true},"nonce":"c78e0b104fb04b188d24b6f7d72a31a4","phase":"registration","pid":7151,"seq":3,"us":1295357,"version":1}
+116:{"data":true,"nonce":"c78e0b104fb04b188d24b6f7d72a31a4","phase":"READY","pid":7151,"seq":4,"us":1404872,"version":1}
+176:{"data":{"ack_us":1630911,"bytes":"c78e0b104fb04b188d24b6f7d72a31a4"},"nonce":"c78e0b104fb04b188d24b6f7d72a31a4","phase":"mutation","pid":7151,"seq":5,"us":1630920,"version":1}
+131:{"data":1630911,"nonce":"c78e0b104fb04b188d24b6f7d72a31a4","phase":"observation-start","pid":7151,"seq":6,"us":1755809,"version":1}
+129:{"data":6873481,"nonce":"c78e0b104fb04b188d24b6f7d72a31a4","phase":"observation-end","pid":7151,"seq":7,"us":6873503,"version":1}
+213:{"data":[99,55,56,101,48,98,49,48,52,102,98,48,52,98,49,56,56,100,50,52,98,54,102,55,100,55,50,97,51,49,97,52],"nonce":"c78e0b104fb04b188d24b6f7d72a31a4","phase":"read","pid":7151,"seq":8,"us":7306163,"version":1}

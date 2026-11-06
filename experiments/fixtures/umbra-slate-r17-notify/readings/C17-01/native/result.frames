@@ -1,0 +1,6 @@
+149:{"data":{"backend":"Fsevent","mode":"construct"},"nonce":"e6006226f30346eeb2742ec7539d749a","phase":"BEGIN","pid":70056,"seq":0,"us":175,"version":1}
+124:{"data":"C17-CHANNEL","nonce":"e6006226f30346eeb2742ec7539d749a","phase":"channel","pid":70056,"seq":1,"us":279,"version":1}
+139:{"data":{"error":null,"ok":true},"nonce":"e6006226f30346eeb2742ec7539d749a","phase":"constructor","pid":70056,"seq":2,"us":351,"version":1}
+128:{"data":"NOT_APPLICABLE","nonce":"e6006226f30346eeb2742ec7539d749a","phase":"workload","pid":70056,"seq":3,"us":370,"version":1}
+145:{"data":{"dropped":true,"overflow":false},"nonce":"e6006226f30346eeb2742ec7539d749a","phase":"teardown","pid":70056,"seq":4,"us":432,"version":1}
+125:{"data":{"records":6},"nonce":"e6006226f30346eeb2742ec7539d749a","phase":"COMPLETE","pid":70056,"seq":5,"us":452,"version":1}
