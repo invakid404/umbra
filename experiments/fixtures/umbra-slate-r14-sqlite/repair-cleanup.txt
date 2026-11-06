@@ -1,0 +1,9 @@
+cleanup CLEAN; status=exit status: 101 timed_out=false group_kills=0 group=19571 final_live_members=0 pipes=EOF direct_child=reaped zombies=""
+19571 19557 19571 SN   /Users/inva/Coding/umbra-worktrees/slate-r14/target/debug/umbra-slate-r14-sqlite qualify-ok /Users/inva/.uah/sessions/operations/36786cd9-2bde-4937-ab85-700541024876/tmp/.tmpTjI3cC/codex-home/state.sqlite 127.0.0.1:65478 e6504757-1e85-459c-a199-fdb291201329
+19571 19557 19571 SN   /Users/inva/Coding/umbra-worktrees/slate-r14/target/debug/umbra-slate-r14-sqlite qualify-ok /Users/inva/.uah/sessions/operations/36786cd9-2bde-4937-ab85-700541024876/tmp/.tmpTjI3cC/codex-home/state.sqlite 127.0.0.1:65478 e6504757-1e85-459c-a199-fdb291201329
+19571 19557 19571 SN   /Users/inva/Coding/umbra-worktrees/slate-r14/target/debug/umbra-slate-r14-sqlite qualify-ok /Users/inva/.uah/sessions/operations/36786cd9-2bde-4937-ab85-700541024876/tmp/.tmpTjI3cC/codex-home/state.sqlite 127.0.0.1:65478 e6504757-1e85-459c-a199-fdb291201329
+19571 19557 19571 SN   /Users/inva/Coding/umbra-worktrees/slate-r14/target/debug/umbra-slate-r14-sqlite qualify-ok /Users/inva/.uah/sessions/operations/36786cd9-2bde-4937-ab85-700541024876/tmp/.tmpTjI3cC/codex-home/state.sqlite 127.0.0.1:65478 e6504757-1e85-459c-a199-fdb291201329
+19571 19557 19571 UN   /Users/inva/Coding/umbra-worktrees/slate-r14/target/debug/umbra-slate-r14-sqlite qualify-ok /Users/inva/.uah/sessions/operations/36786cd9-2bde-4937-ab85-700541024876/tmp/.tmpTjI3cC/codex-home/state.sqlite 127.0.0.1:65478 e6504757-1e85-459c-a199-fdb291201329
+19571 19557 19571 UN   /Users/inva/Coding/umbra-worktrees/slate-r14/target/debug/umbra-slate-r14-sqlite qualify-ok /Users/inva/.uah/sessions/operations/36786cd9-2bde-4937-ab85-700541024876/tmp/.tmpTjI3cC/codex-home/state.sqlite 127.0.0.1:65478 e6504757-1e85-459c-a199-fdb291201329
+19571 19557 19571 ZN   <defunct>
+

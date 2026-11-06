@@ -37,6 +37,47 @@ mounted adapter is a separate boundary at
 [umbra-storage-nfs](../umbra-storage-nfs/README.md); the contract this crate
 implements is [umbra-storage](../umbra-storage/README.md).
 
+## Codex-configured SQLite characterization
+
+The `slate_r14_01_fresh_sqlite_wal` and `slate_r14_02_existing_sqlite_wal`
+cases in `tests/userspace_run.rs` use the fixture at
+`experiments/fixtures/umbra-slate-r14-sqlite` (repository relative). It pins SQLx
+0.9.0 and bundled libsqlite3-sys 0.37.0 to the inspected Codex dependency graph.
+Both native controls select WAL/NORMAL/INCREMENTAL with a 5000 ms busy timeout,
+commit exact sentinel rows and return `integrity_check=ok`. The pool limit is
+one, isolating opening before later connection-count cases.
+
+Both routed first readings fail during connection setup with SQLx database error
+3338 (`SQLITE_IOERR_ACCESS`), fixture exit 20 and supervisor `ProcessFailed`.
+The fresh case leaves an empty shadow database; the seeded case leaves a
+byte-identical copy-up. Neither error barrier observes a WAL or SHM sidecar,
+and host snapshots remain unchanged. The code is a library error report; the
+underlying Darwin syscall has not been observed. No WAL compatibility,
+cross-machine sharing or crash durability is established by these tests.
+
+The approved disposable root contains sibling `project/` and `codex-home/`
+directories. State is outside the project subtree but inside the explicitly
+approved inventory; this does not qualify arbitrary user-home routing. The
+fixture changes cwd to the project and opens state by absolute path. A bounded
+loopback observer retains phase/error records independently of provider stdout.
+Native and routed apparatus tests cover normal exchange, error records and
+abrupt disconnect, with a separate replay test for the instrument repair.
+
+Build the fixture with its locked manifest into the checkout's `target/`, then
+set `UMBRA_SLATE_R14_PATH` to its binary and `UMBRA_SLATE_R14_EVIDENCE` to a fresh
+evidence directory. Also provide the ordinary `UMBRA_SLATE_EVIDENCE`,
+`UMBRA_NFS_RAW_FIXTURE`, pinned `UMBRA_LIBNFS_SRC`, provider binaries and debugger
+permission. `UMBRA_INTEGRATION_REQUIRED=1` makes prerequisites mandatory. Run
+each named case with `cargo test -p umbra-storage-nfs-userspace --features
+transport-raw --test userspace_run <case> -- --exact --nocapture`; local live
+runs use the shared serial-test wrapper while the self-hosted runner is idle.
+The CI baseline supplies these inputs and uploads rank-14 evidence even on
+success. Existing mutation-probe gating keeps these characterization cases on
+unmutated binaries. The tests assert the exact refusal, shadow effects,
+journal completion and writer-authority release; they never accept an arbitrary
+failure as support. The original failed positive-target readings remain in the
+rank-14 graph evidence, separate from subsequent refusal qualification.
+
 ## Why a second NFS provider
 
 [umbra-storage-nfs](../umbra-storage-nfs/README.md) needs an NFSv4 mount that

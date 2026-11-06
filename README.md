@@ -101,6 +101,13 @@ path does **not** claim, and why, is enumerated in that crate's README. The
 `UMBRA_TEST_SKIP_NFS_MATRIX` opt-out above is unaffected: it is about the mounted
 `storage-nfs` adapter, which the routed path does not replace.
 
+The rank-14 SQLx fixture characterizes a persistence blocker: with Codex's
+WAL options, both fresh and seeded databases return SQLite `3338`
+(`SQLITE_IOERR_ACCESS`) at connection setup under routing. Native controls
+complete their transactions and integrity checks. The userspace job builds the
+pinned fixture and retains its phase, sidecar and cleanup evidence; a passing
+refusal test does not qualify SQLite compatibility.
+
 Fork pull requests cannot run either self-hosted job -- the `native-qualification`
 qualification job or the `native-userspace-routing` routing job -- and neither
 checkout persists job credentials. A labeled runner must be provisioned before

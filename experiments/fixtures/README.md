@@ -121,3 +121,17 @@ for preparation and measured statuses, and [CI](../../.github/workflows/ci.yml)
 for provisioning. Native controls succeed; routed cases characterize pre-effect
 rename refusal and post-effect unlink failure. They do not qualify routed
 publication or retained-descriptor semantics after successful publication.
+
+## Rank-14 SQLite fixture
+
+`umbra-slate-r14-sqlite/` is an isolated Cargo package for the Codex-configured
+SQLite workload. Build with its checked-in lockfile and use the
+`slate_r14_*` integration tests in `umbra-storage-nfs-userspace/tests/userspace_run.rs`
+to drive it; it requires a bounded host observer that acknowledges phase frames.
+The harness owns native controls, seed verification and enforced routed readings.
+Fresh and existing databases both return SQLite `3338` at routed connection setup,
+while native controls commit and read exact sentinel rows. This characterizes a
+refusal, not WAL support. The two `repair-*` inputs preserve original instrument
+failure data for the checked-in L46 replay test. See the
+[userspace-storage README](../../crates/umbra-storage-nfs-userspace/README.md#codex-configured-sqlite-characterization)
+for prerequisites, evidence and limitations.
