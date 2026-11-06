@@ -465,7 +465,7 @@ convenience, and it does nothing at all unless the feature is enabled:
    allowlist passed to a generator is a statement of intent; the scan is a
    statement about the artefact.
 
-Two hazards the audited spike carried are closed by construction:
+The audited spike’s transport hazards are closed by construction:
 
 - **libnfs never receives the address of a Rust value.** `private_data` is a
   `u64` call id resolved against a registry, so a late or duplicated completion
@@ -555,7 +555,7 @@ owning the question; this is where it is owned.
 | `authority::journal` | Durable intent, payload and committed result over the frozen `ReplayLog` |
 | `authority::outage` | The finite state machine over the failure model's five states |
 
-Four rules shape it.
+The authority rules are:
 
 1. **A held marker denies every acquirer.** Not until a lease elapses, and not
    unless the token matches — denies. No code path leads from elapsed time to
@@ -775,9 +775,9 @@ sufficient, because umbra must be able to represent it too.
 | **A syscall the tracee issues from memory it wrote itself** | **Not mediated, and not mediable by this architecture.** Measured: a process can allocate memory, write `svc #0x80` into it, flip the page to `r-x` with no entitlement, and execute it. umbra breakpoints `svc` sites in the main image and in its own interposer, so an instruction at neither site is never trapped — under interposition and under syscall-breakpoint tracing alike. What fail-closes host writes is the **kernel-enforced Seatbelt profile** installed before the target's first instruction, not the interception. Closing this needs kernel-assisted whole-process syscall filtering, which is outside the accepted setup. |
 | Writable shared file mappings (`mmap` `MAP_SHARED` with `PROT_WRITE`) | **Permanently unsupported by any syscall- or call-level interception.** A store to a resident page is not a call of any kind. Needs a pager. Today the call itself is refused before any page exists: measured, `mmap(MAP_SHARED, PROT_READ\|PROT_WRITE)` of a routed descriptor answers `MAP_FAILED` with `EBADF`(9), the run survives, and the seed is unchanged on the host and in the shadow (`slate_c13_04_shared_mapping`). An anonymous mapping passes through (`slate_c13_05_anonymous_mapping`). |
 | `unlink` | **A routed run cannot complete unlink successfully against a server that does not report atomic `change_info4` for REMOVE: the server name is deleted, then the provider stops.** Measured against the Ganesha fixture, with the descriptor open *and* after closing it: `LeaseLost during namespace.remove: authority: object identity unproven: BLOCKED_RECOVERABLE: the REMOVE of <name> succeeded, but the server did not report atomic change info`, the run left recovery-required, and the writer release withheld. This is **this provider's own authority layer**, pre-existing and unrelated to routing — the same refusal a non-routed caller of `unlink` meets. It is listed here because the slice's own docs previously said "unlink or rename *while open*" and pointed at `engine.rs::routed_binding`, which implied unlink-while-closed worked and named a mechanism that is never reached. |
-| `rename`, and any other path operation, on an object **this run created or copied up** | Refused with **`ENOTSUP`** (`Errno(45)`), visibly, and the run survives. `rewrite` needs a kernel path this backend does not have, so `resolve` answers the tracee instead — see the row below. |
+| `rename` on an object **this run created or copied up** | Refused with **`ENOTSUP`** (`Errno(45)`), visibly, and the run survives. `rewrite` needs a kernel path this backend does not have, so `resolve` answers the tracee instead — see the “Intercepted path operations requiring a kernel rewrite target on an object this run created or copied up” row. |
 | A descriptor whose **name stops resolving** while it is open | `ENOENT`. A routed descriptor is bound to a logical *path* and re-resolved on every operation, so an object that loses its name has nothing left to route to; closing that needs handle-based `Storage` operations the surface does not have. Not reachable against this fixture, because `unlink` stops the run first (above). |
-| **Every other intercepted path operation on an object this run created or copied up** — `fstatat`, `faccessat`, `renameat`, `linkat`, `fchownat` | Refused with **`ENOTSUP`** (`Errno(45)` — Darwin's value; routing exists on Darwin only). `rewrite` would have to name a kernel path this backend does not have, so `resolve` answers the tracee instead of stopping the run. The same operation on an object the run did *not* touch still rewrites to the read-only base's host path and works. This is a visible refusal, not a supported operation: `create a file then stat it` is what `cp`, `install` and both the Rust and Go standard libraries do, and on a routed run it fails. Routing these properly means answering `Stat`/`Access` through an ABI encoder the way **`Fstat`** already is — the engine resolves the metadata, the ABI encodes it — and that routing deliberately did **not** widen this row: an `fstat` names a descriptor, so it never reaches path resolution, and `Stat`/`Access` on a shadow object are still refused here. **This row previously offered `ReadLink` as that same precedent, and `ReadLink` is the one named here that does not work.** Measured on both decoder arms against the live fixture: a routed `readlink`(58) or `readlinkat`(473) on a symlink in the run's own shadow answers the tracee nothing at all — it **ends the run**, `UnsupportedCapability during overlay: ReadLink requires set_readlink_buffer`, with no tracee errno and no `finished:` line. `FsOp::ReadLink`'s engine arm is unconditional and resolves the link's target correctly, then requires a buffer only `Overlay::set_readlink_buffer` can bind — and no production caller on the routed path binds one: `routing_for` binds `Open`/`Read`/`Write`, the stat buffer for `Fstat` and the directory buffer for `ReadDir`, while `FsOp::ReadLink` appears nowhere in `umbra-supervisor/src/events.rs`'s `FsOp` set. So copying `ReadLink` as the template would wire `Stat`/`Access` after something that never reaches the tracee; **`Fstat` is the worked precedent to copy.** Characterized by the two `readlink` cases in `userspace_run.rs`, which assert the run-ending shape and go red when the binding lands; the binding itself is a separate slice. |
+| **Intercepted path operations requiring a kernel rewrite target on an object this run created or copied up** — `fstatat`, `faccessat`, `renameat`, `fchownat` | Refused with **`ENOTSUP`** (`Errno(45)` — Darwin's value; routing exists on Darwin only). `rewrite` would have to name a kernel path this backend does not have, so `resolve` answers the tracee instead of stopping the run. The same operation on an object the run did *not* touch still rewrites to the read-only base's host path and works. This is a visible refusal, not a supported operation: `create a file then stat it` is what `cp`, `install` and both the Rust and Go standard libraries do, and on a routed run it fails. Routing these properly means answering `Stat`/`Access` through an ABI encoder the way **`Fstat`** already is — the engine resolves the metadata, the ABI encodes it — and that routing deliberately did **not** widen this row: an `fstat` names a descriptor, so it never reaches path resolution, and `Stat`/`Access` on a shadow object are still refused here. **This row previously offered `ReadLink` as that same precedent, and `ReadLink` is the one named here that does not work.** Measured on both decoder arms against the live fixture: a routed `readlink`(58) or `readlinkat`(473) on a symlink in the run's own shadow answers the tracee nothing at all — it **ends the run**, `UnsupportedCapability during overlay: ReadLink requires set_readlink_buffer`, with no tracee errno and no `finished:` line. `FsOp::ReadLink`'s engine arm is unconditional and resolves the link's target correctly, then requires a buffer only `Overlay::set_readlink_buffer` can bind — and no production caller on the routed path binds one: `routing_for` binds `Open`/`Read`/`Write`, the stat buffer for `Fstat` and the directory buffer for `ReadDir`, while `FsOp::ReadLink` appears nowhere in `umbra-supervisor/src/events.rs`'s `FsOp` set. So copying `ReadLink` as the template would wire `Stat`/`Access` after something that never reaches the tracee; **`Fstat` is the worked precedent to copy.** Characterized by the two `readlink` cases in `userspace_run.rs`, which assert the run-ending shape and go red when the binding lands; the binding itself is a separate slice. |
 | `openat` | **Routed, via the syscall path** -- not in the `EBADF` class. `__openat` is still breakpointed and syscall 463 is still admitted, so it resolves through the same routed-`Open` arm the interposer's `open` reaches, and returns a virtual descriptor. Measured: exit 0, host destination absent. **`openat` with a *virtual* dirfd is served too**, and this row previously said the opposite: measured, `fd=4096` -> `openat` -> `fd=4097`, a second virtual descriptor. The engine has a complete `DirRef::Fd` resolver -- anchor lookup, directory check, object-identity re-check -- and `__openat`(463)/`__openat_nocancel`(464) are `TRACED_STUBS` rows, so the call never reaches the kernel and the `EBADF` mechanism the row below describes cannot apply to it. Pinned by the no-follow walk cases in `userspace_run.rs`: three of them -- `safe-path`, `symlink-in-parent` and `symlink-leaf-follow` -- compose a routed directory open with an `openat` relative to the virtual descriptor it returned, and go on to read the leaf's metadata through it. A fourth, `symlink-leaf`, is refused *at* that `openat`, but by `O_NOFOLLOW` on a symlink leaf -- not by this row's descriptor fence -- and since [#167](https://github.com/invakid404/umbra/issues/167) that refusal is **answered rather than raised**: the routed-`Open` arm returns `Ok(ResolvedAction::Deny(Errno(62)))` at `engine.rs:2575`, so the tracee gets `ELOOP`(62) and the run continues to the fixture's own stage-(b) exit. The refusal is decided at the `openat` itself, after `resolve_path_follow` and `lookup` have already returned, from the resolved final object's `stat.kind` -- not during the walk. The fifth, `flagscan`, issues no `openat` at all: it scans the directory open's admitted flag set. |
 | `fstat` | **Routed, via the syscall path** -- no longer in the `EBADF` class below, and listed separately because it is the first *descriptor-relative* call to leave it. `fstat`(339)/`__fstat`(189) are breakpointed libc stubs, resolved against the descriptor's logical object and answered with an emulated `struct stat`. Every `fstat` in the process traps, including libSystem's own on kernel descriptors, so the supervisor applies the descriptor fence before resolving: below the floor the call passes through to the kernel untouched. `touch` needs this -- without it the file was created and the utility still exited 1 with `Bad file descriptor`. |
 | `lseek`, `dup`, `dup2`, `fcntl`, `ftruncate`, `fsync`, `pread`, `pwrite`, `readv`, `writev` — but no longer `fchdir`, `close` or `__close_nocancel`, which this slice routed, and **no longer `openat` with a virtual dirfd**, which this table listed here and in the row above as refused and which is measured **served** (see that row) | Not interposed and not rewritable: these are **descriptor-relative**, and a routed descriptor is not a kernel object. They reach the kernel, which does not know the number, and receive `EBADF`. The `RLIMIT_NOFILE` fence is what makes that a refusal rather than an operation on someone else's descriptor. **The refusal is answered to the tracee and the run survives** -- the opposite disposition from the `O_APPEND` row below, and measured against this fixture for `lseek`, `fcntl`, `ftruncate`, `fsync`, `pread` and `pwrite`: tracee `errno` `EBADF`(9), a `finished:` line present, and `RunCompleted` recorded in the journal. A program can therefore branch on it, which is what separates this class from a propagated refusal that stops the run; the base object is left byte-identical on the host and in the shadow. **Two call-path details measured here, because the libc spelling is not the one a reader of this row would predict.** Rust's `File::try_clone` issues `fcntl` with command **67** (`F_DUPFD_CLOEXEC`), *not* the command **0** (`F_DUPFD`) the C spelling issues, and a bare `dup` is syscall **41** -- three different calls behind one row. Rust's `File::sync_all` issues `fcntl` with command **51** (`F_FULLFSYNC`) and `File::sync_data` issues the identical call, so **a Rust `File` has no `fsync`(2) call site at all** and `sync_all` never surfaces as the `fsync` named in this row. `dup2`, `readv` and `writev` are listed by mechanism only and were not exercised. Pinned in both C and Rust by the twelve descriptor cases in `userspace_run.rs` -- ten refusals, plus two **served-member controls** (C `fstat`, Rust `File::metadata`) which succeed on the very descriptor the ten are refused on, which is what makes this a statement about interposer and `TRACED_STUBS` coverage rather than about descriptors as such. **`flock` and file-backed `mmap` are in this class too**, and so is `fcntl(F_SETLK)`: measured by the rank-13 cases, `flock(LOCK_EX\|LOCK_NB)`, `fcntl(F_SETLK)`, Rust `File::try_lock` and `mmap(MAP_SHARED)` each answer `EBADF`(9) on a routed descriptor, the run survives, and a kernel pipe used before and after the refusal still carries its bytes and EOF (`slate_c13_01` to `slate_c13_04`). Which call Rust's `try_lock` issues was not traced; only its `raw_os_error` of 9 is measured. |
@@ -1458,3 +1458,68 @@ C17-03's fixture and reading are unchanged. Offline replay checks the retained
 identified local and original runner bytes, rejecting the stale location, wrong
 exits, wrong registration results, and unrelated diagnostics.
 CI must still run the final live assertions on the reviewed head. Refs #217.
+
+### Rank-16 hard-link/no-clobber publication characterization
+
+`linkat` is excluded from the returned-`ENOTSUP` row above. The Link
+operation reaches the resolver’s unsupported-operation arm in
+`umbra-overlay/src/engine.rs`, which returns `UnsupportedCapability` with
+`operation requires descriptor or metadata support beyond MVP`. Nonzero
+`renameatx_np` flags are rejected separately by the macOS ABI decoder.
+The rank-16 expectations below distinguish these run-ending errors from
+a returned tracee errno.
+
+The `c16_*` cases in `tests/userspace_run.rs` compare native publication with
+userspace routing for absent and occupied destinations. C16-01/02 reproduce
+the Codex E13 hard-link decision; C16-03/04 enter its pinned tempfile helper
+independently. The preregistered expectations are supervisor refusals at Link
+resolution and the nonzero renameatx_np flags boundary respectively. These
+expectations are not positive publication support or evidence that E13 reaches
+the fallback after an abort. Refs #79.
+
+Original instrument readings on Darwin 25.5.0 with rustc 1.99.1 did not reach either
+publication boundary. All four native controls passed, but each routed run
+aborted during seed preparation with Rust's `IO Safety violation: owned file
+descriptor already closed`. Independent server reads found the complete source,
+no destination (including in the intended incumbent cases), and no readiness
+file. The supervisor exited 1 without journal completion; the recorded cleanup
+checks passed. For C16-02/04, cleanup qualification is limited as described below.
+The later host-invariance assertions were not reached, so these readings do
+not certify an unchanged host namespace.
+Neither Link nor no-clobber publication is qualified by those original
+readings. The setup defect is tracked as #227.
+
+The revised instrument retains the source File across publication, reports
+through the inherited stderr pipe, and exits explicitly to avoid its teardown. For modes 2/4,
+`umbra-slate-r16-prepared` uses the supervisor’s prepared observer to write the
+incumbent natively in the loopback Ganesha export before tracee launch. It uses
+the existing CLI composition and isolation entry points; the slate launcher
+still bounds execution and performs the remaining cleanup checks, with the
+C16-02/04 census limitation below. This companion requires `docker`
+and the standard `umbra-m1-transport-raw-ganesha` fixture container. Source
+creation and writing remain routed. This deliberately sidesteps #227; it does
+not fix it. C16-05 separately pins the exact routed write-plus-drop abort with
+a passing native control. Under `anchor-ruling-b1.md`, this C16-05 reuses the
+identifier of the committed ideation’s deferred forced-secondary-link-fallback
+case; that forced-fallback case remains deferred. Revised local readings pass all five cases: C16-01/02
+reach the exact Link resolver refusal, C16-03/04 reach the exact
+`renameatx_np` flags `0x4` refusal, and C16-05 demonstrates #227.
+The publication cases preserve source bytes and any incumbent; all five
+qualify host invariance. For C16-02 and C16-04, the guardian-session census
+does not run: the routed launch is led by the prepared companion (pbi_comm
+`umbra-slate-r16`), while `slate_run_session` matches only a session whose
+leader is `umbra` (`tests/userspace_run.rs:8208-8213`). Their cleanup records
+prove the remaining cleanup checks, but NOT guardian-session cleanup.
+C16-01/03/05 are unaffected. Refs #233 and #217. Earlier reporting and
+incumbent-path preparation failures remain separate instrument evidence;
+they do not qualify publication. These local readings do not replace CI.
+
+Build the isolated `experiments/fixtures/umbra-slate-r16-publication` package
+with its lockfile into the workspace target and set `UMBRA_SLATE_R16_PATH`.
+The existing live-server configuration, `UMBRA_SLATE_EVIDENCE`, and
+`UMBRA_INTEGRATION_REQUIRED=1` are required for qualification. CI builds the
+fixture and includes all five cases in the baseline userspace invocation.
+Each case uses the existing slate launcher with a 30-second execution deadline
+and 10-second cleanup grace, retains logs and journal evidence, and independently
+checks server bytes and the unchanged host namespace. Evidence directories must
+be fresh. Mutation-probe invocations do not qualify these baseline statuses.
