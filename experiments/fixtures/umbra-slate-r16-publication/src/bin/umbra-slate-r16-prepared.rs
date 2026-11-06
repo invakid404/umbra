@@ -6,15 +6,24 @@ use std::{
 };
 use umbra_core::{RunId, UmbraError};
 use umbra_supervisor::{RunObserver, RunOutcome};
-struct Prepared;
+struct Prepared {
+    workspace: std::path::PathBuf,
+}
 impl RunObserver for Prepared {
     fn prepared(&mut self, run_id: RunId) {
         // The UUID comes from the supervisor, never from arbitrary shell input.
-        // The parent is the run root already created by provider admission.
-        let path = format!("/umbra/runs/{}/root/dst", run_id.0);
+        // Mirror the absolute logical workspace below the admitted run root.
+        let path = std::path::PathBuf::from(format!("/umbra/runs/{}/root", run_id.0))
+            .join(
+                self.workspace
+                    .strip_prefix("/")
+                    .expect("absolute workspace"),
+            )
+            .join("dst");
+        let path = path.to_str().expect("test workspace is UTF-8");
         let mut child = Command::new("docker")
             .args(["exec", "umbra-m1-transport-raw-ganesha", "sh", "-c",
-                "set -eu; test -d \"${1%/*}\"; test ! -e \"$1\"; printf 'C16 incumbent must survive unchanged\\n' > \"$1\"; chmod 666 \"$1\"",
+                "set -eu; mkdir -m 777 -p \"${1%/*}\"; test ! -e \"$1\"; printf 'C16 incumbent must survive unchanged\\n' > \"$1\"; chmod 666 \"$1\"",
                 "c16-seed", &path])
             .stdin(Stdio::null()).spawn().expect("native export seed spawn");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -53,9 +62,10 @@ fn main() -> ExitCode {
         unreachable!()
     };
     assert!(args.agent.is_none());
+    let workspace = std::fs::canonicalize(&args.workspace).expect("canonical workspace");
     let result = umbra_cli::composition::load_registry(&args.registry)
         .and_then(|registry| {
-            umbra_cli::composition::run_spec(args, registry, Some(Box::new(Prepared)))
+            umbra_cli::composition::run_spec(args, registry, Some(Box::new(Prepared { workspace })))
         })
         .and_then(umbra_supervisor::run);
     match result {
