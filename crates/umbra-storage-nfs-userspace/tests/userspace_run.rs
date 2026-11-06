@@ -13761,6 +13761,8 @@ fn slate_c15_01_shadow_alias_exec() {
 }
 
 // ---- slate-r16: hard-link/no-clobber publication (Refs #79) ----
+// Measured setup abort: ISSUE-TBD(rust-file-drop-abort). Keep the preregistered
+// assertions strict: the IO Safety abort does not qualify either publication path.
 const C16_SOURCE: &[u8] = b"C16 complete temporary payload\n";
 const C16_INCUMBENT: &[u8] = b"C16 incumbent must survive unchanged\n";
 fn c16_case(mode: u8) {
