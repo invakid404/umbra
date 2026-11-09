@@ -14339,3 +14339,156 @@ fn slate_r10_deferred_retained_poll_evidence() {
         "permission refusal is not absence"
     );
 }
+
+// fix-227: public fcntl queries, with a native control before each routed case.
+fn fix_227_fdflags(mode: &str) {
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(root) = slate_evidence() else { return };
+    let evidence = root.join(format!("fix-227-{mode}"));
+    std::fs::create_dir(&evidence).expect("fresh reading");
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(
+        scratch.path(),
+        "umbra-fix-227-fdflags",
+        "UMBRA_FIX_227_FDFLAGS_PATH",
+    );
+    std::fs::write(
+        evidence.join("fixture.sha256"),
+        r14_sha256(&std::fs::read(&program).unwrap()),
+    )
+    .unwrap();
+    let native_file = scratch.path().join("native-file");
+    let (native, timeout) = slate_launch(
+        Command::new(&program).arg(mode).arg(&native_file),
+        &evidence.join("native"),
+        std::time::Duration::from_secs(30),
+        None,
+    );
+    slate_finish_cleanup();
+    assert!(!timeout);
+    assert!(native.status.success(), "{native:?}");
+    let native_text = String::from_utf8_lossy(&native.stdout);
+    let expected = match mode {
+        "fork" => "fork child=0 parent-cloexec=1 parent-live=0 bytes=ABCDE\n",
+        "exec" => "exec child=0 parent-cloexec=1 parent-live=0 bytes=ABCDE\n",
+        "thread" => "thread-live result=1 errno=0\nthread-closed result=-1 errno=9\n",
+        "flags" => "cloexec result=1 errno=0\ninherited result=0 errno=0\n",
+        "closed" => "closed result=-1 errno=9\nunissued result=-1 errno=9\n",
+        "close" => {
+            "close result=0 errno=0\ndouble-close result=-1 errno=9\nreuse-plain equal=1\nclose-nocancel result=0 errno=0\ndouble-nocancel result=-1 errno=9\nreuse-nocancel equal=1\n"
+        }
+        "refusals" => {
+            for name in ["getfl", "setfd", "dupfd", "dupfd-cloexec"] {
+                assert_ne!(slate_field(&native_text, name, "result"), "-1");
+                assert_eq!(slate_field(&native_text, name, "errno"), "0");
+            }
+            "getfl result=-1 errno=9\nsetfd result=-1 errno=9\ndupfd result=-1 errno=9\ndupfd-cloexec result=-1 errno=9\n"
+        }
+        _ => panic!("unknown descriptor case"),
+    };
+    if mode != "refusals" {
+        assert_eq!(native_text, expected);
+    }
+    if mode == "fork" || mode == "exec" {
+        assert_eq!(std::fs::read(&native_file).unwrap(), b"ABCDE");
+    }
+    let workspace = scratch.path().join("workspace");
+    let state = scratch.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed\n").unwrap();
+    let registry = registry(scratch.path(), &host, port);
+    assert_no_nfs_mount(&host, port, &[&workspace], "fix-227 before");
+    let (out, timeout) = slate_launch(
+        Command::new(binaries().join("umbra"))
+            .args(["run", "--registry"])
+            .arg(&registry)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["--experimental", "--"])
+            .arg(&program)
+            .arg(mode)
+            .arg(workspace.join("file")),
+        &evidence.join("routed"),
+        std::time::Duration::from_secs(30),
+        None,
+    );
+    slate_finish_cleanup();
+    assert!(!timeout);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let id = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("umbra: run ")
+                .and_then(|s| s.strip_suffix(" prepared"))
+        })
+        .expect("prepared run");
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+        status: out.status.code(),
+        stderr,
+        destination: workspace.join("file"),
+        workspace,
+        state,
+        registry,
+    };
+    let object = read_whole_object_through_client(&host, port, &shadow_path(&run));
+    std::fs::write(
+        evidence.join("observed.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"status": run.status, "object": object}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        object.as_deref(),
+        Some(if mode == "fork" || mode == "exec" {
+            b"ABCDE".as_slice()
+        } else {
+            b"".as_slice()
+        })
+    );
+    assert_eq!(run.status, Some(0), "{}", run.stderr);
+    assert!(run.stderr.contains("finished: Some(Code(0))"));
+    assert!(journal_records_completion(&run));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    assert_eq!(
+        std::fs::read(run.workspace.join("seed.txt")).unwrap(),
+        b"seed\n"
+    );
+    assert_eq!(std::fs::read_dir(&run.workspace).unwrap().count(), 1);
+    assert_no_nfs_mount(&host, port, &[&run.workspace], "fix-227 after");
+}
+#[test]
+fn fix_227_descriptor_flags() {
+    fix_227_fdflags("flags");
+}
+#[test]
+fn fix_227_closed_and_unissued_descriptors() {
+    fix_227_fdflags("closed");
+}
+#[test]
+fn fix_227_other_fcntl_commands_remain_refused() {
+    fix_227_fdflags("refusals");
+}
+#[test]
+fn fix_227_close_and_number_reuse() {
+    fix_227_fdflags("close");
+}
+
+#[test]
+fn fix_227_fork_flags_and_io() {
+    fix_227_fdflags("fork");
+}
+#[test]
+fn fix_227_exec_sweep_and_io() {
+    fix_227_fdflags("exec");
+}
+#[test]
+fn fix_227_ordered_cross_thread_close() {
+    fix_227_fdflags("thread");
+}
