@@ -14031,14 +14031,10 @@ fn r10_deferred(case: u8) {
     let seed: &[u8] = if case == 7 { b"......" } else { b"ABCDEF" };
     let expected: Vec<(&str, &[u8])> = match case {
         7 => vec![("seed.txt", b"BA....")],
-        8 => vec![("seed.txt", seed), ("out.txt", b"FRESH")],
-        11 => vec![("seed.txt", seed), ("out.txt", b"CHILD")],
-        13 => vec![("seed.txt", seed)],
-        16 => vec![
-            ("seed.txt", seed),
-            ("a.txt", b"TASK-A"),
-            ("b.txt", b"TASK-B"),
-        ],
+        8 => vec![("out.txt", b"FRESH")],
+        11 => vec![("out.txt", b"CHILD")],
+        13 => vec![],
+        16 => vec![("a.txt", b"TASK-A"), ("b.txt", b"TASK-B")],
         _ => unreachable!(),
     };
     let arguments = |cmd: &mut Command, root: &Path| {
@@ -14080,6 +14076,7 @@ fn r10_deferred(case: u8) {
     for (name, bytes) in &expected {
         assert_eq!(std::fs::read(native.join(name)).unwrap(), *bytes);
     }
+    if case != 7 { assert_eq!(std::fs::read(native.join("seed.txt")).unwrap(), seed); }
     slate_finish_cleanup();
     let (host, port) = fixture().expect("live Ganesha required");
     let workspace = scratch.path().join("workspace");
@@ -14158,6 +14155,9 @@ fn r10_deferred(case: u8) {
             Some(bytes.len() as u64)
         );
     }
+    let mut expected_names: Vec<_> = expected.iter().map(|(name, _)| name.as_bytes().to_vec()).collect();
+    expected_names.sort();
+    assert_eq!(c13_shadow_names(&host, port, &run), expected_names);
     assert!(journal_records_completion(&run));
     let reopened = slate_bounded(
         Command::new(binaries().join("umbra"))
