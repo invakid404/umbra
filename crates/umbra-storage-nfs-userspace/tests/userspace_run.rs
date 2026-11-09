@@ -10429,6 +10429,10 @@ fn slate_c11_05_cloexec_null_spawn() {
         "the spawned child's write on a close-on-exec routed number must fail \
          EBADF and leave the victim VICTIM-SEED:\nvictim={victim:?}\n{child}"
     );
+    assert_eq!(slate_field(&child, "kernel-view control", "getfd"), "0");
+    assert_eq!(slate_field(&child, "kernel-view control", "errno"), "0");
+    assert_eq!(slate_field(&child, "kernel-view victim", "getfd"), "-1");
+    assert_eq!(slate_field(&child, "kernel-view victim", "errno"), "9");
     assert_eq!(slate_field(&child, "write-victim", "errno"), "9");
     assert_eq!(slate_field(&child, "pipe ", "collision"), "0");
     assert_eq!(
@@ -13910,26 +13914,33 @@ fn c16_case(mode: u8) {
     retain(&run.state, &evidence.join("state"));
     slate_finish_cleanup();
     assert!(!timeout);
-    assert_eq!(run.status, Some(1));
-    assert!(!completed);
-    let diagnostic = if mode == 5 {
-        "IO Safety violation: owned file descriptor already closed"
-    } else if mode <= 2 {
-        "operation requires descriptor or metadata support beyond MVP"
-    } else {
-        "renameatx_np flags 0x4"
-    };
-    assert!(run.stderr.contains(diagnostic), "{}", run.stderr);
-    assert!(!run.stderr.contains("finished:"));
-    assert!(!run.stderr.contains("C16 decision-return"));
-    assert!(!run.stderr.contains("C16 link-return"));
-    assert!(!run.stderr.contains("C16 persist-return"));
+    let diagnostic;
     if mode == 5 {
+        diagnostic = "C16 drop-return Ok";
+        assert_eq!(run.status, Some(0), "{}", run.stderr);
+        assert!(completed);
         assert!(run.stderr.contains("C16 drop-enter"));
-        assert!(!run.stderr.contains("C16 drop-return"));
+        assert!(run.stderr.contains("C16 drop-return Ok"));
+        assert!(run.stderr.contains("C16 decision-return Ok"));
+        assert!(run.stderr.contains("finished: Some(Code(0))"));
+        assert!(!run.stderr.contains("IO Safety violation"));
+        assert!(!run.stderr.contains("T06"));
         assert!(!run.stderr.contains("C16 ready"));
-        assert!(run.stderr.contains("fatal signal/exception: T06"));
+        assert!(!run.stderr.contains("C16 link-return"));
+        assert!(!run.stderr.contains("C16 persist-return"));
     } else {
+        assert_eq!(run.status, Some(1));
+        assert!(!completed);
+        diagnostic = if mode <= 2 {
+            "operation requires descriptor or metadata support beyond MVP"
+        } else {
+            "renameatx_np flags 0x4"
+        };
+        assert!(run.stderr.contains(diagnostic), "{}", run.stderr);
+        assert!(!run.stderr.contains("finished:"));
+        assert!(!run.stderr.contains("C16 decision-return"));
+        assert!(!run.stderr.contains("C16 link-return"));
+        assert!(!run.stderr.contains("C16 persist-return"));
         assert!(run.stderr.contains(&format!("C16 ready mode={mode}")));
         assert!(!run.stderr.contains("IO Safety violation"));
         if mode <= 2 {
@@ -13986,7 +13997,7 @@ fn c16_04_noclobber_incumbent() {
 }
 
 #[test]
-fn c16_05_written_file_drop_defect() {
+fn c16_05_written_file_drop_completes() {
     c16_case(5);
 }
 
