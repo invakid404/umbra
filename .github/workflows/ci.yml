@@ -539,6 +539,14 @@ jobs:
         run: |
           df -h /System/Volumes/Data
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          # The fixture builds umbra's own crates by path, so its lock also holds
+          # their transitive dependencies, which a workspace dependency bump
+          # moves (#239). Re-lock only those four packages: the bump flows in,
+          # and the `=` pins on tempfile and rustix, the Codex-facing versions,
+          # stay exact. The diff stat records what moved.
+          cargo update --manifest-path experiments/fixtures/umbra-slate-r16-publication/Cargo.toml \
+            -p umbra-cli -p umbra-core -p umbra-supervisor -p umbra-isolation
+          git diff --stat -- experiments/fixtures/umbra-slate-r16-publication/Cargo.lock
           cargo build --locked --manifest-path experiments/fixtures/umbra-slate-r16-publication/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           echo "UMBRA_SLATE_R16_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r16-publication" >> "$GITHUB_ENV"
 

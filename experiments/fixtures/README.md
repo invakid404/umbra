@@ -179,6 +179,11 @@ choice with absent/existing destinations; modes 3/4 enter its no-clobber helper
 directly. Sync, timestamps and decompression are excluded so publication has
 its own reading. Build with `cargo build --locked --manifest-path
 experiments/fixtures/umbra-slate-r16-publication/Cargo.toml --target-dir target`.
+The package builds umbra's crates by path, so its lock also holds their
+transitive dependencies; after a workspace dependency bump, first re-lock them
+as CI does (#239): `cargo update --manifest-path
+experiments/fixtures/umbra-slate-r16-publication/Cargo.toml -p umbra-cli -p
+umbra-core -p umbra-supervisor -p umbra-isolation`.
 Set `UMBRA_SLATE_R16_PATH` to the resulting executable and use the `c16_*`
 userspace tests, which run disposable native controls before enforced routing.
 See the userspace-storage README for evidence and prerequisites.
