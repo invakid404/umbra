@@ -9782,6 +9782,7 @@ struct SlateSpawn {
     program: PathBuf,
     helper: PathBuf,
     provider_environment: Vec<(String, String)>,
+    rpc_timeout_ms: Option<u64>,
 }
 fn slate_spawn(case: &str) -> Option<SlateSpawn> {
     let evidence = slate_evidence()?.join(case);
@@ -9813,6 +9814,7 @@ fn slate_spawn(case: &str) -> Option<SlateSpawn> {
         program,
         helper,
         provider_environment: Vec::new(),
+        rpc_timeout_ms: None,
     })
 }
 
@@ -9888,6 +9890,12 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
     let workspace = workspace.canonicalize().unwrap();
     std::fs::write(workspace.join("seed.txt"), b"ABCDEF").unwrap();
     let registry = registry(spawn.scratch.path(), &host, port);
+    if let Some(timeout_ms) = spawn.rpc_timeout_ms {
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        config["timeout_ms"] = serde_json::json!(timeout_ms);
+        std::fs::write(&registry, serde_json::to_vec(&config).unwrap()).unwrap();
+    }
     assert_no_nfs_mount(&host, port, &[&workspace], "rank-11 before");
     let watch = SlateWatch::new(spawn.scratch.path(), &spawn.evidence.join("routed"), false);
     let output = slate_watched(
@@ -10509,6 +10517,11 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     if !root_probe {
         assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
     }
+    if case == "fix-243-inserted-watchdog" {
+        // The real 30s provider watchdog must fire before transport timeout.
+        // The slate's independent 60s execution deadline remains unchanged.
+        spawn.rpc_timeout_ms = Some(45_000);
+    }
     let phase = match case {
         "fix-243-copyout-error" => "caller-copyout",
         "fix-243-free-error" => "remote-free",
@@ -10608,6 +10621,13 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
                 "caller-copyout" => "spawn caller PID delivery failed",
                 "remote-free" => "spawn snapshot release failed",
                 "register-commit" => "injected final register commit failure",
+                "inserted" if case.ends_with("deadline") => "session timed out",
+                "inserted" if case.ends_with("session-drop") =>
+                    "injected inserted session-drop failure",
+                "inserted" if case.ends_with("backend-drop") =>
+                    "injected inserted backend-drop failure",
+                "inserted" if case.ends_with("terminate") => "injected inserted terminate failure",
+                "inserted" if case.ends_with("watchdog") => "injected inserted watchdog failure",
                 _ => "injected attach failure after registration",
             }),
             "{}",
