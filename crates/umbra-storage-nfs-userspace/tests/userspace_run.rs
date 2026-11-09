@@ -10313,10 +10313,14 @@ fn fix_243_pipe(mode: &str) {
     assert!(correct, "{}", routed.run.stderr);
     assert!(routed.text("records.done")
         .contains("pipe-result bytes=13 payload=FIX-243-NONCE eof=1"));
-    if mode == "fix-243-cloexec" {
+    if mode == "fix-243-cloexec" || mode == "fix-243-error-recovery" {
         let expected = "pruned-victim result=-1 errno=9";
         assert!(std::fs::read_to_string(root.join("records.child")).unwrap().contains(expected));
         assert!(routed.text("records.child").contains(expected));
+    }
+    if mode == "fix-243-error-recovery" {
+        assert!(native_done.contains("kernel-error result=9 expected=9"));
+        assert!(routed.text("records.done").contains("kernel-error result=9 expected=9"));
     }
     assert!(journal_records_completion(&routed.run));
     slate_spawn_finish(&spawn, &routed);
@@ -10328,6 +10332,9 @@ fn fix_243_kernel_pipe_actions() { fix_243_pipe("fix-243-pipe"); }
 
 #[test]
 fn fix_243_cloexec_default_prunes_logical_descriptors() { fix_243_pipe("fix-243-cloexec"); }
+
+#[test]
+fn fix_243_kernel_error_then_success() { fix_243_pipe("fix-243-error-recovery"); }
 
 fn fix_243_refusal(mode: &str, diagnostic: &str) {
     let Some(spawn) = slate_spawn(mode) else { return; };

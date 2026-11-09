@@ -522,7 +522,8 @@ static int race(const char *root, const char *helper) {
 /* D-A1 kernel-only pipe composition. The child gets fd 100 via ordered
  * dup/close/inherit actions; CLOEXEC_DEFAULT must prune the routed victim. */
 static int kernel_pipe(const char *mode, const char *root, const char *helper) {
-    int explicit_policy = !strcmp(mode, "fix-243-cloexec");
+    int recovery = !strcmp(mode, "fix-243-error-recovery");
+    int explicit_policy = !strcmp(mode, "fix-243-cloexec") || recovery;
     int pair[2];
     if (pipe(pair)) return 90;
     char path[4096];
@@ -549,6 +550,18 @@ static int kernel_pipe(const char *mode, const char *root, const char *helper) {
     snprintf(policy_arg, sizeof policy_arg, "%d", explicit_policy);
     char *args[] = {(char *)helper, "fix-243-pipe", (char *)root, victim_arg, policy_arg, NULL};
     pid_t child = -1;
+    if (recovery) {
+        posix_spawn_file_actions_t bad;
+        posix_spawnattr_t defaults;
+        if (posix_spawn_file_actions_init(&bad) || posix_spawnattr_init(&defaults)) return 106;
+        close(200);
+        if (posix_spawn_file_actions_adddup2(&bad, 200, 100)) return 107;
+        int result = spawn(&child, helper, &bad, &defaults, args);
+        note("kernel-error result=%d expected=%d\n", result, EBADF);
+        posix_spawn_file_actions_destroy(&bad);
+        posix_spawnattr_destroy(&defaults);
+        if (result != EBADF) { flush(root, "records.done"); return 108; }
+    }
     if (spawn(&child, helper, &actions, &attr, args)) {
         flush(root, "records.done");
         return 95;
@@ -627,7 +640,8 @@ int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
     if (!strncmp(mode, "fix-243-refuse-", 15)) return refused_plan(mode, root, helper);
-    if (!strcmp(mode, "fix-243-pipe") || !strcmp(mode, "fix-243-cloexec"))
+    if (!strcmp(mode, "fix-243-pipe") || !strcmp(mode, "fix-243-cloexec") ||
+        !strcmp(mode, "fix-243-error-recovery"))
         return kernel_pipe(mode, root, helper);
     if (!strcmp(mode, "c11-01") || !strcmp(mode, "c11-02-actions") ||
         !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both") ||
