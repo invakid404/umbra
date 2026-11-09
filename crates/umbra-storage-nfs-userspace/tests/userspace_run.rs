@@ -15775,13 +15775,23 @@ fn fix_243_policy_deadline() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_policy_session_drop() {
-    fix_243_fault_reading("fix-243-policy-session-drop", "c11-02-attributes", false, b'E');
+    fix_243_fault_reading(
+        "fix-243-policy-session-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_policy_backend_drop() {
-    fix_243_fault_reading("fix-243-policy-backend-drop", "c11-02-attributes", false, b'E');
+    fix_243_fault_reading(
+        "fix-243-policy-backend-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]

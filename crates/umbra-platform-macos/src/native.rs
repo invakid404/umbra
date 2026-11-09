@@ -3637,8 +3637,7 @@ impl TraceBackend for MacosTraceBackend {
                 }
                 ResumeMode::SpawnChildReady(auth) if auth.token.thread == command.thread => {
                     #[cfg(feature = "mutation-probe-spawn-lifecycle")]
-                    if std::env::var("UMBRA_FIX_243_PROBE_PHASE").as_deref()
-                        == Ok("policy-ready")
+                    if std::env::var("UMBRA_FIX_243_PROBE_PHASE").as_deref() == Ok("policy-ready")
                         && matches!(
                             std::env::var("UMBRA_FIX_243_PROBE_TRIGGER").as_deref(),
                             Ok("deadline" | "session-drop" | "backend-drop" | "terminate")
@@ -3646,7 +3645,7 @@ impl TraceBackend for MacosTraceBackend {
                     {
                         return self.probe_teardown_trigger("policy-ready");
                     }
-                    return self.complete_spawn(i, auth, true)
+                    return self.complete_spawn(i, auth, true);
                 }
                 ResumeMode::SpawnAbortReady(auth) if auth.token.thread == command.thread => {
                     return self.complete_spawn(i, auth, false)
