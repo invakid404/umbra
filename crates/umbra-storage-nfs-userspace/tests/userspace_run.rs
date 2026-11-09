@@ -8205,11 +8205,13 @@ struct SlateRunSession {
 /// launched `umbra` (the group's leader) that leads its own session. Native
 /// fixtures, whose own children may lead sessions, are never matched.
 fn slate_run_session(group: u32) -> Result<Option<SlateRunSession>, String> {
-    // SAFETY: getsid reads no memory of ours.
-    if unsafe { libc::getsid(0) } != 1 {
-        return Ok(None);
-    }
-    let Some(leader) = slate_process(group as i32)?.filter(|p| p.command == "umbra") else {
+    // The explicit qualification relay uses the real guardian even outside
+    // launchd. All other runs retain the existing session admission rule.
+    let Some(leader) = slate_process(group as i32)?.filter(|p| {
+        p.command == "umbra243relay"
+            // SAFETY: getsid reads no memory of ours.
+            || (unsafe { libc::getsid(0) } == 1 && p.command == "umbra")
+    }) else {
         return Ok(None);
     };
     let now = std::time::SystemTime::now()
@@ -9783,6 +9785,7 @@ struct SlateSpawn {
     helper: PathBuf,
     provider_environment: Vec<(String, String)>,
     platform_timeout_ms: Option<u64>,
+    guardian: bool,
 }
 fn slate_spawn(case: &str) -> Option<SlateSpawn> {
     let evidence = slate_evidence()?.join(case);
@@ -9815,6 +9818,7 @@ fn slate_spawn(case: &str) -> Option<SlateSpawn> {
         helper,
         provider_environment: Vec::new(),
         platform_timeout_ms: None,
+        guardian: false,
     })
 }
 
@@ -9901,8 +9905,21 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
     }
     assert_no_nfs_mount(&host, port, &[&workspace], "rank-11 before");
     let watch = SlateWatch::new(spawn.scratch.path(), &spawn.evidence.join("routed"), false);
+    let mut command = Command::new(if spawn.guardian {
+        binaries().join("examples/umbra243relay")
+    } else {
+        binaries().join("umbra")
+    });
+    if spawn.guardian {
+        command
+            .env("UMBRA_FIX_243_RELAY_EXE", binaries().join("umbra"))
+            .env(
+                "UMBRA_FIX_243_RELAY_RECORDS",
+                spawn.evidence.join("guardian"),
+            );
+    }
     let output = slate_watched(
-        Command::new(binaries().join("umbra"))
+        command
             .envs(
                 spawn
                     .provider_environment
@@ -10515,6 +10532,7 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     let Some(mut spawn) = slate_spawn(case) else {
         return;
     };
+    spawn.guardian = case.starts_with("fix-243-guardian-");
     let (root, native) = slate_spawn_native(&spawn, mode);
     assert!(native.status.success());
     if !root_probe {
@@ -10526,6 +10544,7 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
         spawn.platform_timeout_ms = Some(10_000);
     }
     let phase = match case {
+        "fix-243-guardian-unregistered" => "unregistered",
         "fix-243-copyout-error" => "caller-copyout",
         "fix-243-free-error" => "remote-free",
         "fix-243-register-error" => "register-commit",
@@ -10702,6 +10721,35 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
             serde_json::json!({
                 "fault": phase, "provider_loss": false,
                 "identity": observed.json(), "cleanup": cleanup,
+            }),
+        );
+    }
+    if spawn.guardian {
+        let census = std::fs::read_to_string(spawn.evidence.join("routed.census.jsonl")).unwrap();
+        assert!(
+            census.contains("SESSION_READING"),
+            "guardian session was not observed"
+        );
+        let records = std::fs::read_dir(spawn.evidence.join("guardian")).unwrap();
+        assert!(records.count() > 0, "guardian record missing");
+        assert!(
+            cleanup.starts_with("cleanup CLEAN")
+                && cleanup.lines().next().unwrap().contains("group_kills=0")
+                && cleanup.lines().next().unwrap().contains("zombies=\"\""),
+            "{cleanup}"
+        );
+        assert!(
+            slate_process(observed.pid)
+                .unwrap()
+                .is_none_or(|p| p.start != observed.start),
+            "guardian left recorded child identity present"
+        );
+        slate_record(
+            &spawn,
+            "GUARDIAN CLEANUP QUALIFIED",
+            serde_json::json!({
+                "fault": phase, "identity": observed.json(), "cleanup": cleanup,
+                "reap_established": false,
             }),
         );
     }
@@ -15798,4 +15846,21 @@ fn fix_243_policy_backend_drop() {
 #[test]
 fn fix_243_policy_terminate() {
     fix_243_fault_reading("fix-243-policy-terminate", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_guardian_provider_loss() {
+    fix_243_fault_reading("fix-243-guardian-loss", "c11-02-attributes", false, b'P');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_guardian_unregistered() {
+    fix_243_fault_reading(
+        "fix-243-guardian-unregistered",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
 }

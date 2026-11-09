@@ -23,6 +23,7 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+umbra-isolation = { path = "../umbra-isolation" }
 # `tests/userspace_run.rs` drives the real `umbra` binary against the live
 # fixture and then checks the result three independent ways: through the raw
 # client (this crate), through the run's journal (these two), and against the
@@ -47,3 +48,8 @@ uuid.workspace = true
 # so bindgen is always available and `build.rs` returns early when the
 # `transport-raw` feature is off.
 bindgen = "=0.73.2"
+
+[[example]]
+name = "umbra243relay"
+path = "../../experiments/fixtures/umbra-fix-243-relay.rs"
+required-features = ["mutation-probe-spawn-lifecycle"]
