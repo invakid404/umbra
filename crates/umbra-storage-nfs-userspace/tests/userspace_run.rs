@@ -10520,7 +10520,7 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     if !root_probe {
         assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
     }
-    if case == "fix-243-inserted-watchdog" {
+    if case.ends_with("-watchdog") {
         // Configure the real watchdog below the existing 12s RPC deadline;
         // the independent 60s slate deadline remains unchanged.
         spawn.platform_timeout_ms = Some(10_000);
@@ -10537,7 +10537,10 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     spawn
         .provider_environment
         .push(("UMBRA_FIX_243_PROBE_PHASE".into(), phase.into()));
-    if let Some(trigger) = case.strip_prefix("fix-243-inserted-") {
+    if let Some(trigger) = case
+        .strip_prefix("fix-243-inserted-")
+        .or_else(|| case.strip_prefix("fix-243-acquired-"))
+    {
         spawn
             .provider_environment
             .push(("UMBRA_FIX_243_PROBE_TRIGGER".into(), trigger.into()));
@@ -10665,6 +10668,15 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
                     "injected inserted backend-drop failure",
                 "inserted" if case.ends_with("terminate") => "injected inserted terminate failure",
                 "inserted" if case.ends_with("watchdog") => "injected inserted watchdog failure",
+                "task-acquired" if case.ends_with("deadline") => "session timed out",
+                "task-acquired" if case.ends_with("session-drop") =>
+                    "injected acquired session-drop failure",
+                "task-acquired" if case.ends_with("backend-drop") =>
+                    "injected acquired backend-drop failure",
+                "task-acquired" if case.ends_with("terminate") =>
+                    "injected acquired terminate failure",
+                "task-acquired" if case.ends_with("watchdog") =>
+                    "injected acquired watchdog failure",
                 _ => "injected attach failure after registration",
             }),
             "{}",
@@ -10806,6 +10818,61 @@ fn fix_243_unregistered_packed_reading() {
 #[test]
 fn fix_243_policy_before_ready_failure() {
     fix_243_fault_reading("fix-243-policy-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_acquired_deadline() {
+    fix_243_fault_reading(
+        "fix-243-acquired-deadline",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_acquired_session_drop() {
+    fix_243_fault_reading(
+        "fix-243-acquired-session-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_acquired_backend_drop() {
+    fix_243_fault_reading(
+        "fix-243-acquired-backend-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_acquired_terminate() {
+    fix_243_fault_reading(
+        "fix-243-acquired-terminate",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_acquired_watchdog() {
+    fix_243_fault_reading(
+        "fix-243-acquired-watchdog",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
 }
 
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision

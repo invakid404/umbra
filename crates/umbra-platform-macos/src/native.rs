@@ -2294,6 +2294,43 @@ impl MacosTraceBackend {
             },
         )
     }
+    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+    fn probe_teardown_trigger(&mut self, phase: &str) -> Result<()> {
+        let trigger = std::env::var("UMBRA_FIX_243_PROBE_TRIGGER").unwrap_or_default();
+        match trigger.as_str() {
+            "deadline" => {
+                self.deadline = Some(Instant::now());
+                self.check_deadline()?;
+            }
+            "session-drop" => {
+                // Before child insertion this drops the existing parent Session;
+                // the acquired child remains in the watchdog task list.
+                drop(self.sessions.pop().expect("registered Session"));
+            }
+            "backend-drop" => {
+                drop(std::mem::take(self));
+            }
+            "terminate" => {
+                self.terminate(
+                    ProcessHandle(self.sessions[0].id),
+                    TerminationPolicy::Immediate,
+                )?;
+            }
+            "watchdog" => {
+                let remaining = self
+                    .deadline
+                    .unwrap()
+                    .saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining + Duration::from_millis(50));
+            }
+            _ => {}
+        }
+        Err(error(
+            "spawn probe",
+            format!("injected {phase} {trigger} failure"),
+        ))
+    }
+
     fn attach_child(
         &mut self,
         parent: usize,
@@ -2313,7 +2350,7 @@ impl MacosTraceBackend {
         // rewritten to name, which is a different binary whenever the tracee
         // asked for one.
         let image = twin.clone();
-        let mut child = Session::attach(
+        let child_result = Session::attach(
             pid,
             self.generation,
             twin,
@@ -2322,7 +2359,17 @@ impl MacosTraceBackend {
             self.deadline.unwrap(),
             self.watchdog.as_ref().unwrap(),
             self.interposer.clone(),
-        )?;
+        );
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if child_result.as_ref().err().is_some_and(|error| {
+            error
+                .to_string()
+                .contains("injected attach failure after registration")
+        }) && std::env::var_os("UMBRA_FIX_243_PROBE_TRIGGER").is_some()
+        {
+            return self.probe_teardown_trigger("acquired");
+        }
+        let mut child = child_result?;
         child.retarget_interposer(&image)?;
         // The parent supplied memory repairs, not breakpoints owned by this RSP.
         debug_assert!(child.breaks.is_empty());
@@ -2350,37 +2397,7 @@ impl MacosTraceBackend {
                 self.sessions[parent].spawn.as_mut().unwrap().child = Some(child_index);
                 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
                 if self.probe_spawn_completion(parent, "inserted")? {
-                    let trigger = std::env::var("UMBRA_FIX_243_PROBE_TRIGGER").unwrap_or_default();
-                    match trigger.as_str() {
-                        "deadline" => {
-                            self.deadline = Some(Instant::now());
-                            self.check_deadline()?;
-                        }
-                        "session-drop" => {
-                            drop(self.sessions.pop().expect("inserted child"));
-                        }
-                        "backend-drop" => {
-                            drop(std::mem::take(self));
-                        }
-                        "terminate" => {
-                            self.terminate(
-                                ProcessHandle(self.sessions[0].id),
-                                TerminationPolicy::Immediate,
-                            )?;
-                        }
-                        "watchdog" => {
-                            let remaining = self
-                                .deadline
-                                .unwrap()
-                                .saturating_duration_since(Instant::now());
-                            std::thread::sleep(remaining + Duration::from_millis(50));
-                        }
-                        _ => {}
-                    }
-                    return Err(error(
-                        "spawn probe",
-                        format!("injected inserted {trigger} failure"),
-                    ));
+                    return self.probe_teardown_trigger("inserted");
                 }
                 self.events.push_back(TraceEvent::SpawnChild {
                     authorization,
