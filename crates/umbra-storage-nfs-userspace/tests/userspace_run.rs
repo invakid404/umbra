@@ -14539,29 +14539,7 @@ fn fix_227_native_fcntl_abi_and_cost() {
         let store = mode_root.join("store");
         if mode == "rewrite" {
             std::fs::create_dir(&store).unwrap();
-            let mut r: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
-            let mut local: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(repository().join("crates/umbra-storage-local/provider.json"))
-                    .unwrap(),
-            )
-            .unwrap();
-            local["executable"] = serde_json::json!(
-                binaries()
-                    .join("umbra-storage-local")
-                    .as_os_str()
-                    .as_bytes()
-            );
-            local["capabilities"] =
-                serde_json::json!(["local-development-v1", "experimental-open-rewrite-v1"]);
-            local["options"] = serde_json::json!(
-                umbra_core::provider::encode(
-                    &umbra_core::BytePath::new(store.as_os_str().as_bytes().to_vec()).unwrap()
-                )
-                .unwrap()
-            );
-            r["providers"]["storage"] = local;
-            std::fs::write(&registry_path, serde_json::to_vec(&r).unwrap()).unwrap();
+            fix_227_rewrite_registry(&registry_path, &store);
         }
         let mut command = if mode == "native" || mode == "inactive" {
             let mut c = Command::new(&program);
@@ -14663,4 +14641,208 @@ fn fix_227_native_fcntl_abi_and_cost() {
         }
     }
     assert_eq!(std::fs::read(&host_file).unwrap(), b"native ABI control\n");
+}
+
+fn fix_227_rewrite_registry(registry_path: &Path, store: &Path) {
+    let mut r: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+    let mut local: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repository().join("crates/umbra-storage-local/provider.json")).unwrap(),
+    )
+    .unwrap();
+    local["executable"] = serde_json::json!(
+        binaries()
+            .join("umbra-storage-local")
+            .as_os_str()
+            .as_bytes()
+    );
+    local["capabilities"] =
+        serde_json::json!(["local-development-v1", "experimental-open-rewrite-v1"]);
+    local["options"] = serde_json::json!(
+        umbra_core::provider::encode(
+            &umbra_core::BytePath::new(store.as_os_str().as_bytes().to_vec()).unwrap()
+        )
+        .unwrap()
+    );
+    r["providers"]["storage"] = local;
+    std::fs::write(&registry_path, serde_json::to_vec(&r).unwrap()).unwrap();
+}
+
+// Behaviour only: generic thread-state gating does NOT prove a kernel wait.
+#[test]
+fn fix_227_sibling_progress_without_kernel_wait_proof() {
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(root) = slate_evidence() else { return };
+    let evidence = root.join("fix-227-lock-progress");
+    std::fs::create_dir(&evidence).expect("fresh reading");
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch_path = scratch.path().canonicalize().unwrap();
+    let program = fixture_binary(
+        &scratch_path,
+        "umbra-fix-227-lock-progress",
+        "UMBRA_FIX_227_LOCK_PATH",
+    );
+    std::fs::write(
+        evidence.join("fixture.sha256"),
+        r14_sha256(&std::fs::read(&program).unwrap()),
+    )
+    .unwrap();
+    for mode in ["native", "routed", "rewrite"] {
+        let mode_root = scratch_path.join(mode);
+        std::fs::create_dir(&mode_root).unwrap();
+        let workspace = mode_root.join("workspace");
+        let state = mode_root.join("state");
+        let store = mode_root.join("store");
+        for dir in [&workspace, &state, &store] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let lock = mode_root.join("lock");
+        std::fs::write(&lock, b"lock\n").unwrap();
+        let locator = mode_root.join("locator");
+        let registry_path = registry(&mode_root, &host, port);
+        if mode == "rewrite" {
+            fix_227_rewrite_registry(&registry_path, &store);
+        }
+        let search = if mode == "routed" {
+            state.clone()
+        } else {
+            store.clone()
+        };
+        let helper_program = program.clone();
+        let helper_evidence = evidence.join(format!("{mode}-helper"));
+        let helper_locator = locator.clone();
+        let helper_lock = lock.clone();
+        let native_shared = mode_root.join("native-shared");
+        let helper = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let shared = if mode == "native" {
+                native_shared
+            } else {
+                loop {
+                    let candidates: Vec<_> = std::fs::read_dir(&search)
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .filter(|p| p.is_dir())
+                        .map(|p| p.join(if mode == "routed" { "host" } else { "root" }))
+                        .filter(|p| p.is_dir())
+                        .collect();
+                    if candidates.len() == 1 {
+                        break candidates[0].join("ft4-shared");
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "run write allowance not created"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            };
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&shared)
+                .unwrap();
+            file.set_len(4096).unwrap();
+            drop(file);
+            let pending = helper_locator.with_extension("pending");
+            std::fs::write(&pending, shared.as_os_str().as_bytes()).unwrap();
+            std::fs::rename(pending, &helper_locator).unwrap();
+            let (out, timeout) = slate_launch(
+                Command::new(helper_program)
+                    .arg("helper")
+                    .arg(&shared)
+                    .arg(helper_lock)
+                    .arg("unused"),
+                &helper_evidence,
+                std::time::Duration::from_secs(35),
+                None,
+            );
+            slate_finish_cleanup();
+            (out, timeout)
+        });
+        let destination = workspace.join("records");
+        let mut command = if mode == "native" {
+            Command::new(&program)
+        } else {
+            let mut c = Command::new(binaries().join("umbra"));
+            c.args(["run", "--registry"])
+                .arg(&registry_path)
+                .arg("--workspace")
+                .arg(&workspace)
+                .arg("--state-dir")
+                .arg(&state)
+                .arg("--experimental");
+            if mode == "rewrite" {
+                c.arg("--local-dev");
+            }
+            c.arg("--").arg(&program);
+            c
+        };
+        command
+            .arg("target")
+            .arg(&locator)
+            .arg(&lock)
+            .arg(&destination);
+        let (out, timeout) = slate_launch(
+            &mut command,
+            &evidence.join(mode),
+            std::time::Duration::from_secs(20),
+            None,
+        );
+        slate_finish_cleanup();
+        let (helper_out, helper_timeout) = helper.join().expect("helper setup thread");
+        assert!(!timeout && !helper_timeout, "{mode} watchdog");
+        assert!(
+            helper_out.status.success(),
+            "helper: {}",
+            String::from_utf8_lossy(&helper_out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "target: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let bytes = if mode == "native" {
+            std::fs::read(&destination).unwrap()
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(stderr.contains("finished: Some(Code(0))"));
+            let id = stderr
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("umbra: run ")
+                        .and_then(|v| v.strip_suffix(" prepared"))
+                })
+                .unwrap();
+            let run = Run {
+                run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+                status: out.status.code(),
+                stderr,
+                destination,
+                workspace,
+                state,
+                registry: registry_path,
+            };
+            assert!(!run.destination.exists());
+            if mode == "routed" {
+                assert!(journal_records_completion(&run));
+                read_whole_object_through_client(&host, port, &shadow_path(&run)).unwrap()
+            } else {
+                std::fs::read(
+                    store
+                        .join(run.run_id.0.to_string())
+                        .join("root")
+                        .join(run.destination.strip_prefix("/").unwrap()),
+                )
+                .unwrap()
+            }
+        };
+        std::fs::write(evidence.join(format!("{mode}.records")), &bytes).unwrap();
+        assert_eq!(
+            bytes,
+            b"NOT_KERNEL_WAIT_PROOF sibling=1 request=1 released=1 result=0 joined=2\n"
+        );
+        assert_eq!(std::fs::read(lock).unwrap(), b"lock\n");
+    }
 }
