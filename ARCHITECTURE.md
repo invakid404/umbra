@@ -229,7 +229,7 @@ using its stable recorded session. External credentials remain external.
 M1/M1.5 subsequently implemented the Rust tracer, storage backends and overlay copy-up/read-through, byte path/dirfd
 resolution and logical symlinks. The userspace-routing suite now exercises the end-to-end CLI with live Ganesha,
 independent NFS readback and a host journal. The rank-14 SQLx workload still fails
-at SQLite connection setup with `SQLITE_IOERR_ACCESS`; a completed journal and
+at SQLite connection setup with `SQLITE_IOERR_READ` (266); a completed journal and
 clean writer release do not imply application success. The platform README records
 the repaired `exec-write` path and current qualification boundaries. Remaining work includes
 multithreaded fork, raw vfork, non-null spawn attributes/file actions, broader
