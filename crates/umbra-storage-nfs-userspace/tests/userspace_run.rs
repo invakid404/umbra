@@ -12602,6 +12602,16 @@ fn f214_open_unlink_rename() {
     f214_metadata_case("unlink");
 }
 
+#[test]
+fn f214_error_precedence() {
+    f214_metadata_case("errors");
+}
+
+#[test]
+fn f214_fork_exec() {
+    f214_metadata_case("fork");
+}
+
 fn f214_metadata_case(mode: &str) {
     let Some(root) = slate_evidence() else {
         return;
@@ -12625,7 +12635,7 @@ fn f214_metadata_case(mode: &str) {
     std::fs::write(native_root.join("seed.txt"), b"ABCDEF").unwrap();
     let watch = SlateWatch::new(spawn.scratch.path(), &spawn.evidence.join("native"), false);
     let native = slate_watched(
-        Command::new(&spawn.program).arg(mode).arg(&native_root),
+        Command::new(&spawn.program).arg(mode).arg(&native_root).arg(&spawn.helper),
         &spawn.evidence.join("native"),
         &watch,
     );
@@ -12659,6 +12669,15 @@ fn f214_metadata_case(mode: &str) {
     assert_eq!(records.len(), 2 * expected.len());
     assert_eq!(&records[..2168], expected.as_slice(), "fstatfs");
     assert_eq!(&records[2168..], expected.as_slice(), "statfs");
+    if mode == "fork" {
+        for output in [&native.stdout, &routed.output.stdout] {
+            let text = String::from_utf8_lossy(output);
+            let child = text.lines().find_map(|line| line.strip_prefix("f214 child completed pid="))
+                .expect("child completion marker");
+            assert!(text.contains(&format!("f214 fork metadata pid={child}")));
+            assert!(text.contains(&format!("f214 exec metadata pid={child}")));
+        }
+    }
 }
 
 fn r14_value(records: &[serde_json::Value], phase: &str) -> serde_json::Value {

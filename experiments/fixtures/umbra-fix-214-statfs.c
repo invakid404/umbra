@@ -6,6 +6,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <sys/wait.h>
+
+extern char **environ;
 
 static void require(int ok, const char *phase) {
     if (!ok) {
@@ -16,6 +20,17 @@ static void require(int ok, const char *phase) {
 
 int main(int argc, char **argv) {
     require(argc >= 3, "arguments");
+    if (strcmp(argv[1], "exec-child") == 0) {
+        require(argc == 6, "exec arguments");
+        int inherited = atoi(argv[2]), cloexec = atoi(argv[3]);
+        struct statfs metadata;
+        require(fstatfs(inherited, &metadata) == 0, "exec inherited metadata");
+        require(metadata.f_fsid.val[0] == (int32_t)strtol(argv[4], NULL, 10) &&
+                metadata.f_fsid.val[1] == (int32_t)strtol(argv[5], NULL, 10), "exec identity");
+        require(fstatfs(cloexec, &metadata) == -1 && errno == EBADF, "exec cloexec");
+        printf("f214 exec metadata pid=%d\n", getpid());
+        return 0;
+    }
     char path[4096], output[4096];
     int length = snprintf(path, sizeof(path), "%s/seed.txt", argv[2]);
     require(length >= 0 && (size_t)length < sizeof(path), "path length");
@@ -35,6 +50,44 @@ int main(int argc, char **argv) {
             strcmp(by_fd.f_mntonname, by_path.f_mntonname) == 0 &&
             strcmp(by_fd.f_mntfromname, by_path.f_mntfromname) == 0,
             "path descriptor names");
+    if (strcmp(argv[1], "errors") == 0) {
+        int closed = open(path, O_RDONLY);
+        require(closed >= 0 && close(closed) == 0, "closed descriptor setup");
+        struct statfs *bad = (struct statfs *)(uintptr_t)1;
+        require(fstatfs(closed, bad) == -1 && errno == EBADF, "closed before bad pointer");
+        require(fstatfs(fd, bad) == -1 && errno == EFAULT, "valid before bad pointer");
+        char missing[4096];
+        length = snprintf(missing, sizeof(missing), "%s/missing", argv[2]);
+        require(length >= 0 && (size_t)length < sizeof(missing), "missing length");
+        require(statfs(missing, bad) == -1 && errno == ENOENT, "missing before bad pointer");
+    }
+    if (strcmp(argv[1], "fork") == 0) {
+        int cloexec = open(path, O_RDONLY | O_CLOEXEC);
+        require(cloexec >= 0, "cloexec open");
+        char fd_arg[32], clo_arg[32], fsid0[32], fsid1[32];
+        snprintf(fd_arg, sizeof(fd_arg), "%d", fd);
+        snprintf(clo_arg, sizeof(clo_arg), "%d", cloexec);
+        snprintf(fsid0, sizeof(fsid0), "%d", by_fd.f_fsid.val[0]);
+        snprintf(fsid1, sizeof(fsid1), "%d", by_fd.f_fsid.val[1]);
+        pid_t child = fork();
+        require(child >= 0, "fork");
+        if (child == 0) {
+            struct statfs inherited;
+            require(fstatfs(fd, &inherited) == 0, "fork inherited metadata");
+            require(memcmp(&inherited.f_fsid, &by_fd.f_fsid, sizeof(inherited.f_fsid)) == 0,
+                    "fork identity");
+            printf("f214 fork metadata pid=%d\n", getpid());
+            fflush(stdout);
+            char *args[] = {argv[3], "exec-child", fd_arg, clo_arg, fsid0, fsid1, NULL};
+            execve(argv[3], args, environ);
+            require(0, "execve");
+        }
+        int status;
+        require(waitpid(child, &status, 0) == child, "wait child");
+        require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child status");
+        printf("f214 child completed pid=%d\n", child);
+        require(close(cloexec) == 0, "parent cloexec close");
+    }
     if (strcmp(argv[1], "copyup") == 0) {
         int writer = open(path, O_WRONLY);
         require(writer >= 0, "copyup open");
