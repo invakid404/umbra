@@ -40,37 +40,37 @@ This establishes B3 by installed instruction inspection plus pinned production s
 
 Re-check: cwd action; originally predicted the spawn guard. Codex utils/pty/src/posix_child.rs:176–178 adds cwd. At this base native.rs:2211–2214 in crates/umbra-platform-macos/src still refuses the non-null packed descriptor before decoding its contents. Descriptor sharing at crates/umbra-supervisor/src/events.rs:1550 does not change that boundary.
 
-**Decision: FIX-PHASE ITEM.** Blocker B1, ISSUE-TBD(spawn-actions). Would repeat C11-02 (userspace_run.rs:10267) and C11-10 (:10664), not extend their reading. After admission, restore the original primitive-specific invariant. C11-08 additionally needs virtual alias semantics; #165 remains a dependency, not evidence that adddup2 itself was measured.
+**Decision: FIX-PHASE ITEM.** Blocker B1, #243. Would repeat C11-02 (userspace_run.rs:10267) and C11-10 (:10664), not extend their reading. After admission, restore the original primitive-specific invariant. C11-08 additionally needs virtual alias semantics; #165 remains a dependency, not evidence that adddup2 itself was measured.
 
 ### C11-04 — adddup2 of a kernel pipe
 
 Re-check: one kernel descriptor action; originally predicted the spawn guard. Codex utils/pty/src/posix_child.rs:180–186 maps child stdio. At this base native.rs:2211–2214 in crates/umbra-platform-macos/src still refuses the non-null packed descriptor before decoding its contents. Descriptor sharing at crates/umbra-supervisor/src/events.rs:1550 does not change that boundary.
 
-**Decision: FIX-PHASE ITEM.** Blocker B1, ISSUE-TBD(spawn-actions). Would repeat C11-02 (userspace_run.rs:10267) and C11-10 (:10664), not extend their reading. After admission, restore the original primitive-specific invariant. C11-08 additionally needs virtual alias semantics; #165 remains a dependency, not evidence that adddup2 itself was measured.
+**Decision: FIX-PHASE ITEM.** Blocker B1, #243. Would repeat C11-02 (userspace_run.rs:10267) and C11-10 (:10664), not extend their reading. After admission, restore the original primitive-specific invariant. C11-08 additionally needs virtual alias semantics; #165 remains a dependency, not evidence that adddup2 itself was measured.
 
 ### C11-06 — Session attribute
 
 Re-check: SETSID alone; originally predicted the spawn guard. Codex utils/pty/src/posix_child.rs:209 selects NewSession. At this base native.rs:2211–2214 in crates/umbra-platform-macos/src still refuses the non-null packed descriptor before decoding its contents. Descriptor sharing at crates/umbra-supervisor/src/events.rs:1550 does not change that boundary.
 
-**Decision: FIX-PHASE ITEM.** Blocker B1, ISSUE-TBD(spawn-actions). Would repeat C11-02 (userspace_run.rs:10267) and C11-10 (:10664), not extend their reading. After admission, restore the original primitive-specific invariant. C11-08 additionally needs virtual alias semantics; #165 remains a dependency, not evidence that adddup2 itself was measured.
+**Decision: FIX-PHASE ITEM.** Blocker B1, #243. Would repeat C11-02 (userspace_run.rs:10267) and C11-10 (:10664), not extend their reading. After admission, restore the original primitive-specific invariant. C11-08 additionally needs virtual alias semantics; #165 remains a dependency, not evidence that adddup2 itself was measured.
 
 ### C11-07 — Signal attributes
 
 Re-check: separate default-disposition and mask leaves; originally predicted the spawn guard. Codex utils/pty/src/posix_child.rs:214–217 restores SIGPIPE. At this base native.rs:2211–2214 in crates/umbra-platform-macos/src still refuses the non-null packed descriptor before decoding its contents. Descriptor sharing at crates/umbra-supervisor/src/events.rs:1550 does not change that boundary.
 
-**Decision: FIX-PHASE ITEM.** Blocker B1, ISSUE-TBD(spawn-actions). Would repeat C11-02 (userspace_run.rs:10267) and C11-10 (:10664), not extend their reading. After admission, restore the original primitive-specific invariant. C11-08 additionally needs virtual alias semantics; #165 remains a dependency, not evidence that adddup2 itself was measured.
+**Decision: FIX-PHASE ITEM.** Blocker B1, #243. Would repeat C11-02 (userspace_run.rs:10267) and C11-10 (:10664), not extend their reading. After admission, restore the original primitive-specific invariant. C11-08 additionally needs virtual alias semantics; #165 remains a dependency, not evidence that adddup2 itself was measured.
 
 ### C11-08 — adddup2 of a routed descriptor
 
 Re-check: virtual aliasing behind action admission; originally blocked by the guard and #165. Codex utils/pty/src/posix_child.rs:180–186 supplies the action. At this base native.rs:2211–2214 in crates/umbra-platform-macos/src still refuses the non-null packed descriptor before decoding its contents. Descriptor sharing at crates/umbra-supervisor/src/events.rs:1550 does not change that boundary.
 
-**Decision: FIX-PHASE ITEM.** Blocker B1, ISSUE-TBD(spawn-actions). Would repeat C11-02 (userspace_run.rs:10267) and C11-10 (:10664), not extend their reading. After admission, restore the original primitive-specific invariant. C11-08 additionally needs virtual alias semantics; #165 remains a dependency, not evidence that adddup2 itself was measured.
+**Decision: FIX-PHASE ITEM.** Blocker B1, #243. Would repeat C11-02 (userspace_run.rs:10267) and C11-10 (:10664), not extend their reading. After admission, restore the original primitive-specific invariant. C11-08 additionally needs virtual alias semantics; #165 remains a dependency, not evidence that adddup2 itself was measured.
 
 ### C11-11 — Pipe cancellation and reap
 
 Re-check: original prerequisite was positive full pipe launch. Codex utils/pty/src/posix_child.rs:174–232 still supplies actions/attributes; native.rs:2213 still stops it before child creation. Existing C11-10 at userspace_run.rs:10664 already characterizes that refusal. The new run session and OFD sharing do not make this launch reachable.
 
-**Decision: FIX-PHASE ITEM.** B1, ISSUE-TBD(spawn-actions). After admission, cancel only after child-ready acknowledgment, close ends, drain EOF and reap within grace; no substitute null-spawn cancellation case under this id.
+**Decision: FIX-PHASE ITEM.** B1, #243. After admission, cancel only after child-ready acknowledgment, close ends, drain EOF and reap within grace; no substitute null-spawn cancellation case under this id.
 
 ### C11-12 — Transient SIGCHLD around a routed call
 
@@ -88,25 +88,25 @@ Umbra active public opens route (crates/umbra-platform-macos/interpose/umbra_int
 
 **Decision: FIX-PHASE ITEM.** Both proposed leaves repeat a pinned guard under L72, by the installed route proof above. Earlier #193 B-T1, reported in open #201 (evidence/reviewer-open-issues.json), already measured `open("/dev/tty")` reaching `UnsupportedCapability during base.stat: special host entries (devices, sockets, FIFOs) are unsupported`; the current fixture primitive is experiments/fixtures/umbra-isolation-fixture.c:201–204. Against B-T1, the proposed /dev/ptmx lookup changes the device pathname but predicts the same open primitive, guard, branch and outcome. Against each other, openpty and posix_openpt begin with the same primitive in the pinned Apple source. Neither proposed leaf reaches a distinct operation before that guard; later grant/unlock/slave operations would be unreachable under the prediction. API spelling and the unexecuted downstream calls cannot establish novelty.
 
-The source-established disposition is UnsupportedCapability/base.stat with `special host entries (devices, sockets, FIFOs) are unsupported`, ending supervision before allocation; this is not a newly measured reading. No duplicate runtime run is selected. Refs ISSUE-TBD(pty-device-acquisition), now a production-blocker draft. #201 supplies the existing refusal evidence but tracks inherited-fd-2 reading rather than allocation support.
+The source-established disposition is UnsupportedCapability/base.stat with `special host entries (devices, sockets, FIFOs) are unsupported`, ending supervision before allocation; this is not a newly measured reading. No duplicate runtime run is selected. Refs #244, now a production-blocker draft. #201 supplies the existing refusal evidence but tracks inherited-fd-2 reading rather than allocation support.
 
 ### C11-14 — PTY session and interactive echo
 
 Re-check: originally required positive allocation and process/session leaves. Codex terminal setup is setsid/TIOCSCTTY (utils/pty/src/pty.rs:662–670). The upstream boundary is base.rs:264–278, reached by the installed allocation route established in C11-13. A fork-based C launcher is not automatically blocked by the spawn guard (abi.rs:310; native.rs:2145); claiming that guard as its result would be wrong.
 
-**Decision: FIX-PHASE ITEM.** B3, ISSUE-TBD(pty-device-acquisition): allocation is production-blocked before session or echo operations. Repeating the device refusal would not measure session, foreground-group or echo behavior. Once acquisition is admitted, use owned terminal, fixed termios, single-thread fork and independent child file oracle. Do not preallocate outside supervision to bypass the original prerequisite.
+**Decision: FIX-PHASE ITEM.** B3, #244: allocation is production-blocked before session or echo operations. Repeating the device refusal would not measure session, foreground-group or echo behavior. Once acquisition is admitted, use owned terminal, fixed termios, single-thread fork and independent child file oracle. Do not preallocate outside supervision to bypass the original prerequisite.
 
 ### C11-15 — E9 preserved descriptors
 
 Re-check both original branches. Core shell pre_exec descriptor cleanup is Codex core/src/spawn.rs:70–136. PTY preserved-fd selection and setup are utils/pty/src/pty.rs:176–177, :398–412; it allocates via :493 before terminal setup. Ordinary OFD inheritance is improved (events.rs:1550–1564), but does not establish explicit cleanup policy or device acquisition.
 
-**Decision: FIX-PHASE ITEM.** B3 blocks the installed allocation route and thus the original positive-PTY prerequisite; ISSUE-TBD(pty-device-acquisition). Keep the ordinary core-shell leaf with this case for the subsequent fix-phase sequence, not as a claim that its pre_exec is itself a non-null spawn guard. #135 remains a conditional dependency if the actual fallback forks with threads; native.rs:644 and :2145 enforce that guard. Do not substitute an unrelated null-spawn inheritance repeat of C11-05/09.
+**Decision: FIX-PHASE ITEM.** B3 blocks the installed allocation route and thus the original positive-PTY prerequisite; #244. Keep the ordinary core-shell leaf with this case for the subsequent fix-phase sequence, not as a claim that its pre_exec is itself a non-null spawn guard. #135 remains a conditional dependency if the actual fallback forks with threads; native.rs:644 and :2145 enforce that guard. Do not substitute an unrelated null-spawn inheritance repeat of C11-05/09.
 
 ### C11-16 — Pinned Codex crate composition
 
 Re-check: original positive C11-10 prerequisite still fails admission. Codex utils/pty/src/child_command.rs:271–296 chooses the native backend; posix_child.rs:174–232 builds non-null actions/attributes, hitting native.rs:2213. Its PTY preserved-fd branch additionally depends on positive C11-15 (pty.rs:398–412, :493).
 
-**Decision: FIX-PHASE ITEM.** B1 for pipe composition and B3 for PTY composition; ISSUE-TBD(spawn-actions), ISSUE-TBD(pty-device-acquisition). A library-level run repeating C11-10 is excluded by L72. No crate fixture or dependency changes now. On revival pin each external version exactly to this Codex Cargo.lock and capture the actual backend; #135 is conditional for threaded fork/park, not a spawn gate.
+**Decision: FIX-PHASE ITEM.** B1 for pipe composition and B3 for PTY composition; #243, #244. A library-level run repeating C11-10 is excluded by L72. No crate fixture or dependency changes now. On revival pin each external version exactly to this Codex Cargo.lock and capture the actual backend; #135 is conditional for threaded fork/park, not a spawn gate.
 
 ## Non-goals
 
@@ -120,9 +120,9 @@ The first cut is empty. All eleven ids are FIX-PHASE ITEM. B1 and B2 are source-
 
 | Blocker | Production site at umbra pin | Cases | Issue | Fix sketch |
 |---|---|---|---|---|
-| B1 packed spawn descriptor admission | crates/umbra-platform-macos/src/native.rs:2213 | C11-03/04/06/07/08/11/16 pipe | ISSUE-TBD(spawn-actions), ISSUE NEEDED | Decode and enforce cwd, actions and attributes before child effects; then qualify cancellation/composition. |
+| B1 packed spawn descriptor admission | crates/umbra-platform-macos/src/native.rs:2213 | C11-03/04/06/07/08/11/16 pipe | #243 | Decode and enforce cwd, actions and attributes before child effects; then qualify cancellation/composition. |
 | B2 observable return-window rendezvous | crates/umbra-platform-macos/src/native.rs:684, :2365 | C11-12 | #118 | Expose precise coordinated window entry for a live signal fixture. |
-| B3 terminal-device acquisition | crates/umbra-supervisor/src/base.rs:264–278 | C11-13 both proposed leaves; C11-14/15/16 PTY | ISSUE-TBD(pty-device-acquisition), ISSUE NEEDED | Define a safe kernel terminal-resource route and ownership before positive allocation, session/echo and descriptor-preservation qualification. |
+| B3 terminal-device acquisition | crates/umbra-supervisor/src/base.rs:264–278 | C11-13 both proposed leaves; C11-14/15/16 PTY | #244 | Define a safe kernel terminal-resource route and ownership before positive allocation, session/echo and descriptor-preservation qualification. |
 
 #165 is C11-08's downstream aliasing dependency; #135 applies only if future composition takes threaded fork/park. Neither is a substitute issue for B1 or B3.
 
@@ -130,8 +130,8 @@ The first cut is empty. All eleven ids are FIX-PHASE ITEM. B1 and B2 are source-
 
 Predictions above are preregistration only. Preserve actual measured statuses, exact refusal disposition and evidence of cleanup; missing observation is NOT QUALIFIED. Unexpected semantic defects need their own issue and semantic assertion. If C11-13 succeeds, revisit downstream selection at review with that evidence rather than silently changing this document after acceptance. The installed route is now established by instruction inspection; no new runtime result is claimed. Revalidate the route if the installed image UUIDs change.
 
-ISSUE NEEDED: defects/spawn-actions.md
-ISSUE NEEDED: defects/pty-device-acquisition.md
+Filed: #243 (defects/spawn-actions.md)
+Filed: #244 (defects/pty-device-acquisition.md)
 ## Revision — 2026-11-09 (ideation-review AMEND)
 
 Applied required amendments 1–3. B3 and its issue draft are conditional on installed acquisition reachability. Added pinned Apple source and the earlier B-T1/#201 reading to the novelty comparison; both proposed C11-13 leaves lack a distinct predicted reading under L72, so the first cut is empty. PTY-dependent decisions preserve original sequencing and must be reassessed if a distinct C11-13 reading becomes available. Corrected NewSession to posix_child.rs:209 and the victim assertion to userspace_run.rs:10421–10425. No build or runtime reading was taken. Driver must archive this revision separately from the original preregistration.
