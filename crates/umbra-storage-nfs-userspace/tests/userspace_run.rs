@@ -12893,10 +12893,10 @@ fn r14_case(seeded: bool) {
         .collect::<Vec<_>>();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0]["phase"], "connect");
-    assert_eq!(errors[0]["data"]["code"], "3338");
+    assert_eq!(errors[0]["data"]["code"], "266");
     assert_eq!(
         errors[0]["data"]["variant"],
-        "Database(SqliteError { code: 3338, message: \"disk I/O error\" })"
+        "Database(SqliteError { code: 266, message: \"disk I/O error\" })"
     );
     assert_eq!(records.last().unwrap()["data"]["ok"], false);
     assert!(!records.iter().any(|r| r["phase"] == "schema"));
