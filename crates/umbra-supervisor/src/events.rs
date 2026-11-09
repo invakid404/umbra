@@ -2258,6 +2258,13 @@ mod tests {
             _: &FsOp,
             token: FilesystemQueryToken,
         ) -> Result<std::result::Result<FilesystemReply, Errno>> {
+            if self.0 == 4 {
+                return Err(UmbraError::new(
+                    ErrorKind::Io,
+                    "provider.call",
+                    "request deadline expired",
+                ));
+            }
             if self.0 < 2 {
                 return Err(UmbraError::new(
                     if self.0 == 0 {
@@ -2366,7 +2373,7 @@ mod tests {
 
     #[test]
     fn f214_provider_errors() {
-        for fault in 0..4 {
+        for fault in 0..5 {
             let mut s = supervisor();
             s.budget = Some(routed_budget(8));
             s.namespace = Box::new(FilesystemFault(fault));
@@ -2383,12 +2390,37 @@ mod tests {
                 thread: ThreadId(task(1).0),
                 registers: RegisterSet::new(Architecture::Aarch64, vec![0; 272]).unwrap(),
             });
-            assert!(result.is_err());
+            let failure = result.unwrap_err();
+            assert_eq!(
+                failure.kind,
+                if fault == 0 || fault == 4 {
+                    ErrorKind::Io
+                } else {
+                    ErrorKind::ProtocolMismatch
+                }
+            );
+            if fault == 4 {
+                assert_eq!(failure.operation, "provider.call");
+                assert_eq!(failure.context, "request deadline expired");
+            }
             assert!(s.is_poisoned());
             assert_eq!(s.state.lifecycle, RunLifecycle::RecoveryRequired);
             // Fake's memory write and register-write methods panic: reaching
             // this point proves neither copyout nor syscall completion occurred.
-            s.filesystem_queries.clear();
+            let token = FilesystemQueryToken {
+                request: 1,
+                task: task(1),
+                thread: ThreadId(task(1).0),
+                image_generation: 0,
+                stop_generation: 1,
+            };
+            let late = FilesystemReply {
+                token,
+                metadata: FilesystemBinding::overlay(s.state.run_id)
+                    .metadata()
+                    .unwrap(),
+            };
+            assert!(s.filesystem_queries.finish(&late, 0).is_none());
         }
     }
 
