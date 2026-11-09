@@ -9850,11 +9850,7 @@ fn slate_spawn_native(spawn: &SlateSpawn, mode: &str) -> (PathBuf, SlateOutput) 
             });
         }
     }
-    let output = slate_watched(
-        &mut command,
-        &spawn.evidence.join("native"),
-        &watch,
-    );
+    let output = slate_watched(&mut command, &spawn.evidence.join("native"), &watch);
     let kept = spawn.evidence.join("native-root");
     std::fs::create_dir_all(&kept).unwrap();
     for entry in std::fs::read_dir(&root).unwrap() {
@@ -9896,7 +9892,12 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
     let watch = SlateWatch::new(spawn.scratch.path(), &spawn.evidence.join("routed"), false);
     let output = slate_watched(
         Command::new(binaries().join("umbra"))
-            .envs(spawn.provider_environment.iter().map(|(key, value)| (key, value)))
+            .envs(
+                spawn
+                    .provider_environment
+                    .iter()
+                    .map(|(key, value)| (key, value)),
+            )
             .args(["run", "--registry"])
             .arg(&registry)
             .arg("--workspace")
@@ -10186,10 +10187,21 @@ fn slate_spawn_shape(mode: &str, admitted: bool) {
         } else {
             "spawn-capture descriptor=null"
         };
-        assert!(routed.run.stderr.lines().any(|line| line == capture), "{}", routed.run.stderr);
+        assert!(
+            routed.run.stderr.lines().any(|line| line == capture),
+            "{}",
+            routed.run.stderr
+        );
         if packed {
-            assert!(routed.run.stderr.lines().any(|line| line == "spawn-policy flags=0x0000 actions=0"),
-                "{}", routed.run.stderr);
+            assert!(
+                routed
+                    .run
+                    .stderr
+                    .lines()
+                    .any(|line| line == "spawn-policy flags=0x0000 actions=0"),
+                "{}",
+                routed.run.stderr
+            );
         }
         assert_eq!(
             classification, "SUPPORTED-AND-CORRECT",
@@ -10251,25 +10263,42 @@ fn slate_c11_02_empty_both() {
 }
 
 fn fix_243_signal(mode: &str, child_record: &str, flags: &str) {
-    let Some(spawn) = slate_spawn(mode) else { return; };
+    let Some(spawn) = slate_spawn(mode) else {
+        return;
+    };
     let (root, native) = slate_spawn_native(&spawn, mode);
     assert!(native.status.success(), "native control: {}", native.status);
     assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
     assert_eq!(std::fs::read(root.join("parent.txt")).unwrap(), b"PARENT");
-    assert!(std::fs::read_to_string(root.join("records.child")).unwrap().contains(child_record));
-    assert!(std::fs::read_to_string(root.join("records.done")).unwrap()
+    assert!(std::fs::read_to_string(root.join("records.child"))
+        .unwrap()
+        .contains(child_record));
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
         .contains("parent-signal ignored=1 blocked=1"));
     let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
     let correct = slate_two_exit_completion(&routed)
         && routed.object("child.txt") == Some(b"CHILD".as_slice())
         && routed.object("parent.txt") == Some(b"PARENT".as_slice());
-    slate_record(&spawn, if correct { "SUPPORTED-AND-CORRECT" } else { "NOT QUALIFIED" },
+    slate_record(
+        &spawn,
+        if correct {
+            "SUPPORTED-AND-CORRECT"
+        } else {
+            "NOT QUALIFIED"
+        },
         serde_json::json!({"run_id": routed.run.run_id.0.to_string(),
-            "expected_child_signal": child_record}));
+            "expected_child_signal": child_record}),
+    );
     assert!(correct, "{}", routed.run.stderr);
     assert!(routed.text("records.child").contains(child_record));
-    assert!(routed.text("records.done").contains("parent-signal ignored=1 blocked=1"));
-    assert!(routed.run.stderr.contains(&format!("spawn-policy flags={flags} actions=0")));
+    assert!(routed
+        .text("records.done")
+        .contains("parent-signal ignored=1 blocked=1"));
+    assert!(routed
+        .run
+        .stderr
+        .contains(&format!("spawn-policy flags={flags} actions=0")));
     assert!(journal_records_completion(&routed.run));
     slate_spawn_finish(&spawn, &routed);
     slate_finish_cleanup();
@@ -10277,53 +10306,82 @@ fn fix_243_signal(mode: &str, child_record: &str, flags: &str) {
 
 #[test]
 fn fix_243_sigpipe_default() {
-    fix_243_signal("fix-243-sigdefault", "child-signal default=1 ignored=0 blocked=1", "0x0004");
+    fix_243_signal(
+        "fix-243-sigdefault",
+        "child-signal default=1 ignored=0 blocked=1",
+        "0x0004",
+    );
 }
 
 #[test]
 fn fix_243_sigpipe_mask() {
-    fix_243_signal("fix-243-sigmask", "child-signal default=0 ignored=1 blocked=0", "0x0008");
+    fix_243_signal(
+        "fix-243-sigmask",
+        "child-signal default=0 ignored=1 blocked=0",
+        "0x0008",
+    );
 }
 
 /// Native apparatus: an ignored disposition must still trip the signal oracle
 /// after removing the observer's constructor interference from this child.
 #[test]
 fn fix_243_signal_oracle_rejects_ignored_child() {
-    let Some(spawn) = slate_spawn("fix-243-sigdefault-mutant") else { return; };
+    let Some(spawn) = slate_spawn("fix-243-sigdefault-mutant") else {
+        return;
+    };
     let (root, native) = slate_spawn_native(&spawn, "fix-243-sigdefault-mutant");
     assert!(!native.status.success());
-    assert!(std::fs::read_to_string(root.join("records.child")).unwrap()
+    assert!(std::fs::read_to_string(root.join("records.child"))
+        .unwrap()
         .contains("child-signal default=0 ignored=1 blocked=1"));
-    assert!(std::fs::read_to_string(root.join("records.done")).unwrap()
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
         .contains("exited=1 code=81"));
     slate_finish_cleanup();
 }
 
 fn fix_243_pipe(mode: &str) {
-    let Some(spawn) = slate_spawn(mode) else { return; };
+    let Some(spawn) = slate_spawn(mode) else {
+        return;
+    };
     let (root, native) = slate_spawn_native(&spawn, mode);
     assert!(native.status.success(), "native control: {}", native.status);
     assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
-    assert_eq!(std::fs::read(root.join("victim.txt")).unwrap(), b"SEEDPARENT");
+    assert_eq!(
+        std::fs::read(root.join("victim.txt")).unwrap(),
+        b"SEEDPARENT"
+    );
     let native_done = std::fs::read_to_string(root.join("records.done")).unwrap();
     assert!(native_done.contains("pipe-result bytes=13 payload=FIX-243-NONCE eof=1"));
     let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "victim.txt"]);
     let correct = slate_two_exit_completion(&routed)
         && routed.object("child.txt") == Some(b"CHILD".as_slice())
         && routed.object("victim.txt") == Some(b"SEEDPARENT".as_slice());
-    slate_record(&spawn, if correct { "SUPPORTED-AND-CORRECT" } else { "NOT QUALIFIED" },
-        serde_json::json!({"run_id": routed.run.run_id.0.to_string()}));
+    slate_record(
+        &spawn,
+        if correct {
+            "SUPPORTED-AND-CORRECT"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({"run_id": routed.run.run_id.0.to_string()}),
+    );
     assert!(correct, "{}", routed.run.stderr);
-    assert!(routed.text("records.done")
+    assert!(routed
+        .text("records.done")
         .contains("pipe-result bytes=13 payload=FIX-243-NONCE eof=1"));
     if mode == "fix-243-cloexec" || mode == "fix-243-error-recovery" {
         let expected = "pruned-victim result=-1 errno=9";
-        assert!(std::fs::read_to_string(root.join("records.child")).unwrap().contains(expected));
+        assert!(std::fs::read_to_string(root.join("records.child"))
+            .unwrap()
+            .contains(expected));
         assert!(routed.text("records.child").contains(expected));
     }
     if mode == "fix-243-error-recovery" {
         assert!(native_done.contains("kernel-error result=9 expected=9"));
-        assert!(routed.text("records.done").contains("kernel-error result=9 expected=9"));
+        assert!(routed
+            .text("records.done")
+            .contains("kernel-error result=9 expected=9"));
     }
     assert!(journal_records_completion(&routed.run));
     slate_spawn_finish(&spawn, &routed);
@@ -10331,28 +10389,47 @@ fn fix_243_pipe(mode: &str) {
 }
 
 #[test]
-fn fix_243_kernel_pipe_actions() { fix_243_pipe("fix-243-pipe"); }
+fn fix_243_kernel_pipe_actions() {
+    fix_243_pipe("fix-243-pipe");
+}
 
 #[test]
-fn fix_243_cloexec_default_prunes_logical_descriptors() { fix_243_pipe("fix-243-cloexec"); }
+fn fix_243_cloexec_default_prunes_logical_descriptors() {
+    fix_243_pipe("fix-243-cloexec");
+}
 
 #[test]
-fn fix_243_kernel_error_then_success() { fix_243_pipe("fix-243-error-recovery"); }
+fn fix_243_kernel_error_then_success() {
+    fix_243_pipe("fix-243-error-recovery");
+}
 
 fn fix_243_refusal(mode: &str, diagnostic: &str) {
-    let Some(spawn) = slate_spawn(mode) else { return; };
+    let Some(spawn) = slate_spawn(mode) else {
+        return;
+    };
     let (root, native) = slate_spawn_native(&spawn, mode);
     assert!(native.status.success(), "native control: {}", native.status);
     assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
-    assert!(std::fs::read_to_string(root.join("records.done")).unwrap().contains("spawn result=0"));
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("spawn result=0"));
     let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "opened.txt", "victim.txt"]);
-    let exact = routed.run.status != Some(0) && routed.run.stderr.contains(diagnostic)
+    let exact = routed.run.status != Some(0)
+        && routed.run.stderr.contains(diagnostic)
         && !routed.run.stderr.contains("finished:")
         && routed.object("records.pre").is_some()
         && ["records.child", "records.done", "child.txt", "opened.txt"]
-            .iter().all(|name| routed.object(name).is_none());
-    slate_record(&spawn, if exact { "EXACT KNOWN REFUSAL" } else { "NOT QUALIFIED" },
-        serde_json::json!({"diagnostic": diagnostic, "run_id": routed.run.run_id.0.to_string()}));
+            .iter()
+            .all(|name| routed.object(name).is_none());
+    slate_record(
+        &spawn,
+        if exact {
+            "EXACT KNOWN REFUSAL"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({"diagnostic": diagnostic, "run_id": routed.run.run_id.0.to_string()}),
+    );
     assert!(exact, "{}", routed.run.stderr);
     if mode.contains("virtual-") {
         assert_eq!(routed.object("victim.txt"), Some(b"SEED".as_slice()));
@@ -10364,15 +10441,24 @@ fn fix_243_refusal(mode: &str, diagnostic: &str) {
 
 #[test]
 fn fix_243_refuses_setsid() {
-    fix_243_refusal("fix-243-refuse-setsid", "spawn unsupported attribute SETSID");
+    fix_243_refusal(
+        "fix-243-refuse-setsid",
+        "spawn unsupported attribute SETSID",
+    );
 }
 #[test]
 fn fix_243_refuses_setpgroup() {
-    fix_243_refusal("fix-243-refuse-setpgroup", "spawn unsupported attribute SETPGROUP");
+    fix_243_refusal(
+        "fix-243-refuse-setpgroup",
+        "spawn unsupported attribute SETPGROUP",
+    );
 }
 #[test]
 fn fix_243_refuses_resetids() {
-    fix_243_refusal("fix-243-refuse-resetids", "spawn unsupported attribute RESETIDS");
+    fix_243_refusal(
+        "fix-243-refuse-resetids",
+        "spawn unsupported attribute RESETIDS",
+    );
 }
 #[test]
 fn fix_243_refuses_open() {
@@ -10384,7 +10470,10 @@ fn fix_243_refuses_chdir() {
 }
 #[test]
 fn fix_243_refuses_late_chdir() {
-    fix_243_refusal("fix-243-refuse-late-chdir", "spawn unsupported action CHDIR");
+    fix_243_refusal(
+        "fix-243-refuse-late-chdir",
+        "spawn unsupported action CHDIR",
+    );
 }
 #[test]
 fn fix_243_refuses_fchdir() {
@@ -10392,11 +10481,17 @@ fn fix_243_refuses_fchdir() {
 }
 #[test]
 fn fix_243_refuses_virtual_source() {
-    fix_243_refusal("fix-243-refuse-virtual-source", "spawn virtual descriptor action");
+    fix_243_refusal(
+        "fix-243-refuse-virtual-source",
+        "spawn virtual descriptor action",
+    );
 }
 #[test]
 fn fix_243_refuses_virtual_destination() {
-    fix_243_refusal("fix-243-refuse-virtual-destination", "spawn virtual descriptor action");
+    fix_243_refusal(
+        "fix-243-refuse-virtual-destination",
+        "spawn virtual descriptor action",
+    );
 }
 
 /// Required registered-window provider-loss cell, terminal/non-isolated entry.
@@ -10406,33 +10501,54 @@ fn fix_243_registered_provider_loss() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
-    let Some(mut spawn) = slate_spawn("fix-243-registered-loss") else { return; };
+    let Some(mut spawn) = slate_spawn("fix-243-registered-loss") else {
+        return;
+    };
     let (root, native) = slate_spawn_native(&spawn, "c11-02-attributes");
     assert!(native.status.success());
     assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
     let socket = spawn.evidence.parent().unwrap().join("probe.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    spawn.provider_environment.push(("UMBRA_FIX_243_PROBE_SOCKET".into(),
-        socket.to_str().unwrap().into()));
+    spawn.provider_environment.push((
+        "UMBRA_FIX_243_PROBE_SOCKET".into(),
+        socket.to_str().unwrap().into(),
+    ));
     let evidence = spawn.evidence.clone();
     let observer = std::thread::spawn(move || {
-        let mut pollfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let mut pollfd = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: a single initialized pollfd; a bounded wait for the rendezvous.
-        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 15000) }, 1, "probe did not rendezvous");
+        assert_eq!(
+            unsafe { libc::poll(&mut pollfd, 1, 15000) },
+            1,
+            "probe did not rendezvous"
+        );
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
         let record: serde_json::Value = serde_json::from_str(&line).unwrap();
         std::fs::write(evidence.join("provider-rendezvous.json"), &line).unwrap();
         assert_eq!(record["phase"], "task-acquired");
         assert_eq!(record["watchdog_registered"], true);
         let child = record["child"].as_i64().unwrap() as i32;
-        let observed = slate_process(child).unwrap().expect("child alive at rendezvous");
+        let observed = slate_process(child)
+            .unwrap()
+            .expect("child alive at rendezvous");
         assert_eq!(record["start_sec"], observed.start.0);
         assert_eq!(record["start_usec"], observed.start.1);
-        std::fs::write(evidence.join("independent-child.json"),
-            serde_json::to_vec_pretty(&observed.json()).unwrap()).unwrap();
+        std::fs::write(
+            evidence.join("independent-child.json"),
+            serde_json::to_vec_pretty(&observed.json()).unwrap(),
+        )
+        .unwrap();
         stream.write_all(b"P").unwrap();
         observed
     });
@@ -10446,11 +10562,21 @@ fn fix_243_registered_provider_loss() {
     let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
     std::fs::write(spawn.evidence.join("primary-cleanup.txt"), &cleanup).unwrap();
     // Test-owned survivor recovery cannot turn the primary result into a pass.
-    assert!(cleanup.lines().next().unwrap().contains("group_kills=0"), "{cleanup}");
-    assert!(cleanup.starts_with("cleanup CLEAN")
-        && cleanup.lines().next().unwrap().contains("zombies=\"\""), "{cleanup}");
-    assert!(slate_process(observed.pid).unwrap().is_none_or(|now| now.start != observed.start),
-        "registered child survived provider loss");
+    assert!(
+        cleanup.lines().next().unwrap().contains("group_kills=0"),
+        "{cleanup}"
+    );
+    assert!(
+        cleanup.starts_with("cleanup CLEAN")
+            && cleanup.lines().next().unwrap().contains("zombies=\"\""),
+        "{cleanup}"
+    );
+    assert!(
+        slate_process(observed.pid)
+            .unwrap()
+            .is_none_or(|now| now.start != observed.start),
+        "registered child survived provider loss"
+    );
     slate_spawn_finish(&spawn, &routed);
     slate_finish_cleanup();
 }
@@ -10921,8 +11047,15 @@ fn slate_c11_10_e8_pipe_refusal() {
         },
     );
     assert!(exact, "{}", routed.run.stderr);
-    assert!(routed.run.stderr.lines().any(|line| line == "spawn-capture descriptor=non-null profile=25F80"),
-        "{}", routed.run.stderr);
+    assert!(
+        routed
+            .run
+            .stderr
+            .lines()
+            .any(|line| line == "spawn-capture descriptor=non-null profile=25F80"),
+        "{}",
+        routed.run.stderr
+    );
     let pre = routed.text("records.pre");
     assert!(pre.starts_with("phase=pre-spawn mode=c11-10\n"));
     for line in pre.lines().filter(|l| l.contains(" result=")) {

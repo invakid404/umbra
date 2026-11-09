@@ -1,5 +1,6 @@
 //! Experimental Darwin arm64 tracer; see README for qualification limits.
 pub mod abi;
+mod spawn;
 pub use abi::DarwinArm64Abi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod cache;
@@ -10,6 +11,14 @@ pub mod interpose;
 mod native;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod rsp;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod spawn_host;
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "mutation-probe-spawn-lifecycle"
+))]
+mod spawn_probe;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use native::{
     BarrierEvidence, BarrierReading, MacosTraceBackend, ReportedExitLookup, TeardownReport,

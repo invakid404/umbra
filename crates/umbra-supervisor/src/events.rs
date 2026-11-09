@@ -257,6 +257,71 @@ impl Supervisor {
     fn dispatch(&mut self, event: TraceEvent) -> Result<()> {
         self.admit_during_routed_effect(&event)?;
         match event {
+            TraceEvent::SpawnPrepare { token, plan } => {
+                let process = self
+                    .state
+                    .processes
+                    .processes
+                    .get(&token.parent)
+                    .ok_or_else(|| ofd_error("spawn parent is not registered"))?;
+                if !process.threads.contains_key(&token.thread) {
+                    return Err(ofd_error("spawn thread is not registered"));
+                }
+                let authorization = self.spawns.prepare(token, plan, &process.context)?;
+                self.platform.control.resume(ResumeCommand {
+                    thread: token.thread,
+                    mode: ResumeMode::SpawnAuthorize(authorization),
+                    signal: None,
+                })
+            }
+            TraceEvent::SpawnAbort { authorization } => {
+                self.spawns.consume(authorization)?;
+                self.platform.control.resume(ResumeCommand {
+                    thread: authorization.token.thread,
+                    mode: ResumeMode::SpawnAbortReady(authorization),
+                    signal: None,
+                })
+            }
+            TraceEvent::SpawnChild {
+                authorization,
+                child,
+            } => {
+                let parent = authorization.token.parent;
+                let plan = self.spawns.plan(authorization)?.clone();
+                if self.state.processes.processes.contains_key(&child.0) {
+                    return Err(ofd_error("spawn child already published"));
+                }
+                let mut context = self.process_mut(parent)?.context.clone();
+                if context.exec_generation != authorization.token.exec_generation {
+                    return Err(ofd_error("spawn parent image changed"));
+                }
+                crate::spawn::validate(&plan, &context)?;
+                context.task = child.0;
+                context.parent = Some(parent);
+                if plan.close_on_exec_default {
+                    context.fds.clear();
+                } else {
+                    Self::sweep_close_on_exec(&mut context);
+                }
+                // Stage references in a private copy. A failure cannot publish
+                // a partial child table or leak acquired OFD references.
+                let mut ofds = self.ofds.clone();
+                for fd in context.fds.keys() {
+                    ofds.share((parent, *fd), (child.0, *fd))
+                        .map_err(ofd_error)?;
+                }
+                self.track_process(child.0, Some(parent));
+                self.process_mut(child.0)?.context = context;
+                self.ofds = ofds;
+                self.live += 1;
+                self.process_mut(parent)?.children.insert(child.0);
+                self.spawns.consume(authorization)?;
+                self.platform.control.resume(ResumeCommand {
+                    thread: authorization.token.thread,
+                    mode: ResumeMode::SpawnChildReady(authorization),
+                    signal: None,
+                })
+            }
             TraceEvent::ThreadStarted { task, thread } => {
                 self.track_thread(task, thread, StopReason::Launch)?;
                 self.resume_thread(thread)

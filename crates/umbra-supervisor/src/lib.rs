@@ -41,6 +41,7 @@ mod ofd;
 pub mod run;
 /// Runtime rendering of the single Seatbelt policy template.
 pub mod sandbox;
+mod spawn;
 
 pub use run::{
     resume, run, CommandLaunch, ResumeOutcome, ResumeSpec, RunLaunch, RunObserver, RunOutcome,
@@ -342,6 +343,7 @@ pub struct Supervisor {
     operations: BTreeMap<ThreadId, OperationId>,
     filesystem_sequence: u64,
     filesystem_queries: crate::filesystem::FilesystemQueries,
+    spawns: crate::spawn::PendingSpawns,
     /// What a routed operation's *observed success* must do to the issuing
     /// process's descriptor table, recorded at the entry that planned it.
     ///
@@ -464,6 +466,7 @@ impl Supervisor {
             operations: BTreeMap::new(),
             filesystem_sequence: 0,
             filesystem_queries: Default::default(),
+            spawns: Default::default(),
             routed: BTreeMap::new(),
             ofds: Default::default(),
             directory: crate::directory::DirectoryBuffer::default(),
