@@ -12570,6 +12570,97 @@ fn slate_r14_observer_routed_qualification() {
     slate_finish_cleanup();
 }
 
+// Independent Darwin SDK layout oracle for the ruled logical filesystem.
+// Compare the whole result, including padding, rather than selecting fields.
+fn f214_expected_metadata(run_id: RunId) -> Vec<u8> {
+    let mut bytes = vec![0u8; 2168];
+    bytes[..64].fill(0xff);
+    bytes[68..72].fill(0xff);
+    let digest = r14_sha256(format!("umbra-overlay-v1:{}", run_id.0).as_bytes());
+    for index in 0..8 {
+        bytes[48 + index] = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    bytes[72..77].copy_from_slice(b"umbra");
+    bytes[88] = b'/';
+    let source = format!("umbra:{}", run_id.0);
+    bytes[1112..1112 + source.len()].copy_from_slice(source.as_bytes());
+    bytes
+}
+
+#[test]
+fn f214_metadata_fields() {
+    f214_metadata_case("fields");
+}
+
+#[test]
+fn f214_base_copyup_identity() {
+    f214_metadata_case("copyup");
+}
+
+#[test]
+fn f214_open_unlink_rename() {
+    f214_metadata_case("unlink");
+}
+
+fn f214_metadata_case(mode: &str) {
+    let Some(root) = slate_evidence() else {
+        return;
+    };
+    let evidence = root.join(format!("f214_{mode}"));
+    slate_fresh_dir(&evidence);
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(
+        scratch.path(),
+        "umbra-fix-214-statfs",
+        "UMBRA_FIX_214_STATFS_PATH",
+    );
+    let spawn = SlateSpawn {
+        evidence,
+        scratch,
+        helper: program.clone(),
+        program,
+    };
+    let native_root = spawn.scratch.path().join("native");
+    std::fs::create_dir(&native_root).unwrap();
+    std::fs::write(native_root.join("seed.txt"), b"ABCDEF").unwrap();
+    let watch = SlateWatch::new(spawn.scratch.path(), &spawn.evidence.join("native"), false);
+    let native = slate_watched(
+        Command::new(&spawn.program).arg(mode).arg(&native_root),
+        &spawn.evidence.join("native"),
+        &watch,
+    );
+    assert!(
+        native.status.success(),
+        "native control: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        std::fs::read(native_root.join("records.done")).unwrap().len(),
+        2 * 2168,
+        "native SDK ABI size"
+    );
+    std::fs::copy(
+        native_root.join("records.done"),
+        spawn.evidence.join("native-metadata.bin"),
+    )
+    .unwrap();
+    let routed = slate_spawn_routed(&spawn, mode, &[]);
+    // Execute lifecycle obligations even when the positive metadata oracle fails.
+    slate_spawn_finish(&spawn, &routed);
+    assert!(journal_records_completion(&routed.run));
+    slate_finish_cleanup();
+    assert!(
+        routed.output.status.success(),
+        "routed metadata: {}",
+        routed.run.stderr
+    );
+    let expected = f214_expected_metadata(routed.run.run_id);
+    let records = routed.object("records.done").expect("metadata records");
+    assert_eq!(records.len(), 2 * expected.len());
+    assert_eq!(&records[..2168], expected.as_slice(), "fstatfs");
+    assert_eq!(&records[2168..], expected.as_slice(), "statfs");
+}
+
 fn r14_value(records: &[serde_json::Value], phase: &str) -> serde_json::Value {
     let values = records
         .iter()
