@@ -10658,6 +10658,13 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     if command == b'E' && phase != "unregistered" {
         assert!(
             routed.run.stderr.contains(match phase {
+                "policy-ready" if case.ends_with("deadline") => "session timed out",
+                "policy-ready" if case.ends_with("session-drop") =>
+                    "injected policy-ready session-drop failure",
+                "policy-ready" if case.ends_with("backend-drop") =>
+                    "injected policy-ready backend-drop failure",
+                "policy-ready" if case.ends_with("terminate") =>
+                    "injected policy-ready terminate failure",
                 "policy-ready" => "injected policy-before-Ready failure",
                 "caller-copyout" => "spawn caller PID delivery failed",
                 "remote-free" => "spawn snapshot release failed",
@@ -15757,4 +15764,28 @@ fn fix_227_sibling_progress_without_kernel_wait_proof() {
         );
         assert_eq!(std::fs::read(lock).unwrap(), b"lock\n");
     }
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_deadline() {
+    fix_243_fault_reading("fix-243-policy-deadline", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_session_drop() {
+    fix_243_fault_reading("fix-243-policy-session-drop", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_backend_drop() {
+    fix_243_fault_reading("fix-243-policy-backend-drop", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_terminate() {
+    fix_243_fault_reading("fix-243-policy-terminate", "c11-02-attributes", false, b'E');
 }
