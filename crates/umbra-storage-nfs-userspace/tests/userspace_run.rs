@@ -14368,7 +14368,7 @@ fn fix_227_fdflags(mode: &str) {
     );
     slate_finish_cleanup();
     assert!(!timeout);
-    assert!(native.status.success(), "{native:?}");
+    assert!(native.status.success(), "native status={} stderr={}", native.status, String::from_utf8_lossy(&native.stderr));
     let native_text = String::from_utf8_lossy(&native.stdout);
     let expected = match mode {
         "fork" => "fork child=0 parent-cloexec=1 parent-live=0 bytes=ABCDE\n",
