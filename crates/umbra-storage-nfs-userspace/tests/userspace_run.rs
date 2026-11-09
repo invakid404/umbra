@@ -6985,14 +6985,14 @@ fn mkfifo_is_in_neither_the_interposed_set_nor_the_traced_stubs() {
         .split_once("};")
         .expect("the interpose array is terminated")
         .0;
-    // Exactly four symbols are replaced, and this counts them rather than
-    // trusting the number: the sibling fixture's doc comment claimed an
+    // Exactly five symbols are replaced, including public GETFD-only fcntl.
+    // Count them rather than trusting the number: the sibling fixture's doc comment claimed an
     // "interposer's refused descriptor-relative set" that has never existed,
     // and this is the assertion that would have caught it.
     assert_eq!(
         replaced.matches("(const void *)umbra_").count(),
-        4,
-        "the interposer no longer replaces exactly four symbols, so every claim \
+        5,
+        "the interposer no longer replaces exactly five symbols, so every claim \
          in this group about what is kernel-bare needs re-measuring"
     );
     for call in ["mkfifo", "mknod"] {
@@ -7589,13 +7589,14 @@ fn stat_and_lstat_and_the_getdirentries_fallback_are_kernel_bare() {
         .split_once("};")
         .expect("the interpose array is terminated")
         .0;
-    // Exactly four symbols are replaced, and this counts them rather than
-    // trusting the number: no metadata operation is interposed at any point, and
+    // Exactly five symbols are replaced, including public GETFD-only fcntl.
+    // Count them rather than trusting the number: no path metadata operation
+    // is interposed, and
     // this is the assertion that catches the first one that is.
     assert_eq!(
         replaced.matches("(const void *)umbra_").count(),
-        4,
-        "the interposer no longer replaces exactly four symbols, so every claim \
+        5,
+        "the interposer no longer replaces exactly five symbols, so every claim \
          in this group about what is kernel-bare needs re-measuring"
     );
     for call in ["stat", "lstat", "getdirentries", "readlink"] {
