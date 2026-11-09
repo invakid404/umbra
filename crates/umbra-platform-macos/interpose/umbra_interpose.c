@@ -5,7 +5,8 @@
  * ------------
  * A dylib umbra loads into the tracee before its first instruction, via
  * DYLD_INSERT_LIBRARIES on the supervised launch. It replaces libc's `open`,
- * `read`, `write` and `close` with functions that hand the operation to umbra,
+ * `read`, `write`, `close` and public `fcntl(F_GETFD)` with functions that hand
+ * routed operations to umbra,
  * which services it through the overlay and the run's storage provider. It
  * exists so a run can be backed by storage with no kernel-visible path at all --
  * a userspace NFS client -- where rewriting a syscall's path operand has nothing
@@ -127,7 +128,10 @@
  *
  * LIMITS -- read these before assuming an operation is covered
  * ------------------------------------------------------------
- * 1. Only `open`, `read`, `write` and `close` are interposed here, and "not
+ * 1. `open`, `read`, `write`, `close` and public `fcntl` are interposed here.
+ *    Only F_GETFD on an armed virtual descriptor takes fcntl's routed path;
+ *    all other fcntl calls tail-branch to libc. Calls internal to libc are
+ *    outside that shim's reach; no fcntl kernel stub is breakpointed. "Not
  *    interposed" is not the same as "not routed". umbra still breakpoints the
  *    libc syscall stubs it always did, so a **path** operation this file does
  *    not replace -- `openat` is the one that matters -- is routed through the
@@ -154,7 +158,8 @@
  *    What is genuinely refused is the rest of the **descriptor-relative** set:
  *    `lseek`, `dup`, `dup2`, unsupported `fcntl` commands, `ftruncate`, `fsync`, `pread`, `pwrite`,
  *    `readv`, `writev`, `mmap`, the directory-reading calls entry 6 below does
- *    not claim, and `openat` with a virtual dirfd. A virtual descriptor is not
+ *    not claim. `openat` with a tracked virtual dirfd is routed through the
+ *    tracer's path resolver. A virtual descriptor is not
  *    a kernel object, so these reach the kernel, which does not know the
  *    number, and receive EBADF. That is a
  *    refusal, not a wrong answer, and it is why the descriptor fence above is
@@ -213,7 +218,7 @@
  *
  *    **This entry previously attributed the dirfd `close` refusal to "the
  *    tracer layer", and that named the wrong layer for the wrong symbol.**
- *    `close`(6) was interposed and *only* interposed -- it is one of the four
+ *    `close`(6) was interposed and *only* interposed -- it is one of the
  *    functions below -- and was never in `TRACED_STUBS` (it is now, which is
  *    what the paragraph above is about); what fts actually closes the dirfd with is
  *    `__close_nocancel`(399), which was neither interposed nor breakpointed.
