@@ -72,6 +72,8 @@ int main(int argc, char **argv) {
         length = snprintf(missing, sizeof(missing), "%s/missing", argv[2]);
         require(length >= 0 && (size_t)length < sizeof(missing), "missing length");
         require(statfs(missing, bad) == -1 && errno == ENOENT, "missing before bad pointer");
+        require(statfs((const char *)(uintptr_t)1, bad) == -1 && errno == EFAULT,
+                "input copy before lookup");
     }
     if (strcmp(argv[1], "lookup") == 0) {
         require(chdir(argv[2]) == 0, "logical chdir");
