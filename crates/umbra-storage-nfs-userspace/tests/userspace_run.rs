@@ -10509,7 +10509,7 @@ fn fix_243_provider_loss_reading(case: &str, mode: &str, root_probe: bool) {
     if !root_probe {
         assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
     }
-    let socket = spawn.evidence.parent().unwrap().join("probe.sock");
+    let socket = spawn.scratch.path().join("probe.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     spawn.provider_environment.push((
         "UMBRA_FIX_243_PROBE_SOCKET".into(),
