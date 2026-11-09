@@ -10258,13 +10258,13 @@ fn slate_c11_02_empty_actions() {
 /// C11-02, attributes only: an initialized, empty attribute object.
 #[test]
 fn slate_c11_02_empty_attributes() {
-    slate_spawn_shape("c11-02-attributes", false);
+    slate_spawn_shape("c11-02-attributes", true);
 }
 
 /// C11-02, both objects initialized and empty.
 #[test]
 fn slate_c11_02_empty_both() {
-    slate_spawn_shape("c11-02-both", false);
+    slate_spawn_shape("c11-02-both", true);
 }
 
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
