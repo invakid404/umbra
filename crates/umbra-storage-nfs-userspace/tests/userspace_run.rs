@@ -10261,6 +10261,20 @@ fn fix_243_sigpipe_mask() {
     fix_243_signal("fix-243-sigmask", "child-signal default=0 ignored=1 blocked=0", "0x0008");
 }
 
+/// Native apparatus: an ignored disposition must still trip the signal oracle
+/// after removing the observer's constructor interference from this child.
+#[test]
+fn fix_243_signal_oracle_rejects_ignored_child() {
+    let Some(spawn) = slate_spawn("fix-243-sigdefault-mutant") else { return; };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-sigdefault-mutant");
+    assert!(!native.status.success());
+    assert!(std::fs::read_to_string(root.join("records.child")).unwrap()
+        .contains("child-signal default=0 ignored=1 blocked=1"));
+    assert!(std::fs::read_to_string(root.join("records.done")).unwrap()
+        .contains("exited=1 code=81"));
+    slate_finish_cleanup();
+}
+
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
 /// premise, with the errno the first reading did not keep.
 #[test]
