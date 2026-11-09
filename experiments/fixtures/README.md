@@ -222,9 +222,11 @@ control before its routed comparison. Evidence includes native/routed streams,
 cleanup and census records, independent NFS objects, run ID and resume output.
 No mounted-NFS run is needed. Missing census evidence does not qualify cleanup.
 
-Implementation caveat: C10-13's accepted external ledger protocol needs a
-revised design before routed qualification. The platform provider launches
-with null stdin/stdout, so the CLI launcher's acknowledgment pipe does not
-reach the tracee. A native ledger pass alone cannot qualify this case. The
-other new modes retain records through inherited stderr. No passing reading
-or production fix is claimed here.
+C10-13 uses a pipe-held child and an in-memory helper rendezvous. The parent
+records the focal WNOHANG result on inherited stderr, joins the helper, then
+writes the child release byte and reaps it. The child emits a post-release
+sentinel; the harness checks its exact status and the record order. This
+replaces the initial proposed external ledger protocol: routed tracee stdin
+and stdout are null, so that acknowledgment channel cannot reach it. Native
+and routed controls use the same amended protocol. No passing result is
+inferred from setup, compilation or a timeout.

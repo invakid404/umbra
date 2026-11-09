@@ -14052,7 +14052,7 @@ fn r10_deferred(case: u8) {
     let native = scratch.path().join("native");
     std::fs::create_dir(&native).unwrap();
     std::fs::write(native.join("seed.txt"), seed).unwrap();
-    let watch = SlateWatch::new(scratch.path(), &evidence.join("native"), case == 13);
+    let watch = SlateWatch::new(scratch.path(), &evidence.join("native"), false);
     let mut command = Command::new(&program);
     arguments(&mut command, &native);
     let (output, timed_out) = slate_launch(
@@ -14065,18 +14065,13 @@ fn r10_deferred(case: u8) {
         !timed_out && output.status.success(),
         "native prerequisite failed"
     );
-    r10_deferred_records(
-        case,
-        if case == 13 {
-            &output.stdout
-        } else {
-            &output.stderr
-        },
-    );
+    r10_deferred_records(case, &output.stderr);
     for (name, bytes) in &expected {
         assert_eq!(std::fs::read(native.join(name)).unwrap(), *bytes);
     }
-    if case != 7 { assert_eq!(std::fs::read(native.join("seed.txt")).unwrap(), seed); }
+    if case != 7 {
+        assert_eq!(std::fs::read(native.join("seed.txt")).unwrap(), seed);
+    }
     slate_finish_cleanup();
     let (host, port) = fixture().expect("live Ganesha required");
     let workspace = scratch.path().join("workspace");
@@ -14098,7 +14093,7 @@ fn r10_deferred(case: u8) {
         .args(["--experimental", "--"])
         .arg(&program);
     arguments(&mut command, &workspace);
-    let watch = SlateWatch::new(scratch.path(), &evidence.join("routed"), case == 13);
+    let watch = SlateWatch::new(scratch.path(), &evidence.join("routed"), false);
     let (output, timed_out) = slate_launch(
         &mut command,
         &evidence.join("routed"),
@@ -14138,14 +14133,7 @@ fn r10_deferred(case: u8) {
     assert!(!timed_out, "routed deadline");
     assert_eq!(run.status, Some(0), "{}", run.stderr);
     assert_eq!(run.child_exit(), 0);
-    r10_deferred_records(
-        case,
-        if case == 13 {
-            &output.stdout
-        } else {
-            run.stderr.as_bytes()
-        },
-    );
+    r10_deferred_records(case, run.stderr.as_bytes());
     for (name, bytes) in &expected {
         assert_eq!(observed[name].as_deref(), Some(*bytes), "NFS {name}");
         let mut path = shadow_path(&run);
@@ -14155,7 +14143,10 @@ fn r10_deferred(case: u8) {
             Some(bytes.len() as u64)
         );
     }
-    let mut expected_names: Vec<_> = expected.iter().map(|(name, _)| name.as_bytes().to_vec()).collect();
+    let mut expected_names: Vec<_> = expected
+        .iter()
+        .map(|(name, _)| name.as_bytes().to_vec())
+        .collect();
     expected_names.sort();
     assert_eq!(c13_shadow_names(&host, port, &run), expected_names);
     assert!(journal_records_completion(&run));
@@ -14199,14 +14190,12 @@ fn r10_deferred_records(case: u8, bytes: &[u8]) {
             );
             assert_eq!(slate_field(opens[0], "open", "tid"), main);
             assert_eq!(slate_field(opens[1], "open", "tid"), helper);
-            assert!(
-                text.lines()
-                    .any(|s| s.starts_with("write ") && s.contains(&format!("tid={main} ")))
-            );
-            assert!(
-                text.lines()
-                    .any(|s| s.starts_with("write ") && s.contains(&format!("tid={helper} ")))
-            );
+            assert!(text
+                .lines()
+                .any(|s| s.starts_with("write ") && s.contains(&format!("tid={main} "))));
+            assert!(text
+                .lines()
+                .any(|s| s.starts_with("write ") && s.contains(&format!("tid={helper} "))));
         }
         if case == 8 {
             assert_eq!(slate_field(text, "close ", "tid"), helper);
@@ -14221,21 +14210,28 @@ fn r10_deferred_records(case: u8, bytes: &[u8]) {
         assert_eq!(slate_field(text, "reap", "child"), ready);
         assert_eq!(slate_field(text, "reap", "result"), ready);
         assert_eq!(slate_field(text, "reap", "status"), "0");
+        assert_eq!(slate_field(text, "c10-13 pre-poll", "parked"), "1");
+        assert_eq!(slate_field(text, "c10-13 pre-poll", "leaving"), "0");
+        assert_eq!(slate_field(text, "c10-13 pre-poll", "phase"), "1");
         assert_eq!(
-            text.lines()
-                .filter(|s| s.starts_with("ledger pid="))
-                .count(),
-            1
+            slate_field(text, "c10-13 pre-poll", "helper_tid"),
+            slate_field(text, "helper-ready", "tid")
         );
+        assert_eq!(
+            slate_field(text, "c10-13 release", "caller_tid"),
+            slate_field(text, "case=", "main_tid")
+        );
+        assert_eq!(text.matches("c10-13 child-post-release=CHILD-G").count(), 1);
         let mut cursor = 0;
         for marker in [
             "c10-13 ready",
             "helper-ready",
+            "c10-13 pre-poll",
             "c10-13 poll",
+            "helper-leaving",
             "c10-13 helper-joined",
-            "ledger pid=",
-            "c10-13 ack=G",
-            "c10-13 forwarded=G",
+            "c10-13 release=G",
+            "c10-13 child-post-release=CHILD-G",
             "reap ",
         ] {
             cursor += text[cursor..].find(marker).expect(marker) + marker.len();

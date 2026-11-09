@@ -1,5 +1,5 @@
 /* Rank-10 deferred leaves. argv: case, seeded input, output.
- * Records use stdout; only C10-13's sole ledger line requests an external G.
+ * Records use inherited stderr. C10-13 releases its child after poll/join.
  * No sleeps establish ordering. The test launcher owns the deadline. */
 #include <assert.h>
 #include <errno.h>
@@ -49,6 +49,8 @@ static void closed(int fd) {
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static int phase, mode, shared;
+static unsigned long long helper_tid;
+static int parked, leaving;
 static const char *input;
 static void publish(int p) {
     assert(pthread_mutex_lock(&mu) == 0); phase = p;
@@ -63,7 +65,16 @@ static void *helper(void *unused) {
     (void)unused;
     int fd = -1;
     if (mode == 7) fd = opened(input, O_WRONLY);
-    note("helper-ready tid=%llu\n", tid()); publish(1); await(2);
+    if (mode == 13) {
+        assert(pthread_mutex_lock(&mu) == 0);
+        helper_tid = tid(); parked = 1; phase = 1;
+        note("helper-ready tid=%llu parked=1 leaving=0\n", helper_tid);
+        assert(pthread_cond_broadcast(&cv) == 0);
+        while (phase < 2) assert(pthread_cond_wait(&cv, &mu) == 0);
+        leaving = 1; parked = 0;
+        note("helper-leaving tid=%llu parked=0 leaving=1\n", helper_tid);
+        assert(pthread_mutex_unlock(&mu) == 0);
+    } else { note("helper-ready tid=%llu\n", tid()); publish(1); await(2); }
     if (mode == 7) { transfer(fd, "B"); closed(fd); }
     if (mode == 8) closed(shared);
     publish(3); return NULL;
@@ -76,7 +87,7 @@ static void finish(pthread_t h) {
 }
 int main(int argc, char **argv) {
     assert(argc == 4); mode = atoi(argv[1]); input = argv[2];
-    if (mode == 13) report_fd = 1;
+
     note("case=%d main_tid=%llu\n", mode, tid());
     if (mode == 7) {
         shared = opened(input, O_WRONLY); pthread_t h = start();
@@ -111,17 +122,24 @@ int main(int argc, char **argv) {
             close(0); close(ready[0]); close(go[1]);
             if (write(ready[1], "R", 1) != 1) _exit(81); close(ready[1]);
             char c; ssize_t n; do n = read(go[0], &c, 1); while (n < 0 && errno == EINTR);
-            close(go[0]); _exit(n == 1 && c == 'G' ? 0 : 82);
+            close(go[0]);
+            if (n != 1 || c != 'G') _exit(82);
+            static const char sentinel[] = "c10-13 child-post-release=CHILD-G\n";
+            if (write(2, sentinel, sizeof sentinel - 1) != sizeof sentinel - 1) _exit(83);
+            _exit(0);
         }
         close(ready[1]); close(go[0]); assert(token(ready[0]) == 'R'); close(ready[0]);
         note("c10-13 ready child=%d\n", child);
         pthread_t h = start(); int st = 0x5a5a5a5a;
+        assert(pthread_mutex_lock(&mu) == 0);
+        assert(parked == 1 && leaving == 0 && phase == 1);
+        note("c10-13 pre-poll helper_tid=%llu parked=%d leaving=%d phase=%d\n", helper_tid, parked, leaving, phase);
+        assert(pthread_mutex_unlock(&mu) == 0);
         errno = 0; pid_t polled = waitpid(child, &st, WNOHANG); int e = errno;
         note("c10-13 poll child=%d result=%d errno=%d status=%d\n", child, polled, e, st);
         finish(h); note("c10-13 helper-joined\n");
-        note("ledger pid=%d\n", child);
-        assert(token(0) == 'G'); note("c10-13 ack=G\n");
-        bytes(go[1], "G", 1); close(go[1]); note("c10-13 forwarded=G\n");
+        note("c10-13 release=G caller_tid=%llu\n", tid());
+        bytes(go[1], "G", 1); close(go[1]);
         int final = -1; pid_t r = waitpid(child, &final, 0);
         note("reap child=%d result=%d status=%d\n", child, r, final);
         assert(polled == 0 && st == 0x5a5a5a5a);
