@@ -104,8 +104,11 @@ static int announce(pid_t child) {
 
 /* C11-01 and the three C11-02 leaves: the same child, one pointer shape each. */
 static int shape(const char *mode, const char *root, const char *helper) {
+    int sigdefault = !strcmp(mode, "fix-243-sigdefault");
+    int sigmask = !strcmp(mode, "fix-243-sigmask");
     int use_actions = !strcmp(mode, "c11-02-actions") || !strcmp(mode, "c11-02-both");
-    int use_attributes = !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both");
+    int use_attributes = !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both") ||
+        sigdefault || sigmask;
     posix_spawn_file_actions_t actions;
     posix_spawnattr_t attributes;
     note("phase=pre-spawn mode=%s actions=%d attributes=%d\n", mode, use_actions, use_attributes);
@@ -120,8 +123,24 @@ static int shape(const char *mode, const char *root, const char *helper) {
         note("spawnattr-init result=%d\n", rc);
         if (rc) return 6;
     }
+    if (sigdefault || sigmask) {
+        struct sigaction ignored = {0};
+        ignored.sa_handler = SIG_IGN;
+        sigemptyset(&ignored.sa_mask);
+        sigset_t pipe_set, empty;
+        sigemptyset(&pipe_set);
+        sigaddset(&pipe_set, SIGPIPE);
+        sigemptyset(&empty);
+        if (sigaction(SIGPIPE, &ignored, NULL) || sigprocmask(SIG_BLOCK, &pipe_set, NULL))
+            return 16;
+        if (posix_spawnattr_setflags(&attributes,
+                sigdefault ? POSIX_SPAWN_SETSIGDEF : POSIX_SPAWN_SETSIGMASK) ||
+            posix_spawnattr_setsigdefault(&attributes, &pipe_set) ||
+            posix_spawnattr_setsigmask(&attributes, &empty)) return 17;
+    }
     flush(root, "records.pre");
-    char *args[] = {(char *)helper, "write-child", (char *)root, NULL};
+    char *args[] = {(char *)helper, (sigdefault || sigmask) ? (char *)mode : "write-child",
+                    (char *)root, NULL};
     pid_t child = -1;
     if (spawn(&child, helper, use_actions ? &actions : NULL,
               use_attributes ? &attributes : NULL, args)) {
@@ -130,6 +149,15 @@ static int shape(const char *mode, const char *root, const char *helper) {
     }
     int status = 0;
     int failed = reap(child, &status);
+    if (sigdefault || sigmask) {
+        struct sigaction current;
+        sigset_t mask;
+        if (sigaction(SIGPIPE, NULL, &current) || sigprocmask(SIG_BLOCK, NULL, &mask))
+            return 18;
+        note("parent-signal ignored=%d blocked=%d\n", current.sa_handler == SIG_IGN,
+             sigismember(&mask, SIGPIPE));
+        if (current.sa_handler != SIG_IGN || sigismember(&mask, SIGPIPE) != 1) return 19;
+    }
     char path[4096];
     path_in(path, sizeof path, root, "parent.txt");
     int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
@@ -487,7 +515,8 @@ int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
     if (!strcmp(mode, "c11-01") || !strcmp(mode, "c11-02-actions") ||
-        !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both"))
+        !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both") ||
+        !strcmp(mode, "fix-243-sigdefault") || !strcmp(mode, "fix-243-sigmask"))
         return shape(mode, root, helper);
     if (!strcmp(mode, "c11-05")) return cloexec(root, helper);
     if (!strcmp(mode, "c11-05-premise")) return premise(root);

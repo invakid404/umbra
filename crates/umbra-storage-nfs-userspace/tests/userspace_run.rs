@@ -9771,59 +9771,9 @@ fn slate_tokio_records(bytes: &[u8], case: &str) {
 // QUALIFIED.
 // ---------------------------------------------------------------------------
 
-/// The exact diagnostic `native.rs` emits for trap 244 with a nonzero packed
-/// descriptor in x2. Its presence is the x2 reading (design-gate R1), so the
-/// literal must have exactly one emission site, inside the `number == 244`
-/// arm, behind `get(&regs, 2)? != 0`. Checked over every production source
-/// file by literal, not by keyword (L17).
-const SLATE_SPAWN_REFUSAL: &str = "spawn requires null attributes/file actions";
-fn slate_spawn_refusal_site() -> String {
-    fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(directory).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                sources(&path, found);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                found.push(path);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(repository().join("crates")).unwrap() {
-        let source = entry.unwrap().path().join("src");
-        if source.is_dir() {
-            sources(&source, &mut files);
-        }
-    }
-    let mut sites = Vec::new();
-    for file in files {
-        let text = std::fs::read_to_string(&file).unwrap();
-        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
-        for index in 0..lines.len() {
-            if lines[index].contains(SLATE_SPAWN_REFUSAL) {
-                sites.push((file.clone(), index, lines.clone()));
-            }
-        }
-    }
-    let found: Vec<_> = sites
-        .iter()
-        .map(|(file, index, _)| format!("{}:{}", file.display(), index + 1))
-        .collect();
-    assert_eq!(
-        found.len(),
-        1,
-        "the spawn refusal diagnostic must have exactly one emission site, or its \
-         presence no longer identifies the x2 != 0 branch: {found:?}"
-    );
-    let (file, index, lines) = &sites[0];
-    assert!(file.ends_with("crates/umbra-platform-macos/src/native.rs"));
-    assert!(
-        lines[index - 1].trim() == "if get(&regs, 2)? != 0 {"
-            && lines[index - 2].trim() == "if number == 244 {",
-        "the emission site is no longer gated solely by number == 244 && x2 != 0"
-    );
-    format!("native.rs:{}", index + 1)
-}
+/// The full E8 request is structurally valid but requests SETSID, which this
+/// slice refuses before its later CHDIR action or any child execution.
+const SLATE_SPAWN_REFUSAL: &str = "spawn unsupported attribute SETSID";
 
 /// One case's built fixtures and its evidence directory.
 struct SlateSpawn {
@@ -10158,7 +10108,6 @@ fn slate_record(spawn: &SlateSpawn, classification: &str, detail: serde_json::Va
 /// C11-01 and the three C11-02 leaves: one helper, one write each from child
 /// and parent, a different public pointer shape per mode.
 fn slate_spawn_shape(mode: &str, admitted: bool) {
-    let site = slate_spawn_refusal_site();
     let Some(spawn) = slate_spawn(mode) else {
         return;
     };
@@ -10199,15 +10148,25 @@ fn slate_spawn_shape(mode: &str, admitted: bool) {
             slate_unqualified_detail(&routed)
         } else {
             serde_json::json!({
-                "x2_side": if refused { "nonzero: the single-site diagnostic was emitted" }
-                    else { "zero: no diagnostic; libc passed a null packed descriptor" },
-                "emission_site": site,
+                "capture": routed.run.stderr.lines().find(|line| line.starts_with("spawn-capture ")),
+                "policy": routed.run.stderr.lines().find(|line| line.starts_with("spawn-policy ")),
                 "run_id": routed.run.run_id.0.to_string(),
                 "supervisor_status": routed.output.status.to_string(),
             })
         },
     );
     if admitted {
+        let packed = matches!(mode, "c11-02-attributes" | "c11-02-both");
+        let capture = if packed {
+            "spawn-capture descriptor=non-null profile=25F80"
+        } else {
+            "spawn-capture descriptor=null"
+        };
+        assert!(routed.run.stderr.lines().any(|line| line == capture), "{}", routed.run.stderr);
+        if packed {
+            assert!(routed.run.stderr.lines().any(|line| line == "spawn-policy flags=0x0000 actions=0"),
+                "{}", routed.run.stderr);
+        }
         assert_eq!(
             classification, "SUPPORTED-AND-CORRECT",
             "{}",
@@ -10265,6 +10224,41 @@ fn slate_c11_02_empty_attributes() {
 #[test]
 fn slate_c11_02_empty_both() {
     slate_spawn_shape("c11-02-both", true);
+}
+
+fn fix_243_signal(mode: &str, child_record: &str, flags: &str) {
+    let Some(spawn) = slate_spawn(mode) else { return; };
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert_eq!(std::fs::read(root.join("parent.txt")).unwrap(), b"PARENT");
+    assert!(std::fs::read_to_string(root.join("records.child")).unwrap().contains(child_record));
+    assert!(std::fs::read_to_string(root.join("records.done")).unwrap()
+        .contains("parent-signal ignored=1 blocked=1"));
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
+    let correct = slate_two_exit_completion(&routed)
+        && routed.object("child.txt") == Some(b"CHILD".as_slice())
+        && routed.object("parent.txt") == Some(b"PARENT".as_slice());
+    slate_record(&spawn, if correct { "SUPPORTED-AND-CORRECT" } else { "NOT QUALIFIED" },
+        serde_json::json!({"run_id": routed.run.run_id.0.to_string(),
+            "expected_child_signal": child_record}));
+    assert!(correct, "{}", routed.run.stderr);
+    assert!(routed.text("records.child").contains(child_record));
+    assert!(routed.text("records.done").contains("parent-signal ignored=1 blocked=1"));
+    assert!(routed.run.stderr.contains(&format!("spawn-policy flags={flags} actions=0")));
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
+fn fix_243_sigpipe_default() {
+    fix_243_signal("fix-243-sigdefault", "child-signal default=1 ignored=0 blocked=1", "0x0004");
+}
+
+#[test]
+fn fix_243_sigpipe_mask() {
+    fix_243_signal("fix-243-sigmask", "child-signal default=0 ignored=1 blocked=0", "0x0008");
 }
 
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
@@ -10659,7 +10653,6 @@ fn race_alternations(bytes: &[u8]) -> usize {
 /// composition support.
 #[test]
 fn slate_c11_10_e8_pipe_refusal() {
-    let site = slate_spawn_refusal_site();
     let Some(spawn) = slate_spawn("c11-10") else {
         return;
     };
@@ -10723,11 +10716,9 @@ fn slate_c11_10_e8_pipe_refusal() {
         } else {
             serde_json::json!({
             "trapped_stub": "__posix_spawn (244)",
-            "x2_side": if refused { "nonzero: the single-site diagnostic was emitted" }
-                else { "no diagnostic" },
-            "emission_site": site,
-            "stage": "Delivery::Exec arm, after the absolute-path check and resign, before \
-                      registers are installed and the spawn syscall resumes",
+            "capture": routed.run.stderr.lines().find(|line| line.starts_with("spawn-capture ")),
+            "diagnostic": SLATE_SPAWN_REFUSAL,
+            "stage": "packed descriptor validation, before authorization and kernel execution",
             "effect_boundary": "no records.done, no records.child, no child.txt in the shadow; \
                                 host workspace pristine",
             "run_id": routed.run.run_id.0.to_string(),
@@ -10736,6 +10727,8 @@ fn slate_c11_10_e8_pipe_refusal() {
         },
     );
     assert!(exact, "{}", routed.run.stderr);
+    assert!(routed.run.stderr.lines().any(|line| line == "spawn-capture descriptor=non-null profile=25F80"),
+        "{}", routed.run.stderr);
     let pre = routed.text("records.pre");
     assert!(pre.starts_with("phase=pre-spawn mode=c11-10\n"));
     for line in pre.lines().filter(|l| l.contains(" result=")) {

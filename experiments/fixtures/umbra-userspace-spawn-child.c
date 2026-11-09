@@ -8,6 +8,7 @@
  * independently read shadow bytes, never the only oracle. */
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -206,6 +207,19 @@ static int race_write(const char *root, int output, int go, int ready) {
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
     const char *mode = argv[1], *root = argv[2];
+    if (!strcmp(mode, "fix-243-sigdefault") || !strcmp(mode, "fix-243-sigmask")) {
+        struct sigaction current;
+        sigset_t mask;
+        if (sigaction(SIGPIPE, NULL, &current) || sigprocmask(SIG_BLOCK, NULL, &mask)) return 80;
+        int defaulted = current.sa_handler == SIG_DFL;
+        int ignored = current.sa_handler == SIG_IGN;
+        int blocked = sigismember(&mask, SIGPIPE);
+        note("child-signal default=%d ignored=%d blocked=%d\n", defaulted, ignored, blocked);
+        int expected_default = !strcmp(mode, "fix-243-sigdefault");
+        if (defaulted != expected_default || ignored == expected_default ||
+            blocked != expected_default) return 81;
+        return write_child(root);
+    }
     if (!strcmp(mode, "write-child") && argc == 3) return write_child(root);
     if (!strcmp(mode, "c11-05") && argc == 7)
         return cloexec(root, atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]));
