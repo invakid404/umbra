@@ -124,6 +124,24 @@ impl TraceMemory for &Task {
         Task::read(self, address, out)
     }
 }
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+fn probe_unregistered(task: &Task, slot: u64) -> Result<bool> {
+    if std::env::var("UMBRA_FIX_243_PROBE_PHASE").as_deref() != Ok("unregistered") {
+        return Ok(false);
+    }
+    // Instrument-only observation. No child Task is acquired or registered.
+    let mut bytes = [0; 4];
+    task.read(slot, &mut bytes)?;
+    let pid = i32::from_le_bytes(bytes);
+    let birth = bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
+    crate::spawn_probe::rendezvous(
+        "unregistered",
+        pid,
+        birth,
+        serde_json::json!({"watchdog_registered": false, "session_inserted": false}),
+    )
+}
+
 struct Watchdog {
     tasks: Arc<Mutex<Vec<Arc<Task>>>>,
     cancel: Option<mpsc::Sender<()>>,
@@ -2401,8 +2419,14 @@ impl MacosTraceBackend {
                 let authorization = spawn.authorization.expect("armed authorization");
                 if matches!(outcome, OperationOutcome::Success { .. }) {
                     let mut bytes = [0; 4];
-                    s.task
-                        .read(spawn.region.expect("armed region") + 400, &mut bytes)?;
+                    let slot = spawn.region.expect("armed region") + 400;
+                    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                    let slot = if probe_unregistered(&s.task, slot)? {
+                        0
+                    } else {
+                        slot
+                    };
+                    s.task.read(slot, &mut bytes)?;
                     let twin = std::mem::take(&mut spawn.twin);
                     self.attach_child(
                         index,
@@ -2449,6 +2473,12 @@ impl MacosTraceBackend {
             ReturnKind::Spawn { pid_pointer, twin } => {
                 if let OperationOutcome::Success { .. } = abi::outcome(&regs)? {
                     let mut bytes = [0; 4];
+                    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                    let pid_pointer = if probe_unregistered(&s.task, pid_pointer)? {
+                        0
+                    } else {
+                        pid_pointer
+                    };
                     s.task.read(pid_pointer, &mut bytes)?;
                     self.attach_child(
                         index,

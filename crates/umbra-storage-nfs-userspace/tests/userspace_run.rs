@@ -10530,6 +10530,7 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
         "fix-243-free-error" => "remote-free",
         "fix-243-register-error" => "register-commit",
         name if name.starts_with("fix-243-inserted-") => "inserted",
+        name if name.starts_with("fix-243-unregistered-") => "unregistered",
         _ => "task-acquired",
     };
     spawn
@@ -10579,13 +10580,13 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
         let record: serde_json::Value = serde_json::from_str(&line).unwrap();
         std::fs::write(evidence.join("provider-rendezvous.json"), &line).unwrap();
         assert_eq!(record["phase"], phase);
-        if phase != "task-acquired" {
+        if phase != "task-acquired" && phase != "unregistered" {
             assert_eq!(record["session_inserted"], true);
             assert_eq!(record["parent_stopped"], true);
             assert_eq!(record["child_stopped"], true);
             assert_eq!(record["region_owned"], phase != "register-commit");
         }
-        assert_eq!(record["watchdog_registered"], true);
+        assert_eq!(record["watchdog_registered"], phase != "unregistered");
         let child = record["child"].as_i64().unwrap() as i32;
         let observed = slate_process(child)
             .unwrap()
@@ -10618,7 +10619,7 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
             "reap_established": false,
         }),
     );
-    if command == b'E' {
+    if command == b'E' && phase != "unregistered" {
         assert!(
             routed.run.stderr.contains(match phase {
                 "caller-copyout" => "spawn caller PID delivery failed",
@@ -10745,6 +10746,23 @@ fn fix_243_inserted_terminate() {
 fn fix_243_inserted_watchdog() {
     fix_243_fault_reading(
         "fix-243-inserted-watchdog",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_unregistered_null_reading() {
+    fix_243_fault_reading("fix-243-unregistered-null", "c11-01", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_unregistered_packed_reading() {
+    fix_243_fault_reading(
+        "fix-243-unregistered-packed",
         "c11-02-attributes",
         false,
         b'E',
