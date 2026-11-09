@@ -12613,6 +12613,11 @@ fn f214_lookup_boundaries() {
 }
 
 #[test]
+fn f214_native_routed_mix() {
+    f214_metadata_case("mixed");
+}
+
+#[test]
 fn f214_fork_exec() {
     f214_metadata_case("fork");
 }
@@ -12683,6 +12688,11 @@ fn f214_metadata_case(mode: &str) {
             assert_eq!(native_marker, native_pid);
             assert_eq!(routed.object(name).expect("metadata phase marker"), routed_pid);
         }
+    }
+    if mode == "mixed" {
+        let marker = routed.object("records.child").expect("mixed metadata phase marker");
+        assert!(std::str::from_utf8(marker).unwrap().trim().parse::<u32>().unwrap() > 0);
+        std::fs::copy(native_root.join("records.child"), spawn.evidence.join("native-records.child")).unwrap();
     }
 }
 
