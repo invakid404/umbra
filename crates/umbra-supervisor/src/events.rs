@@ -2316,6 +2316,55 @@ mod tests {
     }
 
     #[test]
+    fn f214_lifecycle_events_discard_pending_output() {
+        for event in [
+            TraceEvent::Exec {
+                task: task(1),
+                thread: ThreadId(task(1).0),
+                exec_generation: 2,
+            },
+            TraceEvent::ThreadExited {
+                task: task(1),
+                thread: ThreadId(task(1).0),
+            },
+            TraceEvent::Exit {
+                task: task(1),
+                status: ExitStatus::Code(0),
+            },
+        ] {
+            let mut s = supervisor();
+            let token = FilesystemQueryToken {
+                request: 1,
+                task: task(1),
+                thread: ThreadId(task(1).0),
+                image_generation: 0,
+                stop_generation: 1,
+            };
+            let binding = FilesystemBinding::overlay(s.state.run_id);
+            let reply = FilesystemReply {
+                token: token.clone(),
+                metadata: binding.metadata().unwrap(),
+            };
+            assert!(s
+                .filesystem_queries
+                .begin(crate::filesystem::PendingFilesystem {
+                    token,
+                    binding,
+                    output: IoBuffer {
+                        address: 0x1000,
+                        length: 2168
+                    },
+                }));
+            s.handle_event(event).unwrap();
+            // Use the old generation deliberately: cancellation itself must
+            // remove the output, independently of generation validation.
+            assert!(s.filesystem_queries.finish(&reply, 0).is_none());
+            // Fake panics on memory/register writes, so lifecycle processing
+            // cannot have touched the former image's output buffer.
+        }
+    }
+
+    #[test]
     fn f214_provider_errors() {
         for fault in 0..4 {
             let mut s = supervisor();
