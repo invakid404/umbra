@@ -2330,6 +2330,40 @@ impl MacosTraceBackend {
                 let authorization = spawn.authorization.expect("armed spawn");
                 let child_index = self.sessions.len() - 1;
                 self.sessions[parent].spawn.as_mut().unwrap().child = Some(child_index);
+                #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                if self.probe_spawn_completion(parent, "inserted")? {
+                    let trigger = std::env::var("UMBRA_FIX_243_PROBE_TRIGGER").unwrap_or_default();
+                    match trigger.as_str() {
+                        "deadline" => {
+                            self.deadline = Some(Instant::now());
+                            self.check_deadline()?;
+                        }
+                        "session-drop" => {
+                            drop(self.sessions.pop().expect("inserted child"));
+                        }
+                        "backend-drop" => {
+                            drop(std::mem::take(self));
+                        }
+                        "terminate" => {
+                            self.terminate(
+                                ProcessHandle(self.sessions[0].id),
+                                TerminationPolicy::Immediate,
+                            )?;
+                        }
+                        "watchdog" => {
+                            let remaining = self
+                                .deadline
+                                .unwrap()
+                                .saturating_duration_since(Instant::now());
+                            std::thread::sleep(remaining + Duration::from_millis(50));
+                        }
+                        _ => {}
+                    }
+                    return Err(error(
+                        "spawn probe",
+                        format!("injected inserted {trigger} failure"),
+                    ));
+                }
                 self.events.push_back(TraceEvent::SpawnChild {
                     authorization,
                     child: ProcessHandle(self.sessions[child_index].id),

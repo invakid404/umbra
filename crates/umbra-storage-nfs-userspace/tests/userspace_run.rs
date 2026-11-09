@@ -10513,15 +10513,22 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
         "fix-243-copyout-error" => "caller-copyout",
         "fix-243-free-error" => "remote-free",
         "fix-243-register-error" => "register-commit",
+        name if name.starts_with("fix-243-inserted-") => "inserted",
         _ => "task-acquired",
     };
     spawn
         .provider_environment
         .push(("UMBRA_FIX_243_PROBE_PHASE".into(), phase.into()));
-    let socket = spawn.evidence.parent().unwrap().join(format!(
-        "{phase}-{}.sock",
-        if root_probe { "root" } else { "child" }
-    ));
+    if let Some(trigger) = case.strip_prefix("fix-243-inserted-") {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_PROBE_TRIGGER".into(), trigger.into()));
+    }
+    let socket = spawn
+        .evidence
+        .parent()
+        .unwrap()
+        .join(format!("{}.sock", case.trim_start_matches("fix-243-")));
     let listener = UnixListener::bind(&socket).unwrap();
     spawn.provider_environment.push((
         "UMBRA_FIX_243_PROBE_SOCKET".into(),
@@ -10664,6 +10671,61 @@ fn fix_243_completion_free_failure() {
 #[test]
 fn fix_243_completion_register_failure() {
     fix_243_fault_reading("fix-243-register-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_inserted_deadline() {
+    fix_243_fault_reading(
+        "fix-243-inserted-deadline",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_inserted_session_drop() {
+    fix_243_fault_reading(
+        "fix-243-inserted-session-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_inserted_backend_drop() {
+    fix_243_fault_reading(
+        "fix-243-inserted-backend-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_inserted_terminate() {
+    fix_243_fault_reading(
+        "fix-243-inserted-terminate",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_inserted_watchdog() {
+    fix_243_fault_reading(
+        "fix-243-inserted-watchdog",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
 }
 
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
