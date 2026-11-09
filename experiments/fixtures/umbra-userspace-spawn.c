@@ -519,9 +519,66 @@ static int race(const char *root, const char *helper) {
     return failed || short_writes ? 11 : 0;
 }
 
+/* D-A1 kernel-only pipe composition. The child gets fd 100 via ordered
+ * dup/close/inherit actions; CLOEXEC_DEFAULT must prune the routed victim. */
+static int kernel_pipe(const char *mode, const char *root, const char *helper) {
+    int explicit_policy = !strcmp(mode, "fix-243-cloexec");
+    int pair[2];
+    if (pipe(pair)) return 90;
+    char path[4096];
+    path_in(path, sizeof path, root, "victim.txt");
+    int victim = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (victim < 0 || transfer(victim, "SEED", 4) != 4) return 91;
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    if (posix_spawn_file_actions_init(&actions) || posix_spawnattr_init(&attr)) return 92;
+    if (posix_spawn_file_actions_adddup2(&actions, pair[1], 100) ||
+        posix_spawn_file_actions_addclose(&actions, pair[1]) ||
+        posix_spawn_file_actions_adddup2(&actions, 100, 100) ||
+        posix_spawn_file_actions_addinherit_np(&actions, 100)) return 93;
+    if (explicit_policy && posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT))
+        return 94;
+    note("phase=pre-spawn mode=%s\n", mode);
+    identity();
+    note("pipe read=%d write=%d victim=%d\n", pair[0], pair[1], victim);
+    flush(root, "records.pre");
+    /* Constructors must not create descriptors that masquerade as inherited ones. */
+    unsetenv("UMBRA_SLATE_SIGNAL_DIR");
+    char victim_arg[32], policy_arg[8];
+    snprintf(victim_arg, sizeof victim_arg, "%d", victim);
+    snprintf(policy_arg, sizeof policy_arg, "%d", explicit_policy);
+    char *args[] = {(char *)helper, "fix-243-pipe", (char *)root, victim_arg, policy_arg, NULL};
+    pid_t child = -1;
+    if (spawn(&child, helper, &actions, &attr, args)) {
+        flush(root, "records.done");
+        return 95;
+    }
+    close(pair[1]);
+    char bytes[64] = {0};
+    size_t used_bytes = 0;
+    for (;;) {
+        ssize_t n = read(pair[0], bytes + used_bytes, sizeof bytes - used_bytes);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 || used_bytes == sizeof bytes) return 96;
+        if (!n) break;
+        used_bytes += (size_t)n;
+    }
+    close(pair[0]);
+    note("pipe-result bytes=%zu payload=%.*s eof=1\n", used_bytes, (int)used_bytes, bytes);
+    int status = 0;
+    int failed = reap(child, &status);
+    if (transfer(victim, "PARENT", 6) != 6 || close(victim)) return 97;
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    flush(root, "records.done");
+    return failed || used_bytes != 13 || memcmp(bytes, "FIX-243-NONCE", 13) ? 98 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
+    if (!strcmp(mode, "fix-243-pipe") || !strcmp(mode, "fix-243-cloexec"))
+        return kernel_pipe(mode, root, helper);
     if (!strcmp(mode, "c11-01") || !strcmp(mode, "c11-02-actions") ||
         !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both") ||
         !strcmp(mode, "fix-243-sigdefault") || !strcmp(mode, "fix-243-sigmask") ||

@@ -10275,6 +10275,39 @@ fn fix_243_signal_oracle_rejects_ignored_child() {
     slate_finish_cleanup();
 }
 
+fn fix_243_pipe(mode: &str) {
+    let Some(spawn) = slate_spawn(mode) else { return; };
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert_eq!(std::fs::read(root.join("victim.txt")).unwrap(), b"SEEDPARENT");
+    let native_done = std::fs::read_to_string(root.join("records.done")).unwrap();
+    assert!(native_done.contains("pipe-result bytes=13 payload=FIX-243-NONCE eof=1"));
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "victim.txt"]);
+    let correct = slate_two_exit_completion(&routed)
+        && routed.object("child.txt") == Some(b"CHILD".as_slice())
+        && routed.object("victim.txt") == Some(b"SEEDPARENT".as_slice());
+    slate_record(&spawn, if correct { "SUPPORTED-AND-CORRECT" } else { "NOT QUALIFIED" },
+        serde_json::json!({"run_id": routed.run.run_id.0.to_string()}));
+    assert!(correct, "{}", routed.run.stderr);
+    assert!(routed.text("records.done")
+        .contains("pipe-result bytes=13 payload=FIX-243-NONCE eof=1"));
+    if mode == "fix-243-cloexec" {
+        let expected = "pruned-victim result=-1 errno=9";
+        assert!(std::fs::read_to_string(root.join("records.child")).unwrap().contains(expected));
+        assert!(routed.text("records.child").contains(expected));
+    }
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
+fn fix_243_kernel_pipe_actions() { fix_243_pipe("fix-243-pipe"); }
+
+#[test]
+fn fix_243_cloexec_default_prunes_logical_descriptors() { fix_243_pipe("fix-243-cloexec"); }
+
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
 /// premise, with the errno the first reading did not keep.
 #[test]
