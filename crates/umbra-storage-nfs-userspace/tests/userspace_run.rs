@@ -14019,7 +14019,7 @@ fn r10_deferred(case: u8) {
     };
     let evidence = evidence.join(format!("C10-{case:02}-deferred"));
     std::fs::create_dir(&evidence).expect("fresh reading directory required");
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir_in(&evidence).unwrap().keep();
     // Prebuilt fixtures keep compilation outside every measurement deadline.
     let key = if case == 16 {
         "UMBRA_R10_TOKIO_PATH"
@@ -14049,10 +14049,10 @@ fn r10_deferred(case: u8) {
                 .arg(root.join("out.txt"));
         }
     };
-    let native = scratch.path().join("native");
+    let native = scratch.as_path().join("native");
     std::fs::create_dir(&native).unwrap();
     std::fs::write(native.join("seed.txt"), seed).unwrap();
-    let watch = SlateWatch::new(scratch.path(), &evidence.join("native"), false);
+    let watch = SlateWatch::new(scratch.as_path(), &evidence.join("native"), false);
     let mut command = Command::new(&program);
     arguments(&mut command, &native);
     let (output, timed_out) = slate_launch(
@@ -14074,13 +14074,13 @@ fn r10_deferred(case: u8) {
     }
     slate_finish_cleanup();
     let (host, port) = fixture().expect("live Ganesha required");
-    let workspace = scratch.path().join("workspace");
-    let state = scratch.path().join("state");
+    let workspace = scratch.as_path().join("workspace");
+    let state = scratch.as_path().join("state");
     std::fs::create_dir(&workspace).unwrap();
     std::fs::create_dir(&state).unwrap();
     let workspace = workspace.canonicalize().unwrap();
     std::fs::write(workspace.join("seed.txt"), seed).unwrap();
-    let registry = registry(scratch.path(), &host, port);
+    let registry = registry(scratch.as_path(), &host, port);
     assert_no_nfs_mount(&host, port, &[&workspace], "r10-deferred before");
     let mut command = Command::new(binaries().join("umbra"));
     command
@@ -14093,7 +14093,7 @@ fn r10_deferred(case: u8) {
         .args(["--experimental", "--"])
         .arg(&program);
     arguments(&mut command, &workspace);
-    let watch = SlateWatch::new(scratch.path(), &evidence.join("routed"), false);
+    let watch = SlateWatch::new(scratch.as_path(), &evidence.join("routed"), false);
     let (output, timed_out) = slate_launch(
         &mut command,
         &evidence.join("routed"),
@@ -14148,7 +14148,7 @@ fn r10_deferred(case: u8) {
         .map(|(name, _)| name.as_bytes().to_vec())
         .collect();
     expected_names.sort();
-    assert_eq!(c13_shadow_names(&host, port, &run), expected_names);
+    assert_eq!(r10_shadow_names(&host, port, &run), expected_names);
     assert!(journal_records_completion(&run));
     let reopened = slate_bounded(
         Command::new(binaries().join("umbra"))
@@ -14259,4 +14259,24 @@ fn r10_deferred_records(case: u8, bytes: &[u8]) {
         }
         assert_eq!(text.lines().filter(|l| *l == "join=Ok").count(), 2);
     }
+}
+
+// A read-only workload need not materialize its logical workspace in the shadow.
+// Only explicit NOENT below the existing run root means absent; transport errors fail.
+fn r10_shadow_names(host: &str, port: u16, run: &Run) -> Vec<Vec<u8>> {
+    let mut config = RawTransportConfig::loopback(port);
+    config.host = host.to_owned();
+    let deadline = Deadline { millis: 5000 };
+    let mut transport = LibnfsRawTransport::connect(config).unwrap();
+    let mut handle = transport.root_filehandle(deadline).unwrap();
+    let mut path = shadow_path(run);
+    path.pop();
+    for (index, part) in path.into_iter().enumerate() {
+        match transport.lookup(&handle, &ComponentName::new(part).unwrap(), AttrMask::STAT, deadline) {
+            Ok((next, _)) => handle = next,
+            Err(e) if index >= 4 && e.status().is_some_and(|s| s.0 == 2) => return Vec::new(),
+            Err(e) => panic!("shadow namespace inspection failed: {e:?}"),
+        }
+    }
+    c13_shadow_names(host, port, run)
 }
