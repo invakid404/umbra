@@ -14496,3 +14496,171 @@ fn fix_227_exec_sweep_and_io() {
 fn fix_227_ordered_cross_thread_close() {
     fix_227_fdflags("thread");
 }
+#[test]
+fn fix_227_native_fcntl_abi_and_cost() {
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(root) = slate_evidence() else { return };
+    let Some(interposer) = input("UMBRA_FIX_227_INTERPOSER_PATH") else {
+        return;
+    };
+    let evidence = root.join("fix-227-native-abi");
+    std::fs::create_dir(&evidence).expect("fresh reading");
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch_path = scratch.path().canonicalize().unwrap();
+    let program = fixture_binary(
+        &scratch_path,
+        "umbra-fix-227-native-fcntl",
+        "UMBRA_FIX_227_NATIVE_PATH",
+    );
+    let host_file = scratch_path.join("host-file");
+    std::fs::write(&host_file, b"native ABI control\n").unwrap();
+    std::fs::write(
+        evidence.join("fixture.sha256"),
+        r14_sha256(&std::fs::read(&program).unwrap()),
+    )
+    .unwrap();
+    std::fs::write(
+        evidence.join("interposer.sha256"),
+        r14_sha256(&std::fs::read(&interposer).unwrap()),
+    )
+    .unwrap();
+    let mut oracle = None;
+    for mode in ["native", "inactive", "routed", "rewrite"] {
+        let mode_root = scratch_path.join(mode);
+        std::fs::create_dir(&mode_root).unwrap();
+        let workspace = mode_root.join("workspace");
+        let state = mode_root.join("state");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let destination = workspace.join("records");
+        let registry_path = registry(&mode_root, &host, port);
+        let store = mode_root.join("store");
+        if mode == "rewrite" {
+            std::fs::create_dir(&store).unwrap();
+            let mut r: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+            let mut local: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(repository().join("crates/umbra-storage-local/provider.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            local["executable"] = serde_json::json!(
+                binaries()
+                    .join("umbra-storage-local")
+                    .as_os_str()
+                    .as_bytes()
+            );
+            local["capabilities"] =
+                serde_json::json!(["local-development-v1", "experimental-open-rewrite-v1"]);
+            local["options"] = serde_json::json!(
+                umbra_core::provider::encode(
+                    &umbra_core::BytePath::new(store.as_os_str().as_bytes().to_vec()).unwrap()
+                )
+                .unwrap()
+            );
+            r["providers"]["storage"] = local;
+            std::fs::write(&registry_path, serde_json::to_vec(&r).unwrap()).unwrap();
+        }
+        let mut command = if mode == "native" || mode == "inactive" {
+            let mut c = Command::new(&program);
+            if mode == "inactive" {
+                c.env("DYLD_INSERT_LIBRARIES", &interposer);
+            }
+            c
+        } else {
+            let mut c = Command::new(binaries().join("umbra"));
+            c.args(["run", "--registry"])
+                .arg(&registry_path)
+                .arg("--workspace")
+                .arg(&workspace)
+                .arg("--state-dir")
+                .arg(&state)
+                .arg("--experimental");
+            if mode == "rewrite" {
+                c.arg("--local-dev");
+            }
+            c.arg("--").arg(&program);
+            c
+        };
+        command.arg(&host_file).arg(&destination);
+        let (out, timeout) = slate_launch(
+            &mut command,
+            &evidence.join(mode),
+            std::time::Duration::from_secs(60),
+            None,
+        );
+        slate_finish_cleanup();
+        assert!(!timeout, "{mode} timed out");
+        assert!(
+            out.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = if mode == "native" || mode == "inactive" {
+            std::fs::read_to_string(&destination).unwrap()
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(stderr.contains("finished: Some(Code(0))"));
+            let id = stderr
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("umbra: run ")
+                        .and_then(|v| v.strip_suffix(" prepared"))
+                })
+                .unwrap();
+            let run = Run {
+                run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+                status: out.status.code(),
+                stderr,
+                destination,
+                workspace: workspace.clone(),
+                state,
+                registry: registry_path,
+            };
+            assert!(!run.destination.exists(), "host workspace unchanged");
+            if mode == "routed" {
+                assert!(journal_records_completion(&run));
+                String::from_utf8(
+                    read_whole_object_through_client(&host, port, &shadow_path(&run)).unwrap(),
+                )
+                .unwrap()
+            } else {
+                let file = store
+                    .join(run.run_id.0.to_string())
+                    .join("root")
+                    .join(run.destination.strip_prefix("/").unwrap());
+                std::fs::read_to_string(file).unwrap()
+            }
+        };
+        std::fs::write(evidence.join(format!("{mode}.records")), &text).unwrap();
+        if mode == "native" {
+            for name in ["getfd", "getfl", "setfd-clear", "getfd-clear", "setfd-set", "getfd-set", "setfl", "getfl-nonblock", "dupfd", "getpath", "setlk", "unlock"] {
+                assert_ne!(slate_field(&text, name, "result"), "-1");
+                assert_eq!(slate_field(&text, name, "errno"), "0");
+            }
+            assert_eq!(slate_field(&text, "unknown", "result"), "-1");
+        }
+        let abi: Vec<_> = text
+            .lines()
+            .filter(|l| !l.starts_with("cost "))
+            .map(str::to_owned)
+            .collect();
+        if let Some(expected) = &oracle {
+            assert_eq!(&abi, expected, "{mode} ABI mismatch");
+        } else {
+            oracle = Some(abi);
+        }
+        for name in ["getfd", "fstat"] {
+            let prefix = format!("cost {name} ");
+            assert_eq!(slate_field(&text, &prefix, "calls"), "16");
+            let ns: u64 = slate_field(&text, &prefix, "elapsed_ns").parse().unwrap();
+            eprintln!(
+                "fix-227 cost mode={mode} op={name} calls=16 elapsed_ns={ns} ns_per_call={}",
+                ns as f64 / 16.0
+            );
+        }
+    }
+    assert_eq!(std::fs::read(&host_file).unwrap(), b"native ABI control\n");
+}
