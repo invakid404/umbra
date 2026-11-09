@@ -8901,6 +8901,56 @@ fn f214_lookup_boundaries() {
 
 #[test]
 fn f214_resume_identity() {
+    fn recreated_descriptor(
+        overlay: &mut Overlay,
+        process: &ProcessContext,
+        token: umbra_core::FilesystemQueryToken,
+    ) -> umbra_core::FilesystemMetadata {
+        overlay.config.as_mut().unwrap().binding.root.physical_path = None;
+        overlay
+            .set_routed_request(RoutedRequest {
+                descriptor: Some(Ok(TracedFd(4096))),
+                ..Default::default()
+            })
+            .unwrap();
+        let action = overlay
+            .resolve(
+                process,
+                &open(
+                    b"/",
+                    OpenFlags {
+                        read: true,
+                        directory: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        let prepared = overlay
+            .prepare(OperationId(Uuid::new_v4()), &action)
+            .unwrap();
+        let (fd, state) = overlay
+            .routed_descriptor()
+            .unwrap()
+            .expect("real routed open captured binding");
+        overlay
+            .observe_result(
+                prepared.operation_id,
+                &OperationOutcome::Success {
+                    return_value: fd.0 as u64,
+                },
+            )
+            .unwrap();
+        overlay.commit(prepared.operation_id).unwrap();
+        let mut recreated = process.clone();
+        recreated.fds.insert(fd, state);
+        overlay
+            .filesystem_metadata(&recreated, &FsOp::FstatFs { fd }, token)
+            .unwrap()
+            .unwrap()
+            .metadata
+    }
+
     let mut f = Fixture::new(&[]);
     let run_id = f.overlay.config().unwrap().context.run_id;
     let token = umbra_core::FilesystemQueryToken {
@@ -8920,6 +8970,10 @@ fn f214_resume_identity() {
         .filesystem_metadata(&f.process, &operation, token.clone())
         .unwrap()
         .unwrap();
+    assert_eq!(
+        before.metadata,
+        recreated_descriptor(&mut f.overlay, &f.process, token.clone())
+    );
     f.overlay
         .finish_run(&FinishRunRequest {
             run_id,
@@ -8971,10 +9025,14 @@ fn f214_resume_identity() {
         )
         .unwrap();
     let after = reopened
-        .filesystem_metadata(&f.process, &operation, token)
+        .filesystem_metadata(&f.process, &operation, token.clone())
         .unwrap()
         .unwrap();
     assert_eq!(before.metadata, after.metadata);
+    assert_eq!(
+        after.metadata,
+        recreated_descriptor(&mut reopened, &f.process, token)
+    );
     assert_ne!(
         before.metadata.binding,
         umbra_core::FilesystemBinding::overlay(empty_base.overlay.config().unwrap().context.run_id)
