@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
     if (pthread_join(first, NULL) || pthread_join(second, NULL)) return 17;
     if (!s->request || !s->released || s->result || s->counter != 1) return 18;
     if (close(lockfd)) return 19;
-    int out = open(argv[4], O_CREAT | O_EXCL | O_WRONLY, 0600);
+    int out = open(argv[4], O_CREAT | O_TRUNC | O_WRONLY, 0600);
     const char record[] = "NOT_KERNEL_WAIT_PROOF sibling=1 request=1 released=1 result=0 joined=2\n";
     if (out < 0 || write(out, record, sizeof(record) - 1) != sizeof(record) - 1) return 20;
     return close(out) == 0 ? 0 : 21;
