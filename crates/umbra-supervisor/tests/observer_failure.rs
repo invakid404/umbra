@@ -1,10 +1,10 @@
 //! Preparation failure must release writer ownership and permit reopening.
 #![cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use umbra_core::provider::{encode, ProviderDescriptor, ProviderRegistry};
+use umbra_core::provider::{ProviderDescriptor, ProviderRegistry, encode};
 use umbra_core::{BytePath, RunId, UmbraError};
 use umbra_supervisor::run::{CommandLaunch, RunLaunch, RunSpec};
 use umbra_supervisor::{ResumeSpec, RunObserver, RunOutcome, RunPersistence, Supervisor};
@@ -38,7 +38,7 @@ impl RunObserver for Observer {
                     context: "observer rejected preparation".into(),
                     errno: None,
                     launch_tree_terminated: false,
-                })
+                });
             }
             3 => std::panic::panic_any(HostilePayload),
             _ => {}
@@ -171,10 +171,16 @@ fn scenario(label: &str, failure: u8) {
         journal_log.display()
     )
     .into_bytes();
-    let platform_marker = root.path().join("platform-started");
+    let platform_marker = dir.path().join("platform-started");
     if failure != 0 {
-        let sentinel = root.path().join("platform-sentinel");
-        std::fs::copy(bin("umbra-fix-227-platform-sentinel"), &sentinel).unwrap();
+        let sentinel = dir.path().join("platform-sentinel");
+        std::fs::copy(
+            std::path::Path::new(std::ffi::OsStr::from_bytes(
+                bin("umbra-fix-227-platform-sentinel").as_ref(),
+            )),
+            &sentinel,
+        )
+        .unwrap();
         observed_registry
             .providers
             .get_mut("platform")
@@ -210,8 +216,14 @@ fn scenario(label: &str, failure: u8) {
     let run_id = id.lock().unwrap().expect("prepared reached");
     assert!(
         !platform_marker.exists(),
-        "prepared failure must not connect platform or launch a target"
+        "prepared failure must not request a target launch"
     );
+    if failure != 0 {
+        assert_eq!(
+            std::fs::read(dir.path().join("platform-capabilities")).unwrap(),
+            b"Capabilities\n"
+        );
+    }
     let journal_events = std::fs::read_to_string(&journal_log).unwrap();
     assert_eq!(
         journal_events

@@ -265,4 +265,5 @@ and the file journal to record terminal calls and inject separate cleanup errors
 Build its locked manifest into the workspace target. The supervisor's
 `observer_failure` tests require `UMBRA_TEST_OBSERVER` or
 `UMBRA_INTEGRATION_REQUIRED`; CI supplies required mode. A platform sentinel
-checks that failed preparation never starts the platform provider.
+accepts the capability handshake and checks that failed preparation never
+requests Launch.

@@ -44,6 +44,12 @@ Only the most recently resolved plan can be prepared. Calls are serialized throu
 `resolve -> prepare -> observe_result -> commit` (or `abort`); logical reads and
 new resolutions are blocked while a transaction is pending.
 
+- `FsOp::GetDescriptorFlags` is a bound-session, non-mutating descriptor-table
+  query. The supervisor supplies the process context and fences kernel-range
+  descriptors before calling it. A live entry returns its descriptor-local
+  `close_on_exec` bit; an absent entry is `Deny(EBADF)`. It uses no pathname,
+  backend operation, memory write or journal intent, and does not move an OFD
+  offset. Success still participates in `prepare -> observe_result -> commit`.
 - Read/stat chooses the shadow first, rejects whiteouted base paths, and otherwise
   uses the approved immutable base. Path operations return validated runtime
   rewrites. `NamespaceSession::read_at` provides typed bounded reads; it propagates

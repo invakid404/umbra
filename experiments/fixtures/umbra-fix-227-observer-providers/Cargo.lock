@@ -315,6 +315,7 @@ dependencies = [
  "umbra-core",
  "umbra-journal",
  "umbra-journal-file",
+ "umbra-platform",
  "umbra-storage",
  "umbra-storage-local",
 ]
@@ -333,6 +334,14 @@ version = "0.1.0"
 dependencies = [
  "umbra-core",
  "umbra-journal",
+]
+
+[[package]]
+name = "umbra-platform"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "umbra-core",
 ]
 
 [[package]]
