@@ -10509,12 +10509,19 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     if !root_probe {
         assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
     }
-    let socket =
-        spawn
-            .evidence
-            .parent()
-            .unwrap()
-            .join(if root_probe { "root.sock" } else { "null.sock" });
+    let phase = match case {
+        "fix-243-copyout-error" => "caller-copyout",
+        "fix-243-free-error" => "remote-free",
+        "fix-243-register-error" => "register-commit",
+        _ => "task-acquired",
+    };
+    spawn
+        .provider_environment
+        .push(("UMBRA_FIX_243_PROBE_PHASE".into(), phase.into()));
+    let socket = spawn.evidence.parent().unwrap().join(format!(
+        "{phase}-{}.sock",
+        if root_probe { "root" } else { "child" }
+    ));
     let listener = UnixListener::bind(&socket).unwrap();
     spawn.provider_environment.push((
         "UMBRA_FIX_243_PROBE_SOCKET".into(),
@@ -10548,7 +10555,13 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
             .unwrap();
         let record: serde_json::Value = serde_json::from_str(&line).unwrap();
         std::fs::write(evidence.join("provider-rendezvous.json"), &line).unwrap();
-        assert_eq!(record["phase"], "task-acquired");
+        assert_eq!(record["phase"], phase);
+        if phase != "task-acquired" {
+            assert_eq!(record["session_inserted"], true);
+            assert_eq!(record["parent_stopped"], true);
+            assert_eq!(record["child_stopped"], true);
+            assert_eq!(record["region_owned"], phase != "register-commit");
+        }
         assert_eq!(record["watchdog_registered"], true);
         let child = record["child"].as_i64().unwrap() as i32;
         let observed = slate_process(child)
@@ -10584,10 +10597,12 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     );
     if command == b'E' {
         assert!(
-            routed
-                .run
-                .stderr
-                .contains("injected attach failure after registration"),
+            routed.run.stderr.contains(match phase {
+                "caller-copyout" => "spawn caller PID delivery failed",
+                "remote-free" => "spawn snapshot release failed",
+                "register-commit" => "injected final register commit failure",
+                _ => "injected attach failure after registration",
+            }),
             "{}",
             routed.run.stderr
         );
@@ -10601,7 +10616,7 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
             &spawn,
             "REGISTERED CLEANUP QUALIFIED",
             serde_json::json!({
-                "fault": "attach after Task acquisition", "provider_loss": false,
+                "fault": phase, "provider_loss": false,
                 "identity": observed.json(), "cleanup": cleanup,
             }),
         );
@@ -10631,6 +10646,24 @@ fn fix_243_provider_loss_null_reading() {
 #[test]
 fn fix_243_registered_attach_failure() {
     fix_243_fault_reading("fix-243-attach-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_completion_copyout_failure() {
+    fix_243_fault_reading("fix-243-copyout-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_completion_free_failure() {
+    fix_243_fault_reading("fix-243-free-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_completion_register_failure() {
+    fix_243_fault_reading("fix-243-register-error", "c11-02-attributes", false, b'E');
 }
 
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision

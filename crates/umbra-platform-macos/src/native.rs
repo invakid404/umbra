@@ -1659,6 +1659,33 @@ impl MacosTraceBackend {
         s.return_stop(authorization.token.thread, ReturnKind::PackedSpawn)
     }
 
+    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+    fn probe_spawn_completion(&self, index: usize, phase: &str) -> Result<bool> {
+        let parent = &self.sessions[index];
+        let pending = parent.spawn.as_ref().expect("pending completion");
+        let Some(child_index) = pending.child else {
+            return Ok(false);
+        };
+        let child = &self.sessions[child_index];
+        let registered = self
+            .watchdog
+            .as_ref()
+            .expect("watchdog")
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|task| Arc::ptr_eq(task, &child.task));
+        crate::spawn_probe::rendezvous(
+            phase,
+            child.id.0.native_id as i32,
+            child.birth,
+            serde_json::json!({"watchdog_registered": registered, "session_inserted": true,
+                "parent_stopped": parent.stopped, "child_stopped": child.stopped,
+                "region_owned": pending.region.is_some()}),
+        )
+    }
+
     fn complete_spawn(
         &mut self,
         index: usize,
@@ -1681,16 +1708,32 @@ impl MacosTraceBackend {
         if let Some(child_index) = child {
             if caller != 0 {
                 let pid = self.sessions[child_index].id.0.native_id as i32;
+                #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                let caller = if self.probe_spawn_completion(index, "caller-copyout")? {
+                    0
+                } else {
+                    caller
+                };
                 self.sessions[index]
                     .write(caller, &pid.to_le_bytes())
                     .map_err(|_| unsupported("spawn caller PID delivery failed"))?;
             }
         }
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        let release_fault = self.probe_spawn_completion(index, "remote-free")?;
         let s = &mut self.sessions[index];
         // SAFETY: this task owns the dedicated allocation, with its original
         // extent. Failure retains the accounting and stops the run.
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        let task_port = if release_fault {
+            mach2::port::MACH_PORT_NULL
+        } else {
+            s.task.0
+        };
+        #[cfg(not(feature = "mutation-probe-spawn-lifecycle"))]
+        let task_port = s.task.0;
         let result =
-            unsafe { mach2::vm::mach_vm_deallocate(s.task.0, region, spawn::REGION_BYTES as u64) };
+            unsafe { mach2::vm::mach_vm_deallocate(task_port, region, spawn::REGION_BYTES as u64) };
         if result != 0 {
             return Err(unsupported("spawn snapshot release failed"));
         }
@@ -1701,6 +1744,11 @@ impl MacosTraceBackend {
         // operands that are not return slots are restored.
         set(&mut regs, 1, get(&pending.original, 1)?)?;
         set(&mut regs, 2, get(&pending.original, 2)?)?;
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if self.probe_spawn_completion(index, "register-commit")? {
+            return Err(error("spawn", "injected final register commit failure"));
+        }
+        let s = &mut self.sessions[index];
         s.set_regs(authorization.token.thread, &regs)?;
         s.spawn = None;
         if let Some(child_index) = child {
