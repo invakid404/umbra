@@ -13989,3 +13989,278 @@ fn c16_04_noclobber_incumbent() {
 fn c16_05_written_file_drop_defect() {
     c16_case(5);
 }
+
+// slate-r10-deferred: additive leaves; shared launch/cleanup stays in slate_launch.
+// Fix-phase items: C10-09 Refs #242; C10-12 Refs #135.
+#[test]
+fn slate_r10_deferred_07_independent_opens() {
+    r10_deferred(7);
+}
+#[test]
+fn slate_r10_deferred_08_cross_thread_close() {
+    r10_deferred(8);
+}
+#[test]
+fn slate_r10_deferred_11_fork_after_join() {
+    r10_deferred(11);
+}
+#[test]
+fn slate_r10_deferred_13_poll_helper_alive() {
+    r10_deferred(13);
+}
+#[test]
+fn slate_r10_deferred_16_concurrent_tokio() {
+    r10_deferred(16);
+}
+
+fn r10_deferred(case: u8) {
+    let Some(evidence) = slate_evidence() else {
+        return;
+    };
+    let evidence = evidence.join(format!("C10-{case:02}-deferred"));
+    std::fs::create_dir(&evidence).expect("fresh reading directory required");
+    let scratch = tempfile::tempdir().unwrap();
+    // Prebuilt fixtures keep compilation outside every measurement deadline.
+    let key = if case == 16 {
+        "UMBRA_R10_TOKIO_PATH"
+    } else {
+        "UMBRA_R10_DEFERRED_PATH"
+    };
+    let program = PathBuf::from(std::env::var_os(key).expect("prebuilt fixture path required"));
+    assert!(program.is_file());
+    let seed: &[u8] = if case == 7 { b"......" } else { b"ABCDEF" };
+    let expected: Vec<(&str, &[u8])> = match case {
+        7 => vec![("seed.txt", b"BA....")],
+        8 => vec![("seed.txt", seed), ("out.txt", b"FRESH")],
+        11 => vec![("seed.txt", seed), ("out.txt", b"CHILD")],
+        13 => vec![("seed.txt", seed)],
+        16 => vec![
+            ("seed.txt", seed),
+            ("a.txt", b"TASK-A"),
+            ("b.txt", b"TASK-B"),
+        ],
+        _ => unreachable!(),
+    };
+    let arguments = |cmd: &mut Command, root: &Path| {
+        if case == 16 {
+            cmd.arg("c10-16")
+                .arg(root.join("seed.txt"))
+                .arg(root)
+                .arg(root.join("unused-record"));
+        } else {
+            cmd.arg(case.to_string())
+                .arg(root.join("seed.txt"))
+                .arg(root.join("out.txt"));
+        }
+    };
+    let native = scratch.path().join("native");
+    std::fs::create_dir(&native).unwrap();
+    std::fs::write(native.join("seed.txt"), seed).unwrap();
+    let watch = SlateWatch::new(scratch.path(), &evidence.join("native"), case == 13);
+    let mut command = Command::new(&program);
+    arguments(&mut command, &native);
+    let (output, timed_out) = slate_launch(
+        &mut command,
+        &evidence.join("native"),
+        std::time::Duration::from_secs(60),
+        Some(&watch),
+    );
+    assert!(
+        !timed_out && output.status.success(),
+        "native prerequisite failed"
+    );
+    r10_deferred_records(
+        case,
+        if case == 13 {
+            &output.stdout
+        } else {
+            &output.stderr
+        },
+    );
+    for (name, bytes) in &expected {
+        assert_eq!(std::fs::read(native.join(name)).unwrap(), *bytes);
+    }
+    slate_finish_cleanup();
+    let (host, port) = fixture().expect("live Ganesha required");
+    let workspace = scratch.path().join("workspace");
+    let state = scratch.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    std::fs::write(workspace.join("seed.txt"), seed).unwrap();
+    let registry = registry(scratch.path(), &host, port);
+    assert_no_nfs_mount(&host, port, &[&workspace], "r10-deferred before");
+    let mut command = Command::new(binaries().join("umbra"));
+    command
+        .args(["run", "--registry"])
+        .arg(&registry)
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--experimental", "--"])
+        .arg(&program);
+    arguments(&mut command, &workspace);
+    let watch = SlateWatch::new(scratch.path(), &evidence.join("routed"), case == 13);
+    let (output, timed_out) = slate_launch(
+        &mut command,
+        &evidence.join("routed"),
+        std::time::Duration::from_secs(60),
+        Some(&watch),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let id = stderr
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("umbra: run ")
+                .and_then(|s| s.strip_suffix(" prepared"))
+        })
+        .expect("prepared run");
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+        status: output.status.code(),
+        stderr,
+        destination: workspace.join("out.txt"),
+        state,
+        workspace,
+        registry,
+    };
+    // Retain independent object evidence before asserting the terminal reading.
+    let mut observed = std::collections::BTreeMap::new();
+    for (name, _) in &expected {
+        let mut path = shadow_path(&run);
+        *path.last_mut().unwrap() = name.as_bytes().to_vec();
+        observed.insert(*name, read_whole_object_through_client(&host, port, &path));
+    }
+    std::fs::write(
+        evidence.join("objects.json"),
+        serde_json::to_vec_pretty(&observed).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(evidence.join("run-id.txt"), run.run_id.0.to_string()).unwrap();
+    assert!(!timed_out, "routed deadline");
+    assert_eq!(run.status, Some(0), "{}", run.stderr);
+    assert_eq!(run.child_exit(), 0);
+    r10_deferred_records(
+        case,
+        if case == 13 {
+            &output.stdout
+        } else {
+            run.stderr.as_bytes()
+        },
+    );
+    for (name, bytes) in &expected {
+        assert_eq!(observed[name].as_deref(), Some(*bytes), "NFS {name}");
+        let mut path = shadow_path(&run);
+        *path.last_mut().unwrap() = name.as_bytes().to_vec();
+        assert_eq!(
+            stored_size_through_client(&host, port, &path),
+            Some(bytes.len() as u64)
+        );
+    }
+    assert!(journal_records_completion(&run));
+    let reopened = slate_bounded(
+        Command::new(binaries().join("umbra"))
+            .args(["resume", "--registry"])
+            .arg(&run.registry)
+            .arg("--workspace")
+            .arg(&run.workspace)
+            .arg("--state-dir")
+            .arg(&run.state)
+            .arg(run.run_id.0.to_string()),
+        &evidence.join("reopen"),
+    );
+    assert!(reopened.status.success());
+    assert!(String::from_utf8_lossy(&reopened.stderr).contains("requires no reconciliation"));
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+    assert_eq!(std::fs::read(run.workspace.join("seed.txt")).unwrap(), seed);
+    assert_no_nfs_mount(&host, port, &[&run.workspace], "r10-deferred after");
+    slate_finish_cleanup();
+    std::fs::write(evidence.join("result.txt"), "supported-and-correct: native and routed semantics; independent NFS bytes/lengths; host pristine; journal complete; writer authority reacquired; cleanup qualified\n").unwrap();
+}
+
+fn r10_deferred_records(case: u8, bytes: &[u8]) {
+    let text = std::str::from_utf8(bytes).unwrap();
+    assert!(
+        text.lines().any(|s| s == format!("complete case={case}")),
+        "{text}"
+    );
+    if matches!(case, 7 | 8 | 11 | 13) {
+        let main = slate_field(text, "case=", "main_tid");
+        let helper = slate_field(text, "helper-ready", "tid");
+        assert_ne!(main, helper);
+        if case == 7 {
+            let opens: Vec<_> = text.lines().filter(|s| s.starts_with("open ")).collect();
+            assert_eq!(opens.len(), 2);
+            assert_ne!(
+                slate_field(opens[0], "open", "fd"),
+                slate_field(opens[1], "open", "fd")
+            );
+            assert_eq!(slate_field(opens[0], "open", "tid"), main);
+            assert_eq!(slate_field(opens[1], "open", "tid"), helper);
+            assert!(
+                text.lines()
+                    .any(|s| s.starts_with("write ") && s.contains(&format!("tid={main} ")))
+            );
+            assert!(
+                text.lines()
+                    .any(|s| s.starts_with("write ") && s.contains(&format!("tid={helper} ")))
+            );
+        }
+        if case == 8 {
+            assert_eq!(slate_field(text, "close ", "tid"), helper);
+            assert_eq!(slate_field(text, "stale-read", "tid"), main);
+        }
+    }
+    if case == 13 {
+        let ready = slate_field(text, "c10-13 ready", "child");
+        assert_eq!(slate_field(text, "c10-13 poll", "child"), ready);
+        assert_eq!(slate_field(text, "c10-13 poll", "result"), "0");
+        assert_eq!(slate_field(text, "c10-13 poll", "status"), "1515870810");
+        assert_eq!(slate_field(text, "reap", "child"), ready);
+        assert_eq!(slate_field(text, "reap", "result"), ready);
+        assert_eq!(slate_field(text, "reap", "status"), "0");
+        assert_eq!(
+            text.lines()
+                .filter(|s| s.starts_with("ledger pid="))
+                .count(),
+            1
+        );
+        let mut cursor = 0;
+        for marker in [
+            "c10-13 ready",
+            "helper-ready",
+            "c10-13 poll",
+            "c10-13 helper-joined",
+            "ledger pid=",
+            "c10-13 ack=G",
+            "c10-13 forwarded=G",
+            "reap ",
+        ] {
+            cursor += text[cursor..].find(marker).expect(marker) + marker.len();
+        }
+    } else if case == 11 {
+        assert_eq!(
+            slate_field(text, "reap", "child"),
+            slate_field(text, "reap", "result")
+        );
+        assert_eq!(slate_field(text, "reap", "status"), "0");
+        assert!(text.find("helper-joined").unwrap() < text.find("reap ").unwrap());
+    } else if case == 8 {
+        assert_eq!(slate_field(text, "stale-read", "result"), "-1");
+        assert_eq!(slate_field(text, "stale-read", "errno"), "9");
+        assert!(text.contains("reuse old="));
+    } else if case == 16 {
+        for marker in [
+            "workers_ready=2",
+            "workers_still_alive=2",
+            "task=a.txt write=Ok(())",
+            "task=b.txt write=Ok(())",
+            "owner_joined=1",
+        ] {
+            assert!(text.contains(marker), "{text}");
+        }
+        assert_eq!(text.lines().filter(|l| *l == "join=Ok").count(), 2);
+    }
+}

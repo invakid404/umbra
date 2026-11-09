@@ -550,6 +550,15 @@ jobs:
           cargo build --locked --manifest-path experiments/fixtures/umbra-slate-r16-publication/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           echo "UMBRA_SLATE_R16_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r16-publication" >> "$GITHUB_ENV"
 
+      - name: Build rank-10 deferred fixtures
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-slate-r10-deferred-threads.c -o "$GITHUB_WORKSPACE/target/debug/umbra-slate-r10-deferred-threads"
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build --locked --manifest-path experiments/fixtures/slate-r10-tokio/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
+          echo "UMBRA_R10_DEFERRED_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r10-deferred-threads" >> "$GITHUB_ENV"
+          echo "UMBRA_R10_TOKIO_PATH=$GITHUB_WORKSPACE/target/debug/slate-r10-tokio" >> "$GITHUB_ENV"
+
       - name: Proof 1 -- end to end, the toy and the Rust I/O fixture must exit 0
         run: |
           cargo build --workspace --bins
