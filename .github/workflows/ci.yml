@@ -700,6 +700,7 @@ jobs:
         with:
           name: slate-r10-deferred-readings-${{ github.run_id }}-${{ github.run_attempt }}
           path: /tmp/slate-evidence-${{ github.run_id }}/C10-*-deferred
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
 
