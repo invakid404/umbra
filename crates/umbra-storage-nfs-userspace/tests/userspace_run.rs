@@ -14717,8 +14717,8 @@ fn fix_227_sibling_progress_without_kernel_wait_proof() {
         let native_shared = mode_root.join("native-shared");
         let helper = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            let shared = if mode == "native" {
-                native_shared
+            let mut shared = if mode == "native" {
+                native_shared.clone()
             } else {
                 loop {
                     let candidates: Vec<_> = std::fs::read_dir(&search)
@@ -14738,6 +14738,11 @@ fn fix_227_sibling_progress_without_kernel_wait_proof() {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             };
+            let rewrite_root = if mode == "rewrite" {
+                let root = shared.parent().unwrap().to_owned();
+                shared = native_shared;
+                Some(root)
+            } else { None };
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -14748,6 +14753,15 @@ fn fix_227_sibling_progress_without_kernel_wait_proof() {
             let pending = helper_locator.with_extension("pending");
             std::fs::write(&pending, shared.as_os_str().as_bytes()).unwrap();
             std::fs::rename(pending, &helper_locator).unwrap();
+            if let Some(root) = rewrite_root {
+                // Initializers are traced in rewrite mode. Wait for the copy-up
+                // and map the same physical object the target will mmap.
+                shared = root.join(shared.strip_prefix("/").unwrap());
+                while !shared.is_file() {
+                    assert!(std::time::Instant::now() < deadline, "shared mapping copy-up missing");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
             let (out, timeout) = slate_launch(
                 Command::new(helper_program)
                     .arg("helper")
