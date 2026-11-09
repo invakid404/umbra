@@ -13989,3 +13989,342 @@ fn c16_04_noclobber_incumbent() {
 fn c16_05_written_file_drop_defect() {
     c16_case(5);
 }
+
+// slate-r10-deferred: additive leaves; shared launch/cleanup stays in slate_launch.
+// Fix-phase items: C10-09 Refs #242; C10-12 Refs #135.
+#[test]
+fn slate_r10_deferred_07_independent_opens() {
+    r10_deferred(7);
+}
+#[test]
+fn slate_r10_deferred_08_cross_thread_close() {
+    r10_deferred(8);
+}
+#[test]
+fn slate_r10_deferred_11_fork_after_join() {
+    r10_deferred(11);
+}
+#[test]
+fn slate_r10_deferred_13_poll_helper_alive() {
+    r10_deferred(13);
+}
+#[test]
+fn slate_r10_deferred_16_concurrent_tokio() {
+    r10_deferred(16);
+}
+
+fn r10_deferred(case: u8) {
+    let Some(evidence) = slate_evidence() else {
+        return;
+    };
+    let evidence = evidence.join(format!("C10-{case:02}-deferred"));
+    std::fs::create_dir(&evidence).expect("fresh reading directory required");
+    let scratch = tempfile::tempdir_in(&evidence).unwrap().keep();
+    // Prebuilt fixtures keep compilation outside every measurement deadline.
+    let key = if case == 16 {
+        "UMBRA_R10_TOKIO_PATH"
+    } else {
+        "UMBRA_R10_DEFERRED_PATH"
+    };
+    let program = PathBuf::from(std::env::var_os(key).expect("prebuilt fixture path required"));
+    assert!(program.is_file());
+    let seed: &[u8] = if case == 7 { b"......" } else { b"ABCDEF" };
+    let expected: Vec<(&str, &[u8])> = match case {
+        7 => vec![("seed.txt", b"BA....")],
+        8 => vec![("out.txt", b"FRESH")],
+        11 => vec![("out.txt", b"CHILD")],
+        13 => vec![],
+        16 => vec![("a.txt", b"TASK-A"), ("b.txt", b"TASK-B")],
+        _ => unreachable!(),
+    };
+    let arguments = |cmd: &mut Command, root: &Path| {
+        if case == 16 {
+            cmd.arg("c10-16")
+                .arg(root.join("seed.txt"))
+                .arg(root)
+                .arg(root.join("unused-record"));
+        } else {
+            cmd.arg(case.to_string())
+                .arg(root.join("seed.txt"))
+                .arg(root.join("out.txt"));
+        }
+    };
+    let native = scratch.as_path().join("native");
+    std::fs::create_dir(&native).unwrap();
+    std::fs::write(native.join("seed.txt"), seed).unwrap();
+    let watch = SlateWatch::new(scratch.as_path(), &evidence.join("native"), false);
+    let mut command = Command::new(&program);
+    arguments(&mut command, &native);
+    let (output, timed_out) = slate_launch(
+        &mut command,
+        &evidence.join("native"),
+        std::time::Duration::from_secs(60),
+        Some(&watch),
+    );
+    assert!(
+        !timed_out && output.status.success(),
+        "native prerequisite failed"
+    );
+    r10_deferred_records(case, &output.stderr);
+    for (name, bytes) in &expected {
+        assert_eq!(std::fs::read(native.join(name)).unwrap(), *bytes);
+    }
+    if case != 7 {
+        assert_eq!(std::fs::read(native.join("seed.txt")).unwrap(), seed);
+    }
+    slate_finish_cleanup();
+    let (host, port) = fixture().expect("live Ganesha required");
+    let workspace = scratch.as_path().join("workspace");
+    let state = scratch.as_path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    std::fs::write(workspace.join("seed.txt"), seed).unwrap();
+    let registry = registry(scratch.as_path(), &host, port);
+    assert_no_nfs_mount(&host, port, &[&workspace], "r10-deferred before");
+    let mut command = Command::new(binaries().join("umbra"));
+    command
+        .args(["run", "--registry"])
+        .arg(&registry)
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--experimental", "--"])
+        .arg(&program);
+    arguments(&mut command, &workspace);
+    let watch = SlateWatch::new(scratch.as_path(), &evidence.join("routed"), false);
+    let (output, timed_out) = slate_launch(
+        &mut command,
+        &evidence.join("routed"),
+        std::time::Duration::from_secs(60),
+        Some(&watch),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let id = stderr
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("umbra: run ")
+                .and_then(|s| s.strip_suffix(" prepared"))
+        })
+        .expect("prepared run");
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+        status: output.status.code(),
+        stderr,
+        destination: workspace.join("out.txt"),
+        state,
+        workspace,
+        registry,
+    };
+    // Retain independent object evidence before asserting the terminal reading.
+    let mut observed = std::collections::BTreeMap::new();
+    for (name, _) in &expected {
+        let mut path = shadow_path(&run);
+        *path.last_mut().unwrap() = name.as_bytes().to_vec();
+        observed.insert(*name, read_whole_object_through_client(&host, port, &path));
+    }
+    std::fs::write(
+        evidence.join("objects.json"),
+        serde_json::to_vec_pretty(&observed).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(evidence.join("run-id.txt"), run.run_id.0.to_string()).unwrap();
+    assert!(!timed_out, "routed deadline");
+    assert_eq!(run.status, Some(0), "{}", run.stderr);
+    assert_eq!(run.child_exit(), 0);
+    r10_deferred_records(case, run.stderr.as_bytes());
+    for (name, bytes) in &expected {
+        assert_eq!(observed[name].as_deref(), Some(*bytes), "NFS {name}");
+        let mut path = shadow_path(&run);
+        *path.last_mut().unwrap() = name.as_bytes().to_vec();
+        assert_eq!(
+            stored_size_through_client(&host, port, &path),
+            Some(bytes.len() as u64)
+        );
+    }
+    let mut expected_names: Vec<_> = expected
+        .iter()
+        .map(|(name, _)| name.as_bytes().to_vec())
+        .collect();
+    expected_names.sort();
+    assert_eq!(r10_shadow_names(&host, port, &run), expected_names);
+    assert!(journal_records_completion(&run));
+    let reopened = slate_bounded(
+        Command::new(binaries().join("umbra"))
+            .args(["resume", "--registry"])
+            .arg(&run.registry)
+            .arg("--workspace")
+            .arg(&run.workspace)
+            .arg("--state-dir")
+            .arg(&run.state)
+            .arg(run.run_id.0.to_string()),
+        &evidence.join("reopen"),
+    );
+    assert!(reopened.status.success());
+    assert!(String::from_utf8_lossy(&reopened.stderr).contains("requires no reconciliation"));
+    assert_workspace_pristine(&run);
+    assert_host_write_root_empty(&run);
+    assert_eq!(std::fs::read(run.workspace.join("seed.txt")).unwrap(), seed);
+    assert_no_nfs_mount(&host, port, &[&run.workspace], "r10-deferred after");
+    slate_finish_cleanup();
+    std::fs::write(evidence.join("result.txt"), "supported-and-correct: native and routed semantics; independent NFS bytes/lengths; host pristine; journal complete; writer authority reacquired; cleanup qualified\n").unwrap();
+}
+
+fn r10_deferred_records(case: u8, bytes: &[u8]) {
+    let text = std::str::from_utf8(bytes).unwrap();
+    assert!(
+        text.lines().any(|s| s == format!("complete case={case}")),
+        "{text}"
+    );
+    if matches!(case, 7 | 8 | 11 | 13) {
+        let main = slate_field(text, "case=", "main_tid");
+        let helper = slate_field(text, "helper-ready", "tid");
+        assert_ne!(main, helper);
+        if case == 7 {
+            let opens: Vec<_> = text.lines().filter(|s| s.starts_with("open ")).collect();
+            assert_eq!(opens.len(), 2);
+            assert_ne!(
+                slate_field(opens[0], "open", "fd"),
+                slate_field(opens[1], "open", "fd")
+            );
+            assert_eq!(slate_field(opens[0], "open", "tid"), main);
+            assert_eq!(slate_field(opens[1], "open", "tid"), helper);
+            assert!(text
+                .lines()
+                .any(|s| s.starts_with("write ") && s.contains(&format!("tid={main} "))));
+            assert!(text
+                .lines()
+                .any(|s| s.starts_with("write ") && s.contains(&format!("tid={helper} "))));
+        }
+        if case == 8 {
+            assert_eq!(slate_field(text, "close ", "tid"), helper);
+            assert_eq!(slate_field(text, "stale-read", "tid"), main);
+        }
+    }
+    if case == 13 {
+        let ready = slate_field(text, "c10-13 ready", "child");
+        assert_eq!(slate_field(text, "c10-13 poll", "child"), ready);
+        assert_eq!(slate_field(text, "c10-13 poll", "result"), "0");
+        assert_eq!(slate_field(text, "c10-13 poll", "status"), "1515870810");
+        assert_eq!(slate_field(text, "reap", "child"), ready);
+        assert_eq!(slate_field(text, "reap", "result"), ready);
+        assert_eq!(slate_field(text, "reap", "status"), "0");
+        assert_eq!(slate_field(text, "c10-13 pre-poll", "parked"), "1");
+        assert_eq!(slate_field(text, "c10-13 pre-poll", "leaving"), "0");
+        assert_eq!(slate_field(text, "c10-13 pre-poll", "phase"), "1");
+        assert_eq!(
+            slate_field(text, "c10-13 pre-poll", "helper_tid"),
+            slate_field(text, "helper-ready", "tid")
+        );
+        assert_eq!(
+            slate_field(text, "c10-13 release", "caller_tid"),
+            slate_field(text, "case=", "main_tid")
+        );
+        assert_eq!(text.matches("c10-13 child-post-release=CHILD-G").count(), 1);
+        let mut cursor = 0;
+        for marker in [
+            "c10-13 ready",
+            "helper-ready",
+            "c10-13 pre-poll",
+            "c10-13 poll",
+            "helper-leaving",
+            "c10-13 helper-joined",
+            "c10-13 release=G",
+            "c10-13 child-post-release=CHILD-G",
+            "reap ",
+        ] {
+            cursor += text[cursor..].find(marker).expect(marker) + marker.len();
+        }
+    } else if case == 11 {
+        assert_eq!(
+            slate_field(text, "reap", "child"),
+            slate_field(text, "reap", "result")
+        );
+        assert_eq!(slate_field(text, "reap", "status"), "0");
+        assert!(text.find("helper-joined").unwrap() < text.find("reap ").unwrap());
+    } else if case == 8 {
+        assert_eq!(slate_field(text, "stale-read", "result"), "-1");
+        assert_eq!(slate_field(text, "stale-read", "errno"), "9");
+        assert!(text.contains("reuse old="));
+    } else if case == 16 {
+        for marker in [
+            "workers_ready=2",
+            "workers_still_alive=2",
+            "task=a.txt write=Ok(())",
+            "task=b.txt write=Ok(())",
+            "owner_joined=1",
+        ] {
+            assert!(text.contains(marker), "{text}");
+        }
+        assert_eq!(text.lines().filter(|l| *l == "join=Ok").count(), 2);
+    }
+}
+
+// A read-only workload need not materialize its logical workspace in the shadow.
+// Only explicit NOENT below the existing run root means absent; transport errors fail.
+fn r10_shadow_names(host: &str, port: u16, run: &Run) -> Vec<Vec<u8>> {
+    let mut config = RawTransportConfig::loopback(port);
+    config.host = host.to_owned();
+    let deadline = Deadline { millis: 5000 };
+    let mut transport = LibnfsRawTransport::connect(config).unwrap();
+    let mut handle = transport.root_filehandle(deadline).unwrap();
+    let mut path = shadow_path(run);
+    path.pop();
+    for (index, part) in path.into_iter().enumerate() {
+        match transport.lookup(
+            &handle,
+            &ComponentName::new(part).unwrap(),
+            AttrMask::STAT,
+            deadline,
+        ) {
+            Ok((next, _)) => handle = next,
+            Err(e) if r10_absent_workspace(index, e.status().map(|s| s.0)) => return Vec::new(),
+            Err(e) => panic!("shadow namespace inspection failed: {e:?}"),
+        }
+    }
+    c13_shadow_names(host, port, run)
+}
+
+fn r10_absent_workspace(index: usize, status: Option<u32>) -> bool {
+    index >= 4 && status == Some(2)
+}
+
+#[test]
+fn slate_r10_deferred_retained_poll_evidence() {
+    // Original run exited successfully, then the old namespace census failed on
+    // NOENT. Replay its protocol evidence without relabeling that run qualified.
+    for bytes in [
+        include_bytes!(
+            "../../../experiments/fixtures/umbra-slate-r10-deferred-readings/c10-13-native.stderr"
+        )
+        .as_slice(),
+        include_bytes!(
+            "../../../experiments/fixtures/umbra-slate-r10-deferred-readings/c10-13-routed.stderr"
+        )
+        .as_slice(),
+    ] {
+        r10_deferred_records(13, bytes);
+        let text = std::str::from_utf8(bytes).unwrap();
+        for bad in [
+            text.replace("status=1515870810", "status=0"),
+            text.replace("parked=1", "parked=0"),
+            text.replace("child-post-release=CHILD-G", "child-post-release=WRONG"),
+        ] {
+            assert!(std::panic::catch_unwind(|| r10_deferred_records(13, bad.as_bytes())).is_err());
+        }
+    }
+    assert!(r10_absent_workspace(4, Some(2)));
+    assert!(
+        !r10_absent_workspace(3, Some(2)),
+        "missing run root is an error"
+    );
+    assert!(
+        !r10_absent_workspace(4, None),
+        "transport failure is not absence"
+    );
+    assert!(
+        !r10_absent_workspace(4, Some(13)),
+        "permission refusal is not absence"
+    );
+}

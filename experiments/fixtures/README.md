@@ -195,3 +195,50 @@ The revised fixture retains its written source File across publication, reports
 through the inherited stderr pipe and exits explicitly to sidestep #227. Mode 5 independently
 executes write-plus-drop to pin that defect. The incumbent companion requires
 `docker` on the harness PATH and the loopback fixture container.
+
+
+## Rank-10 deferred characterization
+
+The `slate_r10_deferred_` tests add independent-open offsets (C10-07),
+cross-thread close (C10-08), fork after helper join (C10-11), polling wait with
+a helper (C10-13), and concurrent Tokio files (C10-16). These are proposed
+positive contracts; adding a test does not certify its result. C10-09 remains
+fix-phase work under #242, and C10-12 remains under #135.
+
+Prebuild `umbra-slate-r10-deferred-threads.c` with `clang -arch arm64 -O1`
+and the existing `slate-r10-tokio` Cargo fixture with `--locked`, into this
+checkout's `target/`. Set `UMBRA_R10_DEFERRED_PATH` and `UMBRA_R10_TOKIO_PATH`
+to the binaries. Tokio remains pinned to `=1.48.0`; this does not qualify
+version parity with Codex 44fe510's Tokio 1.52.3. Existing fixture modes are
+unchanged. The new mode retains task Results and joins, not blocking-worker
+syscall errno or TID attribution.
+
+Use a fresh `UMBRA_SLATE_EVIDENCE` directory, the live userspace Ganesha fixture,
+and `UMBRA_INTEGRATION_REQUIRED=1`. Run through the serial wrapper while the
+shared runner is idle, with at least 5 GiB free. Select one
+`slate_r10_deferred_` test with `--exact --nocapture`. Each leaf uses the
+existing 60-second launcher and 10-second cleanup grace, running its native
+control before its routed comparison. Evidence includes native/routed streams,
+cleanup and census records, independent NFS objects, run ID and resume output.
+No mounted-NFS run is needed. Missing census evidence does not qualify cleanup.
+
+C10-13 uses a pipe-held child and an in-memory helper rendezvous. The parent
+records the focal WNOHANG result on inherited stderr, joins the helper, then
+writes the child release byte and reaps it. The child emits a post-release
+sentinel; the harness checks its exact status and the record order. This
+replaces the initial proposed external ledger protocol: routed tracee stdin
+and stdout are null, so that acknowledgment channel cannot reach it. Native
+and routed controls use the same amended protocol. No passing result is
+inferred from setup, compilation or a timeout.
+
+Local native/routed pairs for C10-07, C10-08, C10-11 and C10-16 passed their
+complete contracts. C10-13's protocol and launch cleanup matched Expected,
+but its test failed afterwards: the namespace oracle assumed a read-only
+workload materialized its logical workspace in the shadow. The corrected
+oracle accepts only explicit NFS NOENT below the existing run root. The
+original failed reading remains retained; journal/reopen and final host checks
+were not reached and its temporary state was removed on unwind. C10-13 is
+therefore not fully qualified by that reading. The offline retained-record test
+validates its protocol evidence and rejects corrupted records; it cannot recover
+the missing checks. Future readings preserve scratch state under the evidence
+root. Final CI must exercise the corrected instrument independently.

@@ -550,6 +550,15 @@ jobs:
           cargo build --locked --manifest-path experiments/fixtures/umbra-slate-r16-publication/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           echo "UMBRA_SLATE_R16_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r16-publication" >> "$GITHUB_ENV"
 
+      - name: Build rank-10 deferred fixtures
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-slate-r10-deferred-threads.c -o "$GITHUB_WORKSPACE/target/debug/umbra-slate-r10-deferred-threads"
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build --locked --manifest-path experiments/fixtures/slate-r10-tokio/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
+          echo "UMBRA_R10_DEFERRED_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r10-deferred-threads" >> "$GITHUB_ENV"
+          echo "UMBRA_R10_TOKIO_PATH=$GITHUB_WORKSPACE/target/debug/slate-r10-tokio" >> "$GITHUB_ENV"
+
       - name: Proof 1 -- end to end, the toy and the Rust I/O fixture must exit 0
         run: |
           cargo build --workspace --bins
@@ -682,6 +691,16 @@ jobs:
         with:
           name: slate-r16-readings-${{ github.run_id }}-${{ github.run_attempt }}
           path: /tmp/slate-evidence-${{ github.run_id }}/C16-*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload rank-10 deferred readings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: slate-r10-deferred-readings-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/slate-evidence-${{ github.run_id }}/C10-*-deferred
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
 

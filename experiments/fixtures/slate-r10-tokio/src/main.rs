@@ -68,6 +68,10 @@ fn main() {
     let args: Vec<_> = std::env::args_os().collect();
     assert_eq!(args.len(), 5);
     let mode = args[1].to_str().unwrap().to_owned();
+    if mode == "c10-16" {
+        concurrent_files(PathBuf::from(&args[3]));
+        return;
+    }
     assert!(mode == "c10-14" || mode == "c10-15");
     let input = PathBuf::from(&args[2]);
     let output = PathBuf::from(&args[3]);
@@ -105,4 +109,84 @@ fn main() {
     }).join().expect("runtime owner joined");
     // Original thread lives throughout runtime work; records written after join.
     std::fs::write(result.0, format!("{}owner_joined=1\n", result.1)).unwrap();
+}
+
+// Additive rank-10 deferred mode; existing roundtrip modes remain unchanged.
+fn concurrent_files(root: PathBuf) {
+    let main_tid = tid();
+    let report = std::thread::spawn(move || {
+        let owner = tid();
+        let live = Arc::new((Mutex::new(BTreeSet::new()), Condvar::new()));
+        let starts = live.clone();
+        let stops = live.clone();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .on_thread_start(move || {
+                starts.0.lock().unwrap().insert(tid());
+                starts.1.notify_all();
+            })
+            .on_thread_stop(move || {
+                stops.0.lock().unwrap().remove(&tid());
+                stops.1.notify_all();
+            })
+            .build()
+            .unwrap();
+        let mut active = live.0.lock().unwrap();
+        while active.len() < 2 {
+            active = live.1.wait(active).unwrap();
+        }
+        let workers: Vec<_> = active.iter().copied().collect();
+        drop(active);
+        let tasks = rt.block_on(async {
+            let gate = Arc::new(tokio::sync::Barrier::new(3));
+            let mut joins = Vec::new();
+            for (name, payload) in [("a.txt", b"TASK-A"), ("b.txt", b"TASK-B")] {
+                let gate = gate.clone();
+                let path = root.join(name);
+                joins.push(tokio::spawn(async move {
+                    let mut report = format!("task={name} ready poll_tid={}\n", tid());
+                    gate.wait().await;
+                    let written = tokio::fs::write(&path, payload).await;
+                    writeln!(report, "task={name} write={written:?} poll_tid={}", tid()).unwrap();
+                    let read = tokio::fs::read(&path).await;
+                    writeln!(report, "task={name} read={read:?} poll_tid={}", tid()).unwrap();
+                    let ok = written.is_ok() && read.as_deref().ok() == Some(payload.as_slice());
+                    (report, ok)
+                }));
+            }
+            gate.wait().await;
+            let mut reports = Vec::new();
+            for join in joins {
+                reports.push(join.await);
+            }
+            reports
+        });
+        let active = live.0.lock().unwrap();
+        assert!(workers.iter().all(|w| active.contains(w)));
+        drop(active);
+        let mut report = format!(
+            "case=16 main_tid={main_tid} owner_tid={owner} workers_ready=2 workers_still_alive=2\n"
+        );
+        let mut ok = true;
+        for task in tasks {
+            match task {
+                Ok((text, good)) => {
+                    report.push_str(&text);
+                    report.push_str("join=Ok\n");
+                    ok &= good;
+                }
+                Err(e) => {
+                    writeln!(report, "join=Err({e})").unwrap();
+                    ok = false;
+                }
+            }
+        }
+        drop(rt);
+        (report, ok)
+    })
+    .join()
+    .unwrap();
+    eprint!("{}owner_joined=1\n", report.0);
+    assert!(report.1, "concurrent task semantic failure");
+    eprintln!("complete case=16");
 }
