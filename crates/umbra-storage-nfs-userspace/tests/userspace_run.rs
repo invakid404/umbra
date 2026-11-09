@@ -12608,6 +12608,11 @@ fn f214_error_precedence() {
 }
 
 #[test]
+fn f214_lookup_boundaries() {
+    f214_metadata_case("lookup");
+}
+
+#[test]
 fn f214_fork_exec() {
     f214_metadata_case("fork");
 }

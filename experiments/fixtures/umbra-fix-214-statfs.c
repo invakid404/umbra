@@ -72,6 +72,23 @@ int main(int argc, char **argv) {
         require(length >= 0 && (size_t)length < sizeof(missing), "missing length");
         require(statfs(missing, bad) == -1 && errno == ENOENT, "missing before bad pointer");
     }
+    if (strcmp(argv[1], "lookup") == 0) {
+        require(chdir(argv[2]) == 0, "logical chdir");
+        require(symlinkat("seed.txt", AT_FDCWD, "alias") == 0, "alias setup");
+        require(symlinkat("absent", AT_FDCWD, "dangling") == 0, "dangling setup");
+        require(symlinkat("loop", AT_FDCWD, "loop") == 0, "loop setup");
+        struct statfs relative;
+        require(statfs("seed.txt", &relative) == 0, "relative lookup");
+        require(memcmp(&relative.f_fsid, &by_fd.f_fsid, sizeof(relative.f_fsid)) == 0,
+                "relative identity");
+        require(statfs("alias", &relative) == 0, "final symlink");
+        require(memcmp(&relative.f_fsid, &by_fd.f_fsid, sizeof(relative.f_fsid)) == 0,
+                "symlink identity");
+        require(statfs("dangling", &relative) == -1 && errno == ENOENT, "dangling lookup");
+        require(statfs("loop", &relative) == -1 && errno == ELOOP, "loop lookup");
+        require(statfs("seed.txt/child", &relative) == -1 && errno == ENOTDIR,
+                "non-directory prefix");
+    }
     if (strcmp(argv[1], "fork") == 0) {
         int cloexec = open(path, O_RDONLY | O_CLOEXEC);
         require(cloexec >= 0, "cloexec open");
