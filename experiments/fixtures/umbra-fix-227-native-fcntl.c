@@ -71,7 +71,7 @@ int main(int argc, char **argv) {
     note("cost fstat calls=16 elapsed_ns=%llu\n", elapsed);
     if (close(fd)) return 18;
     int out = open(argv[2], O_CREAT | O_EXCL | O_WRONLY, 0600);
-    if (out < 0) return 19;
+    if (out < 0) { fprintf(stderr, "record open path=%s errno=%d\n", argv[2], errno); return 19; }
     size_t done = 0;
     while (done < used) {
         ssize_t n = write(out, records + done, used - done);

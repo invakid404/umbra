@@ -32,10 +32,12 @@ static void *a(void *unused) {
     s->tid = tid;
     s->pid = getpid();
     struct flock lock = {.l_type = F_RDLCK, .l_whence = SEEK_SET};
+    fprintf(stderr, "thread A entering fcntl fd=%d\n", lockfd);
     s->attempted = 1;
     int rc = fcntl(lockfd, F_SETLKW, &lock);
     s->result = rc;
     s->returned = 1;
+    fprintf(stderr, "thread A returned rc=%d errno=%d\n", rc, errno);
     return NULL;
 }
 static void *b(void *unused) {
@@ -83,12 +85,13 @@ __attribute__((constructor)) static void prepare_host_descriptors(void) {
     setup_result = setup(*_NSGetArgc(), *_NSGetArgv());
 }
 int main(int argc, char **argv) {
-    if (setup_result) return setup_result;
+    if (setup_result) { fprintf(stderr, "setup result=%d errno=%d\n", setup_result, errno); return setup_result; }
     if (argc != 5) return 10;
     int helper = !strcmp(argv[1], "helper");
     if (helper) {
         struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
         if (fcntl(lockfd, F_SETLK, &lock)) return 14;
+        fprintf(stderr, "helper acquired lock pid=%d mapping=%s\n", getpid(), argv[2]);
         s->ready = 1;
         struct timespec delay = {.tv_nsec = 10000000};
         int observed = 0;
@@ -115,7 +118,9 @@ int main(int argc, char **argv) {
                 observed, s->request, s->counter, valid, rc);
         return valid && rc == 0 && close(lockfd) == 0 ? 0 : 15;
     }
+    fprintf(stderr, "target mapped pid=%d\n", getpid());
     while (!s->ready) {}
+    fprintf(stderr, "target helper ready\n");
     pthread_t first, second;
     if (pthread_create(&first, NULL, a, NULL) || pthread_create(&second, NULL, b, NULL))
         return 16;
