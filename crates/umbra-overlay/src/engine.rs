@@ -2533,15 +2533,22 @@ impl NamespaceResolver for Overlay {
                 return self.resolve_routed_write(context, operation, *fd, *length, *offset, routed)
             }
             FsOp::GetDescriptorFlags { fd } => {
-                return Ok(match context.fds.get(fd) {
-                    Some(state) => ResolvedAction::Emulate(EmulatedResult {
-                        outcome: OperationOutcome::Success {
-                            return_value: u64::from(state.flags.close_on_exec),
-                        },
-                        memory_writes: vec![],
-                    }),
-                    None => ResolvedAction::Deny(Errno(9)),
+                let Some(state) = context.fds.get(fd) else {
+                    return Ok(ResolvedAction::Deny(Errno(9)));
+                };
+                let action = ResolvedAction::Emulate(EmulatedResult {
+                    outcome: OperationOutcome::Success { return_value: u64::from(state.flags.close_on_exec) },
+                    memory_writes: vec![],
                 });
+                // A non-mutating plan participates in the normal operation
+                // lifecycle but performs no pathname lookup or journal intent.
+                self.planned = Some(Plan {
+                    action: action.clone(), operation: operation.clone(),
+                    path: StoragePath::new(StorageAnchor::Root, Vec::new())?,
+                    destination: None, mutation: false, directory_next: None,
+                    routed_write: None, directory_closed: None,
+                });
+                return Ok(action);
             }
             FsOp::Close { fd } => return self.resolve_routed_close(context, operation, *fd),
             FsOp::Fstat { fd } => return self.resolve_routed_fstat(context, operation, *fd),

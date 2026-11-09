@@ -2,6 +2,7 @@
  * argv: host-file record-file. The host file is outside the routed workspace.
  * Fixed preregistered count: 16 calls per timing loop; startup is excluded. */
 #include <errno.h>
+#include <crt_externs.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -11,6 +12,11 @@
 #include <time.h>
 #include <unistd.h>
 
+static int native_fd = -1;
+/* Before interposer arming: deliberately acquire an ordinary kernel fd. */
+__attribute__((constructor)) static void open_native_control(void) {
+    if (*_NSGetArgc() == 3) native_fd = open((*_NSGetArgv())[1], O_RDONLY | O_CLOEXEC);
+}
 static char records[8192];
 static size_t used;
 static void note(const char *format, ...) {
@@ -31,7 +37,7 @@ static unsigned long long now(void) {
 }
 int main(int argc, char **argv) {
     if (argc != 3) return 12;
-    int fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+    int fd = native_fd;
     if (fd < 0) return 13;
     errno = 0; record("getfd", fcntl(fd, F_GETFD));
     errno = 0; record("getfl", fcntl(fd, F_GETFL));

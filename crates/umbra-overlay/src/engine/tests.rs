@@ -8651,6 +8651,10 @@ fn descriptor_flags_use_only_the_live_descriptor_table() {
         assert_eq!(f.overlay.resolve(&f.process, &op).unwrap(), ResolvedAction::Emulate(EmulatedResult {
             outcome: OperationOutcome::Success { return_value: u64::from(close_on_exec) }, memory_writes: vec![]
         }));
+        let prepared = f.prepare(&op);
+        f.overlay.observe_result(prepared.operation_id, &OperationOutcome::Success { return_value: u64::from(close_on_exec) }).unwrap();
+        f.overlay.commit(prepared.operation_id).unwrap();
+        assert!(f.log.lock().unwrap().records.is_empty(), "GETFD must not journal");
         assert_eq!(f.process.fds[&fd].offset, 73);
     }
     f.process.fds.remove(&fd);

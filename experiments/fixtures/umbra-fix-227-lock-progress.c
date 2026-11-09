@@ -3,6 +3,7 @@
  * suspension. The no-fcntl-stubs test and ABI controls are separate obligations.
  * helper/target share a pre-mapped host file; neither waits on a traced pipe. */
 #include <errno.h>
+#include <crt_externs.h>
 #include <fcntl.h>
 #include <libproc.h>
 #include <pthread.h>
@@ -44,7 +45,7 @@ static void *b(void *unused) {
     s->request = 1;
     return NULL;
 }
-int main(int argc, char **argv) {
+static int setup(int argc, char **argv) {
     if (argc != 5) return 10;
     int helper = !strcmp(argv[1], "helper");
     char shared_path[4096];
@@ -74,6 +75,17 @@ int main(int argc, char **argv) {
     if (s == MAP_FAILED || close(mapping)) return 12;
     lockfd = open(argv[3], helper ? O_RDWR : O_RDONLY);
     if (lockfd < 0) return 13;
+    return 0;
+}
+static int setup_result;
+/* Map shared state and open the host lock before supervisor arming. */
+__attribute__((constructor)) static void prepare_host_descriptors(void) {
+    setup_result = setup(*_NSGetArgc(), *_NSGetArgv());
+}
+int main(int argc, char **argv) {
+    if (setup_result) return setup_result;
+    if (argc != 5) return 10;
+    int helper = !strcmp(argv[1], "helper");
     if (helper) {
         struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
         if (fcntl(lockfd, F_SETLK, &lock)) return 14;
