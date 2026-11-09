@@ -12458,7 +12458,7 @@ fn r14_routed(
     let observer = R14Observer::start(evidence.join("observer"), move |_, end| {
         let id = r14_run_id(&seen_state)?;
         let mut objects = serde_json::Map::new();
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".lock"] {
             let mut path = vec![
                 EXPORT.to_vec(),
                 RUN_PARENT.to_vec(),
@@ -12861,6 +12861,28 @@ fn r14_case(seeded: bool) {
     assert_host_write_root_empty(&run);
     // Exact measured refusal, never compatibility: original afed50b9 positive
     // assertions failed for both cases and remain in the first-reading evidence.
+    // The metadata contract may select dotlock. Observe both before the
+    // terminal exchange and after teardown, even if the error oracle changes.
+    let lock_snapshot: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(evidence.join("routed-reading/observer/sidecars-5.json")).unwrap(),
+    ).unwrap();
+    let (lock_host, lock_port) = fixture().unwrap();
+    let mut lock_path = shadow_path(&run);
+    lock_path.last_mut().unwrap().extend_from_slice(b".lock");
+    let lock_after = r14_nfs_object(
+        &lock_host, lock_port, &lock_path,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+    ).unwrap();
+    std::fs::write(
+        evidence.join("lock-directory.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "after_connect": lock_snapshot["state.sqlite.lock"],
+            "after_teardown": lock_after,
+        })).unwrap(),
+    ).unwrap();
+    assert!(lock_snapshot.get("state.sqlite.lock").is_some(), "lock observation missing");
+    assert!(lock_snapshot["state.sqlite.lock"].is_null(), "persistent lock directory requires anchor ruling");
+    assert!(lock_after.is_null(), "persistent lock directory requires anchor ruling");
     assert_eq!(run.status, Some(1), "{}", run.stderr);
     assert_eq!(run.child_exit(), 20);
     assert!(run.stderr.contains("ProcessFailed during run.child"));
