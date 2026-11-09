@@ -12598,8 +12598,13 @@ fn f214_base_copyup_identity() {
 }
 
 #[test]
-fn f214_open_unlink_rename() {
+fn f214_open_unlink() {
     f214_metadata_case("unlink");
+}
+
+#[test]
+fn f214_rename_refusal_preserves_binding() {
+    f214_metadata_case("rename-refusal");
 }
 
 #[test]

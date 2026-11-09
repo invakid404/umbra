@@ -196,20 +196,30 @@ int main(int argc, char **argv) {
         require(close(writer) == 0, "copyup close");
         by_path = after;
     }
-    if (strcmp(argv[1], "unlink") == 0) {
+    if (strcmp(argv[1], "rename-refusal") == 0) {
         char renamed[4096];
         length = snprintf(renamed, sizeof(renamed), "%s/renamed.txt", argv[2]);
         require(length >= 0 && (size_t)length < sizeof(renamed), "rename length");
-        require(renameat(AT_FDCWD, path, AT_FDCWD, renamed) == 0, "renameat");
         struct statfs after;
-        memset(&after, 0, sizeof(after));
-        require(statfs(path, &after) == -1 && errno == ENOENT, "old name absent");
-        require(statfs(renamed, &after) == 0, "new name present");
-        require(fstatfs(fd, &after) == 0, "renamed fd");
+        if (strcmp(by_fd.f_fstypename, "umbra") == 0) {
+            require(renameat(AT_FDCWD, path, AT_FDCWD, renamed) == -1 && errno == ENOTSUP,
+                    "exact routed rename refusal");
+            require(statfs(path, &after) == 0, "refused source remains");
+            require(statfs(renamed, &after) == -1 && errno == ENOENT, "refused destination absent");
+        } else {
+            require(renameat(AT_FDCWD, path, AT_FDCWD, renamed) == 0, "native renameat");
+            require(statfs(path, &after) == -1 && errno == ENOENT, "native old name absent");
+            require(statfs(renamed, &after) == 0, "native new name present");
+        }
+        require(fstatfs(fd, &after) == 0, "descriptor after rename attempt");
         require(memcmp(&after.f_fsid, &by_fd.f_fsid, sizeof(after.f_fsid)) == 0,
-                "rename identity");
-        require(unlinkat(AT_FDCWD, renamed, 0) == 0, "unlinkat");
-        require(statfs(renamed, &after) == -1 && errno == ENOENT, "unlinked name absent");
+                "rename attempt identity");
+        by_path = after;
+    }
+    if (strcmp(argv[1], "unlink") == 0) {
+        struct statfs after;
+        require(unlinkat(AT_FDCWD, path, 0) == 0, "unlinkat");
+        require(statfs(path, &after) == -1 && errno == ENOENT, "unlinked name absent");
         memset(&after, 0, sizeof(after));
         require(fstatfs(fd, &after) == 0, "unlinked fd");
         require(memcmp(&after.f_fsid, &by_fd.f_fsid, sizeof(after.f_fsid)) == 0,
