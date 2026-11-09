@@ -13807,7 +13807,7 @@ fn c16_case(mode: u8) {
     let scratch = tempfile::tempdir().unwrap();
     let native = scratch.path().join("native");
     std::fs::create_dir(&native).unwrap();
-    if mode % 2 == 0 {
+    if mode.is_multiple_of(2) {
         std::fs::write(native.join("dst"), C16_INCUMBENT).unwrap();
     }
     let (out, timeout) = slate_launch(
@@ -13828,11 +13828,15 @@ fn c16_case(mode: u8) {
         assert!(!native.join("dst").exists());
     } else {
         let operation = if mode <= 2 { "link" } else { "persist" };
-        let result = if mode % 2 == 0 { "AlreadyExists" } else { "Ok" };
+        let result = if mode.is_multiple_of(2) {
+            "AlreadyExists"
+        } else {
+            "Ok"
+        };
         assert!(native_stderr.contains(&format!("C16 {operation}-return {result}")));
         assert_eq!(
             std::fs::read(native.join("dst")).unwrap(),
-            if mode % 2 == 0 {
+            if mode.is_multiple_of(2) {
                 C16_INCUMBENT
             } else {
                 C16_SOURCE
@@ -13857,7 +13861,7 @@ fn c16_case(mode: u8) {
     std::fs::copy(&registry, evidence.join("registry.json")).unwrap();
     assert_no_nfs_mount(&host, port, &[&workspace], "C16 before");
     let (out, timeout) = slate_launch(
-        Command::new(if mode % 2 == 0 {
+        Command::new(if mode.is_multiple_of(2) {
             prepared
         } else {
             binaries().join("umbra")
@@ -13950,14 +13954,14 @@ fn c16_case(mode: u8) {
         } else {
             assert!(run.stderr.contains("C16 fallback-enter"));
         }
-        if mode % 2 == 0 {
+        if mode.is_multiple_of(2) {
             assert!(run.stderr.contains("C16 incumbent seeded before launch:"));
         }
     }
     assert_eq!(src.as_deref(), Some(C16_SOURCE));
     assert_eq!(
         dst.as_deref(),
-        if mode % 2 == 0 {
+        if mode.is_multiple_of(2) {
             Some(C16_INCUMBENT)
         } else {
             None
@@ -14665,7 +14669,7 @@ fn fix_227_native_fcntl_abi_and_cost() {
 
 fn fix_227_rewrite_registry(registry_path: &Path, store: &Path) {
     let mut r: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(registry_path).unwrap()).unwrap();
     let mut local: serde_json::Value = serde_json::from_slice(
         &std::fs::read(repository().join("crates/umbra-storage-local/provider.json")).unwrap(),
     )
@@ -14681,7 +14685,7 @@ fn fix_227_rewrite_registry(registry_path: &Path, store: &Path) {
     )
     .unwrap());
     r["providers"]["storage"] = local;
-    std::fs::write(&registry_path, serde_json::to_vec(&r).unwrap()).unwrap();
+    std::fs::write(registry_path, serde_json::to_vec(&r).unwrap()).unwrap();
 }
 
 // Behaviour only: generic thread-state gating does NOT prove a kernel wait.
