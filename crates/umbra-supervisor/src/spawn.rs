@@ -167,6 +167,59 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_parents_complete_out_of_order_without_crossing_policies() {
+        use umbra_core::{Architecture, BytePath, TaskIdentity, ThreadId};
+        let mut pending = PendingSpawns::default();
+        let mut authorizations = Vec::new();
+        for parent in 1..=16 {
+            let task = TaskId(TaskIdentity {
+                native_id: parent,
+                generation: 1,
+            });
+            let context = ProcessContext {
+                task,
+                parent: None,
+                architecture: Architecture::Aarch64,
+                abi: "test".into(),
+                exec_generation: 0,
+                cwd: BytePath::new(b"/".to_vec()).unwrap(),
+                root: BytePath::new(b"/".to_vec()).unwrap(),
+                fds: BTreeMap::new(),
+            };
+            let token = SpawnToken {
+                run_generation: 1,
+                parent: task,
+                exec_generation: 0,
+                thread: ThreadId(TaskIdentity {
+                    native_id: parent + 100,
+                    generation: 1,
+                }),
+                sequence: 1,
+            };
+            let plan = SpawnPlan {
+                digest: [parent as u8; 32],
+                actions: vec![SpawnAction::Close(parent as i32)],
+                close_on_exec_default: parent % 2 == 0,
+            };
+            let auth = pending.prepare(token, plan.clone(), &context).unwrap();
+            let mut competing = token;
+            competing.thread.0.native_id += 1000;
+            competing.sequence += 1;
+            assert!(pending.prepare(competing, plan.clone(), &context).is_err());
+            assert_eq!(pending.plan(auth).unwrap(), &plan);
+            authorizations.push((auth, plan));
+        }
+        let mut crossed = authorizations[0].0;
+        crossed.token.parent = authorizations[1].0.token.parent;
+        assert!(pending.consume(crossed).is_err());
+        for (auth, plan) in authorizations.into_iter().rev() {
+            assert_eq!(pending.consume(auth).unwrap(), plan);
+            assert!(pending.consume(auth).is_err());
+        }
+        assert!(pending.active.is_empty());
+    }
+
+    #[test]
     fn every_source_destination_and_earlier_close_is_checked() {
         for actions in [
             vec![SpawnAction::Close(4096)],
