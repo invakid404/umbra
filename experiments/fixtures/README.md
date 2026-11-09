@@ -230,3 +230,15 @@ replaces the initial proposed external ledger protocol: routed tracee stdin
 and stdout are null, so that acknowledgment channel cannot reach it. Native
 and routed controls use the same amended protocol. No passing result is
 inferred from setup, compilation or a timeout.
+
+Local native/routed pairs for C10-07, C10-08, C10-11 and C10-16 passed their
+complete contracts. C10-13's protocol and launch cleanup matched Expected,
+but its test failed afterwards: the namespace oracle assumed a read-only
+workload materialized its logical workspace in the shadow. The corrected
+oracle accepts only explicit NFS NOENT below the existing run root. The
+original failed reading remains retained; journal/reopen and final host checks
+were not reached and its temporary state was removed on unwind. C10-13 is
+therefore not fully qualified by that reading. The offline retained-record test
+validates its protocol evidence and rejects corrupted records; it cannot recover
+the missing checks. Future readings preserve scratch state under the evidence
+root. Final CI must exercise the corrected instrument independently.
