@@ -18,10 +18,20 @@ static void require(int ok, const char *phase) {
     }
 }
 
+static void marker(const char *root, const char *name, pid_t pid) {
+    char path[4096], text[32];
+    int n = snprintf(path, sizeof(path), "%s/%s", root, name);
+    require(n >= 0 && (size_t)n < sizeof(path), "marker path");
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    require(fd >= 0, "marker open");
+    n = snprintf(text, sizeof(text), "%d\n", pid);
+    require(write(fd, text, (size_t)n) == n && close(fd) == 0, "marker write");
+}
+
 int main(int argc, char **argv) {
     require(argc >= 3, "arguments");
     if (strcmp(argv[1], "exec-child") == 0) {
-        require(argc == 6, "exec arguments");
+        require(argc == 7, "exec arguments");
         int inherited = atoi(argv[2]), cloexec = atoi(argv[3]);
         struct statfs metadata;
         require(fstatfs(inherited, &metadata) == 0, "exec inherited metadata");
@@ -29,6 +39,7 @@ int main(int argc, char **argv) {
                 metadata.f_fsid.val[1] == (int32_t)strtol(argv[5], NULL, 10), "exec identity");
         require(fstatfs(cloexec, &metadata) == -1 && errno == EBADF, "exec cloexec");
         printf("f214 exec metadata pid=%d\n", getpid());
+        marker(argv[6], "records.child", getpid());
         return 0;
     }
     char path[4096], output[4096];
@@ -77,8 +88,9 @@ int main(int argc, char **argv) {
             require(memcmp(&inherited.f_fsid, &by_fd.f_fsid, sizeof(inherited.f_fsid)) == 0,
                     "fork identity");
             printf("f214 fork metadata pid=%d\n", getpid());
+            marker(argv[2], "records.pre", getpid());
             fflush(stdout);
-            char *args[] = {argv[3], "exec-child", fd_arg, clo_arg, fsid0, fsid1, NULL};
+            char *args[] = {argv[3], "exec-child", fd_arg, clo_arg, fsid0, fsid1, argv[2], NULL};
             execve(argv[3], args, environ);
             require(0, "execve");
         }
@@ -86,6 +98,7 @@ int main(int argc, char **argv) {
         require(waitpid(child, &status, 0) == child, "wait child");
         require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child status");
         printf("f214 child completed pid=%d\n", child);
+        marker(argv[2], "records.pid", child);
         require(close(cloexec) == 0, "parent cloexec close");
     }
     if (strcmp(argv[1], "copyup") == 0) {

@@ -12654,7 +12654,7 @@ fn f214_metadata_case(mode: &str) {
         spawn.evidence.join("native-metadata.bin"),
     )
     .unwrap();
-    let routed = slate_spawn_routed(&spawn, mode, &[]);
+    let routed = slate_spawn_routed(&spawn, mode, &["records.pid"]);
     // Execute lifecycle obligations even when the positive metadata oracle fails.
     slate_spawn_finish(&spawn, &routed);
     assert!(journal_records_completion(&routed.run));
@@ -12670,12 +12670,13 @@ fn f214_metadata_case(mode: &str) {
     assert_eq!(&records[..2168], expected.as_slice(), "fstatfs");
     assert_eq!(&records[2168..], expected.as_slice(), "statfs");
     if mode == "fork" {
-        for output in [&native.stdout, &routed.output.stdout] {
-            let text = String::from_utf8_lossy(output);
-            let child = text.lines().find_map(|line| line.strip_prefix("f214 child completed pid="))
-                .expect("child completion marker");
-            assert!(text.contains(&format!("f214 fork metadata pid={child}")));
-            assert!(text.contains(&format!("f214 exec metadata pid={child}")));
+        let native_pid = std::fs::read(native_root.join("records.pid")).unwrap();
+        let routed_pid = routed.object("records.pid").expect("child completion marker");
+        for name in ["records.pre", "records.child"] {
+            let native_marker = std::fs::read(native_root.join(name)).unwrap();
+            std::fs::write(spawn.evidence.join(format!("native-{name}")), &native_marker).unwrap();
+            assert_eq!(native_marker, native_pid);
+            assert_eq!(routed.object(name).expect("metadata phase marker"), routed_pid);
         }
     }
 }
