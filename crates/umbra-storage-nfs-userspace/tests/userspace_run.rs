@@ -9824,11 +9824,32 @@ fn slate_spawn_native(spawn: &SlateSpawn, mode: &str) -> (PathBuf, SlateOutput) 
         &spawn.evidence.join("native"),
         matches!(mode, "c11-10" | "ledger-escape"),
     );
+    let mut command = Command::new(&spawn.program);
+    command.arg(mode).arg(&root).arg(&spawn.helper);
+    if mode == "c11-10" {
+        use std::os::unix::process::CommandExt;
+        // The observer reserves fd 900; a smaller inherited soft limit leaves
+        // its output at fd 3 and contaminates the exact native census. Supply
+        // that instrument prerequisite without changing the census oracle.
+        // SAFETY: getrlimit/setrlimit use only stack storage in the child.
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit: libc::rlimit = std::mem::zeroed();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if limit.rlim_cur < 1024 {
+                    limit.rlim_cur = 1024;
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
     let output = slate_watched(
-        Command::new(&spawn.program)
-            .arg(mode)
-            .arg(&root)
-            .arg(&spawn.helper),
+        &mut command,
         &spawn.evidence.join("native"),
         &watch,
     );
