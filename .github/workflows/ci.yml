@@ -630,6 +630,16 @@ jobs:
           cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
             --test userspace_run fix_243_policy_before_ready_failure -- --exact --nocapture --test-threads=1
 
+      - name: Packed spawn -- policy window teardown triggers
+        env:
+          UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/spawn-policy-triggers-${{ github.run_attempt }}
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
+            --test userspace_run -- fix_243_policy_deadline fix_243_policy_backend_drop \
+            fix_243_policy_session_drop fix_243_policy_terminate fix_243_policy_watchdog \
+            --exact --nocapture --test-threads=1
+
       - name: Restore binaries after packed spawn faults
         if: always()
         run: |
