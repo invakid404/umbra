@@ -79,8 +79,9 @@ impl RunObserver for StderrStatus {
         eprintln!("provider teardown warning: {error}");
     }
 
-    fn prepared(&mut self, run_id: RunId) {
+    fn prepared(&mut self, run_id: RunId) -> Result<()> {
         eprintln!("umbra: run {} prepared", run_id.0);
+        Ok(())
     }
 
     fn finished(&mut self, outcome: &RunOutcome) {

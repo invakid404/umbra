@@ -122,7 +122,7 @@ pub enum RunLaunch {
 /// to read one. It reports; it cannot ask.
 pub trait RunObserver {
     /// Called once, after preparation succeeds and before the target launches.
-    fn prepared(&mut self, run_id: RunId);
+    fn prepared(&mut self, run_id: RunId) -> Result<()>;
     /// Called once when the supervised tree has finished, before teardown result.
     fn finished(&mut self, outcome: &RunOutcome);
     /// Provider bookkeeping failed after all processes reported exit.
@@ -1289,7 +1289,21 @@ mod unix {
         };
 
         if let Some(observer) = observer.as_mut() {
-            observer.prepared(run_id);
+            let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.prepared(run_id)
+            }));
+            match prepared {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(fail(namespace, run_id, e, true)),
+                Err(payload) => {
+                    // Nothing has launched. Do not format or drop an arbitrary
+                    // panic payload: either operation may itself panic.
+                    let e = error(ErrorKind::InvalidState, "run.observer", "prepared observer panicked");
+                    let failure = fail(namespace, run_id, e, true);
+                    std::mem::forget(payload);
+                    return Err(failure);
+                }
+            }
         }
 
         let mut supervisor = Supervisor::with_namespace(run_id, platform, namespace, None);
