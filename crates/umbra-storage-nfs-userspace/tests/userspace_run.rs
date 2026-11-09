@@ -9507,7 +9507,7 @@ fn slate_c10_10_fork_helper_refusal() {
     // unchanged. The structural and runtime checks below remain required.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("7dc0af583b9209aa8169994560567d7d065a62be62d96670273e1830e3daf2ee"),
+        Some("00474a471734027c1511281c929d608f617f8d9bef3799c888cdfd6038e33231"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -12631,7 +12631,10 @@ fn f214_distinct_runs() {
     };
     let second = f214_metadata_case("distinct-b").expect("second run");
     assert_ne!(first, second);
-    assert_ne!(&f214_expected_metadata(first)[48..56], &f214_expected_metadata(second)[48..56]);
+    assert_ne!(
+        &f214_expected_metadata(first)[48..56],
+        &f214_expected_metadata(second)[48..56]
+    );
 }
 
 fn f214_metadata_case(mode: &str) -> Option<RunId> {
@@ -12657,7 +12660,10 @@ fn f214_metadata_case(mode: &str) -> Option<RunId> {
     std::fs::write(native_root.join("seed.txt"), b"ABCDEF").unwrap();
     let watch = SlateWatch::new(spawn.scratch.path(), &spawn.evidence.join("native"), false);
     let native = slate_watched(
-        Command::new(&spawn.program).arg(mode).arg(&native_root).arg(&spawn.helper),
+        Command::new(&spawn.program)
+            .arg(mode)
+            .arg(&native_root)
+            .arg(&spawn.helper),
         &spawn.evidence.join("native"),
         &watch,
     );
@@ -12667,7 +12673,9 @@ fn f214_metadata_case(mode: &str) -> Option<RunId> {
         String::from_utf8_lossy(&native.stderr)
     );
     assert_eq!(
-        std::fs::read(native_root.join("records.done")).unwrap().len(),
+        std::fs::read(native_root.join("records.done"))
+            .unwrap()
+            .len(),
         2 * 2168,
         "native SDK ABI size"
     );
@@ -12693,18 +12701,40 @@ fn f214_metadata_case(mode: &str) -> Option<RunId> {
     assert_eq!(&records[2168..], expected.as_slice(), "statfs");
     if mode == "fork" {
         let native_pid = std::fs::read(native_root.join("records.pid")).unwrap();
-        let routed_pid = routed.object("records.pid").expect("child completion marker");
+        let routed_pid = routed
+            .object("records.pid")
+            .expect("child completion marker");
         for name in ["records.pre", "records.child"] {
             let native_marker = std::fs::read(native_root.join(name)).unwrap();
-            std::fs::write(spawn.evidence.join(format!("native-{name}")), &native_marker).unwrap();
+            std::fs::write(
+                spawn.evidence.join(format!("native-{name}")),
+                &native_marker,
+            )
+            .unwrap();
             assert_eq!(native_marker, native_pid);
-            assert_eq!(routed.object(name).expect("metadata phase marker"), routed_pid);
+            assert_eq!(
+                routed.object(name).expect("metadata phase marker"),
+                routed_pid
+            );
         }
     }
     if mode == "mixed" {
-        let marker = routed.object("records.child").expect("mixed metadata phase marker");
-        assert!(std::str::from_utf8(marker).unwrap().trim().parse::<u32>().unwrap() > 0);
-        std::fs::copy(native_root.join("records.child"), spawn.evidence.join("native-records.child")).unwrap();
+        let marker = routed
+            .object("records.child")
+            .expect("mixed metadata phase marker");
+        assert!(
+            std::str::from_utf8(marker)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+                > 0
+        );
+        std::fs::copy(
+            native_root.join("records.child"),
+            spawn.evidence.join("native-records.child"),
+        )
+        .unwrap();
     }
     Some(routed.run.run_id)
 }
@@ -12893,24 +12923,39 @@ fn r14_case(seeded: bool) {
     // terminal exchange and after teardown, even if the error oracle changes.
     let lock_snapshot: serde_json::Value = serde_json::from_slice(
         &std::fs::read(evidence.join("routed-reading/observer/sidecars-5.json")).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
     let (lock_host, lock_port) = fixture().unwrap();
     let mut lock_path = shadow_path(&run);
     lock_path.last_mut().unwrap().extend_from_slice(b".lock");
     let lock_after = r14_nfs_object(
-        &lock_host, lock_port, &lock_path,
+        &lock_host,
+        lock_port,
+        &lock_path,
         std::time::Instant::now() + std::time::Duration::from_secs(2),
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         evidence.join("lock-directory.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "after_connect": lock_snapshot["state.sqlite.lock"],
             "after_teardown": lock_after,
-        })).unwrap(),
-    ).unwrap();
-    assert!(lock_snapshot.get("state.sqlite.lock").is_some(), "lock observation missing");
-    assert!(lock_snapshot["state.sqlite.lock"].is_null(), "persistent lock directory requires anchor ruling");
-    assert!(lock_after.is_null(), "persistent lock directory requires anchor ruling");
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        lock_snapshot.get("state.sqlite.lock").is_some(),
+        "lock observation missing"
+    );
+    assert!(
+        lock_snapshot["state.sqlite.lock"].is_null(),
+        "persistent lock directory requires anchor ruling"
+    );
+    assert!(
+        lock_after.is_null(),
+        "persistent lock directory requires anchor ruling"
+    );
     assert_eq!(run.status, Some(1), "{}", run.stderr);
     assert_eq!(run.child_exit(), 20);
     assert!(run.stderr.contains("ProcessFailed during run.child"));

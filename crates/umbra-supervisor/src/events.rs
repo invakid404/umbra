@@ -408,8 +408,10 @@ impl Supervisor {
         };
         let operation = match operation {
             Ok(operation) => operation,
-            Err(e) if e.operation == "statfs.path"
-                && matches!(e.errno, Some(umbra_core::Errno(14) | umbra_core::Errno(63))) => {
+            Err(e)
+                if e.operation == "statfs.path"
+                    && matches!(e.errno, Some(umbra_core::Errno(14) | umbra_core::Errno(63))) =>
+            {
                 return self.deny_to_tracee(thread, &mut registers, e.errno.unwrap());
             }
             Err(e) => return Err(e),

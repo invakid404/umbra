@@ -8834,11 +8834,19 @@ fn f214_retained_binding_survives_external_namespace_rename() {
         )
         .unwrap();
     assert_eq!(missing, Err(Errno(2)));
-    let moved = f.overlay.filesystem_metadata(
-        &f.process,
-        &FsOp::StatFs { dir: DirRef::Cwd, path: bytes(b"moved/seed.txt"), follow: true },
-        token,
-    ).unwrap().unwrap();
+    let moved = f
+        .overlay
+        .filesystem_metadata(
+            &f.process,
+            &FsOp::StatFs {
+                dir: DirRef::Cwd,
+                path: bytes(b"moved/seed.txt"),
+                follow: true,
+            },
+            token,
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(moved.metadata, binding.metadata().unwrap());
 }
 
@@ -8896,35 +8904,86 @@ fn f214_resume_identity() {
     let mut f = Fixture::new(&[]);
     let run_id = f.overlay.config().unwrap().context.run_id;
     let token = umbra_core::FilesystemQueryToken {
-        request: 1, task: f.process.task, thread: ThreadId(f.process.task.0),
-        image_generation: 0, stop_generation: 1,
+        request: 1,
+        task: f.process.task,
+        thread: ThreadId(f.process.task.0),
+        image_generation: 0,
+        stop_generation: 1,
     };
-    let operation = FsOp::StatFs { dir: DirRef::Cwd, path: bytes(b"/"), follow: true };
-    let before = f.overlay.filesystem_metadata(&f.process, &operation, token.clone()).unwrap().unwrap();
-    f.overlay.finish_run(&FinishRunRequest {
-        run_id, root_status: Some(ExitStatus::Code(0)), processes_exited: 1,
-    }).unwrap();
+    let operation = FsOp::StatFs {
+        dir: DirRef::Cwd,
+        path: bytes(b"/"),
+        follow: true,
+    };
+    let before = f
+        .overlay
+        .filesystem_metadata(&f.process, &operation, token.clone())
+        .unwrap()
+        .unwrap();
+    f.overlay
+        .finish_run(&FinishRunRequest {
+            run_id,
+            root_status: Some(ExitStatus::Code(0)),
+            processes_exited: 1,
+        })
+        .unwrap();
     let mut storage = LocalStorage::new(f._dirs[1].path()).unwrap();
-    let binding = storage.open_run(&OpenRunRequest {
-        run_id, intent: OpenRunIntent::OpenExisting,
-        immutable_base: ImmutableBaseContract { identity: "test-base".into(), fingerprint: vec![1] },
-        policy: StoragePolicy { read_only: false, require_strict_remote_persistence: false,
-            require_kernel_shadow: false, format_version: 1 },
-    }).unwrap();
-    let lease = storage.acquire_writer(&AcquireWriterRequest {
-        run_id, writer_id: WriterId("reopened".into()), takeover: TakeoverPolicy::Refuse,
-    }).unwrap();
+    let binding = storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::OpenExisting,
+            immutable_base: ImmutableBaseContract {
+                identity: "test-base".into(),
+                fingerprint: vec![1],
+            },
+            policy: StoragePolicy {
+                read_only: false,
+                require_strict_remote_persistence: false,
+                require_kernel_shadow: false,
+                format_version: 1,
+            },
+        })
+        .unwrap();
+    let lease = storage
+        .acquire_writer(&AcquireWriterRequest {
+            run_id,
+            writer_id: WriterId("reopened".into()),
+            takeover: TakeoverPolicy::Refuse,
+        })
+        .unwrap();
     let mut empty_base = Fixture::new(&[]);
     let base = empty_base.overlay.base.take().unwrap();
-    let journal = MemoryJournal { log: Arc::new(Mutex::new(Log::default())), run: run_id, epoch: lease.epoch };
+    let journal = MemoryJournal {
+        log: Arc::new(Mutex::new(Log::default())),
+        run: run_id,
+        epoch: lease.epoch,
+    };
     let mut reopened = Overlay::new(Box::new(storage), Box::new(journal));
-    reopened.bind(SessionConfig {
-        context: context(run_id, Some(lease.epoch)), recovery: recovery(run_id), binding, lease,
-    }, base).unwrap();
-    let after = reopened.filesystem_metadata(&f.process, &operation, token).unwrap().unwrap();
+    reopened
+        .bind(
+            SessionConfig {
+                context: context(run_id, Some(lease.epoch)),
+                recovery: recovery(run_id),
+                binding,
+                lease,
+            },
+            base,
+        )
+        .unwrap();
+    let after = reopened
+        .filesystem_metadata(&f.process, &operation, token)
+        .unwrap()
+        .unwrap();
     assert_eq!(before.metadata, after.metadata);
-    assert_ne!(before.metadata.binding, umbra_core::FilesystemBinding::overlay(empty_base.overlay.config().unwrap().context.run_id));
-    reopened.finish_run(&FinishRunRequest {
-        run_id, root_status: Some(ExitStatus::Code(0)), processes_exited: 1,
-    }).unwrap();
+    assert_ne!(
+        before.metadata.binding,
+        umbra_core::FilesystemBinding::overlay(empty_base.overlay.config().unwrap().context.run_id)
+    );
+    reopened
+        .finish_run(&FinishRunRequest {
+            run_id,
+            root_status: Some(ExitStatus::Code(0)),
+            processes_exited: 1,
+        })
+        .unwrap();
 }
