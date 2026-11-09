@@ -215,6 +215,8 @@ int main(int argc, char **argv) {
         int ignored = current.sa_handler == SIG_IGN;
         int blocked = sigismember(&mask, SIGPIPE);
         note("child-signal default=%d ignored=%d blocked=%d\n", defaulted, ignored, blocked);
+        note("child-signal-raw handler=%p default=%p ignored=%p flags=%x\n",
+             (void *)current.sa_handler, (void *)SIG_DFL, (void *)SIG_IGN, current.sa_flags);
         int expected_default = !strcmp(mode, "fix-243-sigdefault");
         if (defaulted != expected_default || ignored == expected_default ||
             blocked != expected_default) {
