@@ -10399,6 +10399,62 @@ fn fix_243_refuses_virtual_destination() {
     fix_243_refusal("fix-243-refuse-virtual-destination", "spawn virtual descriptor action");
 }
 
+/// Required registered-window provider-loss cell, terminal/non-isolated entry.
+/// Build the provider with mutation-probe-spawn-lifecycle for this qualification.
+#[test]
+fn fix_243_registered_provider_loss() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    let Some(mut spawn) = slate_spawn("fix-243-registered-loss") else { return; };
+    let (root, native) = slate_spawn_native(&spawn, "c11-02-attributes");
+    assert!(native.status.success());
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    let socket = spawn.evidence.parent().unwrap().join("probe.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    spawn.provider_environment.push(("UMBRA_FIX_243_PROBE_SOCKET".into(),
+        socket.to_str().unwrap().into()));
+    let evidence = spawn.evidence.clone();
+    let observer = std::thread::spawn(move || {
+        let mut pollfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: a single initialized pollfd; a bounded wait for the rendezvous.
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 15000) }, 1, "probe did not rendezvous");
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+        std::fs::write(evidence.join("provider-rendezvous.json"), &line).unwrap();
+        assert_eq!(record["phase"], "task-acquired");
+        assert_eq!(record["watchdog_registered"], true);
+        let child = record["child"].as_i64().unwrap() as i32;
+        let observed = slate_process(child).unwrap().expect("child alive at rendezvous");
+        assert_eq!(record["start_sec"], observed.start.0);
+        assert_eq!(record["start_usec"], observed.start.1);
+        std::fs::write(evidence.join("independent-child.json"),
+            serde_json::to_vec_pretty(&observed.json()).unwrap()).unwrap();
+        stream.write_all(b"P").unwrap();
+        observed
+    });
+    let routed = slate_spawn_routed(&spawn, "c11-02-attributes", &["child.txt", "parent.txt"]);
+    let observed = observer.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
+    assert_ne!(routed.run.status, Some(0));
+    for name in ["records.child", "records.done", "child.txt", "parent.txt"] {
+        assert!(routed.object(name).is_none(), "pre-commit effect: {name}");
+    }
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+    std::fs::write(spawn.evidence.join("primary-cleanup.txt"), &cleanup).unwrap();
+    // Test-owned survivor recovery cannot turn the primary result into a pass.
+    assert!(cleanup.lines().next().unwrap().contains("group_kills=0"), "{cleanup}");
+    assert!(cleanup.starts_with("cleanup CLEAN")
+        && cleanup.lines().next().unwrap().contains("zombies=\"\""), "{cleanup}");
+    assert!(slate_process(observed.pid).unwrap().is_none_or(|now| now.start != observed.start),
+        "registered child survived provider loss");
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
 /// premise, with the errno the first reading did not keep.
 #[test]
