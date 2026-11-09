@@ -10497,7 +10497,7 @@ fn fix_243_refuses_virtual_destination() {
 /// Local comparison only: surviving owners are recorded as NOT QUALIFIED.
 /// Build the provider with the matching probe feature for this apparatus.
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
-fn fix_243_provider_loss_reading(case: &str, mode: &str, root_probe: bool) {
+fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) {
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
@@ -10509,7 +10509,12 @@ fn fix_243_provider_loss_reading(case: &str, mode: &str, root_probe: bool) {
     if !root_probe {
         assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
     }
-    let socket = spawn.evidence.parent().unwrap().join(if root_probe { "root.sock" } else { "null.sock" });
+    let socket =
+        spawn
+            .evidence
+            .parent()
+            .unwrap()
+            .join(if root_probe { "root.sock" } else { "null.sock" });
     let listener = UnixListener::bind(&socket).unwrap();
     spawn.provider_environment.push((
         "UMBRA_FIX_243_PROBE_SOCKET".into(),
@@ -10556,7 +10561,7 @@ fn fix_243_provider_loss_reading(case: &str, mode: &str, root_probe: bool) {
             serde_json::to_vec_pretty(&observed.json()).unwrap(),
         )
         .unwrap();
-        stream.write_all(b"P").unwrap();
+        stream.write_all(&[command]).unwrap();
         observed
     });
     let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
@@ -10577,6 +10582,30 @@ fn fix_243_provider_loss_reading(case: &str, mode: &str, root_probe: bool) {
             "reap_established": false,
         }),
     );
+    if command == b'E' {
+        assert!(
+            routed
+                .run
+                .stderr
+                .contains("injected attach failure after registration"),
+            "{}",
+            routed.run.stderr
+        );
+        assert!(
+            cleanup.starts_with("cleanup CLEAN")
+                && cleanup.lines().next().unwrap().contains("group_kills=0")
+                && cleanup.lines().next().unwrap().contains("zombies=\"\""),
+            "{cleanup}"
+        );
+        slate_record(
+            &spawn,
+            "REGISTERED CLEANUP QUALIFIED",
+            serde_json::json!({
+                "fault": "attach after Task acquisition", "provider_loss": false,
+                "identity": observed.json(), "cleanup": cleanup,
+            }),
+        );
+    }
     // Recovery is a harness obligation, never a production cleanup pass.
     assert!(
         slate_process(observed.pid)
@@ -10589,13 +10618,19 @@ fn fix_243_provider_loss_reading(case: &str, mode: &str, root_probe: bool) {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_provider_loss_no_spawn_reading() {
-    fix_243_provider_loss_reading("fix-243-loss-no-spawn", "fix-243-no-spawn", true);
+    fix_243_fault_reading("fix-243-loss-no-spawn", "fix-243-no-spawn", true, b'P');
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_provider_loss_null_reading() {
-    fix_243_provider_loss_reading("fix-243-loss-null", "c11-01", false);
+    fix_243_fault_reading("fix-243-loss-null", "c11-01", false, b'P');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_registered_attach_failure() {
+    fix_243_fault_reading("fix-243-attach-error", "c11-02-attributes", false, b'E');
 }
 
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
