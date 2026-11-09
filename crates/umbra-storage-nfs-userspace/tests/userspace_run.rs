@@ -9502,20 +9502,12 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-pinned for #186 (was 81e1cd50…, the slate-r10/r11 characterization).
-    // native.rs gained the ordered teardown only: +709/-0 lines, all of them
-    // teardown (Session::ordered_teardown, its barrier and decision table,
-    // terminate/Drop wiring, the exit-report capture in `stop`, the k re-send
-    // and the post-kill barrier of the #186 review ruling, and the barrier
-    // lookup's exec-swap citations).
-    // The fork guard (`fn single_thread`, sha256 41efdfc0…, and its call sites)
-    // and the __posix_spawn x2 guard (`if number == 244 {` block, sha256
-    // fe7c9f4b…) are byte-identical to 7ccd7b0e. The runtime refusal
-    // characterization this pin protects is repeated by this case itself, which
-    // the #186 fix un-skips in required CI on the runner.
+    // Re-pinned for filesystem metadata: native.rs changes input-error mapping
+    // and adds checked copyout. The fork/spawn guards and their call sites are
+    // unchanged. The structural and runtime checks below remain required.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("298739649ddb961bc76bd2d5ae2186f634574c363639761797765efb2497d006"),
+        Some("7dc0af583b9209aa8169994560567d7d065a62be62d96670273e1830e3daf2ee"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
