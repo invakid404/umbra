@@ -10529,7 +10529,7 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
         "fix-243-copyout-error" => "caller-copyout",
         "fix-243-free-error" => "remote-free",
         "fix-243-register-error" => "register-commit",
-        "fix-243-policy-error" => "policy-ready",
+        name if name.starts_with("fix-243-policy-") => "policy-ready",
         name if name.starts_with("fix-243-inserted-") => "inserted",
         name if name.starts_with("fix-243-unregistered-") => "unregistered",
         _ => "task-acquired",
@@ -10540,6 +10540,7 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     if let Some(trigger) = case
         .strip_prefix("fix-243-inserted-")
         .or_else(|| case.strip_prefix("fix-243-acquired-"))
+        .or_else(|| case.strip_prefix("fix-243-policy-"))
     {
         spawn
             .provider_environment
@@ -10818,6 +10819,12 @@ fn fix_243_unregistered_packed_reading() {
 #[test]
 fn fix_243_policy_before_ready_failure() {
     fix_243_fault_reading("fix-243-policy-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_watchdog() {
+    fix_243_fault_reading("fix-243-policy-watchdog", "c11-02-attributes", false, b'E');
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]

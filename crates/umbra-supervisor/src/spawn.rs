@@ -273,6 +273,11 @@ pub(crate) fn before_ready(child: TaskId) -> Result<()> {
     if command[0] != b'E' {
         return Err(invalid());
     }
+    if std::env::var("UMBRA_FIX_243_PROBE_TRIGGER").as_deref() == Ok("watchdog") {
+        // The fixture configures the provider's real watchdog to ten seconds.
+        // Keep policy Ready withheld until that registered owner has expired.
+        std::thread::sleep(Duration::from_secs(11));
+    }
     Err(UmbraError::new(
         ErrorKind::InvalidState,
         "spawn probe",
