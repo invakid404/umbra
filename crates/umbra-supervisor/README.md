@@ -8,7 +8,7 @@ run's durable journal state directly before reopening it. The suites that spawn
 the real provider executables skip when those are absent, and fail instead under
 `UMBRA_INTEGRATION_REQUIRED` (`tests/reopen.rs:38-67`).
 This crate owns `src/lib.rs`, `src/run.rs`, `src/events.rs`, `src/ofd.rs`,
-`src/base.rs`, `src/sandbox.rs`, `src/directory.rs` and its manifest. `directory.rs` holds the
+`src/base.rs`, `src/sandbox.rs`, `src/directory.rs`, `src/filesystem.rs` and its manifest. `directory.rs` holds the
 `DirectoryEncoder` the overlay requires for `FsOp::ReadDir`: the engine resolves
 the merged entries and this side turns them into the native records the tracee's
 `getattrlistbulk` reply expects, using the wire format in `umbra_platform::dirents`
@@ -153,8 +153,7 @@ prepare the physical rewrite, apply it, then resume to the matching exit, observ
 the outcome and commit or abort. Not every operation reaches the kernel: when the
 namespace answers `resolve` with a refusal for the tracee, `deny_to_tracee`
 emulates that errno into the return register and resumes, so no intent is
-journalled, no rewrite is prepared and the syscall never executes. Both of its
-call sites share that one implementation, and the refusals that reach it are
+journalled, no rewrite is prepared and the syscall never executes. Its call sites share that implementation, and the refusals that reach it are
 enumerated over it in `src/events.rs`. A kernel errno is an observed outcome, not
 an
 interception failure: it is aborted as `AbortReason::KernelRefused(errno)`, which
@@ -252,8 +251,7 @@ others' descriptions. Exit closes every descriptor the process held: its
 `context.fds` is left empty and each description loses that reference; the
 last reference frees it. `ProcessContext::fds` keeps one `FdState` per
 descriptor as that process's *view*, and the supervisor writes every advance
-through to every view of the description, so `FdState` and its provider-wire
-encoding are unchanged. A `Clone` child is refused rather than treated as a
+through to every view of the description, while the filesystem binding is carried separately in each `FdState`. A `Clone` child is refused rather than treated as a
 fork: `CLONE_FILES` would share the descriptor *table*, which this does not
 model, and no backend emits it today.
 
