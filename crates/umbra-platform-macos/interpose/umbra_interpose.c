@@ -152,7 +152,7 @@
  *    and `cat` `fstat`s fd 1.
  *
  *    What is genuinely refused is the rest of the **descriptor-relative** set:
- *    `lseek`, `dup`, `dup2`, `fcntl`, `ftruncate`, `fsync`, `pread`, `pwrite`,
+ *    `lseek`, `dup`, `dup2`, unsupported `fcntl` commands, `ftruncate`, `fsync`, `pread`, `pwrite`,
  *    `readv`, `writev`, `mmap`, the directory-reading calls entry 6 below does
  *    not claim, and `openat` with a virtual dirfd. A virtual descriptor is not
  *    a kernel object, so these reach the kernel, which does not know the

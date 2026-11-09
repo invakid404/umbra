@@ -1390,9 +1390,14 @@ mod tests {
     fn interpose_getfd_decodes_only_the_signed_descriptor() {
         let mut memory = strings();
         for fd in [4096i32, -1] {
-            let regs = entry(INTERPOSE_TRAP, [INTERPOSE_GETFD, fd as u64, u64::MAX, u64::MAX, 0]);
-            assert_eq!(DarwinArm64Abi.decode_entry(&regs, &mut memory).unwrap(),
-                Some(FsOp::GetDescriptorFlags { fd: TracedFd(fd) }));
+            let regs = entry(
+                INTERPOSE_TRAP,
+                [INTERPOSE_GETFD, fd as u64, u64::MAX, u64::MAX, 0],
+            );
+            assert_eq!(
+                DarwinArm64Abi.decode_entry(&regs, &mut memory).unwrap(),
+                Some(FsOp::GetDescriptorFlags { fd: TracedFd(fd) })
+            );
         }
         assert_eq!(memory.reads, 0);
     }

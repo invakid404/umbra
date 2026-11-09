@@ -2537,16 +2537,22 @@ impl NamespaceResolver for Overlay {
                     return Ok(ResolvedAction::Deny(Errno(9)));
                 };
                 let action = ResolvedAction::Emulate(EmulatedResult {
-                    outcome: OperationOutcome::Success { return_value: u64::from(state.flags.close_on_exec) },
+                    outcome: OperationOutcome::Success {
+                        return_value: u64::from(state.flags.close_on_exec),
+                    },
                     memory_writes: vec![],
                 });
                 // A non-mutating plan participates in the normal operation
                 // lifecycle but performs no pathname lookup or journal intent.
                 self.planned = Some(Plan {
-                    action: action.clone(), operation: operation.clone(),
+                    action: action.clone(),
+                    operation: operation.clone(),
                     path: StoragePath::new(StorageAnchor::Root, Vec::new())?,
-                    destination: None, mutation: false, directory_next: None,
-                    routed_write: None, directory_closed: None,
+                    destination: None,
+                    mutation: false,
+                    directory_next: None,
+                    routed_write: None,
+                    directory_closed: None,
                 });
                 return Ok(action);
             }

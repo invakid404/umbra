@@ -85,7 +85,14 @@ The M1 mechanisms named in the tracker spec are all present:
    the exec. The library ships **inert** and is switched on by
    `Session::arm_interposer`, which writes its `__DATA,__umbra_arm` control block
    after `install_image` has breakpointed its traps — it has no constructor and
-   reads no environment. See **What interception does not cover** below.
+   reads no environment. Its public `fcntl` shim routes only `F_GETFD` on an
+   armed descriptor at or above the virtual floor, through `UMBRA_OP_GETFD`.
+   The fixed-signature handler answers descriptor-local `close_on_exec` without
+   looking up a pathname; missing entries answer `EBADF`. All other commands,
+   inactive calls, negative descriptors and kernel-range descriptors tail-branch
+   to libc with the caller's argument registers and variadic stack untouched.
+   Neither `__fcntl` nor `__fcntl_nocancel` is a traced stub. The shim does not
+   catch libc-internal calls. See **What interception does not cover** below.
 10. **Inherited arming across `fork`**: a forked child of a routed tracee starts
     with the interposer already mapped *and* already armed, because `fork` copies
     `__DATA,__umbra_arm` with the rest of the address space. So `install` finds

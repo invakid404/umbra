@@ -1298,7 +1298,11 @@ mod unix {
                 Err(payload) => {
                     // Nothing has launched. Do not format or drop an arbitrary
                     // panic payload: either operation may itself panic.
-                    let e = error(ErrorKind::InvalidState, "run.observer", "prepared observer panicked");
+                    let e = error(
+                        ErrorKind::InvalidState,
+                        "run.observer",
+                        "prepared observer panicked",
+                    );
                     let failure = fail(namespace, run_id, e, true);
                     std::mem::forget(payload);
                     return Err(failure);

@@ -1,10 +1,10 @@
 //! Preparation failure must release writer ownership and permit reopening.
 #![cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use umbra_core::provider::{ProviderDescriptor, ProviderRegistry, encode};
+use umbra_core::provider::{encode, ProviderDescriptor, ProviderRegistry};
 use umbra_core::{BytePath, RunId, UmbraError};
 use umbra_supervisor::run::{CommandLaunch, RunLaunch, RunSpec};
 use umbra_supervisor::{ResumeSpec, RunObserver, RunOutcome, RunPersistence, Supervisor};
@@ -16,7 +16,9 @@ impl std::fmt::Display for HostilePayload {
     }
 }
 impl Drop for HostilePayload {
-    fn drop(&mut self) { panic!("panic payload must not be dropped"); }
+    fn drop(&mut self) {
+        panic!("panic payload must not be dropped");
+    }
 }
 
 struct Observer {
@@ -29,11 +31,15 @@ impl RunObserver for Observer {
         *self.id.lock().unwrap() = Some(run_id);
         match self.failure {
             1 => panic!("observer failure"),
-            2 | 4 | 5 | 6 => return Err(umbra_core::UmbraError {
-                kind: umbra_core::ErrorKind::Io, operation: "test.prepared".into(),
-                context: "observer rejected preparation".into(), errno: None,
-                launch_tree_terminated: false,
-            }),
+            2 | 4 | 5 | 6 => {
+                return Err(umbra_core::UmbraError {
+                    kind: umbra_core::ErrorKind::Io,
+                    operation: "test.prepared".into(),
+                    context: "observer rejected preparation".into(),
+                    errno: None,
+                    launch_tree_terminated: false,
+                })
+            }
             3 => std::panic::panic_any(HostilePayload),
             _ => {}
         }
@@ -120,6 +126,14 @@ fn locks(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 fn scenario(label: &str, failure: u8) {
+    if std::env::var_os("UMBRA_TEST_OBSERVER").is_none()
+        && std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none()
+    {
+        eprintln!(
+            "SKIP observer integration: set UMBRA_TEST_OBSERVER or UMBRA_INTEGRATION_REQUIRED"
+        );
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("store");
     std::fs::create_dir_all(&store).unwrap();
@@ -134,10 +148,39 @@ fn scenario(label: &str, failure: u8) {
     let mut observed_registry = registry(&store, true);
     let journal = observed_registry.providers.get_mut("journal").unwrap();
     journal.executable = bin("umbra-fix-227-journal");
-    journal.options = format!("{}\n{}", if failure == 4 { "fail-close" } else { "observe" }, journal_log.display()).into_bytes();
+    journal.options = format!(
+        "{}\n{}",
+        if failure == 4 {
+            "fail-close"
+        } else {
+            "observe"
+        },
+        journal_log.display()
+    )
+    .into_bytes();
     let storage = observed_registry.providers.get_mut("storage").unwrap();
     storage.executable = bin("umbra-fix-227-storage");
-    storage.options = format!("{}\n{}\n{}", match failure { 5 => "release", 6 => "close-run", _ => "observe" }, store.display(), journal_log.display()).into_bytes();
+    storage.options = format!(
+        "{}\n{}\n{}",
+        match failure {
+            5 => "release",
+            6 => "close-run",
+            _ => "observe",
+        },
+        store.display(),
+        journal_log.display()
+    )
+    .into_bytes();
+    let platform_marker = root.path().join("platform-started");
+    if failure != 0 {
+        let sentinel = root.path().join("platform-sentinel");
+        std::fs::copy(bin("umbra-fix-227-platform-sentinel"), &sentinel).unwrap();
+        observed_registry
+            .providers
+            .get_mut("platform")
+            .unwrap()
+            .executable = BytePath::new(sentinel.as_os_str().as_bytes().to_vec()).unwrap();
+    }
     let spec = RunSpec {
         registry: observed_registry,
         launch: RunLaunch::Command(CommandLaunch {
@@ -165,11 +208,27 @@ fn scenario(label: &str, failure: u8) {
     locks(&store, &mut found);
     eprintln!("PROBE {label}: writer.lock count={} {found:?}", found.len());
     let run_id = id.lock().unwrap().expect("prepared reached");
+    assert!(
+        !platform_marker.exists(),
+        "prepared failure must not connect platform or launch a target"
+    );
     let journal_events = std::fs::read_to_string(&journal_log).unwrap();
-    assert_eq!(journal_events.lines().filter(|line| *line == "Close").count(), 1, "{journal_events}");
-    let terminal: Vec<_> = journal_events.lines().filter(|line| ["Close", "Release", "CloseRun"].contains(line)).collect();
+    assert_eq!(
+        journal_events
+            .lines()
+            .filter(|line| *line == "Close")
+            .count(),
+        1,
+        "{journal_events}"
+    );
+    let terminal: Vec<_> = journal_events
+        .lines()
+        .filter(|line| ["Close", "Release", "CloseRun"].contains(line))
+        .collect();
     assert_eq!(terminal, ["Close", "Release", "CloseRun"]);
-    if failure != 0 { assert!(!journal_events.lines().any(|line| line == "Completed")); }
+    if failure != 0 {
+        assert!(!journal_events.lines().any(|line| line == "Completed"));
+    }
     let resumed = Supervisor::resume(ResumeSpec {
         registry: registry(&store, false),
         run_id,
@@ -182,10 +241,23 @@ fn scenario(label: &str, failure: u8) {
     let outcome = outcome.unwrap();
     if failure != 0 {
         let error = outcome.expect_err("preparation failure must return an error");
-        if failure == 5 { assert!(error.context.contains("injected writer release"), "{error}"); }
-        if failure == 6 { assert!(error.context.contains("injected storage close"), "{error}"); }
-        if failure == 4 { assert!(error.context.contains("injected journal close"), "{error}"); }
-        assert_eq!(error.operation, if matches!(failure, 2 | 4 | 5 | 6) { "test.prepared" } else { "run.observer" });
+        if failure == 5 {
+            assert!(error.context.contains("injected writer release"), "{error}");
+        }
+        if failure == 6 {
+            assert!(error.context.contains("injected storage close"), "{error}");
+        }
+        if failure == 4 {
+            assert!(error.context.contains("injected journal close"), "{error}");
+        }
+        assert_eq!(
+            error.operation,
+            if matches!(failure, 2 | 4 | 5 | 6) {
+                "test.prepared"
+            } else {
+                "run.observer"
+            }
+        );
         assert!(
             callbacks.lock().unwrap().is_empty(),
             "no callbacks after failed preparation"
@@ -210,14 +282,24 @@ fn prepared_panic_returns_error_and_releases_writer() {
 }
 
 #[test]
-fn prepared_error_returns_error_and_releases_writer() { scenario("error", 2); }
+fn prepared_error_returns_error_and_releases_writer() {
+    scenario("error", 2);
+}
 #[test]
-fn prepared_hostile_panic_payload_cannot_prevent_cleanup() { scenario("hostile-payload", 3); }
+fn prepared_hostile_panic_payload_cannot_prevent_cleanup() {
+    scenario("hostile-payload", 3);
+}
 
 #[test]
-fn prepared_error_preserves_journal_close_failure() { scenario("close-error", 4); }
+fn prepared_error_preserves_journal_close_failure() {
+    scenario("close-error", 4);
+}
 
 #[test]
-fn prepared_error_preserves_writer_release_failure() { scenario("release-error", 5); }
+fn prepared_error_preserves_writer_release_failure() {
+    scenario("release-error", 5);
+}
 #[test]
-fn prepared_error_preserves_storage_close_failure() { scenario("storage-close-error", 6); }
+fn prepared_error_preserves_storage_close_failure() {
+    scenario("storage-close-error", 6);
+}

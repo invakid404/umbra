@@ -140,6 +140,11 @@ because `FsOp::Read`/`Write` carry `offset: Option<u64>` where `None` means "at
 the descriptor's current position" -- and without the field there was no position
 to mean.
 
+`FsOp::GetDescriptorFlags { fd }` queries the live descriptor table. It carries
+no pathname or memory buffer and changes neither the shared file offset nor the
+journal. The public macOS `fcntl(F_GETFD)` shim supplies it only for the virtual
+descriptor range; native descriptors remain on the kernel path.
+
 `LaunchPolicy::interpose` and `LaunchPolicy::descriptor_limit` are set together
 or not at all. The second is what makes the first safe for the tracee's whole
 lifetime rather than only at the instant a descriptor is allocated: POSIX

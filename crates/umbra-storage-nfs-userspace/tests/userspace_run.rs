@@ -14368,7 +14368,12 @@ fn fix_227_fdflags(mode: &str) {
     );
     slate_finish_cleanup();
     assert!(!timeout);
-    assert!(native.status.success(), "native status={} stderr={}", native.status, String::from_utf8_lossy(&native.stderr));
+    assert!(
+        native.status.success(),
+        "native status={} stderr={}",
+        native.status,
+        String::from_utf8_lossy(&native.stderr)
+    );
     let native_text = std::fs::read_to_string(scratch.path().join("native-file.records")).unwrap();
     let expected = match mode {
         "fork" => "fork child=0 parent-cloexec=1 parent-live=0 bytes=ABCDE\n",
@@ -14457,7 +14462,8 @@ fn fix_227_fdflags(mode: &str) {
     assert!(journal_records_completion(&run));
     let mut record_path = shadow_path(&run);
     *record_path.last_mut().unwrap() = b"file.records".to_vec();
-    let records = read_whole_object_through_client(&host, port, &record_path).expect("routed records");
+    let records =
+        read_whole_object_through_client(&host, port, &record_path).expect("routed records");
     std::fs::write(evidence.join("routed-records.txt"), &records).unwrap();
     assert_eq!(String::from_utf8_lossy(&records), expected);
     assert_eq!(
@@ -14614,7 +14620,20 @@ fn fix_227_native_fcntl_abi_and_cost() {
         };
         std::fs::write(evidence.join(format!("{mode}.records")), &text).unwrap();
         if mode == "native" {
-            for name in ["getfd", "getfl", "setfd-clear", "getfd-clear", "setfd-set", "getfd-set", "setfl", "getfl-nonblock", "dupfd", "getpath", "setlk", "unlock"] {
+            for name in [
+                "getfd",
+                "getfl",
+                "setfd-clear",
+                "getfd-clear",
+                "setfd-set",
+                "getfd-set",
+                "setfl",
+                "getfl-nonblock",
+                "dupfd",
+                "getpath",
+                "setlk",
+                "unlock",
+            ] {
                 assert_ne!(slate_field(&text, name, "result"), "-1");
                 assert_eq!(slate_field(&text, name, "errno"), "0");
             }
@@ -14650,20 +14669,16 @@ fn fix_227_rewrite_registry(registry_path: &Path, store: &Path) {
         &std::fs::read(repository().join("crates/umbra-storage-local/provider.json")).unwrap(),
     )
     .unwrap();
-    local["executable"] = serde_json::json!(
-        binaries()
-            .join("umbra-storage-local")
-            .as_os_str()
-            .as_bytes()
-    );
+    local["executable"] = serde_json::json!(binaries()
+        .join("umbra-storage-local")
+        .as_os_str()
+        .as_bytes());
     local["capabilities"] =
         serde_json::json!(["local-development-v1", "experimental-open-rewrite-v1"]);
-    local["options"] = serde_json::json!(
-        umbra_core::provider::encode(
-            &umbra_core::BytePath::new(store.as_os_str().as_bytes().to_vec()).unwrap()
-        )
-        .unwrap()
-    );
+    local["options"] = serde_json::json!(umbra_core::provider::encode(
+        &umbra_core::BytePath::new(store.as_os_str().as_bytes().to_vec()).unwrap()
+    )
+    .unwrap());
     r["providers"]["storage"] = local;
     std::fs::write(&registry_path, serde_json::to_vec(&r).unwrap()).unwrap();
 }
@@ -14742,7 +14757,9 @@ fn fix_227_sibling_progress_without_kernel_wait_proof() {
                 let root = shared.parent().unwrap().to_owned();
                 shared = native_shared;
                 Some(root)
-            } else { None };
+            } else {
+                None
+            };
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -14758,7 +14775,10 @@ fn fix_227_sibling_progress_without_kernel_wait_proof() {
                 // and map the same physical object the target will mmap.
                 shared = root.join(shared.strip_prefix("/").unwrap());
                 while !shared.is_file() {
-                    assert!(std::time::Instant::now() < deadline, "shared mapping copy-up missing");
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "shared mapping copy-up missing"
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             }

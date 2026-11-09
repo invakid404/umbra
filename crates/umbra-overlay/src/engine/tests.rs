@@ -8642,21 +8642,59 @@ fn a_set_times_on_a_backend_without_timestamp_fidelity_denies_without_journallin
 fn descriptor_flags_use_only_the_live_descriptor_table() {
     let mut f = Fixture::new(&[(b"seed.txt", b"seed\n")]);
     let fd = TracedFd(4096);
-    let object = f.overlay.lookup(&StoragePath::new(StorageAnchor::Root, b"seed.txt".to_vec()).unwrap()).unwrap().0.object_id;
+    let object = f
+        .overlay
+        .lookup(&StoragePath::new(StorageAnchor::Root, b"seed.txt".to_vec()).unwrap())
+        .unwrap()
+        .0
+        .object_id;
     let op = FsOp::GetDescriptorFlags { fd };
-    assert_eq!(f.overlay.resolve(&f.process, &op).unwrap(), ResolvedAction::Deny(Errno(9)));
+    assert_eq!(
+        f.overlay.resolve(&f.process, &op).unwrap(),
+        ResolvedAction::Deny(Errno(9))
+    );
     for close_on_exec in [false, true] {
-        f.process.fds.insert(fd, FdState { object, logical_path: None, directory: false,
-            flags: OpenFlags { close_on_exec, ..Default::default() }, offset: 73 });
-        assert_eq!(f.overlay.resolve(&f.process, &op).unwrap(), ResolvedAction::Emulate(EmulatedResult {
-            outcome: OperationOutcome::Success { return_value: u64::from(close_on_exec) }, memory_writes: vec![]
-        }));
+        f.process.fds.insert(
+            fd,
+            FdState {
+                object,
+                logical_path: None,
+                directory: false,
+                flags: OpenFlags {
+                    close_on_exec,
+                    ..Default::default()
+                },
+                offset: 73,
+            },
+        );
+        assert_eq!(
+            f.overlay.resolve(&f.process, &op).unwrap(),
+            ResolvedAction::Emulate(EmulatedResult {
+                outcome: OperationOutcome::Success {
+                    return_value: u64::from(close_on_exec)
+                },
+                memory_writes: vec![]
+            })
+        );
         let prepared = f.prepare(&op);
-        f.overlay.observe_result(prepared.operation_id, &OperationOutcome::Success { return_value: u64::from(close_on_exec) }).unwrap();
+        f.overlay
+            .observe_result(
+                prepared.operation_id,
+                &OperationOutcome::Success {
+                    return_value: u64::from(close_on_exec),
+                },
+            )
+            .unwrap();
         f.overlay.commit(prepared.operation_id).unwrap();
-        assert!(f.log.lock().unwrap().records.is_empty(), "GETFD must not journal");
+        assert!(
+            f.log.lock().unwrap().records.is_empty(),
+            "GETFD must not journal"
+        );
         assert_eq!(f.process.fds[&fd].offset, 73);
     }
     f.process.fds.remove(&fd);
-    assert_eq!(f.overlay.resolve(&f.process, &op).unwrap(), ResolvedAction::Deny(Errno(9)));
+    assert_eq!(
+        f.overlay.resolve(&f.process, &op).unwrap(),
+        ResolvedAction::Deny(Errno(9))
+    );
 }

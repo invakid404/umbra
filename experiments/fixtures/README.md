@@ -192,8 +192,9 @@ The rank-16 package also builds `umbra-slate-r16-prepared`, which uses the
 supervisor’s prepared observer to seed an incumbent natively in the standard
 Ganesha container before tracee launch. Keep it beside the publication binary.
 The revised fixture retains its written source File across publication, reports
-through the inherited stderr pipe and exits explicitly to sidestep #227. Mode 5 independently
-executes write-plus-drop to pin that defect. The incumbent companion requires
+through the inherited stderr pipe and exits explicitly to keep publication
+independent of File teardown. Mode 5 independently executes write-plus-drop and
+requires successful drop, exact source bytes and Code(0) completion. The incumbent companion requires
 `docker` on the harness PATH and the loopback fixture container.
 
 
@@ -242,3 +243,26 @@ therefore not fully qualified by that reading. The offline retained-record test
 validates its protocol evidence and rejects corrupted records; it cannot recover
 the missing checks. Future readings preserve scratch state under the evidence
 root. Final CI must exercise the corrected instrument independently.
+
+## Descriptor flags and prepared-observer regressions
+
+The `umbra-fix-227-fdflags.c` fixture checks public F_GETFD, unchanged refusal
+commands, close/reuse, fork/exec I/O, and ordered cross-thread close. Build it
+with `clang -arch arm64 -O1 -Wall -Wextra -Werror` and set
+`UMBRA_FIX_227_FDFLAGS_PATH` for the userspace suite.
+
+`umbra-fix-227-native-fcntl.c` compares native, inactive-interposer, routed, and
+rewrite-backed kernel-descriptor calls. Set `UMBRA_FIX_227_NATIVE_PATH` and
+`UMBRA_FIX_227_INTERPOSER_PATH` (the built universal interposer). The two timing
+loops have 16 calls each; elapsed time is retained separately from ABI equality.
+`umbra-fix-227-lock-progress.c`, selected by `UMBRA_FIX_227_LOCK_PATH`, uses an
+owned helper and a pre-mapped shared control page to check sibling progress.
+Its generic waiting-state observation does **not** prove a kernel lock wait;
+the test retains that limitation explicitly.
+
+The isolated `umbra-fix-227-observer-providers` package wraps real local storage
+and the file journal to record terminal calls and inject separate cleanup errors.
+Build its locked manifest into the workspace target. The supervisor's
+`observer_failure` tests require `UMBRA_TEST_OBSERVER` or
+`UMBRA_INTEGRATION_REQUIRED`; CI supplies required mode. A platform sentinel
+checks that failed preparation never starts the platform provider.

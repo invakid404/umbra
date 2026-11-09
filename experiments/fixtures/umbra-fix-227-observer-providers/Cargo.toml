@@ -20,3 +20,7 @@ path = "src/journal.rs"
 [[bin]]
 name = "umbra-fix-227-storage"
 path = "src/storage.rs"
+
+[[bin]]
+name = "umbra-fix-227-platform-sentinel"
+path = "src/platform-sentinel.rs"
