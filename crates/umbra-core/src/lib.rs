@@ -496,6 +496,11 @@ pub enum FsOp {
         /// Close on exec.
         close_on_exec: bool,
     },
+    /// Descriptor-local flags, independent of pathname or open-file offset.
+    GetDescriptorFlags {
+        /// Descriptor to query.
+        fd: TracedFd,
+    },
     /// Fstat.
     Fstat {
         /// Fd.

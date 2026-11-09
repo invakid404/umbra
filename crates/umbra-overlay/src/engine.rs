@@ -2532,6 +2532,17 @@ impl NamespaceResolver for Overlay {
             FsOp::Write { fd, length, offset } => {
                 return self.resolve_routed_write(context, operation, *fd, *length, *offset, routed)
             }
+            FsOp::GetDescriptorFlags { fd } => {
+                return Ok(match context.fds.get(fd) {
+                    Some(state) => ResolvedAction::Emulate(EmulatedResult {
+                        outcome: OperationOutcome::Success {
+                            return_value: u64::from(state.flags.close_on_exec),
+                        },
+                        memory_writes: vec![],
+                    }),
+                    None => ResolvedAction::Deny(Errno(9)),
+                });
+            }
             FsOp::Close { fd } => return self.resolve_routed_close(context, operation, *fd),
             FsOp::Fstat { fd } => return self.resolve_routed_fstat(context, operation, *fd),
             FsOp::Fchdir { fd } => return self.resolve_routed_fchdir(context, operation, *fd),

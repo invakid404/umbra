@@ -476,7 +476,8 @@ impl Supervisor {
         // `unserved_directory_request`. Anything later that can refuse a
         // breakpointed call before this point breaks it again, and the way to
         // tell is that the four calls have no other gate: this is it.
-        if let FsOp::Fstat { fd }
+        if let FsOp::GetDescriptorFlags { fd }
+        | FsOp::Fstat { fd }
         | FsOp::ReadDir { fd, .. }
         | FsOp::Fchdir { fd }
         | FsOp::Close { fd } = &operation

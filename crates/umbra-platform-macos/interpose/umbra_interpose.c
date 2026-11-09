@@ -294,6 +294,7 @@
 #define UMBRA_OP_READ 2
 #define UMBRA_OP_WRITE 3
 #define UMBRA_OP_CLOSE 4
+#define UMBRA_OP_GETFD 5
 
 /*
  * What umbra writes to arm this library. See ARMING.
@@ -346,6 +347,7 @@ extern int open(const char *, int, ...);
 extern ssize_t read(int, void *, size_t);
 extern ssize_t write(int, const void *, size_t);
 extern int close(int);
+extern int fcntl(int, int, ...);
 
 /*
  * Hand one operation to umbra.
@@ -469,6 +471,40 @@ static int umbra_close(int fd) {
     return (int)umbra_finish(value, failed);
 }
 
+/* Fixed-signature slow path. No variadic operand is consumed for F_GETFD. */
+__attribute__((used, noinline)) static int umbra_getfd(int fd) {
+    int failed = 0;
+    long value = umbra_trap(UMBRA_OP_GETFD, (long)fd, 0, 0, &failed);
+    return (int)umbra_finish(value, failed);
+}
+
+/* Darwin arm64 variadic arguments can live in the caller's stack area.
+ * Passthrough therefore tail-branches without touching SP, LR, x0-x8 or
+ * vector registers. Only caller-scratch x9-x11 and condition flags change.
+ * The same-image libc import has the binding policy documented above.
+ * This reaches public dyld-bound fcntl calls, not libc-internal calls. */
+__attribute__((naked)) static int umbra_fcntl(int fd __attribute__((unused)), int command __attribute__((unused)), ...) {
+    __asm__ __volatile__(
+        "cmp w1, #1\n\t" /* F_GETFD */
+        "b.ne 1f\n\t"
+        "tbnz w0, #31, 1f\n\t"
+        "adrp x9, _umbra_control@PAGE\n\t"
+        "add x9, x9, _umbra_control@PAGEOFF\n\t"
+        "ldr x10, [x9]\n\t"
+        "movz x11, #0x4d31\n\t"
+        "movk x11, #0x4152, lsl #16\n\t"
+        "movk x11, #0x4252, lsl #32\n\t"
+        "movk x11, #0x554d, lsl #48\n\t"
+        "cmp x10, x11\n\t"
+        "b.ne 1f\n\t"
+        "ldr x10, [x9, #8]\n\t"
+        "uxtw x11, w0\n\t"
+        "cmp x11, x10\n\t"
+        "b.lo 1f\n\t"
+        "b _umbra_getfd\n\t"
+        "1: b _fcntl\n\t");
+}
+
 struct umbra_interpose_entry {
     const void *replacement;
     const void *original;
@@ -480,4 +516,5 @@ __attribute__((used)) static struct umbra_interpose_entry umbra_interposed[]
         {(const void *)umbra_read, (const void *)read},
         {(const void *)umbra_write, (const void *)write},
         {(const void *)umbra_close, (const void *)close},
+        {(const void *)umbra_fcntl, (const void *)fcntl},
 };

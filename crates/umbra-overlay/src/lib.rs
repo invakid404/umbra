@@ -311,7 +311,8 @@ pub fn dispatch(operation: &FsOp) -> Dispatch {
         | FsOp::Access { .. }
         | FsOp::ReadLink { .. }
         | FsOp::Read { .. }
-        | FsOp::Fstat { .. } => Dispatch::ReadThrough,
+        | FsOp::Fstat { .. }
+        | FsOp::GetDescriptorFlags { .. } => Dispatch::ReadThrough,
         FsOp::Rename { .. }
         | FsOp::Link { .. }
         | FsOp::Symlink { .. }

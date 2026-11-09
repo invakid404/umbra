@@ -29,6 +29,7 @@ const INTERPOSE_READ: u64 = 2;
 const INTERPOSE_WRITE: u64 = 3;
 /// Operation code in x0 of an [`INTERPOSE_TRAP`]. Mirrors the C header.
 const INTERPOSE_CLOSE: u64 = 4;
+const INTERPOSE_GETFD: u64 = 5;
 
 /// Decode Darwin `O_*` bits into the contract's flag set.
 ///
@@ -95,6 +96,9 @@ fn decode_interpose(regs: &RegisterSet, memory: &mut dyn TraceMemory) -> Result<
             fd: TracedFd(get(regs, 1)? as i32),
             length: transfer_length(get(regs, 3)?),
             offset: None,
+        },
+        INTERPOSE_GETFD => FsOp::GetDescriptorFlags {
+            fd: TracedFd(get(regs, 1)? as i32),
         },
         INTERPOSE_CLOSE => FsOp::Close {
             fd: TracedFd(get(regs, 1)? as i32),
@@ -1372,6 +1376,7 @@ mod tests {
             ("UMBRA_OP_READ", INTERPOSE_READ),
             ("UMBRA_OP_WRITE", INTERPOSE_WRITE),
             ("UMBRA_OP_CLOSE", INTERPOSE_CLOSE),
+            ("UMBRA_OP_GETFD", INTERPOSE_GETFD),
         ] {
             assert_eq!(
                 ours,
@@ -1379,6 +1384,17 @@ mod tests {
                 "{name} disagrees with the interposer's"
             );
         }
+    }
+
+    #[test]
+    fn interpose_getfd_decodes_only_the_signed_descriptor() {
+        let mut memory = strings();
+        for fd in [4096i32, -1] {
+            let regs = entry(INTERPOSE_TRAP, [INTERPOSE_GETFD, fd as u64, u64::MAX, u64::MAX, 0]);
+            assert_eq!(DarwinArm64Abi.decode_entry(&regs, &mut memory).unwrap(),
+                Some(FsOp::GetDescriptorFlags { fd: TracedFd(fd) }));
+        }
+        assert_eq!(memory.reads, 0);
     }
 
     struct Memory {
