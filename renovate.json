@@ -19,8 +19,11 @@
       "enabled": false
     },
     {
-      "description": "Each slate fixture pins the exact versions Codex 44fe510 locks, so its readings describe Codex's own dependency stack; move a pin together with a re-measured slate case, not through Renovate.",
-      "matchFileNames": ["experiments/fixtures/umbra-slate-*/**"],
+      "description": "Each slate fixture pins the exact versions the Codex revision it characterizes locks, so its readings describe Codex's own dependency stack; move a pin together with a re-measured slate case, not through Renovate.",
+      "matchFileNames": [
+        "experiments/fixtures/umbra-slate-*/**",
+        "experiments/fixtures/slate-*/**"
+      ],
       "enabled": false
     }
   ]
