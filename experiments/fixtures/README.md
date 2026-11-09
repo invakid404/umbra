@@ -274,3 +274,20 @@ requests Launch.
 check host syscall relationships; routed descriptor results are compared
 byte-for-byte with the virtual filesystem contract. Path `statfs` remains native. Fork/exec phase markers use retained
 files because routed stdout is not an observation channel.
+
+## Packed-spawn fixtures
+
+`umbra-userspace-spawn.c` and its separate child fixture exercise the experimental
+exact-profile packed-spawn subset: initialized attributes, signal policy,
+ordered kernel pipe actions, CLOEXEC_DEFAULT, kernel-error recovery and precise
+unsupported-action/attribute refusals. The `fix-243-no-spawn` mode exits without
+creating a child and supplies the native control for a local provider-loss
+comparison. Existing null-spawn modes retain their separate coverage.
+
+Signal-policy modes remove only the child's diagnostic signal-observer setting:
+the observer installs a SIGPIPE handler and would otherwise alter the disposition
+being measured. A negative control retains an ignored SIGPIPE and requires the
+strict disposition oracle to reject it. Native E8 needs a soft descriptor limit
+of at least 1024 so the diagnostic observer can relocate its output to fd 900;
+the exact descriptor census remains unchanged. The relocation failure under a
+lower limit is tracked by [#249](https://github.com/invakid404/umbra/issues/249).

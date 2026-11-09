@@ -155,6 +155,12 @@ is the load-bearing half; with only the soft limit lowered the tracee raises it
 back.
 <!-- /memoria:section -->
 
+`spawn` defines the immutable kernel-action plan and authorization token used by
+the experimental packed-spawn protocol. The token binds parent/thread identity,
+run and exec generations, request sequence, plan digest and descriptor-table
+generation. Platform validation and supervisor authorization remain separate;
+these wire types alone make no ABI portability or cleanup guarantee.
+
 ## Logical filesystem metadata
 
 `FilesystemBinding` is the full `(RunId, overlay-v1)` authority key captured

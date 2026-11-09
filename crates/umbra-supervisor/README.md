@@ -388,3 +388,15 @@ a prior request from completing a newer one.
 Pathname `statfs` retains the native host view. It may disagree with synthetic
 descriptor metadata or fail for an overlay-only path. The descriptor capability
 does not hide host mounts.
+
+## Packed spawn authorization
+
+The experimental macOS packed-spawn path prepares a single-use token bound to
+the run, parent, thread, exec generation, request sequence and immutable plan.
+The supervisor rejects file-action operands in the virtual descriptor table.
+Before Ready it applies the child's logical inheritance policy, retaining
+shared open file descriptions and pruning close-on-exec descriptors (or all
+logical descriptors for CLOEXEC_DEFAULT). A kernel error consumes the pending
+request without publishing a child. Platform completion still owns caller PID
+delivery, remote allocation release and the stopped execution barrier; see the
+[platform qualification limits](../umbra-platform-macos/README.md).

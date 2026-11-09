@@ -232,7 +232,7 @@ independent NFS readback and a host journal. The rank-14 SQLx workload still fai
 at SQLite connection setup with `SQLITE_IOERR_READ` (266); a completed journal and
 clean writer release do not imply application success. The platform README records
 the repaired `exec-write` path and current qualification boundaries. Remaining work includes
-multithreaded fork, raw vfork, non-null spawn attributes/file actions, broader
+multithreaded fork, raw vfork, spawn attributes/file actions outside the exact-profile kernel-only subset, broader
 wait semantics, exec argv[0], native namespace/descriptor integration, hard links,
 Rosetta/JIT, real NFS durability and independent fail-closed sandbox composition.
 

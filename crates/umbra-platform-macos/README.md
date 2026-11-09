@@ -19,6 +19,38 @@ The RSP client (`src/rsp.rs`) is a
 small, bounded reverse-connect implementation with framed `$…#CC` packets,
 RLE decode, and a per-request deadline.
 
+## Packed spawn descriptors (experimental)
+
+The bounded packed-descriptor path admits kernel-only CLOSE, DUP2 and INHERIT
+file actions, plus initialized default attributes, SETSIGDEF, SETSIGMASK and
+CLOEXEC_DEFAULT. The supervisor authorizes each immutable plan against the
+parent's logical descriptor table. Actions touching virtual descriptors, path
+actions, RESETIDS, SETSID, SETPGROUP and other unadmitted extensions fail closed.
+The full Codex E8 launch remains blocked, including its SETSID request.
+
+Admission is restricted to the exact ABI profile checked in `src/spawn.rs`
+and `src/spawn_host.rs`; it is not a portability claim. Broader admission is
+tracked in [#247](https://github.com/invakid404/umbra/issues/247). After a macOS
+update, retain the named profile refusal, inspect the packed descriptor layout
+and libsystem kernel identity, and re-run native controls, decoder/profile
+checks, positive leaves, exact refusals and lifecycle qualification before
+changing the allowlist. Do not widen it from a version string alone.
+
+Parent and child remain stopped through supervisor Ready, caller PID delivery,
+release of the dedicated remote region and final register commit. New fallible
+completion work follows child Session insertion. The inherited interval between
+spawn success and Task acquisition remains unowned in non-isolated runs; see
+[#248](https://github.com/invakid404/umbra/issues/248). Provider loss also removes
+the in-process watchdog. Terminal/library runs have no outer guardian sweep;
+the local no-spawn, null-spawn and packed-spawn comparison left root/debugger
+survivors requiring test recovery. A live-process census does not prove reap.
+Guardian-isolated entry retains its existing session sweep and zombie caveat.
+Later child-initiated group/session changes remain outside this guarantee.
+
+Lifecycle probes are compiled only with `mutation-probe-spawn-lifecycle`.
+The semantic readings do not certify the full fault matrix, which remains
+under qualification. Normal provider builds exclude the probes.
+
 <!-- memoria:section id="public-api" files="src/lib.rs" -->
 ## Public API
 
