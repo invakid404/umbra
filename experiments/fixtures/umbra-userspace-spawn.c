@@ -648,6 +648,7 @@ int main(int argc, char **argv) {
         !strcmp(mode, "fix-243-sigdefault") || !strcmp(mode, "fix-243-sigmask") ||
         !strcmp(mode, "fix-243-sigdefault-mutant"))
         return shape(mode, root, helper);
+    if (!strcmp(mode, "fix-243-no-spawn")) return 0;
     if (!strcmp(mode, "c11-05")) return cloexec(root, helper);
     if (!strcmp(mode, "c11-05-premise")) return premise(root);
     if (!strcmp(mode, "c11-09")) return offset(root, helper);

@@ -436,6 +436,12 @@ impl Session {
         if !stop.starts_with('T') {
             return Err(error("attach", stop));
         }
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if parent.is_none() && std::env::var_os("UMBRA_FIX_243_PROBE_ROOT").is_some() {
+            // Plain-run comparison: root is acquired and debugger attached;
+            // no spawn request has executed.
+            crate::spawn_probe::acquired(pid, birth, true)?;
+        }
         let fields = rsp::fields(&stop[3..]);
         let thread = rsp::number(
             fields

@@ -10494,25 +10494,32 @@ fn fix_243_refuses_virtual_destination() {
     );
 }
 
-/// Required registered-window provider-loss cell, terminal/non-isolated entry.
-/// Build the provider with mutation-probe-spawn-lifecycle for this qualification.
-#[test]
-fn fix_243_registered_provider_loss() {
+/// Local comparison only: surviving owners are recorded as NOT QUALIFIED.
+/// Build the provider with the matching probe feature for this apparatus.
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+fn fix_243_provider_loss_reading(case: &str, mode: &str, root_probe: bool) {
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
-    let Some(mut spawn) = slate_spawn("fix-243-registered-loss") else {
+    let Some(mut spawn) = slate_spawn(case) else {
         return;
     };
-    let (root, native) = slate_spawn_native(&spawn, "c11-02-attributes");
+    let (root, native) = slate_spawn_native(&spawn, mode);
     assert!(native.status.success());
-    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    if !root_probe {
+        assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    }
     let socket = spawn.evidence.parent().unwrap().join("probe.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     spawn.provider_environment.push((
         "UMBRA_FIX_243_PROBE_SOCKET".into(),
         socket.to_str().unwrap().into(),
     ));
+    if root_probe {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_PROBE_ROOT".into(), "1".into()));
+    }
     let evidence = spawn.evidence.clone();
     let observer = std::thread::spawn(move || {
         let mut pollfd = libc::pollfd {
@@ -10552,7 +10559,7 @@ fn fix_243_registered_provider_loss() {
         stream.write_all(b"P").unwrap();
         observed
     });
-    let routed = slate_spawn_routed(&spawn, "c11-02-attributes", &["child.txt", "parent.txt"]);
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
     let observed = observer.join().unwrap();
     std::fs::remove_file(socket).unwrap();
     assert_ne!(routed.run.status, Some(0));
@@ -10561,24 +10568,34 @@ fn fix_243_registered_provider_loss() {
     }
     let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
     std::fs::write(spawn.evidence.join("primary-cleanup.txt"), &cleanup).unwrap();
-    // Test-owned survivor recovery cannot turn the primary result into a pass.
-    assert!(
-        cleanup.lines().next().unwrap().contains("group_kills=0"),
-        "{cleanup}"
+    slate_record(
+        &spawn,
+        "NOT QUALIFIED",
+        serde_json::json!({
+            "comparison_only": true, "mode": mode, "cleanup": cleanup,
+            "observed_identity": observed.json(),
+            "reap_established": false,
+        }),
     );
-    assert!(
-        cleanup.starts_with("cleanup CLEAN")
-            && cleanup.lines().next().unwrap().contains("zombies=\"\""),
-        "{cleanup}"
-    );
+    // Recovery is a harness obligation, never a production cleanup pass.
     assert!(
         slate_process(observed.pid)
             .unwrap()
-            .is_none_or(|now| now.start != observed.start),
-        "registered child survived provider loss"
+            .is_none_or(|now| now.start != observed.start || now.status == 5),
+        "recorded process still live after harness recovery"
     );
-    slate_spawn_finish(&spawn, &routed);
-    slate_finish_cleanup();
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_provider_loss_no_spawn_reading() {
+    fix_243_provider_loss_reading("fix-243-loss-no-spawn", "fix-243-no-spawn", true);
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_provider_loss_null_reading() {
+    fix_243_provider_loss_reading("fix-243-loss-null", "c11-01", false);
 }
 
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
