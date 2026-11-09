@@ -217,7 +217,10 @@ int main(int argc, char **argv) {
         note("child-signal default=%d ignored=%d blocked=%d\n", defaulted, ignored, blocked);
         int expected_default = !strcmp(mode, "fix-243-sigdefault");
         if (defaulted != expected_default || ignored == expected_default ||
-            blocked != expected_default) return 81;
+            blocked != expected_default) {
+            flush(root);
+            return 81;
+        }
         return write_child(root);
     }
     if (!strcmp(mode, "write-child") && argc == 3) return write_child(root);
