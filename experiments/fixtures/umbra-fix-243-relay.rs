@@ -10,6 +10,7 @@ fn main() {
     let args = std::iter::once(exe.clone().into_os_string())
         .chain(std::env::args_os().skip(1))
         .collect();
+    std::fs::create_dir_all(&dir).expect("create guardian record directory");
     umbra_isolation::__relay_for_tests(exe, args, dir)
 }
 

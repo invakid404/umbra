@@ -291,3 +291,14 @@ strict disposition oracle to reject it. Native E8 needs a soft descriptor limit
 of at least 1024 so the diagnostic observer can relocate its output to fd 900;
 the exact descriptor census remains unchanged. The relocation failure under a
 lower limit is tracked by [#249](https://github.com/invakid404/umbra/issues/249).
+
+`umbra-fix-243-relay.rs` is the `umbra243relay` Cargo example in the
+userspace-storage crate, enabled only with `mutation-probe-spawn-lifecycle`.
+It invokes the real isolation relay with the real CLI to drive guardian
+qualification outside launchd's session. The caller supplies
+`UMBRA_FIX_243_RELAY_EXE` and `UMBRA_FIX_243_RELAY_RECORDS`; the latter holds
+relay and guardian records. Build it with `cargo build -p
+umbra-storage-nfs-userspace --features mutation-probe-spawn-lifecycle --example
+umbra243relay`. The guardian fault cases require a COMPLETE sweep, independent
+child-identity disappearance and CLEAN cleanup without harness kills. These
+cases await live qualification; a COMPLETE sweep alone does not establish reap.

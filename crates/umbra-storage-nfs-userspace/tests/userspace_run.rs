@@ -10731,7 +10731,19 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
             "guardian session was not observed"
         );
         let records = std::fs::read_dir(spawn.evidence.join("guardian")).unwrap();
-        assert!(records.count() > 0, "guardian record missing");
+        let mut complete = false;
+        for entry in records {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            for line in text.lines() {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                if record["event"] == "sweep" {
+                    assert_eq!(record["outcome"], "COMPLETE", "{record}");
+                    assert_eq!(record["owned_alive"], 0, "{record}");
+                    complete = true;
+                }
+            }
+        }
+        assert!(complete, "guardian COMPLETE sweep record missing");
         assert!(
             cleanup.starts_with("cleanup CLEAN")
                 && cleanup.lines().next().unwrap().contains("group_kills=0")
