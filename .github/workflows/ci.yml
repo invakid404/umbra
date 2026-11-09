@@ -553,8 +553,8 @@ jobs:
 
       - name: Build descriptor and sibling-progress controls
         run: |
-          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
           for fixture in fdflags native-fcntl lock-progress; do
+            test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
             clang -arch arm64 -O1 -Wall -Wextra -Werror "experiments/fixtures/umbra-fix-227-$fixture.c" -o "$GITHUB_WORKSPACE/target/debug/umbra-fix-227-$fixture"
           done
           echo "UMBRA_FIX_227_FDFLAGS_PATH=$GITHUB_WORKSPACE/target/debug/umbra-fix-227-fdflags" >> "$GITHUB_ENV"
