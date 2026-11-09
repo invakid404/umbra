@@ -2,6 +2,7 @@
  * "refusals" intentionally has different native and routed expectations.
  * Inheritance and threaded ordering are separate cases in the harness. */
 #include <errno.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,9 +14,31 @@
 
 extern int __close_nocancel(int);
 
+static char records[4096], record_path[4096];
+static size_t used;
+static void note(const char *format, ...) {
+    va_list args; va_start(args, format);
+    int n = vsnprintf(records + used, sizeof(records) - used, format, args);
+    va_end(args);
+    if (n < 0 || (size_t)n >= sizeof(records) - used) _exit(70);
+    used += (size_t)n;
+}
+static void flush_records(void) {
+    int out = open(record_path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (out < 0) _exit(71);
+    size_t done = 0;
+    while (done < used) {
+        ssize_t n = write(out, records + done, used - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) _exit(72);
+        done += (size_t)n;
+    }
+    if (close(out)) _exit(73);
+}
+
 static void result(const char *name, int value) {
     int error = value < 0 ? errno : 0;
-    printf("%s result=%d errno=%d\n", name, value, error);
+    note("%s result=%d errno=%d\n", name, value, error);
 }
 
 static _Atomic int phase;
@@ -44,6 +67,8 @@ int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[1], "exec-child"))
         return exec_child(atoi(argv[2]), atoi(argv[3]));
     if (argc != 3) return 10;
+    if (snprintf(record_path, sizeof(record_path), "%s.records", argv[2]) >= (int)sizeof(record_path)) return 74;
+    if (atexit(flush_records)) return 75;
     int fd = open(argv[2], O_CREAT | O_RDWR | O_CLOEXEC, 0600);
     if (fd < 0) return 11;
     if (!strcmp(argv[1], "flags")) {
@@ -72,12 +97,12 @@ int main(int argc, char **argv) {
         result("double-close", close(fd));
         fd = open(argv[2], O_RDWR);
         if (fd < 0) return 17;
-        printf("reuse-plain equal=%d\n", fd == original);
+        note("reuse-plain equal=%d\n", fd == original);
         result("close-nocancel", __close_nocancel(fd));
         result("double-nocancel", __close_nocancel(fd));
         fd = open(argv[2], O_RDWR);
         if (fd < 0) return 18;
-        printf("reuse-nocancel equal=%d\n", fd == original);
+        note("reuse-nocancel equal=%d\n", fd == original);
     } else if (!strcmp(argv[1], "thread")) {
         pthread_t thread;
         shared_fd = fd;
@@ -132,7 +157,7 @@ int main(int argc, char **argv) {
         char all[5];
         if (verify < 0 || read(verify, all, 5) != 5 || memcmp(all, "ABCDE", 5)) return 66;
         if (close(verify)) return 67;
-        printf("%s child=0 parent-cloexec=1 parent-live=0 bytes=ABCDE\n", argv[1]);
+        note("%s child=0 parent-cloexec=1 parent-live=0 bytes=ABCDE\n", argv[1]);
     } else {
         return 19;
     }

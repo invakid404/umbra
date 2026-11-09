@@ -14369,7 +14369,7 @@ fn fix_227_fdflags(mode: &str) {
     slate_finish_cleanup();
     assert!(!timeout);
     assert!(native.status.success(), "native status={} stderr={}", native.status, String::from_utf8_lossy(&native.stderr));
-    let native_text = String::from_utf8_lossy(&native.stdout);
+    let native_text = std::fs::read_to_string(scratch.path().join("native-file.records")).unwrap();
     let expected = match mode {
         "fork" => "fork child=0 parent-cloexec=1 parent-live=0 bytes=ABCDE\n",
         "exec" => "exec child=0 parent-cloexec=1 parent-live=0 bytes=ABCDE\n",
@@ -14455,7 +14455,11 @@ fn fix_227_fdflags(mode: &str) {
     assert_eq!(run.status, Some(0), "{}", run.stderr);
     assert!(run.stderr.contains("finished: Some(Code(0))"));
     assert!(journal_records_completion(&run));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    let mut record_path = shadow_path(&run);
+    *record_path.last_mut().unwrap() = b"file.records".to_vec();
+    let records = read_whole_object_through_client(&host, port, &record_path).expect("routed records");
+    std::fs::write(evidence.join("routed-records.txt"), &records).unwrap();
+    assert_eq!(String::from_utf8_lossy(&records), expected);
     assert_eq!(
         std::fs::read(run.workspace.join("seed.txt")).unwrap(),
         b"seed\n"
