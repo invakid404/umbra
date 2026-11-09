@@ -9782,7 +9782,7 @@ struct SlateSpawn {
     program: PathBuf,
     helper: PathBuf,
     provider_environment: Vec<(String, String)>,
-    rpc_timeout_ms: Option<u64>,
+    platform_timeout_ms: Option<u64>,
 }
 fn slate_spawn(case: &str) -> Option<SlateSpawn> {
     let evidence = slate_evidence()?.join(case);
@@ -9814,7 +9814,7 @@ fn slate_spawn(case: &str) -> Option<SlateSpawn> {
         program,
         helper,
         provider_environment: Vec::new(),
-        rpc_timeout_ms: None,
+        platform_timeout_ms: None,
     })
 }
 
@@ -9890,10 +9890,13 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
     let workspace = workspace.canonicalize().unwrap();
     std::fs::write(workspace.join("seed.txt"), b"ABCDEF").unwrap();
     let registry = registry(spawn.scratch.path(), &host, port);
-    if let Some(timeout_ms) = spawn.rpc_timeout_ms {
+    if let Some(timeout_ms) = spawn.platform_timeout_ms {
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
-        config["timeout_ms"] = serde_json::json!(timeout_ms);
+        config["providers"]["platform"]["options"] = serde_json::json!(serde_json::to_vec(
+            &serde_json::json!({"timeout_ms": timeout_ms})
+        )
+        .unwrap());
         std::fs::write(&registry, serde_json::to_vec(&config).unwrap()).unwrap();
     }
     assert_no_nfs_mount(&host, port, &[&workspace], "rank-11 before");
@@ -10518,9 +10521,9 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
         assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
     }
     if case == "fix-243-inserted-watchdog" {
-        // The real 30s provider watchdog must fire before transport timeout.
-        // The slate's independent 60s execution deadline remains unchanged.
-        spawn.rpc_timeout_ms = Some(45_000);
+        // Configure the real watchdog below the existing 12s RPC deadline;
+        // the independent 60s slate deadline remains unchanged.
+        spawn.platform_timeout_ms = Some(10_000);
     }
     let phase = match case {
         "fix-243-copyout-error" => "caller-copyout",
