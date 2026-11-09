@@ -1,0 +1,14 @@
+umbra: run b29e2fd7-b2f2-4b9e-bbc4-fd8f214fb864 prepared
+case=13 main_tid=127101689
+c10-13 ready child=77929
+helper-ready tid=127101706 parked=1 leaving=0
+c10-13 pre-poll helper_tid=127101706 parked=1 leaving=0 phase=1
+c10-13 poll child=77929 result=0 errno=0 status=1515870810
+helper-leaving tid=127101706 parked=0 leaving=1
+helper-joined tid=127101689
+c10-13 helper-joined
+c10-13 release=G caller_tid=127101689
+c10-13 child-post-release=CHILD-G
+reap child=77929 result=77929 status=0
+complete case=13
+umbra: run b29e2fd7-b2f2-4b9e-bbc4-fd8f214fb864 finished: Some(Code(0)) after 2 process exits

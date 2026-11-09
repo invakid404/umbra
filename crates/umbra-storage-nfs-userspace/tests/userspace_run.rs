@@ -14272,11 +14272,59 @@ fn r10_shadow_names(host: &str, port: u16, run: &Run) -> Vec<Vec<u8>> {
     let mut path = shadow_path(run);
     path.pop();
     for (index, part) in path.into_iter().enumerate() {
-        match transport.lookup(&handle, &ComponentName::new(part).unwrap(), AttrMask::STAT, deadline) {
+        match transport.lookup(
+            &handle,
+            &ComponentName::new(part).unwrap(),
+            AttrMask::STAT,
+            deadline,
+        ) {
             Ok((next, _)) => handle = next,
-            Err(e) if index >= 4 && e.status().is_some_and(|s| s.0 == 2) => return Vec::new(),
+            Err(e) if r10_absent_workspace(index, e.status().map(|s| s.0)) => return Vec::new(),
             Err(e) => panic!("shadow namespace inspection failed: {e:?}"),
         }
     }
     c13_shadow_names(host, port, run)
+}
+
+fn r10_absent_workspace(index: usize, status: Option<u32>) -> bool {
+    index >= 4 && status == Some(2)
+}
+
+#[test]
+fn slate_r10_deferred_retained_poll_evidence() {
+    // Original run exited successfully, then the old namespace census failed on
+    // NOENT. Replay its protocol evidence without relabeling that run qualified.
+    for bytes in [
+        include_bytes!(
+            "../../../experiments/fixtures/umbra-slate-r10-deferred-readings/c10-13-native.stderr"
+        )
+        .as_slice(),
+        include_bytes!(
+            "../../../experiments/fixtures/umbra-slate-r10-deferred-readings/c10-13-routed.stderr"
+        )
+        .as_slice(),
+    ] {
+        r10_deferred_records(13, bytes);
+        let text = std::str::from_utf8(bytes).unwrap();
+        for bad in [
+            text.replace("status=1515870810", "status=0"),
+            text.replace("parked=1", "parked=0"),
+            text.replace("child-post-release=CHILD-G", "child-post-release=WRONG"),
+        ] {
+            assert!(std::panic::catch_unwind(|| r10_deferred_records(13, bad.as_bytes())).is_err());
+        }
+    }
+    assert!(r10_absent_workspace(4, Some(2)));
+    assert!(
+        !r10_absent_workspace(3, Some(2)),
+        "missing run root is an error"
+    );
+    assert!(
+        !r10_absent_workspace(4, None),
+        "transport failure is not absence"
+    );
+    assert!(
+        !r10_absent_workspace(4, Some(13)),
+        "permission refusal is not absence"
+    );
 }

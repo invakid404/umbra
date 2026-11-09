@@ -1,0 +1,12 @@
+case=13 main_tid=127101520
+c10-13 ready child=77863
+helper-ready tid=127101539 parked=1 leaving=0
+c10-13 pre-poll helper_tid=127101539 parked=1 leaving=0 phase=1
+c10-13 poll child=77863 result=0 errno=0 status=1515870810
+helper-leaving tid=127101539 parked=0 leaving=1
+helper-joined tid=127101520
+c10-13 helper-joined
+c10-13 release=G caller_tid=127101520
+c10-13 child-post-release=CHILD-G
+reap child=77863 result=77863 status=0
+complete case=13
