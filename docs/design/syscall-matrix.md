@@ -39,7 +39,7 @@ Statuses are intended M2 behavior for run-backed files: **emulated** through the
 | `access`, `faccessat` | emulated | P; correct real/effective identity and nofollow flags; ACCESS is a current probe, not authorization for a later mutation. |
 | `opendir`, `readdir`, `closedir` | emulated | libc wrappers over emulated open/enumerate/close; D/H. Bounded buffers, byte names, stable object identity; no host DIR pointer on the wire. |
 | `getdents64` | emulated | Linux D; ABI-encoded complete records and opaque cookies, correct EOF/buffer bounds. |
-| `statfs`, `fstatfs` | emulated | P/H; translate qualified server capacity/limits/filesystem identity; no invented local free-space answer. |
+| `statfs`, `fstatfs` | emulated | Darwin routed namespace metadata v1: per-run virtual identity, undefined aggregate statistics; native descriptors pass through. No host mount disclosure or invented capacity. |
 | `getcwd`, `chdir`, `fchdir` | emulated | V/P/H; logical cwd and pinned directory identity. Revalidate renamed/unlinked cwd; report failure when no valid logical path exists. |
 | `dup`, `dup2`, `dup3` | emulated | V/H; shared open-file description, atomic dup2 replacement, CLOEXEC, valid platform flags. Kernel-resource aliases remain kernel-backed and tracked. |
 | `fcntl` | emulated | V/H; GET/SETFD, GET/SETFL, duplication and supported record locks. Unknown commands rejected. Lock design must match per-process/OFD distinctions and NFS lock-owner mapping; no local-only locks advertised as cross-client locks. |

@@ -1507,6 +1507,7 @@ fn overlay_fixture(
                                     process.fds.insert(
                                         TracedFd(*return_value as i32),
                                         FdState {
+                                            filesystem: None,
                                             object: stat.object_id,
                                             logical_path: Some(path),
                                             directory: true,

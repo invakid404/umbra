@@ -129,7 +129,7 @@ SQLite workload. Build with its checked-in lockfile and use the
 `slate_r14_*` integration tests in `umbra-storage-nfs-userspace/tests/userspace_run.rs`
 to drive it; it requires a bounded host observer that acknowledges phase frames.
 The harness owns native controls, seed verification and enforced routed readings.
-Fresh and existing databases both return SQLite `3338` at routed connection setup,
+Fresh and existing databases both return SQLite `266` at routed connection setup,
 while native controls commit and read exact sentinel rows. This characterizes a
 refusal, not WAL support. The two `repair-*` inputs preserve original instrument
 failure data for the checked-in L46 replay test. See the
@@ -267,3 +267,10 @@ Build its locked manifest into the workspace target. The supervisor's
 `UMBRA_INTEGRATION_REQUIRED`; CI supplies required mode. A platform sentinel
 accepts the capability handshake and checks that failed preparation never
 requests Launch.
+
+## Filesystem metadata fixture
+
+`umbra-fix-214-statfs.c` drives the `f214_` userspace tests. Native controls
+check host syscall relationships; routed results are compared byte-for-byte
+with the virtual filesystem contract. Fork/exec phase markers use retained
+files because routed stdout is not an observation channel.

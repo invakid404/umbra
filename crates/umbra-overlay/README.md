@@ -991,3 +991,24 @@ protocol now carries the lifecycle calls, but `umbra_supervisor` still binds
 `standard_namespace` and refuses a namespace-role registry, so an alternative
 namespace provider cannot yet own a run.
 <!-- /memoria:section -->
+
+## Filesystem metadata queries
+
+The namespace advertises `namespace-filesystem-metadata-v1` through
+`filesystem_metadata_capabilities`. `filesystem_metadata` follows logical
+paths through the existing resolver. Descriptor queries instead use the
+immutable filesystem binding captured at open, so removing a pathname does
+not invalidate filesystem metadata. This does not repair the separate
+pathname-dependent descriptor byte-I/O limitation.
+
+All objects in one run share the `overlay-v1` filesystem, including base-only
+and copied-up objects. Metadata is reconstructed from the run key, independent
+of the provider instance or writer epoch. Aggregate capacity, free space,
+inode counts, block size and optimal I/O size are undefined. No storage
+capacity request or storage protocol change is involved.
+
+Routed rename still returns ENOTSUP. Live tests separately verify descriptor
+metadata after successful unlink and after an exact rename refusal with an
+unchanged namespace. A deterministic namespace test renames the backing
+namespace directly and verifies the retained descriptor binding, old-path
+ENOENT and new-path metadata. It does not claim live routed rename support.

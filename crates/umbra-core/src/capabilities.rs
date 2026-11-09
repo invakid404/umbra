@@ -34,6 +34,8 @@ pub const PLATFORM_SYSCALL_REWRITE_V1: &str = "experimental-syscall-rewrite-v1";
 /// leaving a failed one explicitly failed. Advertise only when `renew_writer`,
 /// `finish_run` and `fail_run` are implemented, not merely routed.
 pub const NAMESPACE_RUN_LIFECYCLE_V1: &str = "namespace-run-lifecycle-v1";
+/// Truthful metadata for the composed logical filesystem.
+pub const NAMESPACE_FILESYSTEM_METADATA_V1: &str = "namespace-filesystem-metadata-v1";
 
 /// Storage applies [`crate::storage::MetadataUpdate::uid`]/`gid` on a
 /// `SetMetadata` and reflects the result in [`crate::storage::BlobStat`].

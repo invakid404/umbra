@@ -986,3 +986,19 @@ sandbox qualification tests exercise a symlinked cache root.
 Failed attach and sandbox-handoff paths set `launch_tree_terminated` on the returned
 error only when `waitpid` confirms reaping every created tracee. Missing evidence
 remains false so the supervisor retains writer authority after uncertain launch failure.
+
+## Routed filesystem metadata
+
+The arm64 `statfs`/`fstatfs` stubs decode syscall numbers 345/346; their 64-bit
+libc aliases share those entry points. Legacy numbers 157/158 are not encoded
+using this layout. The SDK structure is 2168 bytes. The encoder zeroes reserved
+bytes, reports type `umbra`, logical mount `/`, and source `umbra:<RunId>`.
+The fsid contains the first eight SHA-256 bytes of `umbra-overlay-v1:<RunId>`
+as two little-endian words. This compact ID is presentation, not authority.
+
+Block size, optimal I/O size, block/inode counts, owner, numeric VFS type and
+subtype use all-ones undefined values. Flags and extended flags are zero;
+no local mount, read-only mount or durability property is claimed. Numeric
+conversion overflow returns EOVERFLOW; names must fit without truncation.
+Output addresses are retained without probing until lookup and provider
+validation complete. Invalid output then returns EFAULT.

@@ -212,3 +212,13 @@ refuse the launch: an interposed tracee whose descriptors are not fenced can be
 handed a kernel descriptor number that already names something else, which is a
 wrong-object read rather than a refusal.
 <!-- /memoria:section -->
+
+## Filesystem metadata ABI boundary
+
+`SyscallAbi::encode_filesystem_metadata` encodes namespace metadata for the
+target ABI. The provider proxy carries this typed request and bounds its
+response. `TraceBackend::copyout_memory` is the syscall-result write path:
+an inaccessible output produces EFAULT, while provider or task failures remain
+fatal. It is distinct from debugger memory writes used to install code or
+rewrite a stopped call. The Darwin backend uses Mach writes so read-only
+pages are not made writable by debugger behavior.

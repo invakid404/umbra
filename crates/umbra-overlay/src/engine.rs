@@ -876,10 +876,10 @@ impl Overlay {
     }
     fn directory(&mut self, path: &StoragePath) -> Result<()> {
         if self.lookup(path)?.0.kind != ObjectKind::Directory {
-            return Err(error(
-                ErrorKind::InvalidPath,
-                "path component is not a directory",
-            ));
+            return Err(
+                error(ErrorKind::InvalidPath, "path component is not a directory")
+                    .with_errno(Errno(20)),
+            );
         }
         Ok(())
     }
@@ -984,7 +984,8 @@ impl Overlay {
                 b"" | b"." => {}
                 b".." => {
                     if parts.len() == logical_root.len() {
-                        return Err(error(ErrorKind::InvalidPath, "parent escapes logical root"));
+                        return Err(error(ErrorKind::InvalidPath, "parent escapes logical root")
+                            .with_errno(Errno(13)));
                     }
                     parts.pop();
                 }
@@ -1117,7 +1118,7 @@ impl Overlay {
                 return Err(error(
                     ErrorKind::CorruptJournal,
                     "conflicting logical symlink identity",
-                ))
+                ));
             }
             Some(_) => {}
             None => self.write_control(&metadata, target.as_bytes())?,
@@ -1856,7 +1857,7 @@ impl Overlay {
         let path = match self.resolve_path(context, DirRef::Cwd, &logical, false) {
             Ok(path) => path,
             Err(e) if e.kind == ErrorKind::NotFound => {
-                return Ok(Err(ResolvedAction::Deny(Errno::ENOENT)))
+                return Ok(Err(ResolvedAction::Deny(Errno::ENOENT)));
             }
             Err(e) => return Err(e),
         };
@@ -1958,7 +1959,7 @@ impl Overlay {
                 return Err(unsupported(
                     "a routed read needs a buffer binding from set_routed_request; typed \
                      read_at is available for a caller with no tracee to write into",
-                ))
+                ));
             }
         };
         let action = ResolvedAction::Emulate(EmulatedResult {
@@ -2013,7 +2014,7 @@ impl Overlay {
                 return Err(unsupported(
                     "a routed write needs its bytes from set_routed_request; FsOp::Write \
                      carries only their count",
-                ))
+                ));
             }
         };
         // The binding must describe *this* operation before anything is clamped:
@@ -2482,7 +2483,7 @@ fn absolute_components(path: &BytePath) -> Result<Vec<Vec<u8>>> {
                 return Err(error(
                     ErrorKind::InvalidPath,
                     "context anchor contains parent",
-                ))
+                ));
             }
             name => parts.push(name.to_vec()),
         }
@@ -2527,10 +2528,11 @@ impl NamespaceResolver for Overlay {
         // against, and it is `ProcessContext::fds` that holds it.
         match operation {
             FsOp::Read { fd, length, offset } => {
-                return self.resolve_routed_read(context, operation, *fd, *length, *offset, routed)
+                return self.resolve_routed_read(context, operation, *fd, *length, *offset, routed);
             }
             FsOp::Write { fd, length, offset } => {
-                return self.resolve_routed_write(context, operation, *fd, *length, *offset, routed)
+                return self
+                    .resolve_routed_write(context, operation, *fd, *length, *offset, routed);
             }
             FsOp::GetDescriptorFlags { fd } => {
                 let Some(state) = context.fds.get(fd) else {
@@ -2560,7 +2562,7 @@ impl NamespaceResolver for Overlay {
             FsOp::Fstat { fd } => return self.resolve_routed_fstat(context, operation, *fd),
             FsOp::Fchdir { fd } => return self.resolve_routed_fchdir(context, operation, *fd),
             FsOp::Chdir { dir, path } => {
-                return self.resolve_routed_chdir(context, operation, *dir, path)
+                return self.resolve_routed_chdir(context, operation, *dir, path);
             }
             _ => {}
         }
@@ -2584,7 +2586,7 @@ impl NamespaceResolver for Overlay {
             _ => {
                 return Err(unsupported(
                     "operation requires descriptor or metadata support beyond MVP",
-                ))
+                ));
             }
         };
         let readlink_buffer = if matches!(operation, FsOp::ReadLink { .. }) {
@@ -3001,7 +3003,7 @@ impl NamespaceResolver for Overlay {
                         return Err(unsupported(
                             "a routed open needs a descriptor from set_routed_request; this \
                              backend has no kernel path for a rewrite to target",
-                        ))
+                        ));
                     }
                 };
                 if descriptor.0 < 0 {
@@ -3303,6 +3305,68 @@ fn reconcilable_on_reopen(operation: &JournalPendingOperation) -> bool {
         )
 }
 impl NamespaceSession for Overlay {
+    fn filesystem_metadata_capabilities(&self) -> &'static [&'static str] {
+        &[umbra_core::capabilities::NAMESPACE_FILESYSTEM_METADATA_V1]
+    }
+    fn filesystem_metadata(
+        &mut self,
+        context: &ProcessContext,
+        operation: &FsOp,
+        token: umbra_core::FilesystemQueryToken,
+    ) -> Result<std::result::Result<umbra_core::FilesystemReply, Errno>> {
+        self.idle()?;
+        if token.task != context.task || token.image_generation != context.exec_generation {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "filesystem query context mismatch",
+            ));
+        }
+        let binding = match operation {
+            FsOp::FstatFs { fd } => {
+                let Some(state) = context.fds.get(fd) else {
+                    return Ok(Err(Errno(9)));
+                };
+                let Some(binding) = &state.filesystem else {
+                    return Ok(Err(Errno(45)));
+                };
+                // No pathname lookup: an open description retains its binding
+                // through unlink, rename, copy-up and descriptor-number reuse.
+                binding.clone()
+            }
+            FsOp::StatFs { dir, path, follow } => {
+                let resolved = self.resolve_path_follow(context, *dir, path, false, *follow);
+                let resolved = match resolved {
+                    Ok(path) => path,
+                    Err(e) if e.kind == ErrorKind::NotFound => return Ok(Err(Errno(2))),
+                    Err(e)
+                        if e.kind == ErrorKind::InvalidPath
+                            && matches!(e.errno, Some(Errno(20) | Errno(13))) =>
+                    {
+                        return Ok(Err(e.errno.unwrap()));
+                    }
+                    Err(e) => match self.hidden_or(e, false)? {
+                        ResolvedAction::Deny(errno) => return Ok(Err(errno)),
+                        _ => {
+                            return Err(error(
+                                ErrorKind::ProtocolMismatch,
+                                "unexpected filesystem lookup action",
+                            ));
+                        }
+                    },
+                };
+                if absent(self.lookup(&resolved))?.is_none() {
+                    return Ok(Err(Errno(2)));
+                }
+                umbra_core::FilesystemBinding::overlay(self.config()?.context.run_id)
+            }
+            _ => return Err(error(ErrorKind::ProtocolMismatch, "not a filesystem query")),
+        };
+        Ok(Ok(umbra_core::FilesystemReply {
+            token,
+            metadata: binding.metadata()?,
+        }))
+    }
+
     fn set_routed_request(&mut self, request: RoutedRequest) -> Result<()> {
         self.idle()?;
         self.routed_request = None;
@@ -3702,7 +3766,7 @@ impl NamespaceSession for Overlay {
                                     return Err(error(
                                         ErrorKind::ProtocolMismatch,
                                         "storage answered a truncate with something else",
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -3913,7 +3977,7 @@ impl NamespaceSession for Overlay {
                             return Err(error(
                                 ErrorKind::ProtocolMismatch,
                                 "storage answered a set_metadata with something else",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -3983,6 +4047,10 @@ impl NamespaceSession for Overlay {
                 self.routed_descriptor = Some((
                     descriptor,
                     FdState {
+                        filesystem: Some(umbra_core::FilesystemBinding {
+                            run: self.config()?.context.run_id,
+                            filesystem: "overlay-v1".to_owned(),
+                        }),
                         object: stat.object_id,
                         logical_path: Some(logical_path),
                         // **What the object is, not what the caller asked for.**

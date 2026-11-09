@@ -195,6 +195,7 @@ impl Supervisor {
             // A lost or timed-out event channel means we can no longer prove what
             // the tree is doing. Nothing may be resumed after this point.
             self.poisoned = true;
+            self.filesystem_queries.clear();
         })?;
         self.handle_event(event)
     }
@@ -203,6 +204,7 @@ impl Supervisor {
     pub fn handle_event(&mut self, event: TraceEvent) -> Result<()> {
         let result = self.service_renewal().and_then(|()| self.dispatch(event));
         if result.is_err() {
+            self.filesystem_queries.clear();
             self.poisoned = true;
             self.state.lifecycle = RunLifecycle::RecoveryRequired;
         }
@@ -260,6 +262,7 @@ impl Supervisor {
                 self.resume_thread(thread)
             }
             TraceEvent::ThreadExited { task, thread } => {
+                self.filesystem_queries.cancel_task(task);
                 if let Some(process) = self.state.processes.processes.get_mut(&task) {
                     process.threads.remove(&thread);
                 }
@@ -300,6 +303,7 @@ impl Supervisor {
                 thread,
                 exec_generation,
             } => {
+                self.filesystem_queries.cancel_task(task);
                 let process = self.process_mut(task)?;
                 process.context.exec_generation = exec_generation;
                 // Close-on-exec descriptors are gone and mappings are replaced;
@@ -316,6 +320,7 @@ impl Supervisor {
                 self.resume_thread(thread)
             }
             TraceEvent::Exit { task, status } => {
+                self.filesystem_queries.cancel_task(task);
                 let process = self
                     .state
                     .processes
@@ -399,7 +404,15 @@ impl Supervisor {
                 renew_at: &mut self.renew_at,
                 interval: self.budget.as_ref().map(|b| b.renew_after),
             };
-            self.platform.abi.decode_entry(&registers, &mut memory)?
+            self.platform.abi.decode_entry(&registers, &mut memory)
+        };
+        let operation = match operation {
+            Ok(operation) => operation,
+            Err(e) if e.operation == "statfs.path"
+                && matches!(e.errno, Some(umbra_core::Errno(14) | umbra_core::Errno(63))) => {
+                return self.deny_to_tracee(thread, &mut registers, e.errno.unwrap());
+            }
+            Err(e) => return Err(e),
         };
         // `None` is a positively classified non-filesystem call, never an unknown
         // syscall: the decoder errors on anything it cannot classify.
@@ -411,6 +424,9 @@ impl Supervisor {
             umbra_overlay::Dispatch::Materialise | umbra_overlay::Dispatch::Whiteout
         );
         let context = self.process(task)?.context.clone();
+        if matches!(operation, FsOp::StatFs { .. } | FsOp::FstatFs { .. }) {
+            return self.filesystem_query(task, thread, &mut registers, &context, &operation);
+        }
         // **The descriptor fence, applied to the one descriptor-relative call
         // the tracer carries rather than the interposer.**
         //
@@ -610,7 +626,7 @@ impl Supervisor {
                         ErrorKind::ProtocolMismatch,
                         "supervisor.directory",
                         "the ABI reported no output buffer for a directory read",
-                    ))
+                    ));
                 }
             },
             _ => self.directory.clear()?,
@@ -1012,13 +1028,13 @@ impl Supervisor {
                     ErrorKind::ProtocolMismatch,
                     "supervisor.directory",
                     "the ABI reported no attribute request block for a directory read",
-                ))
+                ));
             }
             Err(e) => {
                 return match e.errno {
                     Some(errno) => Ok(Some(errno)),
                     None => Err(e),
-                }
+                };
             }
         };
         if block.length as usize != umbra_platform::dirents::ATTRLIST_BYTES {
@@ -1121,6 +1137,141 @@ impl Supervisor {
     /// null `struct stat` pointer -- must be answered rather than raised. Both
     /// reach the tracee the same way, and a second copy of this sequence is the
     /// shape that produced the `intercept()`/`install()` drift.
+    fn filesystem_query(
+        &mut self,
+        task: TaskId,
+        thread: ThreadId,
+        registers: &mut umbra_core::RegisterSet,
+        context: &umbra_core::ProcessContext,
+        operation: &FsOp,
+    ) -> Result<()> {
+        let floor = self.budget.as_ref().and_then(|b| b.descriptor_floor);
+        if floor.is_none() {
+            return self.resume_thread(thread);
+        }
+        let binding = match operation {
+            FsOp::FstatFs { fd } => {
+                if !umbra_owns_descriptor(floor, *fd) {
+                    return self.resume_thread(thread);
+                }
+                let Some(state) = context.fds.get(fd) else {
+                    return self.deny_to_tracee(thread, registers, umbra_core::Errno(9));
+                };
+                let Some(binding) = state.filesystem.clone() else {
+                    return self.deny_to_tracee(thread, registers, umbra_core::Errno(45));
+                };
+                binding
+            }
+            _ => umbra_core::FilesystemBinding::overlay(self.state.run_id),
+        };
+        self.filesystem_sequence = self.filesystem_sequence.checked_add(1).ok_or_else(|| {
+            error(
+                ErrorKind::InvalidState,
+                "filesystem.query",
+                "request identity exhausted",
+            )
+        })?;
+        let token = umbra_core::FilesystemQueryToken {
+            request: self.filesystem_sequence,
+            task,
+            thread,
+            image_generation: context.exec_generation,
+            stop_generation: self.filesystem_sequence,
+        };
+        // Decoding retains the address; it must not probe or reject it.
+        let buffer = self.platform.abi.io_buffer(registers)?.ok_or_else(|| {
+            error(
+                ErrorKind::ProtocolMismatch,
+                "filesystem.query",
+                "missing output descriptor",
+            )
+        })?;
+        if !self
+            .filesystem_queries
+            .begin(crate::filesystem::PendingFilesystem {
+                token: token.clone(),
+                binding,
+                output: buffer,
+            })
+        {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "filesystem.query",
+                "query already pending",
+            ));
+        }
+        self.service_renewal()?;
+        let reply = match self
+            .namespace
+            .filesystem_metadata(context, operation, token.clone())?
+        {
+            Ok(reply) => reply,
+            Err(errno) => {
+                self.filesystem_queries.clear();
+                return self.deny_to_tracee(thread, registers, errno);
+            }
+        };
+        let generation = self.process(task)?.context.exec_generation;
+        let buffer = self
+            .filesystem_queries
+            .finish(&reply, generation)
+            .ok_or_else(|| {
+                error(
+                    ErrorKind::ProtocolMismatch,
+                    "filesystem.query",
+                    "stale or mismatched reply",
+                )
+            })?;
+        if !self
+            .namespace
+            .filesystem_metadata_capabilities()
+            .contains(&umbra_core::capabilities::NAMESPACE_FILESYSTEM_METADATA_V1)
+        {
+            return self.deny_to_tracee(thread, registers, umbra_core::Errno(45));
+        }
+        let bytes = match self
+            .platform
+            .abi
+            .encode_filesystem_metadata(&reply.metadata)
+        {
+            Ok(bytes) => bytes,
+            Err(e) if e.errno == Some(umbra_core::Errno(84)) => {
+                return self.deny_to_tracee(thread, registers, umbra_core::Errno(84));
+            }
+            Err(e) => return Err(e),
+        };
+        if bytes.len() != buffer.length as usize {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "filesystem.query",
+                "output size mismatch",
+            ));
+        }
+        if buffer.address == 0 || buffer.address.checked_add(bytes.len() as u64).is_none() {
+            return self.deny_to_tracee(thread, registers, umbra_core::Errno(14));
+        }
+        self.service_renewal()?;
+        if let Err(e) = self
+            .platform
+            .control
+            .copyout_memory(task, buffer.address, &bytes)
+        {
+            if e.errno == Some(umbra_core::Errno(14)) {
+                return self.deny_to_tracee(thread, registers, umbra_core::Errno(14));
+            }
+            return Err(e);
+        }
+        self.platform.abi.emulate_result(
+            registers,
+            &EmulatedResult {
+                outcome: OperationOutcome::Success { return_value: 0 },
+                memory_writes: vec![],
+            },
+        )?;
+        self.platform.control.set_registers(thread, registers)?;
+        self.resume_thread(thread)
+    }
+
     fn deny_to_tracee(
         &mut self,
         thread: ThreadId,
@@ -1187,14 +1338,14 @@ impl Supervisor {
                     ErrorKind::InvalidState,
                     "supervisor.routed_stat",
                     format!("a refused stat buffer ({errno:?}) reached the emulated answer"),
-                ))
+                ));
             }
             None => {
                 return Err(error(
                     ErrorKind::ProtocolMismatch,
                     "supervisor.routed_stat",
                     "the ABI decoded an fstat but reports no output buffer for it",
-                ))
+                ));
             }
         };
         // The encoding and the buffer are produced by the same ABI from the same
@@ -1261,7 +1412,7 @@ impl Supervisor {
                         "supervisor.routing",
                         "the namespace emulated a chdir without resolving a working \
                          directory for it",
-                    ))
+                    ));
                 }
             },
             _ => return Ok(()),
@@ -1697,6 +1848,7 @@ impl Supervisor {
     /// Returns success only when the platform confirms termination; the caller
     /// uses that confirmation to decide whether writer authority may be released.
     pub fn terminate_tree(&mut self, policy: TerminationPolicy) -> Result<()> {
+        self.filesystem_queries.clear();
         let Some(process) = self.state.processes.root else {
             return Ok(());
         };
@@ -2091,6 +2243,104 @@ mod tests {
 
     /// A routed budget with a deliberately tiny fence, so the range can be
     /// exhausted in a test rather than only in principle.
+    struct FilesystemFault(u8);
+    impl NamespaceResolver for FilesystemFault {
+        fn resolve(&mut self, _: &ProcessContext, _: &FsOp) -> Result<ResolvedAction> {
+            unreachable!()
+        }
+    }
+    impl NamespaceSession for FilesystemFault {
+        fn filesystem_metadata(
+            &mut self,
+            context: &ProcessContext,
+            _: &FsOp,
+            token: FilesystemQueryToken,
+        ) -> Result<std::result::Result<FilesystemReply, Errno>> {
+            if self.0 < 2 {
+                return Err(UmbraError::new(
+                    if self.0 == 0 {
+                        ErrorKind::Io
+                    } else {
+                        ErrorKind::ProtocolMismatch
+                    },
+                    "test.provider",
+                    "provider failed before reply",
+                ));
+            }
+            let mut metadata = context.fds[&TracedFd(8)]
+                .filesystem
+                .as_ref()
+                .unwrap()
+                .metadata()?;
+            if self.0 == 2 {
+                metadata.binding.run = RunId(Uuid::new_v4());
+            } else {
+                metadata.counts[0] = FilesystemStatistic::Known(0);
+            }
+            Ok(Ok(FilesystemReply { token, metadata }))
+        }
+        fn prepare(&mut self, _: OperationId, _: &ResolvedAction) -> Result<PreparedAction> {
+            unreachable!()
+        }
+        fn observe_result(&mut self, _: OperationId, _: &OperationOutcome) -> Result<()> {
+            unreachable!()
+        }
+        fn commit(&mut self, _: OperationId) -> Result<CommitReceipt> {
+            unreachable!()
+        }
+        fn abort(&mut self, _: OperationId, _: &AbortReason) -> Result<()> {
+            unreachable!()
+        }
+        fn checkpoint(&mut self, _: &CheckpointRequest) -> Result<Checkpoint> {
+            unreachable!()
+        }
+    }
+    impl SyscallAbi for FilesystemFault {
+        fn decode_entry(&self, _: &RegisterSet, _: &mut dyn TraceMemory) -> Result<Option<FsOp>> {
+            Ok(Some(FsOp::FstatFs { fd: TracedFd(8) }))
+        }
+        fn io_buffer(&self, _: &RegisterSet) -> Result<Option<IoBuffer>> {
+            Ok(Some(IoBuffer {
+                address: 1,
+                length: 2168,
+            }))
+        }
+        fn apply_rewrite(&self, _: &mut RegisterSet, _: &PreparedRewrite) -> Result<()> {
+            unreachable!()
+        }
+        fn emulate_result(&self, _: &mut RegisterSet, _: &EmulatedResult) -> Result<()> {
+            panic!("provider failure must never return syscall success or EFAULT")
+        }
+    }
+
+    #[test]
+    fn f214_provider_errors() {
+        for fault in 0..4 {
+            let mut s = supervisor();
+            s.budget = Some(routed_budget(8));
+            s.namespace = Box::new(FilesystemFault(fault));
+            s.platform.abi = Box::new(FilesystemFault(fault));
+            let mut fd = bound_fd(b"/gone");
+            fd.filesystem = Some(FilesystemBinding::overlay(s.state.run_id));
+            s.process_mut(task(1))
+                .unwrap()
+                .context
+                .fds
+                .insert(TracedFd(8), fd);
+            let result = s.handle_event(TraceEvent::SyscallEntry {
+                task: task(1),
+                thread: ThreadId(task(1).0),
+                registers: RegisterSet::new(Architecture::Aarch64, vec![0; 272]).unwrap(),
+            });
+            assert!(result.is_err());
+            assert!(s.is_poisoned());
+            assert_eq!(s.state.lifecycle, RunLifecycle::RecoveryRequired);
+            // Fake's memory write and register-write methods panic: reaching
+            // this point proves neither copyout nor syscall completion occurred.
+            s.filesystem_queries.clear();
+        }
+    }
+
     fn routed_budget(fence: u32) -> RunBudget {
         RunBudget {
             renew_after: Duration::from_secs(1),
@@ -2103,6 +2353,7 @@ mod tests {
 
     fn bound_fd(path: &[u8]) -> FdState {
         FdState {
+            filesystem: None,
             object: ObjectId(Uuid::new_v4()),
             logical_path: Some(BytePath::new(path.to_vec()).unwrap()),
             directory: false,
@@ -2473,6 +2724,7 @@ mod tests {
             task(1),
             TracedFd(3),
             FdState {
+                filesystem: None,
                 object: ObjectId(Uuid::new_v4()),
                 logical_path: Some(BytePath::new(b"/directory".to_vec()).unwrap()),
                 directory: true,

@@ -111,7 +111,7 @@ fn decode_interpose(regs: &RegisterSet, memory: &mut dyn TraceMemory) -> Result<
         _ => {
             return Err(unsupported(format!(
                 "unknown umbra interposer operation {operation}"
-            )))
+            )));
         }
     })
 }
@@ -332,6 +332,8 @@ pub const TRACED_STUBS: &[(&str, u64, Delivery)] = &[
     ("mkdir", 136, Delivery::Namespace),
     ("fstat", 339, Delivery::Namespace),
     ("__fstat", 189, Delivery::Namespace),
+    ("statfs", 345, Delivery::Namespace),
+    ("fstatfs", 346, Delivery::Namespace),
     ("setattrlistat", 524, Delivery::Namespace),
     ("getattrlistbulk", 461, Delivery::Namespace),
     ("chdir", 12, Delivery::Namespace),
@@ -773,6 +775,72 @@ const S_IFDIR: u32 = 0o040000;
 /// stat can never expose the empty regular file the overlay stores for it.
 /// Only fields this layout defines are written; the rest stay zero. A kind the
 /// layout cannot represent fails explicitly rather than guessing a mode.
+pub fn encode_filesystem_metadata(metadata: &umbra_core::FilesystemMetadata) -> Result<Vec<u8>> {
+    use umbra_core::FilesystemStatistic;
+    fn number(value: &FilesystemStatistic, max: u128) -> Result<u128> {
+        match value {
+            FilesystemStatistic::Undefined => Ok(max),
+            FilesystemStatistic::Known(value) if *value < max => Ok(*value),
+            _ => Err(error("statfs", "filesystem statistic overflow").with_errno(Errno(84))),
+        }
+    }
+    fn name(bytes: &mut [u8], value: &str) -> Result<()> {
+        if value.len() >= bytes.len() || value.as_bytes().contains(&0) {
+            return Err(umbra_core::UmbraError::new(
+                umbra_core::ErrorKind::ProtocolMismatch,
+                "statfs",
+                "invalid filesystem name",
+            ));
+        }
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        Ok(())
+    }
+    // Validate the complete binding before deriving its compact presentation ID.
+    metadata.binding.metadata()?;
+    let mut bytes = vec![0; 2168];
+    bytes[0..4]
+        .copy_from_slice(&(number(&metadata.block_size, u32::MAX as u128)? as u32).to_le_bytes());
+    let io = match metadata.io_size {
+        FilesystemStatistic::Undefined => -1,
+        FilesystemStatistic::Known(value) => i32::try_from(value)
+            .map_err(|_| error("statfs", "io size overflow").with_errno(Errno(84)))?,
+    };
+    bytes[4..8].copy_from_slice(&io.to_le_bytes());
+    for (index, count) in metadata.counts.iter().enumerate() {
+        bytes[8 + index * 8..16 + index * 8]
+            .copy_from_slice(&(number(count, u64::MAX as u128)? as u64).to_le_bytes());
+    }
+    let key = format!("umbra-overlay-v1:{}", metadata.binding.run.0);
+    let digest = filesystem_digest(key.as_bytes())?;
+    bytes[48..56].copy_from_slice(&digest[..8]);
+    bytes[56..64].fill(0xff);
+    bytes[68..72].fill(0xff);
+    name(&mut bytes[72..88], &metadata.type_name)?;
+    name(&mut bytes[88..1112], &metadata.mount_name)?;
+    name(&mut bytes[1112..2136], &metadata.source_name)?;
+    Ok(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn filesystem_digest(bytes: &[u8]) -> Result<[u8; 32]> {
+    unsafe extern "C" {
+        fn CC_SHA256(data: *const u8, length: u32, output: *mut u8) -> *mut u8;
+    }
+    let length =
+        u32::try_from(bytes.len()).map_err(|_| error("statfs", "filesystem key too long"))?;
+    let mut digest = [0; 32];
+    // CommonCrypto consumes length initialized bytes and writes 32 bytes.
+    unsafe {
+        CC_SHA256(bytes.as_ptr(), length, digest.as_mut_ptr());
+    }
+    Ok(digest)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn filesystem_digest(_bytes: &[u8]) -> Result<[u8; 32]> {
+    Err(error("statfs", "Darwin filesystem encoding requires macOS"))
+}
+
 pub fn encode_stat(stat: &BlobStat) -> Result<Vec<u8>> {
     let format = match stat.kind {
         ObjectKind::LogicalSymlink => S_IFLNK,
@@ -942,6 +1010,17 @@ impl SyscallAbi for DarwinArm64Abi {
             // separate stub reaching 189. The `fstatat`/`__fstatat` pair above
             // has the same shape and the same reason.
             189 | 339 => FsOp::Fstat {
+                fd: TracedFd(get(regs, 0)? as i32),
+            },
+            345 => FsOp::StatFs {
+                dir: DirRef::Cwd,
+                path: read_path(memory, get(regs, 0)?).map_err(|mut e| {
+                    e.operation = "statfs.path".to_owned();
+                    e
+                })?,
+                follow: true,
+            },
+            346 => FsOp::FstatFs {
                 fd: TracedFd(get(regs, 0)? as i32),
             },
             // `setattrlistat`(524). libc's `utimensat` carries no `svc`: it
@@ -1149,7 +1228,21 @@ impl SyscallAbi for DarwinArm64Abi {
         // unit tests below check the layout offset by offset.
         encode_stat(stat)
     }
+    fn encode_filesystem_metadata(
+        &self,
+        metadata: &umbra_core::FilesystemMetadata,
+    ) -> Result<Vec<u8>> {
+        encode_filesystem_metadata(metadata)
+    }
     fn io_buffer(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>> {
+        if matches!(get(regs, 16)?, 345 | 346) {
+            // Preserve even invalid addresses until lookup and provider reply
+            // have completed: those errors take precedence over copyout.
+            return Ok(Some(IoBuffer {
+                address: get(regs, 1)?,
+                length: 2168,
+            }));
+        }
         // `fstat` is the one breakpointed syscall on this ABI that names an
         // output buffer of its own. Its length is not a caller-supplied count
         // but the fixed width of the layout the kernel would have written, so it
@@ -2832,5 +2925,51 @@ mod tests {
         let through_trait = DarwinArm64Abi.encode_stat(&stat).unwrap();
         assert_eq!(through_trait, encode_stat(&stat).unwrap());
         assert_eq!(through_trait.len(), STAT_BYTES);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod filesystem_tests {
+    use super::*;
+    use umbra_core::{FilesystemBinding, FilesystemStatistic, RunId};
+
+    #[test]
+    fn f214_encoding_bounds() {
+        let binding = FilesystemBinding::overlay(RunId(uuid::Uuid::from_u128(1)));
+        let metadata = binding.metadata().unwrap();
+        let bytes = encode_filesystem_metadata(&metadata).unwrap();
+        assert_eq!(bytes.len(), 2168);
+        assert_eq!(&bytes[..48], &[255; 48]);
+        assert_eq!(&bytes[56..64], &[255; 8]);
+        assert_eq!(&bytes[64..68], &[0; 4]);
+        assert_eq!(&bytes[68..72], &[255; 4]);
+        assert_eq!(&bytes[72..88], b"umbra\0\0\0\0\0\0\0\0\0\0\0");
+        assert!(bytes[2136..].iter().all(|v| *v == 0));
+        let mut bad = metadata.clone();
+        bad.block_size = FilesystemStatistic::Known(1u128 << 32);
+        assert_eq!(
+            encode_filesystem_metadata(&bad).unwrap_err().errno,
+            Some(Errno(84))
+        );
+        bad = metadata.clone();
+        bad.io_size = FilesystemStatistic::Known(1u128 << 31);
+        assert_eq!(
+            encode_filesystem_metadata(&bad).unwrap_err().errno,
+            Some(Errno(84))
+        );
+        for index in 0..5 {
+            bad = metadata.clone();
+            bad.counts[index] = FilesystemStatistic::Known(1u128 << 64);
+            assert_eq!(
+                encode_filesystem_metadata(&bad).unwrap_err().errno,
+                Some(Errno(84))
+            );
+        }
+        bad = metadata.clone();
+        bad.source_name = "x".repeat(1024);
+        assert!(encode_filesystem_metadata(&bad).is_err());
+        bad = metadata;
+        bad.binding.filesystem = "unknown".into();
+        assert!(encode_filesystem_metadata(&bad).is_err());
     }
 }

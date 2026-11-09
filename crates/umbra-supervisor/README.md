@@ -368,3 +368,19 @@ hides is never revealed.
 cargo check -p umbra-supervisor
 cargo test -p umbra-supervisor
 ```
+
+## Filesystem metadata dispatch
+
+Routed filesystem queries retain a full filesystem binding and output buffer
+in `FilesystemQueries`. Native descriptors (including negative descriptors)
+and rewrite-backed runs resume the original syscall. Owned but closed
+descriptors return EBADF before output validation. Namespace errors precede
+copyout, and absent metadata capability returns ENOTSUP.
+
+The supervisor checks request/task/thread/image/stop identity, the full
+binding and every v1 metadata field before encoding or copying bytes. Exec,
+thread/process exit, provider failure and teardown cancel retained queries.
+Provider errors or malformed replies poison the run; they cannot become
+zero-filled successful metadata. The current namespace call is synchronous,
+so the event loop cannot process another trace event during that call;
+pending-state tests exercise invalidation and late replies explicitly.

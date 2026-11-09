@@ -58,6 +58,11 @@ pub trait TraceBackend {
     /// Write bytes to a stopped task after validating address/length bounds.
     /// An error must leave the task stopped; it need not imply an atomic write.
     fn write_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()>;
+    /// Copy a syscall result respecting target memory protections.
+    /// Inaccessible output is EFAULT; transport or task failures remain fatal.
+    fn copyout_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()> {
+        self.write_memory(task, address, bytes)
+    }
 
     /// Read bounded, architecture-tagged registers from a stopped thread.
     fn registers(&mut self, thread: ThreadId) -> Result<RegisterSet>;
@@ -138,6 +143,18 @@ pub trait SyscallAbi {
             umbra_core::ErrorKind::UnsupportedCapability,
             "abi.encode_stat",
             "this ABI has no native stat layout",
+        ))
+    }
+
+    /// Encode filesystem metadata with checked numeric and string bounds.
+    fn encode_filesystem_metadata(
+        &self,
+        _metadata: &umbra_core::FilesystemMetadata,
+    ) -> Result<Vec<u8>> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "abi.encode_filesystem_metadata",
+            "this ABI has no filesystem metadata layout",
         ))
     }
 

@@ -32,6 +32,20 @@ pub trait NamespaceResolver {
 
 /// Transaction lifecycle; errors require retaining a stopped or recovery-required run.
 pub trait NamespaceSession: NamespaceResolver {
+    /// Versioned metadata contracts implemented by this namespace session.
+    fn filesystem_metadata_capabilities(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// Query logical filesystem metadata after resolving the input identity.
+    /// The caller owns output copyout and must validate the response token.
+    fn filesystem_metadata(
+        &mut self,
+        _context: &ProcessContext,
+        _operation: &FsOp,
+        _token: umbra_core::FilesystemQueryToken,
+    ) -> Result<std::result::Result<umbra_core::FilesystemReply, umbra_core::Errno>> {
+        Ok(Err(umbra_core::Errno(45)))
+    }
     /// Read the exact logical target, following ancestors but not the final symlink.
     fn read_link(&mut self, _path: &StoragePath) -> Result<BytePath> {
         Err(umbra_core::UmbraError::new(
@@ -308,6 +322,8 @@ pub fn dispatch(operation: &FsOp) -> Dispatch {
         // later mutation, so it reads through whatever the namespace already
         // shows rather than materialising the target.
         FsOp::Stat { .. }
+        | FsOp::StatFs { .. }
+        | FsOp::FstatFs { .. }
         | FsOp::Access { .. }
         | FsOp::ReadLink { .. }
         | FsOp::Read { .. }

@@ -47,12 +47,16 @@ Both native controls select WAL/NORMAL/INCREMENTAL with a 5000 ms busy timeout,
 commit exact sentinel rows and return `integrity_check=ok`. The pool limit is
 one, isolating opening before later connection-count cases.
 
-Both routed first readings fail during connection setup with SQLx database error
-3338 (`SQLITE_IOERR_ACCESS`), fixture exit 20 and supervisor `ProcessFailed`.
+Both routed cases now fail during connection setup with SQLx database error
+266 (`SQLITE_IOERR_READ`), fixture exit 20 and supervisor `ProcessFailed`.
 The fresh case leaves an empty shadow database; the seeded case leaves a
 byte-identical copy-up. Neither error barrier observes a WAL or SHM sidecar,
-and host snapshots remain unchanged. The code is a library error report; the
-underlying Darwin syscall has not been observed. No WAL compatibility,
+and host snapshots remain unchanged. No lock directory remains after connect
+or teardown. The previous 3338 refusal came from an unhandled `fstatfs` on a
+virtual descriptor. Filesystem metadata now succeeds; the 266 code reports the
+next read failure. Positioned I/O, durability, locking and shared mappings
+remain outstanding under #214. Dotlock selection is not lock support: its
+access/rmdir paths remain incomplete (#158 tracks rmdir). No WAL compatibility,
 cross-machine sharing or crash durability is established by these tests.
 
 The approved disposable root contains sibling `project/` and `codex-home/`

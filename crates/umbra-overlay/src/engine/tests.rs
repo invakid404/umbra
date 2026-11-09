@@ -1192,6 +1192,7 @@ fn resolver_anchors_cwd_dirfd_and_refuses_escape_and_stale_descriptors() {
     f.process.fds.insert(
         TracedFd(3),
         FdState {
+            filesystem: None,
             object,
             logical_path: Some(bytes(b"/jail/dir")),
             directory: true,
@@ -1378,6 +1379,7 @@ fn readdir_uses_injected_encoding_and_advances_only_after_commit() {
     f.process.fds.insert(
         TracedFd(3),
         FdState {
+            filesystem: None,
             object,
             logical_path: Some(bytes(b"/")),
             directory: true,
@@ -1455,6 +1457,7 @@ fn a_directory_read_decides_the_descriptor_before_the_output_bound_and_answers_b
     f.process.fds.insert(
         TracedFd(3),
         FdState {
+            filesystem: None,
             object,
             logical_path: Some(bytes(b"/")),
             directory: true,
@@ -1519,6 +1522,7 @@ fn an_encoder_refusal_is_answered_when_it_carries_an_errno_and_fatal_when_it_doe
         f.process.fds.insert(
             TracedFd(3),
             FdState {
+                filesystem: None,
                 object,
                 logical_path: Some(bytes(b"/")),
                 directory: true,
@@ -1706,6 +1710,7 @@ fn readlink_non_utf8_is_verbatim_and_native_buffer_truncates_without_nul() {
     f.process.fds.insert(
         TracedFd(9),
         FdState {
+            filesystem: None,
             object: stat.object_id,
             logical_path: Some(bytes(b"/dir")),
             directory: true,
@@ -2268,6 +2273,7 @@ fn symlink_cwd_and_dirfd_anchors_are_resolved_before_identity_checks() {
     f.process.fds.insert(
         TracedFd(7),
         FdState {
+            filesystem: None,
             object,
             logical_path: Some(bytes(b"/alias")),
             directory: true,
@@ -8431,6 +8437,7 @@ fn an_fstat_on_a_bound_descriptor_answers_from_the_logical_object() {
     f.process.fds.insert(
         fd,
         FdState {
+            filesystem: None,
             object: stat.object_id,
             logical_path: Some(bytes(b"seed.txt")),
             directory: false,
@@ -8473,6 +8480,7 @@ fn an_fstat_answers_on_a_descriptor_that_was_opened_write_only() {
     f.process.fds.insert(
         fd,
         FdState {
+            filesystem: None,
             object: stat.object_id,
             logical_path: Some(bytes(b"seed.txt")),
             directory: false,
@@ -8528,6 +8536,7 @@ fn routed_stat_does_not_survive_into_the_next_resolution() {
     f.process.fds.insert(
         fd,
         FdState {
+            filesystem: None,
             object: stat.object_id,
             logical_path: Some(bytes(b"seed.txt")),
             directory: false,
@@ -8697,4 +8706,225 @@ fn descriptor_flags_use_only_the_live_descriptor_table() {
         f.overlay.resolve(&f.process, &op).unwrap(),
         ResolvedAction::Deny(Errno(9))
     );
+}
+
+#[test]
+fn f214_descriptor_binding_survives_namespace_removal() {
+    let mut f = Fixture::new(&[(b"dir/seed.txt", b"seed\n")]);
+    let binding =
+        umbra_core::FilesystemBinding::overlay(f.overlay.config().unwrap().context.run_id);
+    let stat = f
+        .overlay
+        .lookup(&StoragePath::new(StorageAnchor::Root, b"dir/seed.txt".to_vec()).unwrap())
+        .unwrap()
+        .0;
+    let fd = TracedFd(4096);
+    f.process.fds.insert(
+        fd,
+        FdState {
+            filesystem: Some(binding.clone()),
+            object: stat.object_id,
+            logical_path: Some(bytes(b"dir/seed.txt")),
+            directory: false,
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+            offset: 7,
+        },
+    );
+    let token = umbra_core::FilesystemQueryToken {
+        request: 1,
+        task: f.process.task,
+        thread: umbra_core::ThreadId(f.process.task.0),
+        image_generation: f.process.exec_generation,
+        stop_generation: 1,
+    };
+    std::fs::remove_file(f.base_root.join("dir/seed.txt")).unwrap();
+    std::fs::remove_dir(f.base_root.join("dir")).unwrap();
+    let response = f
+        .overlay
+        .filesystem_metadata(&f.process, &FsOp::FstatFs { fd }, token.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.metadata, binding.metadata().unwrap());
+    assert_eq!(response.token, token);
+    assert_eq!(f.process.fds[&fd].offset, 7);
+    let missing = f
+        .overlay
+        .filesystem_metadata(
+            &f.process,
+            &FsOp::StatFs {
+                dir: DirRef::Cwd,
+                path: bytes(b"dir/seed.txt"),
+                follow: true,
+            },
+            token.clone(),
+        )
+        .unwrap();
+    assert_eq!(missing, Err(Errno(2)));
+    f.process.fds.get_mut(&fd).unwrap().filesystem = None;
+    assert_eq!(
+        f.overlay
+            .filesystem_metadata(&f.process, &FsOp::FstatFs { fd }, token.clone())
+            .unwrap(),
+        Err(Errno(45))
+    );
+    f.process.fds.remove(&fd);
+    assert_eq!(
+        f.overlay
+            .filesystem_metadata(&f.process, &FsOp::FstatFs { fd }, token)
+            .unwrap(),
+        Err(Errno(9))
+    );
+}
+
+#[test]
+fn f214_retained_binding_survives_external_namespace_rename() {
+    let mut f = Fixture::new(&[(b"dir/seed.txt", b"seed\n")]);
+    let binding =
+        umbra_core::FilesystemBinding::overlay(f.overlay.config().unwrap().context.run_id);
+    let stat = f
+        .overlay
+        .lookup(&StoragePath::new(StorageAnchor::Root, b"dir/seed.txt".to_vec()).unwrap())
+        .unwrap()
+        .0;
+    let fd = TracedFd(4096);
+    f.process.fds.insert(
+        fd,
+        FdState {
+            filesystem: Some(binding.clone()),
+            object: stat.object_id,
+            logical_path: Some(bytes(b"dir/seed.txt")),
+            directory: false,
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+            offset: 7,
+        },
+    );
+    let token = umbra_core::FilesystemQueryToken {
+        request: 1,
+        task: f.process.task,
+        thread: umbra_core::ThreadId(f.process.task.0),
+        image_generation: f.process.exec_generation,
+        stop_generation: 1,
+    };
+    // Mutate the backing namespace directly: this does not claim routed rename support.
+    std::fs::rename(f.base_root.join("dir"), f.base_root.join("moved")).unwrap();
+    let response = f
+        .overlay
+        .filesystem_metadata(&f.process, &FsOp::FstatFs { fd }, token.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.metadata, binding.metadata().unwrap());
+    assert_eq!(response.token, token);
+    assert_eq!(f.process.fds[&fd].offset, 7);
+    let missing = f
+        .overlay
+        .filesystem_metadata(
+            &f.process,
+            &FsOp::StatFs {
+                dir: DirRef::Cwd,
+                path: bytes(b"dir/seed.txt"),
+                follow: true,
+            },
+            token.clone(),
+        )
+        .unwrap();
+    assert_eq!(missing, Err(Errno(2)));
+    let moved = f.overlay.filesystem_metadata(
+        &f.process,
+        &FsOp::StatFs { dir: DirRef::Cwd, path: bytes(b"moved/seed.txt"), follow: true },
+        token,
+    ).unwrap().unwrap();
+    assert_eq!(moved.metadata, binding.metadata().unwrap());
+}
+
+#[test]
+fn f214_lookup_boundaries() {
+    let mut f = Fixture::new(&[(b"dir/file", b"content")]);
+    f.run(&symlink(b"alias", b"dir/file"));
+    f.run(&symlink(b"dangling", b"absent"));
+    f.run(&symlink(b"loop", b"loop"));
+    let token = umbra_core::FilesystemQueryToken {
+        request: 1,
+        task: f.process.task,
+        thread: ThreadId(f.process.task.0),
+        image_generation: f.process.exec_generation,
+        stop_generation: 1,
+    };
+    let mut query = |name: &[u8]| {
+        f.overlay
+            .filesystem_metadata(
+                &f.process,
+                &FsOp::StatFs {
+                    dir: DirRef::Cwd,
+                    path: bytes(name),
+                    follow: true,
+                },
+                token.clone(),
+            )
+            .unwrap()
+    };
+    let file = query(b"dir/file").unwrap();
+    assert_eq!(query(b"alias").unwrap().metadata, file.metadata);
+    assert_eq!(query(b"dangling"), Err(Errno(2)));
+    assert_eq!(query(b"loop"), Err(Errno(62)));
+    assert_eq!(query(b"dir/file/child"), Err(Errno(20)));
+    assert_eq!(query(b"../outside"), Err(Errno(13)));
+    f.process.cwd = bytes(b"/dir");
+    let relative = f
+        .overlay
+        .filesystem_metadata(
+            &f.process,
+            &FsOp::StatFs {
+                dir: DirRef::Cwd,
+                path: bytes(b"file"),
+                follow: true,
+            },
+            token,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(relative.metadata, file.metadata);
+}
+
+#[test]
+fn f214_resume_identity() {
+    let mut f = Fixture::new(&[]);
+    let run_id = f.overlay.config().unwrap().context.run_id;
+    let token = umbra_core::FilesystemQueryToken {
+        request: 1, task: f.process.task, thread: ThreadId(f.process.task.0),
+        image_generation: 0, stop_generation: 1,
+    };
+    let operation = FsOp::StatFs { dir: DirRef::Cwd, path: bytes(b"/"), follow: true };
+    let before = f.overlay.filesystem_metadata(&f.process, &operation, token.clone()).unwrap().unwrap();
+    f.overlay.finish_run(&FinishRunRequest {
+        run_id, root_status: Some(ExitStatus::Code(0)), processes_exited: 1,
+    }).unwrap();
+    let mut storage = LocalStorage::new(f._dirs[1].path()).unwrap();
+    let binding = storage.open_run(&OpenRunRequest {
+        run_id, intent: OpenRunIntent::OpenExisting,
+        immutable_base: ImmutableBaseContract { identity: "test-base".into(), fingerprint: vec![1] },
+        policy: StoragePolicy { read_only: false, require_strict_remote_persistence: false,
+            require_kernel_shadow: false, format_version: 1 },
+    }).unwrap();
+    let lease = storage.acquire_writer(&AcquireWriterRequest {
+        run_id, writer_id: WriterId("reopened".into()), takeover: TakeoverPolicy::Refuse,
+    }).unwrap();
+    let mut empty_base = Fixture::new(&[]);
+    let base = empty_base.overlay.base.take().unwrap();
+    let journal = MemoryJournal { log: Arc::new(Mutex::new(Log::default())), run: run_id, epoch: lease.epoch };
+    let mut reopened = Overlay::new(Box::new(storage), Box::new(journal));
+    reopened.bind(SessionConfig {
+        context: context(run_id, Some(lease.epoch)), recovery: recovery(run_id), binding, lease,
+    }, base).unwrap();
+    let after = reopened.filesystem_metadata(&f.process, &operation, token).unwrap().unwrap();
+    assert_eq!(before.metadata, after.metadata);
+    assert_ne!(before.metadata.binding, umbra_core::FilesystemBinding::overlay(empty_base.overlay.config().unwrap().context.run_id));
+    reopened.finish_run(&FinishRunRequest {
+        run_id, root_status: Some(ExitStatus::Code(0)), processes_exited: 1,
+    }).unwrap();
 }
