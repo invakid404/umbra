@@ -251,3 +251,31 @@ mod tests {
         validate_references(&plan, |fd| fd == 4096).unwrap();
     }
 }
+
+#[cfg(all(feature = "mutation-probe-spawn-lifecycle", unix))]
+pub(crate) fn before_ready(child: TaskId) -> Result<()> {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+    if std::env::var("UMBRA_FIX_243_PROBE_PHASE").as_deref() != Ok("policy-ready") {
+        return Ok(());
+    }
+    let socket = std::env::var_os("UMBRA_FIX_243_PROBE_SOCKET").ok_or_else(invalid)?;
+    let mut stream = UnixStream::connect(socket).map_err(|_| invalid())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(|_| invalid())?;
+    writeln!(stream, "policy-ready {}", child.0.native_id).map_err(|_| invalid())?;
+    let mut command = [0];
+    stream.read_exact(&mut command).map_err(|_| invalid())?;
+    if command[0] != b'E' {
+        return Err(invalid());
+    }
+    Err(UmbraError::new(
+        ErrorKind::InvalidState,
+        "spawn probe",
+        "injected policy-before-Ready failure",
+    ))
+}

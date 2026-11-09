@@ -10529,6 +10529,7 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
         "fix-243-copyout-error" => "caller-copyout",
         "fix-243-free-error" => "remote-free",
         "fix-243-register-error" => "register-commit",
+        "fix-243-policy-error" => "policy-ready",
         name if name.starts_with("fix-243-inserted-") => "inserted",
         name if name.starts_with("fix-243-unregistered-") => "unregistered",
         _ => "task-acquired",
@@ -10579,7 +10580,14 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
             .unwrap();
         let record: serde_json::Value = serde_json::from_str(&line).unwrap();
         std::fs::write(evidence.join("provider-rendezvous.json"), &line).unwrap();
-        assert_eq!(record["phase"], phase);
+        assert_eq!(
+            record["phase"],
+            if phase == "policy-ready" {
+                "inserted"
+            } else {
+                phase
+            }
+        );
         if phase != "task-acquired" && phase != "unregistered" {
             assert_eq!(record["session_inserted"], true);
             assert_eq!(record["parent_stopped"], true);
@@ -10598,7 +10606,31 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
             serde_json::to_vec_pretty(&observed.json()).unwrap(),
         )
         .unwrap();
-        stream.write_all(&[command]).unwrap();
+        if phase == "policy-ready" {
+            stream.write_all(b"C").unwrap();
+            assert_eq!(
+                unsafe { libc::poll(&mut pollfd, 1, 15000) },
+                1,
+                "policy rendezvous absent"
+            );
+            let (mut policy_stream, _) = listener.accept().unwrap();
+            policy_stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut policy = String::new();
+            BufReader::new(policy_stream.try_clone().unwrap())
+                .read_line(&mut policy)
+                .unwrap();
+            assert_eq!(policy.trim(), format!("policy-ready {}", observed.pid));
+            let still_stopped = slate_process(observed.pid)
+                .unwrap()
+                .expect("child before Ready");
+            assert_eq!(still_stopped.start, observed.start);
+            std::fs::write(evidence.join("policy-ready.txt"), policy).unwrap();
+            policy_stream.write_all(&[command]).unwrap();
+        } else {
+            stream.write_all(&[command]).unwrap();
+        }
         observed
     });
     let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
@@ -10622,6 +10654,7 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     if command == b'E' && phase != "unregistered" {
         assert!(
             routed.run.stderr.contains(match phase {
+                "policy-ready" => "injected policy-before-Ready failure",
                 "caller-copyout" => "spawn caller PID delivery failed",
                 "remote-free" => "spawn snapshot release failed",
                 "register-commit" => "injected final register commit failure",
@@ -10767,6 +10800,12 @@ fn fix_243_unregistered_packed_reading() {
         false,
         b'E',
     );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_before_ready_failure() {
+    fix_243_fault_reading("fix-243-policy-error", "c11-02-attributes", false, b'E');
 }
 
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision

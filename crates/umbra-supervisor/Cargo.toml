@@ -20,6 +20,7 @@ mutation-probe-dircache = ["umbra-overlay/mutation-probe-dircache"]
 # the reply stays valid, so what breaks is the *content* and nothing else, and a
 # test that passes with it enabled is a test that never read the names back.
 mutation-probe-readdir = []
+mutation-probe-spawn-lifecycle = []
 
 [dependencies]
 tracing.workspace = true

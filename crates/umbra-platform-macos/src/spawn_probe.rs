@@ -29,7 +29,7 @@ pub(crate) fn rendezvous(
 ) -> Result<bool> {
     let selected =
         std::env::var("UMBRA_FIX_243_PROBE_PHASE").unwrap_or_else(|_| "task-acquired".into());
-    if selected != phase {
+    if selected != phase && !(selected == "policy-ready" && phase == "inserted") {
         return Ok(false);
     }
     let Some(socket) = std::env::var_os("UMBRA_FIX_243_PROBE_SOCKET") else {
@@ -61,6 +61,7 @@ pub(crate) fn rendezvous(
             unsafe { libc::_exit(86) }
         }
         b'E' => Ok(true),
+        b'C' => Ok(false),
         _ => Err(crate::error("spawn probe", "unknown fault command")),
     }
 }

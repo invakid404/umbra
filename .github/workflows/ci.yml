@@ -613,11 +613,20 @@ jobs:
           cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
             --test userspace_run fix_243_inserted_ -- --nocapture --test-threads=1
 
-      - name: Restore provider after packed spawn faults
+      - name: Packed spawn -- policy before Ready failure
+        env:
+          UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/spawn-policy-${{ github.run_attempt }}
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build -p umbra-cli --features mutation-probe-spawn-lifecycle
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
+            --test userspace_run fix_243_policy_before_ready_failure -- --exact --nocapture --test-threads=1
+
+      - name: Restore binaries after packed spawn faults
         if: always()
         run: |
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
-          cargo build -p umbra-platform-macos
+          cargo build -p umbra-platform-macos -p umbra-cli
 
       - name: Proof 2 -- mutation probe A, read routing broken
         env:

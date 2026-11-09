@@ -316,6 +316,8 @@ impl Supervisor {
                 self.live += 1;
                 self.process_mut(parent)?.children.insert(child.0);
                 self.spawns.consume(authorization)?;
+                #[cfg(all(feature = "mutation-probe-spawn-lifecycle", unix))]
+                crate::spawn::before_ready(child.0)?;
                 self.platform.control.resume(ResumeCommand {
                     thread: authorization.token.thread,
                     mode: ResumeMode::SpawnChildReady(authorization),
