@@ -10329,6 +10329,66 @@ fn fix_243_kernel_pipe_actions() { fix_243_pipe("fix-243-pipe"); }
 #[test]
 fn fix_243_cloexec_default_prunes_logical_descriptors() { fix_243_pipe("fix-243-cloexec"); }
 
+fn fix_243_refusal(mode: &str, diagnostic: &str) {
+    let Some(spawn) = slate_spawn(mode) else { return; };
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert!(std::fs::read_to_string(root.join("records.done")).unwrap().contains("spawn result=0"));
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "opened.txt", "victim.txt"]);
+    let exact = routed.run.status != Some(0) && routed.run.stderr.contains(diagnostic)
+        && !routed.run.stderr.contains("finished:")
+        && routed.object("records.pre").is_some()
+        && ["records.child", "records.done", "child.txt", "opened.txt"]
+            .iter().all(|name| routed.object(name).is_none());
+    slate_record(&spawn, if exact { "EXACT KNOWN REFUSAL" } else { "NOT QUALIFIED" },
+        serde_json::json!({"diagnostic": diagnostic, "run_id": routed.run.run_id.0.to_string()}));
+    assert!(exact, "{}", routed.run.stderr);
+    if mode.contains("virtual-") {
+        assert_eq!(routed.object("victim.txt"), Some(b"SEED".as_slice()));
+        assert_eq!(std::fs::read(root.join("victim.txt")).unwrap(), b"SEED");
+    }
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
+fn fix_243_refuses_setsid() {
+    fix_243_refusal("fix-243-refuse-setsid", "spawn unsupported attribute SETSID");
+}
+#[test]
+fn fix_243_refuses_setpgroup() {
+    fix_243_refusal("fix-243-refuse-setpgroup", "spawn unsupported attribute SETPGROUP");
+}
+#[test]
+fn fix_243_refuses_resetids() {
+    fix_243_refusal("fix-243-refuse-resetids", "spawn unsupported attribute RESETIDS");
+}
+#[test]
+fn fix_243_refuses_open() {
+    fix_243_refusal("fix-243-refuse-open", "spawn unsupported action OPEN");
+}
+#[test]
+fn fix_243_refuses_chdir() {
+    fix_243_refusal("fix-243-refuse-chdir", "spawn unsupported action CHDIR");
+}
+#[test]
+fn fix_243_refuses_late_chdir() {
+    fix_243_refusal("fix-243-refuse-late-chdir", "spawn unsupported action CHDIR");
+}
+#[test]
+fn fix_243_refuses_fchdir() {
+    fix_243_refusal("fix-243-refuse-fchdir", "spawn unsupported action FCHDIR");
+}
+#[test]
+fn fix_243_refuses_virtual_source() {
+    fix_243_refusal("fix-243-refuse-virtual-source", "spawn virtual descriptor action");
+}
+#[test]
+fn fix_243_refuses_virtual_destination() {
+    fix_243_refusal("fix-243-refuse-virtual-destination", "spawn virtual descriptor action");
+}
+
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
 /// premise, with the errno the first reading did not keep.
 #[test]

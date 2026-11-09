@@ -574,9 +574,59 @@ static int kernel_pipe(const char *mode, const char *root, const char *helper) {
     return failed || used_bytes != 13 || memcmp(bytes, "FIX-243-NONCE", 13) ? 98 : 0;
 }
 
+static int refused_plan(const char *mode, const char *root, const char *helper) {
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    if (posix_spawn_file_actions_init(&actions) || posix_spawnattr_init(&attr)) return 100;
+    int fd = -1, rc = 0;
+    char path[4096];
+    path_in(path, sizeof path, root, "opened.txt");
+    if (!strcmp(mode, "fix-243-refuse-setsid"))
+        rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    else if (!strcmp(mode, "fix-243-refuse-setpgroup"))
+        rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    else if (!strcmp(mode, "fix-243-refuse-resetids"))
+        rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_RESETIDS);
+    else if (!strcmp(mode, "fix-243-refuse-open"))
+        rc = posix_spawn_file_actions_addopen(&actions, 100, path, O_CREAT | O_WRONLY, 0600);
+    else if (!strcmp(mode, "fix-243-refuse-chdir"))
+        rc = posix_spawn_file_actions_addchdir_np(&actions, root);
+    else if (!strcmp(mode, "fix-243-refuse-late-chdir")) {
+        rc = posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, 100);
+        if (!rc) rc = posix_spawn_file_actions_addchdir_np(&actions, root);
+    } else if (!strcmp(mode, "fix-243-refuse-fchdir")) {
+        fd = open(root, O_RDONLY | O_DIRECTORY);
+        if (fd < 0) return 101;
+        rc = posix_spawn_file_actions_addfchdir_np(&actions, fd);
+    } else if (!strcmp(mode, "fix-243-refuse-virtual-source") ||
+               !strcmp(mode, "fix-243-refuse-virtual-destination")) {
+        path_in(path, sizeof path, root, "victim.txt");
+        fd = open(path, O_CREAT | O_RDWR | O_EXCL, 0600);
+        if (fd < 0 || transfer(fd, "SEED", 4) != 4) return 102;
+        rc = !strcmp(mode, "fix-243-refuse-virtual-source") ?
+            posix_spawn_file_actions_adddup2(&actions, fd, 100) :
+            posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, fd);
+    } else return 103;
+    if (rc) return 104;
+    note("phase=pre-spawn mode=%s setup=0\n", mode);
+    identity();
+    flush(root, "records.pre");
+    pid_t child = -1;
+    char *args[] = {(char *)helper, "write-child", (char *)root, NULL};
+    int result = spawn(&child, helper, &actions, &attr, args);
+    int status = 0;
+    int failed = result || reap(child, &status);
+    if (fd >= 0) close(fd);
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    flush(root, "records.done");
+    return failed ? 105 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
+    if (!strncmp(mode, "fix-243-refuse-", 15)) return refused_plan(mode, root, helper);
     if (!strcmp(mode, "fix-243-pipe") || !strcmp(mode, "fix-243-cloexec"))
         return kernel_pipe(mode, root, helper);
     if (!strcmp(mode, "c11-01") || !strcmp(mode, "c11-02-actions") ||
