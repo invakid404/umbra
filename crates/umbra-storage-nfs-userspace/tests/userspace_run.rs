@@ -12618,13 +12618,28 @@ fn f214_native_routed_mix() {
 }
 
 #[test]
+fn f214_copyup_concurrent() {
+    f214_metadata_case("concurrent");
+}
+
+#[test]
 fn f214_fork_exec() {
     f214_metadata_case("fork");
 }
 
-fn f214_metadata_case(mode: &str) {
-    let Some(root) = slate_evidence() else {
+#[test]
+fn f214_distinct_runs() {
+    let Some(first) = f214_metadata_case("distinct-a") else {
         return;
+    };
+    let second = f214_metadata_case("distinct-b").expect("second run");
+    assert_ne!(first, second);
+    assert_ne!(&f214_expected_metadata(first)[48..56], &f214_expected_metadata(second)[48..56]);
+}
+
+fn f214_metadata_case(mode: &str) -> Option<RunId> {
+    let Some(root) = slate_evidence() else {
+        return None;
     };
     let evidence = root.join(format!("f214_{mode}"));
     slate_fresh_dir(&evidence);
@@ -12694,6 +12709,7 @@ fn f214_metadata_case(mode: &str) {
         assert!(std::str::from_utf8(marker).unwrap().trim().parse::<u32>().unwrap() > 0);
         std::fs::copy(native_root.join("records.child"), spawn.evidence.join("native-records.child")).unwrap();
     }
+    Some(routed.run.run_id)
 }
 
 fn r14_value(records: &[serde_json::Value], phase: &str) -> serde_json::Value {

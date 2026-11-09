@@ -121,6 +121,38 @@ int main(int argc, char **argv) {
         require(fstatfs(-1, &native_after) == -1 && errno == EBADF, "negative native fd");
         require(close(native_fd) == 0, "native close");
     }
+    if (strcmp(argv[1], "concurrent") == 0) {
+        int ready[2], proceed[2];
+        require(pipe(ready) == 0 && pipe(proceed) == 0, "barrier pipes");
+        pid_t child = fork();
+        require(child >= 0, "concurrent fork");
+        if (child == 0) {
+            char phase;
+            require(write(ready[1], "r", 1) == 1, "writer ready");
+            require(read(proceed[0], &phase, 1) == 1, "writer barrier");
+            int writer = open(path, O_WRONLY);
+            require(writer >= 0 && write(writer, "Z", 1) == 1, "concurrent copyup");
+            require(close(writer) == 0, "writer close");
+            require(write(ready[1], "d", 1) == 1, "writer done");
+            _exit(0);
+        }
+        char phase;
+        require(read(ready[0], &phase, 1) == 1 && phase == 'r', "reader barrier");
+        require(write(proceed[1], "g", 1) == 1, "release writer");
+        for (int i = 0; i < 8; ++i) {
+            struct statfs during;
+            require(fstatfs(fd, &during) == 0, "concurrent query");
+            require(memcmp(&during.f_fsid, &by_fd.f_fsid, sizeof(during.f_fsid)) == 0,
+                    "concurrent identity");
+        }
+        require(read(ready[0], &phase, 1) == 1 && phase == 'd', "copyup complete");
+        int status;
+        require(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+                WEXITSTATUS(status) == 0, "concurrent child");
+        require(fstatfs(fd, &by_path) == 0, "post-copyup metadata");
+        for (int i = 0; i < 2; ++i)
+            require(close(ready[i]) == 0 && close(proceed[i]) == 0, "barrier close");
+    }
     if (strcmp(argv[1], "fork") == 0) {
         int cloexec = open(path, O_RDONLY | O_CLOEXEC);
         require(cloexec >= 0, "cloexec open");
