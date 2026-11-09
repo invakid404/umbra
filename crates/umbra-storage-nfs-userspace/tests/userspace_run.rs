@@ -9781,6 +9781,7 @@ struct SlateSpawn {
     scratch: tempfile::TempDir,
     program: PathBuf,
     helper: PathBuf,
+    provider_environment: Vec<(String, String)>,
 }
 fn slate_spawn(case: &str) -> Option<SlateSpawn> {
     let evidence = slate_evidence()?.join(case);
@@ -9811,6 +9812,7 @@ fn slate_spawn(case: &str) -> Option<SlateSpawn> {
         scratch,
         program,
         helper,
+        provider_environment: Vec::new(),
     })
 }
 
@@ -9894,6 +9896,7 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
     let watch = SlateWatch::new(spawn.scratch.path(), &spawn.evidence.join("routed"), false);
     let output = slate_watched(
         Command::new(binaries().join("umbra"))
+            .envs(spawn.provider_environment.iter().map(|(key, value)| (key, value)))
             .args(["run", "--registry"])
             .arg(&registry)
             .arg("--workspace")
