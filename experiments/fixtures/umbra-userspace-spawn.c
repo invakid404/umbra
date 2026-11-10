@@ -22,6 +22,9 @@
  * posix_spawn returned and then wait for one `G` on stdin, so the harness has
  * the child's birth identity before the child is released to do anything. */
 #include <errno.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <sys/fileport.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -524,7 +527,12 @@ static int race(const char *root, const char *helper) {
  * dup/close/inherit actions; CLOEXEC_DEFAULT must prune the routed victim. */
 static int kernel_pipe(const char *mode, const char *root, const char *helper) {
     int recovery = !strcmp(mode, "fix-243-error-recovery");
-    int explicit_policy = !strcmp(mode, "fix-243-cloexec") || recovery;
+    int inherit_cloexec = !strcmp(mode, "fix-243-inherit-cloexec");
+    int close_first = !strcmp(mode, "fix-243-close-before-dup");
+    int dup_first = !strcmp(mode, "fix-243-dup-before-close");
+    int explicit_policy = !strcmp(mode, "fix-243-cloexec") || recovery ||
+        inherit_cloexec || close_first || dup_first;
+    int parent_100 = inherit_cloexec || close_first;
     int pair[2];
     if (pipe(pair)) return 90;
     char path[4096];
@@ -534,10 +542,19 @@ static int kernel_pipe(const char *mode, const char *root, const char *helper) {
     posix_spawn_file_actions_t actions;
     posix_spawnattr_t attr;
     if (posix_spawn_file_actions_init(&actions) || posix_spawnattr_init(&attr)) return 92;
-    if (posix_spawn_file_actions_adddup2(&actions, pair[1], 100) ||
-        posix_spawn_file_actions_addclose(&actions, pair[1]) ||
-        posix_spawn_file_actions_adddup2(&actions, 100, 100) ||
-        posix_spawn_file_actions_addinherit_np(&actions, 100)) return 93;
+    if (parent_100 && dup2(pair[1], 100) != 100) return 130;
+    if (inherit_cloexec && fcntl(100, F_SETFD, FD_CLOEXEC)) return 131;
+    int flags_before = parent_100 ? fcntl(100, F_GETFD) : -1;
+    if (inherit_cloexec) {
+        if (posix_spawn_file_actions_addinherit_np(&actions, 100) ||
+            posix_spawn_file_actions_addclose(&actions, pair[1])) return 93;
+    } else {
+        if (close_first && posix_spawn_file_actions_addclose(&actions, 100)) return 93;
+        if (posix_spawn_file_actions_adddup2(&actions, pair[1], 100) ||
+            posix_spawn_file_actions_addclose(&actions, pair[1]) ||
+            posix_spawn_file_actions_adddup2(&actions, 100, 100) ||
+            posix_spawn_file_actions_addinherit_np(&actions, 100)) return 93;
+    }
     if (explicit_policy && posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT))
         return 94;
     note("phase=pre-spawn mode=%s\n", mode);
@@ -567,6 +584,12 @@ static int kernel_pipe(const char *mode, const char *root, const char *helper) {
         flush(root, "records.done");
         return 95;
     }
+    if (parent_100) {
+        int flags_after = fcntl(100, F_GETFD);
+        note("parent-flags before=%d after=%d\n", flags_before, flags_after);
+        if (flags_after != flags_before) return 132;
+        close(100);
+    }
     close(pair[1]);
     char bytes[64] = {0};
     size_t used_bytes = 0;
@@ -593,9 +616,16 @@ static int refused_plan(const char *mode, const char *root, const char *helper) 
     posix_spawnattr_t attr;
     if (posix_spawn_file_actions_init(&actions) || posix_spawnattr_init(&attr)) return 100;
     int fd = -1, rc = 0;
+    fileport_t port = FILEPORT_NULL;
     char path[4096];
     path_in(path, sizeof path, root, "opened.txt");
-    if (!strcmp(mode, "fix-243-refuse-setsid"))
+    if (!strcmp(mode, "fix-243-refuse-fileport")) {
+        /* Private libsyscall API: xnu/libsyscall/wrappers/spawn/posix_spawn.c. */
+        int (*add)(posix_spawn_file_actions_t *, mach_port_t, int) =
+            dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_add_fileportdup2_np");
+        if (!add || fileport_makeport(STDOUT_FILENO, &port)) return 133;
+        rc = add(&actions, port, 100);
+    } else if (!strcmp(mode, "fix-243-refuse-setsid"))
         rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
     else if (!strcmp(mode, "fix-243-refuse-setpgroup"))
         rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
@@ -643,6 +673,7 @@ static int refused_plan(const char *mode, const char *root, const char *helper) 
     int status = 0;
     int failed = result || reap(child, &status);
     if (fd >= 0) close(fd);
+    if (port != FILEPORT_NULL) mach_port_deallocate(mach_task_self(), port);
     posix_spawnattr_destroy(&attr);
     posix_spawn_file_actions_destroy(&actions);
     flush(root, "records.done");
@@ -805,7 +836,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fix-243-threads")) return threaded(root, helper);
     if (!strncmp(mode, "fix-243-refuse-", 15)) return refused_plan(mode, root, helper);
     if (!strcmp(mode, "fix-243-pipe") || !strcmp(mode, "fix-243-cloexec") ||
-        !strcmp(mode, "fix-243-error-recovery"))
+        !strcmp(mode, "fix-243-error-recovery") ||
+        !strcmp(mode, "fix-243-inherit-cloexec") ||
+        !strcmp(mode, "fix-243-close-before-dup") ||
+        !strcmp(mode, "fix-243-dup-before-close"))
         return kernel_pipe(mode, root, helper);
     if (!strcmp(mode, "c11-01") || !strcmp(mode, "c11-02-actions") ||
         !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both") ||

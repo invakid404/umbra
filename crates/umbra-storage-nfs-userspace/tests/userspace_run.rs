@@ -10399,12 +10399,28 @@ fn fix_243_pipe(mode: &str) {
     assert!(routed
         .text("records.done")
         .contains("pipe-result bytes=13 payload=FIX-243-NONCE eof=1"));
-    if mode == "fix-243-cloexec" || mode == "fix-243-error-recovery" {
+    if matches!(
+        mode,
+        "fix-243-cloexec"
+            | "fix-243-error-recovery"
+            | "fix-243-inherit-cloexec"
+            | "fix-243-close-before-dup"
+            | "fix-243-dup-before-close"
+    ) {
         let expected = "pruned-victim result=-1 errno=9";
         assert!(std::fs::read_to_string(root.join("records.child"))
             .unwrap()
             .contains(expected));
         assert!(routed.text("records.child").contains(expected));
+    }
+    if mode == "fix-243-inherit-cloexec" || mode == "fix-243-close-before-dup" {
+        let expected = if mode == "fix-243-inherit-cloexec" {
+            "parent-flags before=1 after=1"
+        } else {
+            "parent-flags before=0 after=0"
+        };
+        assert!(native_done.contains(expected));
+        assert!(routed.text("records.done").contains(expected));
     }
     if mode == "fix-243-error-recovery" {
         assert!(native_done.contains("kernel-error result=9 expected=9"));
@@ -10415,6 +10431,19 @@ fn fix_243_pipe(mode: &str) {
     assert!(journal_records_completion(&routed.run));
     slate_spawn_finish(&spawn, &routed);
     slate_finish_cleanup();
+}
+
+#[test]
+fn fix_243_inherit_cloexec_kernel_fd() {
+    fix_243_pipe("fix-243-inherit-cloexec");
+}
+#[test]
+fn fix_243_close_before_dup_cloexec_default() {
+    fix_243_pipe("fix-243-close-before-dup");
+}
+#[test]
+fn fix_243_dup_before_close_cloexec_default() {
+    fix_243_pipe("fix-243-dup-before-close");
 }
 
 #[test]
@@ -10772,6 +10801,13 @@ fn fix_243_refuses_resetids() {
     fix_243_refusal(
         "fix-243-refuse-resetids",
         "spawn unsupported attribute RESETIDS",
+    );
+}
+#[test]
+fn fix_243_refuses_fileport_dup2() {
+    fix_243_refusal(
+        "fix-243-refuse-fileport",
+        "spawn unsupported action FILEPORT_DUP2",
     );
 }
 #[test]
