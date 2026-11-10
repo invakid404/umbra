@@ -1157,7 +1157,6 @@ impl Supervisor {
             task,
             thread,
             image_generation: context.exec_generation,
-            stop_generation: self.filesystem_sequence,
         };
         // Decoding retains the address; it must not probe or reject it.
         let buffer = self.platform.abi.io_buffer(registers)?.ok_or_else(|| {
@@ -2374,7 +2373,6 @@ mod tests {
                 task: task(1),
                 thread: ThreadId(task(1).0),
                 image_generation: 0,
-                stop_generation: 1,
             };
             let binding = FilesystemBinding::overlay(s.state.run_id);
             let reply = FilesystemReply {
@@ -2417,7 +2415,6 @@ mod tests {
             task: task(1),
             thread: ThreadId(task(1).0),
             image_generation: 0,
-            stop_generation: 1,
         };
         let captured = s.process(task(1)).unwrap().context.fds[&fd]
             .filesystem
@@ -2465,7 +2462,6 @@ mod tests {
         assert_eq!(current, b);
         let token = FilesystemQueryToken {
             request: 2,
-            stop_generation: 2,
             ..reply.token
         };
         assert!(s
@@ -2564,7 +2560,6 @@ mod tests {
             task: task(1),
             thread: ThreadId(task(1).0),
             image_generation: 0,
-            stop_generation: 1,
         };
         assert!(s
             .filesystem_queries
@@ -2611,7 +2606,6 @@ mod tests {
                 task: task(1),
                 thread: ThreadId(task(1).0),
                 image_generation: generation,
-                stop_generation: 2 + generation,
             };
             let reply = FilesystemReply {
                 token: token.clone(),
@@ -2699,7 +2693,6 @@ mod tests {
                 task: task(1),
                 thread: ThreadId(task(1).0),
                 image_generation: 0,
-                stop_generation: 1,
             };
             let late = FilesystemReply {
                 token,

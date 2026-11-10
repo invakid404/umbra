@@ -8737,7 +8737,6 @@ fn f214_delayed_metadata_reply_keeps_binding_across_copyup() {
         task: f.process.task,
         thread: ThreadId(f.process.task.0),
         image_generation: f.process.exec_generation,
-        stop_generation: 1,
     };
     // The namespace has captured the descriptor response. Hold its
     // delivery while another operation changes the object's backing layer.
@@ -8787,7 +8786,6 @@ fn f214_delayed_metadata_reply_keeps_binding_across_copyup() {
     assert_eq!(delayed.metadata, expected);
     let next_token = umbra_core::FilesystemQueryToken {
         request: 2,
-        stop_generation: 2,
         ..token
     };
     let current = f
@@ -8829,7 +8827,6 @@ fn f214_descriptor_binding_survives_namespace_removal() {
         task: f.process.task,
         thread: umbra_core::ThreadId(f.process.task.0),
         image_generation: f.process.exec_generation,
-        stop_generation: 1,
     };
     std::fs::remove_file(f.base_root.join("dir/seed.txt")).unwrap();
     std::fs::remove_dir(f.base_root.join("dir")).unwrap();
@@ -8888,7 +8885,6 @@ fn f214_retained_binding_survives_external_namespace_rename() {
         task: f.process.task,
         thread: umbra_core::ThreadId(f.process.task.0),
         image_generation: f.process.exec_generation,
-        stop_generation: 1,
     };
     // Mutate the backing namespace directly: this does not claim routed rename support.
     std::fs::rename(f.base_root.join("dir"), f.base_root.join("moved")).unwrap();
@@ -8966,7 +8962,6 @@ fn f214_resume_identity() {
         task: f.process.task,
         thread: ThreadId(f.process.task.0),
         image_generation: 0,
-        stop_generation: 1,
     };
     let before = recreated_descriptor(&mut f.overlay, &f.process, token.clone());
     f.overlay

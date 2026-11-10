@@ -826,8 +826,6 @@ pub struct FilesystemQueryToken {
     pub thread: ThreadId,
     /// Executable image generation.
     pub image_generation: u64,
-    /// Stop generation, independent of descriptor reuse.
-    pub stop_generation: u64,
 }
 
 /// Provider response carrying both request and full filesystem identity.

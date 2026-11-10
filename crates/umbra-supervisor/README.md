@@ -375,13 +375,15 @@ and rewrite-backed runs resume the original syscall. Owned but closed
 descriptors return EBADF before output validation. Namespace errors precede
 copyout, and absent metadata capability returns ENOTSUP.
 
-The supervisor checks request/task/thread/image/stop identity, the full
+The supervisor checks request/task/thread/image identity, the full
 binding and every v1 metadata field before encoding or copying bytes. Exec,
 thread/process exit, provider failure and teardown cancel retained queries.
 Provider errors or malformed replies poison the run; they cannot become
 zero-filled successful metadata. The current namespace call is synchronous,
 so the event loop cannot process another trace event during that call;
 pending-state tests exercise invalidation and late replies explicitly.
+There is no independent stop-generation check; the request identity prevents
+a prior request from completing a newer one.
 
 Pathname `statfs` retains the native host view. It may disagree with synthetic
 descriptor metadata or fail for an overlay-only path. The descriptor capability

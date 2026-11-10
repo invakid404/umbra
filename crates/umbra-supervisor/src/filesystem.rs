@@ -73,7 +73,6 @@ mod tests {
                     generation: 1,
                 }),
                 image_generation: 3,
-                stop_generation: request,
             },
             binding,
             output: IoBuffer {
@@ -143,7 +142,7 @@ mod tests {
                         generation: 1,
                     })
                 }
-                3 => response.token.stop_generation += 1,
+                3 => response.token.task.0.generation += 1,
                 4 => response.metadata.type_name = "apfs".into(),
                 _ => response.metadata.counts[0] = umbra_core::FilesystemStatistic::Known(0),
             }
