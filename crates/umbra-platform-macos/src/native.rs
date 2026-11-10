@@ -1664,6 +1664,8 @@ impl MacosTraceBackend {
             )?;
         }
         pending.region = Some(address);
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        crate::spawn_probe::region("allocated", pending.token, address, 0);
         // Store ownership before any write can fail.
         let backing = pending.snapshot.backing(address)?;
         let mut regs = pending.original.clone();
@@ -1757,6 +1759,8 @@ impl MacosTraceBackend {
         let task_port = s.task.0;
         let result =
             unsafe { mach2::vm::mach_vm_deallocate(task_port, region, spawn::REGION_BYTES as u64) };
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        crate::spawn_probe::region("release-result", authorization.token, region, result);
         if result != 0 {
             #[cfg(feature = "mutation-probe-spawn-lifecycle")]
             self.probe_spawn_completion(index, "remote-free-failed")?;

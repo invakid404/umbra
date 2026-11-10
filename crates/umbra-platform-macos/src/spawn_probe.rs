@@ -6,6 +6,23 @@ use std::{
 };
 use umbra_core::Result;
 
+/// Observation only: no rendezvous, scheduling change, or production build code.
+/// Parent identity is part of the mapping key: equal virtual addresses in two
+/// different tasks do not denote shared backing.
+pub(crate) fn region(event: &str, token: umbra_core::SpawnToken, address: u64, result: i32) {
+    if std::env::var_os("UMBRA_FIX_243_REGION_TRACE").is_some() {
+        eprintln!(
+            "spawn-region {}",
+            serde_json::json!({
+                "event": event, "parent": token.parent,
+                "thread": token.thread, "sequence": token.sequence,
+                "address": address, "bytes": crate::spawn::REGION_BYTES,
+                "result": result,
+            })
+        );
+    }
+}
+
 pub(crate) fn acquired(pid: i32, birth: Option<(u64, u64)>, registered: bool) -> Result<()> {
     if rendezvous(
         "task-acquired",
