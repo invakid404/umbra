@@ -3576,6 +3576,19 @@ impl MacosTraceBackend {
     /// zombie still has its original parent to be handed back to. It does not
     /// remove the sessions; callers clear them afterwards.
     fn tear_down_sessions(&mut self) -> Vec<TeardownReport> {
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if std::env::var_os("UMBRA_FIX_243_OWNER_TRACE").is_some() {
+            let owners: Vec<_> = self
+                .sessions
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "pid": s.id.0.native_id, "birth": s.birth, "stopped": s.stopped,
+                    })
+                })
+                .collect();
+            eprintln!("spawn-teardown-owners {}", serde_json::json!(owners));
+        }
         let mut reports = Vec::new();
         for index in (0..self.sessions.len()).rev() {
             if !self.sessions[index].torn_down {

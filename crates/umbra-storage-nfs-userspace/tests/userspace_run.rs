@@ -10846,6 +10846,11 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
         name if name.starts_with("fix-243-unregistered-") => "unregistered",
         _ => "task-acquired",
     };
+    if case == "fix-243-policy-error" {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_OWNER_TRACE".into(), "1".into()));
+    }
     spawn
         .provider_environment
         .push(("UMBRA_FIX_243_PROBE_PHASE".into(), phase.into()));
@@ -10987,6 +10992,27 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     let observed = observer.join().unwrap();
     std::fs::remove_file(socket).unwrap();
     assert_ne!(routed.run.status, Some(0));
+    if case == "fix-243-policy-error" {
+        let owners: serde_json::Value = serde_json::from_str(
+            routed
+                .run
+                .stderr
+                .lines()
+                .find_map(|l| l.strip_prefix("spawn-teardown-owners "))
+                .expect("policy failure must reach owned teardown"),
+        )
+        .unwrap();
+        assert!(
+            owners
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|owner| owner["pid"] == observed.pid
+                    && owner["birth"] == serde_json::json!([observed.start.0, observed.start.1])
+                    && owner["stopped"] == true),
+            "policy failure discarded child Session: {owners}"
+        );
+    }
     for name in ["records.child", "records.done", "child.txt", "parent.txt"] {
         assert!(routed.object(name).is_none(), "pre-commit effect: {name}");
     }
