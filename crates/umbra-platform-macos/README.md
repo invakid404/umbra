@@ -295,6 +295,8 @@ continuing with an inert one.
 | `chdir` | 12 | `chdir` | x0 path | `FsOp::Chdir`, anchored at the cwd |
 | `fstat` | 339 | `fstat` | x0 descriptor, x1 buffer | `FsOp::Fstat` |
 | `fstat` | 189 | `__fstat` | same layout | `FsOp::Fstat` |
+| `statfs` | 345 | `statfs` | x0 path, x1 buffer | `FsOp::StatFs`, following the final logical symlink |
+| `fstatfs` | 346 | `fstatfs` | x0 descriptor, x1 buffer | `FsOp::FstatFs`, using the captured filesystem binding |
 | `setattrlistat` | 524 | `setattrlistat` | x0 dirfd, x1 path, x2 attrlist, x3 buffer, x4 size, x5 options | `FsOp::SetTimes` |
 | `getattrlistbulk` | 461 | `getattrlistbulk` | x0 descriptor, x1 attrlist, x2 buffer, x3 size, x4 options | `FsOp::ReadDir` |
 | `fchdir` | 13 | `fchdir` | x0 descriptor | `FsOp::Fchdir` |

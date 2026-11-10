@@ -768,13 +768,9 @@ const S_IFLNK: u32 = 0o120000;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 
-/// Encode logical metadata as a Darwin `struct stat` image.
-///
-/// The placeholder's native file kind and size are never consulted: a logical
-/// symlink is reported as `S_IFLNK` with its target length, so a no-follow
-/// stat can never expose the empty regular file the overlay stores for it.
-/// Only fields this layout defines are written; the rest stay zero. A kind the
-/// layout cannot represent fails explicitly rather than guessing a mode.
+/// Encode filesystem metadata as Darwin's arm64 `struct statfs` image.
+/// Undefined statistics use all-ones values; reserved bytes remain zero.
+/// Numeric overflow and names that cannot fit are refused.
 pub fn encode_filesystem_metadata(metadata: &umbra_core::FilesystemMetadata) -> Result<Vec<u8>> {
     use umbra_core::FilesystemStatistic;
     fn number(value: &FilesystemStatistic, max: u128) -> Result<u128> {
@@ -841,6 +837,13 @@ fn filesystem_digest(_bytes: &[u8]) -> Result<[u8; 32]> {
     Err(error("statfs", "Darwin filesystem encoding requires macOS"))
 }
 
+/// Encode logical metadata as a Darwin `struct stat` image.
+///
+/// The placeholder's native file kind and size are never consulted: a logical
+/// symlink is reported as `S_IFLNK` with its target length, so a no-follow
+/// stat can never expose the empty regular file the overlay stores for it.
+/// Only fields this layout defines are written; the rest stay zero. A kind the
+/// layout cannot represent fails explicitly rather than guessing a mode.
 pub fn encode_stat(stat: &BlobStat) -> Result<Vec<u8>> {
     let format = match stat.kind {
         ObjectKind::LogicalSymlink => S_IFLNK,
@@ -1243,8 +1246,8 @@ impl SyscallAbi for DarwinArm64Abi {
                 length: 2168,
             }));
         }
-        // `fstat` is the one breakpointed syscall on this ABI that names an
-        // output buffer of its own. Its length is not a caller-supplied count
+        // `fstat` also names an output buffer of its own.
+        // Its length is not a caller-supplied count
         // but the fixed width of the layout the kernel would have written, so it
         // is reported as that: a caller writing fewer bytes would leave the
         // tail of the tracee's `struct stat` holding whatever was there before.
