@@ -9504,14 +9504,14 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for checked filesystem-metadata copyout (#255) and
-    // the packed-spawn protocol (#243), which changed native.rs,
+    // Re-characterized for opt-in spawn diagnostics on the composed
+    // packed-spawn and filesystem-metadata implementation, which changed native.rs,
     // while single_thread and its Fork/WaitPlan::Park call sites are unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("5d0037c06d34b3c59fe00234e9a27f9153d7563ff327054e4e448fcf31ebfadd"),
+        Some("9835b8f5af1e3c2d08a9475c4cda6bf9a652f96b932f94ea0e457687aa77e592"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -9922,6 +9922,7 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
     }
     let output = slate_watched(
         command
+            .env("UMBRA_SPAWN_LOG", "1")
             .envs(
                 spawn
                     .provider_environment
@@ -10920,6 +10921,11 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
         .parent()
         .unwrap()
         .join(format!("{}.sock", case.trim_start_matches("fix-243-")));
+    match std::fs::remove_file(&socket) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove stale probe socket {}: {error}", socket.display()),
+    }
     let listener = UnixListener::bind(&socket).unwrap();
     spawn.provider_environment.push((
         "UMBRA_FIX_243_PROBE_SOCKET".into(),

@@ -539,7 +539,8 @@ decodes JSON `Options` from opaque provider options (empty falls back to
 `debugserver` option is absent; if both are unset, `xcode-select -p` supplies the
 Xcode path. With no `twin_cache` option, `HOME` selects
 `$HOME/Library/Caches/umbra/twins`; an unset `HOME` refuses that default.
-`UMBRA_RSP_LOG` and `UMBRA_TEARDOWN_LOG` are off when unset. Any set value enables,
+`UMBRA_SPAWN_LOG` is off when unset; any value enables spawn-capture and
+spawn-policy diagnostics on stderr. `UMBRA_RSP_LOG` and `UMBRA_TEARDOWN_LOG` are off when unset. Any set value enables,
 respectively, protocol traffic or per-session teardown reports on stderr.
 
 The `mutation-probe-spawn-lifecycle` feature exposes these test controls; normal

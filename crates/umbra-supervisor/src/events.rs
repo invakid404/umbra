@@ -266,7 +266,7 @@ impl Supervisor {
                 self.track_thread(token.parent, token.thread, StopReason::SyscallEntry)?;
                 let process = &self.state.processes.processes[&token.parent];
                 let authorization = self.spawns.prepare(token, plan, &process.context)?;
-                self.platform.control.resume(ResumeCommand {
+                self.resume_checked(ResumeCommand {
                     thread: token.thread,
                     mode: ResumeMode::SpawnAuthorize(authorization),
                     signal: None,
@@ -274,7 +274,7 @@ impl Supervisor {
             }
             TraceEvent::SpawnAbort { authorization } => {
                 self.spawns.consume(authorization)?;
-                self.platform.control.resume(ResumeCommand {
+                self.resume_checked(ResumeCommand {
                     thread: authorization.token.thread,
                     mode: ResumeMode::SpawnAbortReady(authorization),
                     signal: None,
@@ -316,7 +316,7 @@ impl Supervisor {
                 self.spawns.consume(authorization)?;
                 #[cfg(all(feature = "mutation-probe-spawn-lifecycle", unix))]
                 crate::spawn::before_ready(child.0)?;
-                self.platform.control.resume(ResumeCommand {
+                self.resume_checked(ResumeCommand {
                     thread: authorization.token.thread,
                     mode: ResumeMode::SpawnChildReady(authorization),
                     signal: None,
@@ -1728,6 +1728,14 @@ impl Supervisor {
     }
 
     fn resume_thread(&mut self, thread: ThreadId) -> Result<()> {
+        self.resume_checked(ResumeCommand {
+            thread,
+            mode: ResumeMode::Syscall,
+            signal: None,
+        })
+    }
+
+    fn resume_checked(&mut self, command: ResumeCommand) -> Result<()> {
         self.service_renewal()?;
         if self.poisoned {
             return Err(error(
@@ -1736,11 +1744,7 @@ impl Supervisor {
                 "refusing to resume a poisoned run",
             ));
         }
-        self.platform.control.resume(ResumeCommand {
-            thread,
-            mode: ResumeMode::Syscall,
-            signal: None,
-        })
+        self.platform.control.resume(command)
     }
 
     /// What a new child keeps of its parent's routed descriptors, and the open

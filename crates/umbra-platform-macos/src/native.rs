@@ -1573,7 +1573,9 @@ impl MacosTraceBackend {
         if !qualified {
             return Err(unsupported("spawn ABI profile mismatch"));
         }
-        eprintln!("spawn-capture descriptor=non-null profile=25F80");
+        if std::env::var_os("UMBRA_SPAWN_LOG").is_some() {
+            eprintln!("spawn-capture descriptor=non-null profile=25F80");
+        }
         if self.sessions[index].spawn.is_some()
             || self.sessions.iter().filter(|s| s.spawn.is_some()).count() >= 16
         {
@@ -1585,11 +1587,13 @@ impl MacosTraceBackend {
             .read(get(&regs, 2)?, &mut descriptor)
             .map_err(|_| unsupported("spawn malformed packed descriptor"))?;
         let snapshot = spawn::decode(&descriptor, |address, output| s.task.read(address, output))?;
-        eprintln!(
-            "spawn-policy flags={:#06x} actions={}",
-            u16::from_le_bytes(snapshot.attributes[..2].try_into().unwrap()) & !0x80,
-            snapshot.actions.len()
-        );
+        if std::env::var_os("UMBRA_SPAWN_LOG").is_some() {
+            eprintln!(
+                "spawn-policy flags={:#06x} actions={}",
+                u16::from_le_bytes(snapshot.attributes[..2].try_into().unwrap()) & !0x80,
+                snapshot.actions.len()
+            );
+        }
         let plan = SpawnPlan {
             digest: spawn_host::digest(&snapshot.backing(0)?)?,
             actions: snapshot.actions.clone(),
@@ -2727,7 +2731,9 @@ impl MacosTraceBackend {
                 bytes.push(0);
                 set(&mut regs, slot, s.allocate(&bytes)?)?;
                 if number == 244 {
-                    eprintln!("spawn-capture descriptor=null");
+                    if std::env::var_os("UMBRA_SPAWN_LOG").is_some() {
+                        eprintln!("spawn-capture descriptor=null");
+                    }
                     let attributes = spawn_attributes()?;
                     let attr = s.allocate(&attributes.block)?;
                     let descriptor = spawn_descriptor(attr, attributes.len);
