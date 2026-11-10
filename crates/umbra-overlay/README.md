@@ -798,11 +798,9 @@ through them. Readlink, no-follow stat and a no-follow `FsOp::Access` never
 expose the placeholder as a file: the probe is answered from the `0o777` the
 overlay reports for every logical symlink, not from the placeholder's `0444`.
 That is a resolver-layer property. Each of those answers is a
-`ResolvedAction::Emulate`, and a caller that cannot execute emulated results —
-the macOS supervisor among them — ends the run instead of answering, so it is
-not yet an end-to-end behaviour. For the no-follow `FsOp::Access` case this is
-no worse than before the operation was typed, when the same call was refused at
-decode.
+`ResolvedAction::Emulate`, which the supervisor executes through the platform's
+emulation interface. A backend that cannot install that result and skip the
+trapped call fails closed.
 
 Control metadata lives outside tracee listings:
 
@@ -911,12 +909,12 @@ most-argued arm and poisons (#65): the backing index is keyed by the backend
 object ID the shadow assigned the placeholder, which no intent carries, so its
 undo cannot be rebuilt from durable state at all.
 
-Directory subtree rename, hard links, metadata mutations, pathless native
-read/write emulation, descriptor duplication/close/reuse bookkeeping, renamed or
-unlinked directory handles, and restart recovery fail explicitly or require future
-caller integration. Directory streams must not reuse a tracked fd/object identity
-within one exec generation; descriptor lifecycle integration will remove that
-restriction. This is an executable regular-file MVP, not complete POSIX coverage.
+Directory subtree rename, hard links, unsupported metadata mutations, descriptor
+duplication, renamed or unlinked directory handles, and restart recovery fail
+explicitly or require future caller integration. Routed read/write and close
+already participate in the supervisor's descriptor lifecycle; successful close
+evicts the directory snapshot before the number can be reused. This is an
+executable regular-file MVP, not complete POSIX coverage.
 <!-- /memoria:section -->
 
 <!-- memoria:section id="validation" files="src/engine/tests.rs" guidance="../../docs/guides/reviewing-test-sections.md" -->
