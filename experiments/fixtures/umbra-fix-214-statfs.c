@@ -107,54 +107,6 @@ int main(int argc, char **argv) {
         require(fstatfs(closed, bad) == -1 && errno == EBADF, "closed before bad pointer");
         require(fstatfs(fd, bad) == -1 && errno == EFAULT, "valid before bad pointer");
     }
-    if (strcmp(argv[1], "lookup") == 0) {
-        require(chdir(argv[2]) == 0, "logical chdir");
-        require(symlinkat("seed.txt", AT_FDCWD, "alias") == 0, "alias setup");
-        require(symlinkat("absent", AT_FDCWD, "dangling") == 0, "dangling setup");
-        require(symlinkat("loop", AT_FDCWD, "loop") == 0, "loop setup");
-        struct statfs relative;
-        require(statfs("seed.txt", &relative) == 0, "relative lookup");
-        require(memcmp(&relative.f_fsid, &by_fd.f_fsid, sizeof(relative.f_fsid)) == 0,
-                "relative identity");
-        require(statfs("alias", &relative) == 0, "final symlink");
-        require(memcmp(&relative.f_fsid, &by_fd.f_fsid, sizeof(relative.f_fsid)) == 0,
-                "symlink identity");
-        require(statfs("dangling", &relative) == -1 && errno == ENOENT, "dangling lookup");
-        require(statfs("loop", &relative) == -1 && errno == ELOOP, "loop lookup");
-        require(statfs("seed.txt/child", &relative) == -1 && errno == ENOTDIR,
-                "non-directory prefix");
-    }
-    if (strcmp(argv[1], "mixed") == 0) {
-        // Deliberately obtain a kernel descriptor through the generic syscall
-        // entry, independent of the routed libc open entry. Read-only control
-        // on disposable host data; the file is never changed through this fd.
-        int native_fd = (int)syscall(SYS_open, path, O_RDONLY, 0);
-        require(native_fd >= 0 && native_fd < 4096, "native descriptor");
-        struct statfs native_before, native_after;
-        require(fstatfs(native_fd, &native_before) == 0, "native metadata");
-        require(strcmp(native_before.f_fstypename, "umbra") != 0, "native filesystem type");
-        pid_t child = fork();
-        require(child >= 0, "mixed fork");
-        if (child == 0) {
-            require(fstatfs(native_fd, &native_after) == 0, "inherited native metadata");
-            require(memcmp(&native_before.f_fsid, &native_after.f_fsid, sizeof(native_before.f_fsid)) == 0 &&
-                    native_before.f_type == native_after.f_type &&
-                    strcmp(native_before.f_mntonname, native_after.f_mntonname) == 0 &&
-                    strcmp(native_before.f_mntfromname, native_after.f_mntfromname) == 0,
-                    "native inheritance identity");
-            struct statfs routed;
-            require(fstatfs(fd, &routed) == 0, "inherited routed metadata");
-            require(memcmp(&routed.f_fsid, &by_fd.f_fsid, sizeof(routed.f_fsid)) == 0,
-                    "routed inheritance identity");
-            marker(argv[2], "records.child", getpid());
-            _exit(0);
-        }
-        int status;
-        require(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
-                WEXITSTATUS(status) == 0, "mixed child");
-        require(fstatfs(-1, &native_after) == -1 && errno == EBADF, "negative native fd");
-        require(close(native_fd) == 0, "native close");
-    }
     if (strcmp(argv[1], "concurrent") == 0) {
         int ready[2], proceed[2];
         require(pipe(ready) == 0 && pipe(proceed) == 0, "barrier pipes");

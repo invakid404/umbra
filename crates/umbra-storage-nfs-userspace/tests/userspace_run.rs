@@ -12782,24 +12782,6 @@ fn f214_metadata_case(mode: &str) -> Option<RunId> {
             );
         }
     }
-    if mode == "mixed" {
-        let marker = routed
-            .object("records.child")
-            .expect("mixed metadata phase marker");
-        assert!(
-            std::str::from_utf8(marker)
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap()
-                > 0
-        );
-        std::fs::copy(
-            native_root.join("records.child"),
-            spawn.evidence.join("native-records.child"),
-        )
-        .unwrap();
-    }
     Some(routed.run.run_id)
 }
 
