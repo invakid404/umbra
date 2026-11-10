@@ -1742,7 +1742,27 @@ impl MacosTraceBackend {
         let parent = &self.sessions[index];
         let pending = parent.spawn.as_ref().expect("pending completion");
         let Some(child_index) = pending.child else {
-            return Ok(false);
+            if std::env::var("UMBRA_FIX_243_PROBE_PHASE").as_deref() != Ok(phase) {
+                return Ok(false);
+            }
+            // Observe an early completion call without acquiring or registering
+            // a Task merely for the test. Unknown ownership is not reported as
+            // successful registration.
+            let Some(region) = pending.region else {
+                return Err(error("spawn probe", "no region before child insertion"));
+            };
+            let mut bytes = [0; 4];
+            parent.task.read(region + 400, &mut bytes)?;
+            let pid = i32::from_le_bytes(bytes);
+            let birth = bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
+            return crate::spawn_probe::rendezvous(
+                phase,
+                pid,
+                birth,
+                serde_json::json!({"watchdog_registered": null, "session_inserted": false,
+                    "parent_stopped": parent.stopped, "child_stopped": null,
+                    "region_owned": true}),
+            );
         };
         let child = &self.sessions[child_index];
         let registered = self
