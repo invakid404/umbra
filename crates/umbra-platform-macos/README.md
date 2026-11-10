@@ -835,8 +835,8 @@ silently. For **this** case what ended it was the path decode refusing the
 overwritten operand: `Io during path: null or overflowing pointer` (`EFAULT`),
 measured in 5 of 5 enforced release runs, each exiting non-zero. The overwrite is
 not reachable now, in either profile.
-Per-thread slots do close this case, and so, independently, does the per-thread
-resume; both were measured by reverting one and keeping the other, above.
+The measurements above establish the per-thread resume's effect. They do not
+establish an independent failure from collapsing the pending slots.
 
 (The supervisor also holds an independent per-`ThreadId` guard in
 `umbra-supervisor/src/events.rs` that returns a real `Err(InvalidState)` in release
@@ -861,7 +861,7 @@ The two cases failed differently for one reason: `mt-write`'s threads share **on
 stub at one address**, so the `z0` window un-armed it for the sibling; `mt-spawn`'s
 threads use **different** stubs, so the collision landed on the shared slot
 instead. Both capture now, and measured, it is the per-thread resume that closes
-both — the slots close only the second.
+both; the slot-collapse mutation did not independently fail either case.
 
 **What that costs depends on the harness, and the difference is measured.** In
 this crate's direct-tracer harness the escaped write lands **on the host**,
