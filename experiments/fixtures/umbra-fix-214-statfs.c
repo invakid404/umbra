@@ -11,6 +11,7 @@
 #include <sys/syscall.h>
 
 extern char **environ;
+static volatile unsigned char image_canary[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
 
 static void require(int ok, const char *phase) {
     if (!ok) {
@@ -31,6 +32,25 @@ static void marker(const char *root, const char *name, pid_t pid) {
 
 int main(int argc, char **argv) {
     require(argc >= 3, "arguments");
+    if (strcmp(argv[1], "native-canary-helper") == 0) {
+        require(argc == 4 && getpid() == (pid_t)strtol(argv[3], NULL, 10),
+                "replacement image pid");
+        for (size_t i = 0; i < sizeof(image_canary); ++i)
+            require(image_canary[i] == i + 1, "replacement image canary");
+        marker(argv[2], "records.canary", getpid());
+        return 0;
+    }
+    if (strcmp(argv[1], "native-canary-exec") == 0) {
+        struct statfs before;
+        require(statfs(argv[2], &before) == 0, "native pre-exec metadata");
+        for (size_t i = 0; i < sizeof(image_canary); ++i)
+            image_canary[i] = 0xff;
+        char pid[32];
+        snprintf(pid, sizeof(pid), "%d", getpid());
+        char *next[] = { argv[0], "native-canary-helper", argv[2], pid, NULL };
+        execve(argv[0], next, environ);
+        require(0, "native canary exec");
+    }
     if (strcmp(argv[1], "exec-child") == 0) {
         require(argc == 7, "exec arguments");
         int inherited = atoi(argv[2]), cloexec = atoi(argv[3]);

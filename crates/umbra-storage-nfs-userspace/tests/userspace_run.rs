@@ -12580,6 +12580,32 @@ fn f214_expected_metadata(run_id: RunId) -> Vec<u8> {
 }
 
 #[test]
+fn f214_native_exec_replaces_canary() {
+    let Some(root) = slate_evidence() else {
+        return;
+    };
+    let evidence = root.join("f214_native_exec_canary");
+    slate_fresh_dir(&evidence);
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(
+        scratch.path(),
+        "umbra-fix-214-statfs",
+        "UMBRA_FIX_214_STATFS_PATH",
+    );
+    let output = slate_bounded(
+        Command::new(&program)
+            .arg("native-canary-exec")
+            .arg(scratch.path()),
+        &evidence.join("native"),
+    );
+    assert!(output.status.success(), "native exec canary control");
+    let marker = std::fs::read_to_string(scratch.path().join("records.canary")).unwrap();
+    assert!(marker.trim().parse::<u32>().unwrap() > 0);
+    std::fs::write(evidence.join("replacement-image.pid"), marker).unwrap();
+    slate_finish_cleanup();
+}
+
+#[test]
 fn f214_metadata_fields() {
     f214_metadata_case("fields");
 }
