@@ -660,12 +660,6 @@ static void *thread_spawn(void *opaque) {
     }
     t->result = posix_spawn(&t->child, t->helper, NULL, &attr, args, environ);
     posix_spawnattr_destroy(&attr);
-    if (!t->result) {
-        int status;
-        pid_t got;
-        do got = waitpid(t->child, &status, 0); while (got < 0 && errno == EINTR);
-        if (got != t->child || !WIFEXITED(status) || WEXITSTATUS(status)) t->result = 3;
-    }
     return NULL;
 }
 static int threaded(const char *root, const char *helper) {
@@ -683,6 +677,11 @@ static int threaded(const char *root, const char *helper) {
     if (transfer(gate[1], "GG", 2) != 2) return 112;
     for (int i = 0; i < 2; i++)
         if (pthread_join(threads[i], NULL)) return 113;
+    /* #135: wait only after the secondary threads have exited. */
+    for (int i = 0; i < 2; i++) {
+        int status = 0;
+        if (!t[i].result && reap(t[i].child, &status)) t[i].result = 3;
+    }
     close(gate[0]); close(gate[1]);
     for (int i = 0; i < 2; i++)
         note("thread=%d signal=%d result=%d child=%d\n", i, t[i].signal, t[i].result, t[i].child);
@@ -690,28 +689,23 @@ static int threaded(const char *root, const char *helper) {
     return t[0].result || t[1].result || t[0].child == t[1].child ? 114 : 0;
 }
 
-struct null_thread_spawn { const char *helper, *root; int result; };
+struct null_thread_spawn { const char *helper, *root; int result; pid_t child; };
 static void *null_thread(void *opaque) {
     struct null_thread_spawn *t = opaque;
     char *args[] = {(char *)t->helper, "write-child", (char *)t->root, NULL};
-    pid_t child = -1;
     /* No earlier traced call on this pthread. */
-    t->result = posix_spawn(&child, t->helper, NULL, NULL, args, environ);
-    if (!t->result) {
-        int status;
-        pid_t got;
-        do got = waitpid(child, &status, 0); while (got < 0 && errno == EINTR);
-        if (got != child || !WIFEXITED(status) || WEXITSTATUS(status)) t->result = 115;
-    }
+    t->result = posix_spawn(&t->child, t->helper, NULL, NULL, args, environ);
     return NULL;
 }
 static int second_thread_null(const char *root, const char *helper) {
     pthread_t thread;
-    struct null_thread_spawn t = {helper, root, -1};
+    struct null_thread_spawn t = {helper, root, -1, -1};
     note("phase=pre-spawn mode=fix-243-thread-null\n");
     flush(root, "records.pre");
     if (pthread_create(&thread, NULL, null_thread, &t) || pthread_join(thread, NULL))
         return 116;
+    int status = 0;
+    if (!t.result && reap(t.child, &status)) t.result = 115;
     note("null-thread result=%d\n", t.result);
     flush(root, "records.done");
     return t.result ? 117 : 0;
