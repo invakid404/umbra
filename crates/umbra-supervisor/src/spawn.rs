@@ -84,9 +84,17 @@ fn validate_references(plan: &SpawnPlan, mut virtual_fd: impl FnMut(i32) -> bool
     // against the frozen table therefore also covers all earlier action effects:
     // an action cannot close a virtual slot and disguise a later collision.
     for action in &plan.actions {
+        if let Some(diagnostic) = action.unsupported_diagnostic() {
+            return Err(UmbraError::new(
+                ErrorKind::UnsupportedCapability,
+                "supervisor.spawn",
+                diagnostic,
+            ));
+        }
         let collides = match *action {
             SpawnAction::Close(fd) | SpawnAction::Inherit(fd) => virtual_fd(fd),
             SpawnAction::Dup2(source, destination) => virtual_fd(source) || virtual_fd(destination),
+            SpawnAction::Unsupported(_) => unreachable!("refused above"),
         };
         if collides {
             return Err(UmbraError::new(
@@ -102,6 +110,30 @@ fn validate_references(plan: &SpawnPlan, mut virtual_fd: impl FnMut(i32) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_action_refusals_follow_caller_order() {
+        for (actions, diagnostic) in [
+            (
+                vec![SpawnAction::Dup2(4096, 100), SpawnAction::Unsupported(5)],
+                "spawn virtual descriptor action",
+            ),
+            (
+                vec![SpawnAction::Unsupported(5), SpawnAction::Dup2(4096, 100)],
+                "spawn unsupported action CHDIR",
+            ),
+        ] {
+            let plan = SpawnPlan {
+                digest: [0; 32],
+                actions,
+                close_on_exec_default: false,
+            };
+            assert!(validate_references(&plan, |fd| fd == 4096)
+                .unwrap_err()
+                .to_string()
+                .contains(diagnostic));
+        }
+    }
 
     #[test]
     fn authorization_is_single_use_thread_bound_and_cleared_after_error() {

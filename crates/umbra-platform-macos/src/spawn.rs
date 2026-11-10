@@ -55,6 +55,15 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn require_supported(&self) -> Result<()> {
+        for action in &self.actions {
+            if let Some(diagnostic) = action.unsupported_diagnostic() {
+                return Err(unsupported(diagnostic));
+            }
+        }
+        Ok(())
+    }
+
     /// Build zero-filled, self-contained remote backing after allocation.
     /// Even the unused attribute tail is readable by the qualified kernel.
     pub(crate) fn backing(&self, address: u64) -> Result<Vec<u8>> {
@@ -204,16 +213,7 @@ pub(crate) fn decode(
                 1 => Action::Close(fd),
                 2 => Action::Dup2(fd, i32_at(record, 8)),
                 3 => Action::Inherit(fd),
-                other => {
-                    let name = match other {
-                        0 => "OPEN",
-                        4 => "FILEPORT_DUP2",
-                        5 => "CHDIR",
-                        6 => "FCHDIR",
-                        _ => return Err(unsupported(format!("spawn unsupported action {other}"))),
-                    };
-                    return Err(unsupported(format!("spawn unsupported action {name}")));
-                }
+                other => Action::Unsupported(other),
             });
             // Do not expose unused union backing or allocator slop.
             record[if tag == 2 { 12 } else { 8 }..].fill(0);
@@ -400,6 +400,8 @@ mod tests {
         ] {
             let bytes = action_plan(&[(2, 4, 1), (tag, 3, 0)]);
             assert!(actions(&bytes)
+                .unwrap()
+                .require_supported()
                 .unwrap_err()
                 .to_string()
                 .contains(&format!("spawn unsupported action {diagnostic}")));

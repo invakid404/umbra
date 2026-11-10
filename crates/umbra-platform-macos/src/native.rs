@@ -1649,6 +1649,7 @@ impl MacosTraceBackend {
         {
             return Err(error("spawn", "stale authorization"));
         }
+        pending.snapshot.require_supported()?;
         pending.authorization = Some(authorization);
         let mut address = 0;
         let allocation_task = s.task.0;

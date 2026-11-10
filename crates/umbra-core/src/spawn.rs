@@ -17,7 +17,7 @@ pub struct SpawnToken {
     pub sequence: u64,
 }
 
-/// An admitted kernel action; operands remain signed for native EBADF behavior.
+/// A captured action; unsupported opcodes retain their caller-order position.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpawnAction {
     /// Close one kernel descriptor in the child.
@@ -26,6 +26,25 @@ pub enum SpawnAction {
     Dup2(i32, i32),
     /// Explicitly retain a kernel descriptor across spawn.
     Inherit(i32),
+    /// Refused opcode retained until ordered supervisor validation.
+    Unsupported(i32),
+}
+
+impl SpawnAction {
+    /// Exact refusal for an unsupported opcode, shared by policy and execution.
+    pub fn unsupported_diagnostic(&self) -> Option<String> {
+        let Self::Unsupported(opcode) = self else {
+            return None;
+        };
+        let name = match opcode {
+            0 => "OPEN".into(),
+            4 => "FILEPORT_DUP2".into(),
+            5 => "CHDIR".into(),
+            6 => "FCHDIR".into(),
+            other => other.to_string(),
+        };
+        Some(format!("spawn unsupported action {name}"))
+    }
 }
 
 /// Immutable policy accompanying the platform's captured bytes.
