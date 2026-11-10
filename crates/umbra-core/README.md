@@ -155,11 +155,12 @@ is the load-bearing half; with only the soft limit lowered the tracee raises it
 back.
 <!-- /memoria:section -->
 
-`spawn` defines the immutable kernel-action plan and authorization token used by
-the experimental packed-spawn protocol. The token binds parent/thread identity,
-run and exec generations, request sequence, plan digest and descriptor-table
-generation. Platform validation and supervisor authorization remain separate;
-these wire types alone make no ABI portability or cleanup guarantee.
+`spawn` defines the kernel-action plan and authorization records used by the
+experimental packed-spawn protocol. `SpawnToken` identifies the parent, issuing
+thread, run and exec generations, and request sequence. `SpawnAuthorization`
+binds that token to the plan digest and descriptor-table generation. Platform
+validation and supervisor authorization remain separate; these wire types alone
+make no ABI portability or cleanup guarantee.
 
 ## Logical filesystem metadata
 
