@@ -111,7 +111,7 @@ fn decode_interpose(regs: &RegisterSet, memory: &mut dyn TraceMemory) -> Result<
         _ => {
             return Err(unsupported(format!(
                 "unknown umbra interposer operation {operation}"
-            )));
+            )))
         }
     })
 }

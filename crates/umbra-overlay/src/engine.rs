@@ -876,10 +876,10 @@ impl Overlay {
     }
     fn directory(&mut self, path: &StoragePath) -> Result<()> {
         if self.lookup(path)?.0.kind != ObjectKind::Directory {
-            return Err(
-                error(ErrorKind::InvalidPath, "path component is not a directory")
-                    .with_errno(Errno(20)),
-            );
+            return Err(error(
+                ErrorKind::InvalidPath,
+                "path component is not a directory",
+            ));
         }
         Ok(())
     }
@@ -984,8 +984,7 @@ impl Overlay {
                 b"" | b"." => {}
                 b".." => {
                     if parts.len() == logical_root.len() {
-                        return Err(error(ErrorKind::InvalidPath, "parent escapes logical root")
-                            .with_errno(Errno(13)));
+                        return Err(error(ErrorKind::InvalidPath, "parent escapes logical root"));
                     }
                     parts.pop();
                 }
@@ -1118,7 +1117,7 @@ impl Overlay {
                 return Err(error(
                     ErrorKind::CorruptJournal,
                     "conflicting logical symlink identity",
-                ));
+                ))
             }
             Some(_) => {}
             None => self.write_control(&metadata, target.as_bytes())?,
@@ -1857,7 +1856,7 @@ impl Overlay {
         let path = match self.resolve_path(context, DirRef::Cwd, &logical, false) {
             Ok(path) => path,
             Err(e) if e.kind == ErrorKind::NotFound => {
-                return Ok(Err(ResolvedAction::Deny(Errno::ENOENT)));
+                return Ok(Err(ResolvedAction::Deny(Errno::ENOENT)))
             }
             Err(e) => return Err(e),
         };
@@ -1959,7 +1958,7 @@ impl Overlay {
                 return Err(unsupported(
                     "a routed read needs a buffer binding from set_routed_request; typed \
                      read_at is available for a caller with no tracee to write into",
-                ));
+                ))
             }
         };
         let action = ResolvedAction::Emulate(EmulatedResult {
@@ -2014,7 +2013,7 @@ impl Overlay {
                 return Err(unsupported(
                     "a routed write needs its bytes from set_routed_request; FsOp::Write \
                      carries only their count",
-                ));
+                ))
             }
         };
         // The binding must describe *this* operation before anything is clamped:
@@ -2483,7 +2482,7 @@ fn absolute_components(path: &BytePath) -> Result<Vec<Vec<u8>>> {
                 return Err(error(
                     ErrorKind::InvalidPath,
                     "context anchor contains parent",
-                ));
+                ))
             }
             name => parts.push(name.to_vec()),
         }
@@ -2528,11 +2527,10 @@ impl NamespaceResolver for Overlay {
         // against, and it is `ProcessContext::fds` that holds it.
         match operation {
             FsOp::Read { fd, length, offset } => {
-                return self.resolve_routed_read(context, operation, *fd, *length, *offset, routed);
+                return self.resolve_routed_read(context, operation, *fd, *length, *offset, routed)
             }
             FsOp::Write { fd, length, offset } => {
-                return self
-                    .resolve_routed_write(context, operation, *fd, *length, *offset, routed);
+                return self.resolve_routed_write(context, operation, *fd, *length, *offset, routed)
             }
             FsOp::GetDescriptorFlags { fd } => {
                 let Some(state) = context.fds.get(fd) else {
@@ -2562,7 +2560,7 @@ impl NamespaceResolver for Overlay {
             FsOp::Fstat { fd } => return self.resolve_routed_fstat(context, operation, *fd),
             FsOp::Fchdir { fd } => return self.resolve_routed_fchdir(context, operation, *fd),
             FsOp::Chdir { dir, path } => {
-                return self.resolve_routed_chdir(context, operation, *dir, path);
+                return self.resolve_routed_chdir(context, operation, *dir, path)
             }
             _ => {}
         }
@@ -2586,7 +2584,7 @@ impl NamespaceResolver for Overlay {
             _ => {
                 return Err(unsupported(
                     "operation requires descriptor or metadata support beyond MVP",
-                ));
+                ))
             }
         };
         let readlink_buffer = if matches!(operation, FsOp::ReadLink { .. }) {
@@ -3003,7 +3001,7 @@ impl NamespaceResolver for Overlay {
                         return Err(unsupported(
                             "a routed open needs a descriptor from set_routed_request; this \
                              backend has no kernel path for a rewrite to target",
-                        ));
+                        ))
                     }
                 };
                 if descriptor.0 < 0 {
@@ -3740,7 +3738,7 @@ impl NamespaceSession for Overlay {
                                     return Err(error(
                                         ErrorKind::ProtocolMismatch,
                                         "storage answered a truncate with something else",
-                                    ));
+                                    ))
                                 }
                             }
                         }
@@ -3951,7 +3949,7 @@ impl NamespaceSession for Overlay {
                             return Err(error(
                                 ErrorKind::ProtocolMismatch,
                                 "storage answered a set_metadata with something else",
-                            ));
+                            ))
                         }
                     }
                 }

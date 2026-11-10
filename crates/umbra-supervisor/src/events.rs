@@ -404,9 +404,8 @@ impl Supervisor {
                 renew_at: &mut self.renew_at,
                 interval: self.budget.as_ref().map(|b| b.renew_after),
             };
-            self.platform.abi.decode_entry(&registers, &mut memory)
+            self.platform.abi.decode_entry(&registers, &mut memory)?
         };
-        let operation = operation?;
         // `None` is a positively classified non-filesystem call, never an unknown
         // syscall: the decoder errors on anything it cannot classify.
         let Some(operation) = operation else {
@@ -619,7 +618,7 @@ impl Supervisor {
                         ErrorKind::ProtocolMismatch,
                         "supervisor.directory",
                         "the ABI reported no output buffer for a directory read",
-                    ));
+                    ))
                 }
             },
             _ => self.directory.clear()?,
@@ -1021,13 +1020,13 @@ impl Supervisor {
                     ErrorKind::ProtocolMismatch,
                     "supervisor.directory",
                     "the ABI reported no attribute request block for a directory read",
-                ));
+                ))
             }
             Err(e) => {
                 return match e.errno {
                     Some(errno) => Ok(Some(errno)),
                     None => Err(e),
-                };
+                }
             }
         };
         if block.length as usize != umbra_platform::dirents::ATTRLIST_BYTES {
@@ -1332,14 +1331,14 @@ impl Supervisor {
                     ErrorKind::InvalidState,
                     "supervisor.routed_stat",
                     format!("a refused stat buffer ({errno:?}) reached the emulated answer"),
-                ));
+                ))
             }
             None => {
                 return Err(error(
                     ErrorKind::ProtocolMismatch,
                     "supervisor.routed_stat",
                     "the ABI decoded an fstat but reports no output buffer for it",
-                ));
+                ))
             }
         };
         // The encoding and the buffer are produced by the same ABI from the same
@@ -1406,7 +1405,7 @@ impl Supervisor {
                         "supervisor.routing",
                         "the namespace emulated a chdir without resolving a working \
                          directory for it",
-                    ));
+                    ))
                 }
             },
             _ => return Ok(()),

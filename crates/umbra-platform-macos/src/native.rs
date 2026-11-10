@@ -59,22 +59,17 @@ impl Task {
         let mut size = 0;
         // SAFETY: out owns exactly the requested writable bytes; Mach validates remote addresses.
         unsafe {
-            let result = mach_vm_read_overwrite(
-                self.0,
-                address,
-                out.len() as u64,
-                out.as_mut_ptr() as u64,
-                &mut size,
-            );
-            if result == mach2::kern_return::KERN_INVALID_ADDRESS
-                || result == mach2::kern_return::KERN_PROTECTION_FAILURE
-            {
-                return Err(
-                    error("mach_vm_read", "inaccessible input").with_errno(umbra_core::Errno(14))
-                );
-            }
-            mach(result, "mach_vm_read")
-                .map_err(|e| error("mach_vm_read", format!("{address:#x}/{}: {e}", out.len())))?;
+            mach(
+                mach_vm_read_overwrite(
+                    self.0,
+                    address,
+                    out.len() as u64,
+                    out.as_mut_ptr() as u64,
+                    &mut size,
+                ),
+                "mach_vm_read",
+            )
+            .map_err(|e| error("mach_vm_read", format!("{address:#x}/{}: {e}", out.len())))?;
         }
         if size != out.len() as u64 {
             return Err(error("mach_vm_read", "short read"));
