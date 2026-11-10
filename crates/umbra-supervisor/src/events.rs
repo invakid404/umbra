@@ -2024,6 +2024,65 @@ mod tests {
         s
     }
 
+    fn poisoned_spawn_event(arm: u8) {
+        let mut s = supervisor();
+        let token = SpawnToken {
+            run_generation: 1,
+            parent: task(1),
+            exec_generation: s.state.processes.processes[&task(1)]
+                .context
+                .exec_generation,
+            thread: ThreadId(TaskIdentity {
+                native_id: 2,
+                generation: 1,
+            }),
+            sequence: 1,
+        };
+        let plan = SpawnPlan {
+            digest: [42; 32],
+            actions: vec![],
+            close_on_exec_default: false,
+        };
+        let event = if arm == 0 {
+            TraceEvent::SpawnPrepare { token, plan }
+        } else {
+            let authorization = s
+                .spawns
+                .prepare(token, plan, &s.state.processes.processes[&task(1)].context)
+                .unwrap();
+            if arm == 1 {
+                TraceEvent::SpawnAbort { authorization }
+            } else {
+                TraceEvent::SpawnChild {
+                    authorization,
+                    child: ProcessHandle(task(3)),
+                }
+            }
+        };
+        s.poisoned = true;
+        let error = s.handle_event(event).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to resume a poisoned run"),
+            "{error}"
+        );
+        assert!(s.is_poisoned());
+    }
+
+    #[test]
+    fn poisoned_spawn_prepare_refuses_resume() {
+        poisoned_spawn_event(0);
+    }
+    #[test]
+    fn poisoned_spawn_abort_refuses_resume() {
+        poisoned_spawn_event(1);
+    }
+    #[test]
+    fn poisoned_spawn_child_refuses_resume() {
+        poisoned_spawn_event(2);
+    }
+
     #[test]
     fn spawn_prepare_registers_first_stop_like_main_thread() {
         for previously_registered in [true, false] {
