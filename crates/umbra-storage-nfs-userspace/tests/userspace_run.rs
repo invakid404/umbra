@@ -10794,6 +10794,20 @@ fn fix_243_refuses_fchdir() {
     fix_243_refusal("fix-243-refuse-fchdir", "spawn unsupported action FCHDIR");
 }
 #[test]
+fn fix_243_refuses_virtual_before_chdir() {
+    fix_243_refusal(
+        "fix-243-refuse-virtual-before-chdir",
+        "spawn virtual descriptor action",
+    );
+}
+#[test]
+fn fix_243_refuses_chdir_before_virtual() {
+    fix_243_refusal(
+        "fix-243-refuse-chdir-before-virtual",
+        "spawn unsupported action CHDIR",
+    );
+}
+#[test]
 fn fix_243_refuses_virtual_source() {
     fix_243_refusal(
         "fix-243-refuse-virtual-source",

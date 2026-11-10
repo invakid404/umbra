@@ -612,6 +612,18 @@ static int refused_plan(const char *mode, const char *root, const char *helper) 
         fd = open(root, O_RDONLY | O_DIRECTORY);
         if (fd < 0) return 101;
         rc = posix_spawn_file_actions_addfchdir_np(&actions, fd);
+    } else if (!strcmp(mode, "fix-243-refuse-virtual-before-chdir") ||
+               !strcmp(mode, "fix-243-refuse-chdir-before-virtual")) {
+        path_in(path, sizeof path, root, "victim.txt");
+        fd = open(path, O_CREAT | O_RDWR | O_EXCL, 0600);
+        if (fd < 0 || transfer(fd, "SEED", 4) != 4) return 102;
+        if (!strcmp(mode, "fix-243-refuse-virtual-before-chdir")) {
+            rc = posix_spawn_file_actions_adddup2(&actions, fd, 100);
+            if (!rc) rc = posix_spawn_file_actions_addchdir_np(&actions, root);
+        } else {
+            rc = posix_spawn_file_actions_addchdir_np(&actions, root);
+            if (!rc) rc = posix_spawn_file_actions_adddup2(&actions, fd, 100);
+        }
     } else if (!strcmp(mode, "fix-243-refuse-virtual-source") ||
                !strcmp(mode, "fix-243-refuse-virtual-destination")) {
         path_in(path, sizeof path, root, "victim.txt");
