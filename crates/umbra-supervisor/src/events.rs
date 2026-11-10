@@ -1873,6 +1873,9 @@ mod tests {
         fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
             unreachable!()
         }
+        fn copyout_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            panic!("unexpected syscall copyout in this test")
+        }
         fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
             unreachable!()
         }
@@ -2010,6 +2013,9 @@ mod tests {
         }
         fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
             unreachable!()
+        }
+        fn copyout_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            panic!("unexpected syscall copyout in this test")
         }
         fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
             unreachable!()
@@ -3242,6 +3248,9 @@ mod tests {
         }
         fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
             unreachable!()
+        }
+        fn copyout_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            panic!("unexpected syscall copyout in this test")
         }
         fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
             unreachable!()

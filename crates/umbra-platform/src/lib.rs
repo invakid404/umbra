@@ -60,8 +60,12 @@ pub trait TraceBackend {
     fn write_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()>;
     /// Copy a syscall result respecting target memory protections.
     /// Inaccessible output is EFAULT; transport or task failures remain fatal.
-    fn copyout_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()> {
-        self.write_memory(task, address, bytes)
+    fn copyout_memory(&mut self, _task: TaskId, _address: u64, _bytes: &[u8]) -> Result<()> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "trace.copyout_memory",
+            "this backend has no protection-respecting syscall copyout",
+        ))
     }
 
     /// Read bounded, architecture-tagged registers from a stopped thread.
