@@ -332,7 +332,6 @@ pub const TRACED_STUBS: &[(&str, u64, Delivery)] = &[
     ("mkdir", 136, Delivery::Namespace),
     ("fstat", 339, Delivery::Namespace),
     ("__fstat", 189, Delivery::Namespace),
-    ("statfs", 345, Delivery::Namespace),
     ("fstatfs", 346, Delivery::Namespace),
     ("setattrlistat", 524, Delivery::Namespace),
     ("getattrlistbulk", 461, Delivery::Namespace),
@@ -1015,14 +1014,6 @@ impl SyscallAbi for DarwinArm64Abi {
             189 | 339 => FsOp::Fstat {
                 fd: TracedFd(get(regs, 0)? as i32),
             },
-            345 => FsOp::StatFs {
-                dir: DirRef::Cwd,
-                path: read_path(memory, get(regs, 0)?).map_err(|mut e| {
-                    e.operation = "statfs.path".to_owned();
-                    e
-                })?,
-                follow: true,
-            },
             346 => FsOp::FstatFs {
                 fd: TracedFd(get(regs, 0)? as i32),
             },
@@ -1238,7 +1229,7 @@ impl SyscallAbi for DarwinArm64Abi {
         encode_filesystem_metadata(metadata)
     }
     fn io_buffer(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>> {
-        if matches!(get(regs, 16)?, 345 | 346) {
+        if get(regs, 16)? == 346 {
             // Preserve even invalid addresses until lookup and provider reply
             // have completed: those errors take precedence over copyout.
             return Ok(Some(IoBuffer {

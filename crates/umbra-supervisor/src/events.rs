@@ -406,16 +406,7 @@ impl Supervisor {
             };
             self.platform.abi.decode_entry(&registers, &mut memory)
         };
-        let operation = match operation {
-            Ok(operation) => operation,
-            Err(e)
-                if e.operation == "statfs.path"
-                    && matches!(e.errno, Some(umbra_core::Errno(14) | umbra_core::Errno(63))) =>
-            {
-                return self.deny_to_tracee(thread, &mut registers, e.errno.unwrap());
-            }
-            Err(e) => return Err(e),
-        };
+        let operation = operation?;
         // `None` is a positively classified non-filesystem call, never an unknown
         // syscall: the decoder errors on anything it cannot classify.
         let Some(operation) = operation else {
@@ -426,7 +417,7 @@ impl Supervisor {
             umbra_overlay::Dispatch::Materialise | umbra_overlay::Dispatch::Whiteout
         );
         let context = self.process(task)?.context.clone();
-        if matches!(operation, FsOp::StatFs { .. } | FsOp::FstatFs { .. }) {
+        if matches!(operation, FsOp::FstatFs { .. }) {
             return self.filesystem_query(task, thread, &mut registers, &context, &operation);
         }
         // **The descriptor fence, applied to the one descriptor-relative call
