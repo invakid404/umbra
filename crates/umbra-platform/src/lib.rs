@@ -268,3 +268,54 @@ const _: Option<&dyn TraceMemory> = None;
 /// Versioned provider protocol, server harness and trait proxies.
 #[cfg(unix)]
 pub mod provider;
+
+#[cfg(test)]
+mod copyout_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct DebuggerOnly {
+        writes: usize,
+    }
+
+    impl TraceBackend for DebuggerOnly {
+        fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
+            unreachable!()
+        }
+        fn next_event(&mut self) -> Result<TraceEvent> {
+            unreachable!()
+        }
+        fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            self.writes += 1;
+            Ok(())
+        }
+        fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
+            unreachable!()
+        }
+        fn set_registers(&mut self, _: ThreadId, _: &RegisterSet) -> Result<()> {
+            unreachable!()
+        }
+        fn resume(&mut self, _: ResumeCommand) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn default_copyout_refuses_without_debugger_write() {
+        let mut backend = DebuggerOnly::default();
+        let task = TaskId(umbra_core::TaskIdentity {
+            native_id: 1,
+            generation: 1,
+        });
+        // Establish that debugger writes work, but cannot confer copyout support.
+        backend.write_memory(task, 0x1000, &[7]).unwrap();
+        assert_eq!(backend.writes, 1);
+        let error = backend.copyout_memory(task, 0x1000, &[9]).unwrap_err();
+        assert_eq!(error.kind, umbra_core::ErrorKind::UnsupportedCapability);
+        assert_eq!(error.operation, "trace.copyout_memory");
+        assert_eq!(backend.writes, 1);
+    }
+}
