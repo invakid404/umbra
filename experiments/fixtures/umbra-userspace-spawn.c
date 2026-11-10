@@ -711,9 +711,44 @@ static int second_thread_null(const char *root, const char *helper) {
     return t.result ? 117 : 0;
 }
 
+static int region_cycles(const char *root, const char *helper) {
+    unsetenv("UMBRA_SLATE_SIGNAL_DIR");
+    note("phase=pre-spawn mode=fix-243-region-cycles\n");
+    flush(root, "records.pre");
+    for (int i = 0; i < 8; i++) {
+        posix_spawnattr_t attr;
+        posix_spawn_file_actions_t bad;
+        sigset_t mask;
+        sigemptyset(&mask);
+        int signal = i % 2 ? SIGUSR2 : SIGUSR1;
+        sigaddset(&mask, signal);
+        if (posix_spawnattr_init(&attr) || posix_spawnattr_setsigmask(&attr, &mask) ||
+            posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK) ||
+            posix_spawn_file_actions_init(&bad)) return 120;
+        close(200);
+        if (posix_spawn_file_actions_adddup2(&bad, 200, 100)) return 121;
+        char signal_arg[16];
+        snprintf(signal_arg, sizeof signal_arg, "%d", signal);
+        char *args[] = {(char *)helper, "fix-243-thread-mask", signal_arg, NULL};
+        pid_t child = -1;
+        int result = posix_spawn(&child, helper, &bad, &attr, args, environ);
+        if (result != EBADF) return 122;
+        result = posix_spawn(&child, helper, NULL, &attr, args, environ);
+        if (result) return 123;
+        int status = 0;
+        if (reap(child, &status)) return 124;
+        posix_spawn_file_actions_destroy(&bad);
+        posix_spawnattr_destroy(&attr);
+        note("cycle=%d error=EBADF success=0\n", i);
+    }
+    flush(root, "records.done");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
+    if (!strcmp(mode, "fix-243-region-cycles")) return region_cycles(root, helper);
     if (!strcmp(mode, "fix-243-thread-null")) return second_thread_null(root, helper);
     if (!strcmp(mode, "fix-243-threads")) return threaded(root, helper);
     if (!strncmp(mode, "fix-243-refuse-", 15)) return refused_plan(mode, root, helper);

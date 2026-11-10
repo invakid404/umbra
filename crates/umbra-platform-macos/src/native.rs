@@ -1766,6 +1766,8 @@ impl MacosTraceBackend {
             self.probe_spawn_completion(index, "remote-free-failed")?;
             return Err(unsupported("spawn snapshot release failed"));
         }
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        crate::spawn_probe::released_mapping(s.task.0, authorization.token, region);
         let pending = s.spawn.as_mut().unwrap();
         pending.region = None;
         let mut regs = pending.returned.take().unwrap();

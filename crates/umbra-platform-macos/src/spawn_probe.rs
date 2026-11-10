@@ -6,6 +6,43 @@ use std::{
 };
 use umbra_core::Result;
 
+pub(crate) fn released_mapping(task: u32, token: umbra_core::SpawnToken, start: u64) {
+    if std::env::var_os("UMBRA_FIX_243_REGION_TRACE").is_none() {
+        return;
+    }
+    use mach2::vm_region::{vm_region_basic_info_64, VM_REGION_BASIC_INFO_64};
+    let mut address = start;
+    let mut size = 0;
+    let mut object = 0;
+    // SAFETY: initialized output storage with the advertised region-info count.
+    let result = unsafe {
+        let mut info: vm_region_basic_info_64 = std::mem::zeroed();
+        let mut count = vm_region_basic_info_64::count();
+        let result = mach2::vm::mach_vm_region(
+            task,
+            &mut address,
+            &mut size,
+            VM_REGION_BASIC_INFO_64,
+            (&mut info as *mut vm_region_basic_info_64).cast(),
+            &mut count,
+            &mut object,
+        );
+        if object != 0 {
+            mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), object);
+        }
+        result
+    };
+    eprintln!(
+        "spawn-mapping {}",
+        serde_json::json!({
+            "parent": token.parent, "sequence": token.sequence, "start": start,
+            "query_result": result, "next_address": address, "next_size": size,
+            "absent": result == mach2::kern_return::KERN_INVALID_ADDRESS ||
+                (result == 0 && address >= start + crate::spawn::REGION_BYTES as u64),
+        })
+    );
+}
+
 /// Observation only: no rendezvous, scheduling change, or production build code.
 /// Parent identity is part of the mapping key: equal virtual addresses in two
 /// different tasks do not denote shared backing.

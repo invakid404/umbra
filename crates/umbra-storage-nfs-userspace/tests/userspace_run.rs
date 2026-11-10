@@ -10441,6 +10441,75 @@ fn fix_243_second_thread_null_spawn() {
     slate_finish_cleanup();
 }
 
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_region_success_error_cycles() {
+    let Some(mut spawn) = slate_spawn("fix-243-region-cycles") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-region-cycles");
+    assert!(native.status.success(), "native: {}", native.status);
+    assert_eq!(
+        std::fs::read_to_string(root.join("records.done"))
+            .unwrap()
+            .matches("success=0")
+            .count(),
+        8
+    );
+    spawn
+        .provider_environment
+        .push(("UMBRA_FIX_243_REGION_TRACE".into(), "1".into()));
+    let routed = slate_spawn_routed(&spawn, "fix-243-region-cycles", &[]);
+    assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+    assert_eq!(routed.text("records.done").matches("success=0").count(), 8);
+    let mut active = None;
+    let mut released = None;
+    let mut releases = 0;
+    let mut mappings = 0;
+    for line in routed.run.stderr.lines() {
+        if let Some(json) = line.strip_prefix("spawn-region ") {
+            let record: serde_json::Value = serde_json::from_str(json).unwrap();
+            let key = (
+                record["parent"].clone(),
+                record["sequence"].clone(),
+                record["address"].clone(),
+            );
+            assert_eq!(record["bytes"], 81920);
+            assert_eq!(record["result"], 0);
+            match record["event"].as_str().unwrap() {
+                "allocated" => {
+                    assert!(active.replace(key).is_none());
+                    assert!(released.is_none());
+                }
+                "release-result" => {
+                    assert_eq!(active.take(), Some(key.clone()));
+                    released = Some(key);
+                    releases += 1;
+                }
+                other => panic!("unexpected region event {other}"),
+            }
+        } else if let Some(json) = line.strip_prefix("spawn-mapping ") {
+            let record: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                released.take(),
+                Some((
+                    record["parent"].clone(),
+                    record["sequence"].clone(),
+                    record["start"].clone()
+                ))
+            );
+            assert_eq!(record["absent"], true, "{record}");
+            mappings += 1;
+        }
+    }
+    assert!(active.is_none() && released.is_none());
+    assert_eq!(releases, 16);
+    assert_eq!(mappings, 16);
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
 #[test]
 fn fix_243_same_parent_threads() {
     let Some(spawn) = slate_spawn("fix-243-threads") else {
