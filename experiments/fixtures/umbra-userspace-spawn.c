@@ -745,9 +745,48 @@ static int region_cycles(const char *root, const char *helper) {
     return 0;
 }
 
+static int overlap_parents(const char *root, const char *helper) {
+    unsetenv("UMBRA_SLATE_SIGNAL_DIR");
+    note("phase=pre-spawn mode=fix-243-overlap\n");
+    flush(root, "records.pre");
+    pid_t parents[2];
+    for (int i = 0; i < 2; i++) {
+        parents[i] = fork();
+        if (parents[i] < 0) return 125;
+        if (!parents[i]) {
+            posix_spawnattr_t attr;
+            sigset_t mask;
+            sigemptyset(&mask);
+            int signal = i ? SIGUSR2 : SIGUSR1;
+            sigaddset(&mask, signal);
+            if (posix_spawnattr_init(&attr) ||
+                posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK) ||
+                posix_spawnattr_setsigmask(&attr, &mask)) _exit(126);
+            char value[16];
+            snprintf(value, sizeof value, "%d", signal);
+            char *args[] = {(char *)helper, "fix-243-thread-mask", value, NULL};
+            pid_t child;
+            if (posix_spawn(&child, helper, NULL, &attr, args, environ)) _exit(127);
+            int status = 0;
+            pid_t got;
+            do got = waitpid(child, &status, 0); while (got < 0 && errno == EINTR);
+            posix_spawnattr_destroy(&attr);
+            _exit(got == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 128);
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        int status = 0;
+        if (reap(parents[i], &status)) return 129;
+    }
+    note("overlap parents=2 completed=2\n");
+    flush(root, "records.done");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
+    if (!strcmp(mode, "fix-243-overlap")) return overlap_parents(root, helper);
     if (!strcmp(mode, "fix-243-region-cycles")) return region_cycles(root, helper);
     if (!strcmp(mode, "fix-243-thread-null")) return second_thread_null(root, helper);
     if (!strcmp(mode, "fix-243-threads")) return threaded(root, helper);

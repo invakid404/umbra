@@ -1676,7 +1676,44 @@ impl MacosTraceBackend {
         set(&mut regs, 0, address + 400)?;
         set(&mut regs, 2, address)?;
         s.set_regs(authorization.token.thread, &regs)?;
-        s.return_stop(authorization.token.thread, ReturnKind::PackedSpawn)
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if let Ok(count) = std::env::var("UMBRA_FIX_243_OVERLAP_PARENTS") {
+            let count: usize = count
+                .parse()
+                .map_err(|_| error("spawn probe", "bad overlap count"))?;
+            if !(2..=17).contains(&count) {
+                return Err(error("spawn probe", "overlap count outside test bound"));
+            }
+            // Keep these parents stopped before kernel execution, while the
+            // ordinary event loop continues other independently running tasks.
+            let held: Vec<_> = self
+                .sessions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    let p = s.spawn.as_ref()?;
+                    (p.region.is_some() && p.returned.is_none() && s.pending.is_empty())
+                        .then_some((i, p.token.thread))
+                })
+                .collect();
+            if held.len() < count {
+                return Ok(());
+            }
+            for (i, thread) in held {
+                let p = self.sessions[i].spawn.as_ref().unwrap();
+                let address = p.region.unwrap();
+                let expected = p.snapshot.backing(address)?;
+                let mut actual = vec![0; expected.len()];
+                self.sessions[i].task.read(address, &mut actual)?;
+                if actual != expected {
+                    return Err(error("spawn probe", "overlapping backing changed"));
+                }
+                crate::spawn_probe::region("overlap-verified", p.token, address, 0);
+                self.sessions[i].return_stop(thread, ReturnKind::PackedSpawn)?;
+            }
+            return Ok(());
+        }
+        self.sessions[index].return_stop(authorization.token.thread, ReturnKind::PackedSpawn)
     }
 
     #[cfg(feature = "mutation-probe-spawn-lifecycle")]

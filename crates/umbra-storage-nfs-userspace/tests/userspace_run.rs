@@ -10443,6 +10443,62 @@ fn fix_243_second_thread_null_spawn() {
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
+fn fix_243_distinct_parent_backing_overlap() {
+    let Some(mut spawn) = slate_spawn("fix-243-overlap") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-overlap");
+    assert!(native.status.success(), "native: {}", native.status);
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("completed=2"));
+    spawn.provider_environment.extend([
+        ("UMBRA_FIX_243_REGION_TRACE".into(), "1".into()),
+        ("UMBRA_FIX_243_OVERLAP_PARENTS".into(), "2".into()),
+    ]);
+    let routed = slate_spawn_routed(&spawn, "fix-243-overlap", &[]);
+    assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+    assert!(routed.text("records.done").contains("completed=2"));
+    let mut active = std::collections::BTreeSet::new();
+    let mut peak = 0;
+    let mut verified = 0;
+    let mut absent = 0;
+    for line in routed.run.stderr.lines() {
+        if let Some(json) = line.strip_prefix("spawn-region ") {
+            let r: serde_json::Value = serde_json::from_str(json).unwrap();
+            let key = (r["parent"].to_string(), r["sequence"].to_string());
+            match r["event"].as_str().unwrap() {
+                "allocated" => {
+                    assert!(active.insert(key));
+                    peak = peak.max(active.len());
+                }
+                "overlap-verified" => {
+                    assert!(active.contains(&key));
+                    verified += 1;
+                }
+                "release-result" => {
+                    assert_eq!(r["result"], 0);
+                    assert!(active.remove(&key));
+                }
+                _ => panic!("unknown region event"),
+            }
+        } else if let Some(json) = line.strip_prefix("spawn-mapping ") {
+            let r: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(r["absent"], true);
+            absent += 1;
+        }
+    }
+    assert_eq!(peak, 2);
+    assert_eq!(verified, 2);
+    assert_eq!(absent, 2);
+    assert!(active.is_empty());
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
 fn fix_243_region_success_error_cycles() {
     let Some(mut spawn) = slate_spawn("fix-243-region-cycles") else {
         return;
