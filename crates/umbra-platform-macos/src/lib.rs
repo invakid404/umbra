@@ -1,5 +1,6 @@
 //! Experimental Darwin arm64 tracer; see README for qualification limits.
 pub mod abi;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 mod spawn;
 pub use abi::DarwinArm64Abi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
