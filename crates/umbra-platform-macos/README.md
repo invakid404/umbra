@@ -56,8 +56,9 @@ secondary thread remains refused by the inherited `WaitPlan::Park` guard
 fixtures therefore reap on the main thread after joining the spawning threads.
 
 Lifecycle probes are compiled only with `mutation-probe-spawn-lifecycle`.
-The semantic readings do not certify the full fault matrix, which remains
-under qualification. Normal provider builds exclude the probes.
+Fault tests cover the selected ownership, completion and cleanup boundaries;
+semantic readings alone do not certify them. Normal provider builds exclude
+the probes.
 
 The feature exposes these test controls; normal builds do not read them:
 
