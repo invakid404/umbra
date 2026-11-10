@@ -300,5 +300,7 @@ qualification outside launchd's session. The caller supplies
 relay and guardian records. Build it with `cargo build -p
 umbra-storage-nfs-userspace --features mutation-probe-spawn-lifecycle --example
 umbra243relay`. The guardian fault cases require a COMPLETE sweep, independent
-child-identity disappearance and CLEAN cleanup without harness kills. These
-cases await live qualification; a COMPLETE sweep alone does not establish reap.
+child-identity disappearance and CLEAN cleanup without harness kills. Retained local
+readings passed the provider-loss, unregistered-child, copyout-failure and
+free-failure guardian cases. CI selects all four with
+`mutation-probe-spawn-lifecycle`; a COMPLETE sweep alone does not establish reap.
