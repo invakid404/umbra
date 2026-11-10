@@ -1221,6 +1221,46 @@ mod tests {
     use serde::de::value::{Error as ValueError, SeqDeserializer};
 
     #[test]
+    fn f214_descriptor_binding_serialization_preserves_authority() {
+        let binding = FilesystemBinding::overlay(RunId(uuid::Uuid::from_u128(17)));
+        let state = FdState {
+            filesystem: Some(binding.clone()),
+            object: ObjectId(uuid::Uuid::from_u128(23)),
+            logical_path: Some(BytePath::new(b"/removed".to_vec()).unwrap()),
+            directory: false,
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+            offset: 41,
+        };
+        let mut wire = serde_json::to_value(&state).unwrap();
+        let inherited: FdState = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(inherited, state);
+        assert_eq!(
+            inherited.filesystem.unwrap().metadata().unwrap(),
+            binding.metadata().unwrap()
+        );
+
+        // Old serialized descriptors must not acquire invented authority.
+        wire.as_object_mut().unwrap().remove("filesystem");
+        let legacy: FdState = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(legacy.filesystem, None);
+        assert_eq!(legacy.object, state.object);
+        assert_eq!(legacy.offset, state.offset);
+
+        wire["filesystem"] = serde_json::json!({
+            "run": binding.run,
+            "filesystem": "unknown-version"
+        });
+        let corrupt: FdState = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            corrupt.filesystem.unwrap().metadata().unwrap_err().kind,
+            ErrorKind::ProtocolMismatch
+        );
+    }
+
+    #[test]
     fn byte_paths_preserve_non_utf8_and_unresolved_components() {
         let bytes = b"../\xff/./file".to_vec();
         let path = BytePath::new(bytes.clone()).unwrap();
