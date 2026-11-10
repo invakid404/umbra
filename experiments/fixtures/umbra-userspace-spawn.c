@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -636,9 +637,63 @@ static int refused_plan(const char *mode, const char *root, const char *helper) 
     return failed ? 105 : 0;
 }
 
+struct spawn_thread {
+    const char *helper;
+    int gate, signal, result;
+    pid_t child;
+};
+static void *thread_spawn(void *opaque) {
+    struct spawn_thread *t = opaque;
+    char token;
+    if (read(t->gate, &token, 1) != 1) { t->result = 1; return NULL; }
+    posix_spawnattr_t attr;
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, t->signal);
+    char signal_arg[16];
+    snprintf(signal_arg, sizeof signal_arg, "%d", t->signal);
+    char *args[] = {(char *)t->helper, "fix-243-thread-mask", signal_arg, NULL};
+    if (posix_spawnattr_init(&attr) ||
+        posix_spawnattr_setsigmask(&attr, &mask) ||
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK)) {
+        t->result = 2; return NULL;
+    }
+    t->result = posix_spawn(&t->child, t->helper, NULL, &attr, args, environ);
+    posix_spawnattr_destroy(&attr);
+    if (!t->result) {
+        int status;
+        pid_t got;
+        do got = waitpid(t->child, &status, 0); while (got < 0 && errno == EINTR);
+        if (got != t->child || !WIFEXITED(status) || WEXITSTATUS(status)) t->result = 3;
+    }
+    return NULL;
+}
+static int threaded(const char *root, const char *helper) {
+    unsetenv("UMBRA_SLATE_SIGNAL_DIR");
+    int gate[2];
+    if (pipe(gate)) return 110;
+    struct spawn_thread t[2] = {
+        {helper, gate[0], SIGUSR1, -1, -1}, {helper, gate[0], SIGUSR2, -1, -1}
+    };
+    pthread_t threads[2];
+    note("phase=pre-spawn mode=fix-243-threads\n");
+    flush(root, "records.pre");
+    for (int i = 0; i < 2; i++)
+        if (pthread_create(&threads[i], NULL, thread_spawn, &t[i])) return 111;
+    if (transfer(gate[1], "GG", 2) != 2) return 112;
+    for (int i = 0; i < 2; i++)
+        if (pthread_join(threads[i], NULL)) return 113;
+    close(gate[0]); close(gate[1]);
+    for (int i = 0; i < 2; i++)
+        note("thread=%d signal=%d result=%d child=%d\n", i, t[i].signal, t[i].result, t[i].child);
+    flush(root, "records.done");
+    return t[0].result || t[1].result || t[0].child == t[1].child ? 114 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
+    if (!strcmp(mode, "fix-243-threads")) return threaded(root, helper);
     if (!strncmp(mode, "fix-243-refuse-", 15)) return refused_plan(mode, root, helper);
     if (!strcmp(mode, "fix-243-pipe") || !strcmp(mode, "fix-243-cloexec") ||
         !strcmp(mode, "fix-243-error-recovery"))

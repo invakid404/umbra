@@ -10422,6 +10422,23 @@ fn fix_243_kernel_pipe_actions() {
 }
 
 #[test]
+fn fix_243_same_parent_threads() {
+    let Some(spawn) = slate_spawn("fix-243-threads") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-threads");
+    assert!(native.status.success(), "native: {}", native.status);
+    let native_done = std::fs::read_to_string(root.join("records.done")).unwrap();
+    assert_eq!(native_done.matches("result=0").count(), 2);
+    let routed = slate_spawn_routed(&spawn, "fix-243-threads", &[]);
+    assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+    assert_eq!(routed.text("records.done").matches("result=0").count(), 2);
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
 fn fix_243_cloexec_default_prunes_logical_descriptors() {
     fix_243_pipe("fix-243-cloexec");
 }

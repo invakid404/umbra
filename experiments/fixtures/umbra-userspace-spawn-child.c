@@ -216,6 +216,13 @@ static int race_write(const char *root, int output, int go, int ready) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "fix-243-thread-mask")) {
+        sigset_t mask;
+        int expected = atoi(argv[2]);
+        if (sigprocmask(SIG_BLOCK, NULL, &mask)) return 90;
+        return sigismember(&mask, SIGUSR1) == (expected == SIGUSR1) &&
+            sigismember(&mask, SIGUSR2) == (expected == SIGUSR2) ? 0 : 91;
+    }
     if (argc < 3) return 2;
     const char *mode = argv[1], *root = argv[2];
     if (!strcmp(mode, "fix-243-pipe") && argc == 5) {
