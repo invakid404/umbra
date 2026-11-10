@@ -271,6 +271,6 @@ requests Launch.
 ## Filesystem metadata fixture
 
 `umbra-fix-214-statfs.c` drives the `f214_` userspace tests. Native controls
-check host syscall relationships; routed results are compared byte-for-byte
-with the virtual filesystem contract. Fork/exec phase markers use retained
+check host syscall relationships; routed descriptor results are compared
+byte-for-byte with the virtual filesystem contract. Path `statfs` remains native. Fork/exec phase markers use retained
 files because routed stdout is not an observation channel.

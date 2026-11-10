@@ -8666,6 +8666,7 @@ fn descriptor_flags_use_only_the_live_descriptor_table() {
         f.process.fds.insert(
             fd,
             FdState {
+                filesystem: None,
                 object,
                 logical_path: None,
                 directory: false,
