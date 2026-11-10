@@ -2246,13 +2246,25 @@ mod tests {
 
     /// A routed budget with a deliberately tiny fence, so the range can be
     /// exhausted in a test rather than only in principle.
-    struct FilesystemFault(u8);
+    struct FilesystemFault(
+        u8,
+        Option<std::sync::Arc<std::sync::Mutex<Vec<(bool, String)>>>>,
+    );
     impl NamespaceResolver for FilesystemFault {
         fn resolve(&mut self, _: &ProcessContext, _: &FsOp) -> Result<ResolvedAction> {
             unreachable!()
         }
     }
     impl NamespaceSession for FilesystemFault {
+        fn fail_run(&mut self, request: &FailedRunRequest) -> Result<()> {
+            self.1
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .push((request.tree_terminated, request.reason.clone()));
+            Ok(())
+        }
         fn filesystem_metadata_capabilities(&self) -> &'static [&'static str] {
             &[umbra_core::capabilities::NAMESPACE_FILESYSTEM_METADATA_V1]
         }
@@ -2550,7 +2562,7 @@ mod tests {
         let memory = Arc::new(Mutex::new(vec![0; 2168]));
         s.platform.control = Box::new(Canary(memory.clone()));
         s.platform.abi = Box::new(Canary(memory.clone()));
-        s.namespace = Box::new(FilesystemFault(0));
+        s.namespace = Box::new(FilesystemFault(0, None));
         let binding = FilesystemBinding::overlay(s.state.run_id);
         let token = FilesystemQueryToken {
             request: 1,
@@ -2637,8 +2649,9 @@ mod tests {
         for fault in 0..7 {
             let mut s = supervisor();
             s.budget = Some(routed_budget(8));
-            s.namespace = Box::new(FilesystemFault(fault));
-            s.platform.abi = Box::new(FilesystemFault(fault));
+            let cleanup = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            s.namespace = Box::new(FilesystemFault(fault, Some(cleanup.clone())));
+            s.platform.abi = Box::new(FilesystemFault(fault, None));
             let mut fd = bound_fd(b"/gone");
             fd.filesystem = Some(FilesystemBinding::overlay(s.state.run_id));
             s.process_mut(task(1))
@@ -2700,6 +2713,10 @@ mod tests {
                     .unwrap(),
             };
             assert!(s.filesystem_queries.finish(&late, 0).is_none());
+            let reason = failure.to_string();
+            let returned = crate::run::finish_supervision(s, Err(failure), &mut None).unwrap_err();
+            assert_eq!(returned.to_string(), reason);
+            assert_eq!(*cleanup.lock().unwrap(), vec![(true, reason)]);
         }
     }
 
