@@ -1213,6 +1213,16 @@ impl Supervisor {
                 return self.deny_to_tracee(thread, registers, errno);
             }
         };
+        self.complete_filesystem_query(task, thread, registers, reply)
+    }
+
+    fn complete_filesystem_query(
+        &mut self,
+        task: TaskId,
+        thread: ThreadId,
+        registers: &mut umbra_core::RegisterSet,
+        reply: umbra_core::FilesystemReply,
+    ) -> Result<()> {
         let generation = self.process(task)?.context.exec_generation;
         let buffer = self
             .filesystem_queries
@@ -2252,6 +2262,9 @@ mod tests {
         }
     }
     impl NamespaceSession for FilesystemFault {
+        fn filesystem_metadata_capabilities(&self) -> &'static [&'static str] {
+            &[umbra_core::capabilities::NAMESPACE_FILESYSTEM_METADATA_V1]
+        }
         fn filesystem_metadata(
             &mut self,
             context: &ProcessContext,
@@ -2459,6 +2472,120 @@ mod tests {
             0x2000
         );
         assert_eq!(s.ofds.references((task(1), fd)), Some(1));
+    }
+
+    #[test]
+    fn f214_exec_cancels_delayed_completion_before_replacement_copyout() {
+        use std::sync::{Arc, Mutex};
+
+        struct Canary(Arc<Mutex<Vec<u8>>>);
+        impl TraceBackend for Canary {
+            fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
+                unreachable!()
+            }
+            fn next_event(&mut self) -> Result<TraceEvent> {
+                unreachable!()
+            }
+            fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
+                unreachable!()
+            }
+            fn write_memory(&mut self, _: TaskId, address: u64, bytes: &[u8]) -> Result<()> {
+                assert_eq!(address, 0x1000);
+                self.0.lock().unwrap()[..bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            }
+            fn copyout_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()> {
+                self.write_memory(task, address, bytes)
+            }
+            fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
+                unreachable!()
+            }
+            fn set_registers(&mut self, _: ThreadId, _: &RegisterSet) -> Result<()> {
+                Ok(())
+            }
+            fn resume(&mut self, _: ResumeCommand) -> Result<()> {
+                Ok(())
+            }
+        }
+        impl TraceControl for Canary {
+            fn capabilities(&self) -> PlatformCapabilities {
+                PlatformCapabilities::default()
+            }
+            fn quiesce(&mut self, _: ProcessHandle) -> Result<QuiescedTree> {
+                unreachable!()
+            }
+            fn terminate(&mut self, _: ProcessHandle, _: TerminationPolicy) -> Result<()> {
+                Ok(())
+            }
+        }
+        impl SyscallAbi for Canary {
+            fn decode_entry(
+                &self,
+                _: &RegisterSet,
+                _: &mut dyn TraceMemory,
+            ) -> Result<Option<FsOp>> {
+                unreachable!()
+            }
+            fn apply_rewrite(&self, _: &mut RegisterSet, _: &PreparedRewrite) -> Result<()> {
+                unreachable!()
+            }
+            fn encode_filesystem_metadata(&self, _: &FilesystemMetadata) -> Result<Vec<u8>> {
+                Ok(vec![0x55; 2168])
+            }
+            fn emulate_result(&self, _: &mut RegisterSet, _: &EmulatedResult) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut s = supervisor();
+        let memory = Arc::new(Mutex::new(vec![0; 2168]));
+        s.platform.control = Box::new(Canary(memory.clone()));
+        s.platform.abi = Box::new(Canary(memory.clone()));
+        s.namespace = Box::new(FilesystemFault(0));
+        let binding = FilesystemBinding::overlay(s.state.run_id);
+        let token = FilesystemQueryToken {
+            request: 1,
+            task: task(1),
+            thread: ThreadId(task(1).0),
+            image_generation: 0,
+            stop_generation: 1,
+        };
+        assert!(s
+            .filesystem_queries
+            .begin(crate::filesystem::PendingFilesystem {
+                token: token.clone(),
+                binding: binding.clone(),
+                output: IoBuffer {
+                    address: 0x1000,
+                    length: 2168
+                },
+            }));
+        let (release, paused) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            paused.recv_timeout(Duration::from_secs(10)).unwrap();
+            FilesystemReply {
+                token,
+                metadata: binding.metadata().unwrap(),
+            }
+        });
+        s.handle_event(TraceEvent::Exec {
+            task: task(1),
+            thread: ThreadId(task(1).0),
+            exec_generation: 1,
+        })
+        .unwrap();
+        // The replacement image deliberately reuses the old virtual address.
+        // Its memory backend accepts writes, so a stale copyout changes this.
+        memory.lock().unwrap().fill(0xa7);
+        release.send(()).unwrap();
+        let reply = responder.join().unwrap();
+        let mut registers = RegisterSet::new(Architecture::Aarch64, vec![0; 272]).unwrap();
+        let error = s
+            .complete_filesystem_query(task(1), ThreadId(task(1).0), &mut registers, reply)
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::ProtocolMismatch);
+        assert_eq!(error.context, "stale or mismatched reply");
+        assert_eq!(*memory.lock().unwrap(), vec![0xa7; 2168]);
     }
 
     #[test]
