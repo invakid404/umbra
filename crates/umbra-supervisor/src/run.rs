@@ -122,6 +122,15 @@ pub enum RunLaunch {
 /// to read one. It reports; it cannot ask.
 pub trait RunObserver {
     /// Called once, after preparation succeeds and before the target launches.
+    ///
+    /// Returning `Err` aborts before launch through failure cleanup with
+    /// `tree_terminated=true`, because no target has launched. A caught unwind
+    /// panic becomes `InvalidState` with operation `run.observer`; its payload
+    /// is leaked to avoid a second panic during destruction. This containment
+    /// does not apply to `panic=abort`.
+    ///
+    /// Neither `finished` nor `teardown_warning` is called after `prepared`
+    /// fails. Panics in those other callbacks are not contained.
     fn prepared(&mut self, run_id: RunId) -> Result<()>;
     /// Called once when the supervised tree has finished, before teardown result.
     fn finished(&mut self, outcome: &RunOutcome);

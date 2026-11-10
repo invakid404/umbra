@@ -483,6 +483,11 @@ __attribute__((used, noinline)) static int umbra_getfd(int fd) {
     return (int)umbra_finish(value, failed);
 }
 
+_Static_assert(UMBRA_ARM_MAGIC == 0x554d425241524d31ULL,
+               "fcntl shim immediates must match UMBRA_ARM_MAGIC");
+_Static_assert(offsetof(struct umbra_control, floor) == 8,
+               "fcntl shim floor load must match the control layout");
+
 /* Darwin arm64 variadic arguments can live in the caller's stack area.
  * Passthrough therefore tail-branches without touching SP, LR, x0-x8 or
  * vector registers. Only caller-scratch x9-x11 and condition flags change.
