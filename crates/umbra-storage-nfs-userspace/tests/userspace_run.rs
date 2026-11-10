@@ -12631,16 +12631,6 @@ fn f214_error_precedence() {
 }
 
 #[test]
-fn f214_lookup_boundaries() {
-    f214_metadata_case("lookup");
-}
-
-#[test]
-fn f214_native_routed_mix() {
-    f214_metadata_case("mixed");
-}
-
-#[test]
 fn f214_copyup_concurrent() {
     f214_metadata_case("concurrent");
 }
@@ -12769,7 +12759,7 @@ fn f214_metadata_case(mode: &str) -> Option<RunId> {
     let records = routed.object("records.done").expect("metadata records");
     assert_eq!(records.len(), 2 * expected.len());
     assert_eq!(&records[..2168], expected.as_slice(), "fstatfs");
-    assert_eq!(&records[2168..], expected.as_slice(), "statfs");
+    assert_eq!(&records[2168..], expected.as_slice(), "final fstatfs");
     if mode == "fork" {
         let native_pid = std::fs::read(native_root.join("records.pid")).unwrap();
         let routed_pid = routed

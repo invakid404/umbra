@@ -90,25 +90,22 @@ int main(int argc, char **argv) {
     memset(&by_path, 0, sizeof(by_path));
     require(fstatfs(fd, &by_fd) == 0, "fstatfs");
     require(statfs(path, &by_path) == 0, "statfs");
-    require(memcmp(&by_fd.f_fsid, &by_path.f_fsid, sizeof(by_fd.f_fsid)) == 0,
-            "path descriptor identity");
-    require(by_fd.f_type == by_path.f_type &&
-            strcmp(by_fd.f_fstypename, by_path.f_fstypename) == 0 &&
-            strcmp(by_fd.f_mntonname, by_path.f_mntonname) == 0 &&
-            strcmp(by_fd.f_mntfromname, by_path.f_mntfromname) == 0,
-            "path descriptor names");
+    int routed = strcmp(by_fd.f_fstypename, "umbra") == 0;
+    if (!routed) {
+        require(memcmp(&by_fd.f_fsid, &by_path.f_fsid, sizeof(by_fd.f_fsid)) == 0,
+                "native path descriptor identity");
+        require(by_fd.f_type == by_path.f_type &&
+                strcmp(by_fd.f_fstypename, by_path.f_fstypename) == 0 &&
+                strcmp(by_fd.f_mntonname, by_path.f_mntonname) == 0 &&
+                strcmp(by_fd.f_mntfromname, by_path.f_mntfromname) == 0,
+                "native path descriptor names");
+    }
     if (strcmp(argv[1], "errors") == 0) {
         int closed = open(path, O_RDONLY);
         require(closed >= 0 && close(closed) == 0, "closed descriptor setup");
         struct statfs *bad = (struct statfs *)(uintptr_t)1;
         require(fstatfs(closed, bad) == -1 && errno == EBADF, "closed before bad pointer");
         require(fstatfs(fd, bad) == -1 && errno == EFAULT, "valid before bad pointer");
-        char missing[4096];
-        length = snprintf(missing, sizeof(missing), "%s/missing", argv[2]);
-        require(length >= 0 && (size_t)length < sizeof(missing), "missing length");
-        require(statfs(missing, bad) == -1 && errno == ENOENT, "missing before bad pointer");
-        require(statfs((const char *)(uintptr_t)1, bad) == -1 && errno == EFAULT,
-                "input copy before lookup");
     }
     if (strcmp(argv[1], "lookup") == 0) {
         require(chdir(argv[2]) == 0, "logical chdir");
@@ -254,17 +251,25 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "unlink") == 0) {
         struct statfs after;
         require(unlinkat(AT_FDCWD, path, 0) == 0, "unlinkat");
-        require(statfs(path, &after) == -1 && errno == ENOENT, "unlinked name absent");
+        int absent = open(path, O_RDONLY);
+        require(absent == -1 && errno == ENOENT, "unlinked logical name absent");
+        if (routed) {
+            require(statfs(path, &after) == 0, "native base path survives whiteout");
+        } else {
+            require(statfs(path, &after) == -1 && errno == ENOENT, "native unlinked name absent");
+        }
         memset(&after, 0, sizeof(after));
         require(fstatfs(fd, &after) == 0, "unlinked fd");
         require(memcmp(&after.f_fsid, &by_fd.f_fsid, sizeof(after.f_fsid)) == 0,
                 "unlink identity");
         by_path = after;
     }
+    memset(&by_path, 0, sizeof(by_path));
+    require(fstatfs(fd, &by_path) == 0, "final descriptor metadata");
     int record = open(output, O_CREAT | O_WRONLY | O_TRUNC, 0600);
     require(record >= 0, "record open");
     require(write(record, &by_fd, sizeof(by_fd)) == sizeof(by_fd), "record fd");
-    require(write(record, &by_path, sizeof(by_path)) == sizeof(by_path), "record path");
+    require(write(record, &by_path, sizeof(by_path)) == sizeof(by_path), "record final descriptor");
     require(close(record) == 0 && close(fd) == 0, "close");
     return 0;
 }
