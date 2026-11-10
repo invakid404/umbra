@@ -31,6 +31,11 @@ parent's logical descriptor table. Actions touching virtual descriptors, path
 actions, RESETIDS, SETSID, SETPGROUP and other unadmitted extensions fail closed.
 The full Codex E8 launch remains blocked, including its SETSID request.
 
+After structural and attribute validation, unsupported opcodes retain their
+positions in the captured plan. The supervisor selects the first unsupported
+opcode or virtual operand in caller order; the platform independently rejects
+unsupported actions before allocation or kernel execution.
+
 Admission is restricted to the exact ABI profile checked in `src/spawn.rs`
 and `src/spawn_host.rs`; it is not a portability claim. Broader admission is
 tracked in [#247](https://github.com/invakid404/umbra/issues/247). After a macOS

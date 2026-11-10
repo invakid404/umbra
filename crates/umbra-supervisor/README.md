@@ -397,7 +397,9 @@ does not hide host mounts.
 
 The experimental macOS packed-spawn path prepares a single-use token bound to
 the run, parent, thread, exec generation, request sequence and immutable plan.
-The supervisor rejects file-action operands in the virtual descriptor table.
+The supervisor checks actions in caller order: the first unsupported opcode or
+operand in the virtual descriptor table supplies the refusal. Structural and
+attribute validation still precede these checks in the platform.
 Before Ready it applies the child's logical inheritance policy, retaining
 shared open file descriptions and pruning close-on-exec descriptors (or all
 logical descriptors for CLOEXEC_DEFAULT). A kernel error consumes the pending

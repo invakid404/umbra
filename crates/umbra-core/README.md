@@ -161,6 +161,9 @@ thread, run and exec generations, and request sequence. `SpawnAuthorization`
 binds that token to the plan digest and descriptor-table generation. Platform
 validation and supervisor authorization remain separate; these wire types alone
 make no ABI portability or cleanup guarantee.
+`SpawnAction::Unsupported` retains an opcode's position until the supervisor
+can compare it with virtual operands in caller order. It never authorizes that
+opcode; the platform also rejects it before kernel execution.
 
 ## Logical filesystem metadata
 
