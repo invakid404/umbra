@@ -13767,6 +13767,9 @@ fn f214_native_mount_identity_preserved() {
         scratch,
         helper: program.clone(),
         program,
+        provider_environment: Vec::new(),
+        platform_timeout_ms: None,
+        guardian: false,
     };
     let native_root = spawn.scratch.path().join("native");
     std::fs::create_dir(&native_root).unwrap();
@@ -13814,6 +13817,9 @@ fn f214_metadata_case(mode: &str) -> Option<RunId> {
         scratch,
         helper: program.clone(),
         program,
+        provider_environment: Vec::new(),
+        platform_timeout_ms: None,
+        guardian: false,
     };
     let native_root = spawn.scratch.path().join("native");
     std::fs::create_dir(&native_root).unwrap();

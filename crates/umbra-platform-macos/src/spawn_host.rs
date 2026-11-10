@@ -10,7 +10,7 @@ unsafe extern "C" {
     fn _dyld_image_count() -> u32;
     fn _dyld_get_image_name(index: u32) -> *const libc::c_char;
     fn _dyld_get_image_header(index: u32) -> *const u8;
-    fn CC_SHA256(data: *const libc::c_void, len: u32, out: *mut u8) -> *mut u8;
+    fn CC_SHA256(data: *const u8, len: u32, out: *mut u8) -> *mut u8;
 }
 
 fn mismatch() -> umbra_core::UmbraError {
@@ -150,7 +150,7 @@ pub(crate) fn digest(bytes: &[u8]) -> Result<[u8; 32]> {
     let length = u32::try_from(bytes.len()).map_err(|_| mismatch())?;
     let mut result = [0; 32];
     // SAFETY: both buffers cover their advertised lengths; CommonCrypto writes 32 bytes.
-    if unsafe { CC_SHA256(bytes.as_ptr().cast(), length, result.as_mut_ptr()) }.is_null() {
+    if unsafe { CC_SHA256(bytes.as_ptr(), length, result.as_mut_ptr()) }.is_null() {
         return Err(mismatch());
     }
     Ok(result)
