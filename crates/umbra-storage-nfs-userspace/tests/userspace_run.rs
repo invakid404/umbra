@@ -12695,7 +12695,10 @@ fn f214_native_mount_identity_preserved() {
     let native_rows = identity_rows(std::str::from_utf8(&native.stderr).unwrap());
     let routed_rows = identity_rows(&routed.run.stderr);
     assert_eq!(native_rows.len(), 3, "native mount identity table");
-    assert_eq!(routed_rows, native_rows, "base native mount view must survive routing");
+    assert_eq!(
+        routed_rows, native_rows,
+        "base native mount view must survive routing"
+    );
 }
 
 fn f214_metadata_case(mode: &str) -> Option<RunId> {
