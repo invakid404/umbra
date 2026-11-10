@@ -2025,6 +2025,48 @@ mod tests {
         s.state.lifecycle = RunLifecycle::Running;
         s
     }
+
+    #[test]
+    fn spawn_prepare_registers_first_stop_like_main_thread() {
+        for previously_registered in [true, false] {
+            let mut s = supervisor();
+            let thread = ThreadId(TaskIdentity {
+                native_id: 2,
+                generation: 1,
+            });
+            if previously_registered {
+                s.track_thread(task(1), thread, StopReason::Launch).unwrap();
+            }
+            let token = SpawnToken {
+                run_generation: 1,
+                parent: task(1),
+                exec_generation: s.state.processes.processes[&task(1)]
+                    .context
+                    .exec_generation,
+                thread,
+                sequence: 1,
+            };
+            let plan = SpawnPlan {
+                digest: [42; 32],
+                actions: vec![],
+                close_on_exec_default: false,
+            };
+            s.dispatch(TraceEvent::SpawnPrepare {
+                token,
+                plan: plan.clone(),
+            })
+            .unwrap_or_else(|e| panic!("previously_registered={previously_registered}: {e}"));
+            let authorization = SpawnAuthorization {
+                token,
+                digest: plan.digest,
+                table_generation: 1,
+            };
+            assert_eq!(s.spawns.plan(authorization).unwrap(), &plan);
+            assert!(s.state.processes.processes[&task(1)]
+                .threads
+                .contains_key(&thread));
+        }
+    }
     /// A platform double whose `directory_request` and tracee memory are the
     /// test's to choose, so `unserved_directory_request` can be driven over
     /// every exit it has.
