@@ -102,7 +102,7 @@ The staged order is fixed, and each stage's failure decides what may be released
    writer identity and epoch, rejecting a non-fresh recovery state for CreateNew.
    A **routed** run -- storage with no kernel-visible path -- instead journals
    under `RunSpec::state_root`, and mints a nonce into both the store's
-   `control/journal-id` and a file beside the log. See *Routed runs*.
+   `control/journal-id` and the log’s first record. See *Routed runs*.
 5. Bind the namespace over those already-open sessions, handing it the lease so
    one owner renews, releases and mutates.
 6. Render enforcement from the run's own root, re-verify the workspace inventory,
@@ -315,7 +315,7 @@ optional.** A writer `journal.open` against an existing-but-empty directory
 establishes a *fresh* log; a fresh log has nothing pending, so `Overlay::bind`
 does not poison and `requires_recovery()` would answer `false` for a run that may
 have crashed mid-transaction. `run` therefore mints a journal-instance nonce into
-the store *and* beside the log, and `resume` requires them to match before it
+the store *and* the log’s first record, and `resume` requires them to match before it
 opens anything. Missing or mismatched is a structured refusal naming the missing
 evidence -- a third outcome beside `recovery_required: true` and `false`, and the
 reason `false` always means "classified, and no reconciliation is required".

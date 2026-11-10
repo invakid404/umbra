@@ -1116,20 +1116,9 @@ impl Supervisor {
         Ok(Err(umbra_core::Errno(24)))
     }
 
-    /// Answer the stopped tracee with an errno and resume it, executing nothing.
-    ///
-    /// The backend must **skip** the trapped syscall, not merely rewrite its
-    /// return registers. On Darwin arm64 the entry stop is the `svc` itself and
-    /// `emulate_result` steps PC past it; a backend that cannot do this (the
-    /// Linux stub's `emulate_result` returns an error) fails closed here rather
-    /// than resuming the call it was told to refuse.
-    ///
-    /// One function rather than two copies, because there are two places a
-    /// refusal is decided: `resolve` answering `Deny`, and the entry path
-    /// finding that a binding the *tracee's own request* made impossible -- a
-    /// null `struct stat` pointer -- must be answered rather than raised. Both
-    /// reach the tracee the same way, and a second copy of this sequence is the
-    /// shape that produced the `intercept()`/`install()` drift.
+    /// Capture a routed descriptor's immutable filesystem binding and retain its
+    /// output buffer until a validated reply is ready. Native descriptors resume
+    /// their original syscall; descriptor errors precede output validation.
     fn filesystem_query(
         &mut self,
         task: TaskId,
@@ -1275,6 +1264,8 @@ impl Supervisor {
         self.resume_thread(thread)
     }
 
+    /// Answer an errno without executing the trapped syscall. The ABI must skip
+    /// the trap before the thread resumes; replacing registers alone is insufficient.
     fn deny_to_tracee(
         &mut self,
         thread: ThreadId,
