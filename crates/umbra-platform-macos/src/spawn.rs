@@ -431,6 +431,21 @@ mod tests {
     }
 
     #[test]
+    fn extension_pointers_are_refused_without_dereferencing_them() {
+        for pair in 2..9 {
+            let mut descriptor = [0; DESCRIPTOR_BYTES];
+            descriptor[pair * 16..pair * 16 + 8].copy_from_slice(&16u64.to_le_bytes());
+            descriptor[pair * 16 + 8..pair * 16 + 16].copy_from_slice(&0x5000u64.to_le_bytes());
+            assert!(
+                decode(&descriptor, |_, _| panic!("extension must not be read"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("spawn unsupported extension")
+            );
+        }
+    }
+
+    #[test]
     fn backing_contains_all_kernel_reads_and_only_owned_pointers() {
         let snapshot = actions(&action_plan(&[(2, 4, 1)])).unwrap();
         let base = 0x100000;
