@@ -10533,6 +10533,12 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
         return;
     };
     spawn.guardian = case.starts_with("fix-243-guardian-");
+    let loss_after_failure = case.ends_with("-failure-loss");
+    if loss_after_failure {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_PROBE_AFTER_FAILURE".into(), "1".into()));
+    }
     let (root, native) = slate_spawn_native(&spawn, mode);
     assert!(native.status.success());
     if !root_probe {
@@ -10545,6 +10551,8 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
     }
     let phase = match case {
         "fix-243-guardian-unregistered" => "unregistered",
+        "fix-243-guardian-copyout-failure-loss" => "caller-copyout",
+        "fix-243-guardian-free-failure-loss" => "remote-free",
         "fix-243-copyout-error" => "caller-copyout",
         "fix-243-free-error" => "remote-free",
         "fix-243-register-error" => "register-commit",
@@ -10652,7 +10660,41 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
             std::fs::write(evidence.join("policy-ready.txt"), policy).unwrap();
             policy_stream.write_all(&[command]).unwrap();
         } else {
-            stream.write_all(&[command]).unwrap();
+            stream
+                .write_all(&[if loss_after_failure { b'E' } else { command }])
+                .unwrap();
+            if loss_after_failure {
+                assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 15000) }, 1);
+                let (mut failed, _) = listener.accept().unwrap();
+                failed
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(failed.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                std::fs::write(evidence.join("failed-owner.json"), &line).unwrap();
+                let retained: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(retained["phase"], format!("{phase}-failed"));
+                for key in [
+                    "child",
+                    "start_sec",
+                    "start_usec",
+                    "provider",
+                    "watchdog_registered",
+                    "session_inserted",
+                    "parent_stopped",
+                    "child_stopped",
+                    "region_owned",
+                ] {
+                    assert_eq!(retained[key], record[key], "{key}");
+                }
+                let current = slate_process(child)
+                    .unwrap()
+                    .expect("child retained after failure");
+                assert_eq!(current.start, observed.start);
+                failed.write_all(b"P").unwrap();
+            }
         }
         observed
     });
@@ -15877,5 +15919,27 @@ fn fix_243_guardian_unregistered() {
         "c11-02-attributes",
         false,
         b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_guardian_copyout_failure_loss() {
+    fix_243_fault_reading(
+        "fix-243-guardian-copyout-failure-loss",
+        "c11-02-attributes",
+        false,
+        b'P',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_guardian_free_failure_loss() {
+    fix_243_fault_reading(
+        "fix-243-guardian-free-failure-loss",
+        "c11-02-attributes",
+        false,
+        b'P',
     );
 }

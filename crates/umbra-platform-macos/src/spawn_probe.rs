@@ -29,7 +29,11 @@ pub(crate) fn rendezvous(
 ) -> Result<bool> {
     let selected =
         std::env::var("UMBRA_FIX_243_PROBE_PHASE").unwrap_or_else(|_| "task-acquired".into());
-    if selected != phase && !(selected == "policy-ready" && phase == "inserted") {
+    if selected != phase
+        && !(selected == "policy-ready" && phase == "inserted")
+        && !(std::env::var_os("UMBRA_FIX_243_PROBE_AFTER_FAILURE").is_some()
+            && phase == format!("{selected}-failed"))
+    {
         return Ok(false);
     }
     let Some(socket) = std::env::var_os("UMBRA_FIX_243_PROBE_SOCKET") else {

@@ -1732,9 +1732,14 @@ impl MacosTraceBackend {
                 } else {
                     caller
                 };
-                self.sessions[index]
+                if self.sessions[index]
                     .write(caller, &pid.to_le_bytes())
-                    .map_err(|_| unsupported("spawn caller PID delivery failed"))?;
+                    .is_err()
+                {
+                    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                    self.probe_spawn_completion(index, "caller-copyout-failed")?;
+                    return Err(unsupported("spawn caller PID delivery failed"));
+                }
             }
         }
         #[cfg(feature = "mutation-probe-spawn-lifecycle")]
@@ -1753,6 +1758,8 @@ impl MacosTraceBackend {
         let result =
             unsafe { mach2::vm::mach_vm_deallocate(task_port, region, spawn::REGION_BYTES as u64) };
         if result != 0 {
+            #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+            self.probe_spawn_completion(index, "remote-free-failed")?;
             return Err(unsupported("spawn snapshot release failed"));
         }
         let pending = s.spawn.as_mut().unwrap();
