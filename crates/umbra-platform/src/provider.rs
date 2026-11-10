@@ -129,6 +129,8 @@ pub enum Response {
     /// bytes are an ABI encoding of metadata and were never in the tracee, and
     /// a shared variant would let one answer the other's request.
     EncodedStat(Vec<u8>),
+    /// Encoded filesystem metadata, distinct from file-stat and memory replies.
+    EncodedFilesystemMetadata(Vec<u8>),
     /// Prepared.
     Prepared(PreparedRewrite),
 }
@@ -380,7 +382,7 @@ impl SyscallAbi for Abi {
             &self.client,
             &Request::EncodeFilesystemMetadata(metadata.clone()),
         )? {
-            Response::EncodedStat(bytes) if bytes.len() == 2168 => Ok(bytes),
+            Response::EncodedFilesystemMetadata(bytes) if bytes.len() == 2168 => Ok(bytes),
             _ => Err(protocol_error(
                 "platform.encode_filesystem_metadata response",
             )),
@@ -596,7 +598,7 @@ fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> R
                 Request::EncodeFilesystemMetadata(metadata) => platform
                     .abi
                     .encode_filesystem_metadata(&metadata)
-                    .map(Response::EncodedStat),
+                    .map(Response::EncodedFilesystemMetadata),
                 Request::Rewrite { mut regs, rewrite } => platform
                     .abi
                     .apply_rewrite(&mut regs, &rewrite)
