@@ -569,7 +569,11 @@ and runs one post-kill barrier inside the 250 ms tracer reap:
 - **Still unconfirmed:** `Terminate` returns the warning as its error, and the
   run is left recovery-required.
 
-Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome.
+Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome, or
+`UMBRA_RSP_LOG` to log sent packets and received bytes to stderr. Both are off
+when unset and enabled by any value. `UMBRA_DEBUGSERVER` overrides debugger
+discovery when `Options.debugserver` is absent; `HOME` supplies the default
+twin and interposer cache roots when `Options.twin_cache` is absent.
 
 The timeout path is still reachable by ordinary failure paths, not only abnormal
 ones. A session whose debugserver neither confirms the exit nor answers `k`
@@ -1004,6 +1008,11 @@ no local mount, read-only mount or durability property is claimed. Numeric
 conversion overflow returns EOVERFLOW; names must fit without truncation.
 Output addresses are retained without probing until lookup and provider
 validation complete. Invalid output then returns EFAULT.
+Copyout uses Mach writes that respect the destination's protection, separately
+from debugger writes used for instrumentation. The macOS-only unit test
+`f214_encoding_bounds` checks undefined fields, reserved bytes, numeric overflow,
+oversized names and invalid binding versions; live descriptor controls are in
+the userspace storage integration suite.
 
 Descriptor `fstatfs` reports synthetic run identity, including on routed directory
 descriptors. Path `statfs` reports the host view and can fail for an overlay-only
