@@ -265,6 +265,9 @@ jobs:
           cargo test -p umbra-cli --test run_fixtures --test resume_cli -- --nocapture --test-threads=1
           cargo test -p umbra-supervisor --test reopen -- --nocapture --test-threads=1
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo update --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml \
+            -p umbra-platform -p umbra-core -p umbra-journal -p umbra-journal-file -p umbra-storage -p umbra-storage-local
+          git diff --stat -- experiments/fixtures/umbra-fix-227-observer-providers/Cargo.lock
           cargo build --locked --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           cargo test -p umbra-supervisor --test observer_failure -- --nocapture --test-threads=1
       # #193: this runner's jobs run in launchd's session (SID 1), the one place
