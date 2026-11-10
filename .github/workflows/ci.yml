@@ -565,6 +565,9 @@ jobs:
           echo "UMBRA_FIX_227_FDFLAGS_PATH=$GITHUB_WORKSPACE/target/debug/umbra-fix-227-fdflags" >> "$GITHUB_ENV"
           echo "UMBRA_FIX_227_NATIVE_PATH=$GITHUB_WORKSPACE/target/debug/umbra-fix-227-native-fcntl" >> "$GITHUB_ENV"
           echo "UMBRA_FIX_227_LOCK_PATH=$GITHUB_WORKSPACE/target/debug/umbra-fix-227-lock-progress" >> "$GITHUB_ENV"
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build -p umbra-platform-macos --bins
+          test "$(find "$GITHUB_WORKSPACE/target/debug/build" -path '*/out/libumbra_interpose.dylib' | wc -l | tr -d ' ')" -eq 1
           interposer=$(find "$GITHUB_WORKSPACE/target/debug/build" -path '*/out/libumbra_interpose.dylib' -print | head -n 1)
           test -n "$interposer"
           echo "UMBRA_FIX_227_INTERPOSER_PATH=$interposer" >> "$GITHUB_ENV"
