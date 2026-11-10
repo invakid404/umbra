@@ -995,8 +995,8 @@ namespace provider cannot yet own a run.
 ## Filesystem metadata queries
 
 The namespace advertises `namespace-filesystem-metadata-v1` through
-`filesystem_metadata_capabilities`. `filesystem_metadata` follows logical
-paths through the existing resolver. Descriptor queries instead use the
+`filesystem_metadata_capabilities`. `filesystem_metadata` accepts descriptor
+queries only and uses the
 immutable filesystem binding captured at open, so removing a pathname does
 not invalidate filesystem metadata. This does not repair the separate
 pathname-dependent descriptor byte-I/O limitation.
@@ -1011,4 +1011,4 @@ Routed rename still returns ENOTSUP. Live tests separately verify descriptor
 metadata after successful unlink and after an exact rename refusal with an
 unchanged namespace. A deterministic namespace test renames the backing
 namespace directly and verifies the retained descriptor binding, old-path
-ENOENT and new-path metadata. It does not claim live routed rename support.
+absence and the new backing-file contents. It does not claim live routed rename support.

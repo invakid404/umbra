@@ -345,15 +345,6 @@ pub enum MapFlags {
 /// Decoders must reject unclassified potential mutations, never treat them as reads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FsOp {
-    /// Query the composed filesystem containing a logical path.
-    StatFs {
-        /// Directory for relative lookup.
-        dir: DirRef,
-        /// Logical path.
-        path: BytePath,
-        /// Whether to follow the final symlink.
-        follow: bool,
-    },
     /// Query the filesystem captured by an open descriptor.
     FstatFs {
         /// Descriptor; lookup must precede output-buffer validation.

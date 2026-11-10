@@ -8,8 +8,8 @@
 //! Construction performs no I/O. [`run`] owns the staged composition of one
 //! command run: validate, connect storage, open the run, take the writer lease,
 //! open the journal, bind the namespace, render enforcement, launch stopped, drive
-//! events, then tear down in order. Checkpoint, resume and recovery remain
-//! unimplemented and say so.
+//! events, then tear down in order. Resume reopens and classifies existing state;
+//! checkpoint publication and recovery reconciliation remain unimplemented.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

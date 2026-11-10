@@ -8713,11 +8713,24 @@ fn f214_delayed_metadata_reply_keeps_binding_across_copyup() {
     let mut f = Fixture::new(&[(b"dir/seed.txt", b"base bytes")]);
     let path = StoragePath::new(StorageAnchor::Root, b"dir/seed.txt".to_vec()).unwrap();
     let original_object = f.overlay.lookup(&path).unwrap().0.object_id;
-    let query = FsOp::StatFs {
-        dir: DirRef::Cwd,
-        path: bytes(b"dir/seed.txt"),
-        follow: true,
-    };
+    let fd = TracedFd(4096);
+    f.process.fds.insert(
+        fd,
+        FdState {
+            filesystem: Some(umbra_core::FilesystemBinding::overlay(
+                f.overlay.config().unwrap().context.run_id,
+            )),
+            object: original_object,
+            logical_path: Some(bytes(b"dir/seed.txt")),
+            directory: false,
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+            offset: 0,
+        },
+    );
+    let query = FsOp::FstatFs { fd };
     let token = umbra_core::FilesystemQueryToken {
         request: 1,
         task: f.process.task,
@@ -8725,7 +8738,7 @@ fn f214_delayed_metadata_reply_keeps_binding_across_copyup() {
         image_generation: f.process.exec_generation,
         stop_generation: 1,
     };
-    // The namespace has resolved the path and captured the response. Hold its
+    // The namespace has captured the descriptor response. Hold its
     // delivery while another operation changes the object's backing layer.
     let captured = f
         .overlay
@@ -8827,19 +8840,7 @@ fn f214_descriptor_binding_survives_namespace_removal() {
     assert_eq!(response.metadata, binding.metadata().unwrap());
     assert_eq!(response.token, token);
     assert_eq!(f.process.fds[&fd].offset, 7);
-    let missing = f
-        .overlay
-        .filesystem_metadata(
-            &f.process,
-            &FsOp::StatFs {
-                dir: DirRef::Cwd,
-                path: bytes(b"dir/seed.txt"),
-                follow: true,
-            },
-            token.clone(),
-        )
-        .unwrap();
-    assert_eq!(missing, Err(Errno(2)));
+    assert!(!f.base_root.join("dir/seed.txt").exists());
     f.process.fds.get_mut(&fd).unwrap().filesystem = None;
     assert_eq!(
         f.overlay
@@ -8898,82 +8899,11 @@ fn f214_retained_binding_survives_external_namespace_rename() {
     assert_eq!(response.metadata, binding.metadata().unwrap());
     assert_eq!(response.token, token);
     assert_eq!(f.process.fds[&fd].offset, 7);
-    let missing = f
-        .overlay
-        .filesystem_metadata(
-            &f.process,
-            &FsOp::StatFs {
-                dir: DirRef::Cwd,
-                path: bytes(b"dir/seed.txt"),
-                follow: true,
-            },
-            token.clone(),
-        )
-        .unwrap();
-    assert_eq!(missing, Err(Errno(2)));
-    let moved = f
-        .overlay
-        .filesystem_metadata(
-            &f.process,
-            &FsOp::StatFs {
-                dir: DirRef::Cwd,
-                path: bytes(b"moved/seed.txt"),
-                follow: true,
-            },
-            token,
-        )
-        .unwrap()
-        .unwrap();
-    assert_eq!(moved.metadata, binding.metadata().unwrap());
-}
-
-#[test]
-fn f214_lookup_boundaries() {
-    let mut f = Fixture::new(&[(b"dir/file", b"content")]);
-    f.run(&symlink(b"alias", b"dir/file"));
-    f.run(&symlink(b"dangling", b"absent"));
-    f.run(&symlink(b"loop", b"loop"));
-    let token = umbra_core::FilesystemQueryToken {
-        request: 1,
-        task: f.process.task,
-        thread: ThreadId(f.process.task.0),
-        image_generation: f.process.exec_generation,
-        stop_generation: 1,
-    };
-    let mut query = |name: &[u8]| {
-        f.overlay
-            .filesystem_metadata(
-                &f.process,
-                &FsOp::StatFs {
-                    dir: DirRef::Cwd,
-                    path: bytes(name),
-                    follow: true,
-                },
-                token.clone(),
-            )
-            .unwrap()
-    };
-    let file = query(b"dir/file").unwrap();
-    assert_eq!(query(b"alias").unwrap().metadata, file.metadata);
-    assert_eq!(query(b"dangling"), Err(Errno(2)));
-    assert_eq!(query(b"loop"), Err(Errno(62)));
-    assert_eq!(query(b"dir/file/child"), Err(Errno(20)));
-    assert_eq!(query(b"../outside"), Err(Errno(13)));
-    f.process.cwd = bytes(b"/dir");
-    let relative = f
-        .overlay
-        .filesystem_metadata(
-            &f.process,
-            &FsOp::StatFs {
-                dir: DirRef::Cwd,
-                path: bytes(b"file"),
-                follow: true,
-            },
-            token,
-        )
-        .unwrap()
-        .unwrap();
-    assert_eq!(relative.metadata, file.metadata);
+    assert!(!f.base_root.join("dir/seed.txt").exists());
+    assert_eq!(
+        fs::read(f.base_root.join("moved/seed.txt")).unwrap(),
+        b"seed\n"
+    );
 }
 
 #[test]
@@ -9037,20 +8967,7 @@ fn f214_resume_identity() {
         image_generation: 0,
         stop_generation: 1,
     };
-    let operation = FsOp::StatFs {
-        dir: DirRef::Cwd,
-        path: bytes(b"/"),
-        follow: true,
-    };
-    let before = f
-        .overlay
-        .filesystem_metadata(&f.process, &operation, token.clone())
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        before.metadata,
-        recreated_descriptor(&mut f.overlay, &f.process, token.clone())
-    );
+    let before = recreated_descriptor(&mut f.overlay, &f.process, token.clone());
     f.overlay
         .finish_run(&FinishRunRequest {
             run_id,
@@ -9101,17 +9018,10 @@ fn f214_resume_identity() {
             base,
         )
         .unwrap();
-    let after = reopened
-        .filesystem_metadata(&f.process, &operation, token.clone())
-        .unwrap()
-        .unwrap();
-    assert_eq!(before.metadata, after.metadata);
-    assert_eq!(
-        after.metadata,
-        recreated_descriptor(&mut reopened, &f.process, token)
-    );
+    let after = recreated_descriptor(&mut reopened, &f.process, token);
+    assert_eq!(before, after);
     assert_ne!(
-        before.metadata.binding,
+        before.binding,
         umbra_core::FilesystemBinding::overlay(empty_base.overlay.config().unwrap().context.run_id)
     );
     reopened

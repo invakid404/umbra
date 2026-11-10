@@ -295,7 +295,6 @@ continuing with an inert one.
 | `chdir` | 12 | `chdir` | x0 path | `FsOp::Chdir`, anchored at the cwd |
 | `fstat` | 339 | `fstat` | x0 descriptor, x1 buffer | `FsOp::Fstat` |
 | `fstat` | 189 | `__fstat` | same layout | `FsOp::Fstat` |
-| `statfs` | 345 | `statfs` | x0 path, x1 buffer | `FsOp::StatFs`, following the final logical symlink |
 | `fstatfs` | 346 | `fstatfs` | x0 descriptor, x1 buffer | `FsOp::FstatFs`, using the captured filesystem binding |
 | `setattrlistat` | 524 | `setattrlistat` | x0 dirfd, x1 path, x2 attrlist, x3 buffer, x4 size, x5 options | `FsOp::SetTimes` |
 | `getattrlistbulk` | 461 | `getattrlistbulk` | x0 descriptor, x1 attrlist, x2 buffer, x3 size, x4 options | `FsOp::ReadDir` |
@@ -991,8 +990,9 @@ remains false so the supervisor retains writer authority after uncertain launch 
 
 ## Routed filesystem metadata
 
-The arm64 `statfs`/`fstatfs` stubs decode syscall numbers 345/346; their 64-bit
-libc aliases share those entry points. Legacy numbers 157/158 are not encoded
+The arm64 `fstatfs` stub decodes syscall number 346; its 64-bit
+libc alias shares that entry point. Path `statfs` retains native behavior.
+Legacy numbers 157/158 are not encoded
 using this layout. The SDK structure is 2168 bytes. The encoder zeroes reserved
 bytes, reports type `umbra`, logical mount `/`, and source `umbra:<RunId>`.
 The fsid contains the first eight SHA-256 bytes of `umbra-overlay-v1:<RunId>`
@@ -1004,3 +1004,10 @@ no local mount, read-only mount or durability property is claimed. Numeric
 conversion overflow returns EOVERFLOW; names must fit without truncation.
 Output addresses are retained without probing until lookup and provider
 validation complete. Invalid output then returns EFAULT.
+
+Descriptor `fstatfs` reports synthetic run identity, including on routed directory
+descriptors. Path `statfs` reports the host view and can fail for an overlay-only
+path even when descriptor metadata succeeds. Host mounts are not hidden.
+The first fsid word is only 32 bits and can coincidentally equal a native mount
+word. C17-02 characterizes only the CarbonCore path it exercises; it does not
+establish compatibility for all directory-descriptor volume queries.

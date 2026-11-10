@@ -369,7 +369,7 @@ cargo test -p umbra-supervisor
 
 ## Filesystem metadata dispatch
 
-Routed filesystem queries retain a full filesystem binding and output buffer
+Routed descriptor filesystem queries retain a full filesystem binding and output buffer
 in `FilesystemQueries`. Native descriptors (including negative descriptors)
 and rewrite-backed runs resume the original syscall. Owned but closed
 descriptors return EBADF before output validation. Namespace errors precede
@@ -382,3 +382,7 @@ Provider errors or malformed replies poison the run; they cannot become
 zero-filled successful metadata. The current namespace call is synchronous,
 so the event loop cannot process another trace event during that call;
 pending-state tests exercise invalidation and late replies explicitly.
+
+Pathname `statfs` retains the native host view. It may disagree with synthetic
+descriptor metadata or fail for an overlay-only path. The descriptor capability
+does not hide host mounts.

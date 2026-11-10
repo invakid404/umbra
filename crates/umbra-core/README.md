@@ -165,3 +165,7 @@ describes the composed namespace, not an inode or physical export.
 not zero or unlimited space. `FilesystemQueryToken` and `FilesystemReply`
 carry runtime request, task, thread, image and stop identity; they are not
 journal or manifest data.
+
+The v1 capability serves descriptor queries only. Pathname filesystem metadata
+retains the native host view; no path/descriptor equality or host-mount isolation
+is promised.

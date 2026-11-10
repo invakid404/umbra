@@ -3333,32 +3333,6 @@ impl NamespaceSession for Overlay {
                 // through unlink, rename, copy-up and descriptor-number reuse.
                 binding.clone()
             }
-            FsOp::StatFs { dir, path, follow } => {
-                let resolved = self.resolve_path_follow(context, *dir, path, false, *follow);
-                let resolved = match resolved {
-                    Ok(path) => path,
-                    Err(e) if e.kind == ErrorKind::NotFound => return Ok(Err(Errno(2))),
-                    Err(e)
-                        if e.kind == ErrorKind::InvalidPath
-                            && matches!(e.errno, Some(Errno(20) | Errno(13))) =>
-                    {
-                        return Ok(Err(e.errno.unwrap()));
-                    }
-                    Err(e) => match self.hidden_or(e, false)? {
-                        ResolvedAction::Deny(errno) => return Ok(Err(errno)),
-                        _ => {
-                            return Err(error(
-                                ErrorKind::ProtocolMismatch,
-                                "unexpected filesystem lookup action",
-                            ));
-                        }
-                    },
-                };
-                if absent(self.lookup(&resolved))?.is_none() {
-                    return Ok(Err(Errno(2)));
-                }
-                umbra_core::FilesystemBinding::overlay(self.config()?.context.run_id)
-            }
             _ => return Err(error(ErrorKind::ProtocolMismatch, "not a filesystem query")),
         };
         Ok(Ok(umbra_core::FilesystemReply {

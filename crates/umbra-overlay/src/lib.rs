@@ -322,7 +322,6 @@ pub fn dispatch(operation: &FsOp) -> Dispatch {
         // later mutation, so it reads through whatever the namespace already
         // shows rather than materialising the target.
         FsOp::Stat { .. }
-        | FsOp::StatFs { .. }
         | FsOp::FstatFs { .. }
         | FsOp::Access { .. }
         | FsOp::ReadLink { .. }
