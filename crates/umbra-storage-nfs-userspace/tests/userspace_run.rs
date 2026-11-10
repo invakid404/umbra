@@ -10499,6 +10499,57 @@ fn fix_243_distinct_parent_backing_overlap() {
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
+fn fix_243_provider_region_cap() {
+    let Some(mut spawn) = slate_spawn("fix-243-cap") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-cap");
+    assert!(native.status.success(), "native: {}", native.status);
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("completed=17"));
+    spawn.provider_environment.extend([
+        ("UMBRA_FIX_243_REGION_TRACE".into(), "1".into()),
+        ("UMBRA_FIX_243_OVERLAP_PARENTS".into(), "17".into()),
+    ]);
+    let routed = slate_spawn_routed(&spawn, "fix-243-cap", &[]);
+    assert_ne!(routed.run.status, Some(0));
+    assert!(
+        routed
+            .run
+            .stderr
+            .contains("spawn snapshot capacity exceeded"),
+        "{}",
+        routed.run.stderr
+    );
+    let records: Vec<serde_json::Value> = routed
+        .run
+        .stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("spawn-region "))
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(records.len(), 16);
+    let mut parents = std::collections::BTreeSet::new();
+    for r in records {
+        assert_eq!(r["event"], "allocated");
+        assert_eq!(r["bytes"], 81920);
+        assert!(parents.insert(r["parent"].to_string()));
+    }
+    assert!(routed.object("records.done").is_none());
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+    assert!(
+        cleanup.starts_with("cleanup CLEAN")
+            && cleanup.lines().next().unwrap().contains("group_kills=0")
+            && cleanup.lines().next().unwrap().contains("zombies=\"\""),
+        "{cleanup}"
+    );
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
 fn fix_243_region_success_error_cycles() {
     let Some(mut spawn) = slate_spawn("fix-243-region-cycles") else {
         return;

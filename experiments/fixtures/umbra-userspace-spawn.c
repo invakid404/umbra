@@ -745,19 +745,19 @@ static int region_cycles(const char *root, const char *helper) {
     return 0;
 }
 
-static int overlap_parents(const char *root, const char *helper) {
+static int overlap_parents(const char *root, const char *helper, int count) {
     unsetenv("UMBRA_SLATE_SIGNAL_DIR");
     note("phase=pre-spawn mode=fix-243-overlap\n");
     flush(root, "records.pre");
-    pid_t parents[2];
-    for (int i = 0; i < 2; i++) {
+    pid_t parents[17];
+    for (int i = 0; i < count; i++) {
         parents[i] = fork();
         if (parents[i] < 0) return 125;
         if (!parents[i]) {
             posix_spawnattr_t attr;
             sigset_t mask;
             sigemptyset(&mask);
-            int signal = i ? SIGUSR2 : SIGUSR1;
+            int signal = i % 2 ? SIGUSR2 : SIGUSR1;
             sigaddset(&mask, signal);
             if (posix_spawnattr_init(&attr) ||
                 posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK) ||
@@ -774,11 +774,11 @@ static int overlap_parents(const char *root, const char *helper) {
             _exit(got == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 128);
         }
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < count; i++) {
         int status = 0;
         if (reap(parents[i], &status)) return 129;
     }
-    note("overlap parents=2 completed=2\n");
+    note("overlap parents=%d completed=%d\n", count, count);
     flush(root, "records.done");
     return 0;
 }
@@ -786,7 +786,8 @@ static int overlap_parents(const char *root, const char *helper) {
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
-    if (!strcmp(mode, "fix-243-overlap")) return overlap_parents(root, helper);
+    if (!strcmp(mode, "fix-243-overlap")) return overlap_parents(root, helper, 2);
+    if (!strcmp(mode, "fix-243-cap")) return overlap_parents(root, helper, 17);
     if (!strcmp(mode, "fix-243-region-cycles")) return region_cycles(root, helper);
     if (!strcmp(mode, "fix-243-thread-null")) return second_thread_null(root, helper);
     if (!strcmp(mode, "fix-243-threads")) return threaded(root, helper);
