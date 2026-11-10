@@ -10422,6 +10422,26 @@ fn fix_243_kernel_pipe_actions() {
 }
 
 #[test]
+fn fix_243_second_thread_null_spawn() {
+    let Some(spawn) = slate_spawn("fix-243-thread-null") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-thread-null");
+    assert!(native.status.success(), "native: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("null-thread result=0"));
+    let routed = slate_spawn_routed(&spawn, "fix-243-thread-null", &["child.txt"]);
+    assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+    assert_eq!(routed.text("child.txt"), "CHILD");
+    assert!(routed.text("records.done").contains("null-thread result=0"));
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
 fn fix_243_same_parent_threads() {
     let Some(spawn) = slate_spawn("fix-243-threads") else {
         return;

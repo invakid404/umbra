@@ -690,9 +690,37 @@ static int threaded(const char *root, const char *helper) {
     return t[0].result || t[1].result || t[0].child == t[1].child ? 114 : 0;
 }
 
+struct null_thread_spawn { const char *helper, *root; int result; };
+static void *null_thread(void *opaque) {
+    struct null_thread_spawn *t = opaque;
+    char *args[] = {(char *)t->helper, "write-child", (char *)t->root, NULL};
+    pid_t child = -1;
+    /* No earlier traced call on this pthread. */
+    t->result = posix_spawn(&child, t->helper, NULL, NULL, args, environ);
+    if (!t->result) {
+        int status;
+        pid_t got;
+        do got = waitpid(child, &status, 0); while (got < 0 && errno == EINTR);
+        if (got != child || !WIFEXITED(status) || WEXITSTATUS(status)) t->result = 115;
+    }
+    return NULL;
+}
+static int second_thread_null(const char *root, const char *helper) {
+    pthread_t thread;
+    struct null_thread_spawn t = {helper, root, -1};
+    note("phase=pre-spawn mode=fix-243-thread-null\n");
+    flush(root, "records.pre");
+    if (pthread_create(&thread, NULL, null_thread, &t) || pthread_join(thread, NULL))
+        return 116;
+    note("null-thread result=%d\n", t.result);
+    flush(root, "records.done");
+    return t.result ? 117 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
+    if (!strcmp(mode, "fix-243-thread-null")) return second_thread_null(root, helper);
     if (!strcmp(mode, "fix-243-threads")) return threaded(root, helper);
     if (!strncmp(mode, "fix-243-refuse-", 15)) return refused_plan(mode, root, helper);
     if (!strcmp(mode, "fix-243-pipe") || !strcmp(mode, "fix-243-cloexec") ||
