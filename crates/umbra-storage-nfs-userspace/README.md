@@ -57,7 +57,7 @@ loss, overlapping backing regions, the 16-token cap, repeated mapping release,
 and allocation/write errors. Tests retain ownership observations separately from
 cleanup results. Guardian completion does not prove a child was reaped;
 provider-loss comparisons outside the guardian remain distinct
-([#249](https://github.com/invakid404/umbra/issues/249)).
+([#198](https://github.com/invakid404/umbra/issues/198)).
 All live cases require the normal userspace integration prerequisites and a fresh
 `UMBRA_SLATE_EVIDENCE` directory. Probe controls are documented by the
 [platform provider](../umbra-platform-macos/README.md).
