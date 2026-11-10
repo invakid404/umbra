@@ -295,6 +295,7 @@ continuing with an inert one.
 | `chdir` | 12 | `chdir` | x0 path | `FsOp::Chdir`, anchored at the cwd |
 | `fstat` | 339 | `fstat` | x0 descriptor, x1 buffer | `FsOp::Fstat` |
 | `fstat` | 189 | `__fstat` | same layout | `FsOp::Fstat` |
+| `fstatfs` | 346 | `fstatfs` | x0 descriptor, x1 buffer | `FsOp::FstatFs`, using the captured filesystem binding |
 | `setattrlistat` | 524 | `setattrlistat` | x0 dirfd, x1 path, x2 attrlist, x3 buffer, x4 size, x5 options | `FsOp::SetTimes` |
 | `getattrlistbulk` | 461 | `getattrlistbulk` | x0 descriptor, x1 attrlist, x2 buffer, x3 size, x4 options | `FsOp::ReadDir` |
 | `fchdir` | 13 | `fchdir` | x0 descriptor | `FsOp::Fchdir` |
@@ -568,7 +569,11 @@ and runs one post-kill barrier inside the 250 ms tracer reap:
 - **Still unconfirmed:** `Terminate` returns the warning as its error, and the
   run is left recovery-required.
 
-Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome.
+Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome, or
+`UMBRA_RSP_LOG` to log sent packets and received bytes to stderr. Both are off
+when unset and enabled by any value. `UMBRA_DEBUGSERVER` overrides debugger
+discovery when `Options.debugserver` is absent; `HOME` supplies the default
+twin and interposer cache roots when `Options.twin_cache` is absent.
 
 The timeout path is still reachable by ordinary failure paths, not only abnormal
 ones. A session whose debugserver neither confirms the exit nor answers `k`
@@ -986,3 +991,32 @@ sandbox qualification tests exercise a symlinked cache root.
 Failed attach and sandbox-handoff paths set `launch_tree_terminated` on the returned
 error only when `waitpid` confirms reaping every created tracee. Missing evidence
 remains false so the supervisor retains writer authority after uncertain launch failure.
+
+## Routed filesystem metadata
+
+The arm64 `fstatfs` stub decodes syscall number 346; its 64-bit
+libc alias shares that entry point. Path `statfs` retains native behavior.
+Legacy numbers 157/158 are not encoded
+using this layout. The SDK structure is 2168 bytes. The encoder zeroes reserved
+bytes, reports type `umbra`, logical mount `/`, and source `umbra:<RunId>`.
+The fsid contains the first eight SHA-256 bytes of `umbra-overlay-v1:<RunId>`
+as two little-endian words. This compact ID is presentation, not authority.
+
+Block size, optimal I/O size, block/inode counts, owner, numeric VFS type and
+subtype use all-ones undefined values. Flags and extended flags are zero;
+no local mount, read-only mount or durability property is claimed. Numeric
+conversion overflow returns EOVERFLOW; names must fit without truncation.
+Output addresses are retained without probing until lookup and provider
+validation complete. Invalid output then returns EFAULT.
+Copyout uses Mach writes that respect the destination's protection, separately
+from debugger writes used for instrumentation. The macOS-only unit test
+`f214_encoding_bounds` checks undefined fields, reserved bytes, numeric overflow,
+oversized names and invalid binding versions; live descriptor controls are in
+the userspace storage integration suite.
+
+Descriptor `fstatfs` reports synthetic run identity, including on routed directory
+descriptors. Path `statfs` reports the host view and can fail for an overlay-only
+path even when descriptor metadata succeeds. Host mounts are not hidden.
+The first fsid word is only 32 bits and can coincidentally equal a native mount
+word. C17-02 characterizes only the CarbonCore path it exercises; it does not
+establish compatibility for all directory-descriptor volume queries.

@@ -13,6 +13,7 @@ pub trait TraceBackend {
     fn next_event(&mut self) -> Result<TraceEvent>;
     fn read_memory(&mut self, task: TaskId, address: u64, out: &mut [u8]) -> Result<()>;
     fn write_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()>;
+    fn copyout_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()>;
     fn registers(&mut self, thread: ThreadId) -> Result<RegisterSet>;
     fn set_registers(&mut self, thread: ThreadId, regs: &RegisterSet) -> Result<()>;
     fn resume(&mut self, command: ResumeCommand) -> Result<()>;
@@ -31,6 +32,7 @@ pub trait SyscallAbi {
     fn io_buffer(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>>;
     fn directory_request(&self, regs: &RegisterSet) -> Result<Option<IoBuffer>>;
     fn encode_stat(&self, stat: &BlobStat) -> Result<Vec<u8>>;
+    fn encode_filesystem_metadata(&self, metadata: &FilesystemMetadata) -> Result<Vec<u8>>;
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()>;
     fn emulate_result(&self, regs: &mut RegisterSet, result: &EmulatedResult) -> Result<()>;
 }
@@ -54,8 +56,8 @@ slots for its ABI, and returns the argument and memory writes that would perform
 the rewrite. The client proxy requires the returned operation and single path
 operand to match the request before exposing the plan. It writes nothing and resumes nothing. `operation` is the *prepared*
 operation, whose flags may differ from the ones the tracee issued, because the
-namespace may already have created the target. It is the one method with a default
-implementation, and that default refuses, so a backend without a qualified scratch
+namespace may already have created the target. Its default
+implementation refuses, so a backend without a qualified scratch
 mechanism cannot be mistaken for one that has it.
 
 Every `LaunchSpec` carries a `SandboxRequirement`. A backend that accepts
@@ -171,7 +173,7 @@ Its default answers `None`, which is correct for every path operation and for a
 backend that services no data transfer. A consumer needing a buffer and getting
 `None` fails with its own diagnosis rather than reading address zero.
 
-`fstat` is the one call whose buffer is an *output* rather than a transfer, and
+`fstat` has a fixed-layout *output* buffer rather than a byte transfer, and
 it is reported through the same seam: its length is not a caller-supplied count
 but the fixed width of the layout the kernel would have written, so a partial
 write would leave the tail of the tracee's `struct stat` stale. A null or
@@ -212,3 +214,15 @@ refuse the launch: an interposed tracee whose descriptors are not fenced can be
 handed a kernel descriptor number that already names something else, which is a
 wrong-object read rather than a refusal.
 <!-- /memoria:section -->
+
+## Filesystem metadata ABI boundary
+
+`SyscallAbi::encode_filesystem_metadata` encodes namespace metadata for the
+target ABI. The provider proxy carries this typed request and bounds its
+response. `TraceBackend::copyout_memory` is the syscall-result write path:
+an inaccessible output produces EFAULT, while provider or task failures remain
+fatal. It is distinct from debugger memory writes used to install code or
+rewrite a stopped call. The default refuses with `UnsupportedCapability`;
+backends serving filesystem metadata must explicitly supply protection-respecting
+copyout. The Darwin backend uses Mach
+writes so read-only pages are not made writable by debugger behavior.

@@ -195,6 +195,7 @@ impl Supervisor {
             // A lost or timed-out event channel means we can no longer prove what
             // the tree is doing. Nothing may be resumed after this point.
             self.poisoned = true;
+            self.filesystem_queries.clear();
         })?;
         self.handle_event(event)
     }
@@ -203,6 +204,7 @@ impl Supervisor {
     pub fn handle_event(&mut self, event: TraceEvent) -> Result<()> {
         let result = self.service_renewal().and_then(|()| self.dispatch(event));
         if result.is_err() {
+            self.filesystem_queries.clear();
             self.poisoned = true;
             self.state.lifecycle = RunLifecycle::RecoveryRequired;
         }
@@ -260,6 +262,7 @@ impl Supervisor {
                 self.resume_thread(thread)
             }
             TraceEvent::ThreadExited { task, thread } => {
+                self.filesystem_queries.cancel_task(task);
                 if let Some(process) = self.state.processes.processes.get_mut(&task) {
                     process.threads.remove(&thread);
                 }
@@ -300,6 +303,7 @@ impl Supervisor {
                 thread,
                 exec_generation,
             } => {
+                self.filesystem_queries.cancel_task(task);
                 let process = self.process_mut(task)?;
                 process.context.exec_generation = exec_generation;
                 // Close-on-exec descriptors are gone and mappings are replaced;
@@ -316,6 +320,7 @@ impl Supervisor {
                 self.resume_thread(thread)
             }
             TraceEvent::Exit { task, status } => {
+                self.filesystem_queries.cancel_task(task);
                 let process = self
                     .state
                     .processes
@@ -411,6 +416,9 @@ impl Supervisor {
             umbra_overlay::Dispatch::Materialise | umbra_overlay::Dispatch::Whiteout
         );
         let context = self.process(task)?.context.clone();
+        if matches!(operation, FsOp::FstatFs { .. }) {
+            return self.filesystem_query(task, thread, &mut registers, &context, &operation);
+        }
         // **The descriptor fence, applied to the one descriptor-relative call
         // the tracer carries rather than the interposer.**
         //
@@ -1107,20 +1115,155 @@ impl Supervisor {
         Ok(Err(umbra_core::Errno(24)))
     }
 
-    /// Answer the stopped tracee with an errno and resume it, executing nothing.
-    ///
-    /// The backend must **skip** the trapped syscall, not merely rewrite its
-    /// return registers. On Darwin arm64 the entry stop is the `svc` itself and
-    /// `emulate_result` steps PC past it; a backend that cannot do this (the
-    /// Linux stub's `emulate_result` returns an error) fails closed here rather
-    /// than resuming the call it was told to refuse.
-    ///
-    /// One function rather than two copies, because there are two places a
-    /// refusal is decided: `resolve` answering `Deny`, and the entry path
-    /// finding that a binding the *tracee's own request* made impossible -- a
-    /// null `struct stat` pointer -- must be answered rather than raised. Both
-    /// reach the tracee the same way, and a second copy of this sequence is the
-    /// shape that produced the `intercept()`/`install()` drift.
+    /// Capture a routed descriptor's immutable filesystem binding and retain its
+    /// output buffer until a validated reply is ready. Native descriptors resume
+    /// their original syscall; descriptor errors precede output validation.
+    fn filesystem_query(
+        &mut self,
+        task: TaskId,
+        thread: ThreadId,
+        registers: &mut umbra_core::RegisterSet,
+        context: &umbra_core::ProcessContext,
+        operation: &FsOp,
+    ) -> Result<()> {
+        let floor = self.budget.as_ref().and_then(|b| b.descriptor_floor);
+        if floor.is_none() {
+            return self.resume_thread(thread);
+        }
+        let binding = match operation {
+            FsOp::FstatFs { fd } => {
+                if !umbra_owns_descriptor(floor, *fd) {
+                    return self.resume_thread(thread);
+                }
+                let Some(state) = context.fds.get(fd) else {
+                    return self.deny_to_tracee(thread, registers, umbra_core::Errno(9));
+                };
+                let Some(binding) = state.filesystem.clone() else {
+                    return self.deny_to_tracee(thread, registers, umbra_core::Errno(45));
+                };
+                binding
+            }
+            _ => umbra_core::FilesystemBinding::overlay(self.state.run_id),
+        };
+        self.filesystem_sequence = self.filesystem_sequence.checked_add(1).ok_or_else(|| {
+            error(
+                ErrorKind::InvalidState,
+                "filesystem.query",
+                "request identity exhausted",
+            )
+        })?;
+        let token = umbra_core::FilesystemQueryToken {
+            request: self.filesystem_sequence,
+            task,
+            thread,
+            image_generation: context.exec_generation,
+        };
+        // Decoding retains the address; it must not probe or reject it.
+        let buffer = self.platform.abi.io_buffer(registers)?.ok_or_else(|| {
+            error(
+                ErrorKind::ProtocolMismatch,
+                "filesystem.query",
+                "missing output descriptor",
+            )
+        })?;
+        if !self
+            .filesystem_queries
+            .begin(crate::filesystem::PendingFilesystem {
+                token: token.clone(),
+                binding,
+                output: buffer,
+            })
+        {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "filesystem.query",
+                "query already pending",
+            ));
+        }
+        self.service_renewal()?;
+        let reply = match self
+            .namespace
+            .filesystem_metadata(context, operation, token.clone())?
+        {
+            Ok(reply) => reply,
+            Err(errno) => {
+                self.filesystem_queries.clear();
+                return self.deny_to_tracee(thread, registers, errno);
+            }
+        };
+        self.complete_filesystem_query(task, thread, registers, reply)
+    }
+
+    fn complete_filesystem_query(
+        &mut self,
+        task: TaskId,
+        thread: ThreadId,
+        registers: &mut umbra_core::RegisterSet,
+        reply: umbra_core::FilesystemReply,
+    ) -> Result<()> {
+        let generation = self.process(task)?.context.exec_generation;
+        let buffer = self
+            .filesystem_queries
+            .finish(&reply, generation)
+            .ok_or_else(|| {
+                error(
+                    ErrorKind::ProtocolMismatch,
+                    "filesystem.query",
+                    "stale or mismatched reply",
+                )
+            })?;
+        if !self
+            .namespace
+            .filesystem_metadata_capabilities()
+            .contains(&umbra_core::capabilities::NAMESPACE_FILESYSTEM_METADATA_V1)
+        {
+            return self.deny_to_tracee(thread, registers, umbra_core::Errno(45));
+        }
+        let bytes = match self
+            .platform
+            .abi
+            .encode_filesystem_metadata(&reply.metadata)
+        {
+            Ok(bytes) => bytes,
+            Err(e) if e.errno == Some(umbra_core::Errno(84)) => {
+                return self.deny_to_tracee(thread, registers, umbra_core::Errno(84));
+            }
+            Err(e) => return Err(e),
+        };
+        if bytes.len() != buffer.length as usize {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "filesystem.query",
+                "output size mismatch",
+            ));
+        }
+        if buffer.address == 0 || buffer.address.checked_add(bytes.len() as u64).is_none() {
+            return self.deny_to_tracee(thread, registers, umbra_core::Errno(14));
+        }
+        self.service_renewal()?;
+        if let Err(e) = self
+            .platform
+            .control
+            .copyout_memory(task, buffer.address, &bytes)
+        {
+            if e.errno == Some(umbra_core::Errno(14)) {
+                return self.deny_to_tracee(thread, registers, umbra_core::Errno(14));
+            }
+            return Err(e);
+        }
+        self.platform.abi.emulate_result(
+            registers,
+            &EmulatedResult {
+                outcome: OperationOutcome::Success { return_value: 0 },
+                memory_writes: vec![],
+            },
+        )?;
+        self.platform.control.set_registers(thread, registers)?;
+        self.resume_thread(thread)
+    }
+
+    /// Answer an errno without executing the trapped syscall. The ABI must skip
+    /// the trap before the thread resumes; replacing registers alone is insufficient.
     fn deny_to_tracee(
         &mut self,
         thread: ThreadId,
@@ -1697,6 +1840,7 @@ impl Supervisor {
     /// Returns success only when the platform confirms termination; the caller
     /// uses that confirmation to decide whether writer authority may be released.
     pub fn terminate_tree(&mut self, policy: TerminationPolicy) -> Result<()> {
+        self.filesystem_queries.clear();
         let Some(process) = self.state.processes.root else {
             return Ok(());
         };
@@ -1727,6 +1871,9 @@ mod tests {
         }
         fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
             unreachable!()
+        }
+        fn copyout_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            panic!("unexpected syscall copyout in this test")
         }
         fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
             unreachable!()
@@ -1865,6 +2012,9 @@ mod tests {
         }
         fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
             unreachable!()
+        }
+        fn copyout_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            panic!("unexpected syscall copyout in this test")
         }
         fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
             unreachable!()
@@ -2089,8 +2239,475 @@ mod tests {
         }
     }
 
+    type FilesystemFailureRecords = std::sync::Arc<std::sync::Mutex<Vec<(bool, String)>>>;
+
     /// A routed budget with a deliberately tiny fence, so the range can be
     /// exhausted in a test rather than only in principle.
+    struct FilesystemFault(u8, Option<FilesystemFailureRecords>);
+    impl NamespaceResolver for FilesystemFault {
+        fn resolve(&mut self, _: &ProcessContext, _: &FsOp) -> Result<ResolvedAction> {
+            unreachable!()
+        }
+    }
+    impl NamespaceSession for FilesystemFault {
+        fn fail_run(&mut self, request: &FailedRunRequest) -> Result<()> {
+            self.1
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .push((request.tree_terminated, request.reason.clone()));
+            Ok(())
+        }
+        fn filesystem_metadata_capabilities(&self) -> &'static [&'static str] {
+            &[umbra_core::capabilities::NAMESPACE_FILESYSTEM_METADATA_V1]
+        }
+        fn filesystem_metadata(
+            &mut self,
+            context: &ProcessContext,
+            _: &FsOp,
+            token: FilesystemQueryToken,
+        ) -> Result<std::result::Result<FilesystemReply, Errno>> {
+            if self.0 == 5 || self.0 == 6 {
+                let (client, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                let mut connection =
+                    umbra_core::provider::Connection::new(client, Duration::from_millis(20));
+                // Hold a silent peer for a real receive deadline, or close it
+                // before receive for an actual transport disconnect.
+                let _peer = if self.0 == 5 {
+                    drop(peer);
+                    None
+                } else {
+                    Some(peer)
+                };
+                let failure = connection.receive::<u8>().unwrap_err();
+                let closed = connection.receive::<u8>().unwrap_err();
+                assert_eq!(closed.kind, ErrorKind::StorageUnavailable);
+                assert_eq!(closed.context, "connection is closed");
+                return Err(failure);
+            }
+            if self.0 == 4 {
+                return Err(UmbraError::new(
+                    ErrorKind::Io,
+                    "provider.call",
+                    "request deadline expired",
+                ));
+            }
+            if self.0 < 2 {
+                return Err(UmbraError::new(
+                    if self.0 == 0 {
+                        ErrorKind::Io
+                    } else {
+                        ErrorKind::ProtocolMismatch
+                    },
+                    "test.provider",
+                    "provider failed before reply",
+                ));
+            }
+            let mut metadata = context.fds[&TracedFd(8)]
+                .filesystem
+                .as_ref()
+                .unwrap()
+                .metadata()?;
+            if self.0 == 2 {
+                metadata.binding.run = RunId(Uuid::new_v4());
+            } else {
+                metadata.counts[0] = FilesystemStatistic::Known(0);
+            }
+            Ok(Ok(FilesystemReply { token, metadata }))
+        }
+        fn prepare(&mut self, _: OperationId, _: &ResolvedAction) -> Result<PreparedAction> {
+            unreachable!()
+        }
+        fn observe_result(&mut self, _: OperationId, _: &OperationOutcome) -> Result<()> {
+            unreachable!()
+        }
+        fn commit(&mut self, _: OperationId) -> Result<CommitReceipt> {
+            unreachable!()
+        }
+        fn abort(&mut self, _: OperationId, _: &AbortReason) -> Result<()> {
+            unreachable!()
+        }
+        fn checkpoint(&mut self, _: &CheckpointRequest) -> Result<Checkpoint> {
+            unreachable!()
+        }
+    }
+    impl SyscallAbi for FilesystemFault {
+        fn decode_entry(&self, _: &RegisterSet, _: &mut dyn TraceMemory) -> Result<Option<FsOp>> {
+            Ok(Some(FsOp::FstatFs { fd: TracedFd(8) }))
+        }
+        fn io_buffer(&self, _: &RegisterSet) -> Result<Option<IoBuffer>> {
+            Ok(Some(IoBuffer {
+                address: 1,
+                length: 2168,
+            }))
+        }
+        fn apply_rewrite(&self, _: &mut RegisterSet, _: &PreparedRewrite) -> Result<()> {
+            unreachable!()
+        }
+        fn emulate_result(&self, _: &mut RegisterSet, _: &EmulatedResult) -> Result<()> {
+            panic!("provider failure must never return syscall success or EFAULT")
+        }
+    }
+
+    #[test]
+    fn f214_lifecycle_events_discard_pending_output() {
+        for event in [
+            TraceEvent::Exec {
+                task: task(1),
+                thread: ThreadId(task(1).0),
+                exec_generation: 2,
+            },
+            TraceEvent::ThreadExited {
+                task: task(1),
+                thread: ThreadId(task(1).0),
+            },
+            TraceEvent::Exit {
+                task: task(1),
+                status: ExitStatus::Code(0),
+            },
+        ] {
+            let mut s = supervisor();
+            let token = FilesystemQueryToken {
+                request: 1,
+                task: task(1),
+                thread: ThreadId(task(1).0),
+                image_generation: 0,
+            };
+            let binding = FilesystemBinding::overlay(s.state.run_id);
+            let reply = FilesystemReply {
+                token: token.clone(),
+                metadata: binding.metadata().unwrap(),
+            };
+            assert!(s
+                .filesystem_queries
+                .begin(crate::filesystem::PendingFilesystem {
+                    token,
+                    binding,
+                    output: IoBuffer {
+                        address: 0x1000,
+                        length: 2168
+                    },
+                }));
+            s.handle_event(event).unwrap();
+            // Use the old generation deliberately: cancellation itself must
+            // remove the output, independently of generation validation.
+            assert!(s.filesystem_queries.finish(&reply, 0).is_none());
+            // Fake panics on memory/register writes, so lifecycle processing
+            // cannot have touched the former image's output buffer.
+        }
+    }
+
+    #[test]
+    fn f214_pending_reply_survives_supervisor_close_and_reuse() {
+        // Exercise the real descriptor/OFD transitions while a deterministic
+        // responder holds the captured reply. Production dispatch is synchronous;
+        // this deliberately drives its ownership components separately.
+        let mut s = supervisor();
+        let fd = TracedFd(8);
+        let a = FilesystemBinding::overlay(RunId(Uuid::from_u128(1)));
+        let b = FilesystemBinding::overlay(RunId(Uuid::from_u128(2)));
+        let mut state = bound_fd(b"/original");
+        state.filesystem = Some(a.clone());
+        open_routed(&mut s, task(1), fd, state);
+        let token = FilesystemQueryToken {
+            request: 1,
+            task: task(1),
+            thread: ThreadId(task(1).0),
+            image_generation: 0,
+        };
+        let captured = s.process(task(1)).unwrap().context.fds[&fd]
+            .filesystem
+            .clone()
+            .unwrap();
+        assert!(s
+            .filesystem_queries
+            .begin(crate::filesystem::PendingFilesystem {
+                token: token.clone(),
+                binding: captured.clone(),
+                output: IoBuffer {
+                    address: 0x1000,
+                    length: 2168
+                },
+            }));
+        let (release, paused) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            paused.recv_timeout(Duration::from_secs(10)).unwrap();
+            FilesystemReply {
+                token,
+                metadata: captured.metadata().unwrap(),
+            }
+        });
+        routed_outcome(
+            &mut s,
+            task(1),
+            RoutedEffect::Closed(fd),
+            OperationOutcome::Success { return_value: 0 },
+        );
+        assert!(s.ofds.is_empty());
+        let mut replacement = bound_fd(b"/replacement");
+        replacement.filesystem = Some(b.clone());
+        open_routed(&mut s, task(1), fd, replacement);
+        release.send(()).unwrap();
+        let reply = responder.join().unwrap();
+        assert_eq!(reply.metadata.binding, a);
+        assert_eq!(
+            s.filesystem_queries.finish(&reply, 0).unwrap().address,
+            0x1000
+        );
+        let current = s.process(task(1)).unwrap().context.fds[&fd]
+            .filesystem
+            .clone()
+            .unwrap();
+        assert_eq!(current, b);
+        let token = FilesystemQueryToken {
+            request: 2,
+            ..reply.token
+        };
+        assert!(s
+            .filesystem_queries
+            .begin(crate::filesystem::PendingFilesystem {
+                token: token.clone(),
+                binding: current.clone(),
+                output: IoBuffer {
+                    address: 0x2000,
+                    length: 2168
+                },
+            }));
+        let next = FilesystemReply {
+            token,
+            metadata: current.metadata().unwrap(),
+        };
+        assert_eq!(next.metadata.binding, b);
+        assert_eq!(
+            s.filesystem_queries.finish(&next, 0).unwrap().address,
+            0x2000
+        );
+        assert_eq!(s.ofds.references((task(1), fd)), Some(1));
+    }
+
+    #[test]
+    fn f214_exec_cancels_delayed_completion_before_replacement_copyout() {
+        use std::sync::{Arc, Mutex};
+
+        struct Canary(Arc<Mutex<Vec<u8>>>);
+        impl TraceBackend for Canary {
+            fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
+                unreachable!()
+            }
+            fn next_event(&mut self) -> Result<TraceEvent> {
+                unreachable!()
+            }
+            fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
+                unreachable!()
+            }
+            fn write_memory(&mut self, _: TaskId, address: u64, bytes: &[u8]) -> Result<()> {
+                assert_eq!(address, 0x1000);
+                self.0.lock().unwrap()[..bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            }
+            fn copyout_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()> {
+                self.write_memory(task, address, bytes)
+            }
+            fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
+                unreachable!()
+            }
+            fn set_registers(&mut self, _: ThreadId, _: &RegisterSet) -> Result<()> {
+                Ok(())
+            }
+            fn resume(&mut self, _: ResumeCommand) -> Result<()> {
+                Ok(())
+            }
+        }
+        impl TraceControl for Canary {
+            fn capabilities(&self) -> PlatformCapabilities {
+                PlatformCapabilities::default()
+            }
+            fn quiesce(&mut self, _: ProcessHandle) -> Result<QuiescedTree> {
+                unreachable!()
+            }
+            fn terminate(&mut self, _: ProcessHandle, _: TerminationPolicy) -> Result<()> {
+                Ok(())
+            }
+        }
+        impl SyscallAbi for Canary {
+            fn decode_entry(
+                &self,
+                _: &RegisterSet,
+                _: &mut dyn TraceMemory,
+            ) -> Result<Option<FsOp>> {
+                unreachable!()
+            }
+            fn apply_rewrite(&self, _: &mut RegisterSet, _: &PreparedRewrite) -> Result<()> {
+                unreachable!()
+            }
+            fn encode_filesystem_metadata(&self, _: &FilesystemMetadata) -> Result<Vec<u8>> {
+                Ok(vec![0x55; 2168])
+            }
+            fn emulate_result(&self, _: &mut RegisterSet, _: &EmulatedResult) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut s = supervisor();
+        let memory = Arc::new(Mutex::new(vec![0; 2168]));
+        s.platform.control = Box::new(Canary(memory.clone()));
+        s.platform.abi = Box::new(Canary(memory.clone()));
+        s.namespace = Box::new(FilesystemFault(0, None));
+        let binding = FilesystemBinding::overlay(s.state.run_id);
+        let token = FilesystemQueryToken {
+            request: 1,
+            task: task(1),
+            thread: ThreadId(task(1).0),
+            image_generation: 0,
+        };
+        assert!(s
+            .filesystem_queries
+            .begin(crate::filesystem::PendingFilesystem {
+                token: token.clone(),
+                binding: binding.clone(),
+                output: IoBuffer {
+                    address: 0x1000,
+                    length: 2168
+                },
+            }));
+        let (release, paused) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            paused.recv_timeout(Duration::from_secs(10)).unwrap();
+            FilesystemReply {
+                token,
+                metadata: binding.metadata().unwrap(),
+            }
+        });
+        s.handle_event(TraceEvent::Exec {
+            task: task(1),
+            thread: ThreadId(task(1).0),
+            exec_generation: 1,
+        })
+        .unwrap();
+        // The replacement image deliberately reuses the old virtual address.
+        // Its memory backend accepts writes, so a stale copyout changes this.
+        memory.lock().unwrap().fill(0xa7);
+        release.send(()).unwrap();
+        let reply = responder.join().unwrap();
+        let mut registers = RegisterSet::new(Architecture::Aarch64, vec![0; 272]).unwrap();
+        let error = s
+            .complete_filesystem_query(task(1), ThreadId(task(1).0), &mut registers, reply)
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::ProtocolMismatch);
+        assert_eq!(error.context, "stale or mismatched reply");
+        assert_eq!(*memory.lock().unwrap(), vec![0xa7; 2168]);
+        // Independently exercise generation validation with retained pending
+        // state, then prove that this backend actually accepts valid copyout.
+        for generation in [0, 1] {
+            let binding = FilesystemBinding::overlay(s.state.run_id);
+            let token = FilesystemQueryToken {
+                request: 2 + generation,
+                task: task(1),
+                thread: ThreadId(task(1).0),
+                image_generation: generation,
+            };
+            let reply = FilesystemReply {
+                token: token.clone(),
+                metadata: binding.metadata().unwrap(),
+            };
+            assert!(s
+                .filesystem_queries
+                .begin(crate::filesystem::PendingFilesystem {
+                    token,
+                    binding,
+                    output: IoBuffer {
+                        address: 0x1000,
+                        length: 2168
+                    },
+                }));
+            let result =
+                s.complete_filesystem_query(task(1), ThreadId(task(1).0), &mut registers, reply);
+            if generation == 0 {
+                assert_eq!(result.unwrap_err().kind, ErrorKind::ProtocolMismatch);
+                assert_eq!(*memory.lock().unwrap(), vec![0xa7; 2168]);
+            } else {
+                result.unwrap();
+                assert_eq!(*memory.lock().unwrap(), vec![0x55; 2168]);
+            }
+        }
+    }
+
+    #[test]
+    fn f214_provider_errors() {
+        for fault in 0..7 {
+            let mut s = supervisor();
+            s.budget = Some(routed_budget(8));
+            let cleanup = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            s.namespace = Box::new(FilesystemFault(fault, Some(cleanup.clone())));
+            s.platform.abi = Box::new(FilesystemFault(fault, None));
+            let mut fd = bound_fd(b"/gone");
+            fd.filesystem = Some(FilesystemBinding::overlay(s.state.run_id));
+            s.process_mut(task(1))
+                .unwrap()
+                .context
+                .fds
+                .insert(TracedFd(8), fd);
+            let result = s.handle_event(TraceEvent::SyscallEntry {
+                task: task(1),
+                thread: ThreadId(task(1).0),
+                registers: RegisterSet::new(Architecture::Aarch64, vec![0; 272]).unwrap(),
+            });
+            let failure = result.unwrap_err();
+            assert_eq!(
+                failure.kind,
+                if fault >= 5 {
+                    ErrorKind::StorageUnavailable
+                } else if fault == 0 || fault == 4 {
+                    ErrorKind::Io
+                } else {
+                    ErrorKind::ProtocolMismatch
+                }
+            );
+            let (operation, context) = match fault {
+                0 | 1 => ("test.provider", "provider failed before reply"),
+                2 | 3 => ("filesystem.query", "stale or mismatched reply"),
+                4 => ("provider.call", "request deadline expired"),
+                5 => ("provider.transport", "provider disconnected"),
+                6 => ("provider.transport", "request deadline exceeded"),
+                _ => unreachable!(),
+            };
+            assert_eq!(failure.operation, operation);
+            assert_eq!(failure.context, context);
+            assert_eq!(
+                failure.errno, None,
+                "fatal failures must not become syscall errnos"
+            );
+            assert!(s.is_poisoned());
+            assert_eq!(s.state.lifecycle, RunLifecycle::RecoveryRequired);
+            let stopped = s.step().unwrap_err();
+            assert_eq!(stopped.kind, ErrorKind::InvalidState);
+            assert_eq!(
+                stopped.context,
+                "run is poisoned; no further events may be serviced"
+            );
+            // Fake's memory write and register-write methods panic: reaching
+            // this point proves neither copyout nor syscall completion occurred.
+            let token = FilesystemQueryToken {
+                request: 1,
+                task: task(1),
+                thread: ThreadId(task(1).0),
+                image_generation: 0,
+            };
+            let late = FilesystemReply {
+                token,
+                metadata: FilesystemBinding::overlay(s.state.run_id)
+                    .metadata()
+                    .unwrap(),
+            };
+            assert!(s.filesystem_queries.finish(&late, 0).is_none());
+            let reason = failure.to_string();
+            let returned = crate::run::finish_supervision(s, Err(failure), &mut None).unwrap_err();
+            assert_eq!(returned.to_string(), reason);
+            assert_eq!(*cleanup.lock().unwrap(), vec![(true, reason)]);
+        }
+    }
+
     fn routed_budget(fence: u32) -> RunBudget {
         RunBudget {
             renew_after: Duration::from_secs(1),
@@ -2103,6 +2720,7 @@ mod tests {
 
     fn bound_fd(path: &[u8]) -> FdState {
         FdState {
+            filesystem: None,
             object: ObjectId(Uuid::new_v4()),
             logical_path: Some(BytePath::new(path.to_vec()).unwrap()),
             directory: false,
@@ -2473,6 +3091,7 @@ mod tests {
             task(1),
             TracedFd(3),
             FdState {
+                filesystem: None,
                 object: ObjectId(Uuid::new_v4()),
                 logical_path: Some(BytePath::new(b"/directory".to_vec()).unwrap()),
                 directory: true,
@@ -2622,6 +3241,9 @@ mod tests {
         }
         fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
             unreachable!()
+        }
+        fn copyout_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            panic!("unexpected syscall copyout in this test")
         }
         fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
             unreachable!()

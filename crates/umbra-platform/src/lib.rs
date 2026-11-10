@@ -58,6 +58,15 @@ pub trait TraceBackend {
     /// Write bytes to a stopped task after validating address/length bounds.
     /// An error must leave the task stopped; it need not imply an atomic write.
     fn write_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()>;
+    /// Copy a syscall result respecting target memory protections.
+    /// Inaccessible output is EFAULT; transport or task failures remain fatal.
+    fn copyout_memory(&mut self, _task: TaskId, _address: u64, _bytes: &[u8]) -> Result<()> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "trace.copyout_memory",
+            "this backend has no protection-respecting syscall copyout",
+        ))
+    }
 
     /// Read bounded, architecture-tagged registers from a stopped thread.
     fn registers(&mut self, thread: ThreadId) -> Result<RegisterSet>;
@@ -138,6 +147,18 @@ pub trait SyscallAbi {
             umbra_core::ErrorKind::UnsupportedCapability,
             "abi.encode_stat",
             "this ABI has no native stat layout",
+        ))
+    }
+
+    /// Encode filesystem metadata with checked numeric and string bounds.
+    fn encode_filesystem_metadata(
+        &self,
+        _metadata: &umbra_core::FilesystemMetadata,
+    ) -> Result<Vec<u8>> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "abi.encode_filesystem_metadata",
+            "this ABI has no filesystem metadata layout",
         ))
     }
 
@@ -251,3 +272,54 @@ const _: Option<&dyn TraceMemory> = None;
 /// Versioned provider protocol, server harness and trait proxies.
 #[cfg(unix)]
 pub mod provider;
+
+#[cfg(test)]
+mod copyout_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct DebuggerOnly {
+        writes: usize,
+    }
+
+    impl TraceBackend for DebuggerOnly {
+        fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
+            unreachable!()
+        }
+        fn next_event(&mut self) -> Result<TraceEvent> {
+            unreachable!()
+        }
+        fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            self.writes += 1;
+            Ok(())
+        }
+        fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
+            unreachable!()
+        }
+        fn set_registers(&mut self, _: ThreadId, _: &RegisterSet) -> Result<()> {
+            unreachable!()
+        }
+        fn resume(&mut self, _: ResumeCommand) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn default_copyout_refuses_without_debugger_write() {
+        let mut backend = DebuggerOnly::default();
+        let task = TaskId(umbra_core::TaskIdentity {
+            native_id: 1,
+            generation: 1,
+        });
+        // Establish that debugger writes work, but cannot confer copyout support.
+        backend.write_memory(task, 0x1000, &[7]).unwrap();
+        assert_eq!(backend.writes, 1);
+        let error = backend.copyout_memory(task, 0x1000, &[9]).unwrap_err();
+        assert_eq!(error.kind, umbra_core::ErrorKind::UnsupportedCapability);
+        assert_eq!(error.operation, "trace.copyout_memory");
+        assert_eq!(backend.writes, 1);
+    }
+}

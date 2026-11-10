@@ -8,7 +8,7 @@ run's durable journal state directly before reopening it. The suites that spawn
 the real provider executables skip when those are absent, and fail instead under
 `UMBRA_INTEGRATION_REQUIRED` (`tests/reopen.rs:38-67`).
 This crate owns `src/lib.rs`, `src/run.rs`, `src/events.rs`, `src/ofd.rs`,
-`src/base.rs`, `src/sandbox.rs`, `src/directory.rs` and its manifest. `directory.rs` holds the
+`src/base.rs`, `src/sandbox.rs`, `src/directory.rs`, `src/filesystem.rs` and its manifest. `directory.rs` holds the
 `DirectoryEncoder` the overlay requires for `FsOp::ReadDir`: the engine resolves
 the merged entries and this side turns them into the native records the tracee's
 `getattrlistbulk` reply expects, using the wire format in `umbra_platform::dirents`
@@ -102,7 +102,7 @@ The staged order is fixed, and each stage's failure decides what may be released
    writer identity and epoch, rejecting a non-fresh recovery state for CreateNew.
    A **routed** run -- storage with no kernel-visible path -- instead journals
    under `RunSpec::state_root`, and mints a nonce into both the store's
-   `control/journal-id` and a file beside the log. See *Routed runs*.
+   `control/journal-id` and the log’s first record. See *Routed runs*.
 5. Bind the namespace over those already-open sessions, handing it the lease so
    one owner renews, releases and mutates.
 6. Render enforcement from the run's own root, re-verify the workspace inventory,
@@ -153,8 +153,7 @@ prepare the physical rewrite, apply it, then resume to the matching exit, observ
 the outcome and commit or abort. Not every operation reaches the kernel: when the
 namespace answers `resolve` with a refusal for the tracee, `deny_to_tracee`
 emulates that errno into the return register and resumes, so no intent is
-journalled, no rewrite is prepared and the syscall never executes. Both of its
-call sites share that one implementation, and the refusals that reach it are
+journalled, no rewrite is prepared and the syscall never executes. Its call sites share that implementation, and the refusals that reach it are
 enumerated over it in `src/events.rs`. A kernel errno is an observed outcome, not
 an
 interception failure: it is aborted as `AbortReason::KernelRefused(errno)`, which
@@ -252,8 +251,7 @@ others' descriptions. Exit closes every descriptor the process held: its
 `context.fds` is left empty and each description loses that reference; the
 last reference frees it. `ProcessContext::fds` keeps one `FdState` per
 descriptor as that process's *view*, and the supervisor writes every advance
-through to every view of the description, so `FdState` and its provider-wire
-encoding are unchanged. A `Clone` child is refused rather than treated as a
+through to every view of the description, while the filesystem binding is carried separately in each `FdState`. A `Clone` child is refused rather than treated as a
 fork: `CLONE_FILES` would share the descriptor *table*, which this does not
 model, and no backend emits it today.
 
@@ -317,7 +315,7 @@ optional.** A writer `journal.open` against an existing-but-empty directory
 establishes a *fresh* log; a fresh log has nothing pending, so `Overlay::bind`
 does not poison and `requires_recovery()` would answer `false` for a run that may
 have crashed mid-transaction. `run` therefore mints a journal-instance nonce into
-the store *and* beside the log, and `resume` requires them to match before it
+the store *and* the log’s first record, and `resume` requires them to match before it
 opens anything. Missing or mismatched is a structured refusal naming the missing
 evidence -- a third outcome beside `recovery_required: true` and `false`, and the
 reason `false` always means "classified, and no reconciliation is required".
@@ -368,3 +366,25 @@ hides is never revealed.
 cargo check -p umbra-supervisor
 cargo test -p umbra-supervisor
 ```
+
+## Filesystem metadata dispatch
+
+Routed descriptor filesystem queries retain a full filesystem binding and output buffer
+in `FilesystemQueries`. Native descriptors (including negative descriptors)
+and rewrite-backed runs resume the original syscall. Owned but closed
+descriptors return EBADF before output validation. Namespace errors precede
+copyout, and absent metadata capability returns ENOTSUP.
+
+The supervisor checks request/task/thread/image identity, the full
+binding and every v1 metadata field before encoding or copying bytes. Exec,
+thread/process exit, provider failure and teardown cancel retained queries.
+Provider errors or malformed replies poison the run; they cannot become
+zero-filled successful metadata. The current namespace call is synchronous,
+so the event loop cannot process another trace event during that call;
+pending-state tests exercise invalidation and late replies explicitly.
+There is no independent stop-generation check; the request identity prevents
+a prior request from completing a newer one.
+
+Pathname `statfs` retains the native host view. It may disagree with synthetic
+descriptor metadata or fail for an overlay-only path. The descriptor capability
+does not hide host mounts.

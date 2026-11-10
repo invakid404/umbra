@@ -3303,6 +3303,42 @@ fn reconcilable_on_reopen(operation: &JournalPendingOperation) -> bool {
         )
 }
 impl NamespaceSession for Overlay {
+    fn filesystem_metadata_capabilities(&self) -> &'static [&'static str] {
+        &[umbra_core::capabilities::NAMESPACE_FILESYSTEM_METADATA_V1]
+    }
+    fn filesystem_metadata(
+        &mut self,
+        context: &ProcessContext,
+        operation: &FsOp,
+        token: umbra_core::FilesystemQueryToken,
+    ) -> Result<std::result::Result<umbra_core::FilesystemReply, Errno>> {
+        self.idle()?;
+        if token.task != context.task || token.image_generation != context.exec_generation {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "filesystem query context mismatch",
+            ));
+        }
+        let binding = match operation {
+            FsOp::FstatFs { fd } => {
+                let Some(state) = context.fds.get(fd) else {
+                    return Ok(Err(Errno(9)));
+                };
+                let Some(binding) = &state.filesystem else {
+                    return Ok(Err(Errno(45)));
+                };
+                // No pathname lookup: an open description retains its binding
+                // through unlink, rename, copy-up and descriptor-number reuse.
+                binding.clone()
+            }
+            _ => return Err(error(ErrorKind::ProtocolMismatch, "not a filesystem query")),
+        };
+        Ok(Ok(umbra_core::FilesystemReply {
+            token,
+            metadata: binding.metadata()?,
+        }))
+    }
+
     fn set_routed_request(&mut self, request: RoutedRequest) -> Result<()> {
         self.idle()?;
         self.routed_request = None;
@@ -3983,6 +4019,9 @@ impl NamespaceSession for Overlay {
                 self.routed_descriptor = Some((
                     descriptor,
                     FdState {
+                        filesystem: Some(umbra_core::FilesystemBinding::overlay(
+                            self.config()?.context.run_id,
+                        )),
                         object: stat.object_id,
                         logical_path: Some(logical_path),
                         // **What the object is, not what the caller asked for.**

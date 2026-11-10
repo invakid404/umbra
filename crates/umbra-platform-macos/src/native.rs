@@ -3165,6 +3165,35 @@ impl TraceBackend for MacosTraceBackend {
         let i = self.task_index(task)?;
         self.sessions[i].write(address, bytes)
     }
+    fn copyout_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()> {
+        let i = self.task_index(task)?;
+        let session = &self.sessions[i];
+        if !session.stopped || session.done || bytes.len() > MAX_IO_BYTES {
+            return Err(error("copyout", "invalid task state or byte count"));
+        }
+        if address == 0 || address.checked_add(bytes.len() as u64).is_none() {
+            return Err(
+                error("copyout", "invalid output address").with_errno(umbra_core::Errno(14))
+            );
+        }
+        // SAFETY: bytes owns the source buffer; the task send right is live.
+        // Mach validates the destination and its protection. Unlike debugger
+        // writes, this must not make a read-only page writable.
+        let result = unsafe {
+            mach2::vm::mach_vm_write(
+                session.task.0,
+                address,
+                bytes.as_ptr() as _,
+                bytes.len() as _,
+            )
+        };
+        if result == mach2::kern_return::KERN_INVALID_ADDRESS
+            || result == mach2::kern_return::KERN_PROTECTION_FAILURE
+        {
+            return Err(error("copyout", "inaccessible output").with_errno(umbra_core::Errno(14)));
+        }
+        mach(result, "copyout")
+    }
     fn registers(&mut self, thread: ThreadId) -> Result<RegisterSet> {
         let i = self.thread_index(thread)?;
         self.sessions[i].regs(thread)

@@ -894,6 +894,9 @@ pub fn resume(_spec: ResumeSpec) -> Result<ResumeOutcome> {
     ))
 }
 
+#[cfg(all(test, unix))]
+pub(crate) use unix::finish_supervision;
+
 #[cfg(unix)]
 mod unix {
     use super::*;
@@ -1333,6 +1336,15 @@ mod unix {
         }
 
         let loop_result = supervisor.run();
+        finish_supervision(supervisor, loop_result, &mut observer)
+    }
+
+    pub(crate) fn finish_supervision(
+        mut supervisor: Supervisor,
+        loop_result: Result<()>,
+        observer: &mut Option<Box<dyn RunObserver>>,
+    ) -> Result<()> {
+        let run_id = supervisor.state().run_id;
         let outcome = RunOutcome {
             run_id,
             root_status: supervisor.root_status(),

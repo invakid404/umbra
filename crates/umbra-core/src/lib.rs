@@ -345,6 +345,11 @@ pub enum MapFlags {
 /// Decoders must reject unclassified potential mutations, never treat them as reads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FsOp {
+    /// Query the filesystem captured by an open descriptor.
+    FstatFs {
+        /// Descriptor; lookup must precede output-buffer validation.
+        fd: TracedFd,
+    },
     /// Open.
     Open {
         /// Dir.
@@ -771,9 +776,104 @@ impl From<RegisterSet> for RegisterData {
     }
 }
 
+/// The authoritative identity of a composed logical filesystem.
+///
+/// Presentation fsids may be truncated hashes; they are never authority keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemBinding {
+    /// Run whose namespace owns the filesystem.
+    pub run: RunId,
+    /// Versioned logical filesystem identity, currently `overlay-v1`.
+    pub filesystem: String,
+}
+
+/// A statistic whose value may be undefined for a composed filesystem.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilesystemStatistic {
+    /// No meaningful aggregate statistic exists.
+    Undefined,
+    /// A known value, checked by the target ABI before narrowing.
+    Known(u128),
+}
+
+/// Filesystem metadata supplied by the namespace, without host mount details.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemMetadata {
+    /// Full authority key echoed by the provider.
+    pub binding: FilesystemBinding,
+    /// Block accounting unit.
+    pub block_size: FilesystemStatistic,
+    /// Optimal transfer size.
+    pub io_size: FilesystemStatistic,
+    /// Total, free and available blocks, followed by total and free inodes.
+    pub counts: [FilesystemStatistic; 5],
+    /// Virtual filesystem type.
+    pub type_name: String,
+    /// Logical mount root.
+    pub mount_name: String,
+    /// Virtual source name.
+    pub source_name: String,
+}
+
+/// Runtime identity of one stopped filesystem query. Never persisted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemQueryToken {
+    /// Monotonically allocated request identity.
+    pub request: u64,
+    /// Process whose address space holds the output.
+    pub task: TaskId,
+    /// Stopped thread.
+    pub thread: ThreadId,
+    /// Executable image generation.
+    pub image_generation: u64,
+}
+
+/// Provider response carrying both request and full filesystem identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemReply {
+    /// Request being completed.
+    pub token: FilesystemQueryToken,
+    /// Resolved metadata; includes the full binding.
+    pub metadata: FilesystemMetadata,
+}
+
+impl FilesystemBinding {
+    /// Construct the one logical filesystem owned by a run.
+    pub fn overlay(run: RunId) -> Self {
+        Self {
+            run,
+            filesystem: "overlay-v1".to_owned(),
+        }
+    }
+
+    /// Reconstruct version-one metadata without consulting physical storage.
+    pub fn metadata(&self) -> Result<FilesystemMetadata> {
+        if self.filesystem != "overlay-v1" {
+            return Err(UmbraError::new(
+                ErrorKind::ProtocolMismatch,
+                "filesystem.binding",
+                "unknown logical filesystem binding",
+            ));
+        }
+        Ok(FilesystemMetadata {
+            binding: self.clone(),
+            block_size: FilesystemStatistic::Undefined,
+            io_size: FilesystemStatistic::Undefined,
+            counts: std::array::from_fn(|_| FilesystemStatistic::Undefined),
+            type_name: "umbra".to_owned(),
+            mount_name: "/".to_owned(),
+            source_name: format!("umbra:{}", self.run.0),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Fd state.
 pub struct FdState {
+    /// Immutable filesystem identity captured at successful routed open.
+    /// Legacy states have no binding and cannot answer filesystem metadata.
+    #[serde(default)]
+    pub filesystem: Option<FilesystemBinding>,
     /// Object.
     pub object: ObjectId,
     /// Logical path.
@@ -1117,6 +1217,46 @@ pub struct ResumeCommand {
 mod tests {
     use super::*;
     use serde::de::value::{Error as ValueError, SeqDeserializer};
+
+    #[test]
+    fn f214_descriptor_binding_serialization_preserves_authority() {
+        let binding = FilesystemBinding::overlay(RunId(uuid::Uuid::from_u128(17)));
+        let state = FdState {
+            filesystem: Some(binding.clone()),
+            object: ObjectId(uuid::Uuid::from_u128(23)),
+            logical_path: Some(BytePath::new(b"/removed".to_vec()).unwrap()),
+            directory: false,
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+            offset: 41,
+        };
+        let mut wire = serde_json::to_value(&state).unwrap();
+        let inherited: FdState = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(inherited, state);
+        assert_eq!(
+            inherited.filesystem.unwrap().metadata().unwrap(),
+            binding.metadata().unwrap()
+        );
+
+        // Old serialized descriptors must not acquire invented authority.
+        wire.as_object_mut().unwrap().remove("filesystem");
+        let legacy: FdState = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(legacy.filesystem, None);
+        assert_eq!(legacy.object, state.object);
+        assert_eq!(legacy.offset, state.offset);
+
+        wire["filesystem"] = serde_json::json!({
+            "run": binding.run,
+            "filesystem": "unknown-version"
+        });
+        let corrupt: FdState = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            corrupt.filesystem.unwrap().metadata().unwrap_err().kind,
+            ErrorKind::ProtocolMismatch
+        );
+    }
 
     #[test]
     fn byte_paths_preserve_non_utf8_and_unresolved_components() {

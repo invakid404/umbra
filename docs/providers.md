@@ -45,7 +45,7 @@ is still refused. It exposes opaque handles and no physical path. `umbra run` se
 the experimental userspace-routing capability with the interposing macOS platform;
 the host-side journal must be retained under `--state-dir` for resume. This path
 qualifies individual operations and refusals, not arbitrary application support:
-the rank-14 SQLx WAL cases fail at connection setup with `SQLITE_IOERR_ACCESS`. Its live transport is behind the off-by-default `transport-raw`
+the rank-14 SQLx WAL cases fail at connection setup with `SQLITE_IOERR_READ` (266). Its live transport is behind the off-by-default `transport-raw`
 feature; a default build binds none. See its
 [README](../crates/umbra-storage-nfs-userspace/README.md).
 

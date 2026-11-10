@@ -39,6 +39,15 @@ pub enum Request {
     },
     /// Registers.
     Registers(ThreadId),
+    /// Syscall result copyout, respecting memory protection.
+    CopyoutMemory {
+        /// Stopped task.
+        task: TaskId,
+        /// Output address.
+        address: u64,
+        /// Result bytes.
+        bytes: Vec<u8>,
+    },
     /// Set registers.
     SetRegisters {
         /// Thread.
@@ -88,6 +97,8 @@ pub enum Request {
     DirectoryRequest(RegisterSet),
     /// Encode stat.
     EncodeStat(umbra_core::BlobStat),
+    /// Encode logical filesystem metadata.
+    EncodeFilesystemMetadata(umbra_core::FilesystemMetadata),
 }
 /// Owned method results, including buffers copied only after response validation.
 #[derive(Serialize, Deserialize)]
@@ -118,6 +129,8 @@ pub enum Response {
     /// bytes are an ABI encoding of metadata and were never in the tracee, and
     /// a shared variant would let one answer the other's request.
     EncodedStat(Vec<u8>),
+    /// Encoded filesystem metadata, distinct from file-stat and memory replies.
+    EncodedFilesystemMetadata(Vec<u8>),
     /// Prepared.
     Prepared(PreparedRewrite),
 }
@@ -218,6 +231,17 @@ impl TraceBackend for Control {
             Response::Registers(v) => Ok(v),
             _ => Err(protocol_error("platform.registers response")),
         }
+    }
+    fn copyout_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()> {
+        bounds(address, bytes.len())?;
+        unit(call(
+            &self.client,
+            &Request::CopyoutMemory {
+                task,
+                address,
+                bytes: bytes.to_vec(),
+            },
+        )?)
     }
     fn set_registers(&mut self, thread: ThreadId, regs: &RegisterSet) -> Result<()> {
         unit(call(
@@ -350,6 +374,20 @@ impl SyscallAbi for Abi {
             _ => Err(protocol_error("platform.encode_stat response")),
         }
     }
+    fn encode_filesystem_metadata(
+        &self,
+        metadata: &umbra_core::FilesystemMetadata,
+    ) -> Result<Vec<u8>> {
+        match call(
+            &self.client,
+            &Request::EncodeFilesystemMetadata(metadata.clone()),
+        )? {
+            Response::EncodedFilesystemMetadata(bytes) if bytes.len() == 2168 => Ok(bytes),
+            _ => Err(protocol_error(
+                "platform.encode_filesystem_metadata response",
+            )),
+        }
+    }
     fn apply_rewrite(&self, regs: &mut RegisterSet, rewrite: &PreparedRewrite) -> Result<()> {
         match call(
             &self.client,
@@ -409,6 +447,16 @@ fn control_request(control: &mut dyn TraceControl, request: Request) -> Result<R
             bounds(address, bytes.len())?;
             control
                 .write_memory(task, address, &bytes)
+                .map(|()| Response::Unit)
+        }
+        Request::CopyoutMemory {
+            task,
+            address,
+            bytes,
+        } => {
+            bounds(address, bytes.len())?;
+            control
+                .copyout_memory(task, address, &bytes)
                 .map(|()| Response::Unit)
         }
         Request::Registers(thread) => control.registers(thread).map(Response::Registers),
@@ -547,6 +595,10 @@ fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> R
                 Request::EncodeStat(stat) => {
                     platform.abi.encode_stat(&stat).map(Response::EncodedStat)
                 }
+                Request::EncodeFilesystemMetadata(metadata) => platform
+                    .abi
+                    .encode_filesystem_metadata(&metadata)
+                    .map(Response::EncodedFilesystemMetadata),
                 Request::Rewrite { mut regs, rewrite } => platform
                     .abi
                     .apply_rewrite(&mut regs, &rewrite)

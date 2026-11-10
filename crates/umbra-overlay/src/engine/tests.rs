@@ -1192,6 +1192,7 @@ fn resolver_anchors_cwd_dirfd_and_refuses_escape_and_stale_descriptors() {
     f.process.fds.insert(
         TracedFd(3),
         FdState {
+            filesystem: None,
             object,
             logical_path: Some(bytes(b"/jail/dir")),
             directory: true,
@@ -1378,6 +1379,7 @@ fn readdir_uses_injected_encoding_and_advances_only_after_commit() {
     f.process.fds.insert(
         TracedFd(3),
         FdState {
+            filesystem: None,
             object,
             logical_path: Some(bytes(b"/")),
             directory: true,
@@ -1455,6 +1457,7 @@ fn a_directory_read_decides_the_descriptor_before_the_output_bound_and_answers_b
     f.process.fds.insert(
         TracedFd(3),
         FdState {
+            filesystem: None,
             object,
             logical_path: Some(bytes(b"/")),
             directory: true,
@@ -1519,6 +1522,7 @@ fn an_encoder_refusal_is_answered_when_it_carries_an_errno_and_fatal_when_it_doe
         f.process.fds.insert(
             TracedFd(3),
             FdState {
+                filesystem: None,
                 object,
                 logical_path: Some(bytes(b"/")),
                 directory: true,
@@ -1706,6 +1710,7 @@ fn readlink_non_utf8_is_verbatim_and_native_buffer_truncates_without_nul() {
     f.process.fds.insert(
         TracedFd(9),
         FdState {
+            filesystem: None,
             object: stat.object_id,
             logical_path: Some(bytes(b"/dir")),
             directory: true,
@@ -2268,6 +2273,7 @@ fn symlink_cwd_and_dirfd_anchors_are_resolved_before_identity_checks() {
     f.process.fds.insert(
         TracedFd(7),
         FdState {
+            filesystem: None,
             object,
             logical_path: Some(bytes(b"/alias")),
             directory: true,
@@ -8431,6 +8437,7 @@ fn an_fstat_on_a_bound_descriptor_answers_from_the_logical_object() {
     f.process.fds.insert(
         fd,
         FdState {
+            filesystem: None,
             object: stat.object_id,
             logical_path: Some(bytes(b"seed.txt")),
             directory: false,
@@ -8473,6 +8480,7 @@ fn an_fstat_answers_on_a_descriptor_that_was_opened_write_only() {
     f.process.fds.insert(
         fd,
         FdState {
+            filesystem: None,
             object: stat.object_id,
             logical_path: Some(bytes(b"seed.txt")),
             directory: false,
@@ -8528,6 +8536,7 @@ fn routed_stat_does_not_survive_into_the_next_resolution() {
     f.process.fds.insert(
         fd,
         FdState {
+            filesystem: None,
             object: stat.object_id,
             logical_path: Some(bytes(b"seed.txt")),
             directory: false,
@@ -8657,6 +8666,7 @@ fn descriptor_flags_use_only_the_live_descriptor_table() {
         f.process.fds.insert(
             fd,
             FdState {
+                filesystem: None,
                 object,
                 logical_path: None,
                 directory: false,
@@ -8697,4 +8707,324 @@ fn descriptor_flags_use_only_the_live_descriptor_table() {
         f.overlay.resolve(&f.process, &op).unwrap(),
         ResolvedAction::Deny(Errno(9))
     );
+}
+
+#[test]
+fn f214_delayed_metadata_reply_keeps_binding_across_copyup() {
+    let mut f = Fixture::new(&[(b"dir/seed.txt", b"base bytes")]);
+    let path = StoragePath::new(StorageAnchor::Root, b"dir/seed.txt".to_vec()).unwrap();
+    let original_object = f.overlay.lookup(&path).unwrap().0.object_id;
+    let fd = TracedFd(4096);
+    f.process.fds.insert(
+        fd,
+        FdState {
+            filesystem: Some(umbra_core::FilesystemBinding::overlay(
+                f.overlay.config().unwrap().context.run_id,
+            )),
+            object: original_object,
+            logical_path: Some(bytes(b"dir/seed.txt")),
+            directory: false,
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+            offset: 0,
+        },
+    );
+    let query = FsOp::FstatFs { fd };
+    let token = umbra_core::FilesystemQueryToken {
+        request: 1,
+        task: f.process.task,
+        thread: ThreadId(f.process.task.0),
+        image_generation: f.process.exec_generation,
+    };
+    // The namespace has captured the descriptor response. Hold its
+    // delivery while another operation changes the object's backing layer.
+    let captured = f
+        .overlay
+        .filesystem_metadata(&f.process, &query, token.clone())
+        .unwrap()
+        .unwrap();
+    let expected =
+        umbra_core::FilesystemBinding::overlay(f.overlay.config().unwrap().context.run_id)
+            .metadata()
+            .unwrap();
+    let (release, paused) = std::sync::mpsc::channel();
+    let responder = std::thread::spawn(move || {
+        paused
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        captured
+    });
+    assert!(!f.shadow_root.join("dir/seed.txt").exists());
+    f.run(&open(
+        b"dir/seed.txt",
+        OpenFlags {
+            read: true,
+            write: true,
+            ..Default::default()
+        },
+    ));
+    assert_eq!(
+        fs::read(f.shadow_root.join("dir/seed.txt")).unwrap(),
+        b"base bytes"
+    );
+    assert_ne!(
+        f.overlay.lookup(&path).unwrap().0.object_id,
+        original_object,
+        "the test must cross a real backing-object transition"
+    );
+    fs::write(f.shadow_root.join("dir/seed.txt"), b"updated shadow").unwrap();
+    assert_eq!(f.read(b"dir/seed.txt").unwrap(), b"updated shadow");
+    assert_eq!(
+        fs::read(f.base_root.join("dir/seed.txt")).unwrap(),
+        b"base bytes"
+    );
+    release.send(()).unwrap();
+    let delayed = responder.join().unwrap();
+    assert_eq!(delayed.token, token);
+    assert_eq!(delayed.metadata, expected);
+    let next_token = umbra_core::FilesystemQueryToken {
+        request: 2,
+        ..token
+    };
+    let current = f
+        .overlay
+        .filesystem_metadata(&f.process, &query, next_token.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.token, next_token);
+    assert_eq!(current.metadata, expected);
+}
+
+#[test]
+fn f214_descriptor_binding_survives_namespace_removal() {
+    let mut f = Fixture::new(&[(b"dir/seed.txt", b"seed\n")]);
+    let binding =
+        umbra_core::FilesystemBinding::overlay(f.overlay.config().unwrap().context.run_id);
+    let stat = f
+        .overlay
+        .lookup(&StoragePath::new(StorageAnchor::Root, b"dir/seed.txt".to_vec()).unwrap())
+        .unwrap()
+        .0;
+    let fd = TracedFd(4096);
+    f.process.fds.insert(
+        fd,
+        FdState {
+            filesystem: Some(binding.clone()),
+            object: stat.object_id,
+            logical_path: Some(bytes(b"dir/seed.txt")),
+            directory: false,
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+            offset: 7,
+        },
+    );
+    let token = umbra_core::FilesystemQueryToken {
+        request: 1,
+        task: f.process.task,
+        thread: umbra_core::ThreadId(f.process.task.0),
+        image_generation: f.process.exec_generation,
+    };
+    std::fs::remove_file(f.base_root.join("dir/seed.txt")).unwrap();
+    std::fs::remove_dir(f.base_root.join("dir")).unwrap();
+    let response = f
+        .overlay
+        .filesystem_metadata(&f.process, &FsOp::FstatFs { fd }, token.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.metadata, binding.metadata().unwrap());
+    assert_eq!(response.token, token);
+    assert_eq!(f.process.fds[&fd].offset, 7);
+    assert!(!f.base_root.join("dir/seed.txt").exists());
+    f.process.fds.get_mut(&fd).unwrap().filesystem = None;
+    assert_eq!(
+        f.overlay
+            .filesystem_metadata(&f.process, &FsOp::FstatFs { fd }, token.clone())
+            .unwrap(),
+        Err(Errno(45))
+    );
+    f.process.fds.remove(&fd);
+    assert_eq!(
+        f.overlay
+            .filesystem_metadata(&f.process, &FsOp::FstatFs { fd }, token)
+            .unwrap(),
+        Err(Errno(9))
+    );
+}
+
+#[test]
+fn f214_retained_binding_survives_external_namespace_rename() {
+    let mut f = Fixture::new(&[(b"dir/seed.txt", b"seed\n")]);
+    let binding =
+        umbra_core::FilesystemBinding::overlay(f.overlay.config().unwrap().context.run_id);
+    let stat = f
+        .overlay
+        .lookup(&StoragePath::new(StorageAnchor::Root, b"dir/seed.txt".to_vec()).unwrap())
+        .unwrap()
+        .0;
+    let fd = TracedFd(4096);
+    f.process.fds.insert(
+        fd,
+        FdState {
+            filesystem: Some(binding.clone()),
+            object: stat.object_id,
+            logical_path: Some(bytes(b"dir/seed.txt")),
+            directory: false,
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+            offset: 7,
+        },
+    );
+    let token = umbra_core::FilesystemQueryToken {
+        request: 1,
+        task: f.process.task,
+        thread: umbra_core::ThreadId(f.process.task.0),
+        image_generation: f.process.exec_generation,
+    };
+    // Mutate the backing namespace directly: this does not claim routed rename support.
+    std::fs::rename(f.base_root.join("dir"), f.base_root.join("moved")).unwrap();
+    let response = f
+        .overlay
+        .filesystem_metadata(&f.process, &FsOp::FstatFs { fd }, token.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.metadata, binding.metadata().unwrap());
+    assert_eq!(response.token, token);
+    assert_eq!(f.process.fds[&fd].offset, 7);
+    assert!(!f.base_root.join("dir/seed.txt").exists());
+    assert_eq!(
+        fs::read(f.base_root.join("moved/seed.txt")).unwrap(),
+        b"seed\n"
+    );
+}
+
+#[test]
+fn f214_resume_identity() {
+    fn recreated_descriptor(
+        overlay: &mut Overlay,
+        process: &ProcessContext,
+        token: umbra_core::FilesystemQueryToken,
+    ) -> umbra_core::FilesystemMetadata {
+        overlay.config.as_mut().unwrap().binding.root.physical_path = None;
+        overlay
+            .set_routed_request(RoutedRequest {
+                descriptor: Some(Ok(TracedFd(4096))),
+                ..Default::default()
+            })
+            .unwrap();
+        let action = overlay
+            .resolve(
+                process,
+                &open(
+                    b"/",
+                    OpenFlags {
+                        read: true,
+                        directory: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        let prepared = overlay
+            .prepare(OperationId(Uuid::new_v4()), &action)
+            .unwrap();
+        let (fd, state) = overlay
+            .routed_descriptor()
+            .unwrap()
+            .expect("real routed open captured binding");
+        overlay
+            .observe_result(
+                prepared.operation_id,
+                &OperationOutcome::Success {
+                    return_value: fd.0 as u64,
+                },
+            )
+            .unwrap();
+        overlay.commit(prepared.operation_id).unwrap();
+        let mut recreated = process.clone();
+        recreated.fds.insert(fd, state);
+        overlay
+            .filesystem_metadata(&recreated, &FsOp::FstatFs { fd }, token)
+            .unwrap()
+            .unwrap()
+            .metadata
+    }
+
+    let mut f = Fixture::new(&[]);
+    let run_id = f.overlay.config().unwrap().context.run_id;
+    let token = umbra_core::FilesystemQueryToken {
+        request: 1,
+        task: f.process.task,
+        thread: ThreadId(f.process.task.0),
+        image_generation: 0,
+    };
+    let before = recreated_descriptor(&mut f.overlay, &f.process, token.clone());
+    f.overlay
+        .finish_run(&FinishRunRequest {
+            run_id,
+            root_status: Some(ExitStatus::Code(0)),
+            processes_exited: 1,
+        })
+        .unwrap();
+    let mut storage = LocalStorage::new(f._dirs[1].path()).unwrap();
+    let binding = storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::OpenExisting,
+            immutable_base: ImmutableBaseContract {
+                identity: "test-base".into(),
+                fingerprint: vec![1],
+            },
+            policy: StoragePolicy {
+                read_only: false,
+                require_strict_remote_persistence: false,
+                require_kernel_shadow: false,
+                format_version: 1,
+            },
+        })
+        .unwrap();
+    let lease = storage
+        .acquire_writer(&AcquireWriterRequest {
+            run_id,
+            writer_id: WriterId("reopened".into()),
+            takeover: TakeoverPolicy::Refuse,
+        })
+        .unwrap();
+    let mut empty_base = Fixture::new(&[]);
+    let base = empty_base.overlay.base.take().unwrap();
+    let journal = MemoryJournal {
+        log: Arc::new(Mutex::new(Log::default())),
+        run: run_id,
+        epoch: lease.epoch,
+    };
+    let mut reopened = Overlay::new(Box::new(storage), Box::new(journal));
+    reopened
+        .bind(
+            SessionConfig {
+                context: context(run_id, Some(lease.epoch)),
+                recovery: recovery(run_id),
+                binding,
+                lease,
+            },
+            base,
+        )
+        .unwrap();
+    let after = recreated_descriptor(&mut reopened, &f.process, token);
+    assert_eq!(before, after);
+    assert_ne!(
+        before.binding,
+        umbra_core::FilesystemBinding::overlay(empty_base.overlay.config().unwrap().context.run_id)
+    );
+    reopened
+        .finish_run(&FinishRunRequest {
+            run_id,
+            root_status: Some(ExitStatus::Code(0)),
+            processes_exited: 1,
+        })
+        .unwrap();
 }

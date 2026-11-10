@@ -154,3 +154,18 @@ the kernel's range and umbra's disjoint by construction. Lowering the hard limit
 is the load-bearing half; with only the soft limit lowered the tracee raises it
 back.
 <!-- /memoria:section -->
+
+## Logical filesystem metadata
+
+`FilesystemBinding` is the full `(RunId, overlay-v1)` authority key captured
+in `FdState::filesystem` at routed open. Inheritance serializes that key;
+missing legacy bindings refuse metadata with ENOTSUP. `FilesystemMetadata`
+describes the composed namespace, not an inode or physical export.
+`FilesystemStatistic::Undefined` denotes unavailable aggregate statistics,
+not zero or unlimited space. `FilesystemQueryToken` and `FilesystemReply`
+carry runtime request, task, thread and image identity; they are not
+journal or manifest data. No independent stop generation is tracked.
+
+The v1 capability serves descriptor queries only. Pathname filesystem metadata
+retains the native host view; no path/descriptor equality or host-mount isolation
+is promised.

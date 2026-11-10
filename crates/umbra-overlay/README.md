@@ -799,8 +799,10 @@ expose the placeholder as a file: the probe is answered from the `0o777` the
 overlay reports for every logical symlink, not from the placeholder's `0444`.
 That is a resolver-layer property. Each of those answers is a
 `ResolvedAction::Emulate`, which the supervisor executes through the platform's
-emulation interface. A backend that cannot install that result and skip the
+emulation interface. Filesystem metadata results include validated memory
+writes. A backend that cannot install that result and skip the
 trapped call fails closed.
+An operation must still reach the resolver through a supported syscall entry.
 
 Control metadata lives outside tracee listings:
 
@@ -921,7 +923,11 @@ executable regular-file MVP, not complete POSIX coverage.
 ## Validation
 
 Run `cargo test -p umbra-overlay`. Tests inject real `umbra-storage-local` base and
-shadow runs, with no NFS or fixture environment variables. They exercise copy-up,
+shadow runs, with no NFS requirement. The optional
+`a_local_run_through_a_proxy_turns_on_the_parent_identity_branch` test locates the
+local provider through `UMBRA_BIN_DIR` or the normal build output and skips when
+that binary is absent; its positive ownership branch also depends on the host
+providing the required distinct parent identity. They exercise copy-up,
 shadow/stat precedence, create parents, the mode a materialised shadow ancestor
 takes from its base counterpart — including a read-only base directory, whose
 owner bits must be widened or the run would be poisoned — whiteouts and
@@ -991,3 +997,27 @@ protocol now carries the lifecycle calls, but `umbra_supervisor` still binds
 `standard_namespace` and refuses a namespace-role registry, so an alternative
 namespace provider cannot yet own a run.
 <!-- /memoria:section -->
+
+## Filesystem metadata queries
+
+The in-process overlay advertises `namespace-filesystem-metadata-v1` through
+`filesystem_metadata_capabilities`. `filesystem_metadata` accepts descriptor
+queries only and uses the
+immutable filesystem binding captured at open, so removing a pathname does
+not invalidate filesystem metadata. This does not repair the separate
+pathname-dependent descriptor byte-I/O limitation.
+The namespace IPC proxy inherits the default metadata refusal; `serve_provider`
+still advertises an empty capability set. This contract adds no namespace IPC
+operation.
+
+All objects in one run share the `overlay-v1` filesystem, including base-only
+and copied-up objects. Metadata is reconstructed from the run key, independent
+of the provider instance or writer epoch. Aggregate capacity, free space,
+inode counts, block size and optimal I/O size are undefined. No storage
+capacity request or storage protocol change is involved.
+
+Routed rename still returns ENOTSUP. Live tests separately verify descriptor
+metadata after successful unlink and after an exact rename refusal with an
+unchanged namespace. A deterministic namespace test renames the backing
+namespace directly and verifies the retained descriptor binding, old-path
+absence and the new backing-file contents. It does not claim live routed rename support.

@@ -8,8 +8,8 @@
 //! Construction performs no I/O. [`run`] owns the staged composition of one
 //! command run: validate, connect storage, open the run, take the writer lease,
 //! open the journal, bind the namespace, render enforcement, launch stopped, drive
-//! events, then tear down in order. Checkpoint, resume and recovery remain
-//! unimplemented and say so.
+//! events, then tear down in order. Resume reopens and classifies existing state;
+//! checkpoint publication and recovery reconciliation remain unimplemented.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -326,6 +326,8 @@ pub struct RunBudget {
     pub descriptor_floor: Option<u32>,
 }
 
+mod filesystem;
+
 /// Contracts only: no backend-kind enum, concrete backend import, or provider I/O.
 pub struct Supervisor {
     platform: PlatformSession,
@@ -338,6 +340,8 @@ pub struct Supervisor {
     root_status: Option<ExitStatus>,
     renew_at: Option<Instant>,
     operations: BTreeMap<ThreadId, OperationId>,
+    filesystem_sequence: u64,
+    filesystem_queries: crate::filesystem::FilesystemQueries,
     /// What a routed operation's *observed success* must do to the issuing
     /// process's descriptor table, recorded at the entry that planned it.
     ///
@@ -458,6 +462,8 @@ impl Supervisor {
             root_status: None,
             renew_at: None,
             operations: BTreeMap::new(),
+            filesystem_sequence: 0,
+            filesystem_queries: Default::default(),
             routed: BTreeMap::new(),
             ofds: Default::default(),
             directory: crate::directory::DirectoryBuffer::default(),

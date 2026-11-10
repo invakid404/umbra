@@ -9502,20 +9502,12 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-pinned for #186 (was 81e1cd50…, the slate-r10/r11 characterization).
-    // native.rs gained the ordered teardown only: +709/-0 lines, all of them
-    // teardown (Session::ordered_teardown, its barrier and decision table,
-    // terminate/Drop wiring, the exit-report capture in `stop`, the k re-send
-    // and the post-kill barrier of the #186 review ruling, and the barrier
-    // lookup's exec-swap citations).
-    // The fork guard (`fn single_thread`, sha256 41efdfc0…, and its call sites)
-    // and the __posix_spawn x2 guard (`if number == 244 {` block, sha256
-    // fe7c9f4b…) are byte-identical to 7ccd7b0e. The runtime refusal
-    // characterization this pin protects is repeated by this case itself, which
-    // the #186 fix un-skips in required CI on the runner.
+    // Re-pinned for filesystem metadata: native.rs adds checked output copyout. Generic input-read
+    // errors retain base behavior. The fork/spawn guards and their call sites are
+    // unchanged. The structural and runtime checks below remain required.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("298739649ddb961bc76bd2d5ae2186f634574c363639761797765efb2497d006"),
+        Some("267ec5959e0a6d7fe8a91b7b146f38eb964878b0a81efc312d1792e1e25d5718"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -12458,7 +12450,7 @@ fn r14_routed(
     let observer = R14Observer::start(evidence.join("observer"), move |_, end| {
         let id = r14_run_id(&seen_state)?;
         let mut objects = serde_json::Map::new();
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".lock"] {
             let mut path = vec![
                 EXPORT.to_vec(),
                 RUN_PARENT.to_vec(),
@@ -12568,6 +12560,229 @@ fn slate_r14_observer_routed_qualification() {
         assert_host_write_root_empty(&run);
     }
     slate_finish_cleanup();
+}
+
+// Independent Darwin SDK layout oracle for the ruled logical filesystem.
+// Compare the whole result, including padding, rather than selecting fields.
+fn f214_expected_metadata(run_id: RunId) -> Vec<u8> {
+    let mut bytes = vec![0u8; 2168];
+    bytes[..64].fill(0xff);
+    bytes[68..72].fill(0xff);
+    let digest = r14_sha256(format!("umbra-overlay-v1:{}", run_id.0).as_bytes());
+    for index in 0..8 {
+        bytes[48 + index] = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    bytes[72..77].copy_from_slice(b"umbra");
+    bytes[88] = b'/';
+    let source = format!("umbra:{}", run_id.0);
+    bytes[1112..1112 + source.len()].copy_from_slice(source.as_bytes());
+    bytes
+}
+
+#[test]
+fn f214_native_exec_replaces_canary() {
+    let Some(root) = slate_evidence() else {
+        return;
+    };
+    let evidence = root.join("f214_native_exec_canary");
+    slate_fresh_dir(&evidence);
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(
+        scratch.path(),
+        "umbra-fix-214-statfs",
+        "UMBRA_FIX_214_STATFS_PATH",
+    );
+    let output = slate_bounded(
+        Command::new(&program)
+            .arg("native-canary-exec")
+            .arg(scratch.path()),
+        &evidence.join("native"),
+    );
+    assert!(output.status.success(), "native exec canary control");
+    let marker = std::fs::read_to_string(scratch.path().join("records.canary")).unwrap();
+    assert!(marker.trim().parse::<u32>().unwrap() > 0);
+    std::fs::write(evidence.join("replacement-image.pid"), marker).unwrap();
+    slate_finish_cleanup();
+}
+
+#[test]
+fn f214_metadata_fields() {
+    f214_metadata_case("fields");
+}
+
+#[test]
+fn f214_base_copyup_identity() {
+    f214_metadata_case("copyup");
+}
+
+#[test]
+fn f214_open_unlink() {
+    f214_metadata_case("unlink");
+}
+
+#[test]
+fn f214_rename_refusal_preserves_binding() {
+    f214_metadata_case("rename-refusal");
+}
+
+#[test]
+fn f214_error_precedence() {
+    f214_metadata_case("errors");
+}
+
+#[test]
+fn f214_copyup_concurrent() {
+    f214_metadata_case("concurrent");
+}
+
+#[test]
+fn f214_fork_exec() {
+    f214_metadata_case("fork");
+}
+
+#[test]
+fn f214_distinct_runs() {
+    let Some(first) = f214_metadata_case("distinct-a") else {
+        return;
+    };
+    let second = f214_metadata_case("distinct-b").expect("second run");
+    assert_ne!(first, second);
+    assert_ne!(
+        &f214_expected_metadata(first)[48..56],
+        &f214_expected_metadata(second)[48..56]
+    );
+}
+
+#[test]
+fn f214_native_mount_identity_preserved() {
+    let Some(root) = slate_evidence() else {
+        return;
+    };
+    let evidence = root.join("identity_snapshot");
+    slate_fresh_dir(&evidence);
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(
+        scratch.path(),
+        "umbra-fix-214-statfs",
+        "UMBRA_FIX_214_STATFS_PATH",
+    );
+    let spawn = SlateSpawn {
+        evidence,
+        scratch,
+        helper: program.clone(),
+        program,
+    };
+    let native_root = spawn.scratch.path().join("native");
+    std::fs::create_dir(&native_root).unwrap();
+    let native = slate_bounded(
+        Command::new(&spawn.program)
+            .arg("identity-snapshot")
+            .arg(&native_root),
+        &spawn.evidence.join("native"),
+    );
+    assert!(native.status.success());
+    let routed = slate_spawn_routed(&spawn, "identity-snapshot", &["records.pid"]);
+    slate_spawn_finish(&spawn, &routed);
+    assert!(routed.output.status.success(), "{}", routed.run.stderr);
+    assert!(journal_records_completion(&routed.run));
+    slate_finish_cleanup();
+    let identity_rows = |text: &str| {
+        text.lines()
+            .filter(|line| line.starts_with("identity-base path="))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let native_rows = identity_rows(std::str::from_utf8(&native.stderr).unwrap());
+    let routed_rows = identity_rows(&routed.run.stderr);
+    assert_eq!(native_rows.len(), 3, "native mount identity table");
+    assert_eq!(
+        routed_rows, native_rows,
+        "base native mount view must survive routing"
+    );
+}
+
+fn f214_metadata_case(mode: &str) -> Option<RunId> {
+    let Some(root) = slate_evidence() else {
+        return None;
+    };
+    let evidence = root.join(format!("f214_{mode}"));
+    slate_fresh_dir(&evidence);
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(
+        scratch.path(),
+        "umbra-fix-214-statfs",
+        "UMBRA_FIX_214_STATFS_PATH",
+    );
+    let spawn = SlateSpawn {
+        evidence,
+        scratch,
+        helper: program.clone(),
+        program,
+    };
+    let native_root = spawn.scratch.path().join("native");
+    std::fs::create_dir(&native_root).unwrap();
+    std::fs::write(native_root.join("seed.txt"), b"ABCDEF").unwrap();
+    let watch = SlateWatch::new(spawn.scratch.path(), &spawn.evidence.join("native"), false);
+    let native = slate_watched(
+        Command::new(&spawn.program)
+            .arg(mode)
+            .arg(&native_root)
+            .arg(&spawn.helper),
+        &spawn.evidence.join("native"),
+        &watch,
+    );
+    assert!(
+        native.status.success(),
+        "native control: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        std::fs::read(native_root.join("records.done"))
+            .unwrap()
+            .len(),
+        2 * 2168,
+        "native SDK ABI size"
+    );
+    std::fs::copy(
+        native_root.join("records.done"),
+        spawn.evidence.join("native-metadata.bin"),
+    )
+    .unwrap();
+    let routed = slate_spawn_routed(&spawn, mode, &["records.pid"]);
+    // Execute lifecycle obligations even when the positive metadata oracle fails.
+    slate_spawn_finish(&spawn, &routed);
+    assert!(journal_records_completion(&routed.run));
+    slate_finish_cleanup();
+    assert!(
+        routed.output.status.success(),
+        "routed metadata: {}",
+        routed.run.stderr
+    );
+    let expected = f214_expected_metadata(routed.run.run_id);
+    let records = routed.object("records.done").expect("metadata records");
+    assert_eq!(records.len(), 2 * expected.len());
+    assert_eq!(&records[..2168], expected.as_slice(), "fstatfs");
+    assert_eq!(&records[2168..], expected.as_slice(), "final fstatfs");
+    if mode == "fork" {
+        let native_pid = std::fs::read(native_root.join("records.pid")).unwrap();
+        let routed_pid = routed
+            .object("records.pid")
+            .expect("child completion marker");
+        for name in ["records.pre", "records.child"] {
+            let native_marker = std::fs::read(native_root.join(name)).unwrap();
+            std::fs::write(
+                spawn.evidence.join(format!("native-{name}")),
+                &native_marker,
+            )
+            .unwrap();
+            assert_eq!(native_marker, native_pid);
+            assert_eq!(
+                routed.object(name).expect("metadata phase marker"),
+                routed_pid
+            );
+        }
+    }
+    Some(routed.run.run_id)
 }
 
 fn r14_value(records: &[serde_json::Value], phase: &str) -> serde_json::Value {
@@ -12750,6 +12965,43 @@ fn r14_case(seeded: bool) {
     assert_host_write_root_empty(&run);
     // Exact measured refusal, never compatibility: original afed50b9 positive
     // assertions failed for both cases and remain in the first-reading evidence.
+    // The metadata contract may select dotlock. Observe both before the
+    // terminal exchange and after teardown, even if the error oracle changes.
+    let lock_snapshot: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(evidence.join("routed-reading/observer/sidecars-5.json")).unwrap(),
+    )
+    .unwrap();
+    let (lock_host, lock_port) = fixture().unwrap();
+    let mut lock_path = shadow_path(&run);
+    lock_path.last_mut().unwrap().extend_from_slice(b".lock");
+    let lock_after = r14_nfs_object(
+        &lock_host,
+        lock_port,
+        &lock_path,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+    )
+    .unwrap();
+    std::fs::write(
+        evidence.join("lock-directory.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "after_connect": lock_snapshot["state.sqlite.lock"],
+            "after_teardown": lock_after,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        lock_snapshot.get("state.sqlite.lock").is_some(),
+        "lock observation missing"
+    );
+    assert!(
+        lock_snapshot["state.sqlite.lock"].is_null(),
+        "persistent lock directory requires anchor ruling"
+    );
+    assert!(
+        lock_after.is_null(),
+        "persistent lock directory requires anchor ruling"
+    );
     assert_eq!(run.status, Some(1), "{}", run.stderr);
     assert_eq!(run.child_exit(), 20);
     assert!(run.stderr.contains("ProcessFailed during run.child"));
@@ -12760,10 +13012,10 @@ fn r14_case(seeded: bool) {
         .collect::<Vec<_>>();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0]["phase"], "connect");
-    assert_eq!(errors[0]["data"]["code"], "3338");
+    assert_eq!(errors[0]["data"]["code"], "266");
     assert_eq!(
         errors[0]["data"]["variant"],
-        "Database(SqliteError { code: 3338, message: \"disk I/O error\" })"
+        "Database(SqliteError { code: 266, message: \"disk I/O error\" })"
     );
     assert_eq!(records.last().unwrap()["data"]["ok"], false);
     assert!(!records.iter().any(|r| r["phase"] == "schema"));
