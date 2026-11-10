@@ -2586,6 +2586,41 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::ProtocolMismatch);
         assert_eq!(error.context, "stale or mismatched reply");
         assert_eq!(*memory.lock().unwrap(), vec![0xa7; 2168]);
+        // Independently exercise generation validation with retained pending
+        // state, then prove that this backend actually accepts valid copyout.
+        for generation in [0, 1] {
+            let binding = FilesystemBinding::overlay(s.state.run_id);
+            let token = FilesystemQueryToken {
+                request: 2 + generation,
+                task: task(1),
+                thread: ThreadId(task(1).0),
+                image_generation: generation,
+                stop_generation: 2 + generation,
+            };
+            let reply = FilesystemReply {
+                token: token.clone(),
+                metadata: binding.metadata().unwrap(),
+            };
+            assert!(s
+                .filesystem_queries
+                .begin(crate::filesystem::PendingFilesystem {
+                    token,
+                    binding,
+                    output: IoBuffer {
+                        address: 0x1000,
+                        length: 2168
+                    },
+                }));
+            let result =
+                s.complete_filesystem_query(task(1), ThreadId(task(1).0), &mut registers, reply);
+            if generation == 0 {
+                assert_eq!(result.unwrap_err().kind, ErrorKind::ProtocolMismatch);
+                assert_eq!(*memory.lock().unwrap(), vec![0xa7; 2168]);
+            } else {
+                result.unwrap();
+                assert_eq!(*memory.lock().unwrap(), vec![0x55; 2168]);
+            }
+        }
     }
 
     #[test]
