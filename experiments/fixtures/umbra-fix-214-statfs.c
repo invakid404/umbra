@@ -32,6 +32,21 @@ static void marker(const char *root, const char *name, pid_t pid) {
 
 int main(int argc, char **argv) {
     require(argc >= 3, "arguments");
+    if (strcmp(argv[1], "identity-snapshot") == 0) {
+        const char *paths[] = {"/", "/System/Volumes/Data", "/System/Volumes/Preboot"};
+        for (size_t i = 0; i < 3; ++i) {
+            struct stat st;
+            struct statfs fs;
+            require(stat(paths[i], &st) == 0, "identity stat");
+            require(statfs(paths[i], &fs) == 0, "identity statfs");
+            fprintf(stderr, "identity-base path=%s st_dev=0x%x fsid=0x%x,0x%x mount=%s source=%s type=%s\n",
+                paths[i], (unsigned)st.st_dev, (unsigned)fs.f_fsid.val[0],
+                (unsigned)fs.f_fsid.val[1], fs.f_mntonname, fs.f_mntfromname, fs.f_fstypename);
+        }
+        marker(argv[2], "records.pid", getpid());
+        return 0;
+    }
+
     if (strcmp(argv[1], "native-canary-helper") == 0) {
         require(argc == 4 && getpid() == (pid_t)strtol(argv[3], NULL, 10),
                 "replacement image pid");

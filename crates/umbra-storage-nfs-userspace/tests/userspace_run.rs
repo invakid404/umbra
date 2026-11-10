@@ -12663,6 +12663,51 @@ fn f214_distinct_runs() {
     );
 }
 
+#[test]
+fn f214_native_mount_identity_preserved() {
+    let Some(root) = slate_evidence() else {
+        return;
+    };
+    let evidence = root.join("identity_snapshot");
+    slate_fresh_dir(&evidence);
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(
+        scratch.path(),
+        "umbra-fix-214-statfs",
+        "UMBRA_FIX_214_STATFS_PATH",
+    );
+    let spawn = SlateSpawn {
+        evidence,
+        scratch,
+        helper: program.clone(),
+        program,
+    };
+    let native_root = spawn.scratch.path().join("native");
+    std::fs::create_dir(&native_root).unwrap();
+    let native = slate_bounded(
+        Command::new(&spawn.program)
+            .arg("identity-snapshot")
+            .arg(&native_root),
+        &spawn.evidence.join("native"),
+    );
+    assert!(native.status.success());
+    let routed = slate_spawn_routed(&spawn, "identity-snapshot", &["records.pid"]);
+    slate_spawn_finish(&spawn, &routed);
+    assert!(routed.output.status.success(), "{}", routed.run.stderr);
+    assert!(journal_records_completion(&routed.run));
+    slate_finish_cleanup();
+    let identity_rows = |text: &str| {
+        text.lines()
+            .filter(|line| line.starts_with("identity-base path="))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let native_rows = identity_rows(std::str::from_utf8(&native.stderr).unwrap());
+    let routed_rows = identity_rows(&routed.run.stderr);
+    assert_eq!(native_rows.len(), 3, "native mount identity table");
+    assert_eq!(routed_rows, native_rows, "base native mount view must survive routing");
+}
+
 fn f214_metadata_case(mode: &str) -> Option<RunId> {
     let Some(root) = slate_evidence() else {
         return None;
