@@ -258,15 +258,13 @@ impl Supervisor {
         self.admit_during_routed_effect(&event)?;
         match event {
             TraceEvent::SpawnPrepare { token, plan } => {
-                let process = self
-                    .state
-                    .processes
-                    .processes
-                    .get(&token.parent)
-                    .ok_or_else(|| ofd_error("spawn parent is not registered"))?;
-                if !process.threads.contains_key(&token.thread) {
-                    return Err(ofd_error("spawn thread is not registered"));
+                if !self.state.processes.processes.contains_key(&token.parent) {
+                    return Err(ofd_error("spawn parent is not registered"));
                 }
+                // A secondary thread may first stop at the packed spawn trap.
+                // Register it with the same platform trust as SyscallEntry.
+                self.track_thread(token.parent, token.thread, StopReason::SyscallEntry)?;
+                let process = &self.state.processes.processes[&token.parent];
                 let authorization = self.spawns.prepare(token, plan, &process.context)?;
                 self.platform.control.resume(ResumeCommand {
                     thread: token.thread,
