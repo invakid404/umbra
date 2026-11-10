@@ -10738,7 +10738,10 @@ fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) 
                 let record: serde_json::Value = serde_json::from_str(line).unwrap();
                 if record["event"] == "sweep" {
                     assert_eq!(record["outcome"], "COMPLETE", "{record}");
-                    assert_eq!(record["owned_alive"], 0, "{record}");
+                    assert!(
+                        record["owned_alive"].as_array().is_some_and(Vec::is_empty),
+                        "{record}"
+                    );
                     complete = true;
                 }
             }
