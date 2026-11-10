@@ -2271,6 +2271,24 @@ mod tests {
             _: &FsOp,
             token: FilesystemQueryToken,
         ) -> Result<std::result::Result<FilesystemReply, Errno>> {
+            if self.0 == 5 || self.0 == 6 {
+                let (client, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                let mut connection =
+                    umbra_core::provider::Connection::new(client, Duration::from_millis(20));
+                // Hold a silent peer for a real receive deadline, or close it
+                // before receive for an actual transport disconnect.
+                let _peer = if self.0 == 5 {
+                    drop(peer);
+                    None
+                } else {
+                    Some(peer)
+                };
+                let failure = connection.receive::<u8>().unwrap_err();
+                let closed = connection.receive::<u8>().unwrap_err();
+                assert_eq!(closed.kind, ErrorKind::StorageUnavailable);
+                assert_eq!(closed.context, "connection is closed");
+                return Err(failure);
+            }
             if self.0 == 4 {
                 return Err(UmbraError::new(
                     ErrorKind::Io,
@@ -2625,7 +2643,7 @@ mod tests {
 
     #[test]
     fn f214_provider_errors() {
-        for fault in 0..5 {
+        for fault in 0..7 {
             let mut s = supervisor();
             s.budget = Some(routed_budget(8));
             s.namespace = Box::new(FilesystemFault(fault));
@@ -2645,7 +2663,9 @@ mod tests {
             let failure = result.unwrap_err();
             assert_eq!(
                 failure.kind,
-                if fault == 0 || fault == 4 {
+                if fault >= 5 {
+                    ErrorKind::StorageUnavailable
+                } else if fault == 0 || fault == 4 {
                     ErrorKind::Io
                 } else {
                     ErrorKind::ProtocolMismatch
@@ -2655,6 +2675,8 @@ mod tests {
                 0 | 1 => ("test.provider", "provider failed before reply"),
                 2 | 3 => ("filesystem.query", "stale or mismatched reply"),
                 4 => ("provider.call", "request deadline expired"),
+                5 => ("provider.transport", "provider disconnected"),
+                6 => ("provider.transport", "request deadline exceeded"),
                 _ => unreachable!(),
             };
             assert_eq!(failure.operation, operation);
