@@ -188,6 +188,11 @@ fn drive(case: &str, fixture: &Path, root: &Path, rewrite: bool) -> Outcome {
                 None
             }
             TraceEvent::ThreadExited { .. } | TraceEvent::Signal { .. } => None,
+            TraceEvent::SpawnPrepare { .. }
+            | TraceEvent::SpawnChild { .. }
+            | TraceEvent::SpawnAbort { .. } => {
+                panic!("sandbox launch fixture unexpectedly requested packed spawn")
+            }
         };
         if let Some(thread) = resume {
             tracer

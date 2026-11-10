@@ -142,7 +142,7 @@ pub(crate) fn decode(
         {
             return Err(malformed());
         }
-        for record in action_bytes[8..].chunks_exact(ACTION_STRIDE) {
+        for record in action_bytes[8..].as_chunks::<ACTION_STRIDE>().0.iter() {
             let tag = i32_at(record, 0);
             let path = match tag {
                 0 => Some(&record[14..]),
@@ -193,7 +193,11 @@ pub(crate) fn decode(
     attributes[..2].copy_from_slice(&(flags | 0x0080).to_le_bytes());
     let mut actions = Vec::new();
     if !action_bytes.is_empty() {
-        for record in action_bytes[8..].chunks_exact_mut(ACTION_STRIDE) {
+        for record in action_bytes[8..]
+            .as_chunks_mut::<ACTION_STRIDE>()
+            .0
+            .iter_mut()
+        {
             let tag = i32_at(record, 0);
             let fd = i32_at(record, 4);
             actions.push(match tag {
@@ -310,8 +314,11 @@ mod tests {
         let mut bytes = vec![0; 8 + records.len() * ACTION_STRIDE];
         bytes[..4].copy_from_slice(&(records.len() as i32).to_le_bytes());
         bytes[4..8].copy_from_slice(&(records.len() as i32).to_le_bytes());
-        for (record, (tag, source, destination)) in
-            bytes[8..].chunks_exact_mut(ACTION_STRIDE).zip(records)
+        for (record, (tag, source, destination)) in bytes[8..]
+            .as_chunks_mut::<ACTION_STRIDE>()
+            .0
+            .iter_mut()
+            .zip(records)
         {
             record[..4].copy_from_slice(&tag.to_le_bytes());
             record[4..8].copy_from_slice(&source.to_le_bytes());
@@ -334,7 +341,7 @@ mod tests {
     #[test]
     fn ordered_kernel_actions_preserve_operands_and_clear_union_slop() {
         let mut bytes = action_plan(&[(1, 3, 0), (2, 4, 3), (3, 3, 0), (2, 7, 7)]);
-        for record in bytes[8..].chunks_exact_mut(ACTION_STRIDE) {
+        for record in bytes[8..].as_chunks_mut::<ACTION_STRIDE>().0.iter_mut() {
             record[12..].fill(0xaa);
         }
         let snapshot = actions(&bytes).unwrap();
@@ -347,7 +354,11 @@ mod tests {
                 Action::Dup2(7, 7),
             ]
         );
-        for record in snapshot.action_bytes[8..].chunks_exact(ACTION_STRIDE) {
+        for record in snapshot.action_bytes[8..]
+            .as_chunks::<ACTION_STRIDE>()
+            .0
+            .iter()
+        {
             assert!(record[12..].iter().all(|byte| *byte == 0));
         }
         // Negative fds are kernel error operands, not structural errors.
@@ -373,9 +384,9 @@ mod tests {
         assert!(actions(&truncated).is_err());
         assert!(actions(&action_plan(&vec![(1, 3, 0); 64])).is_ok());
         assert!(actions(&action_plan(&vec![(1, 3, 0); 65])).is_err());
-        assert!(ACTION_OFFSET + 8 + MAX_ACTIONS * ACTION_STRIDE <= REGION_BYTES);
-        assert!(144 + ATTRIBUTE_BYTES <= 400);
-        assert!(192 <= ATTRIBUTE_BYTES); // Kernel prefix has full backing.
+        const { assert!(ACTION_OFFSET + 8 + MAX_ACTIONS * ACTION_STRIDE <= REGION_BYTES) };
+        const { assert!(144 + ATTRIBUTE_BYTES <= 400) };
+        const { assert!(192 <= ATTRIBUTE_BYTES) }; // Kernel prefix has full backing.
     }
 
     #[test]
