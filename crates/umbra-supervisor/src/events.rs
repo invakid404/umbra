@@ -2234,12 +2234,11 @@ mod tests {
         }
     }
 
+    type FilesystemFailureRecords = std::sync::Arc<std::sync::Mutex<Vec<(bool, String)>>>;
+
     /// A routed budget with a deliberately tiny fence, so the range can be
     /// exhausted in a test rather than only in principle.
-    struct FilesystemFault(
-        u8,
-        Option<std::sync::Arc<std::sync::Mutex<Vec<(bool, String)>>>>,
-    );
+    struct FilesystemFault(u8, Option<FilesystemFailureRecords>);
     impl NamespaceResolver for FilesystemFault {
         fn resolve(&mut self, _: &ProcessContext, _: &FsOp) -> Result<ResolvedAction> {
             unreachable!()
