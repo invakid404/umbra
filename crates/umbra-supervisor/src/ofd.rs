@@ -26,7 +26,7 @@
 //!   overlay, keyed by task and exec generation (#194);
 //! - `O_CLOFORK` is not decoded, so a close-on-fork routed descriptor is still
 //!   inherited (#195);
-//! - the dup family is not routed at all (`dup`, `dup2` and `fcntl` reach the
+//! - the dup family is not routed at all (`dup`, `dup2` and the `fcntl` duplication commands reach the
 //!   kernel and answer `EBADF`). [`OfdTable::share`] is what a routed dup would
 //!   call.
 use std::collections::{BTreeMap, BTreeSet};

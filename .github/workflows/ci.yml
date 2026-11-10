@@ -264,6 +264,12 @@ jobs:
           cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures -- --nocapture --test-threads=1
           cargo test -p umbra-cli --test run_fixtures --test resume_cli -- --nocapture --test-threads=1
           cargo test -p umbra-supervisor --test reopen -- --nocapture --test-threads=1
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo update --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml \
+            -p umbra-platform -p umbra-core -p umbra-journal -p umbra-journal-file -p umbra-storage -p umbra-storage-local
+          git diff --stat -- experiments/fixtures/umbra-fix-227-observer-providers/Cargo.lock
+          cargo build --locked --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
+          cargo test -p umbra-supervisor --test observer_failure -- --nocapture --test-threads=1
       # #193: this runner's jobs run in launchd's session (SID 1), the one place
       # `umbra run` isolates itself. The isolation suite's SID-1 cases (P1-P4,
       # topology, cleanup) skip in any other session, so here a different
@@ -549,6 +555,22 @@ jobs:
           git diff --stat -- experiments/fixtures/umbra-slate-r16-publication/Cargo.lock
           cargo build --locked --manifest-path experiments/fixtures/umbra-slate-r16-publication/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           echo "UMBRA_SLATE_R16_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r16-publication" >> "$GITHUB_ENV"
+
+      - name: Build descriptor and sibling-progress controls
+        run: |
+          for fixture in fdflags native-fcntl lock-progress; do
+            test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+            clang -arch arm64 -O1 -Wall -Wextra -Werror "experiments/fixtures/umbra-fix-227-$fixture.c" -o "$GITHUB_WORKSPACE/target/debug/umbra-fix-227-$fixture"
+          done
+          echo "UMBRA_FIX_227_FDFLAGS_PATH=$GITHUB_WORKSPACE/target/debug/umbra-fix-227-fdflags" >> "$GITHUB_ENV"
+          echo "UMBRA_FIX_227_NATIVE_PATH=$GITHUB_WORKSPACE/target/debug/umbra-fix-227-native-fcntl" >> "$GITHUB_ENV"
+          echo "UMBRA_FIX_227_LOCK_PATH=$GITHUB_WORKSPACE/target/debug/umbra-fix-227-lock-progress" >> "$GITHUB_ENV"
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build -p umbra-platform-macos --bins
+          test "$(find "$GITHUB_WORKSPACE/target/debug/build" -path '*/out/libumbra_interpose.dylib' | wc -l | tr -d ' ')" -eq 1
+          interposer=$(find "$GITHUB_WORKSPACE/target/debug/build" -path '*/out/libumbra_interpose.dylib' -print | head -n 1)
+          test -n "$interposer"
+          echo "UMBRA_FIX_227_INTERPOSER_PATH=$interposer" >> "$GITHUB_ENV"
 
       - name: Build rank-10 deferred fixtures
         run: |

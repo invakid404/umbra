@@ -1,0 +1,27 @@
+[package]
+name = "umbra-fix-227-observer-providers"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+umbra-platform = { path = "../../../crates/umbra-platform" }
+umbra-core = { path = "../../../crates/umbra-core" }
+umbra-journal = { path = "../../../crates/umbra-journal" }
+umbra-journal-file = { path = "../../../crates/umbra-journal-file" }
+umbra-storage = { path = "../../../crates/umbra-storage" }
+umbra-storage-local = { path = "../../../crates/umbra-storage-local" }
+
+[[bin]]
+name = "umbra-fix-227-journal"
+path = "src/journal.rs"
+
+[[bin]]
+name = "umbra-fix-227-storage"
+path = "src/storage.rs"
+
+[[bin]]
+name = "umbra-fix-227-platform-sentinel"
+path = "src/platform-sentinel.rs"

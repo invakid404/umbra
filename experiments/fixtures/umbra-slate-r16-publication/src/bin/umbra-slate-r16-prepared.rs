@@ -6,11 +6,14 @@ use std::{
 };
 use umbra_core::{RunId, UmbraError};
 use umbra_supervisor::{RunObserver, RunOutcome};
+fn seed_error(context: impl Into<String>) -> UmbraError {
+    UmbraError { kind: umbra_core::ErrorKind::Io, operation: "fixture.seed".into(), context: context.into(), errno: None, launch_tree_terminated: false }
+}
 struct Prepared {
     workspace: std::path::PathBuf,
 }
 impl RunObserver for Prepared {
-    fn prepared(&mut self, run_id: RunId) {
+    fn prepared(&mut self, run_id: RunId) -> umbra_core::Result<()> {
         // The UUID comes from the supervisor, never from arbitrary shell input.
         // Mirror the absolute logical workspace below the admitted run root.
         let path = std::path::PathBuf::from(format!("/umbra/runs/{}/root", run_id.0))
@@ -25,22 +28,23 @@ impl RunObserver for Prepared {
             .args(["exec", "umbra-m1-transport-raw-ganesha", "sh", "-c",
                 "set -eu; mkdir -m 777 -p \"${1%/*}\"; test ! -e \"$1\"; printf 'C16 incumbent must survive unchanged\\n' > \"$1\"; chmod 666 \"$1\"",
                 "c16-seed", &path])
-            .stdin(Stdio::null()).spawn().expect("native export seed spawn");
+            .stdin(Stdio::null()).spawn().map_err(|e| seed_error(format!("native export seed spawn: {e}")))?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(status) = child.try_wait().expect("native seed wait") {
-                assert!(status.success(), "native export seed failed: {status}");
+            if let Some(status) = child.try_wait().map_err(|e| seed_error(format!("native seed wait: {e}")))? {
+                if !status.success() { return Err(seed_error(format!("native export seed failed: {status}"))); }
                 break;
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("native export seed deadline; no tracee launched");
+                return Err(seed_error("native export seed deadline; no tracee launched"));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         eprintln!("C16 incumbent seeded before launch: {path}");
         eprintln!("umbra: run {} prepared", run_id.0);
+        Ok(())
     }
     fn finished(&mut self, outcome: &RunOutcome) {
         eprintln!(

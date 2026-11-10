@@ -496,6 +496,11 @@ pub enum FsOp {
         /// Close on exec.
         close_on_exec: bool,
     },
+    /// Descriptor-local flags, independent of pathname or open-file offset.
+    GetDescriptorFlags {
+        /// Descriptor to query.
+        fd: TracedFd,
+    },
     /// Fstat.
     Fstat {
         /// Fd.
@@ -1035,9 +1040,14 @@ pub struct LaunchPolicy {
     /// many descriptors, `getrlimit` and `sysconf(_SC_OPEN_MAX)` report it, and a
     /// program wanting more is refused `EMFILE` -- an honest POSIX answer. It
     /// also fails *closed* for everything umbra does not implement: a virtual
-    /// descriptor is not a kernel object, so `lseek`, `dup`, `fcntl`, `mmap`,
+    /// descriptor is not a kernel object, so `lseek`, `dup`, unsupported `fcntl` commands, `mmap`,
     /// `fsync` and `ftruncate` on one receive `EBADF` from the kernel rather
     /// than a plausible wrong answer.
+    ///
+    /// Public dyld-bound `fcntl(F_GETFD)` is served by the armed interposer:
+    /// it queries descriptor-local `close_on_exec` without a pathname lookup.
+    /// Other fcntl commands and libc-internal fcntl calls retain their native
+    /// path; no fcntl kernel stub is breakpointed.
     ///
     /// **`fstat` is deliberately not in that list, and used to be.** It is
     /// served: `fstat`(339) and `__fstat`(189) are breakpointed libc stubs,

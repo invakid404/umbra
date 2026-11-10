@@ -6985,14 +6985,14 @@ fn mkfifo_is_in_neither_the_interposed_set_nor_the_traced_stubs() {
         .split_once("};")
         .expect("the interpose array is terminated")
         .0;
-    // Exactly four symbols are replaced, and this counts them rather than
-    // trusting the number: the sibling fixture's doc comment claimed an
+    // Exactly five symbols are replaced, including public GETFD-only fcntl.
+    // Count them rather than trusting the number: the sibling fixture's doc comment claimed an
     // "interposer's refused descriptor-relative set" that has never existed,
     // and this is the assertion that would have caught it.
     assert_eq!(
         replaced.matches("(const void *)umbra_").count(),
-        4,
-        "the interposer no longer replaces exactly four symbols, so every claim \
+        5,
+        "the interposer no longer replaces exactly five symbols, so every claim \
          in this group about what is kernel-bare needs re-measuring"
     );
     for call in ["mkfifo", "mknod"] {
@@ -7589,13 +7589,14 @@ fn stat_and_lstat_and_the_getdirentries_fallback_are_kernel_bare() {
         .split_once("};")
         .expect("the interpose array is terminated")
         .0;
-    // Exactly four symbols are replaced, and this counts them rather than
-    // trusting the number: no metadata operation is interposed at any point, and
+    // Exactly five symbols are replaced, including public GETFD-only fcntl.
+    // Count them rather than trusting the number: no path metadata operation
+    // is interposed, and
     // this is the assertion that catches the first one that is.
     assert_eq!(
         replaced.matches("(const void *)umbra_").count(),
-        4,
-        "the interposer no longer replaces exactly four symbols, so every claim \
+        5,
+        "the interposer no longer replaces exactly five symbols, so every claim \
          in this group about what is kernel-bare needs re-measuring"
     );
     for call in ["stat", "lstat", "getdirentries", "readlink"] {
@@ -10429,6 +10430,10 @@ fn slate_c11_05_cloexec_null_spawn() {
         "the spawned child's write on a close-on-exec routed number must fail \
          EBADF and leave the victim VICTIM-SEED:\nvictim={victim:?}\n{child}"
     );
+    assert_eq!(slate_field(&child, "kernel-view control", "getfd"), "0");
+    assert_eq!(slate_field(&child, "kernel-view control", "errno"), "0");
+    assert_eq!(slate_field(&child, "kernel-view victim", "getfd"), "-1");
+    assert_eq!(slate_field(&child, "kernel-view victim", "errno"), "9");
     assert_eq!(slate_field(&child, "write-victim", "errno"), "9");
     assert_eq!(slate_field(&child, "pipe ", "collision"), "0");
     assert_eq!(
@@ -13802,7 +13807,7 @@ fn c16_case(mode: u8) {
     let scratch = tempfile::tempdir().unwrap();
     let native = scratch.path().join("native");
     std::fs::create_dir(&native).unwrap();
-    if mode % 2 == 0 {
+    if mode.is_multiple_of(2) {
         std::fs::write(native.join("dst"), C16_INCUMBENT).unwrap();
     }
     let (out, timeout) = slate_launch(
@@ -13823,11 +13828,15 @@ fn c16_case(mode: u8) {
         assert!(!native.join("dst").exists());
     } else {
         let operation = if mode <= 2 { "link" } else { "persist" };
-        let result = if mode % 2 == 0 { "AlreadyExists" } else { "Ok" };
+        let result = if mode.is_multiple_of(2) {
+            "AlreadyExists"
+        } else {
+            "Ok"
+        };
         assert!(native_stderr.contains(&format!("C16 {operation}-return {result}")));
         assert_eq!(
             std::fs::read(native.join("dst")).unwrap(),
-            if mode % 2 == 0 {
+            if mode.is_multiple_of(2) {
                 C16_INCUMBENT
             } else {
                 C16_SOURCE
@@ -13852,7 +13861,7 @@ fn c16_case(mode: u8) {
     std::fs::copy(&registry, evidence.join("registry.json")).unwrap();
     assert_no_nfs_mount(&host, port, &[&workspace], "C16 before");
     let (out, timeout) = slate_launch(
-        Command::new(if mode % 2 == 0 {
+        Command::new(if mode.is_multiple_of(2) {
             prepared
         } else {
             binaries().join("umbra")
@@ -13910,26 +13919,33 @@ fn c16_case(mode: u8) {
     retain(&run.state, &evidence.join("state"));
     slate_finish_cleanup();
     assert!(!timeout);
-    assert_eq!(run.status, Some(1));
-    assert!(!completed);
-    let diagnostic = if mode == 5 {
-        "IO Safety violation: owned file descriptor already closed"
-    } else if mode <= 2 {
-        "operation requires descriptor or metadata support beyond MVP"
-    } else {
-        "renameatx_np flags 0x4"
-    };
-    assert!(run.stderr.contains(diagnostic), "{}", run.stderr);
-    assert!(!run.stderr.contains("finished:"));
-    assert!(!run.stderr.contains("C16 decision-return"));
-    assert!(!run.stderr.contains("C16 link-return"));
-    assert!(!run.stderr.contains("C16 persist-return"));
+    let diagnostic;
     if mode == 5 {
+        diagnostic = "C16 drop-return Ok";
+        assert_eq!(run.status, Some(0), "{}", run.stderr);
+        assert!(completed);
         assert!(run.stderr.contains("C16 drop-enter"));
-        assert!(!run.stderr.contains("C16 drop-return"));
+        assert!(run.stderr.contains("C16 drop-return Ok"));
+        assert!(run.stderr.contains("C16 decision-return Ok"));
+        assert!(run.stderr.contains("finished: Some(Code(0))"));
+        assert!(!run.stderr.contains("IO Safety violation"));
+        assert!(!run.stderr.contains("T06"));
         assert!(!run.stderr.contains("C16 ready"));
-        assert!(run.stderr.contains("fatal signal/exception: T06"));
+        assert!(!run.stderr.contains("C16 link-return"));
+        assert!(!run.stderr.contains("C16 persist-return"));
     } else {
+        assert_eq!(run.status, Some(1));
+        assert!(!completed);
+        diagnostic = if mode <= 2 {
+            "operation requires descriptor or metadata support beyond MVP"
+        } else {
+            "renameatx_np flags 0x4"
+        };
+        assert!(run.stderr.contains(diagnostic), "{}", run.stderr);
+        assert!(!run.stderr.contains("finished:"));
+        assert!(!run.stderr.contains("C16 decision-return"));
+        assert!(!run.stderr.contains("C16 link-return"));
+        assert!(!run.stderr.contains("C16 persist-return"));
         assert!(run.stderr.contains(&format!("C16 ready mode={mode}")));
         assert!(!run.stderr.contains("IO Safety violation"));
         if mode <= 2 {
@@ -13938,14 +13954,14 @@ fn c16_case(mode: u8) {
         } else {
             assert!(run.stderr.contains("C16 fallback-enter"));
         }
-        if mode % 2 == 0 {
+        if mode.is_multiple_of(2) {
             assert!(run.stderr.contains("C16 incumbent seeded before launch:"));
         }
     }
     assert_eq!(src.as_deref(), Some(C16_SOURCE));
     assert_eq!(
         dst.as_deref(),
-        if mode % 2 == 0 {
+        if mode.is_multiple_of(2) {
             Some(C16_INCUMBENT)
         } else {
             None
@@ -13986,7 +14002,7 @@ fn c16_04_noclobber_incumbent() {
 }
 
 #[test]
-fn c16_05_written_file_drop_defect() {
+fn c16_05_written_file_drop_completes() {
     c16_case(5);
 }
 
@@ -14327,4 +14343,545 @@ fn slate_r10_deferred_retained_poll_evidence() {
         !r10_absent_workspace(4, Some(13)),
         "permission refusal is not absence"
     );
+}
+
+// fix-227: public fcntl queries, with a native control before each routed case.
+fn fix_227_fdflags(mode: &str) {
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(root) = slate_evidence() else { return };
+    let evidence = root.join(format!("fix-227-{mode}"));
+    std::fs::create_dir(&evidence).expect("fresh reading");
+    let scratch = tempfile::tempdir().unwrap();
+    let program = fixture_binary(
+        scratch.path(),
+        "umbra-fix-227-fdflags",
+        "UMBRA_FIX_227_FDFLAGS_PATH",
+    );
+    std::fs::write(
+        evidence.join("fixture.sha256"),
+        r14_sha256(&std::fs::read(&program).unwrap()),
+    )
+    .unwrap();
+    let native_file = scratch.path().join("native-file");
+    let (native, timeout) = slate_launch(
+        Command::new(&program).arg(mode).arg(&native_file),
+        &evidence.join("native"),
+        std::time::Duration::from_secs(30),
+        None,
+    );
+    slate_finish_cleanup();
+    assert!(!timeout);
+    assert!(
+        native.status.success(),
+        "native status={} stderr={}",
+        native.status,
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let native_text = std::fs::read_to_string(scratch.path().join("native-file.records")).unwrap();
+    let expected = match mode {
+        "fork" => "fork child=0 parent-cloexec=1 parent-live=0 bytes=ABCDE\n",
+        "exec" => "exec child=0 parent-cloexec=1 parent-live=0 bytes=ABCDE\n",
+        "thread" => "thread-live result=1 errno=0\nthread-closed result=-1 errno=9\n",
+        "flags" => "cloexec result=1 errno=0\ninherited result=0 errno=0\n",
+        "closed" => "closed result=-1 errno=9\nunissued result=-1 errno=9\n",
+        "close" => {
+            "close result=0 errno=0\ndouble-close result=-1 errno=9\nreuse-plain equal=1\nclose-nocancel result=0 errno=0\ndouble-nocancel result=-1 errno=9\nreuse-nocancel equal=1\n"
+        }
+        "refusals" => {
+            for name in ["getfl", "setfd", "dupfd", "dupfd-cloexec"] {
+                assert_ne!(slate_field(&native_text, name, "result"), "-1");
+                assert_eq!(slate_field(&native_text, name, "errno"), "0");
+            }
+            "getfl result=-1 errno=9\nsetfd result=-1 errno=9\ndupfd result=-1 errno=9\ndupfd-cloexec result=-1 errno=9\n"
+        }
+        _ => panic!("unknown descriptor case"),
+    };
+    if mode != "refusals" {
+        assert_eq!(native_text, expected);
+    }
+    if mode == "fork" || mode == "exec" {
+        assert_eq!(std::fs::read(&native_file).unwrap(), b"ABCDE");
+    }
+    let workspace = scratch.path().join("workspace");
+    let state = scratch.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed\n").unwrap();
+    let registry = registry(scratch.path(), &host, port);
+    assert_no_nfs_mount(&host, port, &[&workspace], "fix-227 before");
+    let (out, timeout) = slate_launch(
+        Command::new(binaries().join("umbra"))
+            .args(["run", "--registry"])
+            .arg(&registry)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["--experimental", "--"])
+            .arg(&program)
+            .arg(mode)
+            .arg(workspace.join("file")),
+        &evidence.join("routed"),
+        std::time::Duration::from_secs(30),
+        None,
+    );
+    slate_finish_cleanup();
+    assert!(!timeout);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let id = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("umbra: run ")
+                .and_then(|s| s.strip_suffix(" prepared"))
+        })
+        .expect("prepared run");
+    let run = Run {
+        run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+        status: out.status.code(),
+        stderr,
+        destination: workspace.join("file"),
+        workspace,
+        state,
+        registry,
+    };
+    let object = read_whole_object_through_client(&host, port, &shadow_path(&run));
+    std::fs::write(
+        evidence.join("observed.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"status": run.status, "object": object}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        object.as_deref(),
+        Some(if mode == "fork" || mode == "exec" {
+            b"ABCDE".as_slice()
+        } else {
+            b"".as_slice()
+        })
+    );
+    assert_eq!(run.status, Some(0), "{}", run.stderr);
+    assert!(run.stderr.contains("finished: Some(Code(0))"));
+    assert!(journal_records_completion(&run));
+    let mut record_path = shadow_path(&run);
+    *record_path.last_mut().unwrap() = b"file.records".to_vec();
+    let records =
+        read_whole_object_through_client(&host, port, &record_path).expect("routed records");
+    std::fs::write(evidence.join("routed-records.txt"), &records).unwrap();
+    assert_eq!(String::from_utf8_lossy(&records), expected);
+    assert_eq!(
+        std::fs::read(run.workspace.join("seed.txt")).unwrap(),
+        b"seed\n"
+    );
+    assert_eq!(std::fs::read_dir(&run.workspace).unwrap().count(), 1);
+    assert_no_nfs_mount(&host, port, &[&run.workspace], "fix-227 after");
+}
+#[test]
+fn fix_227_descriptor_flags() {
+    fix_227_fdflags("flags");
+}
+#[test]
+fn fix_227_closed_and_unissued_descriptors() {
+    fix_227_fdflags("closed");
+}
+#[test]
+fn fix_227_other_fcntl_commands_remain_refused() {
+    fix_227_fdflags("refusals");
+}
+#[test]
+fn fix_227_close_and_number_reuse() {
+    fix_227_fdflags("close");
+}
+
+#[test]
+fn fix_227_fork_flags_and_io() {
+    fix_227_fdflags("fork");
+}
+#[test]
+fn fix_227_exec_sweep_and_io() {
+    fix_227_fdflags("exec");
+}
+#[test]
+fn fix_227_ordered_cross_thread_close() {
+    fix_227_fdflags("thread");
+}
+#[test]
+fn fix_227_native_fcntl_abi_and_cost() {
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(root) = slate_evidence() else { return };
+    let Some(interposer) = input("UMBRA_FIX_227_INTERPOSER_PATH") else {
+        return;
+    };
+    let evidence = root.join("fix-227-native-abi");
+    std::fs::create_dir(&evidence).expect("fresh reading");
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch_path = scratch.path().canonicalize().unwrap();
+    let program = fixture_binary(
+        &scratch_path,
+        "umbra-fix-227-native-fcntl",
+        "UMBRA_FIX_227_NATIVE_PATH",
+    );
+    let host_file = scratch_path.join("host-file");
+    std::fs::write(&host_file, b"native ABI control\n").unwrap();
+    std::fs::write(
+        evidence.join("fixture.sha256"),
+        r14_sha256(&std::fs::read(&program).unwrap()),
+    )
+    .unwrap();
+    std::fs::write(
+        evidence.join("interposer.sha256"),
+        r14_sha256(&std::fs::read(&interposer).unwrap()),
+    )
+    .unwrap();
+    let mut oracle = None;
+    for mode in ["native", "inactive", "routed", "rewrite"] {
+        let mode_root = scratch_path.join(mode);
+        std::fs::create_dir(&mode_root).unwrap();
+        let workspace = mode_root.join("workspace");
+        let state = mode_root.join("state");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let destination = workspace.join("records");
+        let registry_path = registry(&mode_root, &host, port);
+        let store = mode_root.join("store");
+        if mode == "rewrite" {
+            std::fs::create_dir(&store).unwrap();
+            fix_227_rewrite_registry(&registry_path, &store);
+        }
+        let mut command = if mode == "native" || mode == "inactive" {
+            let mut c = Command::new(&program);
+            if mode == "inactive" {
+                c.env("DYLD_INSERT_LIBRARIES", &interposer);
+            }
+            c
+        } else {
+            let mut c = Command::new(binaries().join("umbra"));
+            c.args(["run", "--registry"])
+                .arg(&registry_path)
+                .arg("--workspace")
+                .arg(&workspace)
+                .arg("--state-dir")
+                .arg(&state)
+                .arg("--experimental");
+            if mode == "rewrite" {
+                c.arg("--local-dev");
+            }
+            c.arg("--").arg(&program);
+            c
+        };
+        command.arg(&host_file).arg(&destination);
+        let (out, timeout) = slate_launch(
+            &mut command,
+            &evidence.join(mode),
+            std::time::Duration::from_secs(60),
+            None,
+        );
+        slate_finish_cleanup();
+        assert!(!timeout, "{mode} timed out");
+        assert!(
+            out.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = if mode == "native" || mode == "inactive" {
+            std::fs::read_to_string(&destination).unwrap()
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(stderr.contains("finished: Some(Code(0))"));
+            let id = stderr
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("umbra: run ")
+                        .and_then(|v| v.strip_suffix(" prepared"))
+                })
+                .unwrap();
+            let run = Run {
+                run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+                status: out.status.code(),
+                stderr,
+                destination,
+                workspace: workspace.clone(),
+                state,
+                registry: registry_path,
+            };
+            assert!(!run.destination.exists(), "host workspace unchanged");
+            if mode == "routed" {
+                assert!(journal_records_completion(&run));
+                String::from_utf8(
+                    read_whole_object_through_client(&host, port, &shadow_path(&run)).unwrap(),
+                )
+                .unwrap()
+            } else {
+                let file = store
+                    .join(run.run_id.0.to_string())
+                    .join("root")
+                    .join(run.destination.strip_prefix("/").unwrap());
+                std::fs::read_to_string(file).unwrap()
+            }
+        };
+        std::fs::write(evidence.join(format!("{mode}.records")), &text).unwrap();
+        if mode == "native" {
+            for name in [
+                "getfd",
+                "getfl",
+                "setfd-clear",
+                "getfd-clear",
+                "setfd-set",
+                "getfd-set",
+                "setfl",
+                "getfl-nonblock",
+                "dupfd",
+                "getpath",
+                "setlk",
+                "unlock",
+            ] {
+                assert_ne!(slate_field(&text, name, "result"), "-1");
+                assert_eq!(slate_field(&text, name, "errno"), "0");
+            }
+            assert_eq!(slate_field(&text, "unknown", "result"), "-1");
+        }
+        let abi: Vec<_> = text
+            .lines()
+            .filter(|l| !l.starts_with("cost "))
+            .map(str::to_owned)
+            .collect();
+        if let Some(expected) = &oracle {
+            assert_eq!(&abi, expected, "{mode} ABI mismatch");
+        } else {
+            oracle = Some(abi);
+        }
+        for name in ["getfd", "fstat"] {
+            let prefix = format!("cost {name} ");
+            assert_eq!(slate_field(&text, &prefix, "calls"), "16");
+            let ns: u64 = slate_field(&text, &prefix, "elapsed_ns").parse().unwrap();
+            eprintln!(
+                "fix-227 cost mode={mode} op={name} calls=16 elapsed_ns={ns} ns_per_call={}",
+                ns as f64 / 16.0
+            );
+        }
+    }
+    assert_eq!(std::fs::read(&host_file).unwrap(), b"native ABI control\n");
+}
+
+fn fix_227_rewrite_registry(registry_path: &Path, store: &Path) {
+    let mut r: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(registry_path).unwrap()).unwrap();
+    let mut local: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repository().join("crates/umbra-storage-local/provider.json")).unwrap(),
+    )
+    .unwrap();
+    local["executable"] = serde_json::json!(binaries()
+        .join("umbra-storage-local")
+        .as_os_str()
+        .as_bytes());
+    local["capabilities"] =
+        serde_json::json!(["local-development-v1", "experimental-open-rewrite-v1"]);
+    local["options"] = serde_json::json!(umbra_core::provider::encode(
+        &umbra_core::BytePath::new(store.as_os_str().as_bytes().to_vec()).unwrap()
+    )
+    .unwrap());
+    r["providers"]["storage"] = local;
+    std::fs::write(registry_path, serde_json::to_vec(&r).unwrap()).unwrap();
+}
+
+// Behaviour only: generic thread-state gating does NOT prove a kernel wait.
+#[test]
+fn fix_227_sibling_progress_without_kernel_wait_proof() {
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(root) = slate_evidence() else { return };
+    let evidence = root.join("fix-227-lock-progress");
+    std::fs::create_dir(&evidence).expect("fresh reading");
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch_path = scratch.path().canonicalize().unwrap();
+    let program = fixture_binary(
+        &scratch_path,
+        "umbra-fix-227-lock-progress",
+        "UMBRA_FIX_227_LOCK_PATH",
+    );
+    std::fs::write(
+        evidence.join("fixture.sha256"),
+        r14_sha256(&std::fs::read(&program).unwrap()),
+    )
+    .unwrap();
+    for mode in ["native", "routed", "rewrite"] {
+        let mode_root = scratch_path.join(mode);
+        std::fs::create_dir(&mode_root).unwrap();
+        let workspace = mode_root.join("workspace");
+        let state = mode_root.join("state");
+        let store = mode_root.join("store");
+        for dir in [&workspace, &state, &store] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let lock = mode_root.join("lock");
+        std::fs::write(&lock, b"lock\n").unwrap();
+        let locator = mode_root.join("locator");
+        let registry_path = registry(&mode_root, &host, port);
+        if mode == "rewrite" {
+            fix_227_rewrite_registry(&registry_path, &store);
+        }
+        let search = if mode == "routed" {
+            state.clone()
+        } else {
+            store.clone()
+        };
+        let helper_program = program.clone();
+        let helper_evidence = evidence.join(format!("{mode}-helper"));
+        let helper_locator = locator.clone();
+        let helper_lock = lock.clone();
+        let native_shared = mode_root.join("native-shared");
+        let helper = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut shared = if mode == "native" {
+                native_shared.clone()
+            } else {
+                loop {
+                    let candidates: Vec<_> = std::fs::read_dir(&search)
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .filter(|p| p.is_dir())
+                        .map(|p| p.join(if mode == "routed" { "host" } else { "root" }))
+                        .filter(|p| p.is_dir())
+                        .collect();
+                    if candidates.len() == 1 {
+                        break candidates[0].join("ft4-shared");
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "run write allowance not created"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            };
+            let rewrite_root = if mode == "rewrite" {
+                let root = shared.parent().unwrap().to_owned();
+                shared = native_shared;
+                Some(root)
+            } else {
+                None
+            };
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&shared)
+                .unwrap();
+            file.set_len(4096).unwrap();
+            drop(file);
+            let pending = helper_locator.with_extension("pending");
+            std::fs::write(&pending, shared.as_os_str().as_bytes()).unwrap();
+            std::fs::rename(pending, &helper_locator).unwrap();
+            if let Some(root) = rewrite_root {
+                // Initializers are traced in rewrite mode. Wait for the copy-up
+                // and map the same physical object the target will mmap.
+                shared = root.join(shared.strip_prefix("/").unwrap());
+                while !shared.is_file() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "shared mapping copy-up missing"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            let (out, timeout) = slate_launch(
+                Command::new(helper_program)
+                    .arg("helper")
+                    .arg(&shared)
+                    .arg(helper_lock)
+                    .arg("unused"),
+                &helper_evidence,
+                std::time::Duration::from_secs(35),
+                None,
+            );
+            slate_finish_cleanup();
+            (out, timeout)
+        });
+        let destination = workspace.join("records");
+        let mut command = if mode == "native" {
+            Command::new(&program)
+        } else {
+            let mut c = Command::new(binaries().join("umbra"));
+            c.args(["run", "--registry"])
+                .arg(&registry_path)
+                .arg("--workspace")
+                .arg(&workspace)
+                .arg("--state-dir")
+                .arg(&state)
+                .arg("--experimental");
+            if mode == "rewrite" {
+                c.arg("--local-dev");
+            }
+            c.arg("--").arg(&program);
+            c
+        };
+        command
+            .arg("target")
+            .arg(&locator)
+            .arg(&lock)
+            .arg(&destination);
+        let (out, timeout) = slate_launch(
+            &mut command,
+            &evidence.join(mode),
+            std::time::Duration::from_secs(20),
+            None,
+        );
+        slate_finish_cleanup();
+        let (helper_out, helper_timeout) = helper.join().expect("helper setup thread");
+        assert!(!timeout && !helper_timeout, "{mode} watchdog");
+        assert!(
+            helper_out.status.success(),
+            "helper: {}",
+            String::from_utf8_lossy(&helper_out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "target: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let bytes = if mode == "native" {
+            std::fs::read(&destination).unwrap()
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(stderr.contains("finished: Some(Code(0))"));
+            let id = stderr
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("umbra: run ")
+                        .and_then(|v| v.strip_suffix(" prepared"))
+                })
+                .unwrap();
+            let run = Run {
+                run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
+                status: out.status.code(),
+                stderr,
+                destination,
+                workspace,
+                state,
+                registry: registry_path,
+            };
+            assert!(!run.destination.exists());
+            if mode == "routed" {
+                assert!(journal_records_completion(&run));
+                read_whole_object_through_client(&host, port, &shadow_path(&run)).unwrap()
+            } else {
+                std::fs::read(
+                    store
+                        .join(run.run_id.0.to_string())
+                        .join("root")
+                        .join(run.destination.strip_prefix("/").unwrap()),
+                )
+                .unwrap()
+            }
+        };
+        std::fs::write(evidence.join(format!("{mode}.records")), &bytes).unwrap();
+        assert_eq!(
+            bytes,
+            b"NOT_KERNEL_WAIT_PROOF sibling=1 request=1 released=1 result=0 joined=2\n"
+        );
+        assert_eq!(std::fs::read(lock).unwrap(), b"lock\n");
+    }
 }

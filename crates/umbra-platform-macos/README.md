@@ -85,7 +85,14 @@ The M1 mechanisms named in the tracker spec are all present:
    the exec. The library ships **inert** and is switched on by
    `Session::arm_interposer`, which writes its `__DATA,__umbra_arm` control block
    after `install_image` has breakpointed its traps — it has no constructor and
-   reads no environment. See **What interception does not cover** below.
+   reads no environment. Its public `fcntl` shim routes only `F_GETFD` on an
+   armed descriptor at or above the virtual floor, through `UMBRA_OP_GETFD`.
+   The fixed-signature handler answers descriptor-local `close_on_exec` without
+   looking up a pathname; missing entries answer `EBADF`. All other commands,
+   inactive calls, negative descriptors and kernel-range descriptors tail-branch
+   to libc with the caller's argument registers and variadic stack untouched.
+   Neither `__fcntl` nor `__fcntl_nocancel` is a traced stub. The shim does not
+   catch libc-internal calls. See **What interception does not cover** below.
 10. **Inherited arming across `fork`**: a forked child of a routed tracee starts
     with the interposer already mapped *and* already armed, because `fork` copies
     `__DATA,__umbra_arm` with the rest of the address space. So `install` finds
@@ -696,10 +703,13 @@ remain what makes the invariant expressible and what `thread_index` resolves
 from. What was measured is the `pending` half; `entry` was not separately
 reverted, so no claim is made about it either way.
 
-**One behaviour change comes with the freeze, and it is bounded.** A routed
-`read`/`write`/`close` that blocks now blocks with the siblings held, where the
-bare `c` would have let them run. The session watchdog kills the tree at its
-deadline, so this degrades to a **watchdog kill naming a timeout, not a hang**.
+**A native syscall resumed through a return gate holds its siblings stopped
+until it returns.** If that call blocks, sibling progress cannot release it;
+provider and session deadlines bound the failure. Emulated routed operations
+skip the native syscall. Public `fcntl` passthrough adds no return gate: its
+shim tail-branches to libc and neither fcntl kernel stub is breakpointed.
+`tests/fcntl_passthrough.rs` guards that structural property. The userspace
+sibling-progress test is a behaviour check and does not prove a kernel lock wait.
 
 **Still deferred, deliberately:** `single_thread()` stays on `Delivery::Fork` and
 `WaitPlan::Park`, so a multithreaded parent that forks is refused rather than

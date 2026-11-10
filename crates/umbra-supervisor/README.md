@@ -120,6 +120,16 @@ marker retained, and the primary error is preserved with cleanup damage appended
 A failed launch releases writer authority only when the backend supplies explicit
 `launch_tree_terminated` evidence; an error category is never evidence.
 
+`RunObserver::prepared` returns `Result<()>`. It runs after namespace preparation
+and the platform capability handshake, before target launch. A returned error or
+an unwind panic enters normal namespace failure cleanup with a proven-empty
+launch tree: close
+the journal, release the writer and close storage. Cleanup errors append to the
+original error; no completion record, `finished`, or teardown-warning callback
+is produced. A caught panic has a fixed diagnostic; its arbitrary payload is
+neither formatted nor dropped, preventing a second panic from interrupting
+cleanup. Other observer callbacks retain their existing behaviour.
+
 A provider bookkeeping error after all process exits preserves the run's success
 semantics and is reported through `RunObserver::teardown_warning` (or tracing
 when no observer is installed). A `finish_run` error enters the namespace failure
@@ -203,11 +213,12 @@ than letting the kernel execute one, so the supervisor's `syscall_exit` never
 reaches a real refusal of that op. What those tests pin is the supervisor's
 behaviour when the namespace refuses, not that the op refuses today.
 
-A `Deny`, reached only for
-a whiteout-hidden non-mutating path, is answered here without
+A `Deny`, including a whiteout-hidden non-mutating path or a GETFD query for an
+absent routed descriptor, is answered here without
 minting an operation: the supervisor asks the platform to emulate its errno, which
 steps the tracee past the trapped syscall so the still-present base object stays
-hidden ([#49](https://github.com/invakid404/umbra/issues/49)). A backend whose
+hidden ([#49](https://github.com/invakid404/umbra/issues/49)), or the absent
+descriptor reports `EBADF`. A backend whose
 `emulate_result` cannot skip the trap, such as the Linux stub, fails closed
 instead.
 
@@ -250,7 +261,7 @@ What this is not: the whole of a POSIX open file description. It shares the
 regular-file position. A routed directory's enumeration cursor is still kept
 per process by the overlay (#194); `O_CLOFORK` is not decoded, so a
 close-on-fork routed descriptor is still inherited (#195); and the dup family
-is not routed at all (`dup`, `dup2` and `fcntl` reach the kernel and answer
+is not routed at all (`dup`, `dup2` and the `fcntl` duplication commands reach the kernel and answer
 `EBADF`).
 
 **The ordering contract a shared position depends on.** A routed operation reads
