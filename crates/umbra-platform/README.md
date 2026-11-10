@@ -222,6 +222,7 @@ target ABI. The provider proxy carries this typed request and bounds its
 response. `TraceBackend::copyout_memory` is the syscall-result write path:
 an inaccessible output produces EFAULT, while provider or task failures remain
 fatal. It is distinct from debugger memory writes used to install code or
-rewrite a stopped call. The default delegates to `write_memory`; backends serving filesystem metadata
-must supply the required protection semantics. The Darwin backend uses Mach
+rewrite a stopped call. The default refuses with `UnsupportedCapability`;
+backends serving filesystem metadata must explicitly supply protection-respecting
+copyout. The Darwin backend uses Mach
 writes so read-only pages are not made writable by debugger behavior.
