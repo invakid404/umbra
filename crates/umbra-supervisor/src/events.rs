@@ -2372,6 +2372,96 @@ mod tests {
     }
 
     #[test]
+    fn f214_pending_reply_survives_supervisor_close_and_reuse() {
+        // Exercise the real descriptor/OFD transitions while a deterministic
+        // responder holds the captured reply. Production dispatch is synchronous;
+        // this deliberately drives its ownership components separately.
+        let mut s = supervisor();
+        let fd = TracedFd(8);
+        let a = FilesystemBinding::overlay(RunId(Uuid::from_u128(1)));
+        let b = FilesystemBinding::overlay(RunId(Uuid::from_u128(2)));
+        let mut state = bound_fd(b"/original");
+        state.filesystem = Some(a.clone());
+        open_routed(&mut s, task(1), fd, state);
+        let token = FilesystemQueryToken {
+            request: 1,
+            task: task(1),
+            thread: ThreadId(task(1).0),
+            image_generation: 0,
+            stop_generation: 1,
+        };
+        let captured = s.process(task(1)).unwrap().context.fds[&fd]
+            .filesystem
+            .clone()
+            .unwrap();
+        assert!(s
+            .filesystem_queries
+            .begin(crate::filesystem::PendingFilesystem {
+                token: token.clone(),
+                binding: captured.clone(),
+                output: IoBuffer {
+                    address: 0x1000,
+                    length: 2168
+                },
+            }));
+        let (release, paused) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            paused.recv_timeout(Duration::from_secs(10)).unwrap();
+            FilesystemReply {
+                token,
+                metadata: captured.metadata().unwrap(),
+            }
+        });
+        routed_outcome(
+            &mut s,
+            task(1),
+            RoutedEffect::Closed(fd),
+            OperationOutcome::Success { return_value: 0 },
+        );
+        assert!(s.ofds.is_empty());
+        let mut replacement = bound_fd(b"/replacement");
+        replacement.filesystem = Some(b.clone());
+        open_routed(&mut s, task(1), fd, replacement);
+        release.send(()).unwrap();
+        let reply = responder.join().unwrap();
+        assert_eq!(reply.metadata.binding, a);
+        assert_eq!(
+            s.filesystem_queries.finish(&reply, 0).unwrap().address,
+            0x1000
+        );
+        let current = s.process(task(1)).unwrap().context.fds[&fd]
+            .filesystem
+            .clone()
+            .unwrap();
+        assert_eq!(current, b);
+        let token = FilesystemQueryToken {
+            request: 2,
+            stop_generation: 2,
+            ..reply.token
+        };
+        assert!(s
+            .filesystem_queries
+            .begin(crate::filesystem::PendingFilesystem {
+                token: token.clone(),
+                binding: current.clone(),
+                output: IoBuffer {
+                    address: 0x2000,
+                    length: 2168
+                },
+            }));
+        let next = FilesystemReply {
+            token,
+            metadata: current.metadata().unwrap(),
+        };
+        assert_eq!(next.metadata.binding, b);
+        assert_eq!(
+            s.filesystem_queries.finish(&next, 0).unwrap().address,
+            0x2000
+        );
+        assert_eq!(s.ofds.references((task(1), fd)), Some(1));
+    }
+
+    #[test]
     fn f214_provider_errors() {
         for fault in 0..5 {
             let mut s = supervisor();
