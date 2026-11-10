@@ -60,23 +60,7 @@ Fault tests cover the selected ownership, completion and cleanup boundaries;
 semantic readings alone do not certify them. Normal provider builds exclude
 the probes.
 
-The feature exposes these test controls; normal builds do not read them:
-
-| Variable | Effect |
-|---|---|
-| `UMBRA_FIX_243_PROBE_SOCKET` | Unix socket for a phase record and one-byte acknowledgment; replies time out after 15 seconds. |
-| `UMBRA_FIX_243_PROBE_PHASE` | Selects the rendezvous, defaulting to `task-acquired`. Completion phases include `inserted`, `policy-ready`, `caller-copyout`, `remote-free`, and `register-commit`; `unregistered` observes the earlier PID-read boundary. |
-| `UMBRA_FIX_243_PROBE_AFTER_FAILURE` | Also reports the selected phase's `-failed` observation before teardown. |
-| `UMBRA_FIX_243_PROBE_ROOT` | Enables the acquired-task rendezvous for the attached root comparison. |
-| `UMBRA_FIX_243_PROBE_TRIGGER` | Selects `deadline`, `session-drop`, `backend-drop`, `terminate`, or `watchdog` at the supported test boundary. |
-| `UMBRA_FIX_243_REGION_TRACE` | Reports allocation/release and queries whether the released mapping is absent. |
-| `UMBRA_FIX_243_REGION_FAULT` | `allocate` uses a null task port; `write` attempts the backing write at address zero while retaining allocation ownership. |
-| `UMBRA_FIX_243_OVERLAP_PARENTS` | Holds 2–17 distinct parents before kernel execution and verifies their backing before release; the production cap refuses the seventeenth token. |
-| `UMBRA_FIX_243_OWNER_TRACE` | Reports retained Session identities at teardown entry. |
-
-The socket acknowledgment continues (`C`), injects the selected failure (`E`),
-or exits the provider without Drop (`P`). These controls belong to the fixture
-harness and change scheduling or failure behavior only in feature builds.
+Probe controls are listed under [Provider binary](#provider-binary).
 
 <!-- memoria:section id="public-api" files="src/lib.rs" -->
 ## Public API
@@ -545,6 +529,33 @@ exposed that; the raw-`svc` leg with high bits set in `x2` guards it.
 decodes JSON `Options` from opaque provider options (empty falls back to
 `Options::default()`). Register it via `umbra providers --registry <path>
 --role platform`.
+
+**Environment.** `UMBRA_DEBUGSERVER` overrides discovery when the JSON
+`debugserver` option is absent; if both are unset, `xcode-select -p` supplies the
+Xcode path. With no `twin_cache` option, `HOME` selects
+`$HOME/Library/Caches/umbra/twins`; an unset `HOME` refuses that default.
+`UMBRA_RSP_LOG` and `UMBRA_TEARDOWN_LOG` are off when unset. Any set value enables,
+respectively, protocol traffic or per-session teardown reports on stderr.
+
+The `mutation-probe-spawn-lifecycle` feature exposes these test controls; normal
+builds do not read them. Unset controls do not inject faults or add logging; the
+phase selector defaults as listed when a probe socket is supplied:
+
+| Variable | Effect |
+|---|---|
+| `UMBRA_FIX_243_PROBE_SOCKET` | Unix socket for a phase record and one-byte acknowledgment; replies time out after 15 seconds. |
+| `UMBRA_FIX_243_PROBE_PHASE` | Selects the rendezvous, defaulting to `task-acquired`. Completion phases include `inserted`, `policy-ready`, `caller-copyout`, `remote-free`, and `register-commit`; `unregistered` observes the earlier PID-read boundary. |
+| `UMBRA_FIX_243_PROBE_AFTER_FAILURE` | Also reports the selected phase's `-failed` observation before teardown. |
+| `UMBRA_FIX_243_PROBE_ROOT` | Enables the acquired-task rendezvous for the attached root comparison. |
+| `UMBRA_FIX_243_PROBE_TRIGGER` | Selects `deadline`, `session-drop`, `backend-drop`, `terminate`, or `watchdog` at the supported test boundary. |
+| `UMBRA_FIX_243_REGION_TRACE` | Reports allocation/release and queries whether the released mapping is absent. |
+| `UMBRA_FIX_243_REGION_FAULT` | `allocate` uses a null task port; `write` attempts the backing write at address zero while retaining allocation ownership. |
+| `UMBRA_FIX_243_OVERLAP_PARENTS` | Holds 2–17 distinct parents before kernel execution and verifies their backing before release; the production cap refuses the seventeenth token. |
+| `UMBRA_FIX_243_OWNER_TRACE` | Reports retained Session identities at teardown entry. |
+
+The socket acknowledgment continues (`C`), injects the selected failure (`E`),
+or exits the provider without Drop (`P`). These controls belong to the fixture
+harness and change scheduling or failure behavior only in feature builds.
 
 **Launch and enforcement.** `TraceBackend::launch` and `launch_experimental`
 share `native.rs::MacosTraceBackend::launch_traced`: both launch suspended,
