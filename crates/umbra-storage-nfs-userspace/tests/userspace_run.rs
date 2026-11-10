@@ -10549,6 +10549,78 @@ fn fix_243_provider_region_cap() {
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+fn fix_243_region_fault(fault: &str) {
+    let Some(mut spawn) = slate_spawn(&format!("fix-243-region-{fault}")) else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "c11-02-attributes");
+    assert!(native.status.success());
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    spawn.provider_environment.extend([
+        ("UMBRA_FIX_243_REGION_TRACE".into(), "1".into()),
+        ("UMBRA_FIX_243_REGION_FAULT".into(), fault.into()),
+    ]);
+    let routed = slate_spawn_routed(&spawn, "c11-02-attributes", &["child.txt", "parent.txt"]);
+    assert_ne!(routed.run.status, Some(0));
+    assert!(routed.object("records.pre").is_some());
+    for name in ["child.txt", "parent.txt", "records.child", "records.done"] {
+        assert!(routed.object(name).is_none(), "unexpected {name}");
+    }
+    let allocations: Vec<serde_json::Value> = routed
+        .run
+        .stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("spawn-region "))
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    if fault == "allocate" {
+        assert!(
+            routed.run.stderr.contains("spawn snapshot allocation"),
+            "{}",
+            routed.run.stderr
+        );
+        assert!(allocations.is_empty());
+    } else {
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0]["event"], "allocated");
+        let record: serde_json::Value = serde_json::from_str(
+            routed
+                .run
+                .stderr
+                .lines()
+                .find_map(|l| l.strip_prefix("spawn-write-fault "))
+                .expect("actual write fault"),
+        )
+        .unwrap();
+        assert_eq!(record["failed"], true);
+        assert_eq!(record["region"], allocations[0]["address"]);
+        assert_eq!(record["parent_stopped"], true);
+        assert_eq!(record["child_created"], false);
+    }
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+    assert!(
+        cleanup.starts_with("cleanup CLEAN")
+            && cleanup.lines().next().unwrap().contains("group_kills=0")
+            && cleanup.lines().next().unwrap().contains("zombies=\"\""),
+        "{cleanup}"
+    );
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_region_allocation_failure() {
+    fix_243_region_fault("allocate");
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_region_write_failure() {
+    fix_243_region_fault("write");
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_region_success_error_cycles() {
     let Some(mut spawn) = slate_spawn("fix-243-region-cycles") else {

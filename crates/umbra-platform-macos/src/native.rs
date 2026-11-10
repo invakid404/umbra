@@ -1651,11 +1651,19 @@ impl MacosTraceBackend {
         }
         pending.authorization = Some(authorization);
         let mut address = 0;
+        let allocation_task = s.task.0;
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        let allocation_task =
+            if std::env::var("UMBRA_FIX_243_REGION_FAULT").as_deref() == Ok("allocate") {
+                mach2::port::MACH_PORT_NULL
+            } else {
+                allocation_task
+            };
         // SAFETY: valid out pointer, this session owns the remote task right.
         unsafe {
             mach(
                 mach2::vm::mach_vm_allocate(
-                    s.task.0,
+                    allocation_task,
                     &mut address,
                     spawn::REGION_BYTES as u64,
                     mach2::vm_statistics::VM_FLAGS_ANYWHERE,
@@ -1671,6 +1679,19 @@ impl MacosTraceBackend {
         let mut regs = pending.original.clone();
         let mut path = pending.twin.as_os_str().as_bytes().to_vec();
         path.push(0);
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if std::env::var("UMBRA_FIX_243_REGION_FAULT").as_deref() == Ok("write") {
+            let result = s.write(0, &backing);
+            let owned = s.spawn.as_ref().unwrap().region;
+            eprintln!(
+                "spawn-write-fault {}",
+                serde_json::json!({
+                    "failed": result.is_err(), "region": owned,
+                    "parent_stopped": s.stopped, "child_created": s.spawn.as_ref().unwrap().child.is_some(),
+                })
+            );
+            return result;
+        }
         s.write(address, &backing)?;
         set(&mut regs, 1, s.allocate(&path)?)?;
         set(&mut regs, 0, address + 400)?;
