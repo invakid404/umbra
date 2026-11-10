@@ -8709,6 +8709,83 @@ fn descriptor_flags_use_only_the_live_descriptor_table() {
 }
 
 #[test]
+fn f214_delayed_metadata_reply_keeps_binding_across_copyup() {
+    let mut f = Fixture::new(&[(b"dir/seed.txt", b"base bytes")]);
+    let path = StoragePath::new(StorageAnchor::Root, b"dir/seed.txt".to_vec()).unwrap();
+    let original_object = f.overlay.lookup(&path).unwrap().0.object_id;
+    let query = FsOp::StatFs {
+        dir: DirRef::Cwd,
+        path: bytes(b"dir/seed.txt"),
+        follow: true,
+    };
+    let token = umbra_core::FilesystemQueryToken {
+        request: 1,
+        task: f.process.task,
+        thread: ThreadId(f.process.task.0),
+        image_generation: f.process.exec_generation,
+        stop_generation: 1,
+    };
+    // The namespace has resolved the path and captured the response. Hold its
+    // delivery while another operation changes the object's backing layer.
+    let captured = f
+        .overlay
+        .filesystem_metadata(&f.process, &query, token.clone())
+        .unwrap()
+        .unwrap();
+    let expected =
+        umbra_core::FilesystemBinding::overlay(f.overlay.config().unwrap().context.run_id)
+            .metadata()
+            .unwrap();
+    let (release, paused) = std::sync::mpsc::channel();
+    let responder = std::thread::spawn(move || {
+        paused
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        captured
+    });
+    assert!(!f.shadow_root.join("dir/seed.txt").exists());
+    f.run(&open(
+        b"dir/seed.txt",
+        OpenFlags {
+            read: true,
+            write: true,
+            ..Default::default()
+        },
+    ));
+    assert_eq!(
+        fs::read(f.shadow_root.join("dir/seed.txt")).unwrap(),
+        b"base bytes"
+    );
+    assert_ne!(
+        f.overlay.lookup(&path).unwrap().0.object_id,
+        original_object,
+        "the test must cross a real backing-object transition"
+    );
+    fs::write(f.shadow_root.join("dir/seed.txt"), b"updated shadow").unwrap();
+    assert_eq!(f.read(b"dir/seed.txt").unwrap(), b"updated shadow");
+    assert_eq!(
+        fs::read(f.base_root.join("dir/seed.txt")).unwrap(),
+        b"base bytes"
+    );
+    release.send(()).unwrap();
+    let delayed = responder.join().unwrap();
+    assert_eq!(delayed.token, token);
+    assert_eq!(delayed.metadata, expected);
+    let next_token = umbra_core::FilesystemQueryToken {
+        request: 2,
+        stop_generation: 2,
+        ..token
+    };
+    let current = f
+        .overlay
+        .filesystem_metadata(&f.process, &query, next_token.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.token, next_token);
+    assert_eq!(current.metadata, expected);
+}
+
+#[test]
 fn f214_descriptor_binding_survives_namespace_removal() {
     let mut f = Fixture::new(&[(b"dir/seed.txt", b"seed\n")]);
     let binding =
