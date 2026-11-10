@@ -4019,10 +4019,9 @@ impl NamespaceSession for Overlay {
                 self.routed_descriptor = Some((
                     descriptor,
                     FdState {
-                        filesystem: Some(umbra_core::FilesystemBinding {
-                            run: self.config()?.context.run_id,
-                            filesystem: "overlay-v1".to_owned(),
-                        }),
+                        filesystem: Some(umbra_core::FilesystemBinding::overlay(
+                            self.config()?.context.run_id,
+                        )),
                         object: stat.object_id,
                         logical_path: Some(logical_path),
                         // **What the object is, not what the caller asked for.**
