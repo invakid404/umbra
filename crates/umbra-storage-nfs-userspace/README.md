@@ -37,6 +37,31 @@ mounted adapter is a separate boundary at
 [umbra-storage-nfs](../umbra-storage-nfs/README.md); the contract this crate
 implements is [umbra-storage](../umbra-storage/README.md).
 
+## Packed-spawn qualification
+
+The `fix_243_*` and rank-11 cases in `tests/userspace_run.rs` compare native
+controls with mediated spawns and independently read the resulting objects
+through NFS. They cover the admitted Darwin attribute/action subset, refused
+attributes and virtual descriptors, signal state, logical close-on-exec pruning,
+kernel errors and parent/thread association. Secondary threads spawn; the main
+thread reaps after joining them because the inherited deferred-wait guard
+remains ([#135](https://github.com/invakid404/umbra/issues/135)). The secondary-thread
+null-descriptor case bypasses `SpawnPrepare` and is a comparison control, not
+proof of lazy registration.
+
+The optional `mutation-probe-spawn-lifecycle` feature enables lifecycle fault
+tests. CI builds both the CLI and platform provider with that feature and
+builds the `umbra243relay` example for guardian cases. The selected tests cover
+registered cleanup, policy and completion failures, guardian-contained provider
+loss, overlapping backing regions, the 16-token cap, repeated mapping release,
+and allocation/write errors. Tests retain ownership observations separately from
+cleanup results. Guardian completion does not prove a child was reaped;
+provider-loss comparisons outside the guardian remain distinct
+([#249](https://github.com/invakid404/umbra/issues/249)).
+All live cases require the normal userspace integration prerequisites and a fresh
+`UMBRA_SLATE_EVIDENCE` directory. Probe controls are documented by the
+[platform provider](../umbra-platform-macos/README.md).
+
 ## Codex-configured SQLite characterization
 
 The `slate_r14_01_fresh_sqlite_wal` and `slate_r14_02_existing_sqlite_wal`

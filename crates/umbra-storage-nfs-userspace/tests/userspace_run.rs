@@ -11693,9 +11693,9 @@ fn race_alternations(bytes: &[u8]) -> usize {
 }
 
 /// C11-10: E8's full pipe launch in single-threaded C. Natively the whole
-/// composition must be exact; routed, the packed descriptor is nonzero, so the
-/// guard's refusal is predicted. A refusal qualifies the refusal only, never
-/// composition support.
+/// composition must be exact; routed, SETSID is refused before authorization
+/// and before the later CHDIR action. A refusal qualifies that boundary only,
+/// never composition support.
 #[test]
 fn slate_c11_10_e8_pipe_refusal() {
     let Some(spawn) = slate_spawn("c11-10") else {

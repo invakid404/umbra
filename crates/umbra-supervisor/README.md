@@ -8,7 +8,7 @@ run's durable journal state directly before reopening it. The suites that spawn
 the real provider executables skip when those are absent, and fail instead under
 `UMBRA_INTEGRATION_REQUIRED` (`tests/reopen.rs:38-67`).
 This crate owns `src/lib.rs`, `src/run.rs`, `src/events.rs`, `src/ofd.rs`,
-`src/base.rs`, `src/sandbox.rs`, `src/directory.rs`, `src/filesystem.rs` and its manifest. `directory.rs` holds the
+`src/base.rs`, `src/sandbox.rs`, `src/directory.rs`, `src/filesystem.rs`, `src/spawn.rs` and its manifest. `directory.rs` holds the
 `DirectoryEncoder` the overlay requires for `FsOp::ReadDir`: the engine resolves
 the merged entries and this side turns them into the native records the tracee's
 `getattrlistbulk` reply expects, using the wire format in `umbra_platform::dirents`
@@ -102,7 +102,7 @@ The staged order is fixed, and each stage's failure decides what may be released
    writer identity and epoch, rejecting a non-fresh recovery state for CreateNew.
    A **routed** run -- storage with no kernel-visible path -- instead journals
    under `RunSpec::state_root`, and mints a nonce into both the store's
-   `control/journal-id` and the log’s first record. See *Routed runs*.
+   `control/journal-id` and the log's first `Started` record. See *Routed runs*.
 5. Bind the namespace over those already-open sessions, handing it the lease so
    one owner renews, releases and mutates.
 6. Render enforcement from the run's own root, re-verify the workspace inventory,
@@ -243,7 +243,8 @@ position lives in an *open file description* the supervisor owns (`src/ofd.rs`,
 runtime-only like `ProcessTree`, never serialized). Every routed `open` makes a
 new one; a fork child shares every description its parent's routed descriptors
 refer to, so a write by either moves the position the other sees (#172). A
-`posix_spawn` child arrives as a Child event rather than an Exec, so its
+`posix_spawn` child arrives as a `Child` event for a null descriptor or a
+`SpawnChild` event for the packed protocol, rather than an Exec, so its
 close-on-exec routed descriptors are swept before it runs -- a write on such a
 number answers `EBADF` (#189) -- and the rest share their parent's
 descriptions (#190). Exec sweeps close-on-exec descriptors and keeps the
@@ -315,10 +316,13 @@ optional.** A writer `journal.open` against an existing-but-empty directory
 establishes a *fresh* log; a fresh log has nothing pending, so `Overlay::bind`
 does not poison and `requires_recovery()` would answer `false` for a run that may
 have crashed mid-transaction. `run` therefore mints a journal-instance nonce into
-the store *and* the log’s first record, and `resume` requires them to match before it
-opens anything. Missing or mismatched is a structured refusal naming the missing
+the store *and* the log's first `Started` record. `resume` compares them through a
+read-only journal session before opening the journal as a writer.
+Missing or mismatched is a structured refusal naming the missing
 evidence -- a third outcome beside `recovery_required: true` and `false`, and the
-reason `false` always means "classified, and no reconciliation is required".
+reason `false` means "classified, and no reconciliation is required" for an
+intact log. The identity check does not detect a log truncated to a shorter valid
+prefix; that still needs a persisted sequence watermark.
 
 Reopening on another host is therefore refused rather than attempted: it needs
 the store *and* the log, and the log is on the host that created the run. Moving

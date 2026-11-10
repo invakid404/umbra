@@ -7,6 +7,9 @@ covers non-macOS targets and macOS on x86_64. Fallible tracing/control calls
 report `UnsupportedCapability`, and capabilities are empty. The pure arm64 ABI
 module remains available on those hosts.
 
+This document covers the crate's ABI decoder, native tracer, spawn protocol,
+interposer, provider executable and integration tests.
+
 The crate implements the v2 experimental tracer described in
 `experiments/tracer/umbra_tracer.py` and `experiments/tracer/REPORT-v2.md`
 using a hybrid debugger interface: **Apple's `debugserver` over GDB Remote
@@ -47,9 +50,32 @@ survivors requiring test recovery. A live-process census does not prove reap.
 Guardian-isolated entry retains its existing session sweep and zombie caveat.
 Later child-initiated group/session changes remain outside this guarantee.
 
+Spawning from a secondary thread is supported; waiting for that child from a
+secondary thread remains refused by the inherited `WaitPlan::Park` guard
+([#135](https://github.com/invakid404/umbra/issues/135)). The thread-association
+fixtures therefore reap on the main thread after joining the spawning threads.
+
 Lifecycle probes are compiled only with `mutation-probe-spawn-lifecycle`.
 The semantic readings do not certify the full fault matrix, which remains
 under qualification. Normal provider builds exclude the probes.
+
+The feature exposes these test controls; normal builds do not read them:
+
+| Variable | Effect |
+|---|---|
+| `UMBRA_FIX_243_PROBE_SOCKET` | Unix socket for a phase record and one-byte acknowledgment; replies time out after 15 seconds. |
+| `UMBRA_FIX_243_PROBE_PHASE` | Selects the rendezvous, defaulting to `task-acquired`. Completion phases include `inserted`, `policy-ready`, `caller-copyout`, `remote-free`, and `register-commit`; `unregistered` observes the earlier PID-read boundary. |
+| `UMBRA_FIX_243_PROBE_AFTER_FAILURE` | Also reports the selected phase's `-failed` observation before teardown. |
+| `UMBRA_FIX_243_PROBE_ROOT` | Enables the acquired-task rendezvous for the attached root comparison. |
+| `UMBRA_FIX_243_PROBE_TRIGGER` | Selects `deadline`, `session-drop`, `backend-drop`, `terminate`, or `watchdog` at the supported test boundary. |
+| `UMBRA_FIX_243_REGION_TRACE` | Reports allocation/release and queries whether the released mapping is absent. |
+| `UMBRA_FIX_243_REGION_FAULT` | `allocate` uses a null task port; `write` attempts the backing write at address zero while retaining allocation ownership. |
+| `UMBRA_FIX_243_OVERLAP_PARENTS` | Holds 2–17 distinct parents before kernel execution and verifies their backing before release; the production cap refuses the seventeenth token. |
+| `UMBRA_FIX_243_OWNER_TRACE` | Reports retained Session identities at teardown entry. |
+
+The socket acknowledgment continues (`C`), injects the selected failure (`E`),
+or exits the provider without Drop (`P`). These controls belong to the fixture
+harness and change scheduling or failure behavior only in feature builds.
 
 <!-- memoria:section id="public-api" files="src/lib.rs" -->
 ## Public API
@@ -912,10 +938,11 @@ rather than discarded across an exec — see the closed M2 gap below. A
 duplicate `Z0` at one address makes the matching `z0` decrement without
 restoring the instruction, and debugserver answers `OK` either way.
 
-`posix_spawn` needs no per-release layout knowledge. `struct
+The null-descriptor `posix_spawn` path needs no per-release layout knowledge.
+The packed-descriptor path above instead validates an exact ABI profile. `struct
 _posix_spawnattr` is private and moves between releases — `sizeof` 248 with
-`psa_ports` at 192 on macOS 26, 256 and 200 on 27.0 — so this crate never
-reconstructs it. `spawn_attributes` has the host's own libc build the block
+`psa_ports` at 192 on macOS 26, 256 and 200 on 27.0.
+For the null path, `spawn_attributes` has the host's own libc build the block
 (`posix_spawnattr_init` plus `posix_spawnattr_setflags`), takes its length
 from `malloc_size` rather than a constant, and copies the bytes without
 interpreting them.

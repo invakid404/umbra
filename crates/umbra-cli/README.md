@@ -27,7 +27,8 @@ umbra run --registry PATH [--workspace PATH] [--state-dir PATH] --experimental
       [--local-dev | --strict-remote] [--agent ID]
       [--env NAME=VALUE]... [--inherit-env NAME]... -- COMMAND [ARGS...]
 umbra [--storage-root PATH] stop|checkpoint|inspect RUN_ID
-umbra [--storage-root PATH] resume RUN_ID [--workspace PATH] [--state-dir PATH]
+umbra resume --registry PATH RUN_ID [--workspace PATH] [--state-dir PATH]
+      [--local-dev | --strict-remote]
 umbra providers --registry PATH [--role ROLE]
 ```
 
@@ -150,7 +151,7 @@ at once unless this process was started as a guardian. See
 
 `--agent` no longer defaults to `codex`; the default prevented a raw command
 route. `--storage-root` no longer defaults to `.umbra` and is rejected outright by
-`run` rather than silently ignored, since storage lives in the registry.
+`run` and `resume`, since storage lives in the registry.
 
 <!-- memoria:section id="composition" files="src/composition.rs" -->
 ## Composition
