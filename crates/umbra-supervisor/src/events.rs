@@ -2651,12 +2651,26 @@ mod tests {
                     ErrorKind::ProtocolMismatch
                 }
             );
-            if fault == 4 {
-                assert_eq!(failure.operation, "provider.call");
-                assert_eq!(failure.context, "request deadline expired");
-            }
+            let (operation, context) = match fault {
+                0 | 1 => ("test.provider", "provider failed before reply"),
+                2 | 3 => ("filesystem.query", "stale or mismatched reply"),
+                4 => ("provider.call", "request deadline expired"),
+                _ => unreachable!(),
+            };
+            assert_eq!(failure.operation, operation);
+            assert_eq!(failure.context, context);
+            assert_eq!(
+                failure.errno, None,
+                "fatal failures must not become syscall errnos"
+            );
             assert!(s.is_poisoned());
             assert_eq!(s.state.lifecycle, RunLifecycle::RecoveryRequired);
+            let stopped = s.step().unwrap_err();
+            assert_eq!(stopped.kind, ErrorKind::InvalidState);
+            assert_eq!(
+                stopped.context,
+                "run is poisoned; no further events may be serviced"
+            );
             // Fake's memory write and register-write methods panic: reaching
             // this point proves neither copyout nor syscall completion occurred.
             let token = FilesystemQueryToken {
