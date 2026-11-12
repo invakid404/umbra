@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <mach/mach_time.h>
 #include <sys/proc_info.h>
 #include <time.h>
 #include <unistd.h>
@@ -73,6 +75,13 @@ static int setup(int argc, char **argv) {
     }
     int mapping = open(mapping_path, O_RDWR);
     if (mapping < 0) return 11;
+    struct stat mapping_stat;
+    if (fstat(mapping, &mapping_stat)) { close(mapping); return 25; }
+    if (mapping_stat.st_size < (off_t)sizeof(*s)) {
+        fprintf(stderr, "shared mapping too short: %lld bytes\n", (long long)mapping_stat.st_size);
+        close(mapping);
+        return 26;
+    }
     s = mmap(NULL, sizeof(*s), PROT_READ | PROT_WRITE, MAP_SHARED, mapping, 0);
     if (s == MAP_FAILED || close(mapping)) return 12;
     lockfd = open(argv[3], helper ? O_RDWR : O_RDONLY);
@@ -119,7 +128,20 @@ int main(int argc, char **argv) {
         return valid && rc == 0 && close(lockfd) == 0 ? 0 : 15;
     }
     fprintf(stderr, "target mapped pid=%d\n", getpid());
-    while (!s->ready) {}
+    // Eight seconds allows helper launch/scheduling after copy-up, while staying
+    // below the 12 s provider deadline and 20 s harness watchdog. Read the user
+    // clock only every 4096 spins; no trapped syscall enters the ready loop.
+    mach_timebase_info_data_t timebase;
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS) return 27;
+    uint64_t ready_start = mach_absolute_time();
+    uint64_t ready_ticks = 8000000000ULL * timebase.denom / timebase.numer;
+    unsigned spins = 0;
+    while (!s->ready) {
+        if ((++spins & 4095) == 0 && mach_absolute_time() - ready_start >= ready_ticks) {
+            fprintf(stderr, "target helper never ready\n");
+            return 28;
+        }
+    }
     fprintf(stderr, "target helper ready\n");
     pthread_t first, second;
     if (pthread_create(&first, NULL, a, NULL) || pthread_create(&second, NULL, b, NULL))

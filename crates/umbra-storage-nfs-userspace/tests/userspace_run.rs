@@ -16164,10 +16164,10 @@ fn fix_227_sibling_progress_without_kernel_wait_proof() {
                 // Initializers are traced in rewrite mode. Wait for the copy-up
                 // and map the same physical object the target will mmap.
                 shared = root.join(shared.strip_prefix("/").unwrap());
-                while !shared.is_file() {
+                while !std::fs::metadata(&shared).is_ok_and(|metadata| metadata.len() >= 4096) {
                     assert!(
                         std::time::Instant::now() < deadline,
-                        "shared mapping copy-up missing"
+                        "shared mapping copy-up did not reach 4096 bytes"
                     );
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
