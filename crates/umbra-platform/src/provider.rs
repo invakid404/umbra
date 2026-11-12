@@ -10,7 +10,8 @@ use umbra_core::{
     ErrorKind, SandboxRequirement, UmbraError, MAX_IO_BYTES,
 };
 
-/// Platform control and ABI methods in protocol version 2.
+/// Platform control and ABI methods in protocol version 3.
+/// Bounded polling is negotiated by capability; legacy messages remain supported.
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     /// Capabilities.
