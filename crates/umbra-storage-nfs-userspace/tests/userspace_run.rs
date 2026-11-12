@@ -8956,6 +8956,19 @@ fn slate_signal_records(directory: &Path) -> Vec<serde_json::Value> {
     rows
 }
 
+// Preserve a no-reading classification before trying to interpret product output.
+fn slate_prepared_run<'a>(stderr: &'a str, cleanup: &str) -> &'a str {
+    let line = cleanup.lines().next().expect("cleanup summary");
+    assert!(!line.contains("UNMEASURABLE"), "{line}");
+    stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("umbra: run ")
+                .and_then(|value| value.strip_suffix(" prepared"))
+        })
+        .unwrap_or_else(|| panic!("prepared run missing; {line}\n{stderr}"))
+}
+
 #[test]
 fn slate_launcher_timeout_and_census_overrun() {
     use std::time::{Duration, Instant};
@@ -8968,6 +8981,16 @@ fn slate_launcher_timeout_and_census_overrun() {
         scratch.path(),
         "umbra-userspace-threads",
         "UMBRA_THREADS_PATH",
+    );
+    // Pay macOS first-exec assessment before any of the short budgets below.
+    // No arguments exercises the fixture's immediate usage exit (2), without
+    // entering a workload. The same inode is reused by all three phases.
+    let assessed = Command::new(&program).output().expect("fixture pre-exec");
+    assert_eq!(
+        assessed.status.code(),
+        Some(2),
+        "fixture pre-exec: {}",
+        String::from_utf8_lossy(&assessed.stderr)
     );
     let start = Instant::now();
     let (output, timed_out) = slate_bounded_for(
@@ -9031,6 +9054,12 @@ fn slate_launcher_timeout_and_census_overrun() {
             .unwrap()
             .contains("killed_us")
     );
+    // The copyout reporting path must retain the actual no-reading diagnosis.
+    let cleanup = std::fs::read_to_string(evidence.join("injected-failure.cleanup")).unwrap();
+    let diagnostic = std::panic::catch_unwind(|| slate_prepared_run("", &cleanup)).unwrap_err();
+    let diagnostic = diagnostic.downcast_ref::<String>().expect("panic text");
+    assert_eq!(diagnostic, cleanup.lines().next().unwrap());
+    assert!(diagnostic.contains("UNMEASURABLE"));
 }
 
 #[test]
@@ -9944,13 +9973,9 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
         &watch,
     );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let id = stderr
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("umbra: run ")
-                .and_then(|v| v.strip_suffix(" prepared"))
-        })
-        .expect("prepared run");
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup"))
+        .expect("routed cleanup record");
+    let id = slate_prepared_run(&stderr, &cleanup);
     let run = Run {
         run_id: RunId(uuid::Uuid::parse_str(id).unwrap()),
         status: output.status.code(),
