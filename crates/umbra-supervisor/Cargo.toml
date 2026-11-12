@@ -7,6 +7,8 @@ edition.workspace = true
 publish = false
 
 [features]
+# Test instrumentation: emit only successful writer-renewal observations.
+probe-idle-renewal = []
 # Forwarded to `umbra-overlay`; see its manifest for what each probe breaks and
 # why they are compile-time only. Nothing in this crate reads them.
 mutation-probe-read = ["umbra-overlay/mutation-probe-read"]

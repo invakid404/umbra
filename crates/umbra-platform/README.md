@@ -11,6 +11,7 @@ The public contracts preserve the spec's signatures:
 pub trait TraceBackend {
     fn launch(&mut self, spec: LaunchSpec) -> Result<ProcessHandle>;
     fn next_event(&mut self) -> Result<TraceEvent>;
+    fn poll_event(&mut self, max_wait: Duration) -> Result<EventPoll>;
     fn read_memory(&mut self, task: TaskId, address: u64, out: &mut [u8]) -> Result<()>;
     fn write_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()>;
     fn copyout_memory(&mut self, task: TaskId, address: u64, bytes: &[u8]) -> Result<()>;
@@ -156,7 +157,7 @@ trait-object smoke example with `cargo test -p umbra-platform --doc`.
 The provider dispatcher rejects `UnsandboxedExperiment` before calling a backend:
 IPC launch is exclusively the supervised contract path. ABI capability identities
 use `<platform>-<arch>-abi-v<decimal version>`; run composition requires exactly
-one for its negotiated architecture. Protocol version 2 rejects stale providers
+one for its negotiated architecture. Protocol version 3 rejects stale providers
 before decoding the required sandbox policy and rewrite messages.
 
 <!-- memoria:section id="data-transfers-and-the-iobuffer-seam" files="src/provider.rs src/dirents.rs src/lib.rs" -->
@@ -226,3 +227,10 @@ rewrite a stopped call. The default refuses with `UnsupportedCapability`;
 backends serving filesystem metadata must explicitly supply protection-respecting
 copyout. The Darwin backend uses Mach
 writes so read-only pages are not made writable by debugger behavior.
+
+Bounded event polling uses the `bounded-event-poll-v1` platform capability.
+`EventPoll::Idle` is a quiet interval, not a trace event or a process exit. The
+provider accepts 1 through 100000 microseconds per poll; the proxy also caps the
+wait at a quarter of the registry request timeout. Legacy `NextEvent`/`Event`
+messages keep their encoding and behavior. The supervisor requires the new
+capability before launch. Unsupported providers fail explicitly.

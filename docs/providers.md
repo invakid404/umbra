@@ -119,3 +119,10 @@ request and the `interpose` and `descriptor_limit` fields of the launch policy,
 both of which a version-2 provider would deserialize as absent -- launching a
 tracee that is neither interposed nor descriptor-fenced, which is exactly the
 silently-wrong start the version exists to prevent.
+
+Platform clients require `bounded-event-poll-v1` before Launch. `PollEvent`
+requests bound the wait to at most 100ms and a quarter of the registry deadline;
+Idle lets the supervisor renew the writer before re-issuing. Common protocol
+version 3 and legacy NextEvent/Event messages remain unchanged. The macOS
+session watchdog is an independent absolute limit, and its 1ms debugger-read
+floor means tiny registry timeouts can still fail closed.

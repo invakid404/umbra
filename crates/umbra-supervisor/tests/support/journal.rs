@@ -13,12 +13,7 @@
 //! `closes` counter are stripped, because no test here needs them and an unused
 //! switch is an invitation to assert vacuously.
 //!
-//! The appended records are retained rather than counted, so the first test that
-//! wants journal *shape* — "a reconciled abort journals `Prepare`,
-//! `ObservedResult`, `Abort` and no `Commit`" is the obvious next one — only has
-//! to hand a clone of `records` back out through `Harness`. Exposing that handle
-//! before an assertion reads it would ship a dead accessor, so it is not
-//! exposed yet.
+//! Appended records are shared with the harness for semantic journal assertions.
 
 use umbra_core::{
     Checkpoint, CheckpointId, DurableSequence, JournalOpenRequest, JournalRecord,
@@ -57,7 +52,7 @@ pub fn recovery(run_id: RunId) -> RecoveryState {
 
 /// An ordered log in a `Vec`, with no framing, no checksums and no I/O.
 pub struct MemoryJournal {
-    records: Vec<JournalRecord>,
+    pub records: std::sync::Arc<std::sync::Mutex<Vec<JournalRecord>>>,
     run: RunId,
     epoch: LeaseEpoch,
 }
@@ -69,7 +64,7 @@ impl MemoryJournal {
     /// epoch, so these are not decoration: they are what makes `flush` valid.
     pub fn new(run: RunId, epoch: LeaseEpoch) -> Self {
         Self {
-            records: Vec::new(),
+            records: Default::default(),
             run,
             epoch,
         }
@@ -81,15 +76,15 @@ impl Journal for MemoryJournal {
         Ok(recovery(self.run))
     }
     fn append(&mut self, record: &JournalRecord) -> Result<Sequence> {
-        let sequence = Sequence(self.records.len() as u64 + 1);
+        let sequence = Sequence(self.records.lock().unwrap().len() as u64 + 1);
         let mut record = record.clone();
         record.sequence = sequence;
-        self.records.push(record);
+        self.records.lock().unwrap().push(record);
         Ok(sequence)
     }
     fn flush(&mut self, through: Sequence) -> Result<DurableSequence> {
         assert!(
-            through.0 <= self.records.len() as u64,
+            through.0 <= self.records.lock().unwrap().len() as u64,
             "a flush beyond the log is an engine bug, not an injectable failure"
         );
         Ok(DurableSequence {
@@ -104,6 +99,8 @@ impl Journal for MemoryJournal {
     ) -> Result<Box<dyn Iterator<Item = Result<JournalRecord>> + Send + '_>> {
         let records: Vec<_> = self
             .records
+            .lock()
+            .unwrap()
             .iter()
             .filter(|r| r.sequence.0 > after.0)
             .cloned()

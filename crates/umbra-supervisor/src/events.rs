@@ -45,6 +45,8 @@ fn renew_due(
     let now = Instant::now();
     if now >= deadline {
         namespace.renew_writer()?;
+        #[cfg(feature = "probe-idle-renewal")]
+        eprintln!("umbra-probe: writer-renewed");
         // Account for renewal's own provider latency, rather than adding it to
         // the next interval after the call returns.
         *renew_at = Some(now + interval);
@@ -191,13 +193,31 @@ impl Supervisor {
             ));
         }
         self.service_renewal()?;
-        let event = self.platform.control.next_event().inspect_err(|_| {
-            // A lost or timed-out event channel means we can no longer prove what
-            // the tree is doing. Nothing may be resumed after this point.
-            self.poisoned = true;
-            self.filesystem_queries.clear();
-        })?;
-        self.handle_event(event)
+        let max_wait = self
+            .renew_at
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(100))
+            .min(Duration::from_millis(100));
+        if max_wait.as_micros() == 0 {
+            if !max_wait.is_zero() {
+                std::thread::sleep(max_wait);
+            }
+            return self.service_renewal();
+        }
+        let event = self
+            .platform
+            .control
+            .poll_event(max_wait)
+            .inspect_err(|_| {
+                // A lost or timed-out event channel means we can no longer prove what
+                // the tree is doing. Nothing may be resumed after this point.
+                self.poisoned = true;
+                self.filesystem_queries.clear();
+            })?;
+        match event {
+            umbra_platform::EventPoll::Event(event) => self.handle_event(event),
+            umbra_platform::EventPoll::Idle => self.service_renewal(),
+        }
     }
 
     /// Dispatch one event and issue at most one resume for it.
@@ -1935,6 +1955,9 @@ mod tests {
         fn next_event(&mut self) -> Result<TraceEvent> {
             unreachable!()
         }
+        fn poll_event(&mut self, _: std::time::Duration) -> Result<umbra_platform::EventPoll> {
+            unreachable!()
+        }
         fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
             panic!("renewal failure must precede memory read")
         }
@@ -2026,6 +2049,147 @@ mod tests {
         s.live = 1;
         s.state.lifecycle = RunLifecycle::Running;
         s
+    }
+
+    struct QuietControl(std::rc::Rc<std::cell::Cell<usize>>, bool);
+    struct RenewalCounter {
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+    impl TraceBackend for QuietControl {
+        fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
+            unreachable!()
+        }
+        fn next_event(&mut self) -> Result<TraceEvent> {
+            unreachable!()
+        }
+        fn poll_event(&mut self, wait: std::time::Duration) -> Result<umbra_platform::EventPoll> {
+            self.0.set(self.0.get() + 1);
+            if self.1 {
+                return Err(UmbraError::new(
+                    ErrorKind::StorageUnavailable,
+                    "provider.transport",
+                    "request deadline exceeded",
+                ));
+            }
+            std::thread::sleep(wait);
+            Ok(umbra_platform::EventPoll::Idle)
+        }
+        fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
+            panic!("renewal failure must precede memory read")
+        }
+        fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn copyout_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            panic!("unexpected syscall copyout in this test")
+        }
+        fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
+            unreachable!()
+        }
+        fn set_registers(&mut self, _: ThreadId, _: &RegisterSet) -> Result<()> {
+            unreachable!()
+        }
+        fn resume(&mut self, _: ResumeCommand) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl TraceControl for QuietControl {
+        fn capabilities(&self) -> PlatformCapabilities {
+            PlatformCapabilities::default()
+        }
+        fn quiesce(&mut self, _: ProcessHandle) -> Result<QuiescedTree> {
+            unreachable!()
+        }
+        fn terminate(&mut self, _: ProcessHandle, _: TerminationPolicy) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl NamespaceResolver for RenewalCounter {
+        fn resolve(&mut self, _: &ProcessContext, _: &FsOp) -> Result<ResolvedAction> {
+            unreachable!()
+        }
+    }
+    impl NamespaceSession for RenewalCounter {
+        fn prepare(&mut self, _: OperationId, _: &ResolvedAction) -> Result<PreparedAction> {
+            unreachable!()
+        }
+        fn observe_result(&mut self, _: OperationId, _: &OperationOutcome) -> Result<()> {
+            unreachable!()
+        }
+        fn commit(&mut self, _: OperationId) -> Result<CommitReceipt> {
+            unreachable!()
+        }
+        fn abort(&mut self, _: OperationId, _: &AbortReason) -> Result<()> {
+            unreachable!()
+        }
+        fn checkpoint(&mut self, _: &CheckpointRequest) -> Result<Checkpoint> {
+            unreachable!()
+        }
+        fn renew_writer(&mut self) -> Result<WriterLease> {
+            if self.fail {
+                return Err(UmbraError::new(
+                    ErrorKind::LeaseLost,
+                    "test",
+                    "renewal failed",
+                ));
+            }
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(WriterLease {
+                run_id: RunId(Uuid::nil()),
+                writer_id: umbra_core::WriterId("test".into()),
+                epoch: umbra_core::LeaseEpoch(1),
+                renewal_token: vec![],
+                renew_after_millis: 20,
+            })
+        }
+    }
+
+    #[test]
+    fn fix_262_poll_error_poisoning_prevents_further_poll_or_resume() {
+        let polls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut s = supervisor();
+        s.platform.control = Box::new(QuietControl(polls.clone(), true));
+        assert_eq!(s.step().unwrap_err().kind, ErrorKind::StorageUnavailable);
+        assert!(s.poisoned);
+        assert!(s.step().is_err());
+        assert_eq!(polls.get(), 1);
+        assert!(s.resume_thread(ThreadId(task(1).0)).is_err());
+        s.terminate_tree(TerminationPolicy::Immediate).unwrap();
+    }
+
+    #[test]
+    fn fix_262_idle_renews_and_renewal_failure_poisoning_is_terminal() {
+        for fail in [false, true] {
+            let polls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let renewals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut s = supervisor();
+            s.platform.control = Box::new(QuietControl(polls.clone(), false));
+            s.namespace = Box::new(RenewalCounter {
+                count: renewals.clone(),
+                fail,
+            });
+            let mut budget = routed_budget(100);
+            budget.renew_after = Duration::from_millis(10);
+            s.budget = Some(budget);
+            s.renew_at = Some(Instant::now() + Duration::from_millis(10));
+            let first = s.step();
+            assert_eq!(polls.get(), 1);
+            if fail {
+                assert_eq!(first.unwrap_err().kind, ErrorKind::LeaseLost);
+                assert!(s.poisoned);
+                assert!(s.step().is_err());
+                assert_eq!(polls.get(), 1);
+                assert_eq!(renewals.load(std::sync::atomic::Ordering::SeqCst), 0);
+            } else {
+                first.unwrap();
+                assert_eq!(renewals.load(std::sync::atomic::Ordering::SeqCst), 1);
+                s.step().unwrap();
+                assert_eq!(renewals.load(std::sync::atomic::Ordering::SeqCst), 2);
+                assert_eq!(polls.get(), 2);
+                assert!(!s.poisoned);
+            }
+        }
     }
 
     fn poisoned_spawn_event(arm: u8) {
@@ -2174,6 +2338,9 @@ mod tests {
             unreachable!()
         }
         fn next_event(&mut self) -> Result<TraceEvent> {
+            unreachable!()
+        }
+        fn poll_event(&mut self, _: std::time::Duration) -> Result<umbra_platform::EventPoll> {
             unreachable!()
         }
         fn read_memory(&mut self, _: TaskId, _: u64, out: &mut [u8]) -> Result<()> {
@@ -2666,6 +2833,9 @@ mod tests {
                 unreachable!()
             }
             fn next_event(&mut self) -> Result<TraceEvent> {
+                unreachable!()
+            }
+            fn poll_event(&mut self, _: std::time::Duration) -> Result<umbra_platform::EventPoll> {
                 unreachable!()
             }
             fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
@@ -3404,6 +3574,9 @@ mod tests {
             unreachable!()
         }
         fn next_event(&mut self) -> Result<TraceEvent> {
+            unreachable!()
+        }
+        fn poll_event(&mut self, _: std::time::Duration) -> Result<umbra_platform::EventPoll> {
             unreachable!()
         }
         fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {

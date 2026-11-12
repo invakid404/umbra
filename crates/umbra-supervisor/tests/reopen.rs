@@ -596,3 +596,64 @@ fn reopening_a_healthy_run_twice_leaves_the_journal_where_it_was() {
         "the one thing that does change: each reopen takes its own authority"
     );
 }
+
+// A fresh supervisor is constructed separately: resume restores namespace state,
+// never the old operating-system process or its monotonic polling deadlines.
+#[allow(dead_code)]
+mod support;
+
+#[test]
+fn fix_262_reopen_preserves_semantic_journal_and_fresh_idle_session() {
+    let bins = providers().expect("fix-262 recovery requires built provider executables");
+    let dir = tempfile::tempdir().unwrap();
+    let (workspace_dir, contract) = workspace(dir.path());
+    let storage_root = dir.path().join("storage");
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let control = create_run(&storage_root, run_id, &contract);
+    let id = OperationId(uuid::Uuid::from_u128(262));
+    let (mut journal, request) = open_journal(&control, run_id, 1);
+    journal.open(&request).unwrap();
+    journal
+        .append(&record(
+            1,
+            id,
+            JournalPayload::Prepare {
+                intent: JournalIntent::Unlink {
+                    object: ObjectId(uuid::Uuid::from_u128(263)),
+                    path: BytePath::new(b"/gone".to_vec()).unwrap(),
+                    directory: false,
+                },
+            },
+        ))
+        .unwrap();
+    journal
+        .append(&record(1, id, JournalPayload::Commit))
+        .unwrap();
+    journal.flush(Sequence(2)).unwrap();
+    let before: Vec<_> = journal
+        .replay(Sequence(0))
+        .unwrap()
+        .collect::<umbra_core::Result<_>>()
+        .unwrap();
+    journal.close().unwrap();
+    {
+        let mut previous = support::Harness::new(&[]);
+        previous.idle_step();
+        assert!(previous.journal_records().is_empty());
+    }
+    let outcome = Supervisor::resume(spec(&storage_root, run_id, workspace_dir, bins)).unwrap();
+    assert!(!outcome.recovery_required);
+    let (mut journal, request) = open_journal(&control, run_id, outcome.writer_epoch.0 + 1);
+    journal.open(&request).unwrap();
+    let after: Vec<_> = journal
+        .replay(Sequence(0))
+        .unwrap()
+        .collect::<umbra_core::Result<_>>()
+        .unwrap();
+    assert_eq!(before, after);
+    journal.close().unwrap();
+    let mut fresh = support::Harness::new(&[]);
+    fresh.idle_step();
+    assert!(fresh.journal_records().is_empty());
+    assert!(!fresh.supervisor.is_poisoned());
+}

@@ -1637,3 +1637,16 @@ cells assert no pre-commit child effects, identity-checked disappearance and
 clean teardown without harness survivor kills. Non-isolated provider-loss
 controls are local comparison readings labelled NOT QUALIFIED; harness recovery
 is recorded separately and never establishes production cleanup success.
+
+## Quiet-run provider deadlines
+
+`fix_262_routed_sleep` and `fix_262_routed_idle_renewal` use the existing bounded
+slate launcher and native sleep controls. Both require Code(0) with a 5000ms
+registry timeout and a 60000ms platform session limit. The latter sleeps for
+17 seconds and additionally requires at least one successful writer-renewal
+marker. Build `umbra-cli` with `--features probe-idle-renewal` for this reading;
+normal builds emit no marker. The normal live-server, pinned libnfs, provider
+binaries and fresh `UMBRA_SLATE_EVIDENCE` prerequisites apply, with
+`UMBRA_INTEGRATION_REQUIRED=1`. CI builds the probe feature before its baseline
+userspace suite. This qualifies the observed quiet run, not cancellation,
+unlimited session lifetime, or new storage semantics.

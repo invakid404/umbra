@@ -566,3 +566,26 @@ fn a_set_times_a_backend_cannot_serve_is_answered_rather_than_killing_the_run() 
         "a refused set-times must not materialise its target"
     );
 }
+
+#[test]
+fn fix_262_idle_preserves_real_overlay_journal_and_pending_operation() {
+    let mut h = Harness::new(&[(b"file", b"base bytes")]);
+    let initial = h.journal_records();
+    let mark = h.mark();
+    h.idle_step();
+    assert_eq!(h.journal_records(), initial);
+    assert!(h.resumes_since(mark).is_empty());
+    h.prepared_entry(chown(b"file"), "file");
+    let prepared = h.journal_records();
+    assert!(!prepared.is_empty());
+    let mark = h.mark();
+    h.idle_step();
+    assert_eq!(h.journal_records(), prepared);
+    assert!(h.resumes_since(mark).is_empty());
+    h.exit(EPERM).unwrap();
+    let completed = h.journal_records();
+    assert!(completed.len() > prepared.len());
+    h.idle_step();
+    assert_eq!(h.journal_records(), completed);
+    assert!(!h.supervisor.is_poisoned());
+}

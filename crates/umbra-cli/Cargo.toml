@@ -11,6 +11,7 @@ name = "umbra"
 path = "src/main.rs"
 
 [features]
+probe-idle-renewal = ["umbra-supervisor/probe-idle-renewal"]
 # Forwarded to `umbra-overlay` through `umbra-supervisor`; see that manifest.
 # Building the `umbra` binary with one of these is how
 # `crates/umbra-storage-nfs-userspace/tests/userspace_run.rs` gets a supervisor

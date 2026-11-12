@@ -94,6 +94,7 @@ struct Recording {
 /// refusing default — and returns a plan echoing the prepared physical path
 /// with no memory writes, which is what keeps `write_memory` unreachable too.
 struct Platform {
+    idle: Arc<std::sync::atomic::AtomicBool>,
     log: Arc<Mutex<Recording>>,
     op: Arc<Mutex<Option<FsOp>>>,
 }
@@ -112,6 +113,14 @@ impl TraceBackend for Platform {
     }
     fn next_event(&mut self) -> Result<TraceEvent> {
         unreachable!("the harness hands the supervisor its events directly")
+    }
+    fn poll_event(&mut self, wait: std::time::Duration) -> Result<umbra_platform::EventPoll> {
+        assert!(
+            self.idle.load(std::sync::atomic::Ordering::SeqCst),
+            "unexpected poll"
+        );
+        std::thread::sleep(wait);
+        Ok(umbra_platform::EventPoll::Idle)
     }
     fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
         unreachable!("the scripted decoder reads no tracee memory")
@@ -290,6 +299,8 @@ pub struct Harness {
     log: Arc<Mutex<Recording>>,
     op: Arc<Mutex<Option<FsOp>>>,
     thread: ThreadId,
+    idle: Arc<std::sync::atomic::AtomicBool>,
+    records: Arc<Mutex<Vec<umbra_core::JournalRecord>>>,
     _dirs: [TempDir; 2],
 }
 
@@ -337,6 +348,7 @@ impl Harness {
         let run_id = binding.run_id;
         let shadow_root = native(binding.root.physical_path.as_ref().unwrap());
         let journal = MemoryJournal::new(run_id, lease.epoch);
+        let records = journal.records.clone();
         let config = SessionConfig {
             context: context(run_id, Some(lease.epoch)),
             recovery: recovery(run_id),
@@ -355,14 +367,17 @@ impl Harness {
 
         let log = Arc::new(Mutex::new(Recording::default()));
         let op = Arc::new(Mutex::new(None));
+        let idle = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut supervisor = Supervisor::with_namespace(
             run_id,
             PlatformSession {
                 control: Box::new(Platform {
+                    idle: idle.clone(),
                     log: log.clone(),
                     op: op.clone(),
                 }),
                 abi: Box::new(Platform {
+                    idle: idle.clone(),
                     log: log.clone(),
                     op: op.clone(),
                 }),
@@ -379,6 +394,8 @@ impl Harness {
 
         Self {
             supervisor,
+            idle,
+            records,
             shadow_root,
             base_root,
             log,
@@ -386,6 +403,18 @@ impl Harness {
             thread: ThreadId(task().0),
             _dirs: [base_dir, shadow_dir],
         }
+    }
+
+    /// Drive one explicit quiet interval through the real supervisor.
+    pub fn idle_step(&mut self) {
+        self.idle.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.supervisor.step().unwrap();
+        self.idle.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Semantic records emitted by the real overlay.
+    pub fn journal_records(&self) -> Vec<umbra_core::JournalRecord> {
+        self.records.lock().unwrap().clone()
     }
 
     /// The single thread every event in these tests is driven on.

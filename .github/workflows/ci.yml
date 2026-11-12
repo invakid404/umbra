@@ -584,6 +584,7 @@ jobs:
       - name: Proof 1 -- end to end, the toy and the Rust I/O fixture must exit 0
         run: |
           cargo build --workspace --bins
+          cargo build -p umbra-cli --features probe-idle-renewal
           cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
           cargo test -p umbra-storage-nfs-userspace --features transport-raw \
             --test userspace_run -- --nocapture --test-threads=1

@@ -19,6 +19,11 @@ pub enum Request {
     Launch(LaunchSpec),
     /// Next event.
     NextEvent,
+    /// Bounded event wait, in microseconds.
+    PollEvent {
+        /// Maximum wait in microseconds, from 1 through 100000.
+        max_wait_us: u64,
+    },
     /// Read memory.
     ReadMemory {
         /// Task.
@@ -109,6 +114,8 @@ pub enum Response {
     Process(ProcessHandle),
     /// Event.
     Event(TraceEvent),
+    /// Bounded event outcome.
+    EventPoll(EventPoll),
     /// Bytes.
     Bytes(Vec<u8>),
     /// Registers.
@@ -145,6 +152,7 @@ pub struct MemoryRead {
 struct Control {
     client: Rc<RefCell<Client>>,
     capabilities: PlatformCapabilities,
+    timeout_ms: u64,
 }
 struct Abi {
     client: Rc<RefCell<Client>>,
@@ -163,6 +171,7 @@ pub fn connect(descriptor: &ProviderDescriptor, timeout_ms: u64) -> Result<Platf
         control: Box::new(Control {
             client: client.clone(),
             capabilities,
+            timeout_ms,
         }),
         abi: Box::new(Abi { client }),
     })
@@ -187,9 +196,35 @@ fn unit(response: Response) -> Result<()> {
 }
 impl TraceBackend for Control {
     fn launch(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
+        require_bounded_poll(&self.capabilities)?;
         match call(&self.client, &Request::Launch(spec))? {
             Response::Process(v) => Ok(v),
             _ => Err(protocol_error("platform.launch response")),
+        }
+    }
+    fn poll_event(&mut self, max_wait: std::time::Duration) -> Result<EventPoll> {
+        if !self
+            .capabilities
+            .capabilities
+            .contains(umbra_core::capabilities::PLATFORM_BOUNDED_EVENT_POLL_V1)
+        {
+            return Err(protocol_error("platform lacks bounded-event-poll-v1"));
+        }
+        let transport_us = self
+            .timeout_ms
+            .checked_mul(1000)
+            .ok_or_else(|| protocol_error("poll timeout overflow"))?
+            / 4;
+        let micros = max_wait
+            .as_micros()
+            .min(100_000)
+            .min(u128::from(transport_us));
+        let max_wait_us =
+            u64::try_from(micros).map_err(|_| protocol_error("poll timeout overflow"))?;
+        validate_poll_wait(max_wait_us)?;
+        match call(&self.client, &Request::PollEvent { max_wait_us })? {
+            Response::EventPoll(outcome) => Ok(outcome),
+            _ => Err(protocol_error("platform.poll_event response")),
         }
     }
     fn next_event(&mut self) -> Result<TraceEvent> {
@@ -433,6 +468,9 @@ fn control_request(control: &mut dyn TraceControl, request: Request) -> Result<R
             control.launch(spec).map(Response::Process)
         }
         Request::NextEvent => control.next_event().map(Response::Event),
+        Request::PollEvent { max_wait_us } => control
+            .poll_event(validate_poll_wait(max_wait_us)?)
+            .map(Response::EventPoll),
         Request::ReadMemory { task, address, len } => {
             bounds(address, len as usize)?;
             let mut bytes = vec![0; len as usize];
@@ -699,6 +737,7 @@ mod tests {
                 },
             )));
             let mut control = Control {
+                timeout_ms: 5000,
                 client,
                 capabilities: Default::default(),
             };
@@ -725,6 +764,9 @@ mod tests {
         }
         fn next_event(&mut self) -> Result<TraceEvent> {
             Err(UmbraError::not_implemented("fake.event"))
+        }
+        fn poll_event(&mut self, _: std::time::Duration) -> Result<crate::EventPoll> {
+            Err(umbra_core::UmbraError::not_implemented("poll_event"))
         }
         fn read_memory(&mut self, _: TaskId, address: u64, out: &mut [u8]) -> Result<()> {
             assert_eq!(address, 100);
@@ -811,8 +853,13 @@ mod tests {
             },
         )));
         let mut control = Control {
+            timeout_ms: 5000,
             client: client.clone(),
-            capabilities: Default::default(),
+            capabilities: PlatformCapabilities {
+                capabilities: [umbra_core::capabilities::PLATFORM_BOUNDED_EVENT_POLL_V1.into()]
+                    .into(),
+                ..Default::default()
+            },
         };
         let abi = Abi {
             client: client.clone(),
@@ -845,5 +892,274 @@ mod tests {
         drop(control);
         drop(client);
         assert!(worker.join().unwrap().is_err());
+    }
+}
+
+fn require_bounded_poll(capabilities: &PlatformCapabilities) -> Result<()> {
+    if capabilities
+        .capabilities
+        .contains(umbra_core::capabilities::PLATFORM_BOUNDED_EVENT_POLL_V1)
+    {
+        Ok(())
+    } else {
+        Err(protocol_error("platform lacks bounded-event-poll-v1"))
+    }
+}
+
+fn validate_poll_wait(micros: u64) -> Result<std::time::Duration> {
+    if !(1..=100_000).contains(&micros) {
+        return Err(protocol_error(
+            "poll wait must be in 1..=100000 microseconds",
+        ));
+    }
+    Ok(std::time::Duration::from_micros(micros))
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+    use std::{os::unix::net::UnixStream, time::Duration};
+
+    struct PollControl(bool);
+    impl TraceBackend for PollControl {
+        fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
+            Err(UmbraError::not_implemented("fake.launch"))
+        }
+        fn next_event(&mut self) -> Result<TraceEvent> {
+            Ok(TraceEvent::Exit {
+                task: TaskId(umbra_core::TaskIdentity {
+                    native_id: 7,
+                    generation: 2,
+                }),
+                status: umbra_core::ExitStatus::Code(0),
+            })
+        }
+        fn poll_event(&mut self, _: std::time::Duration) -> Result<crate::EventPoll> {
+            Ok(if self.0 {
+                self.0 = false;
+                EventPoll::Idle
+            } else {
+                EventPoll::Event(self.next_event()?)
+            })
+        }
+        fn read_memory(&mut self, _: TaskId, address: u64, out: &mut [u8]) -> Result<()> {
+            assert_eq!(address, 100);
+            out.copy_from_slice(b"test");
+            Ok(())
+        }
+        fn write_memory(&mut self, _: TaskId, _: u64, _: &[u8]) -> Result<()> {
+            panic!("callback must not mutate")
+        }
+        fn registers(&mut self, _: ThreadId) -> Result<RegisterSet> {
+            Err(UmbraError::not_implemented("fake.registers"))
+        }
+        fn set_registers(&mut self, _: ThreadId, _: &RegisterSet) -> Result<()> {
+            panic!("callback must not mutate")
+        }
+        fn resume(&mut self, _: ResumeCommand) -> Result<()> {
+            panic!("callback must not resume")
+        }
+    }
+    impl TraceControl for PollControl {
+        fn capabilities(&self) -> PlatformCapabilities {
+            PlatformCapabilities::default()
+        }
+        fn quiesce(&mut self, _: ProcessHandle) -> Result<QuiescedTree> {
+            Err(UmbraError::not_implemented("fake.quiesce"))
+        }
+        fn terminate(&mut self, _: ProcessHandle, _: TerminationPolicy) -> Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn dispatch_preserves_legacy_event_and_new_idle_then_event() {
+        let mut control = PollControl(true);
+        let legacy: Request = wire::decode(br#""NextEvent""#).unwrap();
+        let response = control_request(&mut control, legacy).unwrap();
+        assert!(matches!(response, Response::Event(TraceEvent::Exit { .. })));
+        assert!(String::from_utf8(wire::encode(&response).unwrap())
+            .unwrap()
+            .starts_with("{\"Event\":"));
+        assert!(matches!(
+            control_request(&mut control, Request::PollEvent { max_wait_us: 1 }).unwrap(),
+            Response::EventPoll(EventPoll::Idle)
+        ));
+        assert!(matches!(
+            control_request(&mut control, Request::PollEvent { max_wait_us: 1 }).unwrap(),
+            Response::EventPoll(EventPoll::Event(TraceEvent::Exit { .. }))
+        ));
+        assert!(control_request(&mut control, Request::PollEvent { max_wait_us: 0 }).is_err());
+    }
+
+    fn proxy(stream: UnixStream, supported: bool, timeout_ms: u64) -> Control {
+        let capabilities = if supported {
+            [umbra_core::capabilities::PLATFORM_BOUNDED_EVENT_POLL_V1.to_owned()].into()
+        } else {
+            Default::default()
+        };
+        Control {
+            client: Rc::new(RefCell::new(Client::from_connection(
+                Connection::new(stream, Duration::from_millis(timeout_ms)),
+                wire::Welcome {
+                    id: "test".into(),
+                    role: "platform".into(),
+                    version: wire::PROTOCOL_VERSION,
+                    capabilities: Default::default(),
+                },
+            ))),
+            capabilities: PlatformCapabilities {
+                capabilities,
+                ..Default::default()
+            },
+            timeout_ms,
+        }
+    }
+
+    #[test]
+    fn launch_refuses_missing_runtime_support_even_if_handshake_advertised_it() {
+        use std::io::Read;
+        for advertised in [false, true] {
+            let (left, mut right) = UnixStream::pair().unwrap();
+            let mut control = proxy(left, false, 1000);
+            if advertised {
+                control
+                    .client
+                    .borrow_mut()
+                    .welcome
+                    .capabilities
+                    .insert(umbra_core::capabilities::PLATFORM_BOUNDED_EVENT_POLL_V1.into());
+            }
+            let spec = LaunchSpec {
+                executable: BytePath::new(b"/usr/bin/true".to_vec()).unwrap(),
+                argv: vec![],
+                environment: vec![],
+                cwd: BytePath::new(b"/".to_vec()).unwrap(),
+                policy: umbra_core::LaunchPolicy {
+                    persistence: umbra_core::PersistencePolicy::LocalDevelopment,
+                    inherited_fds: vec![],
+                    interpose: false,
+                    descriptor_limit: None,
+                },
+                sandbox: umbra_core::SandboxRequirement::UnsandboxedExperiment,
+            };
+            assert!(control
+                .launch(spec)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded-event-poll-v1"));
+            right.set_nonblocking(true).unwrap();
+            assert_eq!(
+                right.read(&mut [0u8]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn poll_wire_preserves_legacy_and_rejects_invalid_budgets() {
+        assert_eq!(
+            wire::encode(&Request::NextEvent).unwrap(),
+            br#""NextEvent""#
+        );
+        for invalid in [0, 100001, u64::MAX] {
+            assert!(validate_poll_wait(invalid).is_err());
+        }
+        for valid in [1, 250, 100000] {
+            assert_eq!(
+                validate_poll_wait(valid).unwrap(),
+                Duration::from_micros(valid)
+            );
+        }
+        assert!(wire::decode::<Response>(br#"{"EventPoll":"unknown"}"#).is_err());
+    }
+
+    #[test]
+    fn poll_capability_and_concurrent_access_fail_without_sending() {
+        let (left, mut right) = UnixStream::pair().unwrap();
+        let mut control = proxy(left, false, 1000);
+        assert_eq!(
+            control
+                .poll_event(Duration::from_millis(1))
+                .unwrap_err()
+                .kind,
+            ErrorKind::ProtocolMismatch
+        );
+        control
+            .capabilities
+            .capabilities
+            .insert(umbra_core::capabilities::PLATFORM_BOUNDED_EVENT_POLL_V1.into());
+        let shared = control.client.clone();
+        let _borrow = shared.borrow_mut();
+        assert_eq!(
+            control
+                .poll_event(Duration::from_millis(1))
+                .unwrap_err()
+                .kind,
+            ErrorKind::ProtocolMismatch
+        );
+        right.set_nonblocking(true).unwrap();
+        use std::io::Read;
+        assert_eq!(
+            right.read(&mut [0u8]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn poll_proxy_bounds_wait_and_receives_idle() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut connection = Connection::new(right, Duration::from_secs(2));
+            let Frame::Request { id, payload } = connection.receive_request().unwrap() else {
+                panic!("request")
+            };
+            assert!(matches!(
+                wire::decode::<Request>(&payload).unwrap(),
+                Request::PollEvent { max_wait_us: 50000 }
+            ));
+            connection
+                .send(&Frame::Response {
+                    id,
+                    result: wire::encode(&Response::EventPoll(EventPoll::Idle)),
+                })
+                .unwrap();
+        });
+        assert!(matches!(
+            proxy(left, true, 200)
+                .poll_event(Duration::from_secs(1))
+                .unwrap(),
+            EventPoll::Idle
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn silent_and_disconnecting_poll_peers_fail_closed() {
+        for disconnect in [false, true] {
+            let (left, right) = UnixStream::pair().unwrap();
+            let (received_tx, received_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut connection = Connection::new(right, Duration::from_secs(2));
+                assert!(matches!(
+                    connection.receive_request().unwrap(),
+                    Frame::Request { .. }
+                ));
+                received_tx.send(()).unwrap();
+                if !disconnect {
+                    release_rx.recv().unwrap();
+                }
+            });
+            let mut control = proxy(left, true, 100);
+            let error = control.poll_event(Duration::from_millis(5)).unwrap_err();
+            received_rx.recv().unwrap();
+            assert_eq!(error.kind, ErrorKind::StorageUnavailable);
+            if !disconnect {
+                assert!(error.to_string().contains("request deadline exceeded"));
+                release_tx.send(()).unwrap();
+            }
+            worker.join().unwrap();
+            assert!(control.poll_event(Duration::from_millis(5)).is_err());
+        }
     }
 }
