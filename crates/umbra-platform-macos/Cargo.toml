@@ -27,6 +27,8 @@ mutation-probe-mkdir = []
 # where `touch` on an absent one still succeeds -- which is the discriminator no
 # other probe reproduces.
 mutation-probe-setattrlistat = []
+# Test-only lifecycle rendezvous. Normal providers contain no fault controls.
+mutation-probe-spawn-lifecycle = []
 
 [dependencies]
 umbra-core = { path = "../umbra-core" }

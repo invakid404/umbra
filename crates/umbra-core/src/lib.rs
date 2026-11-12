@@ -41,6 +41,8 @@ pub use journal::*;
 
 mod platform;
 pub use platform::{PlatformCapabilities, QuiescedTree, TerminationPolicy};
+mod spawn;
+pub use spawn::{SpawnAction, SpawnAuthorization, SpawnPlan, SpawnToken};
 
 /// A contract result with a structured Umbra error.
 pub type Result<T> = std::result::Result<T, UmbraError>;
@@ -1018,6 +1020,25 @@ pub enum ExitStatus {
 /// Child events must be delivered while the child is stopped, before mutation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TraceEvent {
+    /// A captured packed spawn awaiting logical descriptor authorization.
+    SpawnPrepare {
+        /// Single-use issuing identity.
+        token: SpawnToken,
+        /// Immutable captured policy.
+        plan: SpawnPlan,
+    },
+    /// A registered, stopped child awaiting transactional inheritance.
+    SpawnChild {
+        /// Authorization returned for this exact snapshot.
+        authorization: SpawnAuthorization,
+        /// Registered child owner.
+        child: ProcessHandle,
+    },
+    /// Kernel error: discard this policy without publishing a child.
+    SpawnAbort {
+        /// Authorization being retired.
+        authorization: SpawnAuthorization,
+    },
     /// Syscall entry.
     SyscallEntry {
         /// Task.
@@ -1194,6 +1215,12 @@ pub struct LaunchSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Resume mode.
 pub enum ResumeMode {
+    /// Approve the captured spawn; only the issuing thread may reach its return gate.
+    SpawnAuthorize(SpawnAuthorization),
+    /// Child policy is applied; complete delivery and resource release before resuming.
+    SpawnChildReady(SpawnAuthorization),
+    /// Kernel error policy was discarded; finish error delivery before resuming.
+    SpawnAbortReady(SpawnAuthorization),
     /// Continue.
     Continue,
     /// Syscall.

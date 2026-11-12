@@ -43,6 +43,7 @@ mutation-probe-dircache = [
 # `readdir` has no `umbra-overlay` half: the encoder it breaks is a
 # `umbra-supervisor` type, so there is nothing to forward past that crate.
 mutation-probe-readdir = ["umbra-supervisor/mutation-probe-readdir"]
+mutation-probe-spawn-lifecycle = ["umbra-supervisor/mutation-probe-spawn-lifecycle"]
 
 [dependencies]
 clap.workspace = true

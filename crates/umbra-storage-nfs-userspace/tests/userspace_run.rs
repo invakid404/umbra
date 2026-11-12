@@ -8205,11 +8205,13 @@ struct SlateRunSession {
 /// launched `umbra` (the group's leader) that leads its own session. Native
 /// fixtures, whose own children may lead sessions, are never matched.
 fn slate_run_session(group: u32) -> Result<Option<SlateRunSession>, String> {
-    // SAFETY: getsid reads no memory of ours.
-    if unsafe { libc::getsid(0) } != 1 {
-        return Ok(None);
-    }
-    let Some(leader) = slate_process(group as i32)?.filter(|p| p.command == "umbra") else {
+    // The explicit qualification relay uses the real guardian even outside
+    // launchd. All other runs retain the existing session admission rule.
+    let Some(leader) = slate_process(group as i32)?.filter(|p| {
+        p.command == "umbra243relay"
+            // SAFETY: getsid reads no memory of ours.
+            || (unsafe { libc::getsid(0) } == 1 && p.command == "umbra")
+    }) else {
         return Ok(None);
     };
     let now = std::time::SystemTime::now()
@@ -9502,12 +9504,14 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-pinned for filesystem metadata: native.rs adds checked output copyout. Generic input-read
-    // errors retain base behavior. The fork/spawn guards and their call sites are
-    // unchanged. The structural and runtime checks below remain required.
+    // Re-characterized for opt-in spawn diagnostics on the composed
+    // packed-spawn and filesystem-metadata implementation, which changed native.rs,
+    // while single_thread and its Fork/WaitPlan::Park call sites are unchanged.
+    // The structural unit ran in the affected-crate suite; this case repeats it
+    // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("267ec5959e0a6d7fe8a91b7b146f38eb964878b0a81efc312d1792e1e25d5718"),
+        Some("9835b8f5af1e3c2d08a9475c4cda6bf9a652f96b932f94ea0e457687aa77e592"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -9771,59 +9775,9 @@ fn slate_tokio_records(bytes: &[u8], case: &str) {
 // QUALIFIED.
 // ---------------------------------------------------------------------------
 
-/// The exact diagnostic `native.rs` emits for trap 244 with a nonzero packed
-/// descriptor in x2. Its presence is the x2 reading (design-gate R1), so the
-/// literal must have exactly one emission site, inside the `number == 244`
-/// arm, behind `get(&regs, 2)? != 0`. Checked over every production source
-/// file by literal, not by keyword (L17).
-const SLATE_SPAWN_REFUSAL: &str = "spawn requires null attributes/file actions";
-fn slate_spawn_refusal_site() -> String {
-    fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(directory).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                sources(&path, found);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                found.push(path);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(repository().join("crates")).unwrap() {
-        let source = entry.unwrap().path().join("src");
-        if source.is_dir() {
-            sources(&source, &mut files);
-        }
-    }
-    let mut sites = Vec::new();
-    for file in files {
-        let text = std::fs::read_to_string(&file).unwrap();
-        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
-        for index in 0..lines.len() {
-            if lines[index].contains(SLATE_SPAWN_REFUSAL) {
-                sites.push((file.clone(), index, lines.clone()));
-            }
-        }
-    }
-    let found: Vec<_> = sites
-        .iter()
-        .map(|(file, index, _)| format!("{}:{}", file.display(), index + 1))
-        .collect();
-    assert_eq!(
-        found.len(),
-        1,
-        "the spawn refusal diagnostic must have exactly one emission site, or its \
-         presence no longer identifies the x2 != 0 branch: {found:?}"
-    );
-    let (file, index, lines) = &sites[0];
-    assert!(file.ends_with("crates/umbra-platform-macos/src/native.rs"));
-    assert!(
-        lines[index - 1].trim() == "if get(&regs, 2)? != 0 {"
-            && lines[index - 2].trim() == "if number == 244 {",
-        "the emission site is no longer gated solely by number == 244 && x2 != 0"
-    );
-    format!("native.rs:{}", index + 1)
-}
+/// The full E8 request is structurally valid but requests SETSID, which this
+/// slice refuses before its later CHDIR action or any child execution.
+const SLATE_SPAWN_REFUSAL: &str = "spawn unsupported attribute SETSID";
 
 /// One case's built fixtures and its evidence directory.
 struct SlateSpawn {
@@ -9831,6 +9785,9 @@ struct SlateSpawn {
     scratch: tempfile::TempDir,
     program: PathBuf,
     helper: PathBuf,
+    provider_environment: Vec<(String, String)>,
+    platform_timeout_ms: Option<u64>,
+    guardian: bool,
 }
 fn slate_spawn(case: &str) -> Option<SlateSpawn> {
     let evidence = slate_evidence()?.join(case);
@@ -9861,6 +9818,9 @@ fn slate_spawn(case: &str) -> Option<SlateSpawn> {
         scratch,
         program,
         helper,
+        provider_environment: Vec::new(),
+        platform_timeout_ms: None,
+        guardian: false,
     })
 }
 
@@ -9874,14 +9834,31 @@ fn slate_spawn_native(spawn: &SlateSpawn, mode: &str) -> (PathBuf, SlateOutput) 
         &spawn.evidence.join("native"),
         matches!(mode, "c11-10" | "ledger-escape"),
     );
-    let output = slate_watched(
-        Command::new(&spawn.program)
-            .arg(mode)
-            .arg(&root)
-            .arg(&spawn.helper),
-        &spawn.evidence.join("native"),
-        &watch,
-    );
+    let mut command = Command::new(&spawn.program);
+    command.arg(mode).arg(&root).arg(&spawn.helper);
+    if mode == "c11-10" {
+        use std::os::unix::process::CommandExt;
+        // The observer reserves fd 900; a smaller inherited soft limit leaves
+        // its output at fd 3 and contaminates the exact native census. Supply
+        // that instrument prerequisite without changing the census oracle.
+        // SAFETY: getrlimit/setrlimit use only stack storage in the child.
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit: libc::rlimit = std::mem::zeroed();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if limit.rlim_cur < 1024 {
+                    limit.rlim_cur = 1024;
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    let output = slate_watched(&mut command, &spawn.evidence.join("native"), &watch);
     let kept = spawn.evidence.join("native-root");
     std::fs::create_dir_all(&kept).unwrap();
     for entry in std::fs::read_dir(&root).unwrap() {
@@ -9919,10 +9896,39 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
     let workspace = workspace.canonicalize().unwrap();
     std::fs::write(workspace.join("seed.txt"), b"ABCDEF").unwrap();
     let registry = registry(spawn.scratch.path(), &host, port);
+    if let Some(timeout_ms) = spawn.platform_timeout_ms {
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        config["providers"]["platform"]["options"] = serde_json::json!(serde_json::to_vec(
+            &serde_json::json!({"timeout_ms": timeout_ms})
+        )
+        .unwrap());
+        std::fs::write(&registry, serde_json::to_vec(&config).unwrap()).unwrap();
+    }
     assert_no_nfs_mount(&host, port, &[&workspace], "rank-11 before");
     let watch = SlateWatch::new(spawn.scratch.path(), &spawn.evidence.join("routed"), false);
+    let mut command = Command::new(if spawn.guardian {
+        binaries().join("examples/umbra243relay")
+    } else {
+        binaries().join("umbra")
+    });
+    if spawn.guardian {
+        command
+            .env("UMBRA_FIX_243_RELAY_EXE", binaries().join("umbra"))
+            .env(
+                "UMBRA_FIX_243_RELAY_RECORDS",
+                spawn.evidence.join("guardian"),
+            );
+    }
     let output = slate_watched(
-        Command::new(binaries().join("umbra"))
+        command
+            .env("UMBRA_SPAWN_LOG", "1")
+            .envs(
+                spawn
+                    .provider_environment
+                    .iter()
+                    .map(|(key, value)| (key, value)),
+            )
             .args(["run", "--registry"])
             .arg(&registry)
             .arg("--workspace")
@@ -10158,7 +10164,6 @@ fn slate_record(spawn: &SlateSpawn, classification: &str, detail: serde_json::Va
 /// C11-01 and the three C11-02 leaves: one helper, one write each from child
 /// and parent, a different public pointer shape per mode.
 fn slate_spawn_shape(mode: &str, admitted: bool) {
-    let site = slate_spawn_refusal_site();
     let Some(spawn) = slate_spawn(mode) else {
         return;
     };
@@ -10199,15 +10204,36 @@ fn slate_spawn_shape(mode: &str, admitted: bool) {
             slate_unqualified_detail(&routed)
         } else {
             serde_json::json!({
-                "x2_side": if refused { "nonzero: the single-site diagnostic was emitted" }
-                    else { "zero: no diagnostic; libc passed a null packed descriptor" },
-                "emission_site": site,
+                "capture": routed.run.stderr.lines().find(|line| line.starts_with("spawn-capture ")),
+                "policy": routed.run.stderr.lines().find(|line| line.starts_with("spawn-policy ")),
                 "run_id": routed.run.run_id.0.to_string(),
                 "supervisor_status": routed.output.status.to_string(),
             })
         },
     );
     if admitted {
+        let packed = matches!(mode, "c11-02-attributes" | "c11-02-both");
+        let capture = if packed {
+            "spawn-capture descriptor=non-null profile=25F80"
+        } else {
+            "spawn-capture descriptor=null"
+        };
+        assert!(
+            routed.run.stderr.lines().any(|line| line == capture),
+            "{}",
+            routed.run.stderr
+        );
+        if packed {
+            assert!(
+                routed
+                    .run
+                    .stderr
+                    .lines()
+                    .any(|line| line == "spawn-policy flags=0x0000 actions=0"),
+                "{}",
+                routed.run.stderr
+            );
+        }
         assert_eq!(
             classification, "SUPPORTED-AND-CORRECT",
             "{}",
@@ -10258,13 +10284,1083 @@ fn slate_c11_02_empty_actions() {
 /// C11-02, attributes only: an initialized, empty attribute object.
 #[test]
 fn slate_c11_02_empty_attributes() {
-    slate_spawn_shape("c11-02-attributes", false);
+    slate_spawn_shape("c11-02-attributes", true);
 }
 
 /// C11-02, both objects initialized and empty.
 #[test]
 fn slate_c11_02_empty_both() {
-    slate_spawn_shape("c11-02-both", false);
+    slate_spawn_shape("c11-02-both", true);
+}
+
+fn fix_243_signal(mode: &str, child_record: &str, flags: &str) {
+    let Some(spawn) = slate_spawn(mode) else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert_eq!(std::fs::read(root.join("parent.txt")).unwrap(), b"PARENT");
+    assert!(std::fs::read_to_string(root.join("records.child"))
+        .unwrap()
+        .contains(child_record));
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("parent-signal ignored=1 blocked=1"));
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
+    let correct = slate_two_exit_completion(&routed)
+        && routed.object("child.txt") == Some(b"CHILD".as_slice())
+        && routed.object("parent.txt") == Some(b"PARENT".as_slice());
+    slate_record(
+        &spawn,
+        if correct {
+            "SUPPORTED-AND-CORRECT"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({"run_id": routed.run.run_id.0.to_string(),
+            "expected_child_signal": child_record}),
+    );
+    assert!(correct, "{}", routed.run.stderr);
+    assert!(routed.text("records.child").contains(child_record));
+    assert!(routed
+        .text("records.done")
+        .contains("parent-signal ignored=1 blocked=1"));
+    assert!(routed
+        .run
+        .stderr
+        .contains(&format!("spawn-policy flags={flags} actions=0")));
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
+fn fix_243_sigpipe_default() {
+    fix_243_signal(
+        "fix-243-sigdefault",
+        "child-signal default=1 ignored=0 blocked=1",
+        "0x0004",
+    );
+}
+
+#[test]
+fn fix_243_sigpipe_mask() {
+    fix_243_signal(
+        "fix-243-sigmask",
+        "child-signal default=0 ignored=1 blocked=0",
+        "0x0008",
+    );
+}
+
+/// Native apparatus: an ignored disposition must still trip the signal oracle
+/// after removing the observer's constructor interference from this child.
+#[test]
+fn fix_243_signal_oracle_rejects_ignored_child() {
+    let Some(spawn) = slate_spawn("fix-243-sigdefault-mutant") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-sigdefault-mutant");
+    assert!(!native.status.success());
+    assert!(std::fs::read_to_string(root.join("records.child"))
+        .unwrap()
+        .contains("child-signal default=0 ignored=1 blocked=1"));
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("exited=1 code=81"));
+    slate_finish_cleanup();
+}
+
+fn fix_243_pipe(mode: &str) {
+    let Some(spawn) = slate_spawn(mode) else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert_eq!(
+        std::fs::read(root.join("victim.txt")).unwrap(),
+        b"SEEDPARENT"
+    );
+    let native_done = std::fs::read_to_string(root.join("records.done")).unwrap();
+    assert!(native_done.contains("pipe-result bytes=13 payload=FIX-243-NONCE eof=1"));
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "victim.txt"]);
+    let correct = slate_two_exit_completion(&routed)
+        && routed.object("child.txt") == Some(b"CHILD".as_slice())
+        && routed.object("victim.txt") == Some(b"SEEDPARENT".as_slice());
+    slate_record(
+        &spawn,
+        if correct {
+            "SUPPORTED-AND-CORRECT"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({"run_id": routed.run.run_id.0.to_string()}),
+    );
+    assert!(correct, "{}", routed.run.stderr);
+    assert!(routed
+        .text("records.done")
+        .contains("pipe-result bytes=13 payload=FIX-243-NONCE eof=1"));
+    if matches!(
+        mode,
+        "fix-243-cloexec"
+            | "fix-243-error-recovery"
+            | "fix-243-inherit-cloexec"
+            | "fix-243-close-before-dup"
+            | "fix-243-dup-before-close"
+    ) {
+        let expected = "pruned-victim result=-1 errno=9";
+        assert!(std::fs::read_to_string(root.join("records.child"))
+            .unwrap()
+            .contains(expected));
+        assert!(routed.text("records.child").contains(expected));
+    }
+    if mode == "fix-243-inherit-cloexec" || mode == "fix-243-close-before-dup" {
+        let expected = if mode == "fix-243-inherit-cloexec" {
+            "parent-flags before=1 after=1"
+        } else {
+            "parent-flags before=0 after=0"
+        };
+        assert!(native_done.contains(expected));
+        assert!(routed.text("records.done").contains(expected));
+    }
+    if mode == "fix-243-error-recovery" {
+        assert!(native_done.contains("kernel-error result=9 expected=9"));
+        assert!(routed
+            .text("records.done")
+            .contains("kernel-error result=9 expected=9"));
+    }
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
+fn fix_243_inherit_cloexec_kernel_fd() {
+    fix_243_pipe("fix-243-inherit-cloexec");
+}
+#[test]
+fn fix_243_close_before_dup_cloexec_default() {
+    fix_243_pipe("fix-243-close-before-dup");
+}
+#[test]
+fn fix_243_dup_before_close_cloexec_default() {
+    fix_243_pipe("fix-243-dup-before-close");
+}
+
+#[test]
+fn fix_243_kernel_pipe_actions() {
+    fix_243_pipe("fix-243-pipe");
+}
+
+#[test]
+fn fix_243_second_thread_null_spawn() {
+    let Some(spawn) = slate_spawn("fix-243-thread-null") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-thread-null");
+    assert!(native.status.success(), "native: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("null-thread result=0"));
+    let routed = slate_spawn_routed(&spawn, "fix-243-thread-null", &["child.txt"]);
+    assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+    assert_eq!(routed.text("child.txt"), "CHILD");
+    assert!(routed.text("records.done").contains("null-thread result=0"));
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_distinct_parent_backing_overlap() {
+    let Some(mut spawn) = slate_spawn("fix-243-overlap") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-overlap");
+    assert!(native.status.success(), "native: {}", native.status);
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("completed=2"));
+    spawn.provider_environment.extend([
+        ("UMBRA_FIX_243_REGION_TRACE".into(), "1".into()),
+        ("UMBRA_FIX_243_OVERLAP_PARENTS".into(), "2".into()),
+    ]);
+    let routed = slate_spawn_routed(&spawn, "fix-243-overlap", &[]);
+    assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+    assert!(routed.text("records.done").contains("completed=2"));
+    let mut active = std::collections::BTreeSet::new();
+    let mut peak = 0;
+    let mut verified = 0;
+    let mut absent = 0;
+    for line in routed.run.stderr.lines() {
+        if let Some(json) = line.strip_prefix("spawn-region ") {
+            let r: serde_json::Value = serde_json::from_str(json).unwrap();
+            let key = (r["parent"].to_string(), r["sequence"].to_string());
+            match r["event"].as_str().unwrap() {
+                "allocated" => {
+                    assert!(active.insert(key));
+                    peak = peak.max(active.len());
+                }
+                "overlap-verified" => {
+                    assert!(active.contains(&key));
+                    verified += 1;
+                }
+                "release-result" => {
+                    assert_eq!(r["result"], 0);
+                    assert!(active.remove(&key));
+                }
+                _ => panic!("unknown region event"),
+            }
+        } else if let Some(json) = line.strip_prefix("spawn-mapping ") {
+            let r: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(r["absent"], true);
+            absent += 1;
+        }
+    }
+    assert_eq!(peak, 2);
+    assert_eq!(verified, 2);
+    assert_eq!(absent, 2);
+    assert!(active.is_empty());
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_provider_region_cap() {
+    let Some(mut spawn) = slate_spawn("fix-243-cap") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-cap");
+    assert!(native.status.success(), "native: {}", native.status);
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("completed=17"));
+    spawn.provider_environment.extend([
+        ("UMBRA_FIX_243_REGION_TRACE".into(), "1".into()),
+        ("UMBRA_FIX_243_OVERLAP_PARENTS".into(), "17".into()),
+    ]);
+    let routed = slate_spawn_routed(&spawn, "fix-243-cap", &[]);
+    assert_ne!(routed.run.status, Some(0));
+    assert!(
+        routed
+            .run
+            .stderr
+            .contains("spawn snapshot capacity exceeded"),
+        "{}",
+        routed.run.stderr
+    );
+    let records: Vec<serde_json::Value> = routed
+        .run
+        .stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("spawn-region "))
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(records.len(), 16);
+    let mut parents = std::collections::BTreeSet::new();
+    for r in records {
+        assert_eq!(r["event"], "allocated");
+        assert_eq!(r["bytes"], 81920);
+        assert!(parents.insert(r["parent"].to_string()));
+    }
+    assert!(routed.object("records.done").is_none());
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+    assert!(
+        cleanup.starts_with("cleanup CLEAN")
+            && cleanup.lines().next().unwrap().contains("group_kills=0")
+            && cleanup.lines().next().unwrap().contains("zombies=\"\""),
+        "{cleanup}"
+    );
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+fn fix_243_region_fault(fault: &str) {
+    let Some(mut spawn) = slate_spawn(&format!("fix-243-region-{fault}")) else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "c11-02-attributes");
+    assert!(native.status.success());
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    spawn.provider_environment.extend([
+        ("UMBRA_FIX_243_REGION_TRACE".into(), "1".into()),
+        ("UMBRA_FIX_243_REGION_FAULT".into(), fault.into()),
+    ]);
+    let routed = slate_spawn_routed(&spawn, "c11-02-attributes", &["child.txt", "parent.txt"]);
+    assert_ne!(routed.run.status, Some(0));
+    assert!(routed.object("records.pre").is_some());
+    for name in ["child.txt", "parent.txt", "records.child", "records.done"] {
+        assert!(routed.object(name).is_none(), "unexpected {name}");
+    }
+    let allocations: Vec<serde_json::Value> = routed
+        .run
+        .stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("spawn-region "))
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    if fault == "allocate" {
+        assert!(
+            routed.run.stderr.contains("spawn snapshot allocation"),
+            "{}",
+            routed.run.stderr
+        );
+        assert!(allocations.is_empty());
+    } else {
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0]["event"], "allocated");
+        let record: serde_json::Value = serde_json::from_str(
+            routed
+                .run
+                .stderr
+                .lines()
+                .find_map(|l| l.strip_prefix("spawn-write-fault "))
+                .expect("actual write fault"),
+        )
+        .unwrap();
+        assert_eq!(record["failed"], true);
+        assert_eq!(record["region"], allocations[0]["address"]);
+        assert_eq!(record["parent_stopped"], true);
+        assert_eq!(record["child_created"], false);
+    }
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+    assert!(
+        cleanup.starts_with("cleanup CLEAN")
+            && cleanup.lines().next().unwrap().contains("group_kills=0")
+            && cleanup.lines().next().unwrap().contains("zombies=\"\""),
+        "{cleanup}"
+    );
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_region_allocation_failure() {
+    fix_243_region_fault("allocate");
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_region_write_failure() {
+    fix_243_region_fault("write");
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_region_success_error_cycles() {
+    let Some(mut spawn) = slate_spawn("fix-243-region-cycles") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-region-cycles");
+    assert!(native.status.success(), "native: {}", native.status);
+    assert_eq!(
+        std::fs::read_to_string(root.join("records.done"))
+            .unwrap()
+            .matches("success=0")
+            .count(),
+        8
+    );
+    spawn
+        .provider_environment
+        .push(("UMBRA_FIX_243_REGION_TRACE".into(), "1".into()));
+    let routed = slate_spawn_routed(&spawn, "fix-243-region-cycles", &[]);
+    assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+    assert_eq!(routed.text("records.done").matches("success=0").count(), 8);
+    let mut active = None;
+    let mut released = None;
+    let mut releases = 0;
+    let mut mappings = 0;
+    for line in routed.run.stderr.lines() {
+        if let Some(json) = line.strip_prefix("spawn-region ") {
+            let record: serde_json::Value = serde_json::from_str(json).unwrap();
+            let key = (
+                record["parent"].clone(),
+                record["sequence"].clone(),
+                record["address"].clone(),
+            );
+            assert_eq!(record["bytes"], 81920);
+            assert_eq!(record["result"], 0);
+            match record["event"].as_str().unwrap() {
+                "allocated" => {
+                    assert!(active.replace(key).is_none());
+                    assert!(released.is_none());
+                }
+                "release-result" => {
+                    assert_eq!(active.take(), Some(key.clone()));
+                    released = Some(key);
+                    releases += 1;
+                }
+                other => panic!("unexpected region event {other}"),
+            }
+        } else if let Some(json) = line.strip_prefix("spawn-mapping ") {
+            let record: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                released.take(),
+                Some((
+                    record["parent"].clone(),
+                    record["sequence"].clone(),
+                    record["start"].clone()
+                ))
+            );
+            assert_eq!(record["absent"], true, "{record}");
+            mappings += 1;
+        }
+    }
+    assert!(active.is_none() && released.is_none());
+    assert_eq!(releases, 16);
+    assert_eq!(mappings, 16);
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
+fn fix_243_same_parent_threads() {
+    let Some(spawn) = slate_spawn("fix-243-threads") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-243-threads");
+    assert!(native.status.success(), "native: {}", native.status);
+    let native_done = std::fs::read_to_string(root.join("records.done")).unwrap();
+    assert_eq!(native_done.matches("result=0").count(), 2);
+    let routed = slate_spawn_routed(&spawn, "fix-243-threads", &[]);
+    assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+    assert_eq!(routed.text("records.done").matches("result=0").count(), 2);
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
+fn fix_243_cloexec_default_prunes_logical_descriptors() {
+    fix_243_pipe("fix-243-cloexec");
+}
+
+#[test]
+fn fix_243_kernel_error_then_success() {
+    fix_243_pipe("fix-243-error-recovery");
+}
+
+fn fix_243_refusal(mode: &str, diagnostic: &str) {
+    let Some(spawn) = slate_spawn(mode) else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("spawn result=0"));
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "opened.txt", "victim.txt"]);
+    let exact = routed.run.status != Some(0)
+        && routed.run.stderr.contains(diagnostic)
+        && !routed.run.stderr.contains("finished:")
+        && routed.object("records.pre").is_some()
+        && ["records.child", "records.done", "child.txt", "opened.txt"]
+            .iter()
+            .all(|name| routed.object(name).is_none());
+    slate_record(
+        &spawn,
+        if exact {
+            "EXACT KNOWN REFUSAL"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({"diagnostic": diagnostic, "run_id": routed.run.run_id.0.to_string()}),
+    );
+    assert!(exact, "{}", routed.run.stderr);
+    if mode.contains("virtual-") {
+        assert_eq!(routed.object("victim.txt"), Some(b"SEED".as_slice()));
+        assert_eq!(std::fs::read(root.join("victim.txt")).unwrap(), b"SEED");
+    }
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
+fn fix_243_refuses_setsid() {
+    fix_243_refusal(
+        "fix-243-refuse-setsid",
+        "spawn unsupported attribute SETSID",
+    );
+}
+#[test]
+fn fix_243_refuses_setpgroup() {
+    fix_243_refusal(
+        "fix-243-refuse-setpgroup",
+        "spawn unsupported attribute SETPGROUP",
+    );
+}
+#[test]
+fn fix_243_refuses_resetids() {
+    fix_243_refusal(
+        "fix-243-refuse-resetids",
+        "spawn unsupported attribute RESETIDS",
+    );
+}
+#[test]
+fn fix_243_refuses_fileport_dup2() {
+    fix_243_refusal(
+        "fix-243-refuse-fileport",
+        "spawn unsupported action FILEPORT_DUP2",
+    );
+}
+#[test]
+fn fix_243_refuses_open() {
+    fix_243_refusal("fix-243-refuse-open", "spawn unsupported action OPEN");
+}
+#[test]
+fn fix_243_refuses_chdir() {
+    fix_243_refusal("fix-243-refuse-chdir", "spawn unsupported action CHDIR");
+}
+#[test]
+fn fix_243_refuses_late_chdir() {
+    fix_243_refusal(
+        "fix-243-refuse-late-chdir",
+        "spawn unsupported action CHDIR",
+    );
+}
+#[test]
+fn fix_243_refuses_fchdir() {
+    fix_243_refusal("fix-243-refuse-fchdir", "spawn unsupported action FCHDIR");
+}
+#[test]
+fn fix_243_refuses_virtual_before_chdir() {
+    fix_243_refusal(
+        "fix-243-refuse-virtual-before-chdir",
+        "spawn virtual descriptor action",
+    );
+}
+#[test]
+fn fix_243_refuses_chdir_before_virtual() {
+    fix_243_refusal(
+        "fix-243-refuse-chdir-before-virtual",
+        "spawn unsupported action CHDIR",
+    );
+}
+#[test]
+fn fix_243_refuses_virtual_source() {
+    fix_243_refusal(
+        "fix-243-refuse-virtual-source",
+        "spawn virtual descriptor action",
+    );
+}
+#[test]
+fn fix_243_refuses_virtual_destination() {
+    fix_243_refusal(
+        "fix-243-refuse-virtual-destination",
+        "spawn virtual descriptor action",
+    );
+}
+
+/// Local comparison only: surviving owners are recorded as NOT QUALIFIED.
+/// Build the provider with the matching probe feature for this apparatus.
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+fn fix_243_fault_reading(case: &str, mode: &str, root_probe: bool, command: u8) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    let Some(mut spawn) = slate_spawn(case) else {
+        return;
+    };
+    spawn.guardian = case.starts_with("fix-243-guardian-");
+    let loss_after_failure = case.ends_with("-failure-loss");
+    if loss_after_failure {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_PROBE_AFTER_FAILURE".into(), "1".into()));
+    }
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success());
+    if !root_probe {
+        assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    }
+    if case.ends_with("-watchdog") {
+        // Configure the real watchdog below the existing 12s RPC deadline;
+        // the independent 60s slate deadline remains unchanged.
+        spawn.platform_timeout_ms = Some(10_000);
+    }
+    let phase = match case {
+        "fix-243-guardian-unregistered" => "unregistered",
+        "fix-243-guardian-copyout-failure-loss" => "caller-copyout",
+        "fix-243-guardian-free-failure-loss" => "remote-free",
+        "fix-243-copyout-error" => "caller-copyout",
+        "fix-243-free-error" => "remote-free",
+        "fix-243-register-error" => "register-commit",
+        name if name.starts_with("fix-243-policy-") => "policy-ready",
+        name if name.starts_with("fix-243-inserted-") => "inserted",
+        name if name.starts_with("fix-243-unregistered-") => "unregistered",
+        _ => "task-acquired",
+    };
+    if case == "fix-243-policy-error" {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_OWNER_TRACE".into(), "1".into()));
+    }
+    spawn
+        .provider_environment
+        .push(("UMBRA_FIX_243_PROBE_PHASE".into(), phase.into()));
+    if let Some(trigger) = case
+        .strip_prefix("fix-243-inserted-")
+        .or_else(|| case.strip_prefix("fix-243-acquired-"))
+        .or_else(|| case.strip_prefix("fix-243-policy-"))
+    {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_PROBE_TRIGGER".into(), trigger.into()));
+    }
+    let socket = spawn
+        .evidence
+        .parent()
+        .unwrap()
+        .join(format!("{}.sock", case.trim_start_matches("fix-243-")));
+    match std::fs::remove_file(&socket) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove stale probe socket {}: {error}", socket.display()),
+    }
+    let listener = UnixListener::bind(&socket).unwrap();
+    spawn.provider_environment.push((
+        "UMBRA_FIX_243_PROBE_SOCKET".into(),
+        socket.to_str().unwrap().into(),
+    ));
+    if root_probe {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_PROBE_ROOT".into(), "1".into()));
+    }
+    let evidence = spawn.evidence.clone();
+    let observer = std::thread::spawn(move || {
+        let mut pollfd = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: a single initialized pollfd; a bounded wait for the rendezvous.
+        assert_eq!(
+            unsafe { libc::poll(&mut pollfd, 1, 15000) },
+            1,
+            "probe did not rendezvous"
+        );
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+        std::fs::write(evidence.join("provider-rendezvous.json"), &line).unwrap();
+        assert_eq!(
+            record["phase"],
+            if phase == "policy-ready" {
+                "inserted"
+            } else {
+                phase
+            }
+        );
+        if phase != "task-acquired" && phase != "unregistered" {
+            assert_eq!(record["session_inserted"], true);
+            assert_eq!(record["parent_stopped"], true);
+            assert_eq!(record["child_stopped"], true);
+            assert_eq!(record["region_owned"], phase != "register-commit");
+        }
+        assert_eq!(record["watchdog_registered"], phase != "unregistered");
+        let child = record["child"].as_i64().unwrap() as i32;
+        let observed = slate_process(child)
+            .unwrap()
+            .expect("child alive at rendezvous");
+        assert_eq!(record["start_sec"], observed.start.0);
+        assert_eq!(record["start_usec"], observed.start.1);
+        std::fs::write(
+            evidence.join("independent-child.json"),
+            serde_json::to_vec_pretty(&observed.json()).unwrap(),
+        )
+        .unwrap();
+        if phase == "policy-ready" {
+            stream.write_all(b"C").unwrap();
+            assert_eq!(
+                unsafe { libc::poll(&mut pollfd, 1, 15000) },
+                1,
+                "policy rendezvous absent"
+            );
+            let (mut policy_stream, _) = listener.accept().unwrap();
+            policy_stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut policy = String::new();
+            BufReader::new(policy_stream.try_clone().unwrap())
+                .read_line(&mut policy)
+                .unwrap();
+            assert_eq!(policy.trim(), format!("policy-ready {}", observed.pid));
+            let still_stopped = slate_process(observed.pid)
+                .unwrap()
+                .expect("child before Ready");
+            assert_eq!(still_stopped.start, observed.start);
+            std::fs::write(evidence.join("policy-ready.txt"), policy).unwrap();
+            policy_stream.write_all(&[command]).unwrap();
+        } else {
+            stream
+                .write_all(&[if loss_after_failure { b'E' } else { command }])
+                .unwrap();
+            if loss_after_failure {
+                assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 15000) }, 1);
+                let (mut failed, _) = listener.accept().unwrap();
+                failed
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(failed.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                std::fs::write(evidence.join("failed-owner.json"), &line).unwrap();
+                let retained: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(retained["phase"], format!("{phase}-failed"));
+                for key in [
+                    "child",
+                    "start_sec",
+                    "start_usec",
+                    "provider",
+                    "watchdog_registered",
+                    "session_inserted",
+                    "parent_stopped",
+                    "child_stopped",
+                    "region_owned",
+                ] {
+                    assert_eq!(retained[key], record[key], "{key}");
+                }
+                let current = slate_process(child)
+                    .unwrap()
+                    .expect("child retained after failure");
+                assert_eq!(current.start, observed.start);
+                failed.write_all(b"P").unwrap();
+            }
+        }
+        observed
+    });
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
+    let observed = observer.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
+    assert_ne!(routed.run.status, Some(0));
+    if case == "fix-243-policy-error" {
+        let owners: serde_json::Value = serde_json::from_str(
+            routed
+                .run
+                .stderr
+                .lines()
+                .find_map(|l| l.strip_prefix("spawn-teardown-owners "))
+                .expect("policy failure must reach owned teardown"),
+        )
+        .unwrap();
+        assert!(
+            owners
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|owner| owner["pid"] == observed.pid
+                    && owner["birth"] == serde_json::json!([observed.start.0, observed.start.1])
+                    && owner["stopped"] == true),
+            "policy failure discarded child Session: {owners}"
+        );
+    }
+    for name in ["records.child", "records.done", "child.txt", "parent.txt"] {
+        assert!(routed.object(name).is_none(), "pre-commit effect: {name}");
+    }
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+    std::fs::write(spawn.evidence.join("primary-cleanup.txt"), &cleanup).unwrap();
+    slate_record(
+        &spawn,
+        "NOT QUALIFIED",
+        serde_json::json!({
+            "comparison_only": true, "mode": mode, "cleanup": cleanup,
+            "observed_identity": observed.json(),
+            "reap_established": false,
+        }),
+    );
+    if command == b'E' && phase != "unregistered" {
+        assert!(
+            routed.run.stderr.contains(match phase {
+                "policy-ready" if case.ends_with("deadline") => "session timed out",
+                "policy-ready" if case.ends_with("session-drop") =>
+                    "injected policy-ready session-drop failure",
+                "policy-ready" if case.ends_with("backend-drop") =>
+                    "injected policy-ready backend-drop failure",
+                "policy-ready" if case.ends_with("terminate") =>
+                    "injected policy-ready terminate failure",
+                "policy-ready" => "injected policy-before-Ready failure",
+                "caller-copyout" => "spawn caller PID delivery failed",
+                "remote-free" => "spawn snapshot release failed",
+                "register-commit" => "injected final register commit failure",
+                "inserted" if case.ends_with("deadline") => "session timed out",
+                "inserted" if case.ends_with("session-drop") =>
+                    "injected inserted session-drop failure",
+                "inserted" if case.ends_with("backend-drop") =>
+                    "injected inserted backend-drop failure",
+                "inserted" if case.ends_with("terminate") => "injected inserted terminate failure",
+                "inserted" if case.ends_with("watchdog") => "injected inserted watchdog failure",
+                "task-acquired" if case.ends_with("deadline") => "session timed out",
+                "task-acquired" if case.ends_with("session-drop") =>
+                    "injected acquired session-drop failure",
+                "task-acquired" if case.ends_with("backend-drop") =>
+                    "injected acquired backend-drop failure",
+                "task-acquired" if case.ends_with("terminate") =>
+                    "injected acquired terminate failure",
+                "task-acquired" if case.ends_with("watchdog") =>
+                    "injected acquired watchdog failure",
+                _ => "injected attach failure after registration",
+            }),
+            "{}",
+            routed.run.stderr
+        );
+        assert!(
+            cleanup.starts_with("cleanup CLEAN")
+                && cleanup.lines().next().unwrap().contains("group_kills=0")
+                && cleanup.lines().next().unwrap().contains("zombies=\"\""),
+            "{cleanup}"
+        );
+        slate_record(
+            &spawn,
+            "REGISTERED CLEANUP QUALIFIED",
+            serde_json::json!({
+                "fault": phase, "provider_loss": false,
+                "identity": observed.json(), "cleanup": cleanup,
+            }),
+        );
+    }
+    if spawn.guardian {
+        let census = std::fs::read_to_string(spawn.evidence.join("routed.census.jsonl")).unwrap();
+        assert!(
+            census.contains("SESSION_READING"),
+            "guardian session was not observed"
+        );
+        let records = std::fs::read_dir(spawn.evidence.join("guardian")).unwrap();
+        let mut complete = false;
+        for entry in records {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            for line in text.lines() {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                if record["event"] == "sweep" {
+                    assert_eq!(record["outcome"], "COMPLETE", "{record}");
+                    assert!(
+                        record["owned_alive"].as_array().is_some_and(Vec::is_empty),
+                        "{record}"
+                    );
+                    complete = true;
+                }
+            }
+        }
+        assert!(complete, "guardian COMPLETE sweep record missing");
+        assert!(
+            cleanup.starts_with("cleanup CLEAN")
+                && cleanup.lines().next().unwrap().contains("group_kills=0")
+                && cleanup.lines().next().unwrap().contains("zombies=\"\""),
+            "{cleanup}"
+        );
+        assert!(
+            slate_process(observed.pid)
+                .unwrap()
+                .is_none_or(|p| p.start != observed.start),
+            "guardian left recorded child identity present"
+        );
+        slate_record(
+            &spawn,
+            "GUARDIAN CLEANUP QUALIFIED",
+            serde_json::json!({
+                "fault": phase, "identity": observed.json(), "cleanup": cleanup,
+                "reap_established": false,
+            }),
+        );
+    }
+    // Recovery is a harness obligation, never a production cleanup pass.
+    assert!(
+        slate_process(observed.pid)
+            .unwrap()
+            .is_none_or(|now| now.start != observed.start || now.status == 5),
+        "recorded process still live after harness recovery"
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_provider_loss_no_spawn_reading() {
+    fix_243_fault_reading("fix-243-loss-no-spawn", "fix-243-no-spawn", true, b'P');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_provider_loss_null_reading() {
+    fix_243_fault_reading("fix-243-loss-null", "c11-01", false, b'P');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_registered_attach_failure() {
+    fix_243_fault_reading("fix-243-attach-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_completion_copyout_failure() {
+    fix_243_fault_reading("fix-243-copyout-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_completion_free_failure() {
+    fix_243_fault_reading("fix-243-free-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_completion_register_failure() {
+    fix_243_fault_reading("fix-243-register-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_inserted_deadline() {
+    fix_243_fault_reading(
+        "fix-243-inserted-deadline",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_inserted_session_drop() {
+    fix_243_fault_reading(
+        "fix-243-inserted-session-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_inserted_backend_drop() {
+    fix_243_fault_reading(
+        "fix-243-inserted-backend-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_inserted_terminate() {
+    fix_243_fault_reading(
+        "fix-243-inserted-terminate",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_inserted_watchdog() {
+    fix_243_fault_reading(
+        "fix-243-inserted-watchdog",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_unregistered_null_reading() {
+    fix_243_fault_reading("fix-243-unregistered-null", "c11-01", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_unregistered_packed_reading() {
+    fix_243_fault_reading(
+        "fix-243-unregistered-packed",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_before_ready_failure() {
+    fix_243_fault_reading("fix-243-policy-error", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_watchdog() {
+    fix_243_fault_reading("fix-243-policy-watchdog", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_acquired_deadline() {
+    fix_243_fault_reading(
+        "fix-243-acquired-deadline",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_acquired_session_drop() {
+    fix_243_fault_reading(
+        "fix-243-acquired-session-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_acquired_backend_drop() {
+    fix_243_fault_reading(
+        "fix-243-acquired-backend-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_acquired_terminate() {
+    fix_243_fault_reading(
+        "fix-243-acquired-terminate",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_acquired_watchdog() {
+    fix_243_fault_reading(
+        "fix-243-acquired-watchdog",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
 }
 
 /// C11-05 apparatus (design-gate R4, amendment A2): the kernel `dup2` collision
@@ -10654,12 +11750,11 @@ fn race_alternations(bytes: &[u8]) -> usize {
 }
 
 /// C11-10: E8's full pipe launch in single-threaded C. Natively the whole
-/// composition must be exact; routed, the packed descriptor is nonzero, so the
-/// guard's refusal is predicted. A refusal qualifies the refusal only, never
-/// composition support.
+/// composition must be exact; routed, SETSID is refused before authorization
+/// and before the later CHDIR action. A refusal qualifies that boundary only,
+/// never composition support.
 #[test]
 fn slate_c11_10_e8_pipe_refusal() {
-    let site = slate_spawn_refusal_site();
     let Some(spawn) = slate_spawn("c11-10") else {
         return;
     };
@@ -10723,11 +11818,9 @@ fn slate_c11_10_e8_pipe_refusal() {
         } else {
             serde_json::json!({
             "trapped_stub": "__posix_spawn (244)",
-            "x2_side": if refused { "nonzero: the single-site diagnostic was emitted" }
-                else { "no diagnostic" },
-            "emission_site": site,
-            "stage": "Delivery::Exec arm, after the absolute-path check and resign, before \
-                      registers are installed and the spawn syscall resumes",
+            "capture": routed.run.stderr.lines().find(|line| line.starts_with("spawn-capture ")),
+            "diagnostic": SLATE_SPAWN_REFUSAL,
+            "stage": "packed descriptor validation, before authorization and kernel execution",
             "effect_boundary": "no records.done, no records.child, no child.txt in the shadow; \
                                 host workspace pristine",
             "run_id": routed.run.run_id.0.to_string(),
@@ -10736,6 +11829,15 @@ fn slate_c11_10_e8_pipe_refusal() {
         },
     );
     assert!(exact, "{}", routed.run.stderr);
+    assert!(
+        routed
+            .run
+            .stderr
+            .lines()
+            .any(|line| line == "spawn-capture descriptor=non-null profile=25F80"),
+        "{}",
+        routed.run.stderr
+    );
     let pre = routed.text("records.pre");
     assert!(pre.starts_with("phase=pre-spawn mode=c11-10\n"));
     for line in pre.lines().filter(|l| l.contains(" result=")) {
@@ -12671,6 +13773,9 @@ fn f214_native_mount_identity_preserved() {
         scratch,
         helper: program.clone(),
         program,
+        provider_environment: Vec::new(),
+        platform_timeout_ms: None,
+        guardian: false,
     };
     let native_root = spawn.scratch.path().join("native");
     std::fs::create_dir(&native_root).unwrap();
@@ -12718,6 +13823,9 @@ fn f214_metadata_case(mode: &str) -> Option<RunId> {
         scratch,
         helper: program.clone(),
         program,
+        provider_environment: Vec::new(),
+        platform_timeout_ms: None,
+        guardian: false,
     };
     let native_root = spawn.scratch.path().join("native");
     std::fs::create_dir(&native_root).unwrap();
@@ -15136,4 +16244,77 @@ fn fix_227_sibling_progress_without_kernel_wait_proof() {
         );
         assert_eq!(std::fs::read(lock).unwrap(), b"lock\n");
     }
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_deadline() {
+    fix_243_fault_reading("fix-243-policy-deadline", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_session_drop() {
+    fix_243_fault_reading(
+        "fix-243-policy-session-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_backend_drop() {
+    fix_243_fault_reading(
+        "fix-243-policy-backend-drop",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_policy_terminate() {
+    fix_243_fault_reading("fix-243-policy-terminate", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_guardian_provider_loss() {
+    fix_243_fault_reading("fix-243-guardian-loss", "c11-02-attributes", false, b'P');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_guardian_unregistered() {
+    fix_243_fault_reading(
+        "fix-243-guardian-unregistered",
+        "c11-02-attributes",
+        false,
+        b'E',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_guardian_copyout_failure_loss() {
+    fix_243_fault_reading(
+        "fix-243-guardian-copyout-failure-loss",
+        "c11-02-attributes",
+        false,
+        b'P',
+    );
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_243_guardian_free_failure_loss() {
+    fix_243_fault_reading(
+        "fix-243-guardian-free-failure-loss",
+        "c11-02-attributes",
+        false,
+        b'P',
+    );
 }

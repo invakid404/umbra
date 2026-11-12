@@ -8,6 +8,7 @@
  * independently read shadow bytes, never the only oracle. */
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -158,6 +159,17 @@ static int echo(const char *root, int inherited, int decoy) {
     for (int fd = 0; fd < 256; fd++)
         if (fcntl(fd, F_GETFD) >= 0) note(" %d", fd);
     note("\ndecoy fd=%d open=%d inherited=%d\n", decoy, fcntl(decoy, F_GETFD) >= 0, inherited);
+    struct rlimit census_limit;
+    if (getrlimit(RLIMIT_NOFILE, &census_limit) == 0)
+        note("census-limit soft=%llu hard=%llu\n",
+             (unsigned long long)census_limit.rlim_cur, (unsigned long long)census_limit.rlim_max);
+    for (int candidate = 3; candidate < 256; candidate++) {
+        if (candidate == inherited || fcntl(candidate, F_GETFD) < 0) continue;
+        char target[4096] = {0};
+        int result = fcntl(candidate, F_GETPATH, target);
+        note("census-extra fd=%d path-result=%d path=%s\n", candidate, result,
+             result == 0 ? target : "UNAVAILABLE");
+    }
     char cwd[4096];
     note("cwd %s\n", getcwd(cwd, sizeof cwd) ? cwd : "UNAVAILABLE");
     char line[192];
@@ -204,8 +216,45 @@ static int race_write(const char *root, int output, int go, int ready) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "fix-243-thread-mask")) {
+        sigset_t mask;
+        int expected = atoi(argv[2]);
+        if (sigprocmask(SIG_BLOCK, NULL, &mask)) return 90;
+        return sigismember(&mask, SIGUSR1) == (expected == SIGUSR1) &&
+            sigismember(&mask, SIGUSR2) == (expected == SIGUSR2) ? 0 : 91;
+    }
     if (argc < 3) return 2;
     const char *mode = argv[1], *root = argv[2];
+    if (!strcmp(mode, "fix-243-pipe") && argc == 5) {
+        int victim = atoi(argv[3]), explicit_policy = atoi(argv[4]);
+        if (transfer(100, "FIX-243-NONCE", 13) != 13 || close(100)) return 82;
+        if (explicit_policy) {
+            errno = 0;
+            ssize_t result = write(victim, "BAD", 3);
+            int saved = errno;
+            note("pruned-victim result=%zd errno=%d\n", result, saved);
+            if (result != -1 || saved != EBADF) { flush(root); return 83; }
+        }
+        return write_child(root);
+    }
+    if (!strcmp(mode, "fix-243-sigdefault") || !strcmp(mode, "fix-243-sigmask")) {
+        struct sigaction current;
+        sigset_t mask;
+        if (sigaction(SIGPIPE, NULL, &current) || sigprocmask(SIG_BLOCK, NULL, &mask)) return 80;
+        int defaulted = current.sa_handler == SIG_DFL;
+        int ignored = current.sa_handler == SIG_IGN;
+        int blocked = sigismember(&mask, SIGPIPE);
+        note("child-signal default=%d ignored=%d blocked=%d\n", defaulted, ignored, blocked);
+        note("child-signal-raw handler=%p default=%p ignored=%p flags=%x\n",
+             (void *)current.sa_handler, (void *)SIG_DFL, (void *)SIG_IGN, current.sa_flags);
+        int expected_default = !strcmp(mode, "fix-243-sigdefault");
+        if (defaulted != expected_default || ignored == expected_default ||
+            blocked != expected_default) {
+            flush(root);
+            return 81;
+        }
+        return write_child(root);
+    }
     if (!strcmp(mode, "write-child") && argc == 3) return write_child(root);
     if (!strcmp(mode, "c11-05") && argc == 7)
         return cloexec(root, atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]));

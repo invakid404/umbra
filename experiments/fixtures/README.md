@@ -274,3 +274,33 @@ requests Launch.
 check host syscall relationships; routed descriptor results are compared
 byte-for-byte with the virtual filesystem contract. Path `statfs` remains native. Fork/exec phase markers use retained
 files because routed stdout is not an observation channel.
+
+## Packed-spawn fixtures
+
+`umbra-userspace-spawn.c` and its separate child fixture exercise the experimental
+exact-profile packed-spawn subset: initialized attributes, signal policy,
+ordered kernel pipe actions, CLOEXEC_DEFAULT, kernel-error recovery and precise
+unsupported-action/attribute refusals. The `fix-243-no-spawn` mode exits without
+creating a child and supplies the native control for a local provider-loss
+comparison. Existing null-spawn modes retain their separate coverage.
+
+Signal-policy modes remove only the child's diagnostic signal-observer setting:
+the observer installs a SIGPIPE handler and would otherwise alter the disposition
+being measured. A negative control retains an ignored SIGPIPE and requires the
+strict disposition oracle to reject it. Native E8 needs a soft descriptor limit
+of at least 1024 so the diagnostic observer can relocate its output to fd 900;
+the exact descriptor census remains unchanged. The relocation failure under a
+lower limit is tracked by [#249](https://github.com/invakid404/umbra/issues/249).
+
+`umbra-fix-243-relay.rs` is the `umbra243relay` Cargo example in the
+userspace-storage crate, enabled only with `mutation-probe-spawn-lifecycle`.
+It invokes the real isolation relay with the real CLI to drive guardian
+qualification outside launchd's session. The caller supplies
+`UMBRA_FIX_243_RELAY_EXE` and `UMBRA_FIX_243_RELAY_RECORDS`; the latter holds
+relay and guardian records. Build it with `cargo build -p
+umbra-storage-nfs-userspace --features mutation-probe-spawn-lifecycle --example
+umbra243relay`. The guardian fault cases require a COMPLETE sweep, independent
+child-identity disappearance and CLEAN cleanup without harness kills. Retained local
+readings passed the provider-loss, unregistered-child, copyout-failure and
+free-failure guardian cases. CI selects all four with
+`mutation-probe-spawn-lifecycle`; a COMPLETE sweep alone does not establish reap.

@@ -257,6 +257,71 @@ impl Supervisor {
     fn dispatch(&mut self, event: TraceEvent) -> Result<()> {
         self.admit_during_routed_effect(&event)?;
         match event {
+            TraceEvent::SpawnPrepare { token, plan } => {
+                if !self.state.processes.processes.contains_key(&token.parent) {
+                    return Err(ofd_error("spawn parent is not registered"));
+                }
+                // A secondary thread may first stop at the packed spawn trap.
+                // Register it with the same platform trust as SyscallEntry.
+                self.track_thread(token.parent, token.thread, StopReason::SyscallEntry)?;
+                let process = &self.state.processes.processes[&token.parent];
+                let authorization = self.spawns.prepare(token, plan, &process.context)?;
+                self.resume_checked(ResumeCommand {
+                    thread: token.thread,
+                    mode: ResumeMode::SpawnAuthorize(authorization),
+                    signal: None,
+                })
+            }
+            TraceEvent::SpawnAbort { authorization } => {
+                self.spawns.consume(authorization)?;
+                self.resume_checked(ResumeCommand {
+                    thread: authorization.token.thread,
+                    mode: ResumeMode::SpawnAbortReady(authorization),
+                    signal: None,
+                })
+            }
+            TraceEvent::SpawnChild {
+                authorization,
+                child,
+            } => {
+                let parent = authorization.token.parent;
+                let plan = self.spawns.plan(authorization)?.clone();
+                if self.state.processes.processes.contains_key(&child.0) {
+                    return Err(ofd_error("spawn child already published"));
+                }
+                let mut context = self.process_mut(parent)?.context.clone();
+                if context.exec_generation != authorization.token.exec_generation {
+                    return Err(ofd_error("spawn parent image changed"));
+                }
+                crate::spawn::validate(&plan, &context)?;
+                context.task = child.0;
+                context.parent = Some(parent);
+                if plan.close_on_exec_default {
+                    context.fds.clear();
+                } else {
+                    Self::sweep_close_on_exec(&mut context);
+                }
+                // Stage references in a private copy. A failure cannot publish
+                // a partial child table or leak acquired OFD references.
+                let mut ofds = self.ofds.clone();
+                for fd in context.fds.keys() {
+                    ofds.share((parent, *fd), (child.0, *fd))
+                        .map_err(ofd_error)?;
+                }
+                self.track_process(child.0, Some(parent));
+                self.process_mut(child.0)?.context = context;
+                self.ofds = ofds;
+                self.live += 1;
+                self.process_mut(parent)?.children.insert(child.0);
+                self.spawns.consume(authorization)?;
+                #[cfg(all(feature = "mutation-probe-spawn-lifecycle", unix))]
+                crate::spawn::before_ready(child.0)?;
+                self.resume_checked(ResumeCommand {
+                    thread: authorization.token.thread,
+                    mode: ResumeMode::SpawnChildReady(authorization),
+                    signal: None,
+                })
+            }
             TraceEvent::ThreadStarted { task, thread } => {
                 self.track_thread(task, thread, StopReason::Launch)?;
                 self.resume_thread(thread)
@@ -1663,6 +1728,14 @@ impl Supervisor {
     }
 
     fn resume_thread(&mut self, thread: ThreadId) -> Result<()> {
+        self.resume_checked(ResumeCommand {
+            thread,
+            mode: ResumeMode::Syscall,
+            signal: None,
+        })
+    }
+
+    fn resume_checked(&mut self, command: ResumeCommand) -> Result<()> {
         self.service_renewal()?;
         if self.poisoned {
             return Err(error(
@@ -1671,11 +1744,7 @@ impl Supervisor {
                 "refusing to resume a poisoned run",
             ));
         }
-        self.platform.control.resume(ResumeCommand {
-            thread,
-            mode: ResumeMode::Syscall,
-            signal: None,
-        })
+        self.platform.control.resume(command)
     }
 
     /// What a new child keeps of its parent's routed descriptors, and the open
@@ -1957,6 +2026,107 @@ mod tests {
         s.live = 1;
         s.state.lifecycle = RunLifecycle::Running;
         s
+    }
+
+    fn poisoned_spawn_event(arm: u8) {
+        let mut s = supervisor();
+        let token = SpawnToken {
+            run_generation: 1,
+            parent: task(1),
+            exec_generation: s.state.processes.processes[&task(1)]
+                .context
+                .exec_generation,
+            thread: ThreadId(TaskIdentity {
+                native_id: 2,
+                generation: 1,
+            }),
+            sequence: 1,
+        };
+        let plan = SpawnPlan {
+            digest: [42; 32],
+            actions: vec![],
+            close_on_exec_default: false,
+        };
+        let event = if arm == 0 {
+            TraceEvent::SpawnPrepare { token, plan }
+        } else {
+            let authorization = s
+                .spawns
+                .prepare(token, plan, &s.state.processes.processes[&task(1)].context)
+                .unwrap();
+            if arm == 1 {
+                TraceEvent::SpawnAbort { authorization }
+            } else {
+                TraceEvent::SpawnChild {
+                    authorization,
+                    child: ProcessHandle(task(3)),
+                }
+            }
+        };
+        s.poisoned = true;
+        let error = s.handle_event(event).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to resume a poisoned run"),
+            "{error}"
+        );
+        assert!(s.is_poisoned());
+    }
+
+    #[test]
+    fn poisoned_spawn_prepare_refuses_resume() {
+        poisoned_spawn_event(0);
+    }
+    #[test]
+    fn poisoned_spawn_abort_refuses_resume() {
+        poisoned_spawn_event(1);
+    }
+    #[test]
+    fn poisoned_spawn_child_refuses_resume() {
+        poisoned_spawn_event(2);
+    }
+
+    #[test]
+    fn spawn_prepare_registers_first_stop_like_main_thread() {
+        for previously_registered in [true, false] {
+            let mut s = supervisor();
+            let thread = ThreadId(TaskIdentity {
+                native_id: 2,
+                generation: 1,
+            });
+            if previously_registered {
+                s.track_thread(task(1), thread, StopReason::Launch).unwrap();
+            }
+            let token = SpawnToken {
+                run_generation: 1,
+                parent: task(1),
+                exec_generation: s.state.processes.processes[&task(1)]
+                    .context
+                    .exec_generation,
+                thread,
+                sequence: 1,
+            };
+            let plan = SpawnPlan {
+                digest: [42; 32],
+                actions: vec![],
+                close_on_exec_default: false,
+            };
+            s.dispatch(TraceEvent::SpawnPrepare {
+                token,
+                plan: plan.clone(),
+            })
+            .unwrap_or_else(|e| panic!("previously_registered={previously_registered}: {e}"));
+            let authorization = SpawnAuthorization {
+                token,
+                digest: plan.digest,
+                table_generation: 1,
+            };
+            assert_eq!(s.spawns.plan(authorization).unwrap(), &plan);
+            assert!(s.state.processes.processes[&task(1)]
+                .threads
+                .contains_key(&thread));
+        }
     }
     /// A platform double whose `directory_request` and tracee memory are the
     /// test's to choose, so `unserved_directory_request` can be driven over

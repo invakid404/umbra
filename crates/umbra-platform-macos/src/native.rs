@@ -4,7 +4,7 @@ use crate::{
     abi::{self, get, set, CPSR, PC},
     cache, error, interpose,
     rsp::{self, Rsp},
-    unsupported, Options,
+    spawn, spawn_host, unsupported, Options,
 };
 use mach2::{
     traps::{mach_task_self, task_for_pid},
@@ -41,6 +41,36 @@ fn tid(id: u64, generation: u64) -> ThreadId {
 }
 struct Task(u32);
 impl Task {
+    fn writable_pid_slot(&self, pointer: u64) -> bool {
+        use mach2::vm_region::{vm_region_basic_info_64, VM_REGION_BASIC_INFO_64};
+        let Some(end) = pointer.checked_add(4) else {
+            return false;
+        };
+        let mut address = pointer;
+        let mut size = 0;
+        let mut object = 0;
+        // SAFETY: all output pointers are valid and info has the advertised size.
+        unsafe {
+            let mut info: vm_region_basic_info_64 = std::mem::zeroed();
+            let mut count = vm_region_basic_info_64::count();
+            let result = mach2::vm::mach_vm_region(
+                self.0,
+                &mut address,
+                &mut size,
+                VM_REGION_BASIC_INFO_64,
+                (&mut info as *mut vm_region_basic_info_64).cast(),
+                &mut count,
+                &mut object,
+            );
+            if object != 0 {
+                mach2::mach_port::mach_port_deallocate(mach_task_self(), object);
+            }
+            result == 0
+                && address <= pointer
+                && address.checked_add(size).is_some_and(|limit| end <= limit)
+                && info.protection & mach2::vm_prot::VM_PROT_WRITE != 0
+        }
+    }
     fn acquire(pid: i32) -> Result<Self> {
         let mut port = 0;
         // SAFETY: valid out pointer; the returned send right is owned by Task.
@@ -94,6 +124,24 @@ impl TraceMemory for &Task {
         Task::read(self, address, out)
     }
 }
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+fn probe_unregistered(task: &Task, slot: u64) -> Result<bool> {
+    if std::env::var("UMBRA_FIX_243_PROBE_PHASE").as_deref() != Ok("unregistered") {
+        return Ok(false);
+    }
+    // Instrument-only observation. No child Task is acquired or registered.
+    let mut bytes = [0; 4];
+    task.read(slot, &mut bytes)?;
+    let pid = i32::from_le_bytes(bytes);
+    let birth = bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
+    crate::spawn_probe::rendezvous(
+        "unregistered",
+        pid,
+        birth,
+        serde_json::json!({"watchdog_registered": false, "session_inserted": false}),
+    )
+}
+
 struct Watchdog {
     tasks: Arc<Mutex<Vec<Arc<Task>>>>,
     cancel: Option<mpsc::Sender<()>>,
@@ -155,6 +203,7 @@ enum ReturnKind {
         pid_pointer: u64,
         twin: PathBuf,
     },
+    PackedSpawn,
     /// An `execve` in flight, carrying the resigned image it was rewritten to
     /// name -- as a *candidate*, not as a commitment.
     ///
@@ -250,7 +299,23 @@ struct Pending {
     kind: ReturnKind,
     hardware: bool,
 }
+/// Owned until explicit deallocation succeeds or this task dies. Never dropped
+/// as a side effect of taking the pending return out of the thread map.
+struct SpawnInFlight {
+    token: SpawnToken,
+    snapshot: spawn::Snapshot,
+    plan: SpawnPlan,
+    authorization: Option<SpawnAuthorization>,
+    original: RegisterSet,
+    returned: Option<RegisterSet>,
+    caller_pid: u64,
+    region: Option<u64>,
+    twin: PathBuf,
+    child: Option<usize>,
+}
+
 struct Session {
+    spawn: Option<SpawnInFlight>,
     task: Arc<Task>,
     rsp: Rsp,
     id: TaskId,
@@ -308,6 +373,10 @@ struct Session {
     /// kept for [`BarrierEvidence::TracerReportedExit`].
     exit_report: Option<String>,
     exec_generation: u64,
+    /// Generation visible in the supervisor's logical context. The trusted
+    /// bootstrap's exec is consumed before that context exists, and child
+    /// contexts inherit the parent's generation until a reported exec.
+    policy_exec_generation: u64,
     registers: Vec<(usize, usize)>,
     scratch: Vec<(u64, usize, usize)>,
     initial: bool,
@@ -370,10 +439,26 @@ impl Session {
         let task = Arc::new(Task::acquire(pid)?);
         watchdog.add(task.clone());
         let birth = bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if parent.is_some() {
+            let registered = watchdog
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|owned| Arc::ptr_eq(owned, &task));
+            crate::spawn_probe::acquired(pid, birth, registered)?;
+        }
         let mut rsp = Rsp::connect(options, deadline)?;
         let stop = rsp.request(&format!("vAttach;{pid:x}"))?;
         if !stop.starts_with('T') {
             return Err(error("attach", stop));
+        }
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if parent.is_none() && std::env::var_os("UMBRA_FIX_243_PROBE_ROOT").is_some() {
+            // Plain-run comparison: root is acquired and debugger attached;
+            // no spawn request has executed.
+            crate::spawn_probe::acquired(pid, birth, true)?;
         }
         let fields = rsp::fields(&stop[3..]);
         let thread = rsp::number(
@@ -410,6 +495,7 @@ impl Session {
             registers.push((offset, bits / 8));
         }
         Ok(Self {
+            spawn: None,
             task,
             rsp,
             id: TaskId(TaskIdentity {
@@ -431,6 +517,7 @@ impl Session {
             exit_evidence: None,
             exit_report: None,
             exec_generation: 0,
+            policy_exec_generation: 0,
             registers,
             scratch: vec![],
             initial: true,
@@ -1417,6 +1504,8 @@ impl Drop for Session {
 
 /// Native prototype control, deliberately !Send/!Sync. Construct on the provider thread.
 pub struct MacosTraceBackend {
+    spawn_sequence: u64,
+    spawn_profile: Option<bool>,
     options: Options,
     sessions: Vec<Session>,
     /// Every ordered teardown this backend ran, in order. It is the teardown's
@@ -1444,6 +1533,8 @@ impl Default for MacosTraceBackend {
 impl MacosTraceBackend {
     pub fn new(options: Options) -> Self {
         Self {
+            spawn_sequence: 0,
+            spawn_profile: None,
             options,
             sessions: vec![],
             teardown_reports: vec![],
@@ -1463,6 +1554,325 @@ impl MacosTraceBackend {
             .ok_or_else(|| {
                 UmbraError::new(ErrorKind::StaleHandle, "task", "unknown or exited task")
             })
+    }
+    fn capture_spawn(
+        &mut self,
+        index: usize,
+        thread: ThreadId,
+        regs: RegisterSet,
+        twin: PathBuf,
+    ) -> Result<()> {
+        let qualified = match self.spawn_profile {
+            Some(value) => value,
+            None => {
+                let value = spawn_host::qualify().is_ok();
+                self.spawn_profile = Some(value);
+                value
+            }
+        };
+        if !qualified {
+            return Err(unsupported("spawn ABI profile mismatch"));
+        }
+        if std::env::var_os("UMBRA_SPAWN_LOG").is_some() {
+            eprintln!("spawn-capture descriptor=non-null profile=25F80");
+        }
+        if self.sessions[index].spawn.is_some()
+            || self.sessions.iter().filter(|s| s.spawn.is_some()).count() >= 16
+        {
+            return Err(unsupported("spawn snapshot capacity exceeded"));
+        }
+        let s = &self.sessions[index];
+        let mut descriptor = [0; spawn::DESCRIPTOR_BYTES];
+        s.task
+            .read(get(&regs, 2)?, &mut descriptor)
+            .map_err(|_| unsupported("spawn malformed packed descriptor"))?;
+        let snapshot = spawn::decode(&descriptor, |address, output| s.task.read(address, output))?;
+        if std::env::var_os("UMBRA_SPAWN_LOG").is_some() {
+            eprintln!(
+                "spawn-policy flags={:#06x} actions={}",
+                u16::from_le_bytes(snapshot.attributes[..2].try_into().unwrap()) & !0x80,
+                snapshot.actions.len()
+            );
+        }
+        let plan = SpawnPlan {
+            digest: spawn_host::digest(&snapshot.backing(0)?)?,
+            actions: snapshot.actions.clone(),
+            close_on_exec_default: snapshot.attributes[1] & 0x40 != 0,
+        };
+        let caller_pid = get(&regs, 0)?;
+        if caller_pid != 0 && !s.task.writable_pid_slot(caller_pid) {
+            return Err(unsupported("spawn invalid caller PID pointer"));
+        }
+        // Reserve queue and child-session capacity before the kernel can
+        // create a child; attach adds no allocation for new token bookkeeping.
+        self.sessions
+            .try_reserve(1)
+            .map_err(|e| error("spawn reserve", e))?;
+        self.events
+            .try_reserve(3)
+            .map_err(|e| error("spawn reserve", e))?;
+        self.spawn_sequence = self
+            .spawn_sequence
+            .checked_add(1)
+            .ok_or_else(|| unsupported("spawn sequence exhausted"))?;
+        let run_generation = self.sessions[0].id.0.generation;
+        let s = &mut self.sessions[index];
+        let token = SpawnToken {
+            run_generation,
+            parent: s.id,
+            exec_generation: s.policy_exec_generation,
+            thread,
+            sequence: self.spawn_sequence,
+        };
+        s.spawn = Some(SpawnInFlight {
+            token,
+            snapshot,
+            plan: plan.clone(),
+            authorization: None,
+            original: regs,
+            returned: None,
+            caller_pid,
+            region: None,
+            twin,
+            child: None,
+        });
+        self.events
+            .push_back(TraceEvent::SpawnPrepare { token, plan });
+        Ok(())
+    }
+
+    fn arm_spawn(&mut self, index: usize, authorization: SpawnAuthorization) -> Result<()> {
+        let s = &mut self.sessions[index];
+        let pending = s
+            .spawn
+            .as_mut()
+            .ok_or_else(|| error("spawn", "no captured plan"))?;
+        if pending.token != authorization.token
+            || pending.plan.digest != authorization.digest
+            || pending.authorization.is_some()
+        {
+            return Err(error("spawn", "stale authorization"));
+        }
+        pending.snapshot.require_supported()?;
+        pending.authorization = Some(authorization);
+        let mut address = 0;
+        let allocation_task = s.task.0;
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        let allocation_task =
+            if std::env::var("UMBRA_FIX_243_REGION_FAULT").as_deref() == Ok("allocate") {
+                mach2::port::MACH_PORT_NULL
+            } else {
+                allocation_task
+            };
+        // SAFETY: valid out pointer, this session owns the remote task right.
+        unsafe {
+            mach(
+                mach2::vm::mach_vm_allocate(
+                    allocation_task,
+                    &mut address,
+                    spawn::REGION_BYTES as u64,
+                    mach2::vm_statistics::VM_FLAGS_ANYWHERE,
+                ),
+                "spawn snapshot allocation",
+            )?;
+        }
+        pending.region = Some(address);
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        crate::spawn_probe::region("allocated", pending.token, address, 0);
+        // Store ownership before any write can fail.
+        let backing = pending.snapshot.backing(address)?;
+        let mut regs = pending.original.clone();
+        let mut path = pending.twin.as_os_str().as_bytes().to_vec();
+        path.push(0);
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if std::env::var("UMBRA_FIX_243_REGION_FAULT").as_deref() == Ok("write") {
+            let result = s.write(0, &backing);
+            let owned = s.spawn.as_ref().unwrap().region;
+            eprintln!(
+                "spawn-write-fault {}",
+                serde_json::json!({
+                    "failed": result.is_err(), "region": owned,
+                    "parent_stopped": s.stopped, "child_created": s.spawn.as_ref().unwrap().child.is_some(),
+                })
+            );
+            return result;
+        }
+        s.write(address, &backing)?;
+        set(&mut regs, 1, s.allocate(&path)?)?;
+        set(&mut regs, 0, address + 400)?;
+        set(&mut regs, 2, address)?;
+        s.set_regs(authorization.token.thread, &regs)?;
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if let Ok(count) = std::env::var("UMBRA_FIX_243_OVERLAP_PARENTS") {
+            let count: usize = count
+                .parse()
+                .map_err(|_| error("spawn probe", "bad overlap count"))?;
+            if !(2..=17).contains(&count) {
+                return Err(error("spawn probe", "overlap count outside test bound"));
+            }
+            // Keep these parents stopped before kernel execution, while the
+            // ordinary event loop continues other independently running tasks.
+            let held: Vec<_> = self
+                .sessions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    let p = s.spawn.as_ref()?;
+                    (p.region.is_some() && p.returned.is_none() && s.pending.is_empty())
+                        .then_some((i, p.token.thread))
+                })
+                .collect();
+            if held.len() < count {
+                return Ok(());
+            }
+            for (i, thread) in held {
+                let p = self.sessions[i].spawn.as_ref().unwrap();
+                let address = p.region.unwrap();
+                let expected = p.snapshot.backing(address)?;
+                let mut actual = vec![0; expected.len()];
+                self.sessions[i].task.read(address, &mut actual)?;
+                if actual != expected {
+                    return Err(error("spawn probe", "overlapping backing changed"));
+                }
+                crate::spawn_probe::region("overlap-verified", p.token, address, 0);
+                self.sessions[i].return_stop(thread, ReturnKind::PackedSpawn)?;
+            }
+            return Ok(());
+        }
+        self.sessions[index].return_stop(authorization.token.thread, ReturnKind::PackedSpawn)
+    }
+
+    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+    fn probe_spawn_completion(&self, index: usize, phase: &str) -> Result<bool> {
+        let parent = &self.sessions[index];
+        let pending = parent.spawn.as_ref().expect("pending completion");
+        let Some(child_index) = pending.child else {
+            if std::env::var("UMBRA_FIX_243_PROBE_PHASE").as_deref() != Ok(phase) {
+                return Ok(false);
+            }
+            // Observe an early completion call without acquiring or registering
+            // a Task merely for the test. Unknown ownership is not reported as
+            // successful registration.
+            let Some(region) = pending.region else {
+                return Err(error("spawn probe", "no region before child insertion"));
+            };
+            let mut bytes = [0; 4];
+            parent.task.read(region + 400, &mut bytes)?;
+            let pid = i32::from_le_bytes(bytes);
+            let birth = bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
+            return crate::spawn_probe::rendezvous(
+                phase,
+                pid,
+                birth,
+                serde_json::json!({"watchdog_registered": null, "session_inserted": false,
+                    "parent_stopped": parent.stopped, "child_stopped": null,
+                    "region_owned": true}),
+            );
+        };
+        let child = &self.sessions[child_index];
+        let registered = self
+            .watchdog
+            .as_ref()
+            .expect("watchdog")
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|task| Arc::ptr_eq(task, &child.task));
+        crate::spawn_probe::rendezvous(
+            phase,
+            child.id.0.native_id as i32,
+            child.birth,
+            serde_json::json!({"watchdog_registered": registered, "session_inserted": true,
+                "parent_stopped": parent.stopped, "child_stopped": child.stopped,
+                "region_owned": pending.region.is_some()}),
+        )
+    }
+
+    fn complete_spawn(
+        &mut self,
+        index: usize,
+        authorization: SpawnAuthorization,
+        success: bool,
+    ) -> Result<()> {
+        let pending = self.sessions[index]
+            .spawn
+            .as_ref()
+            .ok_or_else(|| error("spawn", "no pending completion"))?;
+        if pending.authorization != Some(authorization)
+            || pending.returned.is_none()
+            || pending.child.is_some() != success
+        {
+            return Err(error("spawn", "stale or premature Ready"));
+        }
+        let child = pending.child;
+        let caller = pending.caller_pid;
+        let region = pending.region.expect("completion owns region");
+        if let Some(child_index) = child {
+            if caller != 0 {
+                let pid = self.sessions[child_index].id.0.native_id as i32;
+                #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                let caller = if self.probe_spawn_completion(index, "caller-copyout")? {
+                    0
+                } else {
+                    caller
+                };
+                if self.sessions[index]
+                    .write(caller, &pid.to_le_bytes())
+                    .is_err()
+                {
+                    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                    self.probe_spawn_completion(index, "caller-copyout-failed")?;
+                    return Err(unsupported("spawn caller PID delivery failed"));
+                }
+            }
+        }
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        let release_fault = self.probe_spawn_completion(index, "remote-free")?;
+        let s = &mut self.sessions[index];
+        // SAFETY: this task owns the dedicated allocation, with its original
+        // extent. Failure retains the accounting and stops the run.
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        let task_port = if release_fault {
+            mach2::port::MACH_PORT_NULL
+        } else {
+            s.task.0
+        };
+        #[cfg(not(feature = "mutation-probe-spawn-lifecycle"))]
+        let task_port = s.task.0;
+        let result =
+            unsafe { mach2::vm::mach_vm_deallocate(task_port, region, spawn::REGION_BYTES as u64) };
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        crate::spawn_probe::region("release-result", authorization.token, region, result);
+        if result != 0 {
+            #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+            self.probe_spawn_completion(index, "remote-free-failed")?;
+            return Err(unsupported("spawn snapshot release failed"));
+        }
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        crate::spawn_probe::released_mapping(s.task.0, authorization.token, region);
+        let pending = s.spawn.as_mut().unwrap();
+        pending.region = None;
+        let mut regs = pending.returned.take().unwrap();
+        // Preserve return x0, CPSR and post-syscall PC. Only rewritten input
+        // operands that are not return slots are restored.
+        set(&mut regs, 1, get(&pending.original, 1)?)?;
+        set(&mut regs, 2, get(&pending.original, 2)?)?;
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if self.probe_spawn_completion(index, "register-commit")? {
+            return Err(error("spawn", "injected final register commit failure"));
+        }
+        let s = &mut self.sessions[index];
+        s.set_regs(authorization.token.thread, &regs)?;
+        s.spawn = None;
+        if let Some(child_index) = child {
+            let child = &self.sessions[child_index];
+            self.events.push_back(TraceEvent::ThreadStarted {
+                task: child.id,
+                thread: child.thread,
+            });
+        }
+        self.sessions[index].continue_run()
     }
     /// Resolve the session a caller-named thread belongs to.
     ///
@@ -1486,6 +1896,9 @@ impl MacosTraceBackend {
                 !s.done
                     && (s.entry.contains_key(&thread)
                         || s.pending.contains_key(&thread)
+                        || s.spawn
+                            .as_ref()
+                            .is_some_and(|spawn| spawn.token.thread == thread)
                         || s.thread == thread)
             })
             .ok_or_else(|| {
@@ -1852,6 +2265,11 @@ impl MacosTraceBackend {
                         ));
                     }
                     // Report the stopped target the way an ordinary launch does.
+                    self.sessions
+                        .iter_mut()
+                        .find(|session| session.id == task)
+                        .unwrap()
+                        .policy_exec_generation = 0;
                     self.events
                         .push_back(TraceEvent::ThreadStarted { task, thread });
                     return Ok(());
@@ -1865,7 +2283,10 @@ impl MacosTraceBackend {
                         ),
                     ))
                 }
-                TraceEvent::Child { .. } => {
+                TraceEvent::Child { .. }
+                | TraceEvent::SpawnPrepare { .. }
+                | TraceEvent::SpawnChild { .. }
+                | TraceEvent::SpawnAbort { .. } => {
                     return Err(error(
                         "sandbox.launch",
                         "sandbox installer created a child before installing the policy",
@@ -1969,6 +2390,43 @@ impl MacosTraceBackend {
             },
         )
     }
+    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+    fn probe_teardown_trigger(&mut self, phase: &str) -> Result<()> {
+        let trigger = std::env::var("UMBRA_FIX_243_PROBE_TRIGGER").unwrap_or_default();
+        match trigger.as_str() {
+            "deadline" => {
+                self.deadline = Some(Instant::now());
+                self.check_deadline()?;
+            }
+            "session-drop" => {
+                // Before child insertion this drops the existing parent Session;
+                // the acquired child remains in the watchdog task list.
+                drop(self.sessions.pop().expect("registered Session"));
+            }
+            "backend-drop" => {
+                drop(std::mem::take(self));
+            }
+            "terminate" => {
+                self.terminate(
+                    ProcessHandle(self.sessions[0].id),
+                    TerminationPolicy::Immediate,
+                )?;
+            }
+            "watchdog" => {
+                let remaining = self
+                    .deadline
+                    .unwrap()
+                    .saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining + Duration::from_millis(50));
+            }
+            _ => {}
+        }
+        Err(error(
+            "spawn probe",
+            format!("injected {phase} {trigger} failure"),
+        ))
+    }
+
     fn attach_child(
         &mut self,
         parent: usize,
@@ -1988,7 +2446,7 @@ impl MacosTraceBackend {
         // rewritten to name, which is a different binary whenever the tracee
         // asked for one.
         let image = twin.clone();
-        let mut child = Session::attach(
+        let child_result = Session::attach(
             pid,
             self.generation,
             twin,
@@ -1997,7 +2455,17 @@ impl MacosTraceBackend {
             self.deadline.unwrap(),
             self.watchdog.as_ref().unwrap(),
             self.interposer.clone(),
-        )?;
+        );
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if child_result.as_ref().err().is_some_and(|error| {
+            error
+                .to_string()
+                .contains("injected attach failure after registration")
+        }) && std::env::var_os("UMBRA_FIX_243_PROBE_TRIGGER").is_some()
+        {
+            return self.probe_teardown_trigger("acquired");
+        }
+        let mut child = child_result?;
         child.retarget_interposer(&image)?;
         // The parent supplied memory repairs, not breakpoints owned by this RSP.
         debug_assert!(child.breaks.is_empty());
@@ -2007,6 +2475,7 @@ impl MacosTraceBackend {
             }
         }
         child.install()?;
+        child.policy_exec_generation = self.sessions[parent].policy_exec_generation;
         let event = TraceEvent::Child {
             parent: self.sessions[parent].id,
             child: ProcessHandle(child.id),
@@ -2017,6 +2486,22 @@ impl MacosTraceBackend {
             thread: child.thread,
         };
         self.sessions.push(child);
+        if kind == ChildKind::Spawn {
+            if let Some(spawn) = self.sessions[parent].spawn.as_ref() {
+                let authorization = spawn.authorization.expect("armed spawn");
+                let child_index = self.sessions.len() - 1;
+                self.sessions[parent].spawn.as_mut().unwrap().child = Some(child_index);
+                #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                if self.probe_spawn_completion(parent, "inserted")? {
+                    return self.probe_teardown_trigger("inserted");
+                }
+                self.events.push_back(TraceEvent::SpawnChild {
+                    authorization,
+                    child: ProcessHandle(self.sessions[child_index].id),
+                });
+                return Ok(());
+            }
+        }
         self.events.push_back(event);
         self.events.push_back(thread_event);
         Ok(())
@@ -2040,6 +2525,34 @@ impl MacosTraceBackend {
         }
         s.install_breakpoint(pending.entry, pending.entry_breakpoint)?;
         match pending.kind {
+            ReturnKind::PackedSpawn => {
+                let outcome = abi::outcome(&regs)?;
+                let spawn = s.spawn.as_mut().expect("armed spawn owns its snapshot");
+                spawn.returned = Some(regs);
+                let authorization = spawn.authorization.expect("armed authorization");
+                if matches!(outcome, OperationOutcome::Success { .. }) {
+                    let mut bytes = [0; 4];
+                    let slot = spawn.region.expect("armed region") + 400;
+                    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                    let slot = if probe_unregistered(&s.task, slot)? {
+                        0
+                    } else {
+                        slot
+                    };
+                    s.task.read(slot, &mut bytes)?;
+                    let twin = std::mem::take(&mut spawn.twin);
+                    self.attach_child(
+                        index,
+                        i32::from_le_bytes(bytes),
+                        twin,
+                        ChildKind::Spawn,
+                        None,
+                    )?;
+                } else {
+                    self.events
+                        .push_back(TraceEvent::SpawnAbort { authorization });
+                }
+            }
             ReturnKind::Syscall => {
                 self.events.push_back(TraceEvent::SyscallExit {
                     task: s.id,
@@ -2073,6 +2586,12 @@ impl MacosTraceBackend {
             ReturnKind::Spawn { pid_pointer, twin } => {
                 if let OperationOutcome::Success { .. } = abi::outcome(&regs)? {
                     let mut bytes = [0; 4];
+                    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                    let pid_pointer = if probe_unregistered(&s.task, pid_pointer)? {
+                        0
+                    } else {
+                        pid_pointer
+                    };
                     s.task.read(pid_pointer, &mut bytes)?;
                     self.attach_child(
                         index,
@@ -2204,13 +2723,16 @@ impl MacosTraceBackend {
                     &self.options,
                     self.deadline.unwrap(),
                 )?;
+                if number == 244 && get(&regs, 2)? != 0 {
+                    return self.capture_spawn(index, thread, regs, twin);
+                }
                 let s = &mut self.sessions[index];
                 let mut bytes = twin.as_os_str().as_bytes().to_vec();
                 bytes.push(0);
                 set(&mut regs, slot, s.allocate(&bytes)?)?;
                 if number == 244 {
-                    if get(&regs, 2)? != 0 {
-                        return Err(unsupported("spawn requires null attributes/file actions"));
+                    if std::env::var_os("UMBRA_SPAWN_LOG").is_some() {
+                        eprintln!("spawn-capture descriptor=null");
                     }
                     let attributes = spawn_attributes()?;
                     let attr = s.allocate(&attributes.block)?;
@@ -2324,6 +2846,7 @@ impl MacosTraceBackend {
             s.scratch.clear();
             s.entry.clear();
             s.exec_generation += 1;
+            s.policy_exec_generation = s.exec_generation;
             let task = Arc::new(Task::acquire(s.id.0.native_id as i32)?);
             self.watchdog.as_ref().unwrap().add(task.clone());
             s.task = task;
@@ -3060,6 +3583,19 @@ impl MacosTraceBackend {
     /// zombie still has its original parent to be handed back to. It does not
     /// remove the sessions; callers clear them afterwards.
     fn tear_down_sessions(&mut self) -> Vec<TeardownReport> {
+        #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+        if std::env::var_os("UMBRA_FIX_243_OWNER_TRACE").is_some() {
+            let owners: Vec<_> = self
+                .sessions
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "pid": s.id.0.native_id, "birth": s.birth, "stopped": s.stopped,
+                    })
+                })
+                .collect();
+            eprintln!("spawn-teardown-owners {}", serde_json::json!(owners));
+        }
         let mut reports = Vec::new();
         for index in (0..self.sessions.len()).rev() {
             if !self.sessions[index].torn_down {
@@ -3205,6 +3741,39 @@ impl TraceBackend for MacosTraceBackend {
     fn resume(&mut self, command: ResumeCommand) -> Result<()> {
         self.check_deadline()?;
         let i = self.thread_index(command.thread)?;
+        if command.signal.is_none() && self.sessions[i].stopped {
+            match command.mode {
+                ResumeMode::SpawnAuthorize(auth) if auth.token.thread == command.thread => {
+                    return self.arm_spawn(i, auth)
+                }
+                ResumeMode::SpawnChildReady(auth) if auth.token.thread == command.thread => {
+                    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                    if std::env::var("UMBRA_FIX_243_PROBE_PHASE").as_deref() == Ok("policy-ready")
+                        && matches!(
+                            std::env::var("UMBRA_FIX_243_PROBE_TRIGGER").as_deref(),
+                            Ok("deadline" | "session-drop" | "backend-drop" | "terminate")
+                        )
+                    {
+                        return self.probe_teardown_trigger("policy-ready");
+                    }
+                    return self.complete_spawn(i, auth, true);
+                }
+                ResumeMode::SpawnAbortReady(auth) if auth.token.thread == command.thread => {
+                    return self.complete_spawn(i, auth, false)
+                }
+                _ => {}
+            }
+        }
+        if self.sessions[i].spawn.is_some()
+            || matches!(
+                command.mode,
+                ResumeMode::SpawnAuthorize(_)
+                    | ResumeMode::SpawnChildReady(_)
+                    | ResumeMode::SpawnAbortReady(_)
+            )
+        {
+            return Err(error("spawn", "resume before commit barrier"));
+        }
         if self.quiesced_stops.iter().any(|(index, _)| *index == i) {
             return Err(error(
                 "resume",

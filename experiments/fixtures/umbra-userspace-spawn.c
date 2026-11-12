@@ -22,8 +22,12 @@
  * posix_spawn returned and then wait for one `G` on stdin, so the harness has
  * the child's birth identity before the child is released to do anything. */
 #include <errno.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <sys/fileport.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -104,8 +108,12 @@ static int announce(pid_t child) {
 
 /* C11-01 and the three C11-02 leaves: the same child, one pointer shape each. */
 static int shape(const char *mode, const char *root, const char *helper) {
+    int sigdefault = !strcmp(mode, "fix-243-sigdefault") ||
+        !strcmp(mode, "fix-243-sigdefault-mutant");
+    int sigmask = !strcmp(mode, "fix-243-sigmask");
     int use_actions = !strcmp(mode, "c11-02-actions") || !strcmp(mode, "c11-02-both");
-    int use_attributes = !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both");
+    int use_attributes = !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both") ||
+        sigdefault || sigmask;
     posix_spawn_file_actions_t actions;
     posix_spawnattr_t attributes;
     note("phase=pre-spawn mode=%s actions=%d attributes=%d\n", mode, use_actions, use_attributes);
@@ -120,8 +128,31 @@ static int shape(const char *mode, const char *root, const char *helper) {
         note("spawnattr-init result=%d\n", rc);
         if (rc) return 6;
     }
+    if (sigdefault || sigmask) {
+        /* The native slate observer replaces SIG_DFL during the helper's
+         * constructor. Keep parent/launcher observation, but let this child's
+         * signal oracle observe the actual spawn policy before any handler.
+         * The routed helper already has no observer in its launch environment. */
+        unsetenv("UMBRA_SLATE_SIGNAL_DIR");
+        struct sigaction ignored = {0};
+        ignored.sa_handler = SIG_IGN;
+        sigemptyset(&ignored.sa_mask);
+        sigset_t pipe_set, empty;
+        sigemptyset(&pipe_set);
+        sigaddset(&pipe_set, SIGPIPE);
+        sigemptyset(&empty);
+        if (sigaction(SIGPIPE, &ignored, NULL) || sigprocmask(SIG_BLOCK, &pipe_set, NULL))
+            return 16;
+        if (posix_spawnattr_setflags(&attributes,
+                !strcmp(mode, "fix-243-sigdefault-mutant") ? 0 :
+                    sigdefault ? POSIX_SPAWN_SETSIGDEF : POSIX_SPAWN_SETSIGMASK) ||
+            posix_spawnattr_setsigdefault(&attributes, &pipe_set) ||
+            posix_spawnattr_setsigmask(&attributes, &empty)) return 17;
+    }
     flush(root, "records.pre");
-    char *args[] = {(char *)helper, "write-child", (char *)root, NULL};
+    char *args[] = {(char *)helper, sigdefault ? "fix-243-sigdefault" :
+                    sigmask ? "fix-243-sigmask" : "write-child",
+                    (char *)root, NULL};
     pid_t child = -1;
     if (spawn(&child, helper, use_actions ? &actions : NULL,
               use_attributes ? &attributes : NULL, args)) {
@@ -130,6 +161,15 @@ static int shape(const char *mode, const char *root, const char *helper) {
     }
     int status = 0;
     int failed = reap(child, &status);
+    if (sigdefault || sigmask) {
+        struct sigaction current;
+        sigset_t mask;
+        if (sigaction(SIGPIPE, NULL, &current) || sigprocmask(SIG_BLOCK, NULL, &mask))
+            return 18;
+        note("parent-signal ignored=%d blocked=%d\n", current.sa_handler == SIG_IGN,
+             sigismember(&mask, SIGPIPE));
+        if (current.sa_handler != SIG_IGN || sigismember(&mask, SIGPIPE) != 1) return 19;
+    }
     char path[4096];
     path_in(path, sizeof path, root, "parent.txt");
     int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
@@ -483,12 +523,330 @@ static int race(const char *root, const char *helper) {
     return failed || short_writes ? 11 : 0;
 }
 
+/* D-A1 kernel-only pipe composition. The child gets fd 100 via ordered
+ * dup/close/inherit actions; CLOEXEC_DEFAULT must prune the routed victim. */
+static int kernel_pipe(const char *mode, const char *root, const char *helper) {
+    int recovery = !strcmp(mode, "fix-243-error-recovery");
+    int inherit_cloexec = !strcmp(mode, "fix-243-inherit-cloexec");
+    int close_first = !strcmp(mode, "fix-243-close-before-dup");
+    int dup_first = !strcmp(mode, "fix-243-dup-before-close");
+    int explicit_policy = !strcmp(mode, "fix-243-cloexec") || recovery ||
+        inherit_cloexec || close_first || dup_first;
+    int parent_100 = inherit_cloexec || close_first;
+    int pair[2];
+    if (pipe(pair)) return 90;
+    char path[4096];
+    path_in(path, sizeof path, root, "victim.txt");
+    int victim = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (victim < 0 || transfer(victim, "SEED", 4) != 4) return 91;
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    if (posix_spawn_file_actions_init(&actions) || posix_spawnattr_init(&attr)) return 92;
+    if (parent_100 && dup2(pair[1], 100) != 100) return 130;
+    if (inherit_cloexec && fcntl(100, F_SETFD, FD_CLOEXEC)) return 131;
+    int flags_before = parent_100 ? fcntl(100, F_GETFD) : -1;
+    if (inherit_cloexec) {
+        if (posix_spawn_file_actions_addinherit_np(&actions, 100) ||
+            posix_spawn_file_actions_addclose(&actions, pair[1])) return 93;
+    } else {
+        if (close_first && posix_spawn_file_actions_addclose(&actions, 100)) return 93;
+        if (posix_spawn_file_actions_adddup2(&actions, pair[1], 100) ||
+            posix_spawn_file_actions_addclose(&actions, pair[1]) ||
+            posix_spawn_file_actions_adddup2(&actions, 100, 100) ||
+            posix_spawn_file_actions_addinherit_np(&actions, 100)) return 93;
+    }
+    if (explicit_policy && posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT))
+        return 94;
+    note("phase=pre-spawn mode=%s\n", mode);
+    identity();
+    note("pipe read=%d write=%d victim=%d\n", pair[0], pair[1], victim);
+    flush(root, "records.pre");
+    /* Constructors must not create descriptors that masquerade as inherited ones. */
+    unsetenv("UMBRA_SLATE_SIGNAL_DIR");
+    char victim_arg[32], policy_arg[8];
+    snprintf(victim_arg, sizeof victim_arg, "%d", victim);
+    snprintf(policy_arg, sizeof policy_arg, "%d", explicit_policy);
+    char *args[] = {(char *)helper, "fix-243-pipe", (char *)root, victim_arg, policy_arg, NULL};
+    pid_t child = -1;
+    if (recovery) {
+        posix_spawn_file_actions_t bad;
+        posix_spawnattr_t defaults;
+        if (posix_spawn_file_actions_init(&bad) || posix_spawnattr_init(&defaults)) return 106;
+        close(200);
+        if (posix_spawn_file_actions_adddup2(&bad, 200, 100)) return 107;
+        int result = spawn(&child, helper, &bad, &defaults, args);
+        note("kernel-error result=%d expected=%d\n", result, EBADF);
+        posix_spawn_file_actions_destroy(&bad);
+        posix_spawnattr_destroy(&defaults);
+        if (result != EBADF) { flush(root, "records.done"); return 108; }
+    }
+    if (spawn(&child, helper, &actions, &attr, args)) {
+        flush(root, "records.done");
+        return 95;
+    }
+    if (parent_100) {
+        int flags_after = fcntl(100, F_GETFD);
+        note("parent-flags before=%d after=%d\n", flags_before, flags_after);
+        if (flags_after != flags_before) return 132;
+        close(100);
+    }
+    close(pair[1]);
+    char bytes[64] = {0};
+    size_t used_bytes = 0;
+    for (;;) {
+        ssize_t n = read(pair[0], bytes + used_bytes, sizeof bytes - used_bytes);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 || used_bytes == sizeof bytes) return 96;
+        if (!n) break;
+        used_bytes += (size_t)n;
+    }
+    close(pair[0]);
+    note("pipe-result bytes=%zu payload=%.*s eof=1\n", used_bytes, (int)used_bytes, bytes);
+    int status = 0;
+    int failed = reap(child, &status);
+    if (transfer(victim, "PARENT", 6) != 6 || close(victim)) return 97;
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    flush(root, "records.done");
+    return failed || used_bytes != 13 || memcmp(bytes, "FIX-243-NONCE", 13) ? 98 : 0;
+}
+
+static int refused_plan(const char *mode, const char *root, const char *helper) {
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    if (posix_spawn_file_actions_init(&actions) || posix_spawnattr_init(&attr)) return 100;
+    int fd = -1, rc = 0;
+    fileport_t port = FILEPORT_NULL;
+    char path[4096];
+    path_in(path, sizeof path, root, "opened.txt");
+    if (!strcmp(mode, "fix-243-refuse-fileport")) {
+        /* Private libsyscall API: xnu/libsyscall/wrappers/spawn/posix_spawn.c. */
+        int (*add)(posix_spawn_file_actions_t *, mach_port_t, int) =
+            dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_add_fileportdup2_np");
+        if (!add || fileport_makeport(STDOUT_FILENO, &port)) return 133;
+        rc = add(&actions, port, 100);
+    } else if (!strcmp(mode, "fix-243-refuse-setsid"))
+        rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    else if (!strcmp(mode, "fix-243-refuse-setpgroup"))
+        rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    else if (!strcmp(mode, "fix-243-refuse-resetids"))
+        rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_RESETIDS);
+    else if (!strcmp(mode, "fix-243-refuse-open"))
+        rc = posix_spawn_file_actions_addopen(&actions, 100, path, O_CREAT | O_WRONLY, 0600);
+    else if (!strcmp(mode, "fix-243-refuse-chdir"))
+        rc = posix_spawn_file_actions_addchdir_np(&actions, root);
+    else if (!strcmp(mode, "fix-243-refuse-late-chdir")) {
+        rc = posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, 100);
+        if (!rc) rc = posix_spawn_file_actions_addchdir_np(&actions, root);
+    } else if (!strcmp(mode, "fix-243-refuse-fchdir")) {
+        fd = open(root, O_RDONLY | O_DIRECTORY);
+        if (fd < 0) return 101;
+        rc = posix_spawn_file_actions_addfchdir_np(&actions, fd);
+    } else if (!strcmp(mode, "fix-243-refuse-virtual-before-chdir") ||
+               !strcmp(mode, "fix-243-refuse-chdir-before-virtual")) {
+        path_in(path, sizeof path, root, "victim.txt");
+        fd = open(path, O_CREAT | O_RDWR | O_EXCL, 0600);
+        if (fd < 0 || transfer(fd, "SEED", 4) != 4) return 102;
+        if (!strcmp(mode, "fix-243-refuse-virtual-before-chdir")) {
+            rc = posix_spawn_file_actions_adddup2(&actions, fd, 100);
+            if (!rc) rc = posix_spawn_file_actions_addchdir_np(&actions, root);
+        } else {
+            rc = posix_spawn_file_actions_addchdir_np(&actions, root);
+            if (!rc) rc = posix_spawn_file_actions_adddup2(&actions, fd, 100);
+        }
+    } else if (!strcmp(mode, "fix-243-refuse-virtual-source") ||
+               !strcmp(mode, "fix-243-refuse-virtual-destination")) {
+        path_in(path, sizeof path, root, "victim.txt");
+        fd = open(path, O_CREAT | O_RDWR | O_EXCL, 0600);
+        if (fd < 0 || transfer(fd, "SEED", 4) != 4) return 102;
+        rc = !strcmp(mode, "fix-243-refuse-virtual-source") ?
+            posix_spawn_file_actions_adddup2(&actions, fd, 100) :
+            posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, fd);
+    } else return 103;
+    if (rc) return 104;
+    note("phase=pre-spawn mode=%s setup=0\n", mode);
+    identity();
+    flush(root, "records.pre");
+    pid_t child = -1;
+    char *args[] = {(char *)helper, "write-child", (char *)root, NULL};
+    int result = spawn(&child, helper, &actions, &attr, args);
+    int status = 0;
+    int failed = result || reap(child, &status);
+    if (fd >= 0) close(fd);
+    if (port != FILEPORT_NULL) mach_port_deallocate(mach_task_self(), port);
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    flush(root, "records.done");
+    return failed ? 105 : 0;
+}
+
+struct spawn_thread {
+    const char *helper;
+    int gate, signal, result;
+    pid_t child;
+};
+static void *thread_spawn(void *opaque) {
+    struct spawn_thread *t = opaque;
+    char token;
+    if (read(t->gate, &token, 1) != 1) { t->result = 1; return NULL; }
+    posix_spawnattr_t attr;
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, t->signal);
+    char signal_arg[16];
+    snprintf(signal_arg, sizeof signal_arg, "%d", t->signal);
+    char *args[] = {(char *)t->helper, "fix-243-thread-mask", signal_arg, NULL};
+    if (posix_spawnattr_init(&attr) ||
+        posix_spawnattr_setsigmask(&attr, &mask) ||
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK)) {
+        t->result = 2; return NULL;
+    }
+    t->result = posix_spawn(&t->child, t->helper, NULL, &attr, args, environ);
+    posix_spawnattr_destroy(&attr);
+    return NULL;
+}
+static int threaded(const char *root, const char *helper) {
+    unsetenv("UMBRA_SLATE_SIGNAL_DIR");
+    int gate[2];
+    if (pipe(gate)) return 110;
+    struct spawn_thread t[2] = {
+        {helper, gate[0], SIGUSR1, -1, -1}, {helper, gate[0], SIGUSR2, -1, -1}
+    };
+    pthread_t threads[2];
+    note("phase=pre-spawn mode=fix-243-threads\n");
+    flush(root, "records.pre");
+    for (int i = 0; i < 2; i++)
+        if (pthread_create(&threads[i], NULL, thread_spawn, &t[i])) return 111;
+    if (transfer(gate[1], "GG", 2) != 2) return 112;
+    for (int i = 0; i < 2; i++)
+        if (pthread_join(threads[i], NULL)) return 113;
+    /* #135: wait only after the secondary threads have exited. */
+    for (int i = 0; i < 2; i++) {
+        int status = 0;
+        if (!t[i].result && reap(t[i].child, &status)) t[i].result = 3;
+    }
+    close(gate[0]); close(gate[1]);
+    for (int i = 0; i < 2; i++)
+        note("thread=%d signal=%d result=%d child=%d\n", i, t[i].signal, t[i].result, t[i].child);
+    flush(root, "records.done");
+    return t[0].result || t[1].result || t[0].child == t[1].child ? 114 : 0;
+}
+
+struct null_thread_spawn { const char *helper, *root; int result; pid_t child; };
+static void *null_thread(void *opaque) {
+    struct null_thread_spawn *t = opaque;
+    char *args[] = {(char *)t->helper, "write-child", (char *)t->root, NULL};
+    /* No earlier traced call on this pthread. */
+    t->result = posix_spawn(&t->child, t->helper, NULL, NULL, args, environ);
+    return NULL;
+}
+static int second_thread_null(const char *root, const char *helper) {
+    pthread_t thread;
+    struct null_thread_spawn t = {helper, root, -1, -1};
+    note("phase=pre-spawn mode=fix-243-thread-null\n");
+    flush(root, "records.pre");
+    if (pthread_create(&thread, NULL, null_thread, &t) || pthread_join(thread, NULL))
+        return 116;
+    int status = 0;
+    if (!t.result && reap(t.child, &status)) t.result = 115;
+    note("null-thread result=%d\n", t.result);
+    flush(root, "records.done");
+    return t.result ? 117 : 0;
+}
+
+static int region_cycles(const char *root, const char *helper) {
+    unsetenv("UMBRA_SLATE_SIGNAL_DIR");
+    note("phase=pre-spawn mode=fix-243-region-cycles\n");
+    flush(root, "records.pre");
+    for (int i = 0; i < 8; i++) {
+        posix_spawnattr_t attr;
+        posix_spawn_file_actions_t bad;
+        sigset_t mask;
+        sigemptyset(&mask);
+        int signal = i % 2 ? SIGUSR2 : SIGUSR1;
+        sigaddset(&mask, signal);
+        if (posix_spawnattr_init(&attr) || posix_spawnattr_setsigmask(&attr, &mask) ||
+            posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK) ||
+            posix_spawn_file_actions_init(&bad)) return 120;
+        close(200);
+        if (posix_spawn_file_actions_adddup2(&bad, 200, 100)) return 121;
+        char signal_arg[16];
+        snprintf(signal_arg, sizeof signal_arg, "%d", signal);
+        char *args[] = {(char *)helper, "fix-243-thread-mask", signal_arg, NULL};
+        pid_t child = -1;
+        int result = posix_spawn(&child, helper, &bad, &attr, args, environ);
+        if (result != EBADF) return 122;
+        result = posix_spawn(&child, helper, NULL, &attr, args, environ);
+        if (result) return 123;
+        int status = 0;
+        if (reap(child, &status)) return 124;
+        posix_spawn_file_actions_destroy(&bad);
+        posix_spawnattr_destroy(&attr);
+        note("cycle=%d error=EBADF success=0\n", i);
+    }
+    flush(root, "records.done");
+    return 0;
+}
+
+static int overlap_parents(const char *root, const char *helper, int count) {
+    unsetenv("UMBRA_SLATE_SIGNAL_DIR");
+    note("phase=pre-spawn mode=fix-243-overlap\n");
+    flush(root, "records.pre");
+    pid_t parents[17];
+    for (int i = 0; i < count; i++) {
+        parents[i] = fork();
+        if (parents[i] < 0) return 125;
+        if (!parents[i]) {
+            posix_spawnattr_t attr;
+            sigset_t mask;
+            sigemptyset(&mask);
+            int signal = i % 2 ? SIGUSR2 : SIGUSR1;
+            sigaddset(&mask, signal);
+            if (posix_spawnattr_init(&attr) ||
+                posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK) ||
+                posix_spawnattr_setsigmask(&attr, &mask)) _exit(126);
+            char value[16];
+            snprintf(value, sizeof value, "%d", signal);
+            char *args[] = {(char *)helper, "fix-243-thread-mask", value, NULL};
+            pid_t child;
+            if (posix_spawn(&child, helper, NULL, &attr, args, environ)) _exit(127);
+            int status = 0;
+            pid_t got;
+            do got = waitpid(child, &status, 0); while (got < 0 && errno == EINTR);
+            posix_spawnattr_destroy(&attr);
+            _exit(got == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 128);
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        int status = 0;
+        if (reap(parents[i], &status)) return 129;
+    }
+    note("overlap parents=%d completed=%d\n", count, count);
+    flush(root, "records.done");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
+    if (!strcmp(mode, "fix-243-overlap")) return overlap_parents(root, helper, 2);
+    if (!strcmp(mode, "fix-243-cap")) return overlap_parents(root, helper, 17);
+    if (!strcmp(mode, "fix-243-region-cycles")) return region_cycles(root, helper);
+    if (!strcmp(mode, "fix-243-thread-null")) return second_thread_null(root, helper);
+    if (!strcmp(mode, "fix-243-threads")) return threaded(root, helper);
+    if (!strncmp(mode, "fix-243-refuse-", 15)) return refused_plan(mode, root, helper);
+    if (!strcmp(mode, "fix-243-pipe") || !strcmp(mode, "fix-243-cloexec") ||
+        !strcmp(mode, "fix-243-error-recovery") ||
+        !strcmp(mode, "fix-243-inherit-cloexec") ||
+        !strcmp(mode, "fix-243-close-before-dup") ||
+        !strcmp(mode, "fix-243-dup-before-close"))
+        return kernel_pipe(mode, root, helper);
     if (!strcmp(mode, "c11-01") || !strcmp(mode, "c11-02-actions") ||
-        !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both"))
+        !strcmp(mode, "c11-02-attributes") || !strcmp(mode, "c11-02-both") ||
+        !strcmp(mode, "fix-243-sigdefault") || !strcmp(mode, "fix-243-sigmask") ||
+        !strcmp(mode, "fix-243-sigdefault-mutant"))
         return shape(mode, root, helper);
+    if (!strcmp(mode, "fix-243-no-spawn")) return 0;
     if (!strcmp(mode, "c11-05")) return cloexec(root, helper);
     if (!strcmp(mode, "c11-05-premise")) return premise(root);
     if (!strcmp(mode, "c11-09")) return offset(root, helper);

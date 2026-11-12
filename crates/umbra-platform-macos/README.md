@@ -7,6 +7,9 @@ covers non-macOS targets and macOS on x86_64. Fallible tracing/control calls
 report `UnsupportedCapability`, and capabilities are empty. The pure arm64 ABI
 module remains available on those hosts.
 
+This document covers the crate's ABI decoder, native tracer, spawn protocol,
+interposer, provider executable and integration tests.
+
 The crate implements the v2 experimental tracer described in
 `experiments/tracer/umbra_tracer.py` and `experiments/tracer/REPORT-v2.md`
 using a hybrid debugger interface: **Apple's `debugserver` over GDB Remote
@@ -18,6 +21,51 @@ Direct Mach for memory keeps the decode callback out of the RSP round-trip.
 The RSP client (`src/rsp.rs`) is a
 small, bounded reverse-connect implementation with framed `$…#CC` packets,
 RLE decode, and a per-request deadline.
+
+## Packed spawn descriptors (experimental)
+
+The bounded packed-descriptor path admits kernel-only CLOSE, DUP2 and INHERIT
+file actions, plus initialized default attributes, SETSIGDEF, SETSIGMASK and
+CLOEXEC_DEFAULT. The supervisor authorizes each immutable plan against the
+parent's logical descriptor table. Actions touching virtual descriptors, path
+actions, RESETIDS, SETSID, SETPGROUP and other unadmitted extensions fail closed.
+The full Codex E8 launch remains blocked, including its SETSID request.
+
+After structural and attribute validation, unsupported opcodes retain their
+positions in the captured plan. The supervisor selects the first unsupported
+opcode or virtual operand in caller order; the platform independently rejects
+unsupported actions before allocation or kernel execution.
+
+Admission is restricted to the exact ABI profile checked in `src/spawn.rs`
+and `src/spawn_host.rs`; it is not a portability claim. Broader admission is
+tracked in [#247](https://github.com/invakid404/umbra/issues/247). After a macOS
+update, retain the named profile refusal, inspect the packed descriptor layout
+and libsystem kernel identity, and re-run native controls, decoder/profile
+checks, positive leaves, exact refusals and lifecycle qualification before
+changing the allowlist. Do not widen it from a version string alone.
+
+Parent and child remain stopped through supervisor Ready, caller PID delivery,
+release of the dedicated remote region and final register commit. New fallible
+completion work follows child Session insertion. The inherited interval between
+spawn success and Task acquisition remains unowned in non-isolated runs; see
+[#248](https://github.com/invakid404/umbra/issues/248). Provider loss also removes
+the in-process watchdog. Terminal/library runs have no outer guardian sweep;
+the local no-spawn, null-spawn and packed-spawn comparison left root/debugger
+survivors requiring test recovery. A live-process census does not prove reap.
+Guardian-isolated entry retains its existing session sweep and zombie caveat.
+Later child-initiated group/session changes remain outside this guarantee.
+
+Spawning from a secondary thread is supported; waiting for that child from a
+secondary thread remains refused by the inherited `WaitPlan::Park` guard
+([#135](https://github.com/invakid404/umbra/issues/135)). The thread-association
+fixtures therefore reap on the main thread after joining the spawning threads.
+
+Lifecycle probes are compiled only with `mutation-probe-spawn-lifecycle`.
+Fault tests cover the selected ownership, completion and cleanup boundaries;
+semantic readings alone do not certify them. Normal provider builds exclude
+the probes.
+
+Probe controls are listed under [Provider binary](#provider-binary).
 
 <!-- memoria:section id="public-api" files="src/lib.rs" -->
 ## Public API
@@ -487,6 +535,34 @@ decodes JSON `Options` from opaque provider options (empty falls back to
 `Options::default()`). Register it via `umbra providers --registry <path>
 --role platform`.
 
+**Environment.** `UMBRA_DEBUGSERVER` overrides discovery when the JSON
+`debugserver` option is absent; if both are unset, `xcode-select -p` supplies the
+Xcode path. With no `twin_cache` option, `HOME` selects
+`$HOME/Library/Caches/umbra/twins`; an unset `HOME` refuses that default.
+`UMBRA_SPAWN_LOG` is off when unset; any value enables spawn-capture and
+spawn-policy diagnostics on stderr. `UMBRA_RSP_LOG` and `UMBRA_TEARDOWN_LOG` are off when unset. Any set value enables,
+respectively, protocol traffic or per-session teardown reports on stderr.
+
+The `mutation-probe-spawn-lifecycle` feature exposes these test controls; normal
+builds do not read them. Unset controls do not inject faults or add logging; the
+phase selector defaults as listed when a probe socket is supplied:
+
+| Variable | Effect |
+|---|---|
+| `UMBRA_FIX_243_PROBE_SOCKET` | Unix socket for a phase record and one-byte acknowledgment; replies time out after 15 seconds. |
+| `UMBRA_FIX_243_PROBE_PHASE` | Selects the rendezvous, defaulting to `task-acquired`. Completion phases include `inserted`, `policy-ready`, `caller-copyout`, `remote-free`, and `register-commit`; `unregistered` observes the earlier PID-read boundary. |
+| `UMBRA_FIX_243_PROBE_AFTER_FAILURE` | Also reports the selected phase's `-failed` observation before teardown. |
+| `UMBRA_FIX_243_PROBE_ROOT` | Enables the acquired-task rendezvous for the attached root comparison. |
+| `UMBRA_FIX_243_PROBE_TRIGGER` | Selects `deadline`, `session-drop`, `backend-drop`, `terminate`, or `watchdog` at the supported test boundary. |
+| `UMBRA_FIX_243_REGION_TRACE` | Reports allocation/release and queries whether the released mapping is absent. |
+| `UMBRA_FIX_243_REGION_FAULT` | `allocate` uses a null task port; `write` attempts the backing write at address zero while retaining allocation ownership. |
+| `UMBRA_FIX_243_OVERLAP_PARENTS` | Holds 2–17 distinct parents before kernel execution and verifies their backing before release; the production cap refuses the seventeenth token. |
+| `UMBRA_FIX_243_OWNER_TRACE` | Reports retained Session identities at teardown entry. |
+
+The socket acknowledgment continues (`C`), injects the selected failure (`E`),
+or exits the provider without Drop (`P`). These controls belong to the fixture
+harness and change scheduling or failure behavior only in feature builds.
+
 **Launch and enforcement.** `TraceBackend::launch` and `launch_experimental`
 share `native.rs::MacosTraceBackend::launch_traced`: both launch suspended,
 sanitize inherited descriptors, and install the same syscall interception loop
@@ -765,8 +841,8 @@ silently. For **this** case what ended it was the path decode refusing the
 overwritten operand: `Io during path: null or overflowing pointer` (`EFAULT`),
 measured in 5 of 5 enforced release runs, each exiting non-zero. The overwrite is
 not reachable now, in either profile.
-Per-thread slots do close this case, and so, independently, does the per-thread
-resume; both were measured by reverting one and keeping the other, above.
+The measurements above establish the per-thread resume's effect. They do not
+establish an independent failure from collapsing the pending slots.
 
 (The supervisor also holds an independent per-`ThreadId` guard in
 `umbra-supervisor/src/events.rs` that returns a real `Err(InvalidState)` in release
@@ -791,7 +867,7 @@ The two cases failed differently for one reason: `mt-write`'s threads share **on
 stub at one address**, so the `z0` window un-armed it for the sibling; `mt-spawn`'s
 threads use **different** stubs, so the collision landed on the shared slot
 instead. Both capture now, and measured, it is the per-thread resume that closes
-both — the slots close only the second.
+both; the slot-collapse mutation did not independently fail either case.
 
 **What that costs depends on the harness, and the difference is measured.** In
 this crate's direct-tracer harness the escaped write lands **on the host**,
@@ -880,10 +956,11 @@ rather than discarded across an exec — see the closed M2 gap below. A
 duplicate `Z0` at one address makes the matching `z0` decrement without
 restoring the instruction, and debugserver answers `OK` either way.
 
-`posix_spawn` needs no per-release layout knowledge. `struct
+The null-descriptor `posix_spawn` path needs no per-release layout knowledge.
+The packed-descriptor path above instead validates an exact ABI profile. `struct
 _posix_spawnattr` is private and moves between releases — `sizeof` 248 with
-`psa_ports` at 192 on macOS 26, 256 and 200 on 27.0 — so this crate never
-reconstructs it. `spawn_attributes` has the host's own libc build the block
+`psa_ports` at 192 on macOS 26, 256 and 200 on 27.0.
+For the null path, `spawn_attributes` has the host's own libc build the block
 (`posix_spawnattr_init` plus `posix_spawnattr_setflags`), takes its length
 from `malloc_size` rather than a constant, and copies the bytes without
 interpreting them.

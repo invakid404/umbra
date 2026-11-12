@@ -588,6 +588,77 @@ jobs:
           cargo test -p umbra-storage-nfs-userspace --features transport-raw \
             --test userspace_run -- --nocapture --test-threads=1
 
+      - name: Packed spawn -- registered attach failure
+        env:
+          UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/spawn-attach-${{ github.run_attempt }}
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build -p umbra-platform-macos --features mutation-probe-spawn-lifecycle
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
+            --test userspace_run fix_243_registered_attach_failure -- --exact --nocapture --test-threads=1
+
+      - name: Packed spawn -- post-insertion completion failures
+        env:
+          UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/spawn-completion-${{ github.run_attempt }}
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
+            --test userspace_run fix_243_completion_ -- --nocapture --test-threads=1
+
+      - name: Packed spawn -- inserted child teardown triggers
+        env:
+          UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/spawn-inserted-${{ github.run_attempt }}
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
+            --test userspace_run fix_243_inserted_ -- --nocapture --test-threads=1
+
+      - name: Packed spawn -- acquired child teardown triggers
+        env:
+          UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/spawn-acquired-${{ github.run_attempt }}
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
+            --test userspace_run fix_243_acquired_ -- --nocapture --test-threads=1
+
+      - name: Packed spawn -- policy before Ready failure
+        env:
+          UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/spawn-policy-${{ github.run_attempt }}
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build -p umbra-cli --features mutation-probe-spawn-lifecycle
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
+            --test userspace_run fix_243_policy_before_ready_failure -- --exact --nocapture --test-threads=1
+
+      - name: Packed spawn -- policy window teardown triggers
+        env:
+          UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/spawn-policy-triggers-${{ github.run_attempt }}
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
+            --test userspace_run -- fix_243_policy_deadline fix_243_policy_backend_drop \
+            fix_243_policy_session_drop fix_243_policy_terminate fix_243_policy_watchdog \
+            --exact --nocapture --test-threads=1
+
+      - name: Packed spawn -- guardian and region qualification
+        env:
+          UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/spawn-guardian-regions-${{ github.run_attempt }}
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle --example umbra243relay
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
+            --test userspace_run -- fix_243_guardian_provider_loss fix_243_guardian_unregistered \
+            fix_243_guardian_copyout_failure_loss fix_243_guardian_free_failure_loss \
+            fix_243_distinct_parent_backing_overlap fix_243_provider_region_cap \
+            fix_243_region_success_error_cycles fix_243_region_allocation_failure \
+            fix_243_region_write_failure --exact --nocapture --test-threads=1
+
+      - name: Restore binaries after packed spawn faults
+        if: always()
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build -p umbra-platform-macos -p umbra-cli
+
       - name: Proof 2 -- mutation probe A, read routing broken
         env:
           UMBRA_MUTATION_PROBE: read

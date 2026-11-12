@@ -759,6 +759,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "umbra-core",
+ "umbra-isolation",
  "umbra-journal",
  "umbra-journal-file",
  "umbra-platform",
