@@ -16,7 +16,7 @@ impl TraceBackend for MacosTraceBackend {
         Err(unsupported("native macOS arm64 required"))
     }
     fn poll_event(&mut self, _: std::time::Duration) -> Result<umbra_platform::EventPoll> {
-        Err(umbra_core::UmbraError::not_implemented("macos: poll_event"))
+        Err(unsupported("native macOS arm64 required"))
     }
     fn next_event(&mut self) -> Result<TraceEvent> {
         Err(unsupported("native macOS arm64 required"))

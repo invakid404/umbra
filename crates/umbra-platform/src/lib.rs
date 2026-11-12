@@ -56,11 +56,13 @@ pub trait TraceBackend {
     /// Report normalized syscall entry/exit and child/fork/exec/exit notifications.
     ///
     /// Platform-specific return registers must become normalized syscall outcomes.
-    /// Use bounded polling or provider timeouts so lease renewal and control work
-    /// cannot be starved by an indefinitely blocked event read.
+    /// This legacy wait may block until an event arrives. Supervisors use
+    /// `poll_event` to service maintenance during quiet intervals.
     fn next_event(&mut self) -> Result<TraceEvent>;
 
-    /// Wait at most the requested interval for an event, preserving queued state.
+    /// Bound event waiting by the requested interval, preserving queued state.
+    /// Scheduling and backend timer granularity can exceed the requested interval;
+    /// the provider request deadline remains the fail-closed outer bound.
     fn poll_event(&mut self, max_wait: std::time::Duration) -> Result<EventPoll>;
 
     /// Read exactly `out.len()` bytes from a stopped task, or return an error.

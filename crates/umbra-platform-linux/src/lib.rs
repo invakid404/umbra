@@ -27,7 +27,7 @@ impl TraceBackend for LinuxTraceBackend {
         Err(UmbraError::not_implemented("linux: next_event"))
     }
     fn poll_event(&mut self, _: std::time::Duration) -> Result<umbra_platform::EventPoll> {
-        Err(umbra_core::UmbraError::not_implemented("poll_event"))
+        Err(umbra_core::UmbraError::not_implemented("linux: poll_event"))
     }
 
     fn read_memory(&mut self, _task: TaskId, _address: u64, _out: &mut [u8]) -> Result<()> {
