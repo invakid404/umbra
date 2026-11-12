@@ -16343,3 +16343,38 @@ fn fix_243_guardian_free_failure_loss() {
         b'P',
     );
 }
+
+// #262: a healthy quiet tracee must outlive the registry request deadline.
+#[test]
+fn fix_262_routed_sleep() {
+    let Some((host, port)) = fixture() else { return };
+    let Some(root) = slate_evidence() else { return };
+    let evidence = root.join("fix-262-routed-sleep");
+    std::fs::create_dir(&evidence).unwrap();
+    let (native, timeout) = slate_launch(
+        Command::new("/bin/sleep").arg("8"),
+        &evidence.join("native"), std::time::Duration::from_secs(15), None,
+    );
+    assert!(!timeout && native.status.success(), "native sleep: {}", native.status);
+    let scratch = tempfile::tempdir().unwrap();
+    let workspace = scratch.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let path = registry(scratch.path(), &host, port);
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["timeout_ms"] = serde_json::json!(5000);
+    config["providers"]["platform"]["options"] = serde_json::json!(serde_json::to_vec(&serde_json::json!({"timeout_ms":60000})).unwrap());
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert_no_nfs_mount(&host, port, &[&workspace], "fix-262 before");
+    let (out, timeout) = slate_launch(
+        Command::new(binaries().join("umbra")).args(["run", "--registry"]).arg(&path)
+            .arg("--workspace").arg(&workspace).arg("--state-dir").arg(scratch.path().join("state"))
+            .args(["--experimental", "--", "/bin/sleep", "8"]),
+        &evidence.join("routed"), std::time::Duration::from_secs(20), None,
+    );
+    slate_finish_cleanup();
+    assert!(!timeout, "routed sleep exceeded harness bound");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("Some(Code(0))"), "{stderr}");
+}
