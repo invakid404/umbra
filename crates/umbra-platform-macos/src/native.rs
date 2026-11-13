@@ -178,15 +178,15 @@ impl<T: KillOwned> WatchedTasks<T> {
         }
     }
 }
-// Test adapter for the existing exec registration behavior; replacement only adds.
-#[cfg(test)]
 impl<T> WatchedTasks<Arc<T>>
 where
     Arc<T>: KillOwned,
 {
-    fn replace(&mut self, _old: &Arc<T>, new: Arc<T>) -> Option<Arc<T>> {
+    fn replace(&mut self, old: &Arc<T>, new: Arc<T>) -> Option<Arc<T>> {
+        let retired = self.tasks.iter().position(|task| Arc::ptr_eq(task, old));
+        // Register (and, if latched, kill) the replacement before retiring anything.
         self.add(new);
-        None
+        retired.map(|index| self.tasks.swap_remove(index))
     }
 }
 struct Watchdog {
@@ -246,6 +246,14 @@ impl Watchdog {
         {
             task.kill();
         }
+    }
+    fn replace(&self, old: &Arc<Task>, new: Arc<Task>) {
+        let retired = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks.replace(old, new)
+        };
+        // Mach send-right release must not hold the registry lock.
+        drop(retired);
     }
     fn reason(&self) -> Option<&'static str> {
         self.tasks.lock().unwrap_or_else(|e| e.into_inner()).reason
@@ -3010,7 +3018,10 @@ impl MacosTraceBackend {
             s.exec_generation += 1;
             s.policy_exec_generation = s.exec_generation;
             let task = Arc::new(Task::acquire(s.id.0.native_id as i32)?);
-            self.watchdog.as_ref().unwrap().add(task.clone());
+            self.watchdog
+                .as_ref()
+                .unwrap()
+                .replace(&s.task, task.clone());
             s.task = task;
             // Debugserver keeps its breakpoint registrations across exec on this
             // connection, and its Z0 handler is reference counted. Dropping our
