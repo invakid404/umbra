@@ -49,40 +49,46 @@ fn owner_process() {
     let welcome = conn.receive::<Result<Welcome>>().unwrap().unwrap();
     let mut client = Client::from_connection(conn, welcome);
     let path = |p: &str| BytePath::new(p.as_bytes().to_vec()).unwrap();
-    let Response::Process(root) = call(
-        &mut client,
-        Request::Launch(LaunchSpec {
-            executable: path("/bin/sleep"),
-            argv: vec![b"sleep".to_vec(), b"20".to_vec()],
-            environment: vec![],
-            cwd: path("/tmp"),
-            policy: LaunchPolicy {
-                persistence: PersistencePolicy::LocalDevelopment,
-                inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
-                interpose: false,
-                descriptor_limit: None,
-            },
-            sandbox: SandboxRequirement::Required(
-                SandboxProfile::new(
-                    SEATBELT_PROFILE_FORMAT,
-                    include_str!("../../../experiments/seatbelt/umbra.sb")
-                        .replace("{{UMBRA_RUN_ROOT}}", &format!("\"{}\"", dir.display()))
-                        .into_bytes(),
-                    path(dir.to_str().unwrap()),
-                )
-                .unwrap(),
-            ),
-        }),
-    ) else {
-        panic!("launch")
+    let before_launch = std::env::var_os("UMBRA_FIX264_BEFORE_LAUNCH").is_some();
+    let tracee = if before_launch {
+        0
+    } else {
+        let Response::Process(root) = call(
+            &mut client,
+            Request::Launch(LaunchSpec {
+                executable: path("/bin/sleep"),
+                argv: vec![b"sleep".to_vec(), b"20".to_vec()],
+                environment: vec![],
+                cwd: path("/tmp"),
+                policy: LaunchPolicy {
+                    persistence: PersistencePolicy::LocalDevelopment,
+                    inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                    interpose: false,
+                    descriptor_limit: None,
+                },
+                sandbox: SandboxRequirement::Required(
+                    SandboxProfile::new(
+                        SEATBELT_PROFILE_FORMAT,
+                        include_str!("../../../experiments/seatbelt/umbra.sb")
+                            .replace("{{UMBRA_RUN_ROOT}}", &format!("\"{}\"", dir.display()))
+                            .into_bytes(),
+                        path(dir.to_str().unwrap()),
+                    )
+                    .unwrap(),
+                ),
+            }),
+        ) else {
+            panic!("launch")
+        };
+        assert!(matches!(
+            call(&mut client, Request::NextEvent),
+            Response::Event(TraceEvent::ThreadStarted { .. })
+        ));
+        // Keep the launch stop unresumed. The second NextEvent cannot complete
+        // normally, so a serve-loop EOF check cannot mask a missing monitor.
+        client.start(&Request::NextEvent).unwrap();
+        root.0 .0.native_id
     };
-    assert!(matches!(
-        call(&mut client, Request::NextEvent),
-        Response::Event(TraceEvent::ThreadStarted { .. })
-    ));
-    // Keep the launch stop unresumed. The second NextEvent cannot complete
-    // normally, so a serve-loop EOF check cannot mask a missing monitor.
-    client.start(&Request::NextEvent).unwrap();
     let helper = if std::env::var_os("UMBRA_FIX264_DUP").is_some() {
         Some(
             Command::new("/bin/sleep")
@@ -101,7 +107,7 @@ fn owner_process() {
         format!(
             "{} {} {}",
             provider.id(),
-            root.0 .0.native_id,
+            tracee,
             helper.as_ref().map_or(0, |c| c.id())
         ),
     )
@@ -172,7 +178,7 @@ impl Drop for Recovery {
         }
     }
 }
-fn loss(duplicate: bool) {
+fn loss(duplicate: bool, before_launch: bool) {
     if !qualified() {
         eprintln!("SKIP: owner loss requires UMBRA_INTEGRATION_REQUIRED");
         return;
@@ -189,7 +195,13 @@ fn loss(duplicate: bool) {
     let root = std::env::var_os("UMBRA_FIX264_EVIDENCE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| scratch.path().to_owned());
-    let dir = root.join(if duplicate { "retained-peer" } else { "eof" });
+    let dir = root.join(if before_launch {
+        "before-launch"
+    } else if duplicate {
+        "retained-peer"
+    } else {
+        "eof"
+    });
     fs::create_dir(&dir).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -198,6 +210,9 @@ fn loss(duplicate: bool) {
         .stdin(Stdio::piped());
     if duplicate {
         command.env("UMBRA_FIX264_DUP", "1");
+    }
+    if before_launch {
+        command.env("UMBRA_FIX264_BEFORE_LAUNCH", "1");
     }
     let mut owner = command.spawn().unwrap();
     let ready = dir.as_path().join("ready");
@@ -234,7 +249,14 @@ fn loss(duplicate: bool) {
         }
     }
     assert!(
-        owned.0.len() >= if duplicate { 4 } else { 3 },
+        owned.0.len()
+            >= if before_launch {
+                2
+            } else if duplicate {
+                4
+            } else {
+                3
+            },
         "owned debugger identified"
     );
     eprintln!("owned before trigger: {:?}", owned.0);
@@ -249,7 +271,7 @@ fn loss(duplicate: bool) {
     let mut confirmed = false;
     while Instant::now() < until {
         let log = fs::read_to_string(dir.as_path().join("provider.log")).unwrap();
-        if log.contains("tracee exit confirmed")
+        if (before_launch || log.contains("tracee exit confirmed"))
             && owned
                 .0
                 .iter()
@@ -295,9 +317,14 @@ fn loss(duplicate: bool) {
 }
 #[test]
 fn supervisor_exit_with_retained_socket() {
-    loss(true);
+    loss(true, false);
 }
 #[test]
 fn transport_eof_while_supervisor_lives() {
-    loss(false);
+    loss(false, false);
+}
+
+#[test]
+fn supervisor_exit_before_launch_with_retained_socket() {
+    loss(true, true);
 }
