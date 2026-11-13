@@ -4246,11 +4246,11 @@ const RUSTIO_LEAF: &[u8] = b"leaf under a routed directory\n";
 /// Leg vi's payload size, matching `BIG` in the fixture, which carries the full
 /// reasoning. In short: it is the **smallest** size that crosses the backend's
 /// 1 048 572-byte per-call bound more than once -- 8 bytes past two bounds -- and
-/// it is no larger because leg vi moves it three times inside a per-run session
-/// watchdog that is this harness's own `timeout_ms` (`registry`, above) and that
-/// the writer lease will not let anyone raise. That margin is spent by CPU
-/// contention rather than by bytes: measured, 2 621 440 expires the watchdog with
-/// four competing CPU workers on a ten-core host while this size does not.
+/// leg vi moves it three times. Its historical sizing used the former default
+/// session watchdog: 2 621 440 expired that watchdog with four competing CPU
+/// workers on a ten-core host while this size did not. The registry's
+/// `timeout_ms` bounds each IPC request, not the session. The platform lifetime
+/// is now opt-in; this payload remains the same chunk-boundary oracle.
 const RUSTIO_BIG: u64 = 2_097_152;
 
 /// `LibnfsRawTransport`'s per-call bound, and therefore where leg vi's chunk
@@ -4338,12 +4338,9 @@ fn a_rust_library_write_reopen_and_compare_crosses_the_std_fs_wrappers() {
     let Some((host, port)) = fixture() else {
         return;
     };
-    // **Two routed runs, not one, and the separation is the point.** The registry
-    // `timeout_ms` is a whole-session watchdog armed before the twin is resigned,
-    // so legs sharing a run share one budget. Leg vi is the expensive leg; giving
-    // it case `big` and a run of its own means the margin measured for it
-    // describes the session that actually executes. It does not make it
-    // saturation-proof -- see `RUSTIO_BIG`.
+    // Keep leg vi's `big` case in its own run, preserving the measured fixture
+    // arrangement. The historical default-watchdog sizing is recorded at
+    // RUSTIO_BIG; registry timeout_ms is a per-request budget.
     //
     // **Separate scratch directories, deliberately.** `launch` derives
     // `workspace`, `state` and `registry.json` from `scratch`, and
