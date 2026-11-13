@@ -1017,6 +1017,7 @@ distinguishably from the other six:
 ```sh
 # end to end: the toy, the Rust I/O fixture and the utility matrix must pass
 cargo build --workspace --bins
+cargo build -p umbra-cli --features probe-idle-renewal
 cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run
 
 # probe A -- read routing corrupted; the toy's compare must reject (exit 8),
@@ -1078,8 +1079,9 @@ UMBRA_MUTATION_PROBE=dircache cargo test -p umbra-storage-nfs-userspace \
 
 `cargo build -p umbra-cli --features ...` overwrites `target/<profile>/umbra` and
 `cargo build -p umbra-platform-macos --features ...` overwrites the provider
-executable beside it, so rebuild **both** without features before running the
-baseline again.
+executable beside it, so rebuild **both** without mutation features before
+running the baseline again, then build the CLI with `probe-idle-renewal` for
+the quiet-run renewal assertion.
 
 ## Golden fixtures
 
