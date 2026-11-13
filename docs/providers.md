@@ -129,5 +129,5 @@ Platform clients require `bounded-event-poll-v1` before Launch. `PollEvent`
 requests bound the wait to at most 100ms and a quarter of the registry deadline;
 Idle lets the supervisor renew the writer before re-issuing. Common protocol
 version 3 and legacy NextEvent/Event messages remain unchanged. The macOS
-session watchdog is an independent absolute limit, and its 1ms debugger-read
+session watchdog is an independent opt-in absolute limit, and its 1ms debugger-read
 floor means tiny registry timeouts can still fail closed.

@@ -119,7 +119,9 @@ documentation check that runs in CI.
 
 Quiet programs use bounded platform polls so the supervisor can renew writer
 authority between idle replies. This retains the provider request deadline and
-independent platform session watchdog; it adds no cancellation API.
+independent opt-in platform session watchdog; it adds no cancellation API.
+The macOS provider has no default lifetime or inactivity limit and monitors
+supervisor exit and transport EOF for cleanup.
 
 Provider executables can be checked through the [runtime registry](docs/providers.md).
 

@@ -1105,7 +1105,7 @@ shared across sessions, with a rotating cursor. Watchdog errors and queued event
 precede an idle outcome; no-live-process state remains an error. Debugger reads
 retain their 1 ms minimum timeout, so very small registry deadlines can still fail
 closed. Polling never silently increases the transport deadline or resets the
-absolute session watchdog.
+opt-in absolute session watchdog.
 
 `tests/idle_poll.rs` runs on macOS arm64 with `UMBRA_INTEGRATION_REQUIRED` set;
 otherwise it prints `SKIP`. It
