@@ -2051,10 +2051,11 @@ mod tests {
         s
     }
 
-    struct QuietControl(std::rc::Rc<std::cell::Cell<usize>>, bool);
+    struct QuietControl(std::sync::Arc<std::sync::atomic::AtomicUsize>, bool);
     struct RenewalCounter {
         count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         fail: bool,
+        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
     impl TraceBackend for QuietControl {
         fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
@@ -2064,7 +2065,7 @@ mod tests {
             unreachable!()
         }
         fn poll_event(&mut self, wait: std::time::Duration) -> Result<umbra_platform::EventPoll> {
-            self.0.set(self.0.get() + 1);
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.1 {
                 return Err(UmbraError::new(
                     ErrorKind::StorageUnavailable,
@@ -2072,7 +2073,9 @@ mod tests {
                     "request deadline exceeded",
                 ));
             }
-            std::thread::sleep(wait);
+            // Always outlast the test lease interval, even if the pre-poll
+            // check renewed it. Descheduling can only make it more overdue.
+            std::thread::sleep(wait.max(Duration::from_millis(10)));
             Ok(umbra_platform::EventPoll::Idle)
         }
         fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {
@@ -2127,14 +2130,20 @@ mod tests {
             unreachable!()
         }
         fn renew_writer(&mut self) -> Result<WriterLease> {
-            if self.fail {
+            // Pre-poll renewal is allowed regardless of scheduling. Only a
+            // completed poll makes renewal an observation for this oracle.
+            let after_poll = self.polls.load(std::sync::atomic::Ordering::SeqCst)
+                > self.count.load(std::sync::atomic::Ordering::SeqCst);
+            if after_poll && self.fail {
                 return Err(UmbraError::new(
                     ErrorKind::LeaseLost,
                     "test",
                     "renewal failed",
                 ));
             }
-            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if after_poll {
+                self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             Ok(WriterLease {
                 run_id: RunId(Uuid::nil()),
                 writer_id: umbra_core::WriterId("test".into()),
@@ -2147,13 +2156,13 @@ mod tests {
 
     #[test]
     fn fix_262_poll_error_poisoning_prevents_further_poll_or_resume() {
-        let polls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut s = supervisor();
         s.platform.control = Box::new(QuietControl(polls.clone(), true));
         assert_eq!(s.step().unwrap_err().kind, ErrorKind::StorageUnavailable);
         assert!(s.poisoned);
         assert!(s.step().is_err());
-        assert_eq!(polls.get(), 1);
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(s.resume_thread(ThreadId(task(1).0)).is_err());
         s.terminate_tree(TerminationPolicy::Immediate).unwrap();
     }
@@ -2161,32 +2170,44 @@ mod tests {
     #[test]
     fn fix_262_idle_renews_and_renewal_failure_poisoning_is_terminal() {
         for fail in [false, true] {
-            let polls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let renewals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut s = supervisor();
             s.platform.control = Box::new(QuietControl(polls.clone(), false));
             s.namespace = Box::new(RenewalCounter {
                 count: renewals.clone(),
                 fail,
+                polls: polls.clone(),
             });
             let mut budget = routed_budget(100);
             budget.renew_after = Duration::from_millis(10);
             s.budget = Some(budget);
-            s.renew_at = Some(Instant::now() + Duration::from_millis(10));
-            let first = s.step();
-            assert_eq!(polls.get(), 1);
+            s.renew_at = Some(Instant::now());
+            // A descheduled step may service an expired lease without polling.
+            // Such steps are not Idle replies; wait for the first actual poll.
+            let first = loop {
+                let result = s.step();
+                if polls.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                    break result;
+                }
+                result.unwrap();
+            };
+            assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
             if fail {
                 assert_eq!(first.unwrap_err().kind, ErrorKind::LeaseLost);
                 assert!(s.poisoned);
                 assert!(s.step().is_err());
-                assert_eq!(polls.get(), 1);
+                assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
                 assert_eq!(renewals.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(s.resume_thread(ThreadId(task(1).0)).is_err());
             } else {
                 first.unwrap();
                 assert_eq!(renewals.load(std::sync::atomic::Ordering::SeqCst), 1);
-                s.step().unwrap();
+                while polls.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                    s.step().unwrap();
+                }
                 assert_eq!(renewals.load(std::sync::atomic::Ordering::SeqCst), 2);
-                assert_eq!(polls.get(), 2);
+                assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 2);
                 assert!(!s.poisoned);
             }
         }
