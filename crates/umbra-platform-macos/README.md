@@ -529,10 +529,11 @@ exposed that; the raw-`svc` leg with high bits set in `x2` guards it.
 <!-- memoria:section id="provider-binary" files="src/main.rs" guidance="../../docs/guides/reviewing-provider-binary.md" -->
 ## Provider binary
 
-`src/main.rs` is the shipped provider binary. It calls
-`umbra_platform::provider::serve_provider("macos", …)` returning a
-`PlatformSession { control: MacosTraceBackend, abi: DarwinArm64Abi }`, and
-decodes JSON `Options` from opaque provider options (empty falls back to
+`src/main.rs` is the shipped provider binary. It captures its parent identity,
+accepts the `macos` handshake, installs the owner watch, and calls
+`umbra_platform::provider::serve_session` with a
+`PlatformSession { control: MacosTraceBackend, abi: DarwinArm64Abi }`.
+It decodes JSON `Options` from opaque provider options (empty falls back to
 `Options::default()`). Register it via `umbra providers --registry <path>
 --role platform`.
 
@@ -608,7 +609,7 @@ than that a launch merely failed.
 Invoke the shipped binary through a platform `ProviderDescriptor` and
 `umbra_core::provider::Client::connect`, then send `Request::Capabilities`,
 `Request::Launch(spec)`, and the `NextEvent` / memory / register / `Resume`
-requests. The binary's `serve_provider("macos", …)` handles that handshake
+requests. The binary's `wire::accept` and `serve_session` handle that handshake
 and dispatch. For an in-process socketpair, use `serve_provider_on(connection,
 "macos", …)`, which shares the same handshake and dispatcher.
 `Request::Quiesce(process)` interrupts live sessions and waits for stopped
@@ -673,9 +674,10 @@ These paths can still hand a tracee to launchd uncounted:
 
 In launchd's session they no longer reach any group there: #193 runs the whole
 run in a session of its own, with session 1 regression tests for the first four
-(`umbra-cli`'s `tests/isolation.rs`). The platform itself is unchanged by that,
-and after an uncontrolled supervisor death it still keeps the run alive until
-its own deadline (#203).
+(`umbra-cli`'s `tests/isolation.rs`). The remote platform provider now detects
+supervisor death independently through its owner monitor. Provider death and
+unconfirmed teardown remain separate limits; a monitor inside the provider
+cannot survive that provider's death.
 
 `tests/provider_ipc.rs` exercises the socketpair handshake and real `open-libc`
 capture through these requests, including stopped and running quiescence.
@@ -787,7 +789,7 @@ reverted, so no claim is made about it either way.
 
 **A native syscall resumed through a return gate holds its siblings stopped
 until it returns.** If that call blocks, sibling progress cannot release it;
-provider and session deadlines bound the failure. Emulated routed operations
+per-request and opt-in session deadlines bound the failure. Emulated routed operations
 skip the native syscall. Public `fcntl` passthrough adds no return gate: its
 shim tail-branches to libc and neither fcntl kernel stub is breakpointed.
 `tests/fcntl_passthrough.rs` guards that structural property. The userspace
@@ -1057,9 +1059,10 @@ and the host destination remains absent.
 
 Set `UMBRA_INTEGRATION_REQUIRED=1` to make missing fixture inputs fail the sandbox,
 IPC and direct tracer suites. CI's `native-qualification` job runs these and the
-CLI's fourteen-case matrix on a runner labelled `umbra-integration`; that runner
-requires debugger permission and an existing NFSv4 mount configured through the
-`UMBRA_TEST_NFS_ROOT` repository variable. No test provisions a mount or prompts.
+CLI's local matrix on a runner labelled `umbra-integration`; that runner
+requires debugger permission. CI sets `UMBRA_TEST_SKIP_NFS_MATRIX=1`; the separate
+mounted-NFS matrix requires `UMBRA_TEST_NFS_ROOT` when run locally. No test
+provisions a mount or prompts.
 
 Sandbox handoff compares canonical target paths with `proc_pidpath`. The twin
 cache root is also canonicalized so a symlinked cache recognizes already-resigned
