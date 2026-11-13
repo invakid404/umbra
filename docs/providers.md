@@ -79,7 +79,8 @@ A passthrough call blocked while sibling threads are held, such as a pipe read
 whose only writer is a frozen sibling, waits until it returns, supervising umbra
 goes away (including when the user stops umbra), or an opt-in lifetime expires;
 there is no default bound for this known residual ([#242](https://github.com/invakid404/umbra/issues/242)).
-It implements experimental arm64 tracing and advertises `darwin-arm64-abi-v1`.
+
+The macOS provider implements experimental arm64 tracing and advertises `darwin-arm64-abi-v1`.
 Descriptor capabilities are required open
 capability names, verified against the provider handshake. Stubs advertise no runtime
 support. An empty capability requirement permits connection testing, never authorization
