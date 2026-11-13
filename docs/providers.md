@@ -74,6 +74,11 @@ Explicit values 1..=3,600,000 ms opt in; they are separate from registry RPC bou
 The executable monitors authenticated supervisor exit and socket EOF, with no
 inactivity detector. See the [macOS provider](../crates/umbra-platform-macos/README.md#session-lifetime-and-supervisor-loss)
 for awake-time operation budgets, resume and cleanup limits.
+
+A passthrough call blocked while sibling threads are held, such as a pipe read
+whose only writer is a frozen sibling, waits until it returns, supervising umbra
+goes away (including when the user stops umbra), or an opt-in lifetime expires;
+there is no default bound for this known residual ([#242](https://github.com/invakid404/umbra/issues/242)).
 It implements experimental arm64 tracing and advertises `darwin-arm64-abi-v1`.
 Descriptor capabilities are required open
 capability names, verified against the provider handshake. Stubs advertise no runtime

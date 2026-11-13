@@ -769,15 +769,15 @@ impl Session {
     /// `p` and `P` already carry `;thread:<tid>;` under `QThreadSuffixSupported`,
     /// and debugserver advertises `vCont;c;C;s;S`.
     ///
-    /// **The freeze is a real behaviour change, and its bound is the watchdog.**
+    /// **The freeze can hold a blocking call indefinitely by default (#242).**
     /// The interposer routes `read`/`write`/`close`, so a routed call that blocks
-    /// -- a `read` on a pipe whose writer is a frozen sibling is the reachable
-    /// case -- now blocks with those siblings held, where today's bare `c` would
-    /// have let them run. It does not deadlock silently: `check_deadline` kills
-    /// the tree at the session deadline, so the degradation is a **watchdog kill
-    /// naming a timeout, not a hang**. That is the ratified trade, taken
-    /// deliberately, because the thing on the other side of it is the unmediated
-    /// window above -- and that one is silent.
+    /// -- a `read` on a pipe whose only writer is a frozen sibling, for example --
+    /// waits with those siblings held. An opt-in lifetime watchdog kills the tree
+    /// at its deadline. Without that opt-in (the default), the wait lasts until
+    /// the call returns, supervising umbra goes away, or the user stops umbra;
+    /// supervisor loss triggers owner-loss teardown. Safe sibling progress is
+    /// the known residual tracked in #242. A bare `c` is still unsafe: it would
+    /// release siblings into the unmediated window described above.
     fn continue_thread(&mut self, thread: ThreadId) -> Result<()> {
         self.rsp
             .send(&format!("vCont;c:{:x}", thread.0.native_id))?;
@@ -806,7 +806,9 @@ impl Session {
     /// reasoning -- it does not create it, and an earlier revision of this
     /// comment credited the assertion with establishing it, which was wrong.
     /// Were two windows ever open, this resumes one and leaves the other frozen
-    /// -- a watchdog kill, never a released sibling.
+    /// -- never a released sibling. An opt-in lifetime still bounds the wait;
+    /// by default it lasts until return or supervisor loss (including the user
+    /// stopping umbra), as described above and tracked in #242.
     fn continue_absorbed(&mut self) -> Result<()> {
         match self.pending.values().next().map(|p| p.thread) {
             Some(owner) => self.continue_thread(owner),

@@ -123,6 +123,11 @@ independent opt-in platform session watchdog; it adds no cancellation API.
 The macOS provider has no default lifetime or inactivity limit and monitors
 supervisor exit and transport EOF for cleanup.
 
+A passthrough call blocked while sibling threads are held, such as a pipe read
+whose only writer is a frozen sibling, waits until it returns, supervising umbra
+goes away (including when the user stops umbra), or an opt-in lifetime expires;
+there is no default bound for this known residual ([#242](https://github.com/invakid404/umbra/issues/242)).
+
 Provider executables can be checked through the [runtime registry](docs/providers.md).
 
 ## Crate and experiment index

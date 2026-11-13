@@ -1143,6 +1143,11 @@ Normal disarm does not kill tasks. No heartbeat or inactivity-based "stuck"
 classification exists: a busy supervisor is never treated as stuck. Killing a hung
 supervisor supplies the definitive gone signal.
 
+A passthrough call blocked while sibling threads are held, such as a pipe read
+whose only writer is a frozen sibling, waits until it returns, supervising umbra
+goes away (including when the user stops umbra), or an opt-in lifetime expires;
+there is no default bound for this known residual ([#242](https://github.com/invakid404/umbra/issues/242)).
+
 Signing/publication and attach/setup have 10-second per-operation budgets;
 quiesce has a five-second aggregate budget, clipped by any opt-in lifetime.
 RSP retains connect/request/poll caps. These bound individual operations, not a
