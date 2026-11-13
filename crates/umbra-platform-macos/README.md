@@ -1133,7 +1133,10 @@ and a fresh opt-in budget; fork/exec do not renew the current session's budget.
 The executable binds its actual parent's process generation to the Unix socket
 peer, registers NOTE_EXIT and EOF observation, then revalidates before launch.
 Observation failure refuses launch. No protocol bytes are consumed by the monitor.
-Owner exit still triggers when another process retains the socket. The monitor
+Owner exit still triggers when another process retains the socket, including
+before launch, after launch failure, and after termination. Observation runs
+from owner binding until backend disposal, independently of the per-launch
+deadline watchdog; both share the task registry. The monitor
 kills registered tasks; late registrations are killed immediately. The provider
 thread performs existing ordered teardown and retains unconfirmed diagnostics.
 Normal disarm does not kill tasks. No heartbeat or inactivity-based "stuck"
