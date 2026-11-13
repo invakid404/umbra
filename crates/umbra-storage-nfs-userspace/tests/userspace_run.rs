@@ -16414,3 +16414,55 @@ fn fix_262_routed_sleep() {
 fn fix_262_routed_idle_renewal() {
     fix_262_sleep("17", true);
 }
+
+#[test]
+fn fix_264_default_idle_survives() {
+    let seconds = "35";
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(root) = slate_evidence() else { return };
+    let evidence = root.join("fix-264-default-idle");
+    std::fs::create_dir(&evidence).unwrap();
+    let (native, timeout) = slate_launch(
+        Command::new("/bin/sleep").arg(seconds),
+        &evidence.join("native"),
+        std::time::Duration::from_secs(40),
+        None,
+    );
+    assert!(
+        !timeout && native.status.success(),
+        "native sleep: {}",
+        native.status
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let workspace = scratch.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let path = registry(scratch.path(), &host, port);
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["timeout_ms"] = serde_json::json!(5000);
+    config["providers"]["platform"]["options"] =
+        serde_json::json!(serde_json::to_vec(&serde_json::json!({})).unwrap());
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert_no_nfs_mount(&host, port, &[&workspace], "fix-264 before");
+    let (out, timeout) = slate_launch(
+        Command::new(binaries().join("umbra"))
+            .args(["run", "--registry"])
+            .arg(&path)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(scratch.path().join("state"))
+            .args(["--experimental", "--", "/bin/sleep", seconds]),
+        &evidence.join("routed"),
+        std::time::Duration::from_secs(45),
+        None,
+    );
+    slate_finish_cleanup();
+    assert!(!timeout, "routed sleep exceeded harness bound");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("Some(Code(0))"), "{stderr}");
+}
