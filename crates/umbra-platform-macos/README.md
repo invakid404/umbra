@@ -1106,9 +1106,12 @@ retain their 1 ms minimum timeout, so very small registry deadlines can still fa
 closed. Polling never silently increases the transport deadline or resets the
 absolute session watchdog.
 
-`tests/idle_poll.rs` runs on macOS arm64 without a fixture-variable skip. It
+`tests/idle_poll.rs` runs on macOS arm64 with `UMBRA_INTEGRATION_REQUIRED` set;
+otherwise it prints `SKIP`. It
 compiles the quiet-tree fixture, runs its native control, and requires Idle
-across fork/wait/exec phases and successful exits. A separate test requires an
+across fork/wait/exec phases and successful exits. Quiet four-child polls also
+check the shared wait budget, and a stopped-tree test bounds polling thread CPU
+time. A separate test requires an
 8-second absolute watchdog to expire despite repeated Idle replies. These need
 a C compiler and debugger permission. The socketpair/socket tests additionally
 pin a partial RSP packet surviving Idle, the 1ms read floor, queued-event
