@@ -609,7 +609,7 @@ than that a launch merely failed.
 Invoke the shipped binary through a platform `ProviderDescriptor` and
 `umbra_core::provider::Client::connect`, then send `Request::Capabilities`,
 `Request::Launch(spec)`, and the `NextEvent` / memory / register / `Resume`
-requests. The binary's `wire::accept` and `serve_session` handle that handshake
+requests. The binary's `umbra_core::provider::accept` and `serve_session` handle that handshake
 and dispatch. For an in-process socketpair, use `serve_provider_on(connection,
 "macos", …)`, which shares the same handshake and dispatcher.
 `Request::Quiesce(process)` interrupts live sessions and waits for stopped
