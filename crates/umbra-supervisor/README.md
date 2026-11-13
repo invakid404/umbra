@@ -77,8 +77,8 @@ here would be a fifth mechanism racing four.
 `RunSpec` carries the provider registry, a `RunLaunch` (a `CommandLaunch`, or an
 `AgentLaunchRequest` that is refused as unimplemented), the approved workspace,
 a `RunPersistence` selection, the experimental acknowledgement, and an optional
-`RunObserver`. The observer is how status reaches a caller; this crate writes to
-no stream and reads none.
+`RunObserver`. The observer is how status reaches a caller; normal builds of this crate write to
+no stream and read none. The test-only renewal probe described below writes a successful-renewal marker to stderr.
 
 The staged order is fixed, and each stage's failure decides what may be released:
 
@@ -108,7 +108,7 @@ The staged order is fixed, and each stage's failure decides what may be released
 6. Render enforcement from the run's own root, re-verify the workspace inventory,
    then connect the platform, require exactly one advertised architecture and one
    matching ABI capability `<platform>-<arch>-abi-v<decimal version>`,
-   and launch stopped.
+   require `bounded-event-poll-v1`, and launch stopped.
 7. Drive events, then tear down in order: flush run data, append and flush a
    completion record, close the journal, release the writer, close storage.
 
@@ -266,7 +266,7 @@ is not routed at all (`dup`, `dup2` and the `fcntl` duplication commands reach t
 **The ordering contract a shared position depends on.** A routed operation reads
 the position at its entry and advances it at its exit, after the outcome is
 observed, so nothing may be dispatched between the two. The macOS backend
-guarantees that by construction: `next_event` polls only while its queue is
+guarantees that by construction: `poll_event` polls only while its queue is
 empty and stops after the first stop that queued anything, a routed entry is
 the only event its stop queues, and `resume` of an emulated entry queues the
 matching exit synchronously -- so the exit is always the next event.
@@ -406,3 +406,11 @@ logical descriptors for CLOEXEC_DEFAULT). A kernel error consumes the pending
 request without publishing a child. Platform completion still owns caller PID
 delivery, remote allocation release and the stopped execution barrier; see the
 [platform qualification limits](../umbra-platform-macos/README.md).
+
+Quiet traced programs use bounded platform polls. Each step services writer
+renewal before polling and again on an idle reply, without creating a journal
+record or resuming a thread. Transport failures and renewal failures still poison
+the run and use the existing teardown path. The platform session watchdog remains
+absolute; idle replies never extend it. This adds no cancellation API or new run
+limit. The `probe-idle-renewal` test feature emits `umbra-probe: writer-renewed`
+only after a successful namespace renewal, so integration tests can observe it.

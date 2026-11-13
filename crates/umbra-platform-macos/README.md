@@ -1097,3 +1097,22 @@ path even when descriptor metadata succeeds. Host mounts are not hidden.
 The first fsid word is only 32 bits and can coincidentally equal a native mount
 word. C17-02 characterizes only the CarbonCore path it exercises; it does not
 establish compatibility for all directory-descriptor volume queries.
+
+The `bounded-event-poll-v1` capability preserves queued stops, partial debugger
+packets, and process identities across idle replies. One absolute poll budget is
+shared across sessions, with a rotating cursor. Watchdog errors and queued events
+precede an idle outcome; no-live-process state remains an error. Debugger reads
+retain their 1 ms minimum timeout, so very small registry deadlines can still fail
+closed. Polling never silently increases the transport deadline or resets the
+absolute session watchdog.
+
+`tests/idle_poll.rs` runs on macOS arm64 with `UMBRA_INTEGRATION_REQUIRED` set;
+otherwise it prints `SKIP`. It
+compiles the quiet-tree fixture, runs its native control, and requires Idle
+across fork/wait/exec phases and successful exits. Quiet four-child polls also
+check the shared wait budget, and a stopped-tree test bounds polling thread CPU
+time. A separate test requires an
+8-second absolute watchdog to expire despite repeated Idle replies. These need
+a C compiler and debugger permission. The socketpair/socket tests additionally
+pin a partial RSP packet surviving Idle, the 1ms read floor, queued-event
+precedence and watchdog precedence.

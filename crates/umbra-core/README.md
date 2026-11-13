@@ -179,3 +179,8 @@ journal or manifest data. No independent stop generation is tracked.
 The v1 capability serves descriptor queries only. Pathname filesystem metadata
 retains the native host view; no path/descriptor equality or host-mount isolation
 is promised.
+
+`PLATFORM_BOUNDED_EVENT_POLL_V1` names the platform's bounded Event/Idle exchange.
+It is a role capability under common protocol version 3, not a change to common
+framing or the registry timeout. The role request/response remains in
+`umbra-platform`; legacy NextEvent encodings are retained.

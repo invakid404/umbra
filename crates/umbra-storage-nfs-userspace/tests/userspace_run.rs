@@ -58,6 +58,7 @@
 //! # end to end: the toy and the Rust I/O fixture must exit 0, and the utility
 //! # matrix must pass
 //! cargo build --workspace --bins
+//! cargo build -p umbra-cli --features probe-idle-renewal
 //! cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run
 //!
 //! # probe A -- read routing broken; the toy must exit 8
@@ -9533,14 +9534,13 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for opt-in spawn diagnostics on the composed
-    // packed-spawn and filesystem-metadata implementation, which changed native.rs,
+    // Re-characterized for bounded event polling (#262), which changed native.rs,
     // while single_thread and its Fork/WaitPlan::Park call sites are unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("9835b8f5af1e3c2d08a9475c4cda6bf9a652f96b932f94ea0e457687aa77e592"),
+        Some("b9e6f5f19815f3d1f81edf66317977f93e052e4b101624226207d18304bbaa14"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -16342,4 +16342,75 @@ fn fix_243_guardian_free_failure_loss() {
         false,
         b'P',
     );
+}
+
+// #262: a healthy quiet tracee must outlive the registry request deadline.
+fn fix_262_sleep(seconds: &str, renewal: bool) {
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(root) = slate_evidence() else { return };
+    let evidence = root.join(if renewal {
+        "fix-262-routed-renewal"
+    } else {
+        "fix-262-routed-sleep"
+    });
+    std::fs::create_dir(&evidence).unwrap();
+    let (native, timeout) = slate_launch(
+        Command::new("/bin/sleep").arg(seconds),
+        &evidence.join("native"),
+        std::time::Duration::from_secs(25),
+        None,
+    );
+    assert!(
+        !timeout && native.status.success(),
+        "native sleep: {}",
+        native.status
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let workspace = scratch.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let path = registry(scratch.path(), &host, port);
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["timeout_ms"] = serde_json::json!(5000);
+    config["providers"]["platform"]["options"] =
+        serde_json::json!(serde_json::to_vec(&serde_json::json!({"timeout_ms":60000})).unwrap());
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert_no_nfs_mount(&host, port, &[&workspace], "fix-262 before");
+    let (out, timeout) = slate_launch(
+        Command::new(binaries().join("umbra"))
+            .args(["run", "--registry"])
+            .arg(&path)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(scratch.path().join("state"))
+            .args(["--experimental", "--", "/bin/sleep", seconds]),
+        &evidence.join("routed"),
+        std::time::Duration::from_secs(28),
+        None,
+    );
+    slate_finish_cleanup();
+    assert!(!timeout, "routed sleep exceeded harness bound");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    if renewal {
+        assert!(
+            stderr.contains("umbra-probe: writer-renewed"),
+            "successful renewal observation required: {stderr}"
+        );
+    }
+    assert!(stderr.contains("Some(Code(0))"), "{stderr}");
+}
+
+#[test]
+fn fix_262_routed_sleep() {
+    fix_262_sleep("8", false);
+}
+
+#[test]
+fn fix_262_routed_idle_renewal() {
+    fix_262_sleep("17", true);
 }

@@ -154,3 +154,6 @@ pub const STORAGE_USERSPACE_ROUTING_V1: &str = "experimental-userspace-routing-v
 /// descriptors use, and the interposer's trap instruction — and no other site —
 /// is intercepted.
 pub const PLATFORM_INTERPOSE_V1: &str = "experimental-userspace-interpose-v1";
+
+/// Platform returns bounded idle outcomes while waiting for trace events.
+pub const PLATFORM_BOUNDED_EVENT_POLL_V1: &str = "bounded-event-poll-v1";

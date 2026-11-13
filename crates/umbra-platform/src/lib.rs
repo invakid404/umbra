@@ -34,6 +34,15 @@ pub use umbra_core::{
     ThreadId, TraceEvent,
 };
 
+/// A bounded wait distinguishes a real trace event from a quiet interval.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub enum EventPoll {
+    /// A real event, retaining its original ordering and identity.
+    Event(TraceEvent),
+    /// No event arrived during the requested interval.
+    Idle,
+}
+
 /// Owns the tracing transport and process-tree interception boundary.
 ///
 /// Implementations capture descendants before their first mutation, re-arm tracing
@@ -47,9 +56,14 @@ pub trait TraceBackend {
     /// Report normalized syscall entry/exit and child/fork/exec/exit notifications.
     ///
     /// Platform-specific return registers must become normalized syscall outcomes.
-    /// Use bounded polling or provider timeouts so lease renewal and control work
-    /// cannot be starved by an indefinitely blocked event read.
+    /// This legacy wait may block until an event arrives. Supervisors use
+    /// `poll_event` to service maintenance during quiet intervals.
     fn next_event(&mut self) -> Result<TraceEvent>;
+
+    /// Bound event waiting by the requested interval, preserving queued state.
+    /// Scheduling and backend timer granularity can exceed the requested interval;
+    /// the provider request deadline remains the fail-closed outer bound.
+    fn poll_event(&mut self, max_wait: std::time::Duration) -> Result<EventPoll>;
 
     /// Read exactly `out.len()` bytes from a stopped task, or return an error.
     /// Check address/length bounds and preserve bytes without UTF-8 conversion.
@@ -287,6 +301,9 @@ mod copyout_tests {
             unreachable!()
         }
         fn next_event(&mut self) -> Result<TraceEvent> {
+            unreachable!()
+        }
+        fn poll_event(&mut self, _: std::time::Duration) -> Result<crate::EventPoll> {
             unreachable!()
         }
         fn read_memory(&mut self, _: TaskId, _: u64, _: &mut [u8]) -> Result<()> {

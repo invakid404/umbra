@@ -1281,6 +1281,21 @@ mod unix {
                 Err(e) => return Err(fail(namespace, run_id, e, true)),
             };
         let capabilities = platform.control.capabilities();
+        if !capabilities
+            .capabilities
+            .contains(umbra_core::capabilities::PLATFORM_BOUNDED_EVENT_POLL_V1)
+        {
+            return Err(fail(
+                namespace,
+                run_id,
+                error(
+                    ErrorKind::UnsupportedCapability,
+                    "run.platform",
+                    "platform lacks bounded-event-poll-v1",
+                ),
+                true,
+            ));
+        }
         let architecture = match select_architecture(&capabilities.architectures) {
             Ok(architecture) => architecture,
             Err(e) => return Err(fail(namespace, run_id, e, true)),

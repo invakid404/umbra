@@ -286,3 +286,16 @@ user-approved MDM. Local dev runs the cases normally. A userspace NFSv4 backend
 has since landed (`umbra-storage-nfs-userspace`, #116) and the hatch has not
 retired: these two cases exercise the *kernel-mount* adapter, so it retires when
 they stop needing a mount, not when a mountless backend exists.
+
+`tests/fix_262_idle.rs` runs on macOS arm64 when `UMBRA_INTEGRATION_REQUIRED`
+is set, and otherwise prints `SKIP`. The opted-in host needs debugger permission. Build
+`umbra`, the macOS platform, local storage and file-journal executables first.
+It compares native controls with supervised short sleep, an 8-second sleep and
+an 8-second CPU loop, requiring Code(0) under the default registry deadline.
+The optional `probe-idle-renewal` feature forwards the supervisor's test-only
+successful-renewal marker; it changes no storage or deadline policy. The
+userspace integration job builds it for its renewal observation.
+
+Launch now requires runtime platform support for `bounded-event-poll-v1` even
+when the registry omits that capability. Update the platform provider alongside
+the CLI; an old provider fails before Launch rather than waiting indefinitely.

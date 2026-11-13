@@ -263,11 +263,9 @@ impl Rsp {
                 return Ok(None);
             }
             self.stream
-                .set_read_timeout(Some(
-                    limit
-                        .saturating_duration_since(Instant::now())
-                        .max(Duration::from_millis(1)),
-                ))
+                .set_read_timeout(Some(read_timeout(
+                    limit.saturating_duration_since(Instant::now()),
+                )))
                 .map_err(|e| error("rsp timeout", e))?;
             let mut bytes = [0; 8192];
             match self.stream.read(&mut bytes) {
@@ -421,5 +419,58 @@ mod tests {
         // Exercise a reply after negotiation, when debugserver sends #00.
         let host = rsp.request("qHostInfo").unwrap();
         assert_eq!(fields(&host).get("ostype"), Some(&"macosx"));
+    }
+}
+
+// SO_RCVTIMEO has an intentional 1ms floor. A tiny RPC budget can fail closed.
+fn read_timeout(remaining: Duration) -> Duration {
+    remaining.max(Duration::from_millis(1))
+}
+
+#[cfg(test)]
+mod poll_bound_tests {
+    use super::*;
+    #[test]
+    fn partial_packet_survives_idle() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        let mut rsp = Rsp {
+            id: 0,
+            stream,
+            child,
+            buffer: Vec::new(),
+            no_ack: true,
+            deadline: Instant::now() + Duration::from_secs(2),
+            torn_down: true,
+        };
+        peer.write_all(b"$T05thread:").unwrap();
+        assert_eq!(rsp.poll(Duration::from_millis(2)).unwrap(), None);
+        assert_eq!(rsp.buffer, b"$T05thread:");
+        peer.write_all(b"1;#00").unwrap();
+        assert_eq!(
+            rsp.poll(Duration::from_millis(20)).unwrap().as_deref(),
+            Some("T05thread:1;")
+        );
+        assert_eq!(rsp.poll(Duration::from_millis(2)).unwrap(), None);
+    }
+
+    #[test]
+    fn effective_socket_read_floor() {
+        for (input, expected) in [
+            (0, 1000),
+            (250, 1000),
+            (999, 1000),
+            (1000, 1000),
+            (2000, 2000),
+        ] {
+            assert_eq!(
+                read_timeout(Duration::from_micros(input)),
+                Duration::from_micros(expected)
+            );
+        }
     }
 }

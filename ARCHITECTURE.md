@@ -206,7 +206,10 @@ classified non-filesystem operation.
 
 Storage owns fenced single-writer authority; the journal records its evidence.
 Lease expiry alone cannot permit takeover while old descriptors or mappings remain
-writable. Renewal must not depend on indefinitely blocked trace-event reads. Lease
+writable. Renewal does not depend on indefinitely blocked trace-event reads: the platform
+uses capability-negotiated bounded Event/Idle polling, and the supervisor
+renews between idle replies. Polling state is runtime-only and adds no journal
+records. The independent absolute platform watchdog remains in force. Lease
 loss prevents mutation and requests quiescence. The file journal is required to
 store framed, checksummed records in its injected control directory. For
 userspace-routed runs that directory lives on the host under `--state-dir`, since

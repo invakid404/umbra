@@ -2,8 +2,8 @@
 
 Empty precedent for a future Linux platform backend (handoff §7).
 
-`LinuxTraceBackend` implements all seven `TraceBackend` methods, and
-`LinuxSyscallAbi` implements all three `SyscallAbi` methods. `TraceControl` advertises no capabilities or architectures, and its lifecycle
+`LinuxTraceBackend` implements the `TraceBackend` methods, including bounded `poll_event`, and
+`LinuxSyscallAbi` implements the `SyscallAbi` methods. `TraceControl` advertises no capabilities or architectures, and its lifecycle
 methods return explicit stub errors. Every fallible method returns
 `Err(UmbraError::not_implemented("linux: <method>"))` without side effects. The core
 constructor categorizes these errors as `NotImplemented`.

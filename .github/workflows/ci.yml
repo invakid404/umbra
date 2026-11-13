@@ -261,8 +261,8 @@ jobs:
           echo "UMBRA_TEST_REDIRECT_ROOT=$fixture_dir/shadow" >> "$GITHUB_ENV"
       - name: Qualify enforcement, IPC, and the local run-fixture matrix
         run: |
-          cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures -- --nocapture --test-threads=1
-          cargo test -p umbra-cli --test run_fixtures --test resume_cli -- --nocapture --test-threads=1
+          cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures --test idle_poll -- --nocapture --test-threads=1
+          cargo test -p umbra-cli --test run_fixtures --test resume_cli --test fix_262_idle -- --nocapture --test-threads=1
           cargo test -p umbra-supervisor --test reopen -- --nocapture --test-threads=1
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
           cargo update --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml \
@@ -584,6 +584,7 @@ jobs:
       - name: Proof 1 -- end to end, the toy and the Rust I/O fixture must exit 0
         run: |
           cargo build --workspace --bins
+          cargo build -p umbra-cli --features probe-idle-renewal
           cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
           cargo test -p umbra-storage-nfs-userspace --features transport-raw \
             --test userspace_run -- --nocapture --test-threads=1

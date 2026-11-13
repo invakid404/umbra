@@ -43,6 +43,6 @@
     111,
     115
   ],
-  "capabilities": [],
+  "capabilities": ["bounded-event-poll-v1"],
   "options": []
 }

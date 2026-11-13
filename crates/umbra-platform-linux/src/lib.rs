@@ -26,6 +26,9 @@ impl TraceBackend for LinuxTraceBackend {
     fn next_event(&mut self) -> Result<TraceEvent> {
         Err(UmbraError::not_implemented("linux: next_event"))
     }
+    fn poll_event(&mut self, _: std::time::Duration) -> Result<umbra_platform::EventPoll> {
+        Err(umbra_core::UmbraError::not_implemented("linux: poll_event"))
+    }
 
     fn read_memory(&mut self, _task: TaskId, _address: u64, _out: &mut [u8]) -> Result<()> {
         Err(UmbraError::not_implemented("linux: read_memory"))
@@ -81,5 +84,18 @@ impl SyscallAbi for LinuxSyscallAbi {
 
     fn emulate_result(&self, _regs: &mut RegisterSet, _result: &EmulatedResult) -> Result<()> {
         Err(UmbraError::not_implemented("linux: emulate_result"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_event_refuses_without_returning_idle() {
+        let error = LinuxTraceBackend
+            .poll_event(std::time::Duration::from_millis(10))
+            .expect_err("Linux polling must refuse");
+        assert_eq!(error.kind, umbra_core::ErrorKind::NotImplemented);
     }
 }

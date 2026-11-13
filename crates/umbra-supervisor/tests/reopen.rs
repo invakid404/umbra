@@ -23,6 +23,7 @@ use umbra_core::{
 };
 use umbra_journal::Journal;
 use umbra_journal_file::FileJournal;
+use umbra_overlay::NamespaceSession;
 use umbra_storage::Storage;
 use umbra_storage_local::LocalStorage;
 use umbra_supervisor::{base::WorkspaceInventory, ResumeSpec, RunPersistence, Supervisor};
@@ -595,4 +596,121 @@ fn reopening_a_healthy_run_twice_leaves_the_journal_where_it_was() {
         second.writer_epoch.0 > first.writer_epoch.0,
         "the one thing that does change: each reopen takes its own authority"
     );
+}
+
+// A fresh supervisor is constructed separately: resume restores namespace state,
+// never the old operating-system process or its monotonic polling deadlines.
+#[allow(dead_code)]
+mod support;
+
+#[test]
+fn fix_262_reopen_preserves_semantic_journal_and_fresh_idle_session() {
+    let Some(bins) = providers() else { return };
+    assert_eq!(
+        idle_journal_execution(bins.clone(), false),
+        idle_journal_execution(bins, true)
+    );
+}
+
+fn idle_journal_execution(bins: (PathBuf, PathBuf), reopen: bool) -> Vec<JournalPayload> {
+    let dir = tempfile::tempdir().unwrap();
+    let (workspace_dir, contract) = workspace(dir.path());
+    let storage_root = dir.path().join("storage");
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let control = create_run(&storage_root, run_id, &contract);
+    let id = OperationId(uuid::Uuid::from_u128(262));
+    let (mut journal, request) = open_journal(&control, run_id, 1);
+    journal.open(&request).unwrap();
+    journal
+        .append(&record(
+            1,
+            id,
+            JournalPayload::Prepare {
+                intent: JournalIntent::Unlink {
+                    object: ObjectId(uuid::Uuid::from_u128(263)),
+                    path: BytePath::new(b"/gone".to_vec()).unwrap(),
+                    directory: false,
+                },
+            },
+        ))
+        .unwrap();
+    journal
+        .append(&record(1, id, JournalPayload::Commit))
+        .unwrap();
+    journal.flush(Sequence(2)).unwrap();
+    let before: Vec<_> = journal
+        .replay(Sequence(0))
+        .unwrap()
+        .collect::<umbra_core::Result<_>>()
+        .unwrap();
+    journal.close().unwrap();
+    // This overlay owns the very storage run and file journal reopened below.
+    let mut storage = LocalStorage::new(&storage_root).unwrap();
+    let binding = storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::OpenExisting,
+            immutable_base: contract,
+            policy: StoragePolicy {
+                read_only: false,
+                require_strict_remote_persistence: false,
+                require_kernel_shadow: false,
+                format_version: 1,
+            },
+        })
+        .unwrap();
+    let lease = storage
+        .acquire_writer(&AcquireWriterRequest {
+            run_id,
+            writer_id: WriterId("idle-supervisor".into()),
+            takeover: TakeoverPolicy::Refuse,
+        })
+        .unwrap();
+    let (mut journal, request) = open_journal(&control, run_id, lease.epoch.0);
+    let recovery = journal.open(&request).unwrap();
+    let mut overlay = umbra_overlay::Overlay::new(Box::new(storage), Box::new(journal));
+    overlay
+        .bind(
+            umbra_overlay::SessionConfig {
+                binding,
+                context: umbra_core::RequestContext {
+                    run_id,
+                    operation_id: id,
+                    idempotency_key: umbra_core::IdempotencyKey("idle".into()),
+                    writer_epoch: Some(lease.epoch),
+                },
+                recovery,
+                lease,
+            },
+            Box::new(umbra_supervisor::base::HostReadOnlyBase::new(
+                WorkspaceInventory::capture(&workspace_dir).unwrap(),
+            )),
+        )
+        .unwrap();
+    let mut namespace = support::idle_namespace(run_id, Box::new(overlay));
+    namespace
+        .fail_run(&umbra_core::FailedRunRequest {
+            run_id,
+            reason: "end scripted Idle session".into(),
+            tree_terminated: true,
+        })
+        .unwrap();
+    drop(namespace);
+    let epoch = if reopen {
+        let outcome = Supervisor::resume(spec(&storage_root, run_id, workspace_dir, bins)).unwrap();
+        assert!(!outcome.recovery_required);
+        outcome.writer_epoch.0 + 1
+    } else {
+        3
+    };
+    let (mut journal, request) = open_journal(&control, run_id, epoch);
+    journal.open(&request).unwrap();
+    let after: Vec<_> = journal
+        .replay(Sequence(0))
+        .unwrap()
+        .collect::<umbra_core::Result<_>>()
+        .unwrap();
+    assert_eq!(before, after);
+    journal.close().unwrap();
+    after.into_iter().map(|record| record.payload).collect()
 }

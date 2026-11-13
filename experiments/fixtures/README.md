@@ -304,3 +304,14 @@ child-identity disappearance and CLEAN cleanup without harness kills. Retained l
 readings passed the provider-loss, unregistered-child, copyout-failure and
 free-failure guardian cases. CI selects all four with
 `mutation-probe-spawn-lifecycle`; a COMPLETE sweep alone does not establish reap.
+
+## Quiet-program regression fixtures
+
+`umbra-fix-262-cpu.c` runs arithmetic until a monotonic-clock deadline, with no
+file calls during that phase. `umbra-fix-262-tree.c` forks four children, parks
+the parent in wait, and execs sleep in each child. The CLI and macOS integration
+tests compile these fixtures themselves and run native controls before traced
+comparisons. The CLI requires Code(0) for an 8-second quiet interval; the native
+platform test requires Idle across child/exec phases and all exits successful.
+These tests require macOS arm64, a C compiler and debugger permission. They do
+not qualify arbitrary-duration runs beyond the platform session watchdog.

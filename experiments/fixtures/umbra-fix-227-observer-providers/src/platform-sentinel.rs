@@ -11,6 +11,7 @@ fn main() {
             capabilities::PLATFORM_SANDBOXED_LAUNCH_V1.to_owned(),
             capabilities::PLATFORM_SYSCALL_REWRITE_V1.to_owned(),
             capabilities::PLATFORM_INTERPOSE_V1.to_owned(),
+            capabilities::PLATFORM_BOUNDED_EVENT_POLL_V1.to_owned(),
         ]
         .into_iter()
         .collect(),

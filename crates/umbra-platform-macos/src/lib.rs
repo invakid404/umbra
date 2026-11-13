@@ -25,7 +25,9 @@ pub use native::{
     BarrierEvidence, BarrierReading, MacosTraceBackend, ReportedExitLookup, TeardownReport,
     TeardownStep,
 };
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+// Compile the refusal backend in native-host unit tests as well.
+#[cfg(any(test, not(all(target_os = "macos", target_arch = "aarch64"))))]
+#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 mod unsupported;
 use umbra_core::{ErrorKind, UmbraError};
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

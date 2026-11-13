@@ -105,6 +105,7 @@ fn registry(root: &Path, platform: bool) -> ProviderRegistry {
                 &[
                     "sandboxed-stopped-launch-v1",
                     "experimental-syscall-rewrite-v1",
+                    "bounded-event-poll-v1",
                 ],
                 vec![],
             ),

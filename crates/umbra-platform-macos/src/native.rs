@@ -1504,6 +1504,7 @@ impl Drop for Session {
 
 /// Native prototype control, deliberately !Send/!Sync. Construct on the provider thread.
 pub struct MacosTraceBackend {
+    poll_cursor: usize,
     spawn_sequence: u64,
     spawn_profile: Option<bool>,
     options: Options,
@@ -1533,6 +1534,7 @@ impl Default for MacosTraceBackend {
 impl MacosTraceBackend {
     pub fn new(options: Options) -> Self {
         Self {
+            poll_cursor: 0,
             spawn_sequence: 0,
             spawn_profile: None,
             options,
@@ -3645,9 +3647,24 @@ impl TraceBackend for MacosTraceBackend {
     }
     fn next_event(&mut self) -> Result<TraceEvent> {
         loop {
+            if let umbra_platform::EventPoll::Event(event) =
+                self.poll_event(Duration::from_millis(100))?
+            {
+                return Ok(event);
+            }
+        }
+    }
+    fn poll_event(&mut self, max_wait: Duration) -> Result<umbra_platform::EventPoll> {
+        if max_wait.is_zero() || max_wait > Duration::from_millis(100) {
+            return Err(error("poll_event", "invalid wait budget"));
+        }
+        let limit = Instant::now()
+            .checked_add(max_wait)
+            .ok_or_else(|| error("poll_event", "wait overflow"))?;
+        loop {
             self.check_deadline()?;
             if let Some(event) = self.events.pop_front() {
-                return Ok(event);
+                return Ok(umbra_platform::EventPoll::Event(event));
             }
             if let Some((index, reply)) = self.quiesced_stops.pop_front() {
                 self.stop(index, reply, true)?;
@@ -3656,7 +3673,17 @@ impl TraceBackend for MacosTraceBackend {
             if self.sessions.is_empty() || self.sessions.iter().all(|s| s.done) {
                 return Err(error("next_event", "no live processes"));
             }
-            for i in 0..self.sessions.len() {
+            if Instant::now() >= limit {
+                return Ok(umbra_platform::EventPoll::Idle);
+            }
+            let start = Instant::now();
+            let count = self.sessions.len();
+            for _ in 0..count {
+                if Instant::now() >= limit {
+                    break;
+                }
+                let i = self.poll_cursor % self.sessions.len();
+                self.poll_cursor = (i + 1) % self.sessions.len();
                 if self.sessions[i].done {
                     continue;
                 }
@@ -3678,11 +3705,22 @@ impl TraceBackend for MacosTraceBackend {
                 if self.sessions[i].stopped {
                     continue;
                 }
-                if let Some(reply) = self.sessions[i].rsp.poll(Duration::from_millis(2))? {
+                if let Some(reply) = self.sessions[i].rsp.poll(
+                    Duration::from_millis(2).min(limit.saturating_duration_since(Instant::now())),
+                )? {
                     self.stop(i, reply, false)?;
                 }
                 if !self.events.is_empty() {
                     break;
+                }
+            }
+            // A parked/stopped tree must not busy-spin between idle replies.
+            if self.events.is_empty() && Instant::now() < limit {
+                let pause = Duration::from_millis(1)
+                    .saturating_sub(start.elapsed())
+                    .min(limit.saturating_duration_since(Instant::now()));
+                if !pause.is_zero() {
+                    std::thread::sleep(pause);
                 }
             }
         }
@@ -3821,6 +3859,7 @@ impl TraceControl for MacosTraceBackend {
             // installer handoff by tests/sandbox_launch.rs, which also proves an
             // unrewritten write outside the run root is denied by the kernel.
             capabilities: [
+                umbra_core::capabilities::PLATFORM_BOUNDED_EVENT_POLL_V1.to_owned(),
                 umbra_platform::dirents::DARWIN_ARM64_ABI.to_owned(),
                 umbra_core::capabilities::PLATFORM_SANDBOXED_LAUNCH_V1.to_owned(),
                 umbra_core::capabilities::PLATFORM_SYSCALL_REWRITE_V1.to_owned(),
@@ -4431,5 +4470,48 @@ mod tests {
             birth,
             &Lookup::Error("Operation not permitted".into())
         )));
+    }
+}
+
+#[cfg(test)]
+mod bounded_poll_tests {
+    use super::*;
+    fn exit_event() -> TraceEvent {
+        TraceEvent::Exit {
+            task: TaskId(umbra_core::TaskIdentity {
+                native_id: 1,
+                generation: 1,
+            }),
+            status: umbra_core::ExitStatus::Code(0),
+        }
+    }
+    #[test]
+    fn queued_event_precedes_expiry_but_not_watchdog() {
+        let mut backend = MacosTraceBackend::default();
+        backend.events.push_back(exit_event());
+        assert!(matches!(
+            backend.poll_event(Duration::from_nanos(1)).unwrap(),
+            umbra_platform::EventPoll::Event(_)
+        ));
+        backend.events.push_back(exit_event());
+        backend.deadline = Some(Instant::now());
+        assert!(backend
+            .poll_event(Duration::from_millis(1))
+            .unwrap_err()
+            .to_string()
+            .contains("session timed out"));
+        assert_eq!(backend.events.len(), 1);
+    }
+    #[test]
+    fn no_live_process_and_invalid_budget_are_not_idle() {
+        let mut backend = MacosTraceBackend::default();
+        assert!(backend
+            .poll_event(Duration::from_nanos(1))
+            .unwrap_err()
+            .to_string()
+            .contains("no live processes"));
+        for wait in [Duration::ZERO, Duration::MAX] {
+            assert!(backend.poll_event(wait).is_err());
+        }
     }
 }

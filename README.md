@@ -117,6 +117,10 @@ If you're contributing, [the Memoria guide](docs/memoria.md) explains how we kee
 READMEs connected to the code they describe. It covers the review flow and the
 documentation check that runs in CI.
 
+Quiet programs use bounded platform polls so the supervisor can renew writer
+authority between idle replies. This retains the provider request deadline and
+independent platform session watchdog; it adds no cancellation API.
+
 Provider executables can be checked through the [runtime registry](docs/providers.md).
 
 ## Crate and experiment index
