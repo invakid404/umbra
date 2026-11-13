@@ -1136,7 +1136,10 @@ Observation failure refuses launch. No protocol bytes are consumed by the monito
 Owner exit still triggers when another process retains the socket, including
 before launch, after launch failure, and after termination. Observation runs
 from owner binding until backend disposal, independently of the per-launch
-deadline watchdog; both share the task registry. The monitor
+deadline watchdog; both share the task registry. Exec registers a replacement
+Task before retiring the superseded entry, releasing its old Mach right once
+the session replaces its reference. Completed child sessions remain until tree
+cleanup; provider-lifetime owner registry entries remain until backend disposal. The monitor
 kills registered tasks; late registrations are killed immediately. The provider
 thread performs existing ordered teardown and retains unconfirmed diagnostics.
 Normal disarm does not kill tasks. No heartbeat or inactivity-based "stuck"
