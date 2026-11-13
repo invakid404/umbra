@@ -3,6 +3,19 @@ use umbra_core::*;
 use umbra_platform::{TraceBackend, TraceControl};
 #[derive(Default)]
 pub struct MacosTraceBackend;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_event_refuses_without_returning_idle() {
+        let error = MacosTraceBackend
+            .poll_event(std::time::Duration::from_millis(10))
+            .expect_err("unsupported macOS polling must refuse");
+        assert_eq!(error.kind, ErrorKind::UnsupportedCapability);
+    }
+}
 impl MacosTraceBackend {
     pub fn new(_: Options) -> Self {
         Self

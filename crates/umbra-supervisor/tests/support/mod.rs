@@ -543,3 +543,35 @@ fn budget() -> RunBudget {
         abi: "test".into(),
     }
 }
+
+/// Drive Idle on a caller-owned persistent namespace and return its ownership.
+pub fn idle_namespace(
+    run_id: RunId,
+    namespace: Box<dyn NamespaceSession + Send>,
+) -> Box<dyn NamespaceSession + Send> {
+    let log = Arc::new(Mutex::new(Recording::default()));
+    let op = Arc::new(Mutex::new(None));
+    let idle = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let platform = || Platform {
+        idle: idle.clone(),
+        log: log.clone(),
+        op: op.clone(),
+    };
+    let mut supervisor = Supervisor::with_namespace(
+        run_id,
+        PlatformSession {
+            control: Box::new(platform()),
+            abi: Box::new(platform()),
+        },
+        namespace,
+        None,
+    );
+    supervisor.launch_prepared(launch_spec(), budget()).unwrap();
+    supervisor.step().unwrap();
+    assert!(
+        log.lock().unwrap().events.is_empty(),
+        "Idle must not resume"
+    );
+    assert!(!supervisor.is_poisoned());
+    supervisor.into_parts().namespace
+}

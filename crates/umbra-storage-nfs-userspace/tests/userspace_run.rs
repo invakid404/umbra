@@ -58,6 +58,7 @@
 //! # end to end: the toy and the Rust I/O fixture must exit 0, and the utility
 //! # matrix must pass
 //! cargo build --workspace --bins
+//! cargo build -p umbra-cli --features probe-idle-renewal
 //! cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run
 //!
 //! # probe A -- read routing broken; the toy must exit 8

@@ -18,6 +18,19 @@ use umbra_platform::{SyscallAbi, TraceBackend, TraceControl, TraceMemory};
 #[derive(Debug, Default)]
 pub struct LinuxTraceBackend;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_event_refuses_without_returning_idle() {
+        let error = LinuxTraceBackend
+            .poll_event(std::time::Duration::from_millis(10))
+            .expect_err("Linux polling must refuse");
+        assert_eq!(error.kind, umbra_core::ErrorKind::NotImplemented);
+    }
+}
+
 impl TraceBackend for LinuxTraceBackend {
     fn launch(&mut self, _spec: LaunchSpec) -> Result<ProcessHandle> {
         Err(UmbraError::not_implemented("linux: launch"))

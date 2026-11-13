@@ -4,6 +4,10 @@ use serde_json::{json, Value};
 use std::{os::unix::ffi::OsStrExt, path::Path, process::Command};
 
 fn idle(seconds: u32, cpu: bool) {
+    if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none() {
+        eprintln!("SKIP: fix_262_idle requires UMBRA_INTEGRATION_REQUIRED and debugger permission");
+        return;
+    }
     let scratch = tempfile::tempdir().unwrap();
     let root = scratch.path();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
