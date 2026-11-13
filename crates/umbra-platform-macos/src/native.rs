@@ -17,7 +17,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use umbra_core::*;
@@ -142,43 +142,124 @@ fn probe_unregistered(task: &Task, slot: u64) -> Result<bool> {
     )
 }
 
+trait KillOwned {
+    fn kill_owned(&self);
+}
+impl KillOwned for Arc<Task> {
+    fn kill_owned(&self) {
+        self.kill();
+    }
+}
+struct WatchedTasks<T = Arc<Task>> {
+    tasks: Vec<T>,
+    reason: Option<&'static str>,
+}
+impl<T> Default for WatchedTasks<T> {
+    fn default() -> Self {
+        Self {
+            tasks: Vec::new(),
+            reason: None,
+        }
+    }
+}
+impl<T: KillOwned> WatchedTasks<T> {
+    fn add(&mut self, task: T) {
+        if self.reason.is_some() {
+            task.kill_owned();
+        }
+        self.tasks.push(task);
+    }
+    fn latch(&mut self, reason: &'static str) {
+        if self.reason.is_none() {
+            self.reason = Some(reason);
+            for task in self.tasks.iter().rev() {
+                task.kill_owned();
+            }
+        }
+    }
+}
 struct Watchdog {
-    tasks: Arc<Mutex<Vec<Arc<Task>>>>,
-    cancel: Option<mpsc::Sender<()>>,
+    tasks: Arc<Mutex<WatchedTasks>>,
+    cancel: Option<std::os::unix::net::UnixStream>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 impl Watchdog {
-    fn new(deadline: Instant) -> Self {
-        let tasks = Arc::new(Mutex::new(Vec::<Arc<Task>>::new()));
+    fn new(deadline: Option<Instant>, owner: Option<crate::owner::OwnerWatch>) -> Result<Self> {
+        let tasks = Arc::new(Mutex::new(WatchedTasks::default()));
         let owned = tasks.clone();
-        let (tx, rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            if rx
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .is_err()
-            {
-                for task in owned.lock().unwrap().iter().rev() {
-                    task.kill();
+        let (waiter, cancel) = crate::owner::Waiter::new(owner)?;
+        let worker = std::thread::Builder::new()
+            .name("umbra-owner".into())
+            .spawn(move || {
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(reason) = monitor_reason(deadline, || waiter.wait(deadline)) {
+                        owned
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .latch(reason);
+                        if reason != "session timed out" {
+                            waiter.disconnect();
+                        }
+                    }
+                }));
+                if run.is_err() {
+                    owned
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .latch("owner monitor panicked");
+                    waiter.disconnect();
                 }
-            }
-        });
-        Self {
+            })
+            .map_err(|e| error("owner-observation", e))?;
+        Ok(Self {
             tasks,
-            cancel: Some(tx),
+            cancel: Some(cancel),
             worker: Some(worker),
-        }
+        })
     }
     fn add(&self, task: Arc<Task>) {
-        self.tasks.lock().unwrap().push(task);
+        let mut state = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        state.add(task);
+    }
+    fn terminate_registered(&self) {
+        for task in self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tasks
+            .iter()
+            .rev()
+        {
+            task.kill();
+        }
+    }
+    fn reason(&self) -> Option<&'static str> {
+        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).reason
+    }
+}
+fn monitor_reason(
+    deadline: Option<Instant>,
+    mut wait: impl FnMut() -> Result<crate::owner::Wake>,
+) -> Option<&'static str> {
+    loop {
+        match wait() {
+            Ok(crate::owner::Wake::Disarm) => return None,
+            Ok(crate::owner::Wake::Timeout)
+                if !deadline.is_some_and(|d| crate::clock::now() >= d) =>
+            {
+                continue
+            }
+            Ok(crate::owner::Wake::Timeout) => return Some("session timed out"),
+            Ok(crate::owner::Wake::OwnerGone) => return Some("supervisor gone"),
+            Err(_) => return Some("owner monitor failed"),
+        }
     }
 }
 impl Drop for Watchdog {
     fn drop(&mut self) {
-        for task in self.tasks.lock().unwrap().iter().rev() {
-            task.kill();
-        }
-        if let Some(tx) = self.cancel.take() {
-            let _ = tx.send(());
+        use std::io::Write;
+        if let Some(mut tx) = self.cancel.take() {
+            let _ = tx.write_all(b"x");
         }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -432,7 +513,7 @@ impl Session {
         twin: PathBuf,
         parent: Option<usize>,
         options: &Options,
-        deadline: Instant,
+        deadline: Option<Instant>,
         watchdog: &Watchdog,
         interposer: Option<(PathBuf, PathBuf, u32)>,
     ) -> Result<Self> {
@@ -445,6 +526,7 @@ impl Session {
                 .tasks
                 .lock()
                 .unwrap()
+                .tasks
                 .iter()
                 .any(|owned| Arc::ptr_eq(owned, &task));
             crate::spawn_probe::acquired(pid, birth, registered)?;
@@ -861,6 +943,14 @@ impl Session {
         self.continue_thread(thread)
     }
     fn install(&mut self) -> Result<()> {
+        self.rsp.begin_setup();
+        let result = self.install_inner();
+        if result.is_ok() {
+            self.rsp.finish_setup();
+        }
+        result
+    }
+    fn install_inner(&mut self) -> Result<()> {
         self.wait_for_dyld()?;
         // Before any breakpoint is planted, and that order is forced.
         //
@@ -1516,7 +1606,9 @@ pub struct MacosTraceBackend {
     // Stop replies consumed by quiesce still belong to the normal event loop.
     quiesced_stops: VecDeque<(usize, String)>,
     deadline: Option<Instant>,
+    launched: bool,
     watchdog: Option<Watchdog>,
+    owner: Option<crate::owner::OwnerWatch>,
     generation: u64,
     /// The routing interposer this run loads and the image it routes in, if any.
     ///
@@ -1543,7 +1635,9 @@ impl MacosTraceBackend {
             events: VecDeque::new(),
             quiesced_stops: VecDeque::new(),
             deadline: None,
+            launched: false,
             watchdog: None,
+            owner: None,
             generation: 0,
             interposer: None,
             _affine: PhantomData,
@@ -1779,6 +1873,7 @@ impl MacosTraceBackend {
             .tasks
             .lock()
             .unwrap()
+            .tasks
             .iter()
             .any(|task| Arc::ptr_eq(task, &child.task));
         crate::spawn_probe::rendezvous(
@@ -1907,8 +2002,23 @@ impl MacosTraceBackend {
                 UmbraError::new(ErrorKind::StaleHandle, "thread", "unknown or exited thread")
             })
     }
+    /// Bind a remote provider to its authenticated parent before launch.
+    pub fn observe_owner(
+        &mut self,
+        identity: crate::OwnerIdentity,
+        stream: std::os::unix::net::UnixStream,
+    ) -> Result<()> {
+        if self.launched || self.owner.is_some() {
+            return Err(unsupported("owner-observation: already configured"));
+        }
+        self.owner = Some(crate::owner::OwnerWatch::new(identity, stream)?);
+        Ok(())
+    }
     fn check_deadline(&mut self) -> Result<()> {
-        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+        if let Some(reason) = self.watchdog.as_ref().and_then(Watchdog::reason) {
+            return Err(error("watchdog", reason));
+        }
+        if self.deadline.is_some_and(|d| crate::clock::now() >= d) {
             for s in &self.sessions {
                 s.task.kill();
             }
@@ -1962,10 +2072,14 @@ impl MacosTraceBackend {
     }
     fn launch_traced(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
         Self::check_sandbox_shape(&spec)?;
-        if self.deadline.is_some() {
+        if self.launched {
             return Err(error("launch", "one run per backend"));
         }
-        if self.options.timeout_ms == 0 || self.options.timeout_ms > 3_600_000 {
+        if self
+            .options
+            .timeout_ms
+            .is_some_and(|ms| ms == 0 || ms > 3_600_000)
+        {
             return Err(error("launch", "timeout must be 1..3600000 ms"));
         }
         if !matches!(
@@ -2017,13 +2131,22 @@ impl MacosTraceBackend {
         args[0] = cstr(spec.executable.as_bytes())?;
         let mut environment = spec.environment.clone();
         let cwd = cstr(spec.cwd.as_bytes())?;
-        let deadline = Instant::now() + Duration::from_millis(self.options.timeout_ms);
-        self.deadline = Some(deadline);
-        self.watchdog = Some(Watchdog::new(deadline));
+        let deadline = self
+            .options
+            .timeout_ms
+            .map(|ms| {
+                crate::clock::now()
+                    .checked_add(Duration::from_millis(ms))
+                    .ok_or_else(|| error("launch", "lifetime overflow"))
+            })
+            .transpose()?;
+        self.launched = true;
+        self.deadline = deadline;
+        self.watchdog = Some(Watchdog::new(deadline, self.owner.take())?);
         let twin = cache::resign(
             Path::new(OsStr::from_bytes(spec.executable.as_bytes())),
             &self.options,
-            deadline,
+            operation_deadline(deadline, Duration::from_secs(10)),
         )?;
         // Enforcement is installed before the target's first instruction and the
         // interposer is loaded into that same image, so both are arranged here,
@@ -2038,7 +2161,10 @@ impl MacosTraceBackend {
                      than a refusal",
                 )
             })?;
-            let published = interpose::publish(&self.options, deadline)?;
+            let published = interpose::publish(
+                &self.options,
+                operation_deadline(deadline, Duration::from_secs(10)),
+            )?;
             // The target runs as its resigned twin, so this is the image umbra
             // will arm -- not the caller's `spec.executable`. Getting it wrong
             // leaves the interposer unarmed in the very image it was loaded for,
@@ -2085,8 +2211,11 @@ impl MacosTraceBackend {
         let (image, args) = match &spec.sandbox {
             SandboxRequirement::UnsandboxedExperiment => (twin.clone(), args),
             SandboxRequirement::Required(profile) => {
-                let bootstrap =
-                    cache::resign(Path::new(SANDBOX_BOOTSTRAP), &self.options, deadline)?;
+                let bootstrap = cache::resign(
+                    Path::new(SANDBOX_BOOTSTRAP),
+                    &self.options,
+                    operation_deadline(deadline, Duration::from_secs(10)),
+                )?;
                 // The target runs as its resigned twin, exactly as on the
                 // unenforced path, so image identity and `_NSGetExecutablePath`
                 // agree across both. The bootstrap sets the target's argv[0] to
@@ -2397,7 +2526,7 @@ impl MacosTraceBackend {
         let trigger = std::env::var("UMBRA_FIX_243_PROBE_TRIGGER").unwrap_or_default();
         match trigger.as_str() {
             "deadline" => {
-                self.deadline = Some(Instant::now());
+                self.deadline = Some(crate::clock::now());
                 self.check_deadline()?;
             }
             "session-drop" => {
@@ -2418,7 +2547,7 @@ impl MacosTraceBackend {
                 let remaining = self
                     .deadline
                     .unwrap()
-                    .saturating_duration_since(Instant::now());
+                    .saturating_duration_since(crate::clock::now());
                 std::thread::sleep(remaining + Duration::from_millis(50));
             }
             _ => {}
@@ -2454,7 +2583,7 @@ impl MacosTraceBackend {
             twin,
             Some(parent),
             &self.options,
-            self.deadline.unwrap(),
+            self.deadline,
             self.watchdog.as_ref().unwrap(),
             self.interposer.clone(),
         );
@@ -2723,7 +2852,7 @@ impl MacosTraceBackend {
                 let twin = cache::resign(
                     Path::new(OsStr::from_bytes(old.as_bytes())),
                     &self.options,
-                    self.deadline.unwrap(),
+                    operation_deadline(self.deadline, Duration::from_secs(10)),
                 )?;
                 if number == 244 && get(&regs, 2)? != 0 {
                     return self.capture_spawn(index, thread, regs, twin);
@@ -3429,7 +3558,7 @@ impl Session {
     /// goes to stderr **before** the tracer is killed (ruling R3.2).
     fn ordered_teardown(&mut self) -> TeardownReport {
         self.torn_down = true;
-        let started = Instant::now();
+        let started = crate::clock::now();
         let deadline = started + TEARDOWN_BOUND;
         let pid = self.id.0.native_id as i32;
         let tracer = self.rsp.tracer_pid();
@@ -3466,7 +3595,7 @@ impl Session {
                 std::thread::sleep(Duration::from_millis(1));
             } else {
                 let wait = deadline
-                    .saturating_duration_since(Instant::now())
+                    .saturating_duration_since(crate::clock::now())
                     .min(Duration::from_millis(5));
                 match self.rsp.teardown_read(wait) {
                     rsp::TeardownRead::Packet(packet) => {
@@ -3476,7 +3605,7 @@ impl Session {
                         if stop && !resent {
                             resent = true;
                             let bound = deadline
-                                .saturating_duration_since(Instant::now())
+                                .saturating_duration_since(crate::clock::now())
                                 .min(Duration::from_millis(250));
                             match self.rsp.send_kill(bound) {
                                 Ok(()) => steps.push(TeardownStep::KillResent),
@@ -3497,10 +3626,13 @@ impl Session {
                 }
             }
             let reading = self.barrier();
-            if matches!(reading, BarrierReading::Confirmed(_)) || Instant::now() >= deadline {
+            if matches!(reading, BarrierReading::Confirmed(_)) || crate::clock::now() >= deadline {
                 break reading;
             }
         };
+        if let BarrierReading::Confirmed(evidence) = &reading {
+            eprintln!("umbra-platform-macos: tracee exit confirmed: pid={pid} identity={:?} evidence={evidence:?}", self.birth);
+        }
         let timed_out = !matches!(reading, BarrierReading::Confirmed(_));
         steps.push(TeardownStep::Barrier(reading.clone()));
         if timed_out {
@@ -3519,7 +3651,7 @@ impl Session {
         // Measured: a released tracee is a zombie within 5 ms of its tracer's
         // death. The same positives apply (SZOMB with identity under any
         // parent, or proven absence or reuse).
-        let limit = Instant::now() + rsp::TRACER_REAP_BOUND;
+        let limit = crate::clock::now() + rsp::TRACER_REAP_BOUND;
         let mut tracer_reaped = false;
         let mut after_kill: Option<BarrierReading> = None;
         loop {
@@ -3530,7 +3662,7 @@ impl Session {
                 after_kill = Some(self.barrier());
             }
             let settled = !timed_out || matches!(after_kill, Some(BarrierReading::Confirmed(_)));
-            if (tracer_reaped && settled) || Instant::now() >= limit {
+            if (tracer_reaped && settled) || crate::clock::now() >= limit {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -3554,12 +3686,12 @@ impl Session {
             None => {}
         }
         if self.parent.is_none() {
-            let limit = Instant::now() + TRACEE_REAP_BOUND;
+            let limit = crate::clock::now() + TRACEE_REAP_BOUND;
             while !self.reaped {
                 // SAFETY: plain libSystem call on a pid; no memory is passed.
                 if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid {
                     self.reaped = true;
-                } else if Instant::now() >= limit {
+                } else if crate::clock::now() >= limit {
                     break;
                 } else {
                     std::thread::sleep(Duration::from_millis(1));
@@ -3627,6 +3759,9 @@ impl Drop for MacosTraceBackend {
     /// A dropped backend tears its sessions down in the same order `terminate`
     /// does, rather than leaving that to the `Vec`'s front-to-back drop.
     fn drop(&mut self) {
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.terminate_registered();
+        }
         for s in self.sessions.iter().rev() {
             if !s.done {
                 s.task.kill();
@@ -3658,7 +3793,7 @@ impl TraceBackend for MacosTraceBackend {
         if max_wait.is_zero() || max_wait > Duration::from_millis(100) {
             return Err(error("poll_event", "invalid wait budget"));
         }
-        let limit = Instant::now()
+        let limit = crate::clock::now()
             .checked_add(max_wait)
             .ok_or_else(|| error("poll_event", "wait overflow"))?;
         loop {
@@ -3673,13 +3808,13 @@ impl TraceBackend for MacosTraceBackend {
             if self.sessions.is_empty() || self.sessions.iter().all(|s| s.done) {
                 return Err(error("next_event", "no live processes"));
             }
-            if Instant::now() >= limit {
+            if crate::clock::now() >= limit {
                 return Ok(umbra_platform::EventPoll::Idle);
             }
-            let start = Instant::now();
+            let start = crate::clock::now();
             let count = self.sessions.len();
             for _ in 0..count {
-                if Instant::now() >= limit {
+                if crate::clock::now() >= limit {
                     break;
                 }
                 let i = self.poll_cursor % self.sessions.len();
@@ -3706,7 +3841,8 @@ impl TraceBackend for MacosTraceBackend {
                     continue;
                 }
                 if let Some(reply) = self.sessions[i].rsp.poll(
-                    Duration::from_millis(2).min(limit.saturating_duration_since(Instant::now())),
+                    Duration::from_millis(2)
+                        .min(limit.saturating_duration_since(crate::clock::now())),
                 )? {
                     self.stop(i, reply, false)?;
                 }
@@ -3715,10 +3851,10 @@ impl TraceBackend for MacosTraceBackend {
                 }
             }
             // A parked/stopped tree must not busy-spin between idle replies.
-            if self.events.is_empty() && Instant::now() < limit {
+            if self.events.is_empty() && crate::clock::now() < limit {
                 let pause = Duration::from_millis(1)
                     .saturating_sub(start.elapsed())
-                    .min(limit.saturating_duration_since(Instant::now()));
+                    .min(limit.saturating_duration_since(crate::clock::now()));
                 if !pause.is_zero() {
                     std::thread::sleep(pause);
                 }
@@ -3892,16 +4028,20 @@ impl TraceControl for MacosTraceBackend {
             ));
         }
         self.check_deadline()?;
+        let quiesce_limit = operation_deadline(self.deadline, Duration::from_secs(5));
         let result = (|| {
             // Interrupt all live connections before waiting on any one of them.
             for s in &mut self.sessions {
                 if !s.done && !s.stopped {
-                    s.rsp.interrupt()?;
+                    s.rsp.interrupt_until(quiesce_limit)?;
                 }
             }
             for i in 0..self.sessions.len() {
                 while !self.sessions[i].done && !self.sessions[i].stopped {
                     self.check_deadline()?;
+                    if crate::clock::now() >= quiesce_limit {
+                        return Err(error("quiesce", "operation deadline expired"));
+                    }
                     let Some(reply) = self.sessions[i].rsp.poll(Duration::from_millis(10))? else {
                         continue;
                     };
@@ -3967,6 +4107,9 @@ impl TraceControl for MacosTraceBackend {
         }
         if !matches!(policy, TerminationPolicy::Immediate) {
             return Err(unsupported("graceful tree termination"));
+        }
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.terminate_registered();
         }
         for s in self.sessions.iter().rev() {
             if !s.done {
@@ -4494,7 +4637,7 @@ mod bounded_poll_tests {
             umbra_platform::EventPoll::Event(_)
         ));
         backend.events.push_back(exit_event());
-        backend.deadline = Some(Instant::now());
+        backend.deadline = Some(crate::clock::now());
         assert!(backend
             .poll_event(Duration::from_millis(1))
             .unwrap_err()
@@ -4513,5 +4656,74 @@ mod bounded_poll_tests {
         for wait in [Duration::ZERO, Duration::MAX] {
             assert!(backend.poll_event(wait).is_err());
         }
+    }
+}
+
+fn operation_deadline(lifetime: Option<Instant>, budget: Duration) -> Instant {
+    let limit = crate::clock::now() + budget;
+    lifetime.map_or(limit, |d| d.min(limit))
+}
+
+#[cfg(test)]
+mod monitor_sleep_tests {
+    use super::*;
+    use crate::{clock::SCRIPT, owner::Wake};
+    #[test]
+    fn early_timeout_then_disarm_does_not_terminate() {
+        let start = Instant::now();
+        let mut calls = 0;
+        SCRIPT.with(|v| v.set(Some((start, start + Duration::from_secs(86400)))));
+        assert_eq!(
+            monitor_reason(Some(start + Duration::from_secs(1)), || {
+                calls += 1;
+                Ok(if calls == 1 {
+                    Wake::Timeout
+                } else {
+                    Wake::Disarm
+                })
+            }),
+            None
+        );
+        assert_eq!(calls, 2);
+        SCRIPT.with(|v| v.set(None));
+    }
+    struct Count(std::rc::Rc<std::cell::Cell<usize>>);
+    impl KillOwned for Count {
+        fn kill_owned(&self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    #[test]
+    fn latched_reason_kills_every_task_once_including_late_registration() {
+        for reason in [
+            "session timed out",
+            "supervisor gone",
+            "owner monitor failed",
+        ] {
+            let count = std::rc::Rc::new(std::cell::Cell::new(0));
+            let mut tasks = WatchedTasks::default();
+            tasks.add(Count(count.clone()));
+            tasks.add(Count(count.clone()));
+            tasks.latch(reason);
+            tasks.latch(reason);
+            assert_eq!(count.get(), 2);
+            tasks.add(Count(count.clone()));
+            assert_eq!(count.get(), 3);
+            assert_eq!(tasks.reason, Some(reason));
+        }
+    }
+    #[test]
+    fn genuine_expiry_and_owner_loss_are_terminal() {
+        let start = Instant::now();
+        SCRIPT.with(|v| v.set(Some((start, start))));
+        assert_eq!(
+            monitor_reason(Some(start), || Ok(Wake::Timeout)),
+            Some("session timed out")
+        );
+        assert_eq!(
+            monitor_reason(None, || Ok(Wake::OwnerGone)),
+            Some("supervisor gone")
+        );
+        SCRIPT.with(|v| v.set(None));
     }
 }

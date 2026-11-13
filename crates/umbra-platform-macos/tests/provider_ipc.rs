@@ -92,7 +92,7 @@ fn open_libc_provider_ipc() {
             version: wire::PROTOCOL_VERSION,
             required_capabilities: ["darwin-arm64-abi-v1".into()].into_iter().collect(),
             options: serde_json::to_vec(&Options {
-                timeout_ms: 25_000,
+                timeout_ms: Some(25_000),
                 ..Options::default()
             })
             .unwrap(),

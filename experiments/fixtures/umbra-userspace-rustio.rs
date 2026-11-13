@@ -17,7 +17,7 @@
 // channel and no debugger:
 //
 // TWO cases, and they are deliberately two RUNS rather than one. The registry
-// `timeout_ms` is a whole-session watchdog (see `BIG`), so every leg sharing a run
+// The harness platform option `timeout_ms` opts into a whole-session watchdog (see `BIG`), so every leg sharing a run
 // shares one budget with process start and the twin resign. Leg vi is the
 // expensive one and it is on its own.
 //
@@ -170,14 +170,12 @@ const LEAF: &[u8] = b"leaf under a routed directory\n";
 /// is two clamped calls plus an 8-byte third. A loop that stopped after one
 /// remainder would leave those 8 bytes unwritten and the size assertion sees it.
 ///
-/// **The ceiling is a watchdog, and it is why this is not larger.** The registry
-/// `timeout_ms` is not only the per-request IPC deadline: it is also the tracer's
-/// *whole-session* watchdog (`native.rs:1573`, `rsp.rs:146`), set before the twin
-/// is even resigned, and the writer lease refuses any value at or above 15 s
-/// (`check_renewal_budget`: `renew_after_millis / 2 <= timeout_ms`), so the
-/// harness's 12 s is already near the top of the legal range and cannot be
-/// raised. Leg vi moves this payload three times -- one `write_all`, then
-/// `fs::read`, then `read_to_end` -- so its cost is three times whatever this is.
+/// **This harness explicitly opts into a watchdog.** Its platform option
+/// `timeout_ms` bounds the whole session, including initial signing. The registry
+/// timeout separately bounds RPCs and must satisfy writer-renewal constraints.
+/// Production sessions have no default lifetime limit. The historical 12 s
+/// measurements below concern the harness's explicit platform opt-in, not a
+/// mandatory production bound. Leg vi moves this payload three times.
 ///
 /// **The margin is load-bound, not size-bound, and that is the thing to know
 /// before touching this number.** Measured on a 10-core host, **leg vi alone in a
@@ -375,8 +373,8 @@ fn case_edit(destination: &Path) -> i32 {
 
 /// The whole of case `big`: leg vi, in a routed run of its own.
 ///
-/// **Why this is a separate case and not the sixth leg of `edit`.** The registry
-/// `timeout_ms` is a whole-*session* watchdog, not a per-call one, and it is armed
+/// **Why this is a separate case and not the sixth leg of `edit`.** The harness
+/// explicitly configures a platform whole-session watchdog, which is armed
 /// before the twin is even resigned. Run sixth inside `edit`, leg vi's budget was
 /// therefore shared with process start, the resign, and five other legs -- so the
 /// margin measured for leg vi on its own never described the session the harness

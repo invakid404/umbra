@@ -38,7 +38,8 @@ pub struct Rsp {
     child: Child,
     buffer: Vec<u8>,
     no_ack: bool,
-    deadline: Instant,
+    deadline: Option<Instant>,
+    setup_deadline: Option<Instant>,
     /// Set once the owning session's ordered teardown has killed and reaped
     /// the tracer, so `Drop` does not do it a second time.
     torn_down: bool,
@@ -78,9 +79,24 @@ pub fn discover_debugserver() -> Option<std::path::PathBuf> {
 }
 impl Rsp {
     pub fn deadline(&self) -> Instant {
-        self.deadline
+        self.limit(Duration::from_secs(10))
     }
-    pub fn connect(options: &Options, deadline: Instant) -> Result<Self> {
+    fn limit(&self, budget: Duration) -> Instant {
+        let mut limit = crate::clock::now() + budget;
+        for d in [self.deadline, self.setup_deadline].into_iter().flatten() {
+            limit = limit.min(d);
+        }
+        limit
+    }
+    pub fn begin_setup(&mut self) {
+        if self.setup_deadline.is_none() {
+            self.setup_deadline = Some(self.limit(Duration::from_secs(10)));
+        }
+    }
+    pub fn finish_setup(&mut self) {
+        self.setup_deadline = None;
+    }
+    pub fn connect(options: &Options, deadline: Option<Instant>) -> Result<Self> {
         let executable = match &options.debugserver {
             Some(p) => p.clone(),
             None => discover_debugserver()
@@ -103,7 +119,10 @@ impl Rsp {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| error("debugserver spawn", e))?;
-        let limit = deadline.min(Instant::now() + Duration::from_secs(10));
+        let limit = deadline.map_or_else(
+            || crate::clock::now() + Duration::from_secs(10),
+            |d| d.min(crate::clock::now() + Duration::from_secs(10)),
+        );
         let stream = loop {
             match listener.accept() {
                 Ok((s, _)) => break s,
@@ -114,7 +133,7 @@ impl Rsp {
                     return Err(error("debugserver accept", e));
                 }
             }
-            if Instant::now() >= limit
+            if crate::clock::now() >= limit
                 || child
                     .try_wait()
                     .map_err(|e| error("debugserver wait", e))?
@@ -142,11 +161,10 @@ impl Rsp {
             buffer: Vec::new(),
             no_ack: false,
             deadline,
+            setup_deadline: Some(limit),
             torn_down: false,
         };
-        r.stream
-            .write_all(b"+")
-            .map_err(|e| error("rsp handshake", e))?;
+        r.write_packet(b"+", r.limit(Duration::from_secs(2)))?;
         r.ok("QStartNoAckMode")?;
         r.no_ack = true;
         r.request("qSupported:xmlRegisters=arm64")?;
@@ -163,11 +181,39 @@ impl Rsp {
         r.ok("QSetDetachOnError:0")?;
         Ok(r)
     }
+    fn write_packet(&mut self, bytes: &[u8], limit: Instant) -> Result<()> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let remaining = limit
+                .checked_duration_since(crate::clock::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| error("rsp write", "deadline expired"))?;
+            self.stream
+                .set_write_timeout(Some(read_timeout(remaining)))
+                .map_err(|e| error("rsp write", e))?;
+            match self.stream.write(&bytes[offset..]) {
+                Ok(0) => return Err(error("rsp write", "debugserver disconnected")),
+                Ok(n) => offset += n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(error("rsp write", e)),
+            }
+        }
+        Ok(())
+    }
     pub fn send(&mut self, body: &str) -> Result<()> {
         if std::env::var_os("UMBRA_RSP_LOG").is_some() {
             eprintln!("RSP[{}] > {body}", self.id);
         }
-        if Instant::now() >= self.deadline {
+        if self.deadline.is_some_and(|d| crate::clock::now() >= d) {
             return Err(error("watchdog", "session deadline expired"));
         }
         let mut escaped = Vec::new();
@@ -183,18 +229,17 @@ impl Rsp {
         let mut packet = vec![b'$'];
         packet.extend(escaped);
         packet.extend(format!("#{sum:02x}").bytes());
-        self.stream
-            .write_all(&packet)
-            .map_err(|e| error("rsp send", e))
+        self.write_packet(&packet, self.limit(Duration::from_secs(2)))
     }
     #[allow(dead_code)]
     pub fn interrupt(&mut self) -> Result<()> {
-        self.stream
-            .write_all(&[3])
-            .map_err(|e| error("rsp interrupt", e))
+        self.interrupt_until(self.limit(Duration::from_secs(2)))
+    }
+    pub fn interrupt_until(&mut self, limit: Instant) -> Result<()> {
+        self.write_packet(&[3], limit.min(self.limit(Duration::from_secs(2))))
     }
     pub fn poll(&mut self, timeout: Duration) -> Result<Option<String>> {
-        self.poll_until((Instant::now() + timeout).min(self.deadline))
+        self.poll_until(self.limit(timeout))
     }
     /// `poll` against an explicit limit. Teardown reads through this with its
     /// own bound, because the session deadline may already have expired (the
@@ -223,9 +268,7 @@ impl Rsp {
                         let raw = self.buffer[start + 1..end].to_vec();
                         self.buffer.drain(..end + 3);
                         if !self.no_ack {
-                            self.stream
-                                .write_all(b"+")
-                                .map_err(|e| error("rsp ack", e))?;
+                            self.write_packet(b"+", limit)?;
                         }
                         let mut data = Vec::new();
                         let mut i = 0;
@@ -259,16 +302,16 @@ impl Rsp {
             } else {
                 self.buffer.clear();
             }
-            if Instant::now() >= limit {
+            if crate::clock::now() >= limit {
                 return Ok(None);
             }
             self.stream
                 .set_read_timeout(Some(read_timeout(
-                    limit.saturating_duration_since(Instant::now()),
+                    limit.saturating_duration_since(crate::clock::now()),
                 )))
                 .map_err(|e| error("rsp timeout", e))?;
             let mut bytes = [0; 8192];
-            match self.stream.read(&mut bytes) {
+            match self.read_progress(&mut bytes) {
                 Ok(0) => return Err(error("rsp", "debugserver disconnected")),
                 Ok(n) => {
                     if std::env::var_os("UMBRA_RSP_LOG").is_some() {
@@ -283,10 +326,12 @@ impl Rsp {
                 Err(e)
                     if matches!(
                         e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
                     ) =>
                 {
-                    return Ok(None)
+                    continue;
                 }
                 Err(e) => return Err(error("rsp receive", e)),
             }
@@ -295,12 +340,30 @@ impl Rsp {
             }
         }
     }
+    fn read_progress(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if EARLY_PACKET.with(|v| v.get()) && !self.buffer.is_empty() {
+            EARLY_PACKET.with(|v| v.set(false));
+            let awake = crate::clock::now();
+            crate::clock::SCRIPT.with(|v| v.set(Some((awake, awake + Duration::from_secs(86400)))));
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        } else {
+            let len = if EARLY_PACKET.with(|v| v.get()) {
+                3
+            } else {
+                bytes.len()
+            };
+            self.stream.read(&mut bytes[..len])
+        }
+        #[cfg(not(test))]
+        self.stream.read(bytes)
+    }
     pub fn request(&mut self, body: &str) -> Result<String> {
         self.send(body)?;
-        let limit = self.deadline.min(Instant::now() + Duration::from_secs(5));
+        let limit = self.limit(Duration::from_secs(5));
         loop {
             let reply = self
-                .poll(limit.saturating_duration_since(Instant::now()))?
+                .poll(limit.saturating_duration_since(crate::clock::now()))?
                 .ok_or_else(|| error("rsp request", format!("timeout: {body}")))?;
             if reply.starts_with('O') && reply != "OK" {
                 continue;
@@ -334,7 +397,7 @@ impl Rsp {
     }
     /// One bounded read of whatever the tracer sends during teardown.
     pub fn teardown_read(&mut self, wait: Duration) -> TeardownRead {
-        match self.poll_until(Instant::now() + wait) {
+        match self.poll_until(crate::clock::now() + wait) {
             Ok(Some(packet)) => TeardownRead::Packet(packet),
             Ok(None) => TeardownRead::Quiet,
             Err(e) => TeardownRead::Closed(e.to_string()),
@@ -346,14 +409,14 @@ impl Rsp {
     }
     /// Reap the tracer with `WNOHANG` polls until `bound`; true once reaped.
     pub fn reap_tracer(&mut self, bound: Duration) -> bool {
-        let limit = Instant::now() + bound;
+        let limit = crate::clock::now() + bound;
         loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => return true,
                 Ok(None) => {}
                 Err(_) => return false,
             }
-            if Instant::now() >= limit {
+            if crate::clock::now() >= limit {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -413,7 +476,7 @@ mod tests {
         }
         let mut rsp = Rsp::connect(
             &Options::default(),
-            Instant::now() + Duration::from_secs(10),
+            Some(crate::clock::now() + Duration::from_secs(10)),
         )
         .unwrap();
         // Exercise a reply after negotiation, when debugserver sends #00.
@@ -444,7 +507,8 @@ mod poll_bound_tests {
             child,
             buffer: Vec::new(),
             no_ack: true,
-            deadline: Instant::now() + Duration::from_secs(2),
+            deadline: Some(crate::clock::now() + Duration::from_secs(2)),
+            setup_deadline: None,
             torn_down: true,
         };
         peer.write_all(b"$T05thread:").unwrap();
@@ -472,5 +536,38 @@ mod poll_bound_tests {
                 Duration::from_micros(expected)
             );
         }
+    }
+}
+
+#[cfg(test)]
+thread_local! { static EARLY_PACKET:std::cell::Cell<bool>=const{std::cell::Cell::new(false)}; }
+#[cfg(test)]
+mod early_packet_test {
+    use super::*;
+    #[test]
+    fn partial_packet_survives_early_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        let mut rsp = Rsp {
+            id: 0,
+            stream,
+            child,
+            buffer: vec![],
+            no_ack: true,
+            deadline: None,
+            setup_deadline: None,
+            torn_down: true,
+        };
+        peer.write_all(b"$T05thread:1;#00").unwrap();
+        EARLY_PACKET.with(|v| v.set(true));
+        assert_eq!(
+            rsp.poll(Duration::from_secs(2)).unwrap().as_deref(),
+            Some("T05thread:1;")
+        );
+        assert!(rsp.buffer.is_empty());
+        crate::clock::SCRIPT.with(|v| v.set(None));
     }
 }

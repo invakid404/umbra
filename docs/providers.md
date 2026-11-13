@@ -69,7 +69,12 @@ Codex options encode `CodexConfig`; the template's `UNQUALIFIED` version is a pl
 requiring replacement and qualification before runtime use. Claude, file journal and
 the Linux platform stub require empty options. The macOS provider accepts JSON
 `Options { debugserver, twin_cache, timeout_ms }`, or empty options for defaults;
-it implements experimental arm64 tracing and advertises `darwin-arm64-abi-v1`.
+`timeout_ms` is an optional platform lifetime, disabled when omitted or null.
+Explicit values 1..=3,600,000 ms opt in; they are separate from registry RPC bounds.
+The executable monitors authenticated supervisor exit and socket EOF, with no
+inactivity detector. See the [macOS provider](../crates/umbra-platform-macos/README.md#session-lifetime-and-supervisor-loss)
+for awake-time operation budgets, resume and cleanup limits.
+It implements experimental arm64 tracing and advertises `darwin-arm64-abi-v1`.
 Descriptor capabilities are required open
 capability names, verified against the provider handshake. Stubs advertise no runtime
 support. An empty capability requirement permits connection testing, never authorization

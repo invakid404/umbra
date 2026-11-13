@@ -28,7 +28,7 @@ fn owner_process() {
     };
     let dir = std::path::PathBuf::from(dir);
     let listener = UnixListener::bind(dir.join("socket")).unwrap();
-    let provider = Command::new(env!("CARGO_BIN_EXE_umbra-platform-macos"))
+    let mut provider = Command::new(env!("CARGO_BIN_EXE_umbra-platform-macos"))
         .arg("--umbra-socket")
         .arg(dir.join("socket"))
         .args(["--umbra-timeout-ms", "10000"])
@@ -114,6 +114,7 @@ fn owner_process() {
     // The parent test owns termination; keep this supervisor alive for EOF.
     let _ = std::io::stdin().read_exact(&mut byte);
     std::mem::forget(client);
+    let _ = provider.wait();
 }
 
 #[derive(Debug)]
@@ -280,6 +281,14 @@ fn loss(duplicate: bool) {
         );
     }
     drop(owned); // Recovery is after the primary reading.
+    if !duplicate {
+        use std::io::Write;
+        let _ = owner.stdin.as_mut().unwrap().write_all(b"x");
+        let until = Instant::now() + Duration::from_secs(1);
+        while owner.try_wait().unwrap().is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     let _ = owner.kill();
     let _ = owner.wait();
     assert!(confirmed, "owner-loss cleanup not confirmed within 4s");

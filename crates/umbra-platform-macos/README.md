@@ -123,8 +123,9 @@ The M1 mechanisms named in the tracker spec are all present:
    intercepts and defers, and return breakpoints track reaped children.
    See `native.rs::ReturnKind::Wait` and **Wait decisions** below.
 7. **SIGHUP suppression** on newly attached children.
-8. **Embedded watchdog**: an `mpsc`-cancellable worker thread terminates
-   all held Mach tasks on deadline (`native.rs::Watchdog`).
+8. **Owner monitor and opt-in watchdog**: a kqueue worker terminates held Mach
+   tasks on authenticated supervisor exit or transport EOF. A lifetime deadline
+   exists only with an explicit `Options::timeout_ms` (`native.rs::Watchdog`).
 9. **Userspace-routing interposer**: `interpose/umbra_interpose.c`, compiled
    universal (arm64 + arm64e) by `build.rs`, embedded in this binary and
    published into the twin cache at launch. `LaunchPolicy::interpose` loads it
@@ -1116,3 +1117,36 @@ time. A separate test requires an
 a C compiler and debugger permission. The socketpair/socket tests additionally
 pin a partial RSP packet surviving Idle, the 1ms read floor, queued-event
 precedence and watchdog precedence.
+
+## Session lifetime and supervisor loss
+
+There is no default session-age or inactivity limit. Omitted/null `timeout_ms`
+means no lifetime cap; numeric milliseconds opt in, with 1..=3,600,000 accepted.
+This option is independent of the registry's per-request IPC timeout. All timing
+uses awake uptime: laptop sleep does not expire a budget, and early timeout
+wakeups retain partial transport/RSP progress. Resume starts a new provider session
+and a fresh opt-in budget; fork/exec do not renew the current session's budget.
+
+The executable binds its actual parent's process generation to the Unix socket
+peer, registers NOTE_EXIT and EOF observation, then revalidates before launch.
+Observation failure refuses launch. No protocol bytes are consumed by the monitor.
+Owner exit still triggers when another process retains the socket. The monitor
+kills registered tasks; late registrations are killed immediately. The provider
+thread performs existing ordered teardown and retains unconfirmed diagnostics.
+Normal disarm does not kill tasks. No heartbeat or inactivity-based "stuck"
+classification exists: a busy supervisor is never treated as stuck. Killing a hung
+supervisor supplies the definitive gone signal.
+
+Signing/publication and attach/setup have 10-second per-operation budgets;
+quiesce has a five-second aggregate budget, clipped by any opt-in lifetime.
+RSP retains connect/request/poll caps. These bound individual operations, not a
+healthy session's lifetime. Owner loss during work not released by task termination
+(such as a signing subprocess or connect) can wait for that operation's budget.
+A direct in-process backend has no external owner watch; its containing process's
+SIGKILL cannot run Rust cleanup. Provider/group/guardian-loss residuals in #198,
+#199 and #202 remain; this does not implement #268's public cancellation API.
+
+CI runs `owner_loss` only with `UMBRA_INTEGRATION_REQUIRED` on self-hosted
+native-qualification. The default-options 35-second native/routed control is
+`fix_264_default_idle_survives` in the self-hosted userspace suite. Scripted clocks,
+partial-progress adapters and task-registration policy tests execute on hosted Rust.

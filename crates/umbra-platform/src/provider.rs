@@ -599,7 +599,8 @@ pub fn serve_provider_on(
     serve_session(connection, platform)
 }
 
-fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> Result<()> {
+/// Dispatch an already negotiated platform connection, retaining teardown diagnostics.
+pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> Result<()> {
     let mut roots = Vec::new();
     let result = (|| {
         let mut previous = 0;
@@ -658,9 +659,12 @@ fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> R
         }
     })();
     for process in roots {
-        let _ = platform
+        if let Err(error) = platform
             .control
-            .terminate(process, TerminationPolicy::Immediate);
+            .terminate(process, TerminationPolicy::Immediate)
+        {
+            eprintln!("platform provider termination unconfirmed: {error}");
+        }
     }
     result
 }
