@@ -186,7 +186,7 @@ where
         let retired = self.tasks.iter().position(|task| Arc::ptr_eq(task, old));
         // Register (and, if latched, kill) the replacement before retiring anything.
         self.add(new);
-        retired.map(|index| self.tasks.swap_remove(index))
+        retired.map(|index| self.tasks.remove(index))
     }
 }
 struct Watchdog {
