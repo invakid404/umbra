@@ -78,7 +78,9 @@ fn owner_process() {
         Some(
             Command::new("/bin/sleep")
                 .arg("20")
-                .stdin(Stdio::from(retained.try_clone().unwrap()))
+                .stdin(Stdio::from(std::os::fd::OwnedFd::from(
+                    retained.try_clone().unwrap(),
+                )))
                 .spawn()
                 .unwrap(),
         )
