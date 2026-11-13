@@ -647,6 +647,13 @@ pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) 
                     .abi
                     .emulate_result(&mut regs, &result)
                     .map(|()| Response::Registers(regs)),
+                Request::Terminate { process, policy } => {
+                    let result = platform.control.terminate(process, policy);
+                    if result.is_ok() {
+                        roots.retain(|root| *root != process);
+                    }
+                    result.map(|()| Response::Unit)
+                }
                 request => control_request(&mut *platform.control, request),
             };
             if let Ok(Response::Process(process)) = &result {

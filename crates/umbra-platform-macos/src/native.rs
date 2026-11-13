@@ -184,8 +184,11 @@ struct Watchdog {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 impl Watchdog {
-    fn new(deadline: Option<Instant>, owner: Option<crate::owner::OwnerWatch>) -> Result<Self> {
-        let tasks = Arc::new(Mutex::new(WatchedTasks::default()));
+    fn new(
+        deadline: Option<Instant>,
+        owner: Option<crate::owner::OwnerWatch>,
+        tasks: Arc<Mutex<WatchedTasks>>,
+    ) -> Result<Self> {
         let owned = tasks.clone();
         let (waiter, cancel) = crate::owner::Waiter::new(owner)?;
         let worker = std::thread::Builder::new()
@@ -1608,7 +1611,8 @@ pub struct MacosTraceBackend {
     deadline: Option<Instant>,
     launched: bool,
     watchdog: Option<Watchdog>,
-    owner: Option<crate::owner::OwnerWatch>,
+    // Provider-lifetime monitor, independent of launch/terminate.
+    owner: Option<Watchdog>,
     generation: u64,
     /// The routing interposer this run loads and the image it routes in, if any.
     ///
@@ -2011,10 +2015,18 @@ impl MacosTraceBackend {
         if self.launched || self.owner.is_some() {
             return Err(unsupported("owner-observation: already configured"));
         }
-        self.owner = Some(crate::owner::OwnerWatch::new(identity, stream)?);
+        let watch = crate::owner::OwnerWatch::new(identity, stream)?;
+        self.owner = Some(Watchdog::new(
+            None,
+            Some(watch),
+            Arc::new(Mutex::new(WatchedTasks::default())),
+        )?);
         Ok(())
     }
     fn check_deadline(&mut self) -> Result<()> {
+        if let Some(reason) = self.owner.as_ref().and_then(Watchdog::reason) {
+            return Err(error("owner-observation", reason));
+        }
         if let Some(reason) = self.watchdog.as_ref().and_then(Watchdog::reason) {
             return Err(error("watchdog", reason));
         }
@@ -2142,7 +2154,13 @@ impl MacosTraceBackend {
             .transpose()?;
         self.launched = true;
         self.deadline = deadline;
-        self.watchdog = Some(Watchdog::new(deadline, self.owner.take())?);
+        self.check_deadline()?;
+        let tasks = self
+            .owner
+            .as_ref()
+            .map(|owner| owner.tasks.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(WatchedTasks::default())));
+        self.watchdog = Some(Watchdog::new(deadline, None, tasks)?);
         let twin = cache::resign(
             Path::new(OsStr::from_bytes(spec.executable.as_bytes())),
             &self.options,

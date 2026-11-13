@@ -197,7 +197,7 @@ impl Connection {
                 .map_err(unavailable)?;
             let count = match self.write_progress(bytes, offset) {
                 Ok(count) => count,
-                // The write hit its deadline: report the miss, not the raw errno.
+                // Early wakes retain progress; the next iteration rechecks the same deadline.
                 Err(ref e)
                     if is_deadline_timeout(e) || e.kind() == std::io::ErrorKind::Interrupted =>
                 {
