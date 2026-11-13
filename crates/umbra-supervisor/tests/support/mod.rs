@@ -545,6 +545,7 @@ fn budget() -> RunBudget {
 }
 
 /// Drive Idle on a caller-owned persistent namespace and return its ownership.
+#[allow(dead_code)] // Used by reopen; this module also serves kernel_refusal.
 pub fn idle_namespace(
     run_id: RunId,
     namespace: Box<dyn NamespaceSession + Send>,
