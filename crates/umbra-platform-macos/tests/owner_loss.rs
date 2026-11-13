@@ -62,7 +62,16 @@ fn owner_process() {
                 interpose: false,
                 descriptor_limit: None,
             },
-            sandbox: SandboxRequirement::UnsandboxedExperiment,
+            sandbox: SandboxRequirement::Required(
+                SandboxProfile::new(
+                    SEATBELT_PROFILE_FORMAT,
+                    include_str!("../../../experiments/seatbelt/umbra.sb")
+                        .replace("{{UMBRA_RUN_ROOT}}", &format!("\"{}\"", dir.display()))
+                        .into_bytes(),
+                    path(dir.to_str().unwrap()),
+                )
+                .unwrap(),
+            ),
         }),
     ) else {
         panic!("launch")

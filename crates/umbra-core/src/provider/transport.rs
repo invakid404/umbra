@@ -105,7 +105,22 @@ impl Connection {
         while offset < out.len() {
             let remaining = self.remaining()?;
             let count = match self.stream.set_read_timeout(Some(remaining)) {
-                Ok(()) => match self.stream.read(&mut out[offset..]) {
+                Ok(()) => match {
+                    #[cfg(test)]
+                    if FIX264_EARLY.with(|v| v.get()) && offset > 0 {
+                        FIX264_EARLY.with(|v| v.set(false));
+                        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                    } else {
+                        let end = if FIX264_EARLY.with(|v| v.get()) {
+                            offset + 1
+                        } else {
+                            out.len()
+                        };
+                        self.stream.read(&mut out[offset..end])
+                    }
+                    #[cfg(not(test))]
+                    self.stream.read(&mut out[offset..])
+                } {
                     Ok(count) => count,
                     // The read hit its deadline: report the miss, not the raw errno.
                     Err(ref e) if is_deadline_timeout(e) => {
@@ -136,7 +151,22 @@ impl Connection {
             self.stream
                 .set_write_timeout(Some(self.remaining()?))
                 .map_err(unavailable)?;
-            let count = match self.stream.write(&bytes[offset..]) {
+            let count = match {
+                #[cfg(test)]
+                if FIX264_EARLY.with(|v| v.get()) && offset > 0 {
+                    FIX264_EARLY.with(|v| v.set(false));
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                } else {
+                    let end = if FIX264_EARLY.with(|v| v.get()) {
+                        offset + 1
+                    } else {
+                        bytes.len()
+                    };
+                    self.stream.write(&bytes[offset..end])
+                }
+                #[cfg(not(test))]
+                self.stream.write(&bytes[offset..])
+            } {
                 Ok(count) => count,
                 // The write hit its deadline: report the miss, not the raw errno.
                 Err(ref e) if is_deadline_timeout(e) => {
@@ -853,5 +883,46 @@ mod tests {
             error.to_string().contains("request deadline exceeded"),
             "a timed-out read reports the deadline miss, not `os error 35`: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+thread_local! { static FIX264_EARLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+mod fix264_sleep_probe {
+    use super::*;
+    #[test]
+    fn early_read_timeout_preserves_progress() {
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        peer.write_all(b"ab").unwrap();
+        let mut conn = Connection::new(socket, Duration::from_secs(5));
+        FIX264_EARLY.with(|v| v.set(true));
+        let mut out = [0; 2];
+        let result = conn.read_exact(&mut out);
+        assert!(Instant::now() < conn.deadline);
+        eprintln!("partial read={out:?}, early result={result:?}");
+        assert!(
+            result.is_ok(),
+            "early timeout before uptime deadline must preserve progress"
+        );
+        assert_eq!(&out, b"ab");
+    }
+    #[test]
+    fn early_write_timeout_preserves_progress() {
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let mut conn = Connection::new(socket, Duration::from_secs(5));
+        FIX264_EARLY.with(|v| v.set(true));
+        let result = conn.write_all(b"ab");
+        assert!(Instant::now() < conn.deadline);
+        let mut first = [0; 1];
+        peer.read_exact(&mut first).unwrap();
+        eprintln!("first written={first:?}, early result={result:?}");
+        assert!(
+            result.is_ok(),
+            "early timeout before uptime deadline must preserve progress"
+        );
+        let mut rest = [0; 1];
+        peer.read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"b");
     }
 }
