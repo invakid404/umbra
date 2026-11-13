@@ -178,6 +178,17 @@ impl<T: KillOwned> WatchedTasks<T> {
         }
     }
 }
+// Test adapter for the existing exec registration behavior; replacement only adds.
+#[cfg(test)]
+impl<T> WatchedTasks<Arc<T>>
+where
+    Arc<T>: KillOwned,
+{
+    fn replace(&mut self, _old: &Arc<T>, new: Arc<T>) -> Option<Arc<T>> {
+        self.add(new);
+        None
+    }
+}
 struct Watchdog {
     tasks: Arc<Mutex<WatchedTasks>>,
     cancel: Option<std::os::unix::net::UnixStream>,
@@ -4712,6 +4723,78 @@ mod monitor_sleep_tests {
         fn kill_owned(&self) {
             self.0.set(self.0.get() + 1);
         }
+    }
+    impl KillOwned for Arc<std::sync::atomic::AtomicUsize> {
+        fn kill_owned(&self) {
+            self.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn counted() -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::new(std::sync::atomic::AtomicUsize::new(0))
+    }
+    #[test]
+    fn exec_replacements_keep_registry_bounded() {
+        let mut registry = WatchedTasks::default();
+        let mut current = counted();
+        registry.add(current.clone());
+        for _ in 0..128 {
+            let next = counted();
+            let retired = registry.replace(&current, next.clone());
+            assert_eq!(registry.tasks.len(), 1);
+            assert!(Arc::ptr_eq(retired.as_ref().unwrap(), &current));
+            drop(retired);
+            assert_eq!(Arc::strong_count(&current), 1);
+            current = next;
+        }
+    }
+    #[test]
+    fn exec_replacements_latch_kills_only_current_entries_once() {
+        let mut registry = WatchedTasks::default();
+        let sibling = counted();
+        let old = counted();
+        let new = counted();
+        registry.add(sibling.clone());
+        registry.add(old.clone());
+        drop(registry.replace(&old, new.clone()));
+        registry.latch("supervisor gone");
+        registry.latch("supervisor gone");
+        assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(sibling.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn exec_replacement_after_latch_kills_at_registration() {
+        let mut registry = WatchedTasks::default();
+        let old = counted();
+        let new = counted();
+        registry.add(old.clone());
+        registry.latch("supervisor gone");
+        drop(registry.replace(&old, new.clone()));
+        assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(registry.tasks.len(), 1);
+        assert!(Arc::ptr_eq(&registry.tasks[0], &new));
+        registry.latch("supervisor gone");
+        assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn exec_replacement_of_absent_entry_preserves_existing_entries() {
+        let mut registry = WatchedTasks::default();
+        let existing = counted();
+        let absent = counted();
+        let new = counted();
+        registry.add(existing.clone());
+        assert!(registry.replace(&absent, new.clone()).is_none());
+        assert_eq!(registry.tasks.len(), 2);
+        assert!(registry
+            .tasks
+            .iter()
+            .any(|entry| Arc::ptr_eq(entry, &existing)));
+        assert!(registry.tasks.iter().any(|entry| Arc::ptr_eq(entry, &new)));
+        registry.latch("supervisor gone");
+        assert_eq!(existing.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(absent.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
     #[test]
     fn latched_reason_kills_every_task_once_including_late_registration() {
