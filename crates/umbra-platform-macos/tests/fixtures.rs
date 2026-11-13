@@ -146,7 +146,7 @@ fn fixture_argv_locked(
     assert!(!host.exists(), "fixture host output already exists");
     assert!(!shadow.exists(), "fixture shadow output already exists");
     let mut tracer = MacosTraceBackend::new(Options {
-        timeout_ms: 25_000,
+        timeout_ms: Some(25_000),
         ..Options::default()
     });
     let process = tracer
@@ -1265,7 +1265,7 @@ fn overlay_fixture(
         .unwrap();
 
     let mut tracer = MacosTraceBackend::new(Options {
-        timeout_ms: 25_000,
+        timeout_ms: Some(25_000),
         ..Options::default()
     });
     let handle = tracer
@@ -1755,7 +1755,7 @@ fn teardown_launch(case: &str) -> Option<(MacosTraceBackend, ProcessHandle, i32,
     let fixture = PathBuf::from(fixture);
     let host = std::env::temp_dir().join(format!("umbra-teardown-{}-{case}", std::process::id()));
     let mut tracer = MacosTraceBackend::new(Options {
-        timeout_ms: 25_000,
+        timeout_ms: Some(25_000),
         ..Options::default()
     });
     let process = tracer
@@ -2100,7 +2100,7 @@ fn mt_spawn_until(
     let host = std::env::temp_dir().join(format!("umbra-teardown-{}-{case}", std::process::id()));
     std::fs::create_dir_all(&host).unwrap();
     let mut tracer = MacosTraceBackend::new(Options {
-        timeout_ms: 25_000,
+        timeout_ms: Some(25_000),
         ..Options::default()
     });
     let process = tracer

@@ -80,7 +80,7 @@ fn drive(case: &str, fixture: &Path, root: &Path, rewrite: bool) -> Outcome {
     std::os::unix::fs::symlink(cache.path(), &alias).unwrap();
     let mut tracer = MacosTraceBackend::new(Options {
         twin_cache: Some(alias),
-        timeout_ms: 40_000,
+        timeout_ms: Some(40_000),
         ..Options::default()
     });
     let process = tracer
@@ -314,7 +314,7 @@ fn failed_installer_reports_checked_reaping_evidence() {
         .unwrap()
         .replace("(allow process-exec)", "(deny process-exec)");
     let mut tracer = MacosTraceBackend::new(Options {
-        timeout_ms: 40_000,
+        timeout_ms: Some(40_000),
         ..Options::default()
     });
     let e = tracer

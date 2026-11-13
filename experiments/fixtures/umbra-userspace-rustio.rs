@@ -16,10 +16,9 @@
 // The case reports through the exit status, so the assertion needs no output
 // channel and no debugger:
 //
-// TWO cases, and they are deliberately two RUNS rather than one. The registry
-// `timeout_ms` is a whole-session watchdog (see `BIG`), so every leg sharing a run
-// shares one budget with process start and the twin resign. Leg vi is the
-// expensive one and it is on its own.
+// TWO cases in two RUNS. This preserves the historical fixture arrangement
+// measured under the former session watchdog (see `BIG`). The current registry
+// timeout bounds each RPC; the platform has no default session lifetime.
 //
 //   umbra-userspace-rustio edit <path>
 //       Five legs in one run, in this order, because the order is what the
@@ -170,14 +169,11 @@ const LEAF: &[u8] = b"leaf under a routed directory\n";
 /// is two clamped calls plus an 8-byte third. A loop that stopped after one
 /// remainder would leave those 8 bytes unwritten and the size assertion sees it.
 ///
-/// **The ceiling is a watchdog, and it is why this is not larger.** The registry
-/// `timeout_ms` is not only the per-request IPC deadline: it is also the tracer's
-/// *whole-session* watchdog (`native.rs:1573`, `rsp.rs:146`), set before the twin
-/// is even resigned, and the writer lease refuses any value at or above 15 s
-/// (`check_renewal_budget`: `renew_after_millis / 2 <= timeout_ms`), so the
-/// harness's 12 s is already near the top of the legal range and cannot be
-/// raised. Leg vi moves this payload three times -- one `write_all`, then
-/// `fs::read`, then `read_to_end` -- so its cost is three times whatever this is.
+/// **Historical sizing evidence.** The measurements below predate removal of
+/// the default platform lifetime. They do not describe the current registry's
+/// `timeout_ms`, which bounds individual RPCs and satisfies writer-renewal
+/// constraints. The current harness has no platform lifetime opt-in. Leg vi
+/// still moves this payload three times and tests the same chunk boundaries.
 ///
 /// **The margin is load-bound, not size-bound, and that is the thing to know
 /// before touching this number.** Measured on a 10-core host, **leg vi alone in a
@@ -195,13 +191,10 @@ const LEAF: &[u8] = b"leaf under a routed directory\n";
 /// That gap is why leg vi is now case `big`, in a routed run of its own: the
 /// measured session and the executed session are the same session again.
 ///
-/// **What that split buys, stated without overclaiming.** It raises the
-/// contention threshold, because leg vi no longer shares a budget. It does **not**
-/// make this case saturation-proof, and the ladder above is the reason: leg vi
-/// alone, dedicated run, full budget, still expires the watchdog at 8 burners.
-/// The residual is real and stays disclosed -- on a saturated host this is the
-/// most watchdog-exposed step in the job, because it makes three passes over this
-/// payload where the C `bigio` control makes two.
+/// The split improved the contention threshold under that historical watchdog;
+/// it did not make the case saturation-proof. Current per-request deadlines can
+/// still fail under contention. This fixture makes three payload passes where
+/// the C `bigio` control makes two.
 const BIG: usize = 2_097_152;
 
 /// Leg vi's payload, whose bytes are position-dependent on purpose.
@@ -375,13 +368,11 @@ fn case_edit(destination: &Path) -> i32 {
 
 /// The whole of case `big`: leg vi, in a routed run of its own.
 ///
-/// **Why this is a separate case and not the sixth leg of `edit`.** The registry
-/// `timeout_ms` is a whole-*session* watchdog, not a per-call one, and it is armed
-/// before the twin is even resigned. Run sixth inside `edit`, leg vi's budget was
-/// therefore shared with process start, the resign, and five other legs -- so the
-/// margin measured for leg vi on its own never described the session the harness
-/// actually ran. Giving it its own run makes the measured thing and the run thing
-/// the same thing. It does not make it saturation-proof; `BIG` says what it buys.
+/// **Why this is a separate case and not the sixth leg of `edit`.** Under the
+/// former default session watchdog, leg vi shared its budget with process start,
+/// signing and five other legs. Splitting it preserved the arrangement used by
+/// the load measurements at `BIG`. That arrangement remains; a default session
+/// lifetime does not.
 ///
 /// This case depends on nothing `edit` does: it derives `<path>.big` from the one
 /// path it is given and needs no seeded source, so the two runs are independent

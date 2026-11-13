@@ -37,7 +37,7 @@ fn idle_across_fork_park_and_exec() {
         "native control"
     );
     let mut backend = MacosTraceBackend::new(Options {
-        timeout_ms: 15000,
+        timeout_ms: Some(15000),
         ..Options::default()
     });
     let root = backend
@@ -135,7 +135,7 @@ fn absolute_watchdog_expires_across_idle_replies() {
         return;
     }
     let mut backend = MacosTraceBackend::new(Options {
-        timeout_ms: 8000,
+        timeout_ms: Some(8000),
         ..Options::default()
     });
     let root = backend

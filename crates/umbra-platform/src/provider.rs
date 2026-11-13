@@ -599,7 +599,8 @@ pub fn serve_provider_on(
     serve_session(connection, platform)
 }
 
-fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> Result<()> {
+/// Dispatch an already negotiated platform connection, retaining teardown diagnostics.
+pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> Result<()> {
     let mut roots = Vec::new();
     let result = (|| {
         let mut previous = 0;
@@ -646,6 +647,13 @@ fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> R
                     .abi
                     .emulate_result(&mut regs, &result)
                     .map(|()| Response::Registers(regs)),
+                Request::Terminate { process, policy } => {
+                    let result = platform.control.terminate(process, policy);
+                    if result.is_ok() {
+                        roots.retain(|root| *root != process);
+                    }
+                    result.map(|()| Response::Unit)
+                }
                 request => control_request(&mut *platform.control, request),
             };
             if let Ok(Response::Process(process)) = &result {
@@ -658,9 +666,12 @@ fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> R
         }
     })();
     for process in roots {
-        let _ = platform
+        if let Err(error) = platform
             .control
-            .terminate(process, TerminationPolicy::Immediate);
+            .terminate(process, TerminationPolicy::Immediate)
+        {
+            eprintln!("platform provider termination unconfirmed: {error}");
+        }
     }
     result
 }

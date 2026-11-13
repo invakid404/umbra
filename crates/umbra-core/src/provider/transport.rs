@@ -9,6 +9,22 @@ use std::os::unix::{
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+// Instant on Darwin is CLOCK_UPTIME_RAW (sleep does not consume a budget).
+fn transport_now() -> Instant {
+    #[cfg(test)]
+    if let Some((awake, _continuous)) = FIX264_CLOCK.with(|v| v.get()) {
+        return awake;
+    }
+    Instant::now()
+}
+#[cfg(test)]
+thread_local! { static FIX264_CLOCK: std::cell::Cell<Option<(Instant, Instant)>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+fn early_wake() {
+    let awake = transport_now();
+    FIX264_CLOCK.with(|v| v.set(Some((awake, awake + Duration::from_secs(86400)))));
+}
+
 fn unavailable(error: impl std::fmt::Display) -> UmbraError {
     UmbraError::new(
         ErrorKind::StorageUnavailable,
@@ -19,8 +35,8 @@ fn unavailable(error: impl std::fmt::Display) -> UmbraError {
 
 /// A read or write that expired against its `SO_{RCV,SND}TIMEO` deadline surfaces as
 /// `WouldBlock` (EAGAIN, `os error 35`) or, on some platforms, `TimedOut`. Both are
-/// the request deadline being missed, not a distinct failure, so callers report them
-/// as such rather than leaking the raw errno.
+/// wake indications: callers must recheck the original absolute uptime deadline,
+/// retaining partial progress if it has not elapsed.
 fn is_deadline_timeout(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -43,10 +59,15 @@ impl Connection {
     pub fn new(stream: UnixStream, timeout: Duration) -> Self {
         Self {
             stream,
-            deadline: Instant::now() + timeout,
+            deadline: transport_now() + timeout,
             timeout,
             failed: false,
         }
+    }
+    /// Duplicate the provider endpoint for non-consuming liveness observation.
+    /// Closing the duplicate alone does not close this connection.
+    pub fn observation_stream(&self) -> Result<UnixStream> {
+        self.stream.try_clone().map_err(unavailable)
     }
     /// Current absolute deadline, retained by nested callback requests.
     pub fn deadline(&self) -> Instant {
@@ -84,14 +105,14 @@ impl Connection {
     }
     /// Begin.
     pub fn begin(&mut self) {
-        self.deadline = Instant::now() + self.timeout;
+        self.deadline = transport_now() + self.timeout;
     }
     fn remaining(&self) -> Result<Duration> {
         if self.failed {
             return Err(unavailable("connection is closed"));
         }
         self.deadline
-            .checked_duration_since(Instant::now())
+            .checked_duration_since(transport_now())
             .filter(|d| !d.is_zero())
             .ok_or_else(|| unavailable("request deadline exceeded"))
     }
@@ -100,16 +121,37 @@ impl Connection {
         self.failed = true;
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
+    fn read_progress(&mut self, out: &mut [u8], offset: usize) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if FIX264_EARLY.with(|v| v.get()) && offset > 0 {
+            FIX264_EARLY.with(|v| v.set(false));
+            early_wake();
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        } else {
+            let end = if FIX264_EARLY.with(|v| v.get()) {
+                offset + 1
+            } else {
+                out.len()
+            };
+            self.stream.read(&mut out[offset..end])
+        }
+        #[cfg(not(test))]
+        self.stream.read(&mut out[offset..])
+    }
     fn read_exact(&mut self, out: &mut [u8]) -> Result<()> {
         let mut offset = 0;
         while offset < out.len() {
             let remaining = self.remaining()?;
             let count = match self.stream.set_read_timeout(Some(remaining)) {
-                Ok(()) => match self.stream.read(&mut out[offset..]) {
+                Ok(()) => match self.read_progress(out, offset) {
                     Ok(count) => count,
-                    // The read hit its deadline: report the miss, not the raw errno.
-                    Err(ref e) if is_deadline_timeout(e) => {
-                        return Err(unavailable("request deadline exceeded"))
+                    // Timeout errno can be an early wake (including across sleep).
+                    // Retain the offset and let remaining() decide real expiry.
+                    Err(ref e)
+                        if is_deadline_timeout(e)
+                            || e.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        continue
                     }
                     Err(e) => return Err(unavailable(e)),
                 },
@@ -130,17 +172,36 @@ impl Connection {
         }
         Ok(())
     }
+    fn write_progress(&mut self, bytes: &[u8], offset: usize) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if FIX264_EARLY.with(|v| v.get()) && offset > 0 {
+            FIX264_EARLY.with(|v| v.set(false));
+            early_wake();
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        } else {
+            let end = if FIX264_EARLY.with(|v| v.get()) {
+                offset + 1
+            } else {
+                bytes.len()
+            };
+            self.stream.write(&bytes[offset..end])
+        }
+        #[cfg(not(test))]
+        self.stream.write(&bytes[offset..])
+    }
     fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
         let mut offset = 0;
         while offset < bytes.len() {
             self.stream
                 .set_write_timeout(Some(self.remaining()?))
                 .map_err(unavailable)?;
-            let count = match self.stream.write(&bytes[offset..]) {
+            let count = match self.write_progress(bytes, offset) {
                 Ok(count) => count,
-                // The write hit its deadline: report the miss, not the raw errno.
-                Err(ref e) if is_deadline_timeout(e) => {
-                    return Err(unavailable("request deadline exceeded"))
+                // Early wakes retain progress; the next iteration rechecks the same deadline.
+                Err(ref e)
+                    if is_deadline_timeout(e) || e.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    continue
                 }
                 Err(e) => return Err(unavailable(e)),
             };
@@ -853,5 +914,68 @@ mod tests {
             error.to_string().contains("request deadline exceeded"),
             "a timed-out read reports the deadline miss, not `os error 35`: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+thread_local! { static FIX264_EARLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+mod fix264_sleep_probe {
+    use super::*;
+    #[test]
+    fn early_read_timeout_preserves_progress() {
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        peer.write_all(b"ab").unwrap();
+        let mut conn = Connection::new(socket, Duration::from_secs(5));
+        FIX264_EARLY.with(|v| v.set(true));
+        let mut out = [0; 2];
+        let result = conn.read_exact(&mut out);
+        assert!(Instant::now() < conn.deadline);
+        eprintln!("partial read={out:?}, early result={result:?}");
+        assert!(
+            result.is_ok(),
+            "early timeout before uptime deadline must preserve progress"
+        );
+        assert_eq!(&out, b"ab");
+    }
+    #[test]
+    fn early_write_timeout_preserves_progress() {
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let mut conn = Connection::new(socket, Duration::from_secs(5));
+        FIX264_EARLY.with(|v| v.set(true));
+        let result = conn.write_all(b"ab");
+        assert!(Instant::now() < conn.deadline);
+        let mut first = [0; 1];
+        peer.read_exact(&mut first).unwrap();
+        eprintln!("first written={first:?}, early result={result:?}");
+        assert!(
+            result.is_ok(),
+            "early timeout before uptime deadline must preserve progress"
+        );
+        let mut rest = [0; 1];
+        peer.read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"b");
+    }
+}
+
+#[cfg(test)]
+mod fix264_real_expiry {
+    use super::*;
+    #[test]
+    fn actual_uptime_expiry_is_terminal() {
+        for write in [false, true] {
+            let (_peer, socket) = UnixStream::pair().unwrap();
+            FIX264_CLOCK.with(|v| v.set(None));
+            let mut c = Connection::new(socket, Duration::from_secs(5));
+            FIX264_CLOCK.with(|v| v.set(Some((c.deadline, c.deadline))));
+            let e = if write {
+                c.write_all(b"x")
+            } else {
+                c.read_exact(&mut [0])
+            }
+            .unwrap_err();
+            assert!(e.to_string().contains("request deadline exceeded"));
+        }
+        FIX264_CLOCK.with(|v| v.set(None));
     }
 }

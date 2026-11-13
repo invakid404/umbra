@@ -43,19 +43,39 @@ pub(crate) fn unsupported(context: impl ToString) -> UmbraError {
     )
 }
 /// Runtime configuration; redirect policy belongs to the caller.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
     pub debugserver: Option<std::path::PathBuf>,
     pub twin_cache: Option<std::path::PathBuf>,
-    pub timeout_ms: u64,
+    /// Optional absolute lifetime in awake milliseconds; disabled by default.
+    pub timeout_ms: Option<u64>,
 }
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            debugserver: None,
-            twin_cache: None,
-            timeout_ms: 30_000,
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod owner;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use owner::OwnerIdentity;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod clock;
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+    #[test]
+    fn absent_or_null_lifetime_is_unbounded_numeric_is_explicit() {
+        for input in ["{}", r#"{"timeout_ms":null}"#] {
+            assert_eq!(
+                serde_json::from_str::<Options>(input).unwrap().timeout_ms,
+                None
+            );
         }
+        assert_eq!(
+            serde_json::from_str::<Options>(r#"{"timeout_ms":8000}"#)
+                .unwrap()
+                .timeout_ms,
+            Some(8000)
+        );
     }
 }

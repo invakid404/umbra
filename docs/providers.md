@@ -69,7 +69,18 @@ Codex options encode `CodexConfig`; the template's `UNQUALIFIED` version is a pl
 requiring replacement and qualification before runtime use. Claude, file journal and
 the Linux platform stub require empty options. The macOS provider accepts JSON
 `Options { debugserver, twin_cache, timeout_ms }`, or empty options for defaults;
-it implements experimental arm64 tracing and advertises `darwin-arm64-abi-v1`.
+`timeout_ms` is an optional platform lifetime, disabled when omitted or null.
+Explicit values 1..=3,600,000 ms opt in; they are separate from registry RPC bounds.
+The executable monitors authenticated supervisor exit and socket EOF, with no
+inactivity detector. See the [macOS provider](../crates/umbra-platform-macos/README.md#session-lifetime-and-supervisor-loss)
+for awake-time operation budgets, resume and cleanup limits.
+
+A passthrough call blocked while sibling threads are held, such as a pipe read
+whose only writer is a frozen sibling, waits until it returns, supervising umbra
+goes away (including when the user stops umbra), or an opt-in lifetime expires;
+there is no default bound for this known residual ([#242](https://github.com/invakid404/umbra/issues/242)).
+
+The macOS provider implements experimental arm64 tracing and advertises `darwin-arm64-abi-v1`.
 Descriptor capabilities are required open
 capability names, verified against the provider handshake. Stubs advertise no runtime
 support. An empty capability requirement permits connection testing, never authorization
@@ -124,5 +135,5 @@ Platform clients require `bounded-event-poll-v1` before Launch. `PollEvent`
 requests bound the wait to at most 100ms and a quarter of the registry deadline;
 Idle lets the supervisor renew the writer before re-issuing. Common protocol
 version 3 and legacy NextEvent/Event messages remain unchanged. The macOS
-session watchdog is an independent absolute limit, and its 1ms debugger-read
+session watchdog is an independent opt-in absolute limit, and its 1ms debugger-read
 floor means tiny registry timeouts can still fail closed.

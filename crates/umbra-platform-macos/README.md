@@ -123,8 +123,9 @@ The M1 mechanisms named in the tracker spec are all present:
    intercepts and defers, and return breakpoints track reaped children.
    See `native.rs::ReturnKind::Wait` and **Wait decisions** below.
 7. **SIGHUP suppression** on newly attached children.
-8. **Embedded watchdog**: an `mpsc`-cancellable worker thread terminates
-   all held Mach tasks on deadline (`native.rs::Watchdog`).
+8. **Owner monitor and opt-in watchdog**: a kqueue worker terminates held Mach
+   tasks on authenticated supervisor exit or transport EOF. A lifetime deadline
+   exists only with an explicit `Options::timeout_ms` (`native.rs::Watchdog`).
 9. **Userspace-routing interposer**: `interpose/umbra_interpose.c`, compiled
    universal (arm64 + arm64e) by `build.rs`, embedded in this binary and
    published into the twin cache at launch. `LaunchPolicy::interpose` loads it
@@ -528,10 +529,11 @@ exposed that; the raw-`svc` leg with high bits set in `x2` guards it.
 <!-- memoria:section id="provider-binary" files="src/main.rs" guidance="../../docs/guides/reviewing-provider-binary.md" -->
 ## Provider binary
 
-`src/main.rs` is the shipped provider binary. It calls
-`umbra_platform::provider::serve_provider("macos", …)` returning a
-`PlatformSession { control: MacosTraceBackend, abi: DarwinArm64Abi }`, and
-decodes JSON `Options` from opaque provider options (empty falls back to
+`src/main.rs` is the shipped provider binary. It captures its parent identity,
+accepts the `macos` handshake, installs the owner watch, and calls
+`umbra_platform::provider::serve_session` with a
+`PlatformSession { control: MacosTraceBackend, abi: DarwinArm64Abi }`.
+It decodes JSON `Options` from opaque provider options (empty falls back to
 `Options::default()`). Register it via `umbra providers --registry <path>
 --role platform`.
 
@@ -607,7 +609,7 @@ than that a launch merely failed.
 Invoke the shipped binary through a platform `ProviderDescriptor` and
 `umbra_core::provider::Client::connect`, then send `Request::Capabilities`,
 `Request::Launch(spec)`, and the `NextEvent` / memory / register / `Resume`
-requests. The binary's `serve_provider("macos", …)` handles that handshake
+requests. The binary's `umbra_core::provider::accept` and `serve_session` handle that handshake
 and dispatch. For an in-process socketpair, use `serve_provider_on(connection,
 "macos", …)`, which shares the same handshake and dispatcher.
 `Request::Quiesce(process)` interrupts live sessions and waits for stopped
@@ -672,9 +674,10 @@ These paths can still hand a tracee to launchd uncounted:
 
 In launchd's session they no longer reach any group there: #193 runs the whole
 run in a session of its own, with session 1 regression tests for the first four
-(`umbra-cli`'s `tests/isolation.rs`). The platform itself is unchanged by that,
-and after an uncontrolled supervisor death it still keeps the run alive until
-its own deadline (#203).
+(`umbra-cli`'s `tests/isolation.rs`). The remote platform provider now detects
+supervisor death independently through its owner monitor. Provider death and
+unconfirmed teardown remain separate limits; a monitor inside the provider
+cannot survive that provider's death.
 
 `tests/provider_ipc.rs` exercises the socketpair handshake and real `open-libc`
 capture through these requests, including stopped and running quiescence.
@@ -786,7 +789,7 @@ reverted, so no claim is made about it either way.
 
 **A native syscall resumed through a return gate holds its siblings stopped
 until it returns.** If that call blocks, sibling progress cannot release it;
-provider and session deadlines bound the failure. Emulated routed operations
+per-request and opt-in session deadlines bound the failure. Emulated routed operations
 skip the native syscall. Public `fcntl` passthrough adds no return gate: its
 shim tail-branches to libc and neither fcntl kernel stub is breakpointed.
 `tests/fcntl_passthrough.rs` guards that structural property. The userspace
@@ -1056,9 +1059,10 @@ and the host destination remains absent.
 
 Set `UMBRA_INTEGRATION_REQUIRED=1` to make missing fixture inputs fail the sandbox,
 IPC and direct tracer suites. CI's `native-qualification` job runs these and the
-CLI's fourteen-case matrix on a runner labelled `umbra-integration`; that runner
-requires debugger permission and an existing NFSv4 mount configured through the
-`UMBRA_TEST_NFS_ROOT` repository variable. No test provisions a mount or prompts.
+CLI's local matrix on a runner labelled `umbra-integration`; that runner
+requires debugger permission. CI sets `UMBRA_TEST_SKIP_NFS_MATRIX=1`; the separate
+mounted-NFS matrix requires `UMBRA_TEST_NFS_ROOT` when run locally. No test
+provisions a mount or prompts.
 
 Sandbox handoff compares canonical target paths with `proc_pidpath`. The twin
 cache root is also canonicalized so a symlinked cache recognizes already-resigned
@@ -1104,7 +1108,7 @@ shared across sessions, with a rotating cursor. Watchdog errors and queued event
 precede an idle outcome; no-live-process state remains an error. Debugger reads
 retain their 1 ms minimum timeout, so very small registry deadlines can still fail
 closed. Polling never silently increases the transport deadline or resets the
-absolute session watchdog.
+opt-in absolute session watchdog.
 
 `tests/idle_poll.rs` runs on macOS arm64 with `UMBRA_INTEGRATION_REQUIRED` set;
 otherwise it prints `SKIP`. It
@@ -1116,3 +1120,47 @@ time. A separate test requires an
 a C compiler and debugger permission. The socketpair/socket tests additionally
 pin a partial RSP packet surviving Idle, the 1ms read floor, queued-event
 precedence and watchdog precedence.
+
+## Session lifetime and supervisor loss
+
+There is no default session-age or inactivity limit. Omitted/null `timeout_ms`
+means no lifetime cap; numeric milliseconds opt in, with 1..=3,600,000 accepted.
+This option is independent of the registry's per-request IPC timeout. All timing
+uses awake uptime: laptop sleep does not expire a budget, and early timeout
+wakeups retain partial transport/RSP progress. Resume starts a new provider session
+and a fresh opt-in budget; fork/exec do not renew the current session's budget.
+
+The executable binds its actual parent's process generation to the Unix socket
+peer, registers NOTE_EXIT and EOF observation, then revalidates before launch.
+Observation failure refuses launch. No protocol bytes are consumed by the monitor.
+Owner exit still triggers when another process retains the socket, including
+before launch, after launch failure, and after termination. Observation runs
+from owner binding until backend disposal, independently of the per-launch
+deadline watchdog; both share the task registry. Exec registers a replacement
+Task before retiring the superseded entry, releasing its old Mach right once
+the session replaces its reference. Completed child sessions remain until tree
+cleanup; provider-lifetime owner registry entries remain until backend disposal. The monitor
+kills registered tasks; late registrations are killed immediately. The provider
+thread performs existing ordered teardown and retains unconfirmed diagnostics.
+Normal disarm does not kill tasks. No heartbeat or inactivity-based "stuck"
+classification exists: a busy supervisor is never treated as stuck. Killing a hung
+supervisor supplies the definitive gone signal.
+
+A passthrough call blocked while sibling threads are held, such as a pipe read
+whose only writer is a frozen sibling, waits until it returns, supervising umbra
+goes away (including when the user stops umbra), or an opt-in lifetime expires;
+there is no default bound for this known residual ([#242](https://github.com/invakid404/umbra/issues/242)).
+
+Signing/publication and attach/setup have 10-second per-operation budgets;
+quiesce has a five-second aggregate budget, clipped by any opt-in lifetime.
+RSP retains connect/request/poll caps. These bound individual operations, not a
+healthy session's lifetime. Owner loss during work not released by task termination
+(such as a signing subprocess or connect) can wait for that operation's budget.
+A direct in-process backend has no external owner watch; its containing process's
+SIGKILL cannot run Rust cleanup. Provider/group/guardian-loss residuals in #198,
+#199 and #202 remain; this does not implement #268's public cancellation API.
+
+CI runs `owner_loss` only with `UMBRA_INTEGRATION_REQUIRED` on self-hosted
+native-qualification. The default-options 35-second native/routed control is
+`fix_264_default_idle_survives` in the self-hosted userspace suite. Scripted clocks,
+partial-progress adapters and task-registration policy tests execute on hosted Rust.

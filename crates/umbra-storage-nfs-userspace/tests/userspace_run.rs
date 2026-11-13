@@ -4246,11 +4246,11 @@ const RUSTIO_LEAF: &[u8] = b"leaf under a routed directory\n";
 /// Leg vi's payload size, matching `BIG` in the fixture, which carries the full
 /// reasoning. In short: it is the **smallest** size that crosses the backend's
 /// 1 048 572-byte per-call bound more than once -- 8 bytes past two bounds -- and
-/// it is no larger because leg vi moves it three times inside a per-run session
-/// watchdog that is this harness's own `timeout_ms` (`registry`, above) and that
-/// the writer lease will not let anyone raise. That margin is spent by CPU
-/// contention rather than by bytes: measured, 2 621 440 expires the watchdog with
-/// four competing CPU workers on a ten-core host while this size does not.
+/// leg vi moves it three times. Its historical sizing used the former default
+/// session watchdog: 2 621 440 expired that watchdog with four competing CPU
+/// workers on a ten-core host while this size did not. The registry's
+/// `timeout_ms` bounds each IPC request, not the session. The platform lifetime
+/// is now opt-in; this payload remains the same chunk-boundary oracle.
 const RUSTIO_BIG: u64 = 2_097_152;
 
 /// `LibnfsRawTransport`'s per-call bound, and therefore where leg vi's chunk
@@ -4338,12 +4338,9 @@ fn a_rust_library_write_reopen_and_compare_crosses_the_std_fs_wrappers() {
     let Some((host, port)) = fixture() else {
         return;
     };
-    // **Two routed runs, not one, and the separation is the point.** The registry
-    // `timeout_ms` is a whole-session watchdog armed before the twin is resigned,
-    // so legs sharing a run share one budget. Leg vi is the expensive leg; giving
-    // it case `big` and a run of its own means the margin measured for it
-    // describes the session that actually executes. It does not make it
-    // saturation-proof -- see `RUSTIO_BIG`.
+    // Keep leg vi's `big` case in its own run, preserving the measured fixture
+    // arrangement. The historical default-watchdog sizing is recorded at
+    // RUSTIO_BIG; registry timeout_ms is a per-request budget.
     //
     // **Separate scratch directories, deliberately.** `launch` derives
     // `workspace`, `state` and `registry.json` from `scratch`, and
@@ -9534,13 +9531,13 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for bounded event polling (#262), which changed native.rs,
+    // Re-characterized for superseded exec Task retirement (#264, CR-3), which changed native.rs,
     // while single_thread and its Fork/WaitPlan::Park call sites are unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("b9e6f5f19815f3d1f81edf66317977f93e052e4b101624226207d18304bbaa14"),
+        Some("c245e988e23b6b5eaa30d83f4a72771431d390ff9d34cbfa1d0904ee5725d8bf"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -16413,4 +16410,56 @@ fn fix_262_routed_sleep() {
 #[test]
 fn fix_262_routed_idle_renewal() {
     fix_262_sleep("17", true);
+}
+
+#[test]
+fn fix_264_default_idle_survives() {
+    let seconds = "35";
+    let Some((host, port)) = fixture() else {
+        return;
+    };
+    let Some(root) = slate_evidence() else { return };
+    let evidence = root.join("fix-264-default-idle");
+    std::fs::create_dir(&evidence).unwrap();
+    let (native, timeout) = slate_launch(
+        Command::new("/bin/sleep").arg(seconds),
+        &evidence.join("native"),
+        std::time::Duration::from_secs(40),
+        None,
+    );
+    assert!(
+        !timeout && native.status.success(),
+        "native sleep: {}",
+        native.status
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let workspace = scratch.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let path = registry(scratch.path(), &host, port);
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["timeout_ms"] = serde_json::json!(5000);
+    config["providers"]["platform"]["options"] =
+        serde_json::json!(serde_json::to_vec(&serde_json::json!({})).unwrap());
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert_no_nfs_mount(&host, port, &[&workspace], "fix-264 before");
+    let (out, timeout) = slate_launch(
+        Command::new(binaries().join("umbra"))
+            .args(["run", "--registry"])
+            .arg(&path)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--state-dir")
+            .arg(scratch.path().join("state"))
+            .args(["--experimental", "--", "/bin/sleep", seconds]),
+        &evidence.join("routed"),
+        std::time::Duration::from_secs(45),
+        None,
+    );
+    slate_finish_cleanup();
+    assert!(!timeout, "routed sleep exceeded harness bound");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("Some(Code(0))"), "{stderr}");
 }
