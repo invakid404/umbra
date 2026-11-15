@@ -16465,6 +16465,104 @@ fn fix_264_default_idle_survives() {
     assert!(stderr.contains("Some(Code(0))"), "{stderr}");
 }
 
+// Acknowledged kernel observation: the sandboxed fixture does not have
+// permission to subscribe to process exit status itself. This mirrors the
+// existing external loopback observer pattern used by the R14 controls.
+struct Fix274ExitObserver(Option<std::thread::JoinHandle<()>>);
+impl Fix274ExitObserver {
+    fn start(spawn: &SlateSpawn, mode: &str, leg: &str) -> (String, Self) {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+        if !mode.starts_with("parent") {
+            return (mode.into(), Self(None));
+        }
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let evidence = spawn.evidence.join(format!("{leg}-descendant-exit.txt"));
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut peer = loop {
+                match listener.accept() {
+                    Ok((peer, _)) => break peer,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "exit observer connection missing"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("exit observer accept: {e}"),
+                }
+            };
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .unwrap();
+            peer.set_write_timeout(Some(std::time::Duration::from_secs(30)))
+                .unwrap();
+            let mut bytes = [0; 4];
+            peer.read_exact(&mut bytes).unwrap();
+            let pid = u32::from_be_bytes(bytes);
+            assert!(pid > 1);
+            // SAFETY: all event buffers are initialized, valid for the call,
+            // and the queue descriptor is uniquely owned by File below.
+            let status = unsafe {
+                let fd = libc::kqueue();
+                assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+                let _queue = std::fs::File::from_raw_fd(fd);
+                let flags = libc::NOTE_EXIT | libc::NOTE_EXITSTATUS;
+                let change = libc::kevent {
+                    ident: pid as _,
+                    filter: libc::EVFILT_PROC,
+                    flags: libc::EV_ADD | libc::EV_ONESHOT,
+                    fflags: flags,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                assert_eq!(
+                    libc::kevent(fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()),
+                    0,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                peer.write_all(&[1]).unwrap();
+                let mut event: libc::kevent = std::mem::zeroed();
+                let bound = libc::timespec {
+                    tv_sec: 30,
+                    tv_nsec: 0,
+                };
+                assert_eq!(
+                    libc::kevent(fd, std::ptr::null(), 0, &mut event, 1, &bound),
+                    1,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                assert!(
+                    event.ident == pid as libc::uintptr_t
+                        && event.filter == libc::EVFILT_PROC
+                        && event.flags & libc::EV_ERROR == 0
+                        && event.fflags & flags == flags
+                );
+                event.data as i32
+            };
+            std::fs::write(evidence, format!("pid={pid} raw_status={status}\n")).unwrap();
+            peer.write_all(&(status as u32).to_be_bytes()).unwrap();
+        });
+        (format!("{mode}:{port}"), Self(Some(worker)))
+    }
+    fn finish(mut self) {
+        if let Some(worker) = self.0.take() {
+            worker.join().expect("exit observer failed");
+        }
+    }
+}
+impl Drop for Fix274ExitObserver {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 // #274: use the existing paired-run/cleanup instrument for retired slots.
 fn fix_274_lifecycle(mode: &str) {
     let Some(mut spawn) = slate_spawn(&format!("fix-274-{mode}")) else {
@@ -16486,7 +16584,9 @@ fn fix_274_lifecycle(mode: &str) {
         "parent" => (b"ABC", b"parent=19 descendant=0 bytes=ABC\n"),
         _ => unreachable!(),
     };
-    let (root, native) = slate_spawn_native(&spawn, mode);
+    let (observed_mode, observer) = Fix274ExitObserver::start(&spawn, mode, "native");
+    let (root, native) = slate_spawn_native(&spawn, &observed_mode);
+    observer.finish();
     assert!(
         native.status.success(),
         "native: {}",
@@ -16494,7 +16594,13 @@ fn fix_274_lifecycle(mode: &str) {
     );
     assert_eq!(std::fs::read(root.join("file")).unwrap(), bytes);
     assert_eq!(std::fs::read(root.join("records")).unwrap(), record);
-    let routed = slate_spawn_routed(&spawn, mode, &["file", "records", "ready", "done"]);
+    let (observed_mode, observer) = Fix274ExitObserver::start(&spawn, mode, "routed");
+    let routed = slate_spawn_routed(
+        &spawn,
+        &observed_mode,
+        &["file", "records", "ready", "done"],
+    );
+    observer.finish();
     assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
     assert_eq!(routed.object("file"), Some(bytes));
     assert_eq!(routed.object("records"), Some(record));
@@ -16524,11 +16630,24 @@ fn fix_274_descendant_exit_status_controls() {
             "UMBRA_FIX_274_LIFECYCLE_PATH",
         );
         spawn.helper = spawn.program.canonicalize().unwrap();
-        let (root, native) = slate_spawn_native(&spawn, mode);
-        assert_eq!(native.status.code(), Some(106), "{:?}", native);
+        let (observed_mode, observer) = Fix274ExitObserver::start(&spawn, mode, "native");
+        let (root, native) = slate_spawn_native(&spawn, &observed_mode);
+        observer.finish();
+        assert_eq!(
+            native.status.code(),
+            Some(106),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
         assert!(String::from_utf8_lossy(&native.stderr).contains(&format!("exit-status={status}")));
         assert!(!root.join("records").exists());
-        let routed = slate_spawn_routed(&spawn, mode, &["file", "records", "ready", "done"]);
+        let (observed_mode, observer) = Fix274ExitObserver::start(&spawn, mode, "routed");
+        let routed = slate_spawn_routed(
+            &spawn,
+            &observed_mode,
+            &["file", "records", "ready", "done"],
+        );
+        observer.finish();
         assert_eq!(routed.run.status, Some(106), "{}", routed.run.stderr);
         assert!(routed.run.stderr.contains(&format!("exit-status={status}")));
         assert_eq!(routed.object("records"), None);
