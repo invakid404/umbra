@@ -9533,12 +9533,13 @@ fn slate_c10_10_fork_helper_refusal() {
     );
     // Re-characterized for completed-child retirement (#274): the single_thread
     // body and both guard positions are unchanged; Park now wraps its wait
-    // indices in an owning witness container. The refusal oracle is unchanged.
+    // indices in an owning witness container. R7 adds a test-only quiesce/resume
+    // module declaration. The refusal oracle is unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("efe0c15a2871161bb0d568bf31819a75b696b1f40e4c89232bc935ff3e054a4e"),
+        Some("9a533e6a19964266afd7818ab629b3bf69436b64f0329351e57b86027e17aec1"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
