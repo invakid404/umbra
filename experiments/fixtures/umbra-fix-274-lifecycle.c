@@ -7,24 +7,27 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static void require(int ok, int code) { if (!ok) _exit(code); }
+static void require(int ok, int code) { if (!ok) { fprintf(stderr, "f274 pid=%d failure=%d errno=%d\n", getpid(), code, errno); _exit(code); } }
 static void put(int fd, const char *s) { require(write(fd, s, strlen(s)) == (ssize_t)strlen(s), 80); }
 static void mark(const char *name, const char *text) {
     int fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     require(fd >= 0, 81); put(fd, text); require(close(fd) == 0, 82);
 }
 static void gate(const char *name) {
+    fprintf(stderr, "f274 pid=%d gate=%s\n", getpid(), name);
     for (int n = 0; n < 10000; ++n) {
         int fd = open(name, O_RDONLY);
-        if (fd >= 0) { close(fd); return; }
+        if (fd >= 0) { close(fd); fprintf(stderr, "f274 pid=%d gate-ready\n", getpid()); return; }
         require(errno == ENOENT, 83);
         usleep(1000);
     }
-    _exit(84);
+    require(0, 84);
 }
 static void waited(pid_t pid, int code) {
+    fprintf(stderr, "f274 pid=%d wait=%d expected=%d\n", getpid(), pid, code);
     int status = 0; pid_t got;
     do { got = waitpid(pid, &status, 0); } while (got < 0 && errno == EINTR);
+    fprintf(stderr, "f274 pid=%d waited=%d raw=%d\n", getpid(), got, status);
     require(got == pid && WIFEXITED(status) && WEXITSTATUS(status) == code, 85);
 }
 int main(int argc, char **argv) {
