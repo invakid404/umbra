@@ -1660,3 +1660,14 @@ through sibling or parent retirement, then require exact shared-description
 write bytes and child wait statuses. They exercise offsets through routed
 writes, not host `lseek`. Their self-hosted job is `native-userspace-routing`;
 the separate 200-child resource census belongs to `native-qualification`.
+
+The parent-exit case obtains native descendant status from a registered kernel
+exit watch. The routed case enables `UMBRA_RSP_LOG` only for its test provider
+and binds the actual terminal packet to the descendant PID's `vAttach`
+connection; a done marker or a fixed record is not accepted as exit evidence.
+`fix_274_descendant_exit_status_controls` uses the same self-hosted userspace
+job and fixture prerequisites. A nonzero descendant must produce native
+status 7 and routed `W07`; a killed descendant must produce native signal 9
+and the existing routed fatal `T09` refusal with no completed journal.
+Both controls must fail the normal `W00` oracle. All three lifecycle leaves
+also aggregate cleanup errors after the existing reopen and cleanup checks.

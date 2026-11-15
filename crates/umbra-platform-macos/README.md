@@ -758,7 +758,9 @@ run in the one
 self-hosted `native-qualification` job as well as ordinary unit testing.
 `retirement_release_owns_all_resources` populates each working map/buffer,
 then requires every ownership witness to expire, both Task owners to release,
-the registry to empty and the RSP peer to observe EOF.
+the registry to empty and the RSP peer to observe EOF. A dedicated unwind
+control verifies that test-owned self Tasks leave the watchdog registry before
+backend Drop, including when an assertion panics.
 Checkpoint publication/recovery is not implemented at the base; this coverage
 is quiesce/resume only. Existing checkpoint-recovery refusal remains unchanged.
 The CLI's `child_retention` live census and the userspace suite's paired

@@ -194,7 +194,7 @@ supervised census samples provider fds and direct child zombies three seconds
 after the fixture reports completion, with its root still alive. Build the
 platform with `--features retirement-witness` and set
 `UMBRA_RETIREMENT_WITNESS=1` to also require all 200 child ownership witnesses to
-be released. This test runs in self-hosted `native-qualification`, with
+be released before the root is released for final shutdown. This test runs in self-hosted `native-qualification`, with
 `UMBRA_INTEGRATION_REQUIRED=1`; it does not require mounted storage.
 
 `tests/isolation.rs` pins #193 on the production path. It compiles
