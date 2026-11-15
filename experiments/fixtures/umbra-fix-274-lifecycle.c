@@ -80,7 +80,10 @@ int main(int argc, char **argv) {
         pid_t descendant;
         require(read(identities[0], &descendant, sizeof(descendant)) == sizeof(descendant), 102);
         close(identities[0]);
-        fprintf(stderr, "f274 descendant-pid=%d\n", descendant);
+        char identity_path[4096], identity[32];
+        snprintf(identity_path, sizeof(identity_path), "%s/descendant.pid", argv[2]);
+        snprintf(identity, sizeof(identity), "%d\n", descendant);
+        mark(identity_path, identity);
         // Native control observes the kernel status. The routed harness checks
         // this PID's debugger exit packet: Seatbelt denies NOTE_EXITSTATUS and
         // ptrace can suppress outside observers' exit events for orphans.

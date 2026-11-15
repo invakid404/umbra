@@ -16467,13 +16467,21 @@ fn fix_264_default_idle_survives() {
 
 // Bind an actual terminal debugger packet to the fixture's descendant PID.
 // Neither a done marker nor journal completion establishes this exit status.
-fn fix_274_descendant_packets(stderr: &str) -> Vec<String> {
-    let pids: Vec<_> = stderr
-        .lines()
-        .filter_map(|s| s.strip_prefix("f274 descendant-pid="))
-        .collect();
-    assert_eq!(pids.len(), 1, "missing or ambiguous descendant identity");
-    let pid: u32 = pids[0].parse().unwrap();
+fn fix_274_descendant_packets(stderr: &str, identity: &[u8]) -> Vec<String> {
+    // The identity is a separately read-back fixture object, never a line in
+    // stderr shared by independently writing tracees and the provider.
+    let text = std::str::from_utf8(identity).expect("descendant identity is UTF-8");
+    let pid: u32 = text
+        .strip_suffix('\n')
+        .expect("terminated descendant identity")
+        .parse()
+        .expect("one descendant PID");
+    assert!(pid > 1);
+    assert_eq!(
+        identity,
+        format!("{pid}\n").as_bytes(),
+        "canonical descendant identity"
+    );
     let attach = format!("> vAttach;{pid:x}");
     let connections: Vec<_> = stderr
         .lines()
@@ -16501,8 +16509,8 @@ fn fix_274_descendant_packets(stderr: &str) -> Vec<String> {
         })
         .collect()
 }
-fn fix_274_descendant_status(stderr: &str, expected: &str) {
-    let packets = fix_274_descendant_packets(stderr);
+fn fix_274_descendant_status(stderr: &str, identity: &[u8], expected: &str) {
+    let packets = fix_274_descendant_packets(stderr, identity);
     let exits: Vec<_> = packets
         .iter()
         .filter(|s| s.starts_with('W') || s.starts_with('X'))
@@ -16555,12 +16563,18 @@ fn fix_274_lifecycle(mode: &str) {
     let routed = slate_spawn_routed(
         &spawn,
         &observed_mode,
-        &["file", "records", "ready", "done"],
+        &["file", "records", "ready", "done", "descendant.pid"],
     );
 
     assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
     if mode == "parent" {
-        fix_274_descendant_status(&routed.run.stderr, "W00");
+        fix_274_descendant_status(
+            &routed.run.stderr,
+            routed
+                .object("descendant.pid")
+                .expect("descendant identity object"),
+            "W00",
+        );
     }
     assert_eq!(routed.object("file"), Some(bytes));
     assert_eq!(routed.object("records"), Some(record));
@@ -16610,7 +16624,7 @@ fn fix_274_descendant_exit_status_controls() {
         let routed = slate_spawn_routed(
             &spawn,
             &observed_mode,
-            &["file", "records", "ready", "done"],
+            &["file", "records", "ready", "done", "descendant.pid"],
         );
 
         if status == 9 {
@@ -16618,21 +16632,38 @@ fn fix_274_descendant_exit_status_controls() {
             // terminal exit packet. It must never be accepted as completion.
             assert_eq!(routed.run.status, Some(1), "{}", routed.run.stderr);
             assert!(routed.run.stderr.contains("fatal signal/exception: T09"));
-            assert!(fix_274_descendant_packets(&routed.run.stderr)
-                .iter()
-                .any(|s| s.starts_with("T09")));
+            assert!(fix_274_descendant_packets(
+                &routed.run.stderr,
+                routed
+                    .object("descendant.pid")
+                    .expect("descendant identity object")
+            )
+            .iter()
+            .any(|s| s.starts_with("T09")));
             assert!(!journal_records_completion(&routed.run));
         } else {
             assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
-            fix_274_descendant_status(&routed.run.stderr, "W07");
+            fix_274_descendant_status(
+                &routed.run.stderr,
+                routed
+                    .object("descendant.pid")
+                    .expect("descendant identity object"),
+                "W07",
+            );
             assert_eq!(
                 routed.object("records"),
                 Some(b"parent=19 bytes=ABC\n".as_slice())
             );
         }
         assert!(
-            std::panic::catch_unwind(|| fix_274_descendant_status(&routed.run.stderr, "W00"))
-                .is_err(),
+            std::panic::catch_unwind(|| fix_274_descendant_status(
+                &routed.run.stderr,
+                routed
+                    .object("descendant.pid")
+                    .expect("descendant identity object"),
+                "W00"
+            ))
+            .is_err(),
             "a failing descendant must fail the normal lifecycle status oracle"
         );
         slate_spawn_finish(&spawn, &routed);
@@ -16649,5 +16680,38 @@ fn fix_274_interleaved_identity_regression() {
             "RSP[2] > vAttach;13b6d\nRSP[f274 descendant-pid=80749\n1] < $OK#00\nRSP[2] < $W07#00\n"
                 .into()
         });
-    fix_274_descendant_status(&stderr, "W07");
+    fix_274_descendant_status(&stderr, b"80749\n", "W07");
+}
+
+#[test]
+fn fix_274_identity_and_status_controls() {
+    let log = "RSP[2] > vAttach;13b6d\nRSP[2] < $W07#00\n";
+    for identity in [
+        b"".as_slice(),
+        b"80749",
+        b"80749\n80749\n",
+        b"garbage\n",
+        b"80748\n",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| fix_274_descendant_status(log, identity, "W07")).is_err()
+        );
+    }
+    for invalid in [
+        log.replace("vAttach;13b6d", "vAttach;13b6c"),
+        format!("{log}RSP[2] > vAttach;13b6d\n"),
+        log.replace("$W07#00", "$OK#00"),
+        format!("{log}RSP[2] < $W07#00\n"),
+        log.replace("$W07#00", "$W00#00"),
+        log.replace("$W07#00", "$X09#00"),
+    ] {
+        assert!(std::panic::catch_unwind(|| fix_274_descendant_status(
+            &invalid, b"80749\n", "W07"
+        ))
+        .is_err());
+    }
+    fix_274_descendant_status(log, b"80749\n", "W07");
+    assert!(
+        std::panic::catch_unwind(|| fix_274_descendant_status(log, b"80749\n", "W00")).is_err()
+    );
 }
