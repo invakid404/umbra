@@ -745,6 +745,9 @@ retired slots and a registered live sibling. It checks pending service at both
 entry points, unchanged compact exit/barrier/wait facts, the exact resume
 packet and the surviving registry owner. These controls run in the one
 self-hosted `native-qualification` job as well as ordinary unit testing.
+`retirement_release_owns_all_resources` populates each working map/buffer,
+then requires every ownership witness to expire, both Task owners to release,
+the registry to empty and the RSP peer to observe EOF.
 Checkpoint publication/recovery is not implemented at the base; this coverage
 is quiesce/resume only. Existing checkpoint-recovery refusal remains unchanged.
 The CLI's `child_retention` live census and the userspace suite's paired
