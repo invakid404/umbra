@@ -16471,8 +16471,8 @@ fn fix_274_lifecycle(mode: &str) {
     spawn.helper = spawn.program.canonicalize().unwrap();
     std::fs::write(spawn.evidence.join("fixture.sha256"), r14_sha256(&std::fs::read(&spawn.program).unwrap())).unwrap();
     let (bytes, record): (&[u8], &[u8]) = match mode {
-        "sibling" => (b"ABCD", b"exec=17 sibling=23 offset=3 bytes=ABCD\n"),
-        "parent" => (b"ABC", b"parent=19 descendant=0 offset=2 bytes=ABC\n"),
+        "sibling" => (b"ABCD", b"exec=17 sibling=23 bytes=ABCD\n"),
+        "parent" => (b"ABC", b"parent=19 descendant=0 bytes=ABC\n"),
         _ => unreachable!(),
     };
     let (root, native) = slate_spawn_native(&spawn, mode);

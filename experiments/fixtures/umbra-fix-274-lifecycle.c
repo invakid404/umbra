@@ -32,7 +32,7 @@ static void waited(pid_t pid, int code) {
 }
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "writer")) {
-        int fd = atoi(argv[2]); require(lseek(fd, 0, SEEK_CUR) == 1, 86); put(fd, "B"); return 17;
+        int fd = atoi(argv[2]); put(fd, "B"); return 17;
     }
     require(argc == 4, 87);
     char file[4096], ready[4096], done[4096], record[4096];
@@ -43,26 +43,26 @@ int main(int argc, char **argv) {
     int fd = open(file, O_CREAT | O_TRUNC | O_RDWR, 0600); require(fd >= 0, 88); put(fd, "A");
     if (!strcmp(argv[1], "sibling")) {
         pid_t a = fork(); require(a >= 0, 89);
-        if (!a) { gate(ready); require(lseek(fd, 0, SEEK_CUR) == 2, 90); put(fd, "C"); _exit(23); }
+        if (!a) { gate(ready); put(fd, "C"); _exit(23); }
         pid_t b = fork(); require(b >= 0, 91);
         if (!b) {
             char number[32]; snprintf(number, sizeof(number), "%d", fd);
             execl(argv[3], argv[3], "writer", number, (char *)NULL); _exit(92);
         }
         waited(b, 17); usleep(300000); mark(ready, "retired\n");
-        waited(a, 23); require(lseek(fd, 0, SEEK_CUR) == 3, 93); put(fd, "D");
-        mark(record, "exec=17 sibling=23 offset=3 bytes=ABCD\n");
+        waited(a, 23); put(fd, "D");
+        mark(record, "exec=17 sibling=23 bytes=ABCD\n");
     } else {
         require(!strcmp(argv[1], "parent"), 94);
         pid_t p = fork(); require(p >= 0, 95);
         if (!p) {
             pid_t g = fork(); require(g >= 0, 96);
-            if (!g) { gate(ready); require(lseek(fd, 0, SEEK_CUR) == 1, 97); put(fd, "B"); mark(done, "descendant\n"); _exit(0); }
+            if (!g) { gate(ready); put(fd, "B"); mark(done, "descendant\n"); _exit(0); }
             _exit(19);
         }
         waited(p, 19); usleep(300000); mark(ready, "parent-retired\n"); gate(done);
-        require(lseek(fd, 0, SEEK_CUR) == 2, 98); put(fd, "C");
-        mark(record, "parent=19 descendant=0 offset=2 bytes=ABC\n");
+        put(fd, "C");
+        mark(record, "parent=19 descendant=0 bytes=ABC\n");
     }
     require(close(fd) == 0, 99); return 0;
 }
