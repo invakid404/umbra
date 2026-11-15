@@ -202,9 +202,11 @@ The M1 mechanisms named in the tracker spec are all present:
     `a_failed_exec_does_not_leave_a_later_fork_pointed_at_an_image_the_tracee_never_ran`.
 
 13. **Ordered session teardown** (#186): `Session::ordered_teardown`, run for
-    every resource-bearing session (children first) by `terminate`, by the
-    sandboxed-handoff launch failure and by drop. Completed child slots whose
-    resources were already retired reuse their recorded cleanup evidence.
+    live resource-bearing session (children first) by `terminate`, by the
+    sandboxed-handoff launch failure and by drop. Completed child slots reuse
+    their recorded retirement evidence. Failed retirement owners remain held
+    through termination and receive explicit bounded emergency finalization
+    on drop, with its results merged into their original failure reports.
     - It sends RSP `k`, and sends it once more after a stop reply: a session
       left at a breakpoint answers the first `k` with its stale stop.
     - It waits on a fail-closed barrier until the tracee has passed its exit
@@ -241,10 +243,9 @@ The M1 mechanisms named in the tracker spec are all present:
     time and the last observation. Drop explicitly finalizes failed owners,
     preserving the original failure and merging typed emergency kill/wait
     evidence into the retained report. Unconfirmed owners keep ordered barrier
-    and warning handling; confirmed tracer finalization has one bounded window. The `retirement-witness`
-    qualification
-    feature observes actual Task Arcs and owning body/map lifetimes; ordinary
-    builds do not collect that history.
+    and warning handling; confirmed tracer finalization has one bounded window.
+    The `retirement-witness` qualification feature observes actual Task Arcs
+    and owning body/map lifetimes; ordinary builds do not collect that history.
 
 14. **Kill, never detach, on a lost connection, verified** (#193):
     `Rsp::connect` sends `QSetDetachOnError:0` at the end of its handshake,
@@ -663,8 +664,9 @@ The `k` plus the barrier is bounded at 1.5 s per session, and each reap at
 250 ms (at most 2 s per session). On a timeout the provider writes
 `tracee termination unconfirmed; tracer killed` to stderr, kills debugserver,
 and runs one post-kill barrier inside the 250 ms tracer reap:
-- **Confirmed:** `Terminate` succeeds, and a second line,
-  `tracee exit confirmed after tracer kill`, follows the warning.
+- **Confirmed:** a second line, `tracee exit confirmed after tracer kill`,
+  follows the warning. `Terminate` succeeds if no other session remains
+  unconfirmed and no retirement failure is retained.
 - **Still unconfirmed:** `Terminate` returns the warning as its error, and the
   run is left recovery-required.
 
