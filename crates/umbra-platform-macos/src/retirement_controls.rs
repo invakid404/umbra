@@ -59,9 +59,28 @@ fn register(backend: &mut MacosTraceBackend, s: Session) {
     backend.watchdog.as_ref().unwrap().add(s.task.clone());
     backend.sessions.push(s);
 }
+// Controlled slots hold send rights to this test process. Clear the registry
+// and mark sessions done before backend Drop, including assertion unwinding.
+struct SelfTaskBackend(MacosTraceBackend);
+impl Drop for SelfTaskBackend {
+    fn drop(&mut self) {
+        if let Some(watchdog) = &self.0.watchdog {
+            watchdog
+                .tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .tasks
+                .clear();
+        }
+        for session in &mut self.0.sessions {
+            session.done = true;
+        }
+    }
+}
 #[test]
 fn retirement_release_owns_all_resources() {
-    let mut backend = MacosTraceBackend::default();
+    let mut owned = SelfTaskBackend(MacosTraceBackend::default());
+    let backend = &mut owned.0;
     backend.watchdog = Some(Watchdog {
         tasks: Arc::new(Mutex::new(WatchedTasks::default())),
         cancel: None,
@@ -92,7 +111,7 @@ fn retirement_release_owns_all_resources() {
     retiring.scratch.push((1, 1, 1));
     let task = Arc::downgrade(&retiring.task);
     crate::ownership::task(pid, &retiring.task);
-    register(&mut backend, retiring);
+    register(backend, retiring);
     let mut before = crate::ownership::remaining(pid);
     before.sort_unstable();
     assert_eq!(
@@ -127,7 +146,8 @@ fn retirement_release_owns_all_resources() {
 }
 #[test]
 fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
-    let mut backend = MacosTraceBackend::default();
+    let mut owned = SelfTaskBackend(MacosTraceBackend::default());
+    let backend = &mut owned.0;
     backend.watchdog = Some(Watchdog {
         tasks: Arc::new(Mutex::new(WatchedTasks::default())),
         cancel: None,
@@ -141,9 +161,9 @@ fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
     let root = ProcessHandle(live.id);
     let thread = live.thread;
     let live_task = live.task.clone();
-    register(&mut backend, live);
+    register(backend, live);
     let (old, _old_peer) = slot(101, true);
-    register(&mut backend, old);
+    register(backend, old);
     backend.service_retirements();
     assert!(backend.sessions[1].live.is_none());
     let facts = |s: &Session| {
@@ -157,7 +177,7 @@ fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
     };
     let before = facts(&backend.sessions[1]);
     let (pending_quiesce, _q_peer) = slot(102, true);
-    register(&mut backend, pending_quiesce);
+    register(backend, pending_quiesce);
     backend.quiesce(root).unwrap();
     assert!(
         backend.sessions[2].live.is_none(),
@@ -165,7 +185,7 @@ fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
     );
     assert_eq!(facts(&backend.sessions[1]), before);
     let (pending_resume, _r_peer) = slot(103, true);
-    register(&mut backend, pending_resume);
+    register(backend, pending_resume);
     backend
         .resume(ResumeCommand {
             thread,

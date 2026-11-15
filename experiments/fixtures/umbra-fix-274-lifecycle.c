@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/event.h>
 #include <unistd.h>
 
 static void require(int ok, int code) { if (!ok) { fprintf(stderr, "f274 pid=%d failure=%d errno=%d\n", getpid(), code, errno); _exit(code); } }
@@ -54,15 +55,44 @@ int main(int argc, char **argv) {
         mark(record, "exec=17 sibling=23 bytes=ABCD\n");
     } else {
         require(!strcmp(argv[1], "parent"), 94);
+        int identities[2]; require(pipe(identities) == 0, 100);
         pid_t p = fork(); require(p >= 0, 95);
         if (!p) {
             pid_t g = fork(); require(g >= 0, 96);
-            if (!g) { gate(ready); put(fd, "B"); mark(done, "descendant\n"); _exit(0); }
+            if (!g) {
+                close(identities[0]); close(identities[1]);
+                gate(ready); put(fd, "B"); mark(done, "descendant\n"); _exit(0);
+            }
+            close(identities[0]);
+            require(write(identities[1], &g, sizeof(g)) == sizeof(g), 101);
+            close(identities[1]);
             _exit(19);
         }
+        close(identities[1]);
+        pid_t descendant;
+        require(read(identities[0], &descendant, sizeof(descendant)) == sizeof(descendant), 102);
+        close(identities[0]);
+        // Register before releasing the descendant: the done marker is not exit evidence.
+        // Darwin permits NOTE_EXITSTATUS for a process this caller may signal.
+        int queue = kqueue(); require(queue >= 0, 103);
+        struct kevent change, event;
+        EV_SET(&change, descendant, EVFILT_PROC, EV_ADD | EV_ONESHOT,
+               NOTE_EXIT | NOTE_EXITSTATUS, 0, NULL);
+        require(kevent(queue, &change, 1, NULL, 0, NULL) == 0, 104);
         waited(p, 19); usleep(300000); mark(ready, "parent-retired\n"); gate(done);
+        struct timespec bound = {10, 0};
+        int count = kevent(queue, NULL, 0, &event, 1, &bound);
+        require(count == 1 && !(event.flags & EV_ERROR)
+                && event.ident == (uintptr_t)descendant && event.filter == EVFILT_PROC
+                && (event.fflags & (NOTE_EXIT | NOTE_EXITSTATUS)) == (NOTE_EXIT | NOTE_EXITSTATUS), 105);
+        int status = (int)event.data;
+        fprintf(stderr, "f274 descendant=%d exit-status=%d\n", descendant, status);
+        require(WIFEXITED(status) && WEXITSTATUS(status) == 0, 106);
+        require(close(queue) == 0, 107);
         put(fd, "C");
-        mark(record, "parent=19 descendant=0 bytes=ABC\n");
+        char result[80];
+        snprintf(result, sizeof(result), "parent=19 descendant=%d bytes=ABC\n", WEXITSTATUS(status));
+        mark(record, result);
     }
     require(close(fd) == 0, 99); return 0;
 }

@@ -16500,6 +16500,7 @@ fn fix_274_lifecycle(mode: &str) {
     assert_eq!(routed.object("records"), Some(record));
     assert!(journal_records_completion(&routed.run));
     slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
 }
 #[test]
 fn fix_274_live_sibling_inheritance() {

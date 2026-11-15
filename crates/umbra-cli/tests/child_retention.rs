@@ -239,8 +239,7 @@ fn fix_274_completed_children_census() {
     let zombies = children.iter().filter(|p| p.zombie).count();
     let live = children.len() - zombies;
     eprintln!("provider={provider} warm_fds={baseline} final_fds={final_fds} zombies={zombies} live_children={live}");
-    run.finish();
-    let diagnostic = std::fs::read_to_string(stderr).unwrap();
+    let diagnostic = std::fs::read_to_string(&stderr).unwrap();
     eprintln!("supervised stderr:\n{diagnostic}");
     assert!(
         zombies == 0 && final_fds <= baseline + 2,
@@ -262,4 +261,5 @@ fn fix_274_completed_children_census() {
             "retained child owners: {readings:?}"
         );
     }
+    run.finish();
 }
