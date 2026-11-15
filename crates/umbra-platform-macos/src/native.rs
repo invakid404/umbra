@@ -4453,10 +4453,8 @@ impl TraceControl for MacosTraceBackend {
         self.events.clear();
         self.quiesced_stops.clear();
         self.watchdog.take();
-        // Each timed-out session already wrote its warning to stderr before its
-        // tracer was killed. Only a session the post-kill barrier could not
-        // confirm either fails `terminate` (`terminated = false` in
-        // `umbra-supervisor/src/run.rs`): its tree's termination is unknown.
+        // Preserve both unconfirmed tracee termination and failed retirement
+        // outcomes, even when a later emergency attempt may reap the tracer.
         let unconfirmed: Vec<String> = reports
             .iter()
             .filter(|r| r.unconfirmed || r.steps.iter().any(|step| matches!(step, TeardownStep::Retirement(outcome) if !outcome.success())))

@@ -236,8 +236,13 @@ The M1 mechanisms named in the tracker spec are all present:
     tracer still awaiting reap remains owned and is serviced without another
     kill. Root Exit can be held only to that original deadline; other events
     and live siblings continue. Unconfirmed barriers and kill/wait errors are
-    recorded once and remain visible at final termination. Drop retains the
-    existing bounded emergency cleanup. The `retirement-witness` qualification
+    recorded once and remain visible at final termination. Success outcomes
+    retain the owned wait status; failures retain OS error kind/code, elapsed
+    time and the last observation. Drop explicitly finalizes failed owners,
+    preserving the original failure and merging typed emergency kill/wait
+    evidence into the retained report. Unconfirmed owners keep ordered barrier
+    and warning handling; confirmed tracer finalization has one bounded window. The `retirement-witness`
+    qualification
     feature observes actual Task Arcs and owning body/map lifetimes; ordinary
     builds do not collect that history.
 
@@ -742,8 +747,12 @@ was closed (below). Fixture cases:
 backend polling/termination interfaces. `retirement_controls.rs` supplies
 loopback RSP peers and owned ordinary children to exercise quiesce/resume with
 retired slots and a registered live sibling. It checks pending service at both
-entry points, unchanged compact exit/barrier/wait facts, the exact resume
-packet and the surviving registry owner. These controls run in the one
+entry points and quiesce exit, unchanged compact exit/barrier/wait facts, the
+exact resume packet and the surviving registry owner. Backend controls also
+cover late reap versus exhausted final drain, actual failed-owner Drop with
+confirmed and unconfirmed barriers, a live root across a slow child gap,
+simultaneous exits and root-exit delivery after a pending child. These controls
+run in the one
 self-hosted `native-qualification` job as well as ordinary unit testing.
 `retirement_release_owns_all_resources` populates each working map/buffer,
 then requires every ownership witness to expire, both Task owners to release,

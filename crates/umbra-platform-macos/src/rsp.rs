@@ -501,9 +501,8 @@ impl crate::retirement::Tracer for Rsp {
         }) {
             return Ok(None);
         }
-        self.child.try_wait().map(|status| {
+        self.child.try_wait().inspect(|status| {
             self.reaped = status.is_some();
-            status
         })
     }
     fn kill(&mut self) -> std::io::Result<()> {

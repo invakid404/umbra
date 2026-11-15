@@ -428,11 +428,27 @@ fn retirement_root_exit_waits_for_pending_child_without_losing_events() {
 }
 #[test]
 fn retirement_slow_gap_preserves_history_for_the_next_child() {
-    let mut backend = MacosTraceBackend::default();
+    // Assertion unwinding must never signal the self-Task used by the live root.
+    struct SafeBackend(MacosTraceBackend);
+    impl Drop for SafeBackend {
+        fn drop(&mut self) {
+            crate::clock::SCRIPT.with(|clock| clock.set(None));
+            for session in &mut self.0.sessions {
+                session.done = true;
+            }
+        }
+    }
+    let mut owned = SafeBackend(MacosTraceBackend::default());
+    let backend = &mut owned.0;
+    let (mut root, _root_peer) = slot(329, false);
+    root.parent = None;
+    root.torn_down = true;
+    let root_owner = Arc::downgrade(&root.task);
+    backend.sessions.push(root);
     let (first, _peer) = slot(330, true);
     backend.sessions.push(first);
     backend.service_retirements();
-    let old = backend.sessions[0].id;
+    let old = backend.sessions[1].id;
     let future = crate::clock::now() + Duration::from_secs(60 * 60);
     let (mut later, _later_peer) = slot(331, true);
     later.retirement = Some(crate::retirement::Retirement::new(future));
@@ -440,9 +456,12 @@ fn retirement_slow_gap_preserves_history_for_the_next_child() {
     crate::clock::SCRIPT.with(|clock| clock.set(Some((future, future))));
     backend.service_retirements();
     crate::clock::SCRIPT.with(|clock| clock.set(None));
-    assert_eq!(backend.sessions[0].id, old);
-    assert_eq!(backend.sessions.len(), 2);
-    assert!(backend.sessions.iter().all(|s| s.live.is_none()));
+    assert!(!backend.sessions[0].done);
+    assert!(backend.sessions[0].live.is_some());
+    assert!(root_owner.upgrade().is_some());
+    assert_eq!(backend.sessions[1].id, old);
+    assert_eq!(backend.sessions.len(), 3);
+    assert!(backend.sessions[1..].iter().all(|s| s.live.is_none()));
     assert_eq!(backend.teardown_reports.len(), 2);
 }
 
