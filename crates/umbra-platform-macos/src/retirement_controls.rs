@@ -49,6 +49,74 @@ fn register(backend: &mut MacosTraceBackend, s: Session) {
     backend.sessions.push(s);
 }
 #[test]
+fn retirement_release_owns_all_resources() {
+    let mut backend = MacosTraceBackend::default();
+    backend.watchdog = Some(Watchdog {
+        tasks: Arc::new(Mutex::new(WatchedTasks::default())),
+        cancel: None,
+        worker: None,
+    });
+    let (mut retiring, mut peer) = slot(104, true);
+    let pid = retiring.id.0.native_id;
+    let thread = retiring.thread;
+    let breakpoint = Breakpoint {
+        original: [0; 4],
+        raw: false,
+    };
+    retiring.breaks.insert(1, breakpoint.clone());
+    retiring.pending.insert(
+        thread,
+        Pending {
+            thread,
+            entry: 1,
+            entry_breakpoint: breakpoint,
+            gate: 2,
+            kind: ReturnKind::Wait,
+            hardware: false,
+        },
+    );
+    retiring.entry.insert(thread, 1);
+    retiring.waiting.push(0);
+    retiring.registers.push((1, 1));
+    retiring.scratch.push((1, 1, 1));
+    let task = Arc::downgrade(&retiring.task);
+    crate::ownership::task(pid, &retiring.task);
+    register(&mut backend, retiring);
+    let mut before = crate::ownership::remaining(pid);
+    before.sort_unstable();
+    assert_eq!(
+        before,
+        [
+            "body",
+            "breaks",
+            "entry",
+            "pending",
+            "registers",
+            "scratch",
+            "task",
+            "waiting"
+        ]
+    );
+    backend.service_retirements();
+    assert!(backend.sessions[0].live.is_none());
+    assert!(task.upgrade().is_none(), "both Task owners must release");
+    assert!(
+        backend
+            .watchdog
+            .as_ref()
+            .unwrap()
+            .tasks
+            .lock()
+            .unwrap()
+            .tasks
+            .is_empty()
+    );
+    assert_eq!(crate::ownership::remaining(pid), Vec::<&str>::new());
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0, "RSP socket must close");
+}
+#[test]
 fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
     let mut backend = MacosTraceBackend::default();
     backend.watchdog = Some(Watchdog {
