@@ -1644,7 +1644,9 @@ impl Drop for Session {
         // before parents (`MacosTraceBackend::tear_down_sessions`). This only
         // catches a session dropped some other way, so even then the tracer is
         // never killed ahead of the barrier.
-        if !self.torn_down {
+        if self.retirement_report.is_some() {
+            self.finalize_failed_retirement();
+        } else if !self.torn_down {
             let report = self.ordered_teardown();
             log_teardown(&report);
         }
@@ -3568,9 +3570,10 @@ pub enum TeardownStep {
     /// The termination-unconfirmed warning, written to stderr before the kill.
     Warning(String),
     Retirement(crate::retirement::FinishOutcome),
+    EmergencyTracer(crate::retirement::EmergencyFinish),
     RetirementOverrun {
         elapsed: Duration,
-        last_observation: Option<String>,
+        last_observation: Option<crate::retirement::Observation>,
     },
     TracerKilled,
     TracerReaped(bool),
@@ -3596,8 +3599,9 @@ pub struct TeardownReport {
     /// The barrier did not confirm before the bound, so the timeout path ran:
     /// the warning, then the tracer kill.
     pub timed_out: bool,
-    /// Still not confirmed after the post-kill barrier either. Only this makes
-    /// `terminate` fail (review ruling 1 V3).
+    /// Still not confirmed after the post-kill barrier. Cleanup makes terminate
+    /// fail for this condition or any retained failed retirement outcome.
+    /// Invalid root handles and unsupported termination policies also return Err.
     pub unconfirmed: bool,
     pub elapsed: Duration,
 }
@@ -3624,6 +3628,26 @@ fn log_teardown(report: &TeardownReport) {
 }
 
 impl Session {
+    /// Keep the original failure and append one explicit bounded emergency attempt.
+    fn finalize_failed_retirement(&mut self) {
+        if self.torn_down || self.live.is_none() {
+            return;
+        }
+        let Some(mut retained) = self.retirement_report.clone() else {
+            return;
+        };
+        let attempt = self.ordered_teardown_inner(true);
+        retained.steps.extend(attempt.steps);
+        retained.unconfirmed |= attempt.unconfirmed;
+        retained.timed_out |= attempt.timed_out;
+        retained.elapsed += attempt.elapsed;
+        log_teardown(&retained);
+        eprintln!(
+            "umbra-platform-macos: retained retirement failure after emergency cleanup: {}",
+            retained.summary()
+        );
+        self.retirement_report = Some(retained);
+    }
     /// Evaluate the barrier once. It never blocks: the `waitpid` is `WNOHANG`.
     fn barrier(&mut self) -> BarrierReading {
         let reading = self.barrier_now();
@@ -3662,6 +3686,9 @@ impl Session {
     /// platform's child again. Every wait is bounded. On a timeout, the warning
     /// goes to stderr **before** the tracer is killed (ruling R3.2).
     fn ordered_teardown(&mut self) -> TeardownReport {
+        self.ordered_teardown_inner(false)
+    }
+    fn ordered_teardown_inner(&mut self, emergency_retirement: bool) -> TeardownReport {
         self.torn_down = true;
         let started = crate::clock::now();
         let deadline = started + TEARDOWN_BOUND;
@@ -3749,18 +3776,36 @@ impl Session {
             eprintln!("{warning}");
             steps.push(TeardownStep::Warning(warning));
         }
-        self.rsp.kill_tracer();
-        steps.push(TeardownStep::TracerKilled);
+        let emergency_limit = crate::clock::now() + rsp::TRACER_REAP_BOUND;
+        let emergency = emergency_retirement
+            .then(|| crate::retirement::emergency_finish(&mut self.rsp, emergency_limit));
+        if let Some(attempt) = &emergency {
+            steps.push(TeardownStep::EmergencyTracer(attempt.clone()));
+        } else {
+            self.rsp.kill_tracer();
+            steps.push(TeardownStep::TracerKilled);
+        }
         // Review ruling 1 V3: after a timeout, ONE post-kill barrier, run inside
         // the tracer-reap window (so the per-session total stays at most 2 s).
         // Measured: a released tracee is a zombie within 5 ms of its tracer's
         // death. The same positives apply (SZOMB with identity under any
         // parent, or proven absence or reuse).
-        let limit = crate::clock::now() + rsp::TRACER_REAP_BOUND;
-        let mut tracer_reaped = false;
+        let limit = if emergency_retirement {
+            emergency_limit
+        } else {
+            crate::clock::now() + rsp::TRACER_REAP_BOUND
+        };
+        let mut tracer_reaped = emergency.as_ref().is_some_and(|attempt| {
+            attempt.operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    crate::retirement::TracerOperation::Wait(Ok(Some(_)))
+                )
+            })
+        });
         let mut after_kill: Option<BarrierReading> = None;
         loop {
-            if !tracer_reaped {
+            if !tracer_reaped && !emergency_retirement {
                 tracer_reaped = self.rsp.reap_tracer(Duration::ZERO);
             }
             if timed_out && !matches!(after_kill, Some(BarrierReading::Confirmed(_))) {
@@ -3915,7 +3960,7 @@ impl MacosTraceBackend {
             if crate::clock::now() >= limit {
                 for s in &mut self.sessions {
                     if let Some(r) = &mut s.retirement {
-                        r.finish_drain();
+                        r.finish_drain(crate::clock::now());
                     }
                 }
                 self.service_retirements();
@@ -3968,6 +4013,25 @@ impl MacosTraceBackend {
         }
         reports
     }
+    fn finalize_failed_retirements(&mut self) {
+        for session in self
+            .sessions
+            .iter_mut()
+            .rev()
+            .chain(self.failed_retirements.iter_mut().rev())
+        {
+            session.finalize_failed_retirement();
+            if let Some(report) = &session.retirement_report {
+                if let Some(stored) = self
+                    .teardown_reports
+                    .iter_mut()
+                    .find(|stored| stored.pid == report.pid && stored.identity == report.identity)
+                {
+                    *stored = report.clone();
+                }
+            }
+        }
+    }
     /// The tracer (debugserver) pid of each live session. Read-only test seam
     /// for the timeout-path acceptance tests.
     #[doc(hidden)]
@@ -3998,6 +4062,7 @@ impl Drop for MacosTraceBackend {
             }
         }
         self.tear_down_sessions();
+        self.finalize_failed_retirements();
     }
 }
 
@@ -4270,88 +4335,93 @@ impl TraceControl for MacosTraceBackend {
     }
     fn quiesce(&mut self, process: ProcessHandle) -> Result<QuiescedTree> {
         self.service_retirements();
-        if self.sessions.first().is_none_or(|s| s.id != process.0) {
-            return Err(UmbraError::new(
-                ErrorKind::StaleHandle,
-                "quiesce",
-                "unknown root",
-            ));
-        }
-        self.check_deadline()?;
-        let quiesce_limit = operation_deadline(self.deadline, Duration::from_secs(5));
         let result = (|| {
-            // Interrupt all live connections before waiting on any one of them.
-            for s in &mut self.sessions {
-                if !s.done && !s.stopped {
-                    s.rsp.interrupt_until(quiesce_limit)?;
-                }
+            if self.sessions.first().is_none_or(|s| s.id != process.0) {
+                return Err(UmbraError::new(
+                    ErrorKind::StaleHandle,
+                    "quiesce",
+                    "unknown root",
+                ));
             }
-            for i in 0..self.sessions.len() {
-                while !self.sessions[i].done && !self.sessions[i].stopped {
-                    self.check_deadline()?;
-                    if crate::clock::now() >= quiesce_limit {
-                        return Err(error("quiesce", "operation deadline expired"));
+            self.check_deadline()?;
+            let quiesce_limit = operation_deadline(self.deadline, Duration::from_secs(5));
+            let result = (|| {
+                // Interrupt all live connections before waiting on any one of them.
+                for s in &mut self.sessions {
+                    if !s.done && !s.stopped {
+                        s.rsp.interrupt_until(quiesce_limit)?;
                     }
-                    let Some(reply) = self.sessions[i].rsp.poll(Duration::from_millis(10))? else {
-                        continue;
-                    };
-                    if reply.starts_with('O') {
-                        continue;
-                    }
-                    if reply.starts_with('W') || reply.starts_with('X') {
-                        self.stop(i, reply, false)?;
-                        continue;
-                    }
-                    if !reply.starts_with('T') || reply.len() < 3 {
-                        return Err(error(
-                            "quiesce",
-                            format!("expected stopped acknowledgement: {reply}"),
-                        ));
-                    }
-                    let fields = rsp::fields(&reply[3..]);
-                    let thread = rsp::number(
-                        fields
-                            .get("thread")
-                            .ok_or_else(|| error("quiesce", "no stopped thread"))?,
-                    )?;
-                    let s = &mut self.sessions[i];
-                    s.thread = tid(thread, s.id.0.generation);
-                    s.stopped = true;
-                    // Do not dispatch here: process-control stops can resume or attach
-                    // children. Preserve the reply so no syscall trap is skipped.
-                    self.quiesced_stops.push_back((i, reply));
                 }
-            }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            // A failed interrupt/ack must not leave part of the tree running.
-            for s in &self.sessions {
-                if let Some(live) = &s.live {
-                    live.task.kill();
+                for i in 0..self.sessions.len() {
+                    while !self.sessions[i].done && !self.sessions[i].stopped {
+                        self.check_deadline()?;
+                        if crate::clock::now() >= quiesce_limit {
+                            return Err(error("quiesce", "operation deadline expired"));
+                        }
+                        let Some(reply) = self.sessions[i].rsp.poll(Duration::from_millis(10))?
+                        else {
+                            continue;
+                        };
+                        if reply.starts_with('O') {
+                            continue;
+                        }
+                        if reply.starts_with('W') || reply.starts_with('X') {
+                            self.stop(i, reply, false)?;
+                            continue;
+                        }
+                        if !reply.starts_with('T') || reply.len() < 3 {
+                            return Err(error(
+                                "quiesce",
+                                format!("expected stopped acknowledgement: {reply}"),
+                            ));
+                        }
+                        let fields = rsp::fields(&reply[3..]);
+                        let thread = rsp::number(
+                            fields
+                                .get("thread")
+                                .ok_or_else(|| error("quiesce", "no stopped thread"))?,
+                        )?;
+                        let s = &mut self.sessions[i];
+                        s.thread = tid(thread, s.id.0.generation);
+                        s.stopped = true;
+                        // Do not dispatch here: process-control stops can resume or attach
+                        // children. Preserve the reply so no syscall trap is skipped.
+                        self.quiesced_stops.push_back((i, reply));
+                    }
                 }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                // A failed interrupt/ack must not leave part of the tree running.
+                for s in &self.sessions {
+                    if let Some(live) = &s.live {
+                        live.task.kill();
+                    }
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-        if self
-            .sessions
-            .iter()
-            .any(|s| !s.done && !s.pending.is_empty())
-        {
-            return Err(error(
-                "quiesce",
-                "syscall return in flight; drain next_event before retrying",
-            ));
-        }
-        Ok(QuiescedTree {
-            process,
-            tasks: self
+            if self
                 .sessions
                 .iter()
-                .filter(|s| !s.done)
-                .map(|s| s.id)
-                .collect(),
-        })
+                .any(|s| !s.done && !s.pending.is_empty())
+            {
+                return Err(error(
+                    "quiesce",
+                    "syscall return in flight; drain next_event before retrying",
+                ));
+            }
+            Ok(QuiescedTree {
+                process,
+                tasks: self
+                    .sessions
+                    .iter()
+                    .filter(|s| !s.done)
+                    .map(|s| s.id)
+                    .collect(),
+            })
+        })();
+        self.service_retirements();
+        result
     }
     fn terminate(&mut self, process: ProcessHandle, policy: TerminationPolicy) -> Result<()> {
         if self.sessions.first().is_none_or(|s| s.id != process.0) {
@@ -4410,7 +4480,14 @@ mod tests {
         use super::*;
         for outcome in [
             crate::FinishOutcome::UnconfirmedBarrier("scripted lookup".into()),
-            crate::FinishOutcome::WaitError("scripted ECHILD".into()),
+            crate::FinishOutcome::WaitError(crate::retirement::FinishFailure {
+                error: Some(crate::retirement::OsError::from(
+                    &std::io::Error::from_raw_os_error(libc::ECHILD),
+                )),
+                elapsed: Duration::ZERO,
+                last_observation: None,
+                later_wait_status: None,
+            }),
         ] {
             let id = TaskId(TaskIdentity {
                 native_id: 0,

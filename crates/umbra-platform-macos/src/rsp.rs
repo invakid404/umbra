@@ -460,14 +460,45 @@ impl Rsp {
         )
     }
 }
+#[cfg(test)]
+thread_local! {
+    static RETIREMENT_WAIT_GATES: std::cell::RefCell<std::collections::HashMap<u32, usize>> = Default::default();
+}
+#[cfg(test)]
+impl Rsp {
+    /// Delay visibility, never fabricate a successful owned wait status.
+    pub(crate) fn retirement_wait_gate(&mut self, observations: usize) {
+        self.reaped = false;
+        RETIREMENT_WAIT_GATES.with(|gates| {
+            gates.borrow_mut().insert(self.child.id(), observations);
+        });
+    }
+}
 impl crate::retirement::Tracer for Rsp {
     fn already_reaped(&self) -> bool {
         self.reaped
     }
-    fn try_reap(&mut self) -> std::io::Result<bool> {
+    fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        #[cfg(test)]
+        if RETIREMENT_WAIT_GATES.with(|gates| {
+            let mut gates = gates.borrow_mut();
+            let Some(remaining) = gates.get_mut(&self.child.id()) else {
+                return false;
+            };
+            if *remaining == 0 {
+                gates.remove(&self.child.id());
+                return false;
+            }
+            if *remaining != usize::MAX {
+                *remaining -= 1;
+            }
+            true
+        }) {
+            return Ok(None);
+        }
         self.child.try_wait().map(|status| {
             self.reaped = status.is_some();
-            self.reaped
+            status
         })
     }
     fn kill(&mut self) -> std::io::Result<()> {

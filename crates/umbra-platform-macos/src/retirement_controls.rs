@@ -178,3 +178,137 @@ fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
     drop(registry);
     backend.sessions[0].done = true;
 }
+
+#[test]
+fn retirement_quiesce_services_exit_after_pending_entry() {
+    let mut backend = MacosTraceBackend::default();
+    let (mut pending, _peer) = slot(201, true);
+    pending.rsp.retirement_wait_gate(1);
+    let root = ProcessHandle(pending.id);
+    let owner = Arc::downgrade(&pending.task);
+    backend.sessions.push(pending);
+    backend.quiesce(root).unwrap();
+    assert!(
+        backend.sessions[0].live.is_none(),
+        "exit pass must release the newly available owned wait"
+    );
+    assert!(owner.upgrade().is_none());
+}
+
+fn killed_pending(generation: u64) -> (Session, std::net::TcpStream) {
+    let (mut session, peer) = slot(generation, true);
+    session.rsp.retirement_wait_gate(usize::MAX);
+    let start = crate::clock::now() - Duration::from_secs(2);
+    let mut retirement = crate::retirement::Retirement::new(start);
+    retirement.service(start, Ok(()), &mut session.rsp);
+    retirement.service(
+        start + crate::retirement::TRACER_BOUND,
+        Ok(()),
+        &mut session.rsp,
+    );
+    assert!(retirement.outcome().is_none());
+    assert!(retirement.overrun.is_some());
+    session.retirement = Some(retirement);
+    (session, peer)
+}
+#[test]
+fn retirement_backend_late_reap_terminates_ok() {
+    let mut backend = MacosTraceBackend::default();
+    let (mut session, _peer) = killed_pending(202);
+    let root = ProcessHandle(session.id);
+    let owner = Arc::downgrade(&session.task);
+    session.rsp.retirement_wait_gate(1);
+    backend.sessions.push(session);
+    backend.service_retirements();
+    assert!(owner.upgrade().is_some());
+    backend
+        .terminate(root, TerminationPolicy::Immediate)
+        .unwrap();
+    assert!(owner.upgrade().is_none());
+    assert!(backend.failed_retirements.is_empty());
+    assert!(backend.teardown_reports[0]
+        .steps
+        .iter()
+        .any(|step| matches!(step, TeardownStep::RetirementOverrun { .. })));
+    assert!(backend.teardown_reports[0].steps.iter().any(|step| matches!(step,
+        TeardownStep::Retirement(crate::FinishOutcome::KilledThenReaped(status)) if status.success())));
+}
+#[test]
+fn retirement_backend_exhausted_drain_retains_child_and_failure() {
+    let mut backend = MacosTraceBackend::default();
+    let (session, _peer) = killed_pending(203);
+    let root = ProcessHandle(session.id);
+    let tracer = session.rsp.tracer_pid();
+    let owner = Arc::downgrade(&session.task);
+    backend.sessions.push(session);
+    backend.service_retirements();
+    assert!(backend
+        .terminate(root, TerminationPolicy::Immediate)
+        .is_err());
+    assert!(owner.upgrade().is_some());
+    assert_eq!(backend.failed_retirements.len(), 1);
+    assert_eq!(backend.failed_retirements[0].rsp.tracer_pid(), tracer);
+    let original = backend.teardown_reports[0].steps.clone();
+    assert!(original.iter().any(|step| matches!(
+        step,
+        TeardownStep::Retirement(crate::FinishOutcome::BoundExhausted(_))
+    )));
+    assert!(original
+        .iter()
+        .any(|step| matches!(step, TeardownStep::RetirementOverrun { .. })));
+    backend.failed_retirements[0].rsp.retirement_wait_gate(0);
+    backend.finalize_failed_retirements();
+    assert!(backend.teardown_reports[0].steps.starts_with(&original));
+    assert!(backend.teardown_reports[0].steps.iter().any(
+        |step| matches!(step, TeardownStep::EmergencyTracer(attempt) if attempt.outcome.success())
+    ));
+    assert!(backend.failed_retirements[0].torn_down);
+    let report = backend.teardown_reports[0].clone();
+    backend.finalize_failed_retirements();
+    assert_eq!(
+        backend.teardown_reports[0], report,
+        "emergency attempt is once only"
+    );
+    drop(backend);
+    assert!(owner.upgrade().is_none());
+}
+#[test]
+fn retirement_drop_unconfirmed_resource_owner_records_emergency() {
+    let mut backend = MacosTraceBackend::default();
+    let (mut session, mut peer) = slot(204, true);
+    session.exit_evidence = None;
+    session.exit_report = None;
+    session.reaped = false;
+    session.retirement = Some(crate::retirement::Retirement::new(
+        crate::clock::now() - Duration::from_secs(2),
+    ));
+    let root = ProcessHandle(session.id);
+    let owner = Arc::downgrade(&session.task);
+    backend.sessions.push(session);
+    backend.service_retirements();
+    assert!(backend
+        .terminate(root, TerminationPolicy::Immediate)
+        .is_err());
+    assert!(owner.upgrade().is_some());
+    let original = backend.teardown_reports[0].steps.clone();
+    backend.finalize_failed_retirements();
+    let report = &backend.teardown_reports[0];
+    assert!(report.unconfirmed);
+    assert!(report.steps.starts_with(&original));
+    let warning = report
+        .steps
+        .iter()
+        .position(|step| matches!(step, TeardownStep::Warning(_)))
+        .unwrap();
+    let finish = report
+        .steps
+        .iter()
+        .position(|step| matches!(step, TeardownStep::EmergencyTracer(_)))
+        .unwrap();
+    assert!(warning < finish);
+    drop(backend);
+    assert!(owner.upgrade().is_none());
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+}
