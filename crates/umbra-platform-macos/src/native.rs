@@ -5221,3 +5221,7 @@ mod monitor_sleep_tests {
         SCRIPT.with(|v| v.set(None));
     }
 }
+
+#[cfg(test)]
+#[path = "retirement_controls.rs"]
+mod retirement_controls;

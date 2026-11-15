@@ -436,21 +436,28 @@ impl Rsp {
 #[cfg(test)]
 impl Rsp {
     pub(crate) fn retirement_test() -> Self {
+        Self::retirement_test_pair().0
+    }
+    pub(crate) fn retirement_test_pair() -> (Self, TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (stream, _) = listener.accept().unwrap();
-        drop(peer);
-        Self {
-            id: 0,
-            stream,
-            child: Command::new("/usr/bin/true").spawn().unwrap(),
-            reaped: false,
-            buffer: Vec::new(),
-            no_ack: true,
-            deadline: None,
-            setup_deadline: None,
-            torn_down: false,
-        }
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        (
+            Self {
+                id: 0,
+                stream,
+                child,
+                reaped: true,
+                buffer: Vec::new(),
+                no_ack: true,
+                deadline: None,
+                setup_deadline: None,
+                torn_down: false,
+            },
+            peer,
+        )
     }
 }
 impl crate::retirement::Tracer for Rsp {

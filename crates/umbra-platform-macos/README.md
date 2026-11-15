@@ -84,7 +84,7 @@ Probe controls are listed under [Provider binary](#provider-binary).
   hosts whose selected Xcode keeps debugserver under `SharedFrameworks`
   rather than the `Library/PrivateFrameworks` path probed below.
 - `TeardownReport`, `TeardownStep`, `BarrierReading`, `BarrierEvidence` and
-  `ReportedExitLookup` describe each session's ordered teardown (item 13
+  `ReportedExitLookup` and `FinishOutcome` describe each session's ordered teardown (item 13
   below). `MacosTraceBackend::teardown_reports()` returns every report so far
   and `tracer_pids()` the live sessions' debugserver pids. Both are read-only,
   `#[doc(hidden)]` seams for the acceptance tests; the backend never consults
@@ -736,6 +736,20 @@ was closed (below). Fixture cases:
 | `mt-write`          | **CAPTURED** — the closed multithreaded window below |
 | `mt-spawn`          | **CAPTURED** — the closed multithreaded window below |
 
+### Completed-child retirement (#274)
+
+`retirement_` unit controls exercise typed cleanup outcomes and the actual
+backend polling/termination interfaces. `retirement_controls.rs` supplies
+loopback RSP peers and owned ordinary children to exercise quiesce/resume with
+retired slots and a registered live sibling. It checks pending service at both
+entry points, unchanged compact exit/barrier/wait facts, the exact resume
+packet and the surviving registry owner. These controls run in the one
+self-hosted `native-qualification` job as well as ordinary unit testing.
+Checkpoint publication/recovery is not implemented at the base; this coverage
+is quiesce/resume only. Existing checkpoint-recovery refusal remains unchanged.
+The CLI's `child_retention` live census and the userspace suite's paired
+lifecycle cases provide the real-debugger and file-byte measurements.
+
 ### Ordered teardown (#186)
 
 Every case that runs through `fixture_argv` (all but `dirfd-rename` and
@@ -1154,8 +1168,10 @@ before launch, after launch failure, and after termination. Observation runs
 from owner binding until backend disposal, independently of the per-launch
 deadline watchdog; both share the task registry. Exec registers a replacement
 Task before retiring the superseded entry, releasing its old Mach right once
-the session replaces its reference. Completed child sessions remain until tree
-cleanup; provider-lifetime owner registry entries remain until backend disposal. The monitor
+the session replaces its reference. Confirmed completed children release their live
+bodies and registry entries after tracer reaping; compact identity, wait and exit
+facts remain until tree cleanup. Unconfirmed or failed cleanup retains ownership
+and reports its failure at termination. The monitor
 kills registered tasks; late registrations are killed immediately. The provider
 thread performs existing ordered teardown and retains unconfirmed diagnostics.
 Normal disarm does not kill tasks. No heartbeat or inactivity-based "stuck"
