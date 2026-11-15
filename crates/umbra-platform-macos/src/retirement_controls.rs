@@ -99,6 +99,7 @@ fn retirement_release_owns_all_resources() {
     );
     backend.service_retirements();
     assert!(backend.sessions[0].live.is_none());
+    assert_eq!(crate::ownership::remaining(pid), Vec::<&str>::new());
     assert!(task.upgrade().is_none(), "both Task owners must release");
     assert!(
         backend
@@ -111,7 +112,6 @@ fn retirement_release_owns_all_resources() {
             .tasks
             .is_empty()
     );
-    assert_eq!(crate::ownership::remaining(pid), Vec::<&str>::new());
     peer.set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
     assert_eq!(peer.read(&mut [0]).unwrap(), 0, "RSP socket must close");
