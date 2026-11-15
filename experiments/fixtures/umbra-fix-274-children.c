@@ -1,5 +1,5 @@
 /* #274: serial children with externally observable census milestones.
- * stdin supplies one byte to start and one to release the completed root.
+ * Host-created files start and release the completed root.
  * No timeout or lifetime policy is imposed on the supervised session.
  */
 #include <errno.h>
@@ -11,21 +11,22 @@
 
 extern char **environ;
 
-static int gate(void) {
-    char byte;
-    ssize_t n;
-    do {
-        n = read(STDIN_FILENO, &byte, 1);
-    } while (n < 0 && errno == EINTR);
-    return n == 1 ? 0 : 1;
+static int gate(const char *path) {
+    while (access(path, F_OK) != 0) {
+        if (errno != ENOENT)
+            return 1;
+        usleep(10000);
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "child") == 0)
         return 0;
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    printf("ready pid=%d\n", getpid());
-    if (gate())
+    if (argc != 3) return 14;
+    setvbuf(stderr, NULL, _IOLBF, 0);
+    fprintf(stderr, "ready pid=%d\n", getpid());
+    if (gate(argv[1]))
         return 10;
     for (int i = 0; i < 200; ++i) {
         pid_t child;
@@ -46,6 +47,6 @@ int main(int argc, char **argv) {
             return 12;
         }
     }
-    puts("completed=200");
-    return gate() ? 13 : 0;
+    fputs("completed=200\n", stderr);
+    return gate(argv[2]) ? 13 : 0;
 }

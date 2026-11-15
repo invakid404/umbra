@@ -2,11 +2,11 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+
 use std::time::{Duration, Instant};
 
 fn qualified() -> bool {
@@ -63,52 +63,48 @@ fn fds(pid: u32) -> usize {
 
 struct Run {
     child: Child,
-    lines: Receiver<String>,
+    gates: [PathBuf; 2],
+    gate: usize,
     stderr: PathBuf,
 }
 impl Run {
     fn start(mut command: Command, stderr: &Path) -> Self {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+        let gates = [
+            stderr.with_extension("start"),
+            stderr.with_extension("release"),
+        ];
+        let child = command
+            .args(&gates)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .stderr(std::fs::File::create(stderr).unwrap())
             .spawn()
             .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (send, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                if send.send(line.unwrap()).is_err() {
-                    break;
-                }
-            }
-        });
         Self {
             child,
-            lines,
+            gates,
+            gate: 0,
             stderr: stderr.to_owned(),
         }
     }
-    fn marker(&self, prefix: &str) -> String {
+    fn marker(&mut self, prefix: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(300);
         loop {
-            let line = self
-                .lines
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "fixture milestone unavailable: {e}; stderr: {}",
-                        std::fs::read_to_string(&self.stderr).unwrap_or_default()
-                    )
-                });
-            eprintln!("fixture: {line}");
-            if line.starts_with(prefix) {
-                return line;
+            let text = std::fs::read_to_string(&self.stderr).unwrap();
+            if let Some(line) = text.lines().find(|line| line.starts_with(prefix)) {
+                eprintln!("fixture: {line}");
+                return line.to_owned();
             }
+            assert!(
+                self.child.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "fixture milestone unavailable; stderr: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
     fn release(&mut self) {
-        self.child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+        std::fs::write(&self.gates[self.gate], b"release").unwrap();
+        self.gate += 1;
     }
     fn finish(&mut self) {
         self.release();
