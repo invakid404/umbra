@@ -16639,3 +16639,15 @@ fn fix_274_descendant_exit_status_controls() {
         slate_finish_cleanup();
     }
 }
+
+// Retained runner reading: tracee stderr split a concurrent RSP log line.
+#[test]
+fn fix_274_interleaved_identity_regression() {
+    let stderr = std::env::var_os("UMBRA_FIX274_RETAINED_RSP")
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .unwrap_or_else(|| {
+            "RSP[2] > vAttach;13b6d\nRSP[f274 descendant-pid=80749\n1] < $OK#00\nRSP[2] < $W07#00\n"
+                .into()
+        });
+    fix_274_descendant_status(&stderr, "W07");
+}
