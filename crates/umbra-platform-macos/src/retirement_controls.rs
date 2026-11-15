@@ -78,6 +78,24 @@ impl Drop for SelfTaskBackend {
     }
 }
 #[test]
+fn retirement_self_task_registry_is_cleared_on_unwind() {
+    let watched = Arc::new(Mutex::new(WatchedTasks::default()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut owned = SelfTaskBackend(MacosTraceBackend::default());
+        owned.0.watchdog = Some(Watchdog {
+            tasks: watched.clone(),
+            cancel: None,
+            worker: None,
+        });
+        let (live, _peer) = slot(105, false);
+        register(&mut owned.0, live);
+        assert_eq!(watched.lock().unwrap().tasks.len(), 1);
+        panic!("controlled assertion unwind with a registered self Task");
+    }));
+    assert!(result.is_err());
+    assert!(watched.lock().unwrap().tasks.is_empty());
+}
+#[test]
 fn retirement_release_owns_all_resources() {
     let mut owned = SelfTaskBackend(MacosTraceBackend::default());
     let backend = &mut owned.0;
