@@ -240,13 +240,26 @@ fn fix_274_completed_children_census() {
     let live = children.len() - zombies;
     eprintln!("provider={provider} warm_fds={baseline} final_fds={final_fds} zombies={zombies} live_children={live}");
     run.finish();
-    eprintln!(
-        "supervised stderr:\n{}",
-        std::fs::read_to_string(stderr).unwrap()
-    );
+    let diagnostic = std::fs::read_to_string(stderr).unwrap();
+    eprintln!("supervised stderr:\n{diagnostic}");
     assert!(
         zombies == 0 && final_fds <= baseline + 2,
         "completed-child retention: zombies={zombies} (expected 0), fds={final_fds} (maximum {})",
         baseline + 2
     );
+    if std::env::var_os("UMBRA_RETIREMENT_WITNESS").is_some() {
+        let readings: Vec<_> = diagnostic
+            .lines()
+            .filter(|line| line.starts_with("retirement-ownership pid="))
+            .collect();
+        assert_eq!(
+            readings.len(),
+            200,
+            "every child must have an ownership reading"
+        );
+        assert!(
+            readings.iter().all(|line| line.ends_with("remaining=[]")),
+            "retained child owners: {readings:?}"
+        );
+    }
 }
