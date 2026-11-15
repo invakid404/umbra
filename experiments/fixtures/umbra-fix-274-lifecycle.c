@@ -6,9 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <sys/event.h>
 #include <unistd.h>
 
 static void require(int ok, int code) { if (!ok) { fprintf(stderr, "f274 pid=%d failure=%d errno=%d\n", getpid(), code, errno); _exit(code); } }
@@ -40,10 +38,10 @@ int main(int argc, char **argv) {
     }
     require(argc == 4, 87);
     char mode[64];
-    require(strlen(argv[1]) < sizeof(mode), 108);
-    strcpy(mode, argv[1]);
-    char *port = strchr(mode, ':');
-    if (port) *port++ = 0;
+    require(strlen(argv[1]) < sizeof(mode), 108); strcpy(mode, argv[1]);
+    char *suffix = strchr(mode, ":"[0]);
+    int routed = suffix != NULL;
+    if (suffix) { require(!strcmp(suffix, ":routed"), 109); *suffix = 0; }
     char file[4096], ready[4096], done[4096], record[4096];
     snprintf(file, sizeof(file), "%s/file", argv[2]);
     snprintf(ready, sizeof(ready), "%s/ready", argv[2]);
@@ -82,33 +80,32 @@ int main(int argc, char **argv) {
         pid_t descendant;
         require(read(identities[0], &descendant, sizeof(descendant)) == sizeof(descendant), 102);
         close(identities[0]);
-        // The external observer can obtain kernel exit evidence outside Seatbelt.
-        // Its ACK proves the subscription exists before the descendant is released.
-        require(port != NULL, 103);
-        int observer = socket(AF_INET, SOCK_STREAM, 0); require(observer >= 0, 104);
-        struct sockaddr_in address = {0};
-        address.sin_len = sizeof(address); address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        long number = strtol(port, NULL, 10); require(number > 0 && number <= 65535, 109);
-        address.sin_port = htons((uint16_t)number);
-        struct timeval timeout = {30, 0};
-        require(setsockopt(observer, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0, 110);
-        require(connect(observer, (struct sockaddr *)&address, sizeof(address)) == 0, 111);
-        uint32_t identity = htonl((uint32_t)descendant);
-        require(send(observer, &identity, sizeof(identity), 0) == sizeof(identity), 112);
-        unsigned char ack;
-        require(recv(observer, &ack, 1, MSG_WAITALL) == 1 && ack == 1, 113);
+        fprintf(stderr, "f274 descendant-pid=%d\n", descendant);
+        // Native control observes the kernel status. The routed harness checks
+        // this PID's debugger exit packet: Seatbelt denies NOTE_EXITSTATUS and
+        // ptrace can suppress outside observers' exit events for orphans.
+        int queue = -1;
+        struct kevent change, event;
+        if (!routed) {
+            queue = kqueue(); require(queue >= 0, 103);
+            EV_SET(&change, descendant, EVFILT_PROC, EV_ADD | EV_ONESHOT,
+                   NOTE_EXIT | NOTE_EXITSTATUS, 0, NULL);
+            require(kevent(queue, &change, 1, NULL, 0, NULL) == 0, 104);
+        }
         waited(p, 19); usleep(300000); mark(ready, "parent-retired\n"); gate(done);
-        uint32_t observed;
-        require(recv(observer, &observed, sizeof(observed), MSG_WAITALL) == sizeof(observed), 105);
-        int status = (int)ntohl(observed);
+        if (!routed) {
+        struct timespec bound = {10, 0};
+        int count = kevent(queue, NULL, 0, &event, 1, &bound);
+        require(count == 1 && !(event.flags & EV_ERROR)
+                && event.ident == (uintptr_t)descendant && event.filter == EVFILT_PROC
+                && (event.fflags & (NOTE_EXIT | NOTE_EXITSTATUS)) == (NOTE_EXIT | NOTE_EXITSTATUS), 105);
+        int status = (int)event.data;
         fprintf(stderr, "f274 descendant=%d exit-status=%d\n", descendant, status);
         require(WIFEXITED(status) && WEXITSTATUS(status) == 0, 106);
-        require(close(observer) == 0, 107);
+        require(close(queue) == 0, 107);
+        }
         put(fd, "C");
-        char result[80];
-        snprintf(result, sizeof(result), "parent=19 descendant=%d bytes=ABC\n", WEXITSTATUS(status));
-        mark(record, result);
+        mark(record, "parent=19 bytes=ABC\n");
     }
     require(close(fd) == 0, 99); return 0;
 }

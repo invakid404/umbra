@@ -16465,102 +16465,47 @@ fn fix_264_default_idle_survives() {
     assert!(stderr.contains("Some(Code(0))"), "{stderr}");
 }
 
-// Acknowledged kernel observation: the sandboxed fixture does not have
-// permission to subscribe to process exit status itself. This mirrors the
-// existing external loopback observer pattern used by the R14 controls.
-struct Fix274ExitObserver(Option<std::thread::JoinHandle<()>>);
-impl Fix274ExitObserver {
-    fn start(spawn: &SlateSpawn, mode: &str, leg: &str) -> (String, Self) {
-        use std::io::{Read, Write};
-        use std::os::fd::FromRawFd;
-        if !mode.starts_with("parent") {
-            return (mode.into(), Self(None));
-        }
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let evidence = spawn.evidence.join(format!("{leg}-descendant-exit.txt"));
-        let worker = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            let mut peer = loop {
-                match listener.accept() {
-                    Ok((peer, _)) => break peer,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "exit observer connection missing"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(e) => panic!("exit observer accept: {e}"),
-                }
-            };
-            peer.set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                .unwrap();
-            peer.set_write_timeout(Some(std::time::Duration::from_secs(30)))
-                .unwrap();
-            let mut bytes = [0; 4];
-            peer.read_exact(&mut bytes).unwrap();
-            let pid = u32::from_be_bytes(bytes);
-            assert!(pid > 1);
-            // SAFETY: all event buffers are initialized, valid for the call,
-            // and the queue descriptor is uniquely owned by File below.
-            let status = unsafe {
-                let fd = libc::kqueue();
-                assert!(fd >= 0, "{}", std::io::Error::last_os_error());
-                let _queue = std::fs::File::from_raw_fd(fd);
-                let flags = libc::NOTE_EXIT | libc::NOTE_EXITSTATUS;
-                let change = libc::kevent {
-                    ident: pid as _,
-                    filter: libc::EVFILT_PROC,
-                    flags: libc::EV_ADD | libc::EV_ONESHOT,
-                    fflags: flags,
-                    data: 0,
-                    udata: std::ptr::null_mut(),
-                };
-                assert_eq!(
-                    libc::kevent(fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()),
-                    0,
-                    "{}",
-                    std::io::Error::last_os_error()
-                );
-                peer.write_all(&[1]).unwrap();
-                let mut event: libc::kevent = std::mem::zeroed();
-                let bound = libc::timespec {
-                    tv_sec: 30,
-                    tv_nsec: 0,
-                };
-                assert_eq!(
-                    libc::kevent(fd, std::ptr::null(), 0, &mut event, 1, &bound),
-                    1,
-                    "{}",
-                    std::io::Error::last_os_error()
-                );
-                assert!(
-                    event.ident == pid as libc::uintptr_t
-                        && event.filter == libc::EVFILT_PROC
-                        && event.flags & libc::EV_ERROR == 0
-                        && event.fflags & flags == flags
-                );
-                event.data as i32
-            };
-            std::fs::write(evidence, format!("pid={pid} raw_status={status}\n")).unwrap();
-            peer.write_all(&(status as u32).to_be_bytes()).unwrap();
-        });
-        (format!("{mode}:{port}"), Self(Some(worker)))
-    }
-    fn finish(mut self) {
-        if let Some(worker) = self.0.take() {
-            worker.join().expect("exit observer failed");
-        }
-    }
-}
-impl Drop for Fix274ExitObserver {
-    fn drop(&mut self) {
-        if let Some(worker) = self.0.take() {
-            let _ = worker.join();
-        }
-    }
+// Bind an actual terminal debugger packet to the fixture's descendant PID.
+// Neither a done marker nor journal completion establishes this exit status.
+fn fix_274_descendant_status(stderr: &str, expected: &str) {
+    let pids: Vec<_> = stderr
+        .lines()
+        .filter_map(|s| s.strip_prefix("f274 descendant-pid="))
+        .collect();
+    assert_eq!(pids.len(), 1, "missing or ambiguous descendant identity");
+    let pid: u32 = pids[0].parse().unwrap();
+    let attach = format!("> vAttach;{pid:x}");
+    let connections: Vec<_> = stderr
+        .lines()
+        .filter_map(|line| {
+            let (id, body) = line.strip_prefix("RSP[")?.split_once("] ")?;
+            (body == attach).then_some(id)
+        })
+        .collect();
+    assert_eq!(
+        connections.len(),
+        1,
+        "descendant must have one debugger connection"
+    );
+    let prefix = format!("RSP[{}] < ", connections[0]);
+    let bytes: String = stderr
+        .lines()
+        .filter_map(|s| s.strip_prefix(&prefix))
+        .collect();
+    let exits: Vec<_> = bytes
+        .split('$')
+        .skip(1)
+        .filter_map(|packet| {
+            let (body, _) = packet.split_once('#')?;
+            (body.starts_with('W') || body.starts_with('X')).then_some(body)
+        })
+        .collect();
+    assert_eq!(
+        exits.len(),
+        1,
+        "missing or ambiguous descendant terminal packet: {exits:?}"
+    );
+    assert_eq!(&exits[0][..3], expected, "actual descendant status");
 }
 
 // #274: use the existing paired-run/cleanup instrument for retired slots.
@@ -16581,12 +16526,10 @@ fn fix_274_lifecycle(mode: &str) {
     .unwrap();
     let (bytes, record): (&[u8], &[u8]) = match mode {
         "sibling" => (b"ABCD", b"exec=17 sibling=23 bytes=ABCD\n"),
-        "parent" => (b"ABC", b"parent=19 descendant=0 bytes=ABC\n"),
+        "parent" => (b"ABC", b"parent=19 bytes=ABC\n"),
         _ => unreachable!(),
     };
-    let (observed_mode, observer) = Fix274ExitObserver::start(&spawn, mode, "native");
-    let (root, native) = slate_spawn_native(&spawn, &observed_mode);
-    observer.finish();
+    let (root, native) = slate_spawn_native(&spawn, mode);
     assert!(
         native.status.success(),
         "native: {}",
@@ -16594,14 +16537,24 @@ fn fix_274_lifecycle(mode: &str) {
     );
     assert_eq!(std::fs::read(root.join("file")).unwrap(), bytes);
     assert_eq!(std::fs::read(root.join("records")).unwrap(), record);
-    let (observed_mode, observer) = Fix274ExitObserver::start(&spawn, mode, "routed");
+    spawn
+        .provider_environment
+        .push(("UMBRA_RSP_LOG".into(), "1".into()));
+    let observed_mode = if mode.starts_with("parent") {
+        format!("{mode}:routed")
+    } else {
+        mode.into()
+    };
     let routed = slate_spawn_routed(
         &spawn,
         &observed_mode,
         &["file", "records", "ready", "done"],
     );
-    observer.finish();
+
     assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+    if mode == "parent" {
+        fix_274_descendant_status(&routed.run.stderr, "W00");
+    }
     assert_eq!(routed.object("file"), Some(bytes));
     assert_eq!(routed.object("records"), Some(record));
     assert!(journal_records_completion(&routed.run));
@@ -16630,9 +16583,7 @@ fn fix_274_descendant_exit_status_controls() {
             "UMBRA_FIX_274_LIFECYCLE_PATH",
         );
         spawn.helper = spawn.program.canonicalize().unwrap();
-        let (observed_mode, observer) = Fix274ExitObserver::start(&spawn, mode, "native");
-        let (root, native) = slate_spawn_native(&spawn, &observed_mode);
-        observer.finish();
+        let (root, native) = slate_spawn_native(&spawn, mode);
         assert_eq!(
             native.status.code(),
             Some(106),
@@ -16641,16 +16592,27 @@ fn fix_274_descendant_exit_status_controls() {
         );
         assert!(String::from_utf8_lossy(&native.stderr).contains(&format!("exit-status={status}")));
         assert!(!root.join("records").exists());
-        let (observed_mode, observer) = Fix274ExitObserver::start(&spawn, mode, "routed");
+        spawn
+            .provider_environment
+            .push(("UMBRA_RSP_LOG".into(), "1".into()));
+        let observed_mode = if mode.starts_with("parent") {
+            format!("{mode}:routed")
+        } else {
+            mode.into()
+        };
         let routed = slate_spawn_routed(
             &spawn,
             &observed_mode,
             &["file", "records", "ready", "done"],
         );
-        observer.finish();
-        assert_eq!(routed.run.status, Some(106), "{}", routed.run.stderr);
-        assert!(routed.run.stderr.contains(&format!("exit-status={status}")));
-        assert_eq!(routed.object("records"), None);
+
+        assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+        fix_274_descendant_status(&routed.run.stderr, if status == 9 { "X09" } else { "W07" });
+
+        assert_eq!(
+            routed.object("records"),
+            Some(b"parent=19 bytes=ABC\n".as_slice())
+        );
         slate_spawn_finish(&spawn, &routed);
         slate_finish_cleanup();
     }
