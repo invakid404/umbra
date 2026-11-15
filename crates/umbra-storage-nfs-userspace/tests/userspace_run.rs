@@ -16467,7 +16467,7 @@ fn fix_264_default_idle_survives() {
 
 // Bind an actual terminal debugger packet to the fixture's descendant PID.
 // Neither a done marker nor journal completion establishes this exit status.
-fn fix_274_descendant_status(stderr: &str, expected: &str) {
+fn fix_274_descendant_packets(stderr: &str) -> Vec<String> {
     let pids: Vec<_> = stderr
         .lines()
         .filter_map(|s| s.strip_prefix("f274 descendant-pid="))
@@ -16492,13 +16492,20 @@ fn fix_274_descendant_status(stderr: &str, expected: &str) {
         .lines()
         .filter_map(|s| s.strip_prefix(&prefix))
         .collect();
-    let exits: Vec<_> = bytes
+    bytes
         .split('$')
         .skip(1)
         .filter_map(|packet| {
             let (body, _) = packet.split_once('#')?;
-            (body.starts_with('W') || body.starts_with('X')).then_some(body)
+            Some(body.to_owned())
         })
+        .collect()
+}
+fn fix_274_descendant_status(stderr: &str, expected: &str) {
+    let packets = fix_274_descendant_packets(stderr);
+    let exits: Vec<_> = packets
+        .iter()
+        .filter(|s| s.starts_with('W') || s.starts_with('X'))
         .collect();
     assert_eq!(
         exits.len(),
@@ -16606,12 +16613,27 @@ fn fix_274_descendant_exit_status_controls() {
             &["file", "records", "ready", "done"],
         );
 
-        assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
-        fix_274_descendant_status(&routed.run.stderr, if status == 9 { "X09" } else { "W07" });
-
-        assert_eq!(
-            routed.object("records"),
-            Some(b"parent=19 bytes=ABC\n".as_slice())
+        if status == 9 {
+            // Existing backend policy refuses the fatal signal stop before a
+            // terminal exit packet. It must never be accepted as completion.
+            assert_eq!(routed.run.status, Some(1), "{}", routed.run.stderr);
+            assert!(routed.run.stderr.contains("fatal signal/exception: T09"));
+            assert!(fix_274_descendant_packets(&routed.run.stderr)
+                .iter()
+                .any(|s| s.starts_with("T09")));
+            assert!(!journal_records_completion(&routed.run));
+        } else {
+            assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+            fix_274_descendant_status(&routed.run.stderr, "W07");
+            assert_eq!(
+                routed.object("records"),
+                Some(b"parent=19 bytes=ABC\n".as_slice())
+            );
+        }
+        assert!(
+            std::panic::catch_unwind(|| fix_274_descendant_status(&routed.run.stderr, "W00"))
+                .is_err(),
+            "a failing descendant must fail the normal lifecycle status oracle"
         );
         slate_spawn_finish(&spawn, &routed);
         slate_finish_cleanup();
