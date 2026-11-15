@@ -2,6 +2,17 @@
 use super::*;
 use crate::ownership::{Owned, Witness};
 use std::io::Read;
+use std::os::unix::process::ExitStatusExt;
+thread_local! {
+    static DROP_REPORTS: std::cell::RefCell<Option<Vec<TeardownReport>>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn capture_drop(reports: &[TeardownReport]) {
+    DROP_REPORTS.with(|slot| {
+        if let Some(captured) = slot.borrow_mut().as_mut() {
+            *captured = reports.to_vec();
+        }
+    });
+}
 
 fn slot(generation: u64, done: bool) -> (Session, std::net::TcpStream) {
     let pid = std::process::id() as u64;
@@ -197,6 +208,7 @@ fn retirement_quiesce_services_exit_after_pending_entry() {
 
 fn killed_pending(generation: u64) -> (Session, std::net::TcpStream) {
     let (mut session, peer) = slot(generation, true);
+    session.rsp.retirement_live_child();
     session.rsp.retirement_wait_gate(usize::MAX);
     let start = crate::clock::now() - Duration::from_secs(2);
     let mut retirement = crate::retirement::Retirement::new(start);
@@ -231,7 +243,7 @@ fn retirement_backend_late_reap_terminates_ok() {
         .iter()
         .any(|step| matches!(step, TeardownStep::RetirementOverrun { .. })));
     assert!(backend.teardown_reports[0].steps.iter().any(|step| matches!(step,
-        TeardownStep::Retirement(crate::FinishOutcome::KilledThenReaped(status)) if status.success())));
+        TeardownStep::Retirement(crate::FinishOutcome::KilledThenReaped(status)) if status.signal() == Some(libc::SIGKILL))));
 }
 #[test]
 fn retirement_backend_exhausted_drain_retains_child_and_failure() {
@@ -311,4 +323,125 @@ fn retirement_drop_unconfirmed_resource_owner_records_emergency() {
     peer.set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+fn retirement_actual_backend_drop_merges_failed_owner_report() {
+    for confirmed in [true, false] {
+        let mut backend = MacosTraceBackend::default();
+        let (mut session, mut peer) = slot(301, true);
+        session.rsp.retirement_live_child();
+        if !confirmed {
+            session.exit_evidence = None;
+            session.exit_report = None;
+            session.reaped = false;
+        }
+        // A recorded terminal failure owns real resources before actual Drop.
+        let failure = crate::FinishOutcome::UnconfirmedBarrier("retained original failure".into());
+        let report = TeardownReport {
+            pid: session.id.0.native_id as i32,
+            identity: session.birth,
+            tracer: session.rsp.tracer_pid(),
+            steps: vec![TeardownStep::Retirement(failure)],
+            timed_out: true,
+            unconfirmed: !confirmed,
+            elapsed: Duration::ZERO,
+        };
+        let owner = Arc::downgrade(&session.task);
+        session.retirement_report = Some(report.clone());
+        backend.teardown_reports.push(report.clone());
+        backend.failed_retirements.push(session);
+        DROP_REPORTS.with(|slot| *slot.borrow_mut() = Some(vec![]));
+        drop(backend);
+        let reports = DROP_REPORTS.with(|slot| slot.borrow_mut().take().unwrap());
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].steps.starts_with(&report.steps));
+        let emergency = reports[0]
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                TeardownStep::EmergencyTracer(attempt) => Some(attempt),
+                _ => None,
+            })
+            .expect("actual backend Drop must merge emergency results before field destruction");
+        assert!(
+            matches!(&emergency.outcome, crate::FinishOutcome::KilledThenReaped(status) if status.signal() == Some(libc::SIGKILL))
+        );
+        assert!(emergency.operations.iter().any(|operation| matches!(
+            operation,
+            crate::retirement::TracerOperation::Kill(Ok(()))
+        )));
+        assert!(owner.upgrade().is_none());
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+}
+#[test]
+fn retirement_simultaneous_exits_release_independent_owners() {
+    let mut backend = MacosTraceBackend::default();
+    let mut owners = vec![];
+    let mut peers = vec![];
+    for generation in 310..313 {
+        let (session, peer) = slot(generation, true);
+        owners.push(Arc::downgrade(&session.task));
+        peers.push(peer);
+        backend.sessions.push(session);
+    }
+    backend.service_retirements();
+    assert!(owners.iter().all(|owner| owner.upgrade().is_none()));
+    assert!(backend.sessions.iter().all(|s| s.live.is_none()));
+    assert_eq!(backend.teardown_reports.len(), 3);
+    backend.service_retirements();
+    assert_eq!(backend.teardown_reports.len(), 3);
+}
+#[test]
+fn retirement_root_exit_waits_for_pending_child_without_losing_events() {
+    let mut backend = MacosTraceBackend::default();
+    let (root, _root_peer) = slot(320, true);
+    let root_id = root.id;
+    let (mut child, _child_peer) = slot(321, true);
+    let child_id = child.id;
+    child.rsp.retirement_wait_gate(1);
+    backend.sessions.extend([root, child]);
+    backend.events.extend([
+        TraceEvent::Exit {
+            task: root_id,
+            status: ExitStatus::Code(0),
+        },
+        TraceEvent::Exit {
+            task: child_id,
+            status: ExitStatus::Code(7),
+        },
+    ]);
+    let first = backend.poll_event(Duration::from_millis(1)).unwrap();
+    assert!(
+        matches!(first, umbra_platform::EventPoll::Event(TraceEvent::Exit { task, status: ExitStatus::Code(7) }) if task == child_id)
+    );
+    assert!(backend.sessions[1].live.is_some());
+    let second = backend.poll_event(Duration::from_millis(1)).unwrap();
+    assert!(
+        matches!(second, umbra_platform::EventPoll::Event(TraceEvent::Exit { task, .. }) if task == root_id)
+    );
+    assert!(backend.sessions[1].live.is_none());
+    assert!(backend.events.is_empty());
+}
+#[test]
+fn retirement_slow_gap_preserves_history_for_the_next_child() {
+    let mut backend = MacosTraceBackend::default();
+    let (first, _peer) = slot(330, true);
+    backend.sessions.push(first);
+    backend.service_retirements();
+    let old = backend.sessions[0].id;
+    let future = crate::clock::now() + Duration::from_secs(60 * 60);
+    let (mut later, _later_peer) = slot(331, true);
+    later.retirement = Some(crate::retirement::Retirement::new(future));
+    backend.sessions.push(later);
+    crate::clock::SCRIPT.with(|clock| clock.set(Some((future, future))));
+    backend.service_retirements();
+    crate::clock::SCRIPT.with(|clock| clock.set(None));
+    assert_eq!(backend.sessions[0].id, old);
+    assert_eq!(backend.sessions.len(), 2);
+    assert!(backend.sessions.iter().all(|s| s.live.is_none()));
+    assert_eq!(backend.teardown_reports.len(), 2);
 }

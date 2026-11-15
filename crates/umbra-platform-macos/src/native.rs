@@ -4063,6 +4063,8 @@ impl Drop for MacosTraceBackend {
         }
         self.tear_down_sessions();
         self.finalize_failed_retirements();
+        #[cfg(test)]
+        retirement_controls::capture_drop(&self.teardown_reports);
     }
 }
 
@@ -4608,7 +4610,7 @@ mod tests {
             let failure = backend
                 .terminate(ProcessHandle(id), TerminationPolicy::Immediate)
                 .expect_err("retirement failure must surface at final cleanup");
-            assert!(failure.to_string().contains("scripted"));
+            assert!(failure.to_string().contains(&format!("{outcome:?}")));
             assert_eq!(backend.teardown_reports()[0], report);
             assert_eq!(backend.teardown_reports().len(), 2);
             assert_eq!(backend.failed_retirements.len(), 1);

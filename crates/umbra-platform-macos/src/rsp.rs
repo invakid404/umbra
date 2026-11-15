@@ -466,6 +466,11 @@ thread_local! {
 }
 #[cfg(test)]
 impl Rsp {
+    pub(crate) fn retirement_live_child(&mut self) {
+        assert!(self.reaped);
+        self.child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        self.reaped = false;
+    }
     /// Delay visibility, never fabricate a successful owned wait status.
     pub(crate) fn retirement_wait_gate(&mut self, observations: usize) {
         self.reaped = false;
