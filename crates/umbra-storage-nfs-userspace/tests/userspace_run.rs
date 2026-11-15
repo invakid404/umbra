@@ -9531,15 +9531,14 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for completed-child retirement (#274): the single_thread
-    // body and both guard positions are unchanged; Park now wraps its wait
-    // indices in an owning witness container. R7 adds a test-only quiesce/resume
-    // module declaration. The refusal oracle is unchanged.
+    // Re-characterized for typed retirement and explicit failed-owner cleanup
+    // (#274): single_thread and both guard positions remain unchanged. Park
+    // retains its owning wait-index container. The refusal oracle is unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("9a533e6a19964266afd7818ab629b3bf69436b64f0329351e57b86027e17aec1"),
+        Some("7b30c6e0ad3c9e513f40d3e2a06547feccb437945d198108944c3268b48405d0"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
