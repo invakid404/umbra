@@ -1663,11 +1663,22 @@ the separate 200-child resource census belongs to `native-qualification`.
 
 The parent-exit case obtains native descendant status from a registered kernel
 exit watch. The routed case enables `UMBRA_RSP_LOG` only for its test provider
-and binds the actual terminal packet to the descendant PID's `vAttach`
-connection; a done marker or a fixed record is not accepted as exit evidence.
+and reads `descendant.pid` back through storage to bind the actual terminal
+packet to that PID's `vAttach` connection. The identity file contains exactly
+one decimal PID and a newline; shared stderr is not an identity channel. A
+done marker or a fixed record is not accepted as exit evidence.
 `fix_274_descendant_exit_status_controls` uses the same self-hosted userspace
 job and fixture prerequisites. A nonzero descendant must produce native
 status 7 and routed `W07`; a killed descendant must produce native signal 9
 and the existing routed fatal `T09` refusal with no completed journal.
 Both controls must fail the normal `W00` oracle. All three lifecycle leaves
 also aggregate cleanup errors after the existing reopen and cleanup checks.
+
+`fix_274_interleaved_identity_regression` replays a retained interleaved-stderr
+fragment. Set `UMBRA_FIX274_RETAINED_RSP` to a full retained log for the same
+PID to replace that fragment; the default needs no external evidence file.
+`fix_274_identity_and_status_controls` rejects missing, malformed, duplicate or
+mismatched identities and connections, and missing, duplicate or wrong terminal
+statuses. These parser controls run in the same `transport-raw` test target
+without requiring a live server; the lifecycle cases still require the live
+fixture and test the actual identity-object readback.
