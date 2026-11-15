@@ -16510,3 +16510,29 @@ fn fix_274_live_sibling_inheritance() {
 fn fix_274_parked_wait_parent_exit() {
     fix_274_lifecycle("parent");
 }
+
+// CR-4: a done marker must not disguise a later failing descendant exit.
+#[test]
+fn fix_274_descendant_exit_status_controls() {
+    for (mode, status) in [("parent-nonzero", 7 << 8), ("parent-signal", 9)] {
+        let Some(mut spawn) = slate_spawn(&format!("fix-274-{mode}")) else {
+            return;
+        };
+        spawn.program = fixture_binary(
+            spawn.scratch.path(),
+            "umbra-fix-274-lifecycle",
+            "UMBRA_FIX_274_LIFECYCLE_PATH",
+        );
+        spawn.helper = spawn.program.canonicalize().unwrap();
+        let (root, native) = slate_spawn_native(&spawn, mode);
+        assert_eq!(native.status.code(), Some(106), "{:?}", native);
+        assert!(String::from_utf8_lossy(&native.stderr).contains(&format!("exit-status={status}")));
+        assert!(!root.join("records").exists());
+        let routed = slate_spawn_routed(&spawn, mode, &["file", "records", "ready", "done"]);
+        assert_eq!(routed.run.status, Some(106), "{}", routed.run.stderr);
+        assert!(routed.run.stderr.contains(&format!("exit-status={status}")));
+        assert_eq!(routed.object("records"), None);
+        slate_spawn_finish(&spawn, &routed);
+        slate_finish_cleanup();
+    }
+}

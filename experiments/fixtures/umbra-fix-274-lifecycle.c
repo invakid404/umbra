@@ -1,6 +1,7 @@
 /* #274: descendants keep inherited descriptions after another slot retires. */
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,7 +62,9 @@ int main(int argc, char **argv) {
             pid_t g = fork(); require(g >= 0, 96);
             if (!g) {
                 close(identities[0]); close(identities[1]);
-                gate(ready); put(fd, "B"); mark(done, "descendant\n"); _exit(0);
+                gate(ready); put(fd, "B"); mark(done, "descendant\n");
+                if (!strcmp(mode, "parent-signal")) raise(SIGKILL);
+                _exit(!strcmp(mode, "parent-nonzero") ? 7 : 0);
             }
             close(identities[0]);
             require(write(identities[1], &g, sizeof(g)) == sizeof(g), 101);
