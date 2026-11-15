@@ -445,3 +445,34 @@ fn retirement_slow_gap_preserves_history_for_the_next_child() {
     assert!(backend.sessions.iter().all(|s| s.live.is_none()));
     assert_eq!(backend.teardown_reports.len(), 2);
 }
+
+#[test]
+fn retirement_barrier_keeps_real_owners() {
+    let mut backend = MacosTraceBackend::default();
+    let (mut session, mut peer) = slot(340, true);
+    session.exit_evidence = None;
+    session.exit_report = None;
+    session.reaped = false;
+    let owner = Arc::downgrade(&session.task);
+    backend.sessions.push(session);
+    backend.service_retirements();
+    let retained = backend.sessions[0].live.is_some() && owner.upgrade().is_some();
+    peer.set_read_timeout(Some(Duration::from_millis(10)))
+        .unwrap();
+    let socket = peer.read(&mut [0]);
+    // Settle the genuine obligation before assertions, including mutation failures.
+    backend.sessions[0].exit_evidence = Some(BarrierEvidence::ReapedByPlatform);
+    backend.service_retirements();
+    assert!(
+        retained,
+        "unconfirmed barrier must retain the actual Task and body"
+    );
+    assert!(
+        matches!(socket, Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+        "unconfirmed barrier must retain the socket: {socket:?}"
+    );
+    assert!(
+        owner.upgrade().is_none(),
+        "confirmation must release the owner"
+    );
+}
