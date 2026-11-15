@@ -64,6 +64,7 @@ fn fds(pid: u32) -> usize {
 struct Run {
     child: Child,
     lines: Receiver<String>,
+    stderr: PathBuf,
 }
 impl Run {
     fn start(mut command: Command, stderr: &Path) -> Self {
@@ -82,7 +83,11 @@ impl Run {
                 }
             }
         });
-        Self { child, lines }
+        Self {
+            child,
+            lines,
+            stderr: stderr.to_owned(),
+        }
     }
     fn marker(&self, prefix: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(300);
@@ -90,7 +95,12 @@ impl Run {
             let line = self
                 .lines
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .expect("fixture milestone unavailable within 300s");
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "fixture milestone unavailable: {e}; stderr: {}",
+                        std::fs::read_to_string(&self.stderr).unwrap_or_default()
+                    )
+                });
             eprintln!("fixture: {line}");
             if line.starts_with(prefix) {
                 return line;
