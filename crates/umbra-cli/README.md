@@ -188,6 +188,15 @@ commands report their captured stderr before any required run-ID parse. Cleanup
 uses an emitted prepared ID even when that status assertion fails; without one,
 it touches no directory in the shared NFS mount.
 
+`tests/child_retention.rs` qualifies #274 on the same production CLI/local
+storage path. Its native control waits for 200 successful children; the
+supervised census samples provider fds and direct child zombies three seconds
+after the fixture reports completion, with its root still alive. Build the
+platform with `--features retirement-witness` and set
+`UMBRA_RETIREMENT_WITNESS=1` to also require all 200 child ownership witnesses to
+be released. This test runs in self-hosted `native-qualification`, with
+`UMBRA_INTEGRATION_REQUIRED=1`; it does not require mounted storage.
+
 `tests/isolation.rs` pins #193 on the production path. It compiles
 `experiments/fixtures/umbra-isolation-fixture.c` and the signal observer at test
 time, and runs when `UMBRA_TEST_ISOLATION` or `UMBRA_INTEGRATION_REQUIRED` is set.

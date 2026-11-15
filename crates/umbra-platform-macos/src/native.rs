@@ -182,6 +182,12 @@ impl<T> WatchedTasks<Arc<T>>
 where
     Arc<T>: KillOwned,
 {
+    fn retire(&mut self, old: &Arc<T>) -> Option<Arc<T>> {
+        self.tasks
+            .iter()
+            .position(|task| Arc::ptr_eq(task, old))
+            .map(|index| self.tasks.remove(index))
+    }
     fn replace(&mut self, old: &Arc<T>, new: Arc<T>) -> Option<Arc<T>> {
         let retired = self.tasks.iter().position(|task| Arc::ptr_eq(task, old));
         // Register (and, if latched, kill) the replacement before retiring anything.
@@ -418,45 +424,9 @@ struct SpawnInFlight {
 }
 
 struct Session {
-    spawn: Option<SpawnInFlight>,
-    task: Arc<Task>,
-    rsp: Rsp,
     id: TaskId,
     thread: ThreadId,
     parent: Option<usize>,
-    twin: PathBuf,
-    // Only software breakpoints installed on this session's RSP connection.
-    // Disabled entry sites live in Pending; inherited bytes are not ownership.
-    breaks: BTreeMap<u64, Breakpoint>,
-    /// Open return windows, keyed by the thread inside each one.
-    ///
-    /// **At most one is ever open, and the freeze is what makes that true** --
-    /// `return_stop` resumes only the trapping thread and leaves every sibling
-    /// stopped, so no other thread is running to reach `return_stop` and open a
-    /// second. It is a structural consequence of which threads run, not of any
-    /// check. `return_stop` asserts it (see there); the assertion is a tripwire
-    /// over the freeze, not the thing that establishes it.
-    ///
-    /// **A map rather than a slot, for what it makes expressible rather than for
-    /// what it answers.** A single slot answers "which thread owns this window"
-    /// perfectly well through [`Pending::thread`], and that was measured: keyed
-    /// back onto one shared slot, `finish_return` kept attributing correctly,
-    /// `thread_index` kept resolving, and both multithreaded fixtures stayed
-    /// green. What the map buys is that the per-thread invariant can be *stated*
-    /// -- `return_stop`'s tripwire is per thread because this is -- and that the
-    /// shape stays honest for the deferred `single_thread()` removal, at which
-    /// point a second concurrent window becomes reachable and the map becomes
-    /// load-bearing rather than expressive.
-    pending: BTreeMap<ThreadId, Pending>,
-    waiting: Vec<usize>,
-    /// Entry `svc` sites stopped and reported to the caller, keyed by thread.
-    ///
-    /// A `Delivery::Namespace` entry parks here between the `SyscallEntry` this
-    /// backend emits and the `resume` the caller answers it with, so the caller
-    /// can rewrite registers in between. Per thread for the same reason as
-    /// `pending`: the caller names the thread it is answering for, and
-    /// `Session::thread` names whoever stopped last.
-    entry: BTreeMap<ThreadId, u64>,
     stopped: bool,
     done: bool,
     reaped: bool,
@@ -480,9 +450,52 @@ struct Session {
     /// bootstrap's exec is consumed before that context exists, and child
     /// contexts inherit the parent's generation until a reported exec.
     policy_exec_generation: u64,
-    registers: Vec<(usize, usize)>,
-    scratch: Vec<(u64, usize, usize)>,
     initial: bool,
+    live: Option<Box<LiveSession>>,
+    retirement: Option<crate::retirement::Retirement>,
+    retirement_report: Option<TeardownReport>,
+}
+
+struct LiveSession {
+    _witness: crate::ownership::Witness,
+    spawn: Option<SpawnInFlight>,
+    task: Arc<Task>,
+    rsp: Rsp,
+    twin: PathBuf,
+    // Only software breakpoints installed on this session's RSP connection.
+    // Disabled entry sites live in Pending; inherited bytes are not ownership.
+    breaks: crate::ownership::Owned<BTreeMap<u64, Breakpoint>>,
+    /// Open return windows, keyed by the thread inside each one.
+    ///
+    /// **At most one is ever open, and the freeze is what makes that true** --
+    /// `return_stop` resumes only the trapping thread and leaves every sibling
+    /// stopped, so no other thread is running to reach `return_stop` and open a
+    /// second. It is a structural consequence of which threads run, not of any
+    /// check. `return_stop` asserts it (see there); the assertion is a tripwire
+    /// over the freeze, not the thing that establishes it.
+    ///
+    /// **A map rather than a slot, for what it makes expressible rather than for
+    /// what it answers.** A single slot answers "which thread owns this window"
+    /// perfectly well through [`Pending::thread`], and that was measured: keyed
+    /// back onto one shared slot, `finish_return` kept attributing correctly,
+    /// `thread_index` kept resolving, and both multithreaded fixtures stayed
+    /// green. What the map buys is that the per-thread invariant can be *stated*
+    /// -- `return_stop`'s tripwire is per thread because this is -- and that the
+    /// shape stays honest for the deferred `single_thread()` removal, at which
+    /// point a second concurrent window becomes reachable and the map becomes
+    /// load-bearing rather than expressive.
+    pending: crate::ownership::Owned<BTreeMap<ThreadId, Pending>>,
+    waiting: crate::ownership::Owned<Vec<usize>>,
+    /// Entry `svc` sites stopped and reported to the caller, keyed by thread.
+    ///
+    /// A `Delivery::Namespace` entry parks here between the `SyscallEntry` this
+    /// backend emits and the `resume` the caller answers it with, so the caller
+    /// can rewrite registers in between. Per thread for the same reason as
+    /// `pending`: the caller names the thread it is answering for, and
+    /// `Session::thread` names whoever stopped last.
+    entry: crate::ownership::Owned<BTreeMap<ThreadId, u64>>,
+    registers: crate::ownership::Owned<Vec<(usize, usize)>>,
+    scratch: crate::ownership::Owned<Vec<(u64, usize, usize)>>,
     /// The routing interposer this run loads, and **the image this session is
     /// now running**.
     ///
@@ -527,6 +540,19 @@ struct Session {
     /// too, or its routed calls would reach the kernel unmediated.
     interposer: Option<(PathBuf, PathBuf, u32)>,
 }
+
+impl std::ops::Deref for Session {
+    type Target = LiveSession;
+    fn deref(&self) -> &LiveSession {
+        self.live.as_deref().expect("active session resources")
+    }
+}
+impl std::ops::DerefMut for Session {
+    fn deref_mut(&mut self) -> &mut LiveSession {
+        self.live.as_deref_mut().expect("active session resources")
+    }
+}
+
 impl Session {
     #[allow(clippy::too_many_arguments)]
     fn attach(
@@ -541,6 +567,8 @@ impl Session {
     ) -> Result<Self> {
         let task = Arc::new(Task::acquire(pid)?);
         watchdog.add(task.clone());
+        #[cfg(any(test, feature = "retirement-witness"))]
+        crate::ownership::task(pid as u64, &task);
         let birth = bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
         #[cfg(feature = "mutation-probe-spawn-lifecycle")]
         if parent.is_some() {
@@ -599,20 +627,12 @@ impl Session {
             registers.push((offset, bits / 8));
         }
         Ok(Self {
-            spawn: None,
-            task,
-            rsp,
             id: TaskId(TaskIdentity {
                 native_id: pid as u64,
                 generation,
             }),
             thread: tid(thread, generation),
             parent,
-            twin,
-            breaks: BTreeMap::new(),
-            pending: BTreeMap::new(),
-            waiting: vec![],
-            entry: BTreeMap::new(),
             stopped: true,
             done: false,
             reaped: false,
@@ -622,10 +642,23 @@ impl Session {
             exit_report: None,
             exec_generation: 0,
             policy_exec_generation: 0,
-            registers,
-            scratch: vec![],
             initial: true,
-            interposer,
+            retirement: None,
+            retirement_report: None,
+            live: Some(Box::new(LiveSession {
+                _witness: crate::ownership::Witness::new(pid as u64, "body"),
+                spawn: None,
+                task,
+                rsp,
+                twin,
+                breaks: crate::ownership::Owned::new(BTreeMap::new(), pid as u64, "breaks"),
+                pending: crate::ownership::Owned::new(BTreeMap::new(), pid as u64, "pending"),
+                waiting: crate::ownership::Owned::new(vec![], pid as u64, "waiting"),
+                entry: crate::ownership::Owned::new(BTreeMap::new(), pid as u64, "entry"),
+                registers: crate::ownership::Owned::new(registers, pid as u64, "registers"),
+                scratch: crate::ownership::Owned::new(vec![], pid as u64, "scratch"),
+                interposer,
+            })),
         })
     }
     /// Read one thread's registers.
@@ -640,19 +673,20 @@ impl Session {
         if !self.stopped || self.done {
             return Err(error("registers", "task is not stopped"));
         }
+        let live = self.live.as_mut().expect("stopped session resources");
         let raw = rsp::unhex(
-            &self
+            &live
                 .rsp
                 .request(&format!("g;thread:{:x};", thread.0.native_id))?,
         )?;
         let mut regs = RegisterSet::new(Architecture::Aarch64, vec![0; 272])?;
-        for (index, (offset, len)) in self.registers.iter().enumerate() {
+        for (index, (offset, len)) in live.registers.iter().enumerate() {
             // Current Apple debugserver does not implement the bulk g packet.
             // An empty reply means unsupported; use individual register reads.
             let individual;
             let b = if raw.is_empty() {
                 individual = rsp::unhex(
-                    &self
+                    &live
                         .rsp
                         .request(&format!("p{index:x};thread:{:x};", thread.0.native_id))?,
                 )?;
@@ -672,12 +706,13 @@ impl Session {
     }
     fn set_regs(&mut self, thread: ThreadId, regs: &RegisterSet) -> Result<()> {
         let old = self.regs(thread)?;
+        let live = self.live.as_mut().expect("stopped session resources");
         for i in 0..34 {
             let v = get(regs, i)?;
             if v != get(&old, i)? {
-                self.rsp.ok(&format!(
+                live.rsp.ok(&format!(
                     "P{i:x}={};thread:{:x};",
-                    rsp::hex(&v.to_le_bytes()[..self.registers[i].1]),
+                    rsp::hex(&v.to_le_bytes()[..live.registers[i].1]),
                     thread.0.native_id
                 ))?;
             }
@@ -1623,6 +1658,7 @@ pub struct MacosTraceBackend {
     spawn_profile: Option<bool>,
     options: Options,
     sessions: Vec<Session>,
+    failed_retirements: Vec<Session>,
     /// Every ordered teardown this backend ran, in order. It is the teardown's
     /// diagnostic record: read-only, and never consulted by the backend itself.
     teardown_reports: Vec<TeardownReport>,
@@ -1656,6 +1692,7 @@ impl MacosTraceBackend {
             spawn_profile: None,
             options,
             sessions: vec![],
+            failed_retirements: vec![],
             teardown_reports: vec![],
             events: VecDeque::new(),
             quiesced_stops: VecDeque::new(),
@@ -1698,7 +1735,12 @@ impl MacosTraceBackend {
             eprintln!("spawn-capture descriptor=non-null profile=25F80");
         }
         if self.sessions[index].spawn.is_some()
-            || self.sessions.iter().filter(|s| s.spawn.is_some()).count() >= 16
+            || self
+                .sessions
+                .iter()
+                .filter(|s| s.live.as_ref().is_some_and(|live| live.spawn.is_some()))
+                .count()
+                >= 16
         {
             return Err(unsupported("spawn snapshot capacity exceeded"));
         }
@@ -1764,6 +1806,7 @@ impl MacosTraceBackend {
 
     fn arm_spawn(&mut self, index: usize, authorization: SpawnAuthorization) -> Result<()> {
         let s = &mut self.sessions[index];
+        let allocation_task = s.task.0;
         let pending = s
             .spawn
             .as_mut()
@@ -1777,7 +1820,6 @@ impl MacosTraceBackend {
         pending.snapshot.require_supported()?;
         pending.authorization = Some(authorization);
         let mut address = 0;
-        let allocation_task = s.task.0;
         #[cfg(feature = "mutation-probe-spawn-lifecycle")]
         let allocation_task =
             if std::env::var("UMBRA_FIX_243_REGION_FAULT").as_deref() == Ok("allocate") {
@@ -1838,7 +1880,7 @@ impl MacosTraceBackend {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, s)| {
-                    let p = s.spawn.as_ref()?;
+                    let p = s.live.as_ref()?.spawn.as_ref()?;
                     (p.region.is_some() && p.returned.is_none() && s.pending.is_empty())
                         .then_some((i, p.token.thread))
                 })
@@ -2053,7 +2095,9 @@ impl MacosTraceBackend {
         }
         if self.deadline.is_some_and(|d| crate::clock::now() >= d) {
             for s in &self.sessions {
-                s.task.kill();
+                if let Some(live) = &s.live {
+                    live.task.kill();
+                }
             }
             return Err(error("watchdog", "session timed out"));
         }
@@ -2386,7 +2430,9 @@ impl MacosTraceBackend {
                 // Never return a live tree from a launch that could not prove the
                 // boundary: the caller would have no handle to terminate it with.
                 for session in &self.sessions {
-                    session.task.kill();
+                    if let Some(live) = &session.live {
+                        live.task.kill();
+                    }
                 }
                 self.tear_down_sessions();
                 let mut reaped = !self.sessions.is_empty();
@@ -2697,19 +2743,20 @@ impl MacosTraceBackend {
         match pending.kind {
             ReturnKind::PackedSpawn => {
                 let outcome = abi::outcome(&regs)?;
-                let spawn = s.spawn.as_mut().expect("armed spawn owns its snapshot");
+                let live = s.live.as_mut().expect("armed session resources");
+                let spawn = live.spawn.as_mut().expect("armed spawn owns its snapshot");
                 spawn.returned = Some(regs);
                 let authorization = spawn.authorization.expect("armed authorization");
                 if matches!(outcome, OperationOutcome::Success { .. }) {
                     let mut bytes = [0; 4];
                     let slot = spawn.region.expect("armed region") + 400;
                     #[cfg(feature = "mutation-probe-spawn-lifecycle")]
-                    let slot = if probe_unregistered(&s.task, slot)? {
+                    let slot = if probe_unregistered(&live.task, slot)? {
                         0
                     } else {
                         slot
                     };
-                    s.task.read(slot, &mut bytes)?;
+                    live.task.read(slot, &mut bytes)?;
                     let twin = std::mem::take(&mut spawn.twin);
                     self.attach_child(
                         index,
@@ -2877,7 +2924,8 @@ impl MacosTraceBackend {
                     }
                     WaitPlan::Park => {
                         s.single_thread()?;
-                        s.waiting = children;
+                        s.waiting =
+                            crate::ownership::Owned::new(children, s.id.0.native_id, "waiting");
                     }
                     WaitPlan::Native => s.return_stop(thread, ReturnKind::Wait)?,
                 }
@@ -2938,6 +2986,12 @@ impl MacosTraceBackend {
         if reply.starts_with('O') {
             return Ok(());
         }
+        if self.sessions[index].done {
+            if self.sessions[index].exit_report.as_deref() == Some(reply.as_str()) {
+                return Ok(());
+            }
+            return Err(error("stop", "unexpected stop for exited task"));
+        }
         if reply.starts_with('W') || reply.starts_with('X') {
             let status =
                 rsp::number(reply.get(1..3).ok_or_else(|| error("exit", "bad packet"))?)? as i32;
@@ -2964,6 +3018,10 @@ impl MacosTraceBackend {
             // #186: take the teardown barrier's evidence now, while the exited
             // tracee is still a zombie someone has yet to reap.
             let _ = s.barrier();
+            if s.parent.is_some() {
+                s.retirement = Some(crate::retirement::Retirement::new(crate::clock::now()));
+            }
+            self.service_retirements();
             return Ok(());
         }
         if !reply.starts_with('T') {
@@ -3004,12 +3062,10 @@ impl MacosTraceBackend {
             // `execve`, and keying the lookup on it would drop the candidate and
             // leave the exec'd image half-mediated. At most one window is open,
             // and none of them could survive the address space being replaced.
-            let adopted = std::mem::take(&mut s.pending)
-                .into_values()
-                .find_map(|p| match p.kind {
-                    ReturnKind::Exec { twin } => Some(twin),
-                    _ => None,
-                });
+            let adopted = s.pending.take().into_values().find_map(|p| match p.kind {
+                ReturnKind::Exec { twin } => Some(twin),
+                _ => None,
+            });
             if let Some(twin) = adopted {
                 s.twin = twin;
             }
@@ -3018,6 +3074,8 @@ impl MacosTraceBackend {
             s.exec_generation += 1;
             s.policy_exec_generation = s.exec_generation;
             let task = Arc::new(Task::acquire(s.id.0.native_id as i32)?);
+            #[cfg(any(test, feature = "retirement-witness"))]
+            crate::ownership::task(s.id.0.native_id, &task);
             self.watchdog
                 .as_ref()
                 .unwrap()
@@ -3509,6 +3567,11 @@ pub enum TeardownStep {
     Barrier(BarrierReading),
     /// The termination-unconfirmed warning, written to stderr before the kill.
     Warning(String),
+    Retirement(crate::retirement::FinishOutcome),
+    RetirementOverrun {
+        elapsed: Duration,
+        last_observation: Option<String>,
+    },
     TracerKilled,
     TracerReaped(bool),
     /// `k` re-sent once after a stop reply (review ruling 1 V2).
@@ -3545,8 +3608,8 @@ impl TeardownReport {
             _ => None,
         });
         format!(
-            "pid={} identity={:?} tracer={} barrier={barrier:?}",
-            self.pid, self.identity, self.tracer
+            "pid={} identity={:?} tracer={} barrier={barrier:?} steps={:?}",
+            self.pid, self.identity, self.tracer, self.steps
         )
     }
 }
@@ -3754,11 +3817,119 @@ impl Session {
 }
 
 impl MacosTraceBackend {
+    /// Service exited children without turning cleanup failure into a session error.
+    fn service_retirements(&mut self) {
+        let now = crate::clock::now();
+        for s in &mut self.sessions {
+            if s.retirement_report.is_some() || s.retirement.is_none() {
+                continue;
+            }
+            let needs_barrier = s.retirement.as_ref().unwrap().needs_barrier();
+            let barrier = if needs_barrier {
+                match s.barrier() {
+                    BarrierReading::Confirmed(_) => Ok(()),
+                    BarrierReading::Unconfirmed(why) => Err(why),
+                }
+            } else {
+                Ok(())
+            };
+            let retirement = s.retirement.as_mut().unwrap();
+            let live = s.live.as_mut().expect("pending retirement owns resources");
+            retirement.service(now, barrier, &mut live.rsp);
+            let Some(outcome) = retirement.outcome().cloned() else {
+                continue;
+            };
+            let success = outcome.success();
+            let reading = s
+                .exit_evidence
+                .clone()
+                .map(BarrierReading::Confirmed)
+                .unwrap_or_else(|| {
+                    BarrierReading::Unconfirmed("retirement barrier unconfirmed".into())
+                });
+            let mut report = TeardownReport {
+                pid: s.id.0.native_id as i32,
+                identity: s.birth,
+                tracer: live.rsp.tracer_pid(),
+                steps: vec![
+                    TeardownStep::KillSkipped,
+                    TeardownStep::Barrier(reading),
+                    TeardownStep::Retirement(outcome.clone()),
+                    TeardownStep::TracerReaped(success),
+                ],
+                timed_out: !success,
+                unconfirmed: s.exit_evidence.is_none(),
+                elapsed: retirement.elapsed(now),
+            };
+            if let Some(elapsed) = retirement.overrun {
+                report.steps.push(TeardownStep::RetirementOverrun {
+                    elapsed,
+                    last_observation: retirement.last_observation.clone(),
+                });
+            }
+            if success {
+                live.rsp.mark_torn_down();
+                let removed = self
+                    .watchdog
+                    .as_ref()
+                    .and_then(|watchdog| watchdog.tasks.lock().unwrap().retire(&live.task));
+                drop(removed);
+                s.torn_down = true;
+                s.live.take();
+                #[cfg(feature = "retirement-witness")]
+                eprintln!(
+                    "retirement-ownership pid={} remaining={:?}",
+                    s.id.0.native_id,
+                    crate::ownership::remaining(s.id.0.native_id)
+                );
+            } else {
+                eprintln!("umbra-platform-macos: child retirement failed: pid={} tracer={} outcome={outcome:?}", report.pid, report.tracer);
+            }
+            log_teardown(&report);
+            self.teardown_reports.push(report.clone());
+            s.retirement_report = Some(report);
+        }
+    }
+    fn drain_retirements(&mut self) {
+        let started = crate::clock::now();
+        // A final reap window is independent of (and does not rewrite) each
+        // obligation's original deadline. KilledReapPending only try_waits.
+        let limit = self
+            .sessions
+            .iter()
+            .filter_map(|s| s.retirement.as_ref())
+            .filter(|r| r.outcome().is_none())
+            .map(|r| r.deadline())
+            .max()
+            .unwrap_or(started)
+            .max(started + rsp::TRACER_REAP_BOUND);
+        loop {
+            self.service_retirements();
+            if self
+                .sessions
+                .iter()
+                .all(|s| s.retirement.as_ref().is_none_or(|r| r.outcome().is_some()))
+            {
+                break;
+            }
+            if crate::clock::now() >= limit {
+                for s in &mut self.sessions {
+                    if let Some(r) = &mut s.retirement {
+                        r.finish_drain();
+                    }
+                }
+                self.service_retirements();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     /// Run [`Session::ordered_teardown`] for every session not yet torn down,
     /// children before parents (the reverse of creation order), so a child's
     /// zombie still has its original parent to be handed back to. It does not
     /// remove the sessions; callers clear them afterwards.
     fn tear_down_sessions(&mut self) -> Vec<TeardownReport> {
+        self.drain_retirements();
         #[cfg(feature = "mutation-probe-spawn-lifecycle")]
         if std::env::var_os("UMBRA_FIX_243_OWNER_TRACE").is_some() {
             let owners: Vec<_> = self
@@ -3774,20 +3945,37 @@ impl MacosTraceBackend {
         }
         let mut reports = Vec::new();
         for index in (0..self.sessions.len()).rev() {
+            if let Some(report) = self.sessions[index].retirement_report.clone() {
+                reports.push(report);
+                // Keep unresolved owners for the backend's emergency Drop;
+                // normal terminate must not hide a failed wait in legacy cleanup.
+                continue;
+            }
             if !self.sessions[index].torn_down {
                 let report = self.sessions[index].ordered_teardown();
                 log_teardown(&report);
                 reports.push(report);
             }
         }
-        self.teardown_reports.extend(reports.iter().cloned());
+        for report in &reports {
+            if !self
+                .teardown_reports
+                .iter()
+                .any(|old| old.pid == report.pid && old.identity == report.identity)
+            {
+                self.teardown_reports.push(report.clone());
+            }
+        }
         reports
     }
     /// The tracer (debugserver) pid of each live session. Read-only test seam
     /// for the timeout-path acceptance tests.
     #[doc(hidden)]
     pub fn tracer_pids(&self) -> Vec<i32> {
-        self.sessions.iter().map(|s| s.rsp.tracer_pid()).collect()
+        self.sessions
+            .iter()
+            .filter_map(|s| s.live.as_ref().map(|live| live.rsp.tracer_pid()))
+            .collect()
     }
     /// Every ordered-teardown report so far. Read-only test seam and the
     /// teardown's in-process diagnostic record.
@@ -3840,14 +4028,32 @@ impl TraceBackend for MacosTraceBackend {
             .ok_or_else(|| error("poll_event", "wait overflow"))?;
         loop {
             self.check_deadline()?;
-            if let Some(event) = self.events.pop_front() {
-                return Ok(umbra_platform::EventPoll::Event(event));
+            self.service_retirements();
+            let hold_root = self.sessions.iter().any(|s| {
+                s.retirement
+                    .as_ref()
+                    .is_some_and(|r| r.hold_root(crate::clock::now()))
+            });
+            let root = self.sessions.first().map(|s| s.id);
+            let deliver = self.events.iter().position(|event| {
+                !hold_root || !matches!(event, TraceEvent::Exit { task, .. } if Some(*task) == root)
+            });
+            if let Some(index) = deliver {
+                return Ok(umbra_platform::EventPoll::Event(
+                    self.events.remove(index).unwrap(),
+                ));
             }
             if let Some((index, reply)) = self.quiesced_stops.pop_front() {
                 self.stop(index, reply, true)?;
                 continue;
             }
-            if self.sessions.is_empty() || self.sessions.iter().all(|s| s.done) {
+            let pending_cleanup = self
+                .sessions
+                .iter()
+                .any(|s| s.retirement.as_ref().is_some_and(|r| r.outcome().is_none()));
+            if !pending_cleanup
+                && (self.sessions.is_empty() || self.sessions.iter().all(|s| s.done))
+            {
                 return Err(error("next_event", "no live processes"));
             }
             if crate::clock::now() >= limit {
@@ -3955,6 +4161,7 @@ impl TraceBackend for MacosTraceBackend {
         self.sessions[i].set_regs(thread, regs)
     }
     fn resume(&mut self, command: ResumeCommand) -> Result<()> {
+        self.service_retirements();
         self.check_deadline()?;
         let i = self.thread_index(command.thread)?;
         if command.signal.is_none() && self.sessions[i].stopped {
@@ -4062,6 +4269,7 @@ impl TraceControl for MacosTraceBackend {
         MacosTraceBackend::prepare_rewrite(self, thread, path, operation)
     }
     fn quiesce(&mut self, process: ProcessHandle) -> Result<QuiescedTree> {
+        self.service_retirements();
         if self.sessions.first().is_none_or(|s| s.id != process.0) {
             return Err(UmbraError::new(
                 ErrorKind::StaleHandle,
@@ -4119,7 +4327,9 @@ impl TraceControl for MacosTraceBackend {
         if let Err(e) = result {
             // A failed interrupt/ack must not leave part of the tree running.
             for s in &self.sessions {
-                s.task.kill();
+                if let Some(live) = &s.live {
+                    live.task.kill();
+                }
             }
             return Err(e);
         }
@@ -4159,7 +4369,15 @@ impl TraceControl for MacosTraceBackend {
             }
         }
         let reports = self.tear_down_sessions();
-        self.sessions.clear();
+        for session in self.sessions.drain(..) {
+            if session.retirement_report.as_ref().is_some_and(|report| {
+                report.steps.iter().any(
+                    |step| matches!(step, TeardownStep::Retirement(outcome) if !outcome.success()),
+                )
+            }) {
+                self.failed_retirements.push(session);
+            }
+        }
         self.events.clear();
         self.quiesced_stops.clear();
         self.watchdog.take();
@@ -4169,14 +4387,14 @@ impl TraceControl for MacosTraceBackend {
         // `umbra-supervisor/src/run.rs`): its tree's termination is unknown.
         let unconfirmed: Vec<String> = reports
             .iter()
-            .filter(|r| r.unconfirmed)
+            .filter(|r| r.unconfirmed || r.steps.iter().any(|step| matches!(step, TeardownStep::Retirement(outcome) if !outcome.success())))
             .map(TeardownReport::summary)
             .collect();
         if !unconfirmed.is_empty() {
             return Err(error(
                 "terminate",
                 format!(
-                    "tracee termination unconfirmed; tracer killed: {}",
+                    "tree cleanup failed (tracee or retired tracer): {}",
                     unconfirmed.join("; ")
                 ),
             ));
@@ -4187,6 +4405,139 @@ impl TraceControl for MacosTraceBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retirement_failure_does_not_end_the_session() {
+        use super::*;
+        for outcome in [
+            crate::FinishOutcome::UnconfirmedBarrier("scripted lookup".into()),
+            crate::FinishOutcome::WaitError("scripted ECHILD".into()),
+        ] {
+            let id = TaskId(TaskIdentity {
+                native_id: 0,
+                generation: 1,
+            });
+            let report = TeardownReport {
+                pid: 0,
+                identity: None,
+                tracer: 0,
+                steps: vec![TeardownStep::Retirement(outcome.clone())],
+                timed_out: true,
+                unconfirmed: false,
+                elapsed: Duration::ZERO,
+            };
+            let mut backend = MacosTraceBackend::default();
+            // Resource-free recorded slots let this control exercise actual
+            // poll/terminate interfaces without launching or signalling a task.
+            backend.sessions.push(Session {
+                id,
+                thread: tid(0, 1),
+                parent: None,
+                stopped: false,
+                done: true,
+                reaped: true,
+                birth: None,
+                torn_down: true,
+                exit_evidence: Some(BarrierEvidence::ReapedByPlatform),
+                exit_report: Some("W00".into()),
+                exec_generation: 0,
+                policy_exec_generation: 0,
+                initial: false,
+                live: None,
+                retirement: None,
+                retirement_report: Some(report.clone()),
+            });
+            backend.teardown_reports.push(report.clone());
+            backend.stop(0, "W00".into(), false).unwrap();
+            assert!(
+                backend.events.is_empty(),
+                "duplicate exit must not redeliver"
+            );
+            assert!(backend.stop(0, "W01".into(), false).is_err());
+            for _ in 0..2 {
+                backend.events.push_back(TraceEvent::Exit {
+                    task: id,
+                    status: ExitStatus::Code(0),
+                });
+                assert!(matches!(
+                    backend.poll_event(Duration::from_millis(1)),
+                    Ok(umbra_platform::EventPoll::Event(TraceEvent::Exit { .. }))
+                ));
+            }
+            // An externally stopped sibling keeps polling valid. With a one-nanosecond
+            // max_wait, poll must return Idle before touching any live body.
+            backend.sessions[0].done = false;
+            let idle = backend.poll_event(Duration::from_nanos(1));
+            backend.sessions[0].done = true;
+            assert!(matches!(idle, Ok(umbra_platform::EventPoll::Idle)));
+            let later_id = TaskId(TaskIdentity {
+                native_id: std::process::id() as u64,
+                generation: 99,
+            });
+            let task = Arc::new(Task::acquire(std::process::id() as i32).unwrap());
+            let weak = Arc::downgrade(&task);
+            backend.sessions.push(Session {
+                id: later_id,
+                thread: tid(later_id.0.native_id, 1),
+                parent: Some(0),
+                stopped: false,
+                done: true,
+                reaped: false,
+                birth: None,
+                torn_down: false,
+                exit_evidence: Some(BarrierEvidence::ReapedByPlatform),
+                exit_report: Some("W00".into()),
+                exec_generation: 0,
+                policy_exec_generation: 0,
+                initial: false,
+                retirement: Some(crate::retirement::Retirement::new(crate::clock::now())),
+                retirement_report: None,
+                live: Some(Box::new(LiveSession {
+                    _witness: crate::ownership::Witness::new(later_id.0.native_id, "body"),
+                    task,
+                    rsp: Rsp::retirement_test(),
+                    twin: PathBuf::new(),
+                    interposer: None,
+                    spawn: None,
+                    breaks: crate::ownership::Owned::new(
+                        BTreeMap::new(),
+                        later_id.0.native_id,
+                        "breaks",
+                    ),
+                    pending: crate::ownership::Owned::new(
+                        BTreeMap::new(),
+                        later_id.0.native_id,
+                        "pending",
+                    ),
+                    waiting: crate::ownership::Owned::new(vec![], later_id.0.native_id, "waiting"),
+                    entry: crate::ownership::Owned::new(
+                        BTreeMap::new(),
+                        later_id.0.native_id,
+                        "entry",
+                    ),
+                    registers: crate::ownership::Owned::new(
+                        vec![],
+                        later_id.0.native_id,
+                        "registers",
+                    ),
+                    scratch: crate::ownership::Owned::new(vec![], later_id.0.native_id, "scratch"),
+                })),
+            });
+            backend.drain_retirements();
+            assert!(
+                backend.sessions[1].live.is_none(),
+                "later child must retire normally"
+            );
+            assert!(weak.upgrade().is_none(), "actual Task owner released");
+            let failure = backend
+                .terminate(ProcessHandle(id), TerminationPolicy::Immediate)
+                .expect_err("retirement failure must surface at final cleanup");
+            assert!(failure.to_string().contains("scripted"));
+            assert_eq!(backend.teardown_reports()[0], report);
+            assert_eq!(backend.teardown_reports().len(), 2);
+            assert_eq!(backend.failed_retirements.len(), 1);
+        }
+    }
+
     /// This file's own text, for the three pins below.
     ///
     /// Reading the source is the same device `abi.rs` uses to pin the
@@ -4361,7 +4712,7 @@ mod tests {
     fn the_exec_stop_adopts_its_candidate_without_keying_on_the_stopping_thread() {
         let body = body_of("fn stop(&mut self");
         assert!(
-            body.contains("std::mem::take(&mut s.pending)"),
+            body.contains("s.pending.take()"),
             "the exec stop must drain every window and scan the drained values \
              for the `ReturnKind::Exec` candidate"
         );
@@ -4743,6 +5094,35 @@ mod monitor_sleep_tests {
     fn counted() -> Arc<std::sync::atomic::AtomicUsize> {
         Arc::new(std::sync::atomic::AtomicUsize::new(0))
     }
+    #[test]
+    fn retirement_registry_preserves_live_and_late_tasks() {
+        for latch_first in [false, true] {
+            let mut registry = WatchedTasks::default();
+            let finished = counted();
+            let live = counted();
+            let late = counted();
+            let weak = Arc::downgrade(&finished);
+            registry.add(finished.clone());
+            registry.add(live.clone());
+            if latch_first {
+                registry.latch("owner gone");
+            }
+            let retired = registry.retire(&finished).expect("exact owner");
+            assert!(Arc::ptr_eq(&retired, &finished));
+            drop(finished);
+            assert!(weak.upgrade().is_some());
+            drop(retired);
+            assert!(weak.upgrade().is_none());
+            if !latch_first {
+                registry.latch("owner gone");
+            }
+            registry.add(late.clone());
+            assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(late.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(registry.tasks.len(), 2);
+        }
+    }
+
     #[test]
     fn exec_replacements_keep_registry_bounded() {
         let mut registry = WatchedTasks::default();

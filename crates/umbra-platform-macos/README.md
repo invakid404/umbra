@@ -202,8 +202,9 @@ The M1 mechanisms named in the tracker spec are all present:
     `a_failed_exec_does_not_leave_a_later_fork_pointed_at_an_image_the_tracee_never_ran`.
 
 13. **Ordered session teardown** (#186): `Session::ordered_teardown`, run for
-    every session (children first) by `terminate`, by the sandboxed-handoff
-    launch failure and by every drop.
+    every resource-bearing session (children first) by `terminate`, by the
+    sandboxed-handoff launch failure and by drop. Completed child slots whose
+    resources were already retired reuse their recorded cleanup evidence.
     - It sends RSP `k`, and sends it once more after a stop reply: a session
       left at a breakpoint answers the first `k` with its stale stop.
     - It waits on a fail-closed barrier until the tracee has passed its exit
@@ -224,6 +225,21 @@ The M1 mechanisms named in the tracker spec are all present:
     launchd's session the kernel's orphaned-process-group SIGHUP killed the
     supervisor. The bounds, the timeout warning and the residuals are under
     `Request::Terminate` above.
+
+    Completed children now retire resources while their parent remains alive
+    (#274). A stable slot keeps identity, parent/wait indices, exit status and
+    barrier/report evidence; its detachable body owns Task, RSP and working
+    maps. After confirmed exit, nonblocking service reaps the tracer, removes
+    the exact registry Arc under the owner-monitor lock, and drops resources
+    outside that lock. There is no session-age, idle or child-count limit.
+    The original 1750ms obligation contains a 250ms tracer phase. A killed
+    tracer still awaiting reap remains owned and is serviced without another
+    kill. Root Exit can be held only to that original deadline; other events
+    and live siblings continue. Unconfirmed barriers and kill/wait errors are
+    recorded once and remain visible at final termination. Drop retains the
+    existing bounded emergency cleanup. The `retirement-witness` qualification
+    feature observes actual Task Arcs and owning body/map lifetimes; ordinary
+    builds do not collect that history.
 
 14. **Kill, never detach, on a lost connection, verified** (#193):
     `Rsp::connect` sends `QSetDetachOnError:0` at the end of its handshake,

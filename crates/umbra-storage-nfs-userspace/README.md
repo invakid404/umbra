@@ -1652,3 +1652,11 @@ binaries and fresh `UMBRA_SLATE_EVIDENCE` prerequisites apply, with
 `UMBRA_INTEGRATION_REQUIRED=1`. CI builds the probe feature before its baseline
 userspace suite. This qualifies the observed quiet run, not cancellation,
 unlimited session lifetime, or new storage semantics.
+
+The #274 `fix_274_live_sibling_inheritance` and
+`fix_274_parked_wait_parent_exit` cases run in the existing userspace registry
+harness with native controls and journal reopen. They retain a live descendant
+through sibling or parent retirement, then require exact shared-description
+write bytes and child wait statuses. They exercise offsets through routed
+writes, not host `lseek`. Their self-hosted job is `native-userspace-routing`;
+the separate 200-child resource census belongs to `native-qualification`.

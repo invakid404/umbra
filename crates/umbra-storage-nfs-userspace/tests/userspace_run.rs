@@ -16466,17 +16466,31 @@ fn fix_264_default_idle_survives() {
 
 // #274: use the existing paired-run/cleanup instrument for retired slots.
 fn fix_274_lifecycle(mode: &str) {
-    let Some(mut spawn) = slate_spawn(&format!("fix-274-{mode}")) else { return };
-    spawn.program = fixture_binary(spawn.scratch.path(), "umbra-fix-274-lifecycle", "UMBRA_FIX_274_LIFECYCLE_PATH");
+    let Some(mut spawn) = slate_spawn(&format!("fix-274-{mode}")) else {
+        return;
+    };
+    spawn.program = fixture_binary(
+        spawn.scratch.path(),
+        "umbra-fix-274-lifecycle",
+        "UMBRA_FIX_274_LIFECYCLE_PATH",
+    );
     spawn.helper = spawn.program.canonicalize().unwrap();
-    std::fs::write(spawn.evidence.join("fixture.sha256"), r14_sha256(&std::fs::read(&spawn.program).unwrap())).unwrap();
+    std::fs::write(
+        spawn.evidence.join("fixture.sha256"),
+        r14_sha256(&std::fs::read(&spawn.program).unwrap()),
+    )
+    .unwrap();
     let (bytes, record): (&[u8], &[u8]) = match mode {
         "sibling" => (b"ABCD", b"exec=17 sibling=23 bytes=ABCD\n"),
         "parent" => (b"ABC", b"parent=19 descendant=0 bytes=ABC\n"),
         _ => unreachable!(),
     };
     let (root, native) = slate_spawn_native(&spawn, mode);
-    assert!(native.status.success(), "native: {}", String::from_utf8_lossy(&native.stderr));
+    assert!(
+        native.status.success(),
+        "native: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
     assert_eq!(std::fs::read(root.join("file")).unwrap(), bytes);
     assert_eq!(std::fs::read(root.join("records")).unwrap(), record);
     let routed = slate_spawn_routed(&spawn, mode, &["file", "records", "ready", "done"]);
@@ -16487,6 +16501,10 @@ fn fix_274_lifecycle(mode: &str) {
     slate_spawn_finish(&spawn, &routed);
 }
 #[test]
-fn fix_274_live_sibling_inheritance() { fix_274_lifecycle("sibling"); }
+fn fix_274_live_sibling_inheritance() {
+    fix_274_lifecycle("sibling");
+}
 #[test]
-fn fix_274_parked_wait_parent_exit() { fix_274_lifecycle("parent"); }
+fn fix_274_parked_wait_parent_exit() {
+    fix_274_lifecycle("parent");
+}

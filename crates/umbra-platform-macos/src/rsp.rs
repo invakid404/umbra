@@ -36,6 +36,7 @@ pub struct Rsp {
     pub id: u32,
     stream: TcpStream,
     child: Child,
+    reaped: bool,
     buffer: Vec<u8>,
     no_ack: bool,
     deadline: Option<Instant>,
@@ -158,6 +159,7 @@ impl Rsp {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             stream,
             child,
+            reaped: false,
             buffer: Vec::new(),
             no_ack: false,
             deadline,
@@ -412,7 +414,10 @@ impl Rsp {
         let limit = crate::clock::now() + bound;
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return true,
+                Ok(Some(_)) => {
+                    self.reaped = true;
+                    return true;
+                }
                 Ok(None) => {}
                 Err(_) => return false,
             }
@@ -426,6 +431,40 @@ impl Rsp {
     /// reap) the tracer.
     pub fn mark_torn_down(&mut self) {
         self.torn_down = true;
+    }
+}
+#[cfg(test)]
+impl Rsp {
+    pub(crate) fn retirement_test() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        drop(peer);
+        Self {
+            id: 0,
+            stream,
+            child: Command::new("/usr/bin/true").spawn().unwrap(),
+            reaped: false,
+            buffer: Vec::new(),
+            no_ack: true,
+            deadline: None,
+            setup_deadline: None,
+            torn_down: false,
+        }
+    }
+}
+impl crate::retirement::Tracer for Rsp {
+    fn already_reaped(&self) -> bool {
+        self.reaped
+    }
+    fn try_reap(&mut self) -> std::io::Result<bool> {
+        self.child.try_wait().map(|status| {
+            self.reaped = status.is_some();
+            self.reaped
+        })
+    }
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
     }
 }
 impl Drop for Rsp {
@@ -505,6 +544,7 @@ mod poll_bound_tests {
             id: 0,
             stream,
             child,
+            reaped: true,
             buffer: Vec::new(),
             no_ack: true,
             deadline: Some(crate::clock::now() + Duration::from_secs(2)),
@@ -555,6 +595,7 @@ mod early_packet_test {
             id: 0,
             stream,
             child,
+            reaped: true,
             buffer: vec![],
             no_ack: true,
             deadline: None,
