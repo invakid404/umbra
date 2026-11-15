@@ -37,6 +37,7 @@ int main(int argc, char **argv) {
         int fd = atoi(argv[2]); put(fd, "B"); return 17;
     }
     require(argc == 4, 87);
+    const char *mode = argv[1];
     char file[4096], ready[4096], done[4096], record[4096];
     snprintf(file, sizeof(file), "%s/file", argv[2]);
     snprintf(ready, sizeof(ready), "%s/ready", argv[2]);
@@ -55,7 +56,7 @@ int main(int argc, char **argv) {
         waited(a, 23); put(fd, "D");
         mark(record, "exec=17 sibling=23 bytes=ABCD\n");
     } else {
-        require(!strcmp(argv[1], "parent"), 94);
+        require(!strcmp(mode, "parent") || !strcmp(mode, "parent-nonzero") || !strcmp(mode, "parent-signal"), 94);
         int identities[2]; require(pipe(identities) == 0, 100);
         pid_t p = fork(); require(p >= 0, 95);
         if (!p) {
