@@ -74,9 +74,10 @@ the Umbra-owned client state machine, a raw transport behind an off-by-default
 feature, an operations surface that creates and opens runs, and writer admission
 with bounded outage recovery. Its suites run against an isolated NFS-Ganesha
 container from user space, with no mount anywhere. An open run advertises
-`Durability::Remote` — the matched-verifier `COMMIT` barrier its `flush`
-certifies over already-committed writes, with strict remote persistence still
-refused — and no fencing.
+`Durability::Remote` only when its transport declares a remote-server boundary
+and its WRITE/COMMIT probe succeeds; otherwise it advertises `Durability::Local`.
+Its `flush` receipt carries that qualified level over already-committed writes.
+Strict remote persistence remains refused, and no fencing is qualified.
 
 `umbra run` can now use it. Because that backend has no kernel-visible path for
 a run, a supervised command over it cannot have its file operations serviced by

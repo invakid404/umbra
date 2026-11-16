@@ -268,12 +268,9 @@ fn unsupported<T>(operation: &str, context: &str) -> Result<T> {
 
 /// Userspace NFSv4.0 storage backend.
 ///
-/// Holds the facade seams rather than a connection. `connect` builds an unbound
-/// provider whose contract methods report that no run is open and no transport is
-/// bound rather than acting — `flush`, for one, returns `InvalidState` ("no run is
-/// open"); [`NfsUserspaceStorage::with_facades`] injects a transport and replay
-/// log, which is how `raw_state` and `authority_recovery` drive the same code
-/// against the fake.
+/// With `transport-raw`, [`Self::connect`] binds and qualifies a live transport.
+/// Without that feature, it leaves the provider unbound. [`Self::with_facades`]
+/// injects a transport and replay log for callers using the facade interfaces.
 pub struct NfsUserspaceStorage {
     config: NfsUserspaceConfig,
     transport: Option<Box<dyn RawTransport>>,

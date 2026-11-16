@@ -801,10 +801,9 @@ impl Operations {
                 return Err(error);
             }
         }
-        // `UNSTABLE`, because a durability receipt is the only thing entitled to
-        // claim persistence and this provider issues none. The verifier is
-        // recorded against the idempotency key, so whichever node eventually
-        // COMMITs can find it and compare.
+        // Request UNSTABLE and settle the returned ticket with COMMIT below.
+        // `flush` checks the resulting settlement ledger before issuing a receipt
+        // at the run's qualified durability level.
         let written = open.write(
             &mut **transport,
             &mut **replay,
