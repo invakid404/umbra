@@ -84,7 +84,7 @@ Probe controls are listed under [Provider binary](#provider-binary).
   hosts whose selected Xcode keeps debugserver under `SharedFrameworks`
   rather than the `Library/PrivateFrameworks` path probed below.
 - `TeardownReport`, `TeardownStep`, `BarrierReading`, `BarrierEvidence` and
-  `ReportedExitLookup` describe each session's ordered teardown (item 13
+  `ReportedExitLookup` and `FinishOutcome` describe each session's ordered teardown (item 13
   below). `MacosTraceBackend::teardown_reports()` returns every report so far
   and `tracer_pids()` the live sessions' debugserver pids. Both are read-only,
   `#[doc(hidden)]` seams for the acceptance tests; the backend never consults
@@ -202,8 +202,11 @@ The M1 mechanisms named in the tracker spec are all present:
     `a_failed_exec_does_not_leave_a_later_fork_pointed_at_an_image_the_tracee_never_ran`.
 
 13. **Ordered session teardown** (#186): `Session::ordered_teardown`, run for
-    every session (children first) by `terminate`, by the sandboxed-handoff
-    launch failure and by every drop.
+    live resource-bearing session (children first) by `terminate`, by the
+    sandboxed-handoff launch failure and by drop. Completed child slots reuse
+    their recorded retirement evidence. Failed retirement owners remain held
+    through termination and receive explicit bounded emergency finalization
+    on drop, with its results merged into their original failure reports.
     - It sends RSP `k`, and sends it once more after a stop reply: a session
       left at a breakpoint answers the first `k` with its stale stop.
     - It waits on a fail-closed barrier until the tracee has passed its exit
@@ -224,6 +227,25 @@ The M1 mechanisms named in the tracker spec are all present:
     launchd's session the kernel's orphaned-process-group SIGHUP killed the
     supervisor. The bounds, the timeout warning and the residuals are under
     `Request::Terminate` above.
+
+    Completed children now retire resources while their parent remains alive
+    (#274). A stable slot keeps identity, parent/wait indices, exit status and
+    barrier/report evidence; its detachable body owns Task, RSP and working
+    maps. After confirmed exit, nonblocking service reaps the tracer, removes
+    the exact registry Arc under the owner-monitor lock, and drops resources
+    outside that lock. There is no session-age, idle or child-count limit.
+    The original 1750ms obligation contains a 250ms tracer phase. A killed
+    tracer still awaiting reap remains owned and is serviced without another
+    kill. Root Exit can be held only to that original deadline; other events
+    and live siblings continue. Unconfirmed barriers and kill/wait errors are
+    recorded once and remain visible at final termination. Success outcomes
+    retain the owned wait status; failures retain OS error kind/code, elapsed
+    time and the last observation. Drop explicitly finalizes failed owners,
+    preserving the original failure and merging typed emergency kill/wait
+    evidence into the retained report. Unconfirmed owners keep ordered barrier
+    and warning handling; confirmed tracer finalization has one bounded window.
+    The `retirement-witness` qualification feature observes actual Task Arcs
+    and owning body/map lifetimes; ordinary builds do not collect that history.
 
 14. **Kill, never detach, on a lost connection, verified** (#193):
     `Rsp::connect` sends `QSetDetachOnError:0` at the end of its handshake,
@@ -642,8 +664,9 @@ The `k` plus the barrier is bounded at 1.5 s per session, and each reap at
 250 ms (at most 2 s per session). On a timeout the provider writes
 `tracee termination unconfirmed; tracer killed` to stderr, kills debugserver,
 and runs one post-kill barrier inside the 250 ms tracer reap:
-- **Confirmed:** `Terminate` succeeds, and a second line,
-  `tracee exit confirmed after tracer kill`, follows the warning.
+- **Confirmed:** a second line, `tracee exit confirmed after tracer kill`,
+  follows the warning. `Terminate` succeeds if no other session remains
+  unconfirmed and no retirement failure is retained.
 - **Still unconfirmed:** `Terminate` returns the warning as its error, and the
   run is left recovery-required.
 
@@ -719,6 +742,29 @@ was closed (below). Fixture cases:
 | `symlink-cycle`     | **CAPTURED** — the logical symlinks above |
 | `mt-write`          | **CAPTURED** — the closed multithreaded window below |
 | `mt-spawn`          | **CAPTURED** — the closed multithreaded window below |
+
+### Completed-child retirement (#274)
+
+`retirement_` unit controls exercise typed cleanup outcomes and the actual
+backend polling/termination interfaces. `retirement_controls.rs` supplies
+loopback RSP peers and owned ordinary children to exercise quiesce/resume with
+retired slots and a registered live sibling. It checks pending service at both
+entry points and quiesce exit, unchanged compact exit/barrier/wait facts, the
+exact resume packet and the surviving registry owner. Backend controls also
+cover late reap versus exhausted final drain, actual failed-owner Drop with
+confirmed and unconfirmed barriers, a live root across a slow child gap,
+simultaneous exits and root-exit delivery after a pending child. These controls
+run in the one
+self-hosted `native-qualification` job as well as ordinary unit testing.
+`retirement_release_owns_all_resources` populates each working map/buffer,
+then requires every ownership witness to expire, both Task owners to release,
+the registry to empty and the RSP peer to observe EOF. A dedicated unwind
+control verifies that test-owned self Tasks leave the watchdog registry before
+backend Drop, including when an assertion panics.
+Checkpoint publication/recovery is not implemented at the base; this coverage
+is quiesce/resume only. Existing checkpoint-recovery refusal remains unchanged.
+The CLI's `child_retention` live census and the userspace suite's paired
+lifecycle cases provide the real-debugger and file-byte measurements.
 
 ### Ordered teardown (#186)
 
@@ -1138,8 +1184,10 @@ before launch, after launch failure, and after termination. Observation runs
 from owner binding until backend disposal, independently of the per-launch
 deadline watchdog; both share the task registry. Exec registers a replacement
 Task before retiring the superseded entry, releasing its old Mach right once
-the session replaces its reference. Completed child sessions remain until tree
-cleanup; provider-lifetime owner registry entries remain until backend disposal. The monitor
+the session replaces its reference. Confirmed completed children release their live
+bodies and registry entries after tracer reaping; compact identity, wait and exit
+facts remain until tree cleanup. Unconfirmed or failed cleanup retains ownership
+and reports its failure at termination. The monitor
 kills registered tasks; late registrations are killed immediately. The provider
 thread performs existing ordered teardown and retains unconfirmed diagnostics.
 Normal disarm does not kill tasks. No heartbeat or inactivity-based "stuck"

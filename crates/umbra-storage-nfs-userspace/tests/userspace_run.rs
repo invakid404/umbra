@@ -9531,13 +9531,14 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for superseded exec Task retirement (#264, CR-3), which changed native.rs,
-    // while single_thread and its Fork/WaitPlan::Park call sites are unchanged.
+    // Re-characterized for typed retirement and explicit failed-owner cleanup
+    // (#274): single_thread and both guard positions remain unchanged. Park
+    // retains its owning wait-index container. The refusal oracle is unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("c245e988e23b6b5eaa30d83f4a72771431d390ff9d34cbfa1d0904ee5725d8bf"),
+        Some("7b30c6e0ad3c9e513f40d3e2a06547feccb437945d198108944c3268b48405d0"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -16462,4 +16463,255 @@ fn fix_264_default_idle_survives() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     assert!(stderr.contains("Some(Code(0))"), "{stderr}");
+}
+
+// Bind an actual terminal debugger packet to the fixture's descendant PID.
+// Neither a done marker nor journal completion establishes this exit status.
+fn fix_274_descendant_packets(stderr: &str, identity: &[u8]) -> Vec<String> {
+    // The identity is a separately read-back fixture object, never a line in
+    // stderr shared by independently writing tracees and the provider.
+    let text = std::str::from_utf8(identity).expect("descendant identity is UTF-8");
+    let pid: u32 = text
+        .strip_suffix('\n')
+        .expect("terminated descendant identity")
+        .parse()
+        .expect("one descendant PID");
+    assert!(pid > 1);
+    assert_eq!(
+        identity,
+        format!("{pid}\n").as_bytes(),
+        "canonical descendant identity"
+    );
+    let attach = format!("> vAttach;{pid:x}");
+    let connections: Vec<_> = stderr
+        .lines()
+        .filter_map(|line| {
+            let (id, body) = line.strip_prefix("RSP[")?.split_once("] ")?;
+            (body == attach).then_some(id)
+        })
+        .collect();
+    assert_eq!(
+        connections.len(),
+        1,
+        "descendant must have one debugger connection"
+    );
+    let prefix = format!("RSP[{}] < ", connections[0]);
+    let bytes: String = stderr
+        .lines()
+        .filter_map(|s| s.strip_prefix(&prefix))
+        .collect();
+    bytes
+        .split('$')
+        .skip(1)
+        .filter_map(|packet| {
+            let (body, _) = packet.split_once('#')?;
+            Some(body.to_owned())
+        })
+        .collect()
+}
+fn fix_274_descendant_status(stderr: &str, identity: &[u8], expected: &str) {
+    let packets = fix_274_descendant_packets(stderr, identity);
+    let exits: Vec<_> = packets
+        .iter()
+        .filter(|s| s.starts_with('W') || s.starts_with('X'))
+        .collect();
+    assert_eq!(
+        exits.len(),
+        1,
+        "missing or ambiguous descendant terminal packet: {exits:?}"
+    );
+    assert_eq!(&exits[0][..3], expected, "actual descendant status");
+}
+
+// #274: use the existing paired-run/cleanup instrument for retired slots.
+fn fix_274_lifecycle(mode: &str) {
+    let Some(mut spawn) = slate_spawn(&format!("fix-274-{mode}")) else {
+        return;
+    };
+    spawn.program = fixture_binary(
+        spawn.scratch.path(),
+        "umbra-fix-274-lifecycle",
+        "UMBRA_FIX_274_LIFECYCLE_PATH",
+    );
+    spawn.helper = spawn.program.canonicalize().unwrap();
+    std::fs::write(
+        spawn.evidence.join("fixture.sha256"),
+        r14_sha256(&std::fs::read(&spawn.program).unwrap()),
+    )
+    .unwrap();
+    let (bytes, record): (&[u8], &[u8]) = match mode {
+        "sibling" => (b"ABCD", b"exec=17 sibling=23 bytes=ABCD\n"),
+        "parent" => (b"ABC", b"parent=19 bytes=ABC\n"),
+        _ => unreachable!(),
+    };
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(
+        native.status.success(),
+        "native: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(std::fs::read(root.join("file")).unwrap(), bytes);
+    assert_eq!(std::fs::read(root.join("records")).unwrap(), record);
+    spawn
+        .provider_environment
+        .push(("UMBRA_RSP_LOG".into(), "1".into()));
+    let observed_mode = if mode.starts_with("parent") {
+        format!("{mode}:routed")
+    } else {
+        mode.into()
+    };
+    let routed = slate_spawn_routed(
+        &spawn,
+        &observed_mode,
+        &["file", "records", "ready", "done", "descendant.pid"],
+    );
+
+    assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+    if mode == "parent" {
+        fix_274_descendant_status(
+            &routed.run.stderr,
+            routed
+                .object("descendant.pid")
+                .expect("descendant identity object"),
+            "W00",
+        );
+    }
+    assert_eq!(routed.object("file"), Some(bytes));
+    assert_eq!(routed.object("records"), Some(record));
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+#[test]
+fn fix_274_live_sibling_inheritance() {
+    fix_274_lifecycle("sibling");
+}
+#[test]
+fn fix_274_parked_wait_parent_exit() {
+    fix_274_lifecycle("parent");
+}
+
+// CR-4: a done marker must not disguise a later failing descendant exit.
+#[test]
+fn fix_274_descendant_exit_status_controls() {
+    for (mode, status) in [("parent-nonzero", 7 << 8), ("parent-signal", 9)] {
+        let Some(mut spawn) = slate_spawn(&format!("fix-274-{mode}")) else {
+            return;
+        };
+        spawn.program = fixture_binary(
+            spawn.scratch.path(),
+            "umbra-fix-274-lifecycle",
+            "UMBRA_FIX_274_LIFECYCLE_PATH",
+        );
+        spawn.helper = spawn.program.canonicalize().unwrap();
+        let (root, native) = slate_spawn_native(&spawn, mode);
+        assert_eq!(
+            native.status.code(),
+            Some(106),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        assert!(String::from_utf8_lossy(&native.stderr).contains(&format!("exit-status={status}")));
+        assert!(!root.join("records").exists());
+        spawn
+            .provider_environment
+            .push(("UMBRA_RSP_LOG".into(), "1".into()));
+        let observed_mode = if mode.starts_with("parent") {
+            format!("{mode}:routed")
+        } else {
+            mode.into()
+        };
+        let routed = slate_spawn_routed(
+            &spawn,
+            &observed_mode,
+            &["file", "records", "ready", "done", "descendant.pid"],
+        );
+
+        if status == 9 {
+            // Existing backend policy refuses the fatal signal stop before a
+            // terminal exit packet. It must never be accepted as completion.
+            assert_eq!(routed.run.status, Some(1), "{}", routed.run.stderr);
+            assert!(routed.run.stderr.contains("fatal signal/exception: T09"));
+            assert!(fix_274_descendant_packets(
+                &routed.run.stderr,
+                routed
+                    .object("descendant.pid")
+                    .expect("descendant identity object")
+            )
+            .iter()
+            .any(|s| s.starts_with("T09")));
+            assert!(!journal_records_completion(&routed.run));
+        } else {
+            assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
+            fix_274_descendant_status(
+                &routed.run.stderr,
+                routed
+                    .object("descendant.pid")
+                    .expect("descendant identity object"),
+                "W07",
+            );
+            assert_eq!(
+                routed.object("records"),
+                Some(b"parent=19 bytes=ABC\n".as_slice())
+            );
+        }
+        assert!(
+            std::panic::catch_unwind(|| fix_274_descendant_status(
+                &routed.run.stderr,
+                routed
+                    .object("descendant.pid")
+                    .expect("descendant identity object"),
+                "W00"
+            ))
+            .is_err(),
+            "a failing descendant must fail the normal lifecycle status oracle"
+        );
+        slate_spawn_finish(&spawn, &routed);
+        slate_finish_cleanup();
+    }
+}
+
+// Retained runner reading: tracee stderr split a concurrent RSP log line.
+#[test]
+fn fix_274_interleaved_identity_regression() {
+    let stderr = std::env::var_os("UMBRA_FIX274_RETAINED_RSP")
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .unwrap_or_else(|| {
+            "RSP[2] > vAttach;13b6d\nRSP[f274 descendant-pid=80749\n1] < $OK#00\nRSP[2] < $W07#00\n"
+                .into()
+        });
+    fix_274_descendant_status(&stderr, b"80749\n", "W07");
+}
+
+#[test]
+fn fix_274_identity_and_status_controls() {
+    let log = "RSP[2] > vAttach;13b6d\nRSP[2] < $W07#00\n";
+    for identity in [
+        b"".as_slice(),
+        b"80749",
+        b"80749\n80749\n",
+        b"garbage\n",
+        b"80748\n",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| fix_274_descendant_status(log, identity, "W07")).is_err()
+        );
+    }
+    for invalid in [
+        log.replace("vAttach;13b6d", "vAttach;13b6c"),
+        format!("{log}RSP[2] > vAttach;13b6d\n"),
+        log.replace("$W07#00", "$OK#00"),
+        format!("{log}RSP[2] < $W07#00\n"),
+        log.replace("$W07#00", "$W00#00"),
+        log.replace("$W07#00", "$X09#00"),
+    ] {
+        assert!(std::panic::catch_unwind(|| fix_274_descendant_status(
+            &invalid, b"80749\n", "W07"
+        ))
+        .is_err());
+    }
+    fix_274_descendant_status(log, b"80749\n", "W07");
+    assert!(
+        std::panic::catch_unwind(|| fix_274_descendant_status(log, b"80749\n", "W00")).is_err()
+    );
 }

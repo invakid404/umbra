@@ -271,6 +271,13 @@ jobs:
           git diff --stat -- experiments/fixtures/umbra-fix-227-observer-providers/Cargo.lock
           cargo build --locked --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           cargo test -p umbra-supervisor --test observer_failure -- --nocapture --test-threads=1
+      - name: Qualify completed-child resource retirement
+        env:
+          UMBRA_RETIREMENT_WITNESS: "1"
+        run: |
+          cargo build -p umbra-platform-macos --features retirement-witness --bin umbra-platform-macos
+          cargo test -p umbra-platform-macos --lib retirement_ -- --nocapture
+          cargo test -p umbra-cli --test child_retention -- --nocapture --test-threads=1
       # #193: this runner's jobs run in launchd's session (SID 1), the one place
       # `umbra run` isolates itself. The isolation suite's SID-1 cases (P1-P4,
       # topology, cleanup) skip in any other session, so here a different

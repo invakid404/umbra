@@ -11,7 +11,13 @@ pub mod interpose;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod native;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod ownership;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod retirement;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod rsp;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use retirement::FinishOutcome;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod spawn_host;
 #[cfg(all(
