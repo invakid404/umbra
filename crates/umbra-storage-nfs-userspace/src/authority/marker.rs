@@ -47,10 +47,8 @@ const VERSION: u8 = 1;
 pub const LEGACY_MARKER_BYTES: usize = 16;
 /// Byte length of every extended record.
 ///
-/// Fixed, not variable, because the frozen transport facade has no `SETATTR` and
-/// therefore no way to truncate: a shorter record written over a longer one would
-/// leave the old tail behind and the next reader would decode a chimera. A
-/// constant width makes every overwrite total.
+/// Fixed width keeps extended-record overwrites independent of writer-id length:
+/// a shorter writer id still replaces the whole record, including its padding.
 pub const EXTENDED_MARKER_BYTES: usize = 256;
 /// Offset the writer id starts at within an extended record.
 const WRITER_ID_OFFSET: usize = 8 + 1 + 1 + 8 + 16 + 2;
@@ -498,9 +496,8 @@ mod tests {
 
     #[test]
     fn every_record_is_the_same_width_so_an_overwrite_is_total() {
-        // The frozen transport has no SETATTR, so a shorter record written over a
-        // longer one would leave a readable tail. Widths must not depend on the
-        // writer id.
+        // Extended records retain the same width regardless of writer-id length,
+        // so overwriting a longer id also replaces its trailing bytes.
         let short = held("a", 1).encode().expect("encode");
         let long = held(&"w".repeat(MAX_WRITER_ID_BYTES), 1)
             .encode()

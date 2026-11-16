@@ -1,11 +1,8 @@
-//! Userspace NFSv4.0 storage provider: frozen facade interfaces and scaffold.
+//! Userspace NFSv4.0 storage provider.
 //!
-//! This crate carries the private facade contracts for Umbra's userspace NFS
-//! backend and a [`Storage`](umbra_storage::Storage) scaffold that implements the
-//! contract's shape without yet performing I/O. It exists so `raw_rpc` (transport)
-//! and `raw_state` (protocol state) can be built against a fixed seam, and so
-//! `authority_recovery` can build admission and replay wiring against the same
-//! types with an in-memory implementation.
+//! Implements [`Storage`](umbra_storage::Storage) over the transport and protocol
+//! state facades. With `transport-raw`, [`NfsUserspaceStorage::connect`] binds the
+//! live libnfs transport; without it, the provider remains unbound.
 //!
 //! # Wire profile
 //!
@@ -25,26 +22,16 @@
 //!
 //! # Safe-wrapper posture
 //!
-//! Unsafe code is denied crate-wide. The future libnfs binding is the only place
-//! that may opt back in, and only with a documented safety contract, so the FFI
-//! surface stays visible in review rather than diffused through the crate.
+//! Unsafe code is denied crate-wide; the raw transport binding opts in locally
+//! for its FFI implementation.
 //!
 //! # Current state
 //!
-//! The operations surface is wired against the frozen facades: anchoring, path
-//! resolution, stat, bounded enumeration, read, exclusive and plain create, and
-//! WRITE with `UNSTABLE`/COMMIT verifier accounting all run over whatever
-//! [`RawTransport`](transport::RawTransport) is injected. `flush` is wired: it
-//! certifies a zero-I/O completeness barrier over the run's already-committed
-//! writes and returns a `Durability::Remote` receipt, refusing rather than
-//! certifying whenever the evidence is absent. No live transport is bound by
-//! `connect` — that is `m1_integrate`'s seam.
-//!
-//! Namespace mutation — REMOVE, RENAME, CREATE of a directory, SETATTR — is
-//! typed and reachable through [`namespace::NamespaceDispatcher`] but has no
-//! in-crate implementation, because the frozen [`transport::Nfs4Op`] carries no
-//! argument variant for those NFSv4.0 operations. See [`capability`] for the
-//! full matrix and [`namespace`] for why the seam is unbound rather than faked.
+//! Data operations use [`RawTransport`](transport::RawTransport), and namespace
+//! mutations use [`namespace::dispatch::TransportDispatcher`]. Writes settle
+//! their COMMIT evidence before returning. `flush` checks the settlement ledger
+//! and returns a receipt at the run's qualified durability level.
+//! Durable checkpoint support remains unimplemented.
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
