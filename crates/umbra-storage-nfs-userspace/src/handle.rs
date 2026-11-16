@@ -271,7 +271,7 @@ struct OpenState {
 
 /// Everything a successful OPEN establishes about one open file.
 ///
-/// Grouped so [`OpenFile::new`] cannot be called with two same-typed arguments
+/// Grouped so `OpenFile::new` cannot be called with two same-typed arguments
 /// transposed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenGrant {

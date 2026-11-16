@@ -53,10 +53,9 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace --all-targets
 
-      # `cargo test` compiles other packages' `[[bin]]` targets only as test
-      # harnesses under `deps/`, so `target/debug/umbra-storage-local` and
-      # friends do not exist on a clean checkout. The reopen suites spawn those
-      # provider executables, and without this they would skip here and run
+      # Test harness artifacts do not supply the standalone provider executables
+      # at `target/debug/umbra-storage-local` and friends on a clean checkout.
+      # The reopen suites spawn those provider executables, and without this they would skip here and run
       # nowhere. Linking them is cheap at this point: every dependency is already
       # built by the three steps above.
       - name: Build provider executables for the suites that spawn them
@@ -242,9 +241,9 @@ jobs:
       # test remains in the suite and runs in local dev; on macOS Sequoia/Tahoe
       # self-hosted runners the TCC SystemPolicyNetworkVolumes gate blocks
       # openat on the mount point from a launchd context, and the PPPC
-      # bypass would require user-approved MDM. A userspace NFSv4 client
-      # backend that removes the local-mount requirement is planned; when
-      # it lands the skip can be removed.
+      # bypass would require user-approved MDM. The userspace NFS backend
+      # has its own native-userspace-routing job. These skipped matrices still
+      # require a kernel NFS mount, so that backend does not remove this skip.
       UMBRA_TEST_SKIP_NFS_MATRIX: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

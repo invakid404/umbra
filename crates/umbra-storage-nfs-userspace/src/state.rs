@@ -5,7 +5,7 @@
 //! stateids, seqids, lease renewal, reconnect, grace and reclaim, and the
 //! verifier accounting the replay ledger consumes — is Umbra's, and it lives
 //! here. Nothing in this module opens a socket, links a library or knows a wire
-//! format: it talks to [`RawTransport`](crate::transport::RawTransport) and to
+//! format: it talks to [`RawTransport`] and to
 //! [`ReplayLog`](crate::replay::ReplayLog), and it is developed against the fake
 //! implementations of both.
 //!

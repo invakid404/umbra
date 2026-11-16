@@ -60,7 +60,7 @@ pub struct OpsContext<'a> {
     /// raise an unresolved-recovery obligation for an unproven one, after the
     /// borrow ends.
     ///
-    /// Set by [`Operations::write_at`] once its WRITE was accepted — with
+    /// Set by `Operations::write_at` once its WRITE was accepted — with
     /// [`WriteSettlement::committed`] `true` when the COMMIT then matched, `false`
     /// when the WRITE landed but its COMMIT failed. A read, or a write that failed
     /// before its WRITE was accepted, leaves it `None`.

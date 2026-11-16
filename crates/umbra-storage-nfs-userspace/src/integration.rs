@@ -1,8 +1,8 @@
 //! The `raw_rpc` ↔ `raw_state` join.
 //!
 //! `raw_state` developed its protocol state machine against
-//! [`FakeTransport`](crate::fake::FakeTransport); `raw_rpc` shipped
-//! [`LibnfsRawTransport`](crate::transport::raw::LibnfsRawTransport). Both
+//! [`FakeTransport`]; `raw_rpc` shipped
+//! `LibnfsRawTransport` (available with `transport-raw`). Both
 //! satisfy the frozen [`RawTransport`], so joining them is a choice of backend
 //! and nothing else — no state-machine code changes, and neither implementer's
 //! public surface moves.
