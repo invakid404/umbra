@@ -16,29 +16,35 @@ def build(argv, **kwargs):
     return subprocess.run(argv, check=True, cwd=root, **kwargs)
 build(["clang", "-arch", "arm64", "-O1", "-Wall", "-Wextra", "-Werror",
        "experiments/fixtures/umbra-slate-r12-publication.c", "-o", str(out / "publication")])
-args = ["rustc", "--edition=2021", "experiments/fixtures/umbra-slate-r12-provider.rs",
-        "-L", "dependency=" + str(target / "deps"), "-o", str(out / "provider")]
-for crate in ["umbra_core", "umbra_storage", "umbra_storage_nfs_userspace"]:
-    lib = target / ("lib" + crate + ".rlib")
-    if not lib.exists():
-        matches = list((target / "deps").glob("lib" + crate + "-*.rlib"))
-        if len(matches) != 1:
-            raise SystemExit("ambiguous library artifacts: " + repr(matches))
-        lib = matches[0]
-    args += ["--extern", crate + "=" + str(lib)]
+# Cargo 1.100 places dependencies in per-package build directories. Use the
+# current build's artifact stream for both externs and transitive search paths.
 artifacts = build(["cargo", "build", "-p", "umbra-storage-nfs-userspace",
                    "--features", "transport-raw", "--message-format=json"],
                   stdout=subprocess.PIPE, text=True)
-libs = set()
+required = {name: set() for name in
+            ["umbra_core", "umbra_storage", "umbra_storage_nfs_userspace", "serde_json"]}
+dependency_dirs = set()
+native_paths = set()
 for line in artifacts.stdout.splitlines():
     message = json.loads(line)
-    if message.get("reason") == "compiler-artifact" and message["target"]["name"] == "serde_json":
-        libs.update(path for path in message["filenames"] if path.endswith(".rlib"))
-if len(libs) != 1:
-    raise SystemExit("expected one current serde_json artifact: " + repr(libs))
-args += ["--extern", "serde_json=" + next(iter(libs))]
-# Native static libnfs is built by this crate's build script.
-for directory in (target / "build").glob("umbra-storage-nfs-userspace-*/out"):
-    for lib in directory.rglob("libnfs.a"):
-        args += ["-L", "native=" + str(lib.parent)]
+    if message.get("reason") == "compiler-artifact":
+        for filename in message["filenames"]:
+            path = Path(filename)
+            if path.suffix in {".rlib", ".rmeta", ".dylib", ".so"}:
+                dependency_dirs.add(str(path.parent))
+            name = message["target"]["name"]
+            if name in required and path.suffix == ".rlib":
+                required[name].add(filename)
+    elif message.get("reason") == "build-script-executed":
+        native_paths.update(message["linked_paths"])
+args = ["rustc", "--edition=2021", "experiments/fixtures/umbra-slate-r12-provider.rs",
+        "-o", str(out / "provider")]
+for crate, paths in required.items():
+    if len(paths) != 1:
+        raise SystemExit("expected one current " + crate + " artifact: " + repr(paths))
+    args += ["--extern", crate + "=" + next(iter(paths))]
+for directory in sorted(dependency_dirs):
+    args += ["-L", "dependency=" + directory]
+for path in sorted(native_paths):
+    args += ["-L", path]
 build(args)

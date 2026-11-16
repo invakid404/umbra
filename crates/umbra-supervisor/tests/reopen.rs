@@ -42,11 +42,25 @@ use umbra_supervisor::{base::WorkspaceInventory, ResumeSpec, RunPersistence, Sup
 /// cannot help: it covers only the test's own package, and these belong to
 /// others.
 fn provider_bin(name: &str) -> Option<PathBuf> {
-    let mut path = std::env::current_exe().expect("test binary has a path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
+    let executable = std::env::current_exe().expect("test binary has a path");
+    let parent = executable.parent().expect("test binary has a parent");
+    // Cargo 1.100 uses <profile>/build/<package>/<hash>/out for tests.
+    // Older Cargo versions put them directly under <profile>/deps.
+    let path = if parent.ends_with("deps") {
+        parent.parent().expect("deps has a profile directory")
+    } else if parent.ends_with("out")
+        && parent
+            .ancestors()
+            .nth(3)
+            .is_some_and(|p| p.ends_with("build"))
+    {
+        parent
+            .ancestors()
+            .nth(4)
+            .expect("build has a profile directory")
+    } else {
+        parent
+    };
     let path = path.join(name);
     if !path.is_file() {
         assert!(
