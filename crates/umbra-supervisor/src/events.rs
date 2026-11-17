@@ -1947,6 +1947,8 @@ mod tests {
     use umbra_overlay::{NamespaceResolver, NamespaceSession};
     use umbra_platform::{PlatformSession, SyscallAbi, TraceBackend};
 
+    include!("shutdown_journal_tests.rs");
+
     struct Fake;
     impl TraceBackend for Fake {
         fn launch(&mut self, _: LaunchSpec) -> Result<ProcessHandle> {
@@ -2049,6 +2051,43 @@ mod tests {
         s.live = 1;
         s.state.lifecycle = RunLifecycle::Running;
         s
+    }
+
+    #[test]
+    fn shutdown_failed_journal_finish_does_not_notify_observer_success() {
+        use crate::run::{RunObserver, RunOutcome};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Observer(Arc<AtomicUsize>);
+        impl RunObserver for Observer {
+            fn prepared(&mut self, _: RunId) -> Result<()> {
+                Ok(())
+            }
+            fn finished(&mut self, _: &RunOutcome) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn teardown_warning(&mut self, _: &UmbraError) {}
+        }
+        let finished = Arc::new(AtomicUsize::new(0));
+        let mut observer: Option<Box<dyn RunObserver>> = Some(Box::new(Observer(finished.clone())));
+        let mut supervisor = supervisor();
+        supervisor.platform.control = Box::new(shutdown_journal::ScriptedControl(
+            Some(shutdown_journal::confirmed()),
+            false,
+        ));
+        supervisor
+            .handle_event(TraceEvent::Exit {
+                task: task(1),
+                status: ExitStatus::Code(0),
+            })
+            .unwrap();
+        // Fake's default finish_run refuses completion. This small ordering
+        // regression complements the persisted-journal closure matrix.
+        let result = crate::run::finish_supervision(supervisor, Ok(()), &mut observer);
+        assert!(result.is_err());
+        assert_eq!(finished.load(Ordering::SeqCst), 0);
     }
 
     struct QuietControl(std::sync::Arc<std::sync::atomic::AtomicUsize>, bool);
@@ -3063,6 +3102,12 @@ mod tests {
             };
             assert!(s.filesystem_queries.finish(&late, 0).is_none());
             let reason = failure.to_string();
+            // This case has no native resources and explicitly confirms closure.
+            // Other uses of Fake retain its unsupported-shutdown behavior.
+            s.platform.control = Box::new(shutdown_journal::ScriptedControl(
+                Some(shutdown_journal::confirmed()),
+                false,
+            ));
             let returned = crate::run::finish_supervision(s, Err(failure), &mut None).unwrap_err();
             assert_eq!(returned.to_string(), reason);
             assert_eq!(*cleanup.lock().unwrap(), vec![(true, reason)]);

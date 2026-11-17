@@ -6,6 +6,7 @@
 #![deny(missing_docs)]
 
 pub mod capabilities;
+pub mod shutdown;
 pub mod storage;
 
 mod sandbox;

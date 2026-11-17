@@ -10,10 +10,27 @@ use umbra_core::{
     ErrorKind, SandboxRequirement, UmbraError, MAX_IO_BYTES,
 };
 
+#[path = "shutdown_transport.rs"]
+mod closing;
+
 /// Platform control and ABI methods in protocol version 3.
 /// Bounded polling is negotiated by capability; legacy messages remain supported.
 #[derive(Serialize, Deserialize)]
 pub enum Request {
+    /// Freeze the provider's complete resource inventory.
+    BeginShutdown {
+        /// Fresh client request identity.
+        nonce: umbra_core::shutdown::Nonce,
+    },
+    /// Retrieve progress or the final ledger after owner destruction.
+    PollShutdown {
+        /// Accepted request identity.
+        nonce: umbra_core::shutdown::Nonce,
+        /// Frozen inventory generation.
+        generation: u64,
+        /// Bounded poll duration, at most the existing event-poll ceiling.
+        max_wait_ms: u64,
+    },
     /// Capabilities.
     Capabilities,
     /// Launch.
@@ -109,6 +126,10 @@ pub enum Request {
 /// Owned method results, including buffers copied only after response validation.
 #[derive(Serialize, Deserialize)]
 pub enum Response {
+    /// Frozen inventory, not a completion acknowledgment.
+    ShutdownAccepted(umbra_core::shutdown::Accepted),
+    /// Terminal closure progress.
+    ShutdownPoll(umbra_core::shutdown::Poll),
     /// Capabilities.
     Capabilities(PlatformCapabilities),
     /// Process.
@@ -162,7 +183,11 @@ struct Abi {
 /// Negotiate both proxies on one provider session; no architecture-based backend selection.
 pub fn connect(descriptor: &ProviderDescriptor, timeout_ms: u64) -> Result<PlatformSession> {
     descriptor.validate("platform")?;
-    let mut client = Client::connect(descriptor, timeout_ms)?;
+    let mut descriptor = descriptor.clone();
+    descriptor
+        .capabilities
+        .insert(umbra_core::shutdown::CAPABILITY.into());
+    let mut client = Client::connect(&descriptor, timeout_ms)?;
     let capabilities = match client.call(&Request::Capabilities)? {
         Response::Capabilities(v) => v,
         _ => return Err(protocol_error("platform.capabilities response")),
@@ -293,6 +318,17 @@ impl TraceBackend for Control {
     }
 }
 impl TraceControl for Control {
+    fn begin_shutdown(&mut self, nonce: umbra_core::shutdown::Nonce) -> Result<shutdown::Start> {
+        if Rc::strong_count(&self.client) != 1 {
+            return Err(protocol_error(
+                "shutdown requires exclusive platform ownership",
+            ));
+        }
+        Ok(shutdown::Start::Remote(closing::close_client(
+            &mut self.client.borrow_mut(),
+            nonce,
+        )))
+    }
     fn capabilities(&self) -> PlatformCapabilities {
         self.capabilities.clone()
     }
@@ -614,6 +650,7 @@ pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) 
             }
             previous = id;
             let result = match wire::decode(&payload)? {
+                Request::BeginShutdown { nonce } => return Ok(Some((id, nonce))),
                 Request::Decode(regs) => {
                     let mut memory = Memory {
                         connection: &mut connection,
@@ -652,6 +689,16 @@ pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) 
                     if result.is_ok() {
                         roots.retain(|root| *root != process);
                     }
+                    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                    let result = if std::env::var_os("UMBRA_FIX_271_MISSING_FINAL").is_some() {
+                        Err(UmbraError::new(
+                            ErrorKind::Io,
+                            "shutdown.probe",
+                            "injected unconfirmed provider closure",
+                        ))
+                    } else {
+                        result
+                    };
                     result.map(|()| Response::Unit)
                 }
                 request => control_request(&mut *platform.control, request),
@@ -665,6 +712,9 @@ pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) 
             })?;
         }
     })();
+    if let Ok(Some((id, nonce))) = result {
+        return closing::serve_shutdown(connection, platform, id, nonce);
+    }
     for process in roots {
         if let Err(error) = platform
             .control
@@ -673,7 +723,7 @@ pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) 
             eprintln!("platform provider termination unconfirmed: {error}");
         }
     }
-    result
+    result.map(|_| ())
 }
 
 #[cfg(test)]

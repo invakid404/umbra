@@ -109,7 +109,8 @@ adds `TMPDIR`.
 
 Clap usage diagnostics exit 2. Every structured failure exits 1, including a
 supervised program that exited nonzero, which surfaces as `ProcessFailed` after a
-clean teardown. Exit 0 means the root process succeeded **and** the run's data,
+clean teardown. Exit 0 requires confirmed platform resource closure and collection
+of its provider process. It means the root process succeeded **and** the run's data,
 journal and writer lease were closed cleanly. The child's own exit code is not
 propagated: a 0 would describe the child while saying nothing about persistence.
 
@@ -117,7 +118,7 @@ Run status goes to stderr, so `umbra`'s own diagnostics never reach stdout. The
 supervised program's streams are not the caller's, though: it inherits fds 0-2
 from the platform provider process, which the provider transport starts with
 stdin and stdout on `/dev/null` and stderr inherited
-(`umbra-core/src/provider/transport.rs:321-323`). A supervised program's stderr
+(`umbra-core/src/provider/transport.rs`). A supervised program's stderr
 therefore reaches the caller and its stdout is discarded — `/bin/cat` under
 `umbra run` exits 0 and prints nothing. Plumbing the tracee's stdout through to
 the caller is unimplemented.
@@ -196,6 +197,15 @@ platform with `--features retirement-witness` and set
 `UMBRA_RETIREMENT_WITNESS=1` to also require all 200 child ownership witnesses to
 be released before the root is released for final shutdown. This test runs in self-hosted `native-qualification`, with
 `UMBRA_INTEGRATION_REQUIRED=1`; it does not require mounted storage.
+It records the executed provider path and SHA-256 and checks the
+`retirement-ownership` build marker immediately before launch.
+
+The `shutdown-witness` feature forwards test-only closure instrumentation to
+`umbra-platform`. With `UMBRA_FIX_271_EVIDENCE_FILE` set, it records validated
+ledger proof and decoded-Final-to-owned-exit timing, including validation.
+External fixtures that link the CLI
+library can enable `umbra-cli/shutdown-witness` through Cargo; the provider build
+needs its own `shutdown-witness` feature for acquisition and owner-thread records.
 
 `tests/isolation.rs` pins #193 on the production path. It compiles
 `experiments/fixtures/umbra-isolation-fixture.c` and the signal observer at test
@@ -305,6 +315,7 @@ The optional `probe-idle-renewal` feature forwards the supervisor's test-only
 successful-renewal marker; it changes no storage or deadline policy. The
 userspace integration job builds it for its renewal observation.
 
-Launch now requires runtime platform support for `bounded-event-poll-v1` even
+Launch requires runtime platform support for `bounded-event-poll-v1` and
+`platform.shutdown-ledger.v1` even
 when the registry omits that capability. Update the platform provider alongside
 the CLI; an old provider fails before Launch rather than waiting indefinitely.

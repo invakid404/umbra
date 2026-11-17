@@ -277,6 +277,32 @@ jobs:
           cargo build -p umbra-platform-macos --features retirement-witness --bin umbra-platform-macos
           cargo test -p umbra-platform-macos --lib retirement_ -- --nocapture
           cargo test -p umbra-cli --test child_retention -- --nocapture --test-threads=1
+      - name: Qualify shutdown inventory and owner destruction
+        env:
+          UMBRA_RETIREMENT_WITNESS: "1"
+          UMBRA_FIX_271_EVIDENCE_FILE: /tmp/umbra-shutdown-${{ github.run_id }}-${{ github.run_attempt }}.jsonl
+        run: |
+          cargo build --workspace --bins --features umbra-platform-macos/retirement-witness,umbra-platform-macos/shutdown-witness
+          cargo test -p umbra-platform-macos -p umbra-cli --features umbra-platform-macos/retirement-witness,umbra-platform-macos/shutdown-witness --test shutdown_ledger --test child_retention -- --nocapture --test-threads=1
+          python3 - <<'PY'
+          import json, os
+          from collections import Counter
+          rows = [json.loads(line) for line in open(os.environ["UMBRA_FIX_271_EVIDENCE_FILE"])]
+          transports = {row["nonce"]: row for row in rows if row["event"] == "transport-final"}
+          exits = [row for row in rows if row["event"] == "final-to-exit"]
+          assert exits, "no Final-to-exit readings"
+          for row in exits:
+              assert row["timing_origin"] == "final-decoded", row
+              owner = transports[row["nonce"]]
+              assert owner["instance"] == row["accepted"]["instance"]
+              actual = Counter((r["kind"], r["pid"]) for r in rows
+                               if r["event"] == "acquired" and r["writer_instance"] == owner["writer_instance"])
+              recorded = Counter((e["slot"]["kind"], e["identity"]["pid"]) for e in row["final"]["entries"]
+                                 if e["identity"] is not None)
+              assert actual == recorded, (actual - recorded, recorded - actual)
+              print("shutdown Final-to-exit:", row["nanos"], "ns", "acquisitions:", sum(actual.values()))
+              assert row["proof"] and row["exit_ok"] and int(row["nanos"]) <= 50_000_000, row
+          PY
       # #193: this runner's jobs run in launchd's session (SID 1), the one place
       # `umbra run` isolates itself. The isolation suite's SID-1 cases (P1-P4,
       # topology, cleanup) skip in any other session, so here a different
@@ -660,6 +686,39 @@ jobs:
             fix_243_distinct_parent_backing_overlap fix_243_provider_region_cap \
             fix_243_region_success_error_cycles fix_243_region_allocation_failure \
             fix_243_region_write_failure --exact --nocapture --test-threads=1
+
+      - name: Confirm routed shutdown before journal completion
+        env:
+          UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/shutdown-${{ github.run_attempt }}
+          UMBRA_FIX_271_EVIDENCE_FILE: /tmp/slate-evidence-${{ github.run_id }}/shutdown-${{ github.run_attempt }}.jsonl
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build --workspace --bins --features umbra-platform-macos/mutation-probe-spawn-lifecycle,umbra-platform-macos/shutdown-witness,umbra-cli/mutation-probe-spawn-lifecycle,umbra-cli/shutdown-witness
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
+            --test userspace_run -- fix_271_shutdown_journal_and_inheritance fix_274_live_sibling_inheritance \
+            fix_243_acquired_backend_drop fix_243_inserted_backend_drop fix_243_policy_backend_drop \
+            --exact --nocapture --test-threads=1
+          python3 - <<'PY'
+          import json, os
+          from collections import Counter
+          rows = [json.loads(line) for line in open(os.environ["UMBRA_FIX_271_EVIDENCE_FILE"])]
+          transports = {row["nonce"]: row for row in rows if row["event"] == "transport-final"}
+          exits = [row for row in rows if row["event"] == "final-to-exit"]
+          assert exits, "no positive closure reading"
+          assert any(row["proof"] for row in exits), "no confirmed closure control"
+          for row in exits:
+              assert row["timing_origin"] == "final-decoded", row
+              owner = transports[row["nonce"]]
+              assert owner["instance"] == row["accepted"]["instance"]
+              actual = Counter((r["kind"], r["pid"]) for r in rows
+                               if r["event"] == "acquired" and r["writer_instance"] == owner["writer_instance"])
+              recorded = Counter((e["slot"]["kind"], e["identity"]["pid"]) for e in row["final"]["entries"]
+                                 if e["identity"] is not None)
+              assert actual == recorded, (actual - recorded, recorded - actual)
+              print("shutdown Final-to-exit:", row["nanos"], "ns", "acquisitions:", sum(actual.values()))
+              # Fault cases may correctly return an unconfirmed complete inventory.
+              assert row["exit_ok"] and int(row["nanos"]) <= 50_000_000, row
+          PY
 
       - name: Restore binaries after packed spawn faults
         if: always()

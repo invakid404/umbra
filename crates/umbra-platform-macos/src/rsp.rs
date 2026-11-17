@@ -32,6 +32,7 @@ pub fn fields(s: &str) -> BTreeMap<&str, &str> {
     s.split(';').filter_map(|f| f.split_once(':')).collect()
 }
 pub struct Rsp {
+    ownership: Option<umbra_platform::shutdown::Reservation>,
     /// Debug aid: distinguishes concurrent connections in UMBRA_RSP_LOG output.
     pub id: u32,
     stream: TcpStream,
@@ -44,6 +45,53 @@ pub struct Rsp {
     /// Set once the owning session's ordered teardown has killed and reaped
     /// the tracer, so `Drop` does not do it a second time.
     torn_down: bool,
+}
+
+// Own the child immediately after spawn, before any fallible socket operation.
+// Once Rsp takes it, the existing ordered teardown owns cleanup instead.
+struct SetupChild {
+    child: Option<std::process::Child>,
+    ownership: Option<umbra_platform::shutdown::Reservation>,
+}
+impl std::ops::Deref for SetupChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.child.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for SetupChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child.as_mut().unwrap()
+    }
+}
+impl Drop for SetupChild {
+    fn drop(&mut self) {
+        let Some(child) = &mut self.child else { return };
+        let _ = child.kill();
+        let deadline = crate::clock::now() + TRACER_REAP_BOUND;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if let Some(slot) = &self.ownership {
+                        let _ = slot.confirm(umbra_core::shutdown::Proof::Collected {
+                            status: status.to_string(),
+                        });
+                    }
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+                Ok(None) => {}
+            }
+            if crate::clock::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(slot) = &self.ownership {
+            let _ = slot.unconfirmed("debugserver setup cleanup did not confirm collection");
+        }
+    }
 }
 /// How long a tracer is given to be reaped after its `SIGKILL`, by the ordered
 /// teardown and by the `Drop` fallback alike. Every wait in teardown is bounded.
@@ -97,7 +145,26 @@ impl Rsp {
     pub fn finish_setup(&mut self) {
         self.setup_deadline = None;
     }
+    #[cfg(test)]
     pub fn connect(options: &Options, deadline: Option<Instant>) -> Result<Self> {
+        Self::connect_inner(options, deadline, None)
+    }
+    pub(crate) fn connect_owned(
+        options: &Options,
+        deadline: Option<Instant>,
+        ownership: umbra_platform::shutdown::Reservation,
+    ) -> Result<Self> {
+        let result = Self::connect_inner(options, deadline, Some(ownership.clone()));
+        if result.is_err() {
+            ownership.creation_failed();
+        }
+        result
+    }
+    fn connect_inner(
+        options: &Options,
+        deadline: Option<Instant>,
+        ownership: Option<umbra_platform::shutdown::Reservation>,
+    ) -> Result<Self> {
         let executable = match &options.debugserver {
             Some(p) => p.clone(),
             None => discover_debugserver()
@@ -111,7 +178,7 @@ impl Rsp {
         let address = listener
             .local_addr()
             .map_err(|e| error("debugserver listen", e))?;
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .args(["--reverse-connect", &address.to_string()])
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
@@ -120,6 +187,20 @@ impl Rsp {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| error("debugserver spawn", e))?;
+        let mut child = SetupChild {
+            child: Some(child),
+            ownership: ownership.clone(),
+        };
+        #[cfg(feature = "shutdown-witness")]
+        umbra_platform::shutdown::witness(
+            serde_json::json!({"event": "acquired", "kind": "Tracer", "pid": child.id()}),
+        );
+        if let Some(slot) = &ownership {
+            slot.acquired(umbra_core::shutdown::Identity {
+                pid: Some(child.id() as i32),
+                birth: None,
+            })?;
+        }
         let limit = deadline.map_or_else(
             || crate::clock::now() + Duration::from_secs(10),
             |d| d.min(crate::clock::now() + Duration::from_secs(10)),
@@ -129,8 +210,6 @@ impl Rsp {
                 Ok((s, _)) => break s,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
                 Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
                     return Err(error("debugserver accept", e));
                 }
             }
@@ -140,8 +219,6 @@ impl Rsp {
                     .map_err(|e| error("debugserver wait", e))?
                     .is_some()
             {
-                let _ = child.kill();
-                let _ = child.wait();
                 return Err(error("debugserver connect", "timeout or server exited"));
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -156,9 +233,10 @@ impl Rsp {
             .map_err(|e| error("rsp", e))?;
         static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let mut r = Self {
+            ownership,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             stream,
-            child,
+            child: child.child.take().unwrap(),
             reaped: false,
             buffer: Vec::new(),
             no_ack: false,
@@ -414,8 +492,13 @@ impl Rsp {
         let limit = crate::clock::now() + bound;
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => {
+                Ok(Some(status)) => {
                     self.reaped = true;
+                    if let Some(slot) = self.ownership.take() {
+                        let _ = slot.confirm(umbra_core::shutdown::Proof::Collected {
+                            status: status.to_string(),
+                        });
+                    }
                     return true;
                 }
                 Ok(None) => {}
@@ -435,6 +518,9 @@ impl Rsp {
 }
 #[cfg(test)]
 impl Rsp {
+    pub(crate) fn set_test_ownership(&mut self, slot: umbra_platform::shutdown::Reservation) {
+        self.ownership = Some(slot);
+    }
     pub(crate) fn retirement_test() -> Self {
         Self::retirement_test_pair().0
     }
@@ -446,6 +532,7 @@ impl Rsp {
         child.wait().unwrap();
         (
             Self {
+                ownership: None,
                 id: 0,
                 stream,
                 child,
@@ -503,6 +590,13 @@ impl crate::retirement::Tracer for Rsp {
         }
         self.child.try_wait().inspect(|status| {
             self.reaped = status.is_some();
+            if let Some(status) = status {
+                if let Some(slot) = self.ownership.take() {
+                    let _ = slot.confirm(umbra_core::shutdown::Proof::Collected {
+                        status: status.to_string(),
+                    });
+                }
+            }
         })
     }
     fn kill(&mut self) -> std::io::Result<()> {
@@ -583,6 +677,7 @@ mod poll_bound_tests {
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         child.wait().unwrap();
         let mut rsp = Rsp {
+            ownership: None,
             id: 0,
             stream,
             child,
@@ -634,6 +729,7 @@ mod early_packet_test {
         let mut child = Command::new("/usr/bin/true").spawn().unwrap();
         child.wait().unwrap();
         let mut rsp = Rsp {
+            ownership: None,
             id: 0,
             stream,
             child,

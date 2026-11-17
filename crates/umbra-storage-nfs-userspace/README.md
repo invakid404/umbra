@@ -921,6 +921,15 @@ objects, read through the client; the probe seed and the host routing root must
 remain unchanged on a refusal. A reported success never substitutes for exact
 stored bytes, pipe EOF, journal completion and writer-authority reopen.
 
+`fix_271_shutdown_journal_and_inheritance` uses the spawn apparatus with
+`mutation-probe-spawn-lifecycle` enabled in both test and provider builds. Its
+native control completes; the routed provider deliberately withholds Final after
+cleanup. The case requires nonzero supervisor status, no durable `RunCompleted`,
+a durable `RecoveryRequired` marker and refused writer admission on reopen.
+Existing slate cases retain their successful-reopen assertions. The self-hosted
+routed job pairs this negative case with `fix_274_live_sibling_inheritance` and
+records Final-to-owned-exit timing through `shutdown-witness`.
+
 The slate thread/fork/spawn tests also require `UMBRA_SLATE_EVIDENCE`, an absolute
 writable evidence directory, and so does
 `a_parent_and_its_spawned_child_writing_one_descriptor_at_once_lose_no_record`,

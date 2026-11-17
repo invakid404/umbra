@@ -88,8 +88,8 @@ requirement to import every allowed crate.
 
 Contracts are synchronous and object-safe: constructors stay outside the runtime
 trait surface, which has no generic methods, unconstrained associated types, or
-opaque `impl Trait` returns. Platform objects may be thread-affine; construct them
-on their dedicated control thread. Apply `Send` only where ownership crosses
+opaque `impl Trait` returns. Platform objects may be thread-affine; construct and
+destroy them on their dedicated control thread. Apply `Send` only where ownership crosses
 threads; storage, journal, and agent contracts require it. Use bounded owned worker
 messages with explicit ordering rather than making the debugger state machine async.
 
@@ -104,7 +104,7 @@ READMEs for implementation gaps.
 
 | Extension point | Contract and responsibilities | Local walkthrough |
 | --- | --- | --- |
-| Platform | `TraceBackend` launches stopped processes, reports events, reads/writes memory and registers, and resumes execution. `TraceControl` adds capabilities, whole-tree quiescence and safe termination. | [Adding a new platform backend](crates/umbra-platform/README.md#adding-a-new-platform-backend) |
+| Platform | `TraceBackend` launches stopped processes, reports events, reads/writes memory and registers, and resumes execution. `TraceControl` adds capabilities, whole-tree quiescence, preliminary termination and a complete shutdown inventory. | [Adding a new platform backend](crates/umbra-platform/README.md#adding-a-new-platform-backend) |
 | Syscall ABI and memory | `SyscallAbi` decodes entries, applies rewrites and emulates results. `TraceMemory` binds reads to the stopped task. A platform supplies a paired control/ABI session with negotiated architecture support. | [Platform contracts](crates/umbra-platform/README.md) |
 | Storage | `Storage` owns one run binding, typed shadow operations, atomic writer acquisition/renewal/release, durability receipts and close errors. Namespace policy stays in overlay. | [Adding a new storage backend](crates/umbra-storage/README.md#adding-a-new-storage-backend) |
 | Namespace | `NamespaceResolver::resolve` classifies an operation without unjournaled mutation. The required `NamespaceSession` extension prepares, observes results, commits, aborts/reconciles and checkpoints. | [Namespace engine and binding](crates/umbra-overlay/README.md) |
@@ -216,6 +216,13 @@ userspace-routed runs that directory lives on the host under `--state-dir`, sinc
 the storage provider exposes no physical path; resume requires the retained log.
 This is single-host recovery, not cross-machine handoff. A torn final
 frame may be recovered under documented rules; interior corruption is an error.
+
+Run completion requires a complete platform resource ledger after same-owner
+destruction, followed by collection of the owned provider process. A separate
+transport thread serves shutdown polls using snapshots; it never owns the native
+backend. Only confirmed closure permits `finish_run` and its success observer.
+Missing closure proof enters failure cleanup and the supervisor appends and
+flushes the existing `RecoveryRequired` lifecycle record when the journal allows it.
 
 For checkpoint/handoff, reject new mutations and children, quiesce the whole tree,
 request orderly agent exit and handle remaining descendants, reconcile transactions,

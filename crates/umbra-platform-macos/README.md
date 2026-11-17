@@ -22,6 +22,32 @@ The RSP client (`src/rsp.rs`) is a
 small, bounded reverse-connect implementation with framed `$…#CC` packets,
 RLE decode, and a per-request deadline.
 
+## Confirmed shutdown
+
+The provider advertises `platform.shutdown-ledger.v1`. Its ledger reserves slots
+before root/child creation, tracer launch and task-right acquisition, and keeps
+retired history through quiesce, resume and preliminary termination. Exec records
+replacement-right relationships without discarding the old right's release
+obligation. Captured process birth identities remain attached to their slots.
+Exact owned-child collection is distinct from descendant exit accounting:
+`ECHILD`, EOF and sending a signal are never collection receipts.
+
+Shutdown freezes admissions and destroys the backend on its original thread.
+A separate transport thread serves bounded polls from snapshots and emits Final
+only after all owner destruction. Existing session teardown, tracer/root reap
+and retirement windows determine the owner envelope; polling never restarts
+them. Synchronous kernel calls and cooperative watchdog cancellation/join assume
+kernel-call completion. An envelope overrun fails closure rather than claiming
+successful cleanup. No session-age, inactivity or cancellation policy is added.
+
+The shared monitor stores a typed terminal cause. Genuine explicit deadline
+expiry reports operation `watchdog`; owner loss, monitor failure and panic
+report `owner-observation`, regardless of which monitor reads the shared latch.
+The `shutdown-witness` test feature records acquisition identities, owner/thread
+ordering and Final-to-owned-exit duration to `UMBRA_FIX_271_EVIDENCE_FILE`.
+It adds no default production logging. Provider-loss limitations in #198 and
+#205 remain unqualified.
+
 ## Packed spawn descriptors (experimental)
 
 The bounded packed-descriptor path admits kernel-only CLOSE, DUP2 and INHERIT
@@ -47,7 +73,9 @@ changing the allowlist. Do not widen it from a version string alone.
 Parent and child remain stopped through supervisor Ready, caller PID delivery,
 release of the dedicated remote region and final register commit. New fallible
 completion work follows child Session insertion. The inherited interval between
-spawn success and Task acquisition remains unowned in non-isolated runs; see
+spawn success and Task acquisition remains outside held-Mach-task cleanup in
+non-isolated runs. A ledger reservation retains the obligation but supplies no
+Mach handle to the owner monitor; see
 [#248](https://github.com/invakid404/umbra/issues/248). Provider loss also removes
 the in-process watchdog. Terminal/library runs have no outer guardian sweep;
 the local no-spawn, null-spawn and packed-spawn comparison left root/debugger
@@ -582,10 +610,17 @@ phase selector defaults as listed when a probe socket is supplied:
 | `UMBRA_FIX_243_REGION_FAULT` | `allocate` uses a null task port; `write` attempts the backing write at address zero while retaining allocation ownership. |
 | `UMBRA_FIX_243_OVERLAP_PARENTS` | Holds 2–17 distinct parents before kernel execution and verifies their backing before release; the production cap refuses the seventeenth token. |
 | `UMBRA_FIX_243_OWNER_TRACE` | Reports retained Session identities at teardown entry. |
+| `UMBRA_FIX_271_MISSING_FINAL` | Any set value reports preliminary termination failure and withholds Final after owner destruction. |
 
 The socket acknowledgment continues (`C`), injects the selected failure (`E`),
 or exits the provider without Drop (`P`). These controls belong to the fixture
 harness and change scheduling or failure behavior only in feature builds.
+The backend-drop probe retains the provider ledger across its replacement
+backend, so disposal cannot erase earlier acquisition obligations.
+
+With `shutdown-witness`, `UMBRA_FIX_271_EVIDENCE_FILE` selects an append-only
+JSONL file for acquisition, thread-order and closure timing observations. Unset
+means no witness output; builds without the feature do not read the variable.
 
 **Launch and enforcement.** `TraceBackend::launch` and `launch_experimental`
 share `native.rs::MacosTraceBackend::launch_traced`: both launch suspended,
@@ -639,8 +674,10 @@ acknowledgements, returning the root and live task IDs. Stop replies remain
 queued for `NextEvent`; consume them before resuming that thread. If a syscall
 return is in flight, quiesce leaves the tree stopped and reports an error:
 drain events to a transaction boundary before retrying. Interrupted transport
-failures terminate held tasks. Finish with `Request::Terminate` using
-`TerminationPolicy::Immediate`.
+failures terminate held tasks. Preliminary termination uses `Request::Terminate`
+with `TerminationPolicy::Immediate`. Supervised closure then uses
+`BeginShutdown` and bounded `PollShutdown` replies, validates Final, and collects
+the provider process before recording completion.
 
 Termination tears each session down in order, children first (#186):
 - send RSP `k` to its debugserver;
@@ -667,8 +704,8 @@ and runs one post-kill barrier inside the 250 ms tracer reap:
 - **Confirmed:** a second line, `tracee exit confirmed after tracer kill`,
   follows the warning. `Terminate` succeeds if no other session remains
   unconfirmed and no retirement failure is retained.
-- **Still unconfirmed:** `Terminate` returns the warning as its error, and the
-  run is left recovery-required.
+- **Still unconfirmed:** `Terminate` returns the warning as its error. If final
+  shutdown cannot confirm every obligation, the run is left recovery-required.
 
 Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome, or
 `UMBRA_RSP_LOG` to log sent packets and received bytes to stderr. Both are off
@@ -742,6 +779,24 @@ was closed (below). Fixture cases:
 | `symlink-cycle`     | **CAPTURED** — the logical symlinks above |
 | `mt-write`          | **CAPTURED** — the closed multithreaded window below |
 | `mt-spawn`          | **CAPTURED** — the closed multithreaded window below |
+
+### Shutdown ledger and attribution (#271, #273)
+
+`tests/shutdown_ledger.rs` requires macOS arm64, debugger permission,
+`UMBRA_INTEGRATION_REQUIRED=1`, and a writable `UMBRA_FIX_271_EVIDENCE_FILE`.
+Run `cargo test -p umbra-platform-macos --features shutdown-witness --test
+shutdown_ledger -- --nocapture`; the same invocation builds the measured provider.
+The case checks its executable hash and witness marker before launch. A native
+owned-child wait control precedes the sandboxed provider run. Independent
+acquisition records must match the complete ledger, retain birth/replacement
+identities, and show same-owner destruction before transport Final.
+Final-to-owned-exit must be at most 50 ms.
+
+Deterministic unit tests cover shared terminal-cause attribution, late reserved
+results, old tracer collection and Drop during a channel-held latch. Platform
+protocol tests separately cover exhausted owner progress and unchanged poll
+deadlines. These tests establish ordering and failure verdicts; they do not
+bound kernel-call latency.
 
 ### Completed-child retirement (#274)
 
@@ -834,8 +889,9 @@ from. What was measured is the `pending` half; `entry` was not separately
 reverted, so no claim is made about it either way.
 
 **A native syscall resumed through a return gate holds its siblings stopped
-until it returns.** If that call blocks, sibling progress cannot release it;
-per-request and opt-in session deadlines bound the failure. Emulated routed operations
+until it returns.** If that call blocks, sibling progress cannot release it.
+Owner loss or an explicit lifetime expiry can terminate the held task; there is
+no default lifetime bound. Emulated routed operations
 skip the native syscall. Public `fcntl` passthrough adds no return gate: its
 shim tail-branches to libc and neither fcntl kernel stub is breakpointed.
 `tests/fcntl_passthrough.rs` guards that structural property. The userspace
@@ -1117,7 +1173,8 @@ sandbox qualification tests exercise a symlinked cache root.
 
 Failed attach and sandbox-handoff paths set `launch_tree_terminated` on the returned
 error only when `waitpid` confirms reaping every created tracee. Missing evidence
-remains false so the supervisor retains writer authority after uncertain launch failure.
+remains false. The supervisor decides writer release from the complete shutdown
+ledger and provider collection, rather than this flag alone.
 
 ## Routed filesystem metadata
 

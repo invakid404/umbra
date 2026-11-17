@@ -30,6 +30,11 @@ stopped behind an installed sandbox, drives the syscall loop, and tears the run
 down in order. Nothing in that path prompts: a missing capability, provider,
 mount or permission is an actionable error and a nonzero exit.
 
+Successful completion also requires a complete platform shutdown ledger and
+collection of the provider process before the journal records completion.
+Missing closure proof fails the run and records recovery-required when the
+journal remains writable.
+
 ```sh
 umbra run --registry providers.json --workspace . --experimental   -- /absolute/path/to/program args...
 ```

@@ -3,7 +3,7 @@
 Pure synchronous tracing contracts, depending only on `umbra-core`. This crate has
 no native bindings, backend selection, implementation dependencies, or mandatory
 `Send` bound. Shared DTOs are defined in core and re-exported here. The workspace
-uses Rust 1.99.1 and edition 2021.
+uses Rust 1.100.0 and edition 2021.
 
 The public contracts preserve the spec's signatures:
 
@@ -78,8 +78,23 @@ notifications. Backends own capture, instruction repair, sandboxing, and signals
 factory must negotiate the same session and architecture for both. Constructors
 stay outside the traits. Use `T: TraceControl + ?Sized` for consumers that need
 both tracing and lifecycle methods, avoiding trait-object upcasting. Construct
-thread-affine objects on the dedicated debug-control thread. Add `Send` only at
-injection points that cross worker boundaries.
+thread-affine objects on the dedicated debug-control thread and destroy them on
+that same thread.
+
+`PlatformSession::shutdown` consumes the session. A supervised remote provider
+must advertise `platform.shutdown-ledger.v1` before launch. `BeginShutdown`
+freezes a complete inventory; each subsequent `PollShutdown` receives one
+correlated Pending or Final response. Accepted and EOF are never proof. The
+client validates identities, generations, slot relationships and every final
+disposition, then independently collects its owned provider process. An attached
+connection without that process ownership cannot close a supervised run.
+
+Only the private connection, channels and immutable snapshots cross to the
+shutdown transport thread. The original owner destroys the ABI, backend,
+monitors and native resources before publishing Final. Polling carries the
+existing cleanup schedule without renewing it; exhausted owner progress fails
+closure. Backends implement `TraceControl::begin_shutdown` and reserve ledger
+slots before resource creation. The default refuses unsupported closure.
 
 ## Adding a new platform backend
 

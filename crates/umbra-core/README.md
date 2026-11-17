@@ -19,6 +19,8 @@ running without a policy is the explicitly named `UnsandboxedExperiment`.
 `UmbraError::launch_tree_terminated` carries explicit backend evidence that a
 failed launch's tracees were reaped; it defaults to false, including when absent
 on the wire. Error categories alone provide no termination evidence.
+Supervised completion requires the separate complete shutdown ledger and owned
+provider-exit confirmation; this legacy flag cannot replace either.
 
 `ErrorKind::ProcessFailed` reports a supervised child that exited nonzero or was
 signalled, which is a run result rather than an Umbra malfunction.
@@ -112,6 +114,23 @@ outcome surfaces instead of a deadline miss. A missed deadline invalidates the
 connection, and dropping the client kills the provider and reaps it with a bounded
 wait — a child still stuck in the kernel is handed to a detached reaper thread rather
 than blocking the caller, so teardown proceeds and at worst a zombie outlives the drop.
+
+`shutdown` defines `platform.shutdown-ledger.v1`: instance-scoped slots reserved
+before acquisition, a frozen accepted inventory, and final resource dispositions.
+Slots retain parent, generation, captured identity and exec-replacement
+relationships. Never-created slots need explicit disposition; acquired tracees,
+owned tracers and Mach rights need their respective accounting, collection and
+release evidence. Validation rejects pending, omitted, duplicate, unknown or
+mismatched obligations. Parents must be earlier tracee slots; every tracer and
+task right needs one. Native child reservations retain the creator's generation,
+while acquired rights and tracers use their tracee's attachment generation.
+These records are ephemeral protocol data, with no
+journal format change.
+
+After a validated platform Final, `Client::confirm_provider_exit` waits for its
+owned child without killing it, using the existing 100 ms reap grace. Failure
+preserves the ledger proof but prevents successful closure. Emergency client Drop
+retains its existing kill/reap behavior and never establishes ledger proof.
 
 Check with `cargo check -p umbra-core`.
 

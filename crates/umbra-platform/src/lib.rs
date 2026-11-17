@@ -27,6 +27,7 @@
 #![deny(missing_docs)]
 
 pub mod dirents;
+pub mod shutdown;
 
 pub use umbra_core::{
     BytePath, EmulatedResult, FsOp, IoBuffer, LaunchSpec, PlatformCapabilities, PreparedRewrite,
@@ -228,6 +229,16 @@ pub trait SyscallAbi {
 
 /// Process-tree lifecycle operations required for checkpointing and safe shutdown.
 pub trait TraceControl: TraceBackend {
+    /// Freeze acquisitions and begin terminal provider closure. Default refusal
+    /// prevents legacy controls from silently manufacturing an empty proof.
+    fn begin_shutdown(&mut self, _nonce: umbra_core::shutdown::Nonce) -> Result<shutdown::Start> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "platform.shutdown",
+            "backend does not implement shutdown ledger",
+        ))
+    }
+
     /// Report only capabilities qualified on the actual OS/architecture setup.
     fn capabilities(&self) -> PlatformCapabilities;
 

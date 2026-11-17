@@ -1350,6 +1350,12 @@ fn shadow_path(run: &Run) -> Vec<Vec<u8>> {
 /// before any payload is looked at. Every failure panics rather than answering
 /// `false`: a log this cannot read is not a log without a completion record.
 fn journal_records_completion(run: &Run) -> bool {
+    journal_has_lifecycle(run, |lifecycle| {
+        matches!(lifecycle, JournalLifecycle::RunCompleted { .. })
+    })
+}
+
+fn journal_has_lifecycle(run: &Run, predicate: impl Fn(&JournalLifecycle) -> bool) -> bool {
     let control = run.state_root().join("journal");
     let directory = PhysicalPath(BytePath::new(control.as_os_str().as_bytes().to_vec()).unwrap());
     let mut journal = FileJournal::new();
@@ -1373,7 +1379,7 @@ fn journal_records_completion(run: &Run) -> bool {
         .any(|record| {
             matches!(
                 record.payload,
-                JournalPayload::Lifecycle(JournalLifecycle::RunCompleted { .. })
+                JournalPayload::Lifecycle(ref lifecycle) if predicate(lifecycle)
             )
         });
     completed
@@ -9545,14 +9551,14 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for typed retirement and explicit failed-owner cleanup
-    // (#274): single_thread and both guard positions remain unchanged. Park
-    // retains its owning wait-index container. The refusal oracle is unchanged.
+    // Re-characterized for retained shutdown history (#271): single_thread,
+    // Fork, and WaitPlan::Park are byte-identical to the characterized base.
+    // The refusal oracle and runtime-witness limitation remain unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("7b30c6e0ad3c9e513f40d3e2a06547feccb437945d198108944c3268b48405d0"),
+        Some("05838e68faffc6e054c55477b8364bd161bddcdf6b291f1da6c4ccd8bcb9b370"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -10035,6 +10041,10 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
 /// What every routed leaf owes after its own oracles: no host effect, no
 /// mount, a reopen that takes writer authority, no SIGHUP anywhere observed.
 fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
+    slate_spawn_finish_reopen(spawn, routed, false);
+}
+
+fn slate_spawn_finish_reopen(spawn: &SlateSpawn, routed: &SlateRouted, unconfirmed: bool) {
     let reopened = slate_bounded(
         Command::new(binaries().join("umbra"))
             .args(["resume", "--registry"])
@@ -10055,7 +10065,25 @@ fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
         ),
     )
     .unwrap();
-    assert!(reopened.status.success(), "writer authority reopen failed");
+    if unconfirmed {
+        assert!(
+            !reopened.status.success(),
+            "unconfirmed tree regained writer authority"
+        );
+        assert!(
+            String::from_utf8_lossy(&reopened.stderr).contains("LeaseLost during open_run"),
+            "unexpected reopen refusal: {}",
+            String::from_utf8_lossy(&reopened.stderr)
+        );
+        assert!(
+            journal_has_lifecycle(&routed.run, |lifecycle| {
+                matches!(lifecycle, JournalLifecycle::RecoveryRequired)
+            }),
+            "missing durable recovery-required marker"
+        );
+    } else {
+        assert!(reopened.status.success(), "writer authority reopen failed");
+    }
     assert_workspace_pristine(&routed.run);
     assert_host_write_root_empty(&routed.run);
     assert_eq!(
@@ -16287,6 +16315,44 @@ fn fix_227_sibling_progress_without_kernel_wait_proof() {
 #[test]
 fn fix_243_policy_deadline() {
     fix_243_fault_reading("fix-243-policy-deadline", "c11-02-attributes", false, b'E');
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_271_shutdown_journal_and_inheritance() {
+    let Some(mut spawn) = slate_spawn("fix-271-shutdown-journal-and-inheritance") else {
+        return;
+    };
+    let mode = "c11-02-attributes";
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    spawn
+        .provider_environment
+        .push(("UMBRA_FIX_271_MISSING_FINAL".into(), "1".into()));
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
+    let completed = journal_records_completion(&routed.run);
+    // Finish the existing ownership census before asserting the new verdict,
+    // preserving evidence even on the expected failing-first reading.
+    slate_spawn_finish_reopen(&spawn, &routed, true);
+    slate_finish_cleanup();
+    assert!(
+        routed
+            .run
+            .stderr
+            .contains("injected unconfirmed provider closure"),
+        "the closure fault must actually run: {}",
+        routed.run.stderr
+    );
+    assert!(
+        !completed,
+        "unconfirmed shutdown persisted successful completion"
+    );
+    assert_ne!(routed.run.status, Some(0), "unconfirmed shutdown succeeded");
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]

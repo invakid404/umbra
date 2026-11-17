@@ -132,7 +132,7 @@ pub trait RunObserver {
     /// Neither `finished` nor `teardown_warning` is called after `prepared`
     /// fails. Panics in those other callbacks are not contained.
     fn prepared(&mut self, run_id: RunId) -> Result<()>;
-    /// Called once when the supervised tree has finished, before teardown result.
+    /// Called once after confirmed platform closure and successful journal finish.
     fn finished(&mut self, outcome: &RunOutcome);
     /// Provider bookkeeping failed after all processes reported exit.
     fn teardown_warning(&mut self, error: &UmbraError);
@@ -895,7 +895,7 @@ pub fn resume(_spec: ResumeSpec) -> Result<ResumeOutcome> {
 }
 
 #[cfg(all(test, unix))]
-pub(crate) use unix::finish_supervision;
+pub(crate) use unix::{finish_supervision, supervise_prepared};
 
 #[cfg(unix)]
 mod unix {
@@ -1201,6 +1201,8 @@ mod unix {
 
         // From here the namespace owns storage and journal; failures go through
         // its own fail path so one owner decides what is released.
+        let (journal, terminal_journal) =
+            crate::shutdown_journal::TerminalJournal::wrap(journal, lease.epoch);
         let mut namespace = standard_namespace(storage, journal);
         // A routed run's tracee-visible root is not on this host at all, so the
         // profile's one write allowance names an empty per-run directory instead.
@@ -1338,20 +1340,21 @@ mod unix {
         }
 
         let mut supervisor = Supervisor::with_namespace(run_id, platform, namespace, None);
-        if let Err(e) = supervisor.launch_prepared(launch_spec, budget) {
-            // The backend's explicit cleanup evidence survives launch_prepared
-            // and IPC. Error category alone says nothing about a spawned tree.
-            let terminated = e.launch_tree_terminated;
-            return Err(fail(
-                supervisor.into_parts().namespace,
-                run_id,
-                e,
-                terminated,
-            ));
-        }
+        supervisor.terminal_journal = Some(terminal_journal);
+        supervise_prepared(supervisor, launch_spec, budget, &mut observer)
+    }
 
+    pub(crate) fn supervise_prepared(
+        mut supervisor: Supervisor,
+        launch_spec: LaunchSpec,
+        budget: RunBudget,
+        observer: &mut Option<Box<dyn RunObserver>>,
+    ) -> Result<()> {
+        if let Err(primary) = supervisor.launch_prepared(launch_spec, budget) {
+            return finish_supervision(supervisor, Err(primary), observer);
+        }
         let loop_result = supervisor.run();
-        finish_supervision(supervisor, loop_result, &mut observer)
+        finish_supervision(supervisor, loop_result, observer)
     }
 
     pub(crate) fn finish_supervision(
@@ -1365,26 +1368,37 @@ mod unix {
             root_status: supervisor.root_status(),
             processes_exited: supervisor.processes_exited(),
         };
-        // On the success path every process reported its exit, so the tree is gone
-        // by observation and this call only reaps provider bookkeeping. On the
-        // failure path its result is the only termination evidence we have.
-        let reaped = supervisor.terminate_tree(TerminationPolicy::Immediate);
-        let mut namespace = supervisor.into_parts().namespace;
-
-        if let Err(primary) = loop_result {
-            let terminated = reaped.is_ok();
-            return Err(fail(namespace, run_id, primary, terminated));
-        }
-
-        if let Err(e) = reaped {
-            if let Some(observer) = observer.as_mut() {
-                observer.teardown_warning(&e);
+        let preliminary = supervisor.terminate_tree(TerminationPolicy::Immediate);
+        let crate::SupervisorParts {
+            platform,
+            mut namespace,
+            terminal_journal,
+            agent,
+            ..
+        } = supervisor.into_parts();
+        let closure = platform.shutdown();
+        let closure_failed = closure.error.is_some();
+        drop(agent);
+        let mut failure = match (loop_result, closure.error) {
+            (Err(primary), secondary) => Some(with_cleanup(primary, secondary.map_or(Ok(()), Err))),
+            (Ok(()), secondary) => secondary,
+        };
+        if let Err(diagnostic) = preliminary {
+            if let Some(primary) = failure.take() {
+                failure = Some(with_cleanup(primary, Err(diagnostic)));
+            } else if let Some(observer) = observer.as_mut() {
+                observer.teardown_warning(&diagnostic);
             } else {
-                tracing::warn!(error = %e, "provider teardown bookkeeping failed");
+                tracing::warn!(error = %diagnostic, "preliminary teardown failed; final closure confirmed");
             }
         }
-        if let Some(observer) = observer.as_mut() {
-            observer.finished(&outcome);
+        if let Some(mut primary) = failure {
+            if closure_failed {
+                if let Some(journal) = terminal_journal {
+                    primary = with_cleanup(primary, journal.recovery_required());
+                }
+            }
+            return Err(fail(namespace, run_id, primary, closure.tree_terminated));
         }
         if let Err(e) = namespace.finish_run(&FinishRunRequest {
             run_id,
@@ -1392,6 +1406,9 @@ mod unix {
             processes_exited: outcome.processes_exited,
         }) {
             return Err(fail(namespace, run_id, e, true));
+        }
+        if let Some(observer) = observer.as_mut() {
+            observer.finished(&outcome);
         }
 
         match outcome.root_status {

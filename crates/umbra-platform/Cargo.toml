@@ -6,11 +6,19 @@ license.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Qualification-only evidence; absent from ordinary provider builds.
+shutdown-witness = ["dep:serde_json"]
+# Test-only fault at the provider closure boundary.
+mutation-probe-spawn-lifecycle = []
+
 [dependencies]
 umbra-core = { path = "../umbra-core" }
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
+umbra-core = { path = "../umbra-core", features = ["test-owned-exit"] }
 # Test-only: `dirents`'s fixtures build `ObjectId`s, which are UUIDs. The crate
 # itself needs no generator.
 uuid.workspace = true

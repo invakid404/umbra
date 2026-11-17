@@ -19,6 +19,7 @@ fn slot(generation: u64, done: bool) -> (Session, std::net::TcpStream) {
     let (rsp, peer) = Rsp::retirement_test_pair();
     (
         Session {
+            ownership: None,
             id: TaskId(TaskIdentity {
                 native_id: pid,
                 generation,
@@ -115,6 +116,7 @@ fn retirement_release_owns_all_resources() {
     retiring.pending.insert(
         thread,
         Pending {
+            creation: None,
             thread,
             entry: 1,
             entry_breakpoint: breakpoint,
@@ -164,6 +166,36 @@ fn retirement_release_owns_all_resources() {
 }
 #[test]
 fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
+    fn register_owned(backend: &mut MacosTraceBackend, mut session: Session) {
+        let parent = session.parent.map(|index| {
+            backend.sessions[index]
+                .ownership
+                .as_ref()
+                .unwrap()
+                .tracee
+                .id()
+        });
+        let tracee = backend
+            .ledger
+            .reserve(
+                umbra_core::shutdown::ResourceKind::Tracee,
+                parent,
+                session.id.0.generation,
+                0,
+            )
+            .unwrap();
+        tracee
+            .acquired(umbra_core::shutdown::Identity {
+                pid: Some(session.id.0.native_id as i32),
+                birth: None,
+            })
+            .unwrap();
+        session.ownership = Some(TraceOwnership {
+            ledger: backend.ledger.clone(),
+            tracee,
+        });
+        register(backend, session);
+    }
     let mut owned = SelfTaskBackend(MacosTraceBackend::default());
     let backend = &mut owned.0;
     backend.watchdog = Some(Watchdog {
@@ -179,9 +211,9 @@ fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
     let root = ProcessHandle(live.id);
     let thread = live.thread;
     let live_task = live.task.clone();
-    register(backend, live);
+    register_owned(backend, live);
     let (old, _old_peer) = slot(101, true);
-    register(backend, old);
+    register_owned(backend, old);
     backend.service_retirements();
     assert!(backend.sessions[1].live.is_none());
     let facts = |s: &Session| {
@@ -195,7 +227,7 @@ fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
     };
     let before = facts(&backend.sessions[1]);
     let (pending_quiesce, _q_peer) = slot(102, true);
-    register(backend, pending_quiesce);
+    register_owned(backend, pending_quiesce);
     backend.quiesce(root).unwrap();
     assert!(
         backend.sessions[2].live.is_none(),
@@ -203,7 +235,7 @@ fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
     );
     assert_eq!(facts(&backend.sessions[1]), before);
     let (pending_resume, _r_peer) = slot(103, true);
-    register(backend, pending_resume);
+    register_owned(backend, pending_resume);
     backend
         .resume(ResumeCommand {
             thread,
@@ -226,6 +258,34 @@ fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
     assert!(Arc::ptr_eq(&registry.tasks[0], &live_task));
     drop(registry);
     backend.sessions[0].done = true;
+    // These controlled sessions own rights to this test process. Clear only
+    // their fake kill registry before exercising the production drain path.
+    backend
+        .watchdog
+        .as_ref()
+        .unwrap()
+        .tasks
+        .lock()
+        .unwrap()
+        .tasks
+        .clear();
+    backend
+        .terminate(root, TerminationPolicy::Immediate)
+        .unwrap();
+    let umbra_platform::shutdown::Start::Local { accepted, ledger } = backend
+        .begin_shutdown(umbra_core::shutdown::Nonce::new_v4())
+        .unwrap()
+    else {
+        panic!("native owner")
+    };
+    assert_eq!(
+        accepted.slots.len(),
+        4,
+        "retired child history survives quiesce/resume/terminate"
+    );
+    assert!(accepted
+        .confirms(&ledger.final_snapshot().unwrap())
+        .unwrap());
 }
 
 #[test]

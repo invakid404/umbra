@@ -9,6 +9,8 @@ publish = false
 [features]
 # Qualification-only allocation witnesses; no fault injection.
 retirement-witness = []
+# Independent acquisition and Final-to-exit qualification records.
+shutdown-witness = ["umbra-platform/shutdown-witness"]
 # Mutation probes for the two syscall decode arms this crate owns, on the same
 # terms as `umbra-overlay`'s: each BREAKS one arm on purpose so a test can prove
 # an end-to-end case depends on it, both are compile-time only so no product
@@ -30,7 +32,7 @@ mutation-probe-mkdir = []
 # other probe reproduces.
 mutation-probe-setattrlistat = []
 # Test-only lifecycle rendezvous. Normal providers contain no fault controls.
-mutation-probe-spawn-lifecycle = []
+mutation-probe-spawn-lifecycle = ["umbra-platform/mutation-probe-spawn-lifecycle"]
 
 [dependencies]
 umbra-core = { path = "../umbra-core" }
