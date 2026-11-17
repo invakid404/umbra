@@ -3,7 +3,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-fn shared_reason(reason: &'static str) -> UmbraError {
+fn shared_reason(reason: TerminalCause) -> UmbraError {
     let tasks = Arc::new(Mutex::new(WatchedTasks::default()));
     tasks.lock().unwrap().latch(reason);
     let mut backend = MacosTraceBackend::default();
@@ -22,7 +22,7 @@ fn shared_reason(reason: &'static str) -> UmbraError {
 
 #[test]
 fn timeout_attribution() {
-    let error = shared_reason("session timed out");
+    let error = shared_reason(TerminalCause::Deadline);
     assert_eq!(error.kind, ErrorKind::Io);
     assert_eq!(error.operation, "watchdog");
 }
@@ -30,9 +30,9 @@ fn timeout_attribution() {
 #[test]
 fn owner_causes_keep_their_attribution() {
     for reason in [
-        "supervisor exited",
-        "owner monitor failed",
-        "owner monitor panicked",
+        TerminalCause::OwnerGone,
+        TerminalCause::MonitorFailed,
+        TerminalCause::MonitorPanicked,
     ] {
         let error = shared_reason(reason);
         assert_eq!(error.kind, ErrorKind::Io);
@@ -69,7 +69,7 @@ fn drop_during_latch_joins_after_release() {
     let worker = std::thread::spawn(move || {
         let mut registry = WatchedTasks::default();
         registry.add(task);
-        registry.latch("session timed out");
+        registry.latch(TerminalCause::Deadline);
     });
     entered_rx.recv().unwrap();
     let returned_control = returned.clone();

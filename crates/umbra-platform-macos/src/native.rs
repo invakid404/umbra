@@ -150,9 +150,32 @@ impl KillOwned for Arc<Task> {
         self.kill();
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalCause {
+    Deadline,
+    OwnerGone,
+    MonitorFailed,
+    MonitorPanicked,
+}
+impl TerminalCause {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Deadline => "session timed out",
+            Self::OwnerGone => "supervisor gone",
+            Self::MonitorFailed => "owner monitor failed",
+            Self::MonitorPanicked => "owner monitor panicked",
+        }
+    }
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Deadline => "watchdog",
+            _ => "owner-observation",
+        }
+    }
+}
 struct WatchedTasks<T = Arc<Task>> {
     tasks: Vec<T>,
-    reason: Option<&'static str>,
+    reason: Option<TerminalCause>,
 }
 impl<T> Default for WatchedTasks<T> {
     fn default() -> Self {
@@ -169,7 +192,7 @@ impl<T: KillOwned> WatchedTasks<T> {
         }
         self.tasks.push(task);
     }
-    fn latch(&mut self, reason: &'static str) {
+    fn latch(&mut self, reason: TerminalCause) {
         if self.reason.is_none() {
             self.reason = Some(reason);
             for task in self.tasks.iter().rev() {
@@ -217,7 +240,7 @@ impl Watchdog {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .latch(reason);
-                        if reason != "session timed out" {
+                        if reason != TerminalCause::Deadline {
                             waiter.disconnect();
                         }
                     }
@@ -226,7 +249,7 @@ impl Watchdog {
                     owned
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .latch("owner monitor panicked");
+                        .latch(TerminalCause::MonitorPanicked);
                     waiter.disconnect();
                 }
             })
@@ -261,14 +284,14 @@ impl Watchdog {
         // Mach send-right release must not hold the registry lock.
         drop(retired);
     }
-    fn reason(&self) -> Option<&'static str> {
+    fn reason(&self) -> Option<TerminalCause> {
         self.tasks.lock().unwrap_or_else(|e| e.into_inner()).reason
     }
 }
 fn monitor_reason(
     deadline: Option<Instant>,
     mut wait: impl FnMut() -> Result<crate::owner::Wake>,
-) -> Option<&'static str> {
+) -> Option<TerminalCause> {
     loop {
         match wait() {
             Ok(crate::owner::Wake::Disarm) => return None,
@@ -277,9 +300,9 @@ fn monitor_reason(
             {
                 continue
             }
-            Ok(crate::owner::Wake::Timeout) => return Some("session timed out"),
-            Ok(crate::owner::Wake::OwnerGone) => return Some("supervisor gone"),
-            Err(_) => return Some("owner monitor failed"),
+            Ok(crate::owner::Wake::Timeout) => return Some(TerminalCause::Deadline),
+            Ok(crate::owner::Wake::OwnerGone) => return Some(TerminalCause::OwnerGone),
+            Err(_) => return Some(TerminalCause::MonitorFailed),
         }
     }
 }
@@ -2090,10 +2113,10 @@ impl MacosTraceBackend {
     }
     fn check_deadline(&mut self) -> Result<()> {
         if let Some(reason) = self.owner.as_ref().and_then(Watchdog::reason) {
-            return Err(error("owner-observation", reason));
+            return Err(error(reason.operation(), reason.message()));
         }
         if let Some(reason) = self.watchdog.as_ref().and_then(Watchdog::reason) {
-            return Err(error("watchdog", reason));
+            return Err(error(reason.operation(), reason.message()));
         }
         if self.deadline.is_some_and(|d| crate::clock::now() >= d) {
             for s in &self.sessions {
@@ -5182,7 +5205,7 @@ mod monitor_sleep_tests {
             registry.add(finished.clone());
             registry.add(live.clone());
             if latch_first {
-                registry.latch("owner gone");
+                registry.latch(TerminalCause::OwnerGone);
             }
             let retired = registry.retire(&finished).expect("exact owner");
             assert!(Arc::ptr_eq(&retired, &finished));
@@ -5191,7 +5214,7 @@ mod monitor_sleep_tests {
             drop(retired);
             assert!(weak.upgrade().is_none());
             if !latch_first {
-                registry.latch("owner gone");
+                registry.latch(TerminalCause::OwnerGone);
             }
             registry.add(late.clone());
             assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -5224,8 +5247,8 @@ mod monitor_sleep_tests {
         registry.add(sibling.clone());
         registry.add(old.clone());
         drop(registry.replace(&old, new.clone()));
-        registry.latch("supervisor gone");
-        registry.latch("supervisor gone");
+        registry.latch(TerminalCause::OwnerGone);
+        registry.latch(TerminalCause::OwnerGone);
         assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(sibling.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -5236,13 +5259,13 @@ mod monitor_sleep_tests {
         let old = counted();
         let new = counted();
         registry.add(old.clone());
-        registry.latch("supervisor gone");
+        registry.latch(TerminalCause::OwnerGone);
         drop(registry.replace(&old, new.clone()));
         assert_eq!(old.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(registry.tasks.len(), 1);
         assert!(Arc::ptr_eq(&registry.tasks[0], &new));
-        registry.latch("supervisor gone");
+        registry.latch(TerminalCause::OwnerGone);
         assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
     #[test]
@@ -5259,7 +5282,7 @@ mod monitor_sleep_tests {
             .iter()
             .any(|entry| Arc::ptr_eq(entry, &existing)));
         assert!(registry.tasks.iter().any(|entry| Arc::ptr_eq(entry, &new)));
-        registry.latch("supervisor gone");
+        registry.latch(TerminalCause::OwnerGone);
         assert_eq!(existing.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(new.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(absent.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -5267,9 +5290,9 @@ mod monitor_sleep_tests {
     #[test]
     fn latched_reason_kills_every_task_once_including_late_registration() {
         for reason in [
-            "session timed out",
-            "supervisor gone",
-            "owner monitor failed",
+            TerminalCause::Deadline,
+            TerminalCause::OwnerGone,
+            TerminalCause::MonitorFailed,
         ] {
             let count = std::rc::Rc::new(std::cell::Cell::new(0));
             let mut tasks = WatchedTasks::default();
@@ -5289,11 +5312,11 @@ mod monitor_sleep_tests {
         SCRIPT.with(|v| v.set(Some((start, start))));
         assert_eq!(
             monitor_reason(Some(start), || Ok(Wake::Timeout)),
-            Some("session timed out")
+            Some(TerminalCause::Deadline)
         );
         assert_eq!(
             monitor_reason(None, || Ok(Wake::OwnerGone)),
-            Some("supervisor gone")
+            Some(TerminalCause::OwnerGone)
         );
         SCRIPT.with(|v| v.set(None));
     }
