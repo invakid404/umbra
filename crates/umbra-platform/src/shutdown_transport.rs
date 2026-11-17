@@ -373,10 +373,10 @@ pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
         }
     })();
     match result {
-        Ok(duration) => Closure {
+        Ok(_) => Closure {
             tree_terminated: proof,
             error: None,
-            final_to_exit: Some(duration),
+            final_to_exit,
         },
         Err(error) => {
             client.connection.invalidate();

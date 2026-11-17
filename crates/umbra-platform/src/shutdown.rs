@@ -225,10 +225,15 @@ impl Ledger {
             return Err(invalid("invalid acquisition parent"));
         }
         if let Some(previous) = replaces {
+            let index = previous
+                .sequence
+                .checked_sub(1)
+                .and_then(|sequence| usize::try_from(sequence).ok())
+                .ok_or_else(|| invalid("unknown replacement source"))?;
             let old = state
                 .entries
-                .iter()
-                .find(|entry| entry.slot.id == previous)
+                .get(index)
+                .filter(|entry| entry.slot.id == previous)
                 .ok_or_else(|| invalid("unknown replacement source"))?;
             if old.slot.kind != ResourceKind::TaskRight
                 || old.slot.parent != parent
