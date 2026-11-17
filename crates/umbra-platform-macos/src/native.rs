@@ -5302,3 +5302,7 @@ mod monitor_sleep_tests {
 #[cfg(test)]
 #[path = "retirement_controls.rs"]
 mod retirement_controls;
+
+#[cfg(test)]
+#[path = "shutdown_tests.rs"]
+mod shutdown_tests;
