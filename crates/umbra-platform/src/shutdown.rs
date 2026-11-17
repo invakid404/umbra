@@ -176,6 +176,34 @@ impl Ledger {
         generation: u64,
         exec_generation: u64,
     ) -> Result<Reservation> {
+        self.reserve_inner(kind, parent, generation, exec_generation, None)
+    }
+
+    /// Atomically reserve an exec replacement while retaining its source right.
+    pub fn reserve_replacement(
+        &self,
+        parent: SlotId,
+        generation: u64,
+        exec_generation: u64,
+        previous: SlotId,
+    ) -> Result<Reservation> {
+        self.reserve_inner(
+            ResourceKind::TaskRight,
+            Some(parent),
+            generation,
+            exec_generation,
+            Some(previous),
+        )
+    }
+
+    fn reserve_inner(
+        &self,
+        kind: ResourceKind,
+        parent: Option<SlotId>,
+        generation: u64,
+        exec_generation: u64,
+        replaces: Option<SlotId>,
+    ) -> Result<Reservation> {
         let mut state = self.state();
         if state.accepted.is_some() || state.poisoned {
             return Err(invalid(
@@ -191,6 +219,24 @@ impl Ledger {
         }) {
             return Err(invalid("invalid acquisition parent"));
         }
+        if let Some(previous) = replaces {
+            let old = state
+                .entries
+                .iter()
+                .find(|entry| entry.slot.id == previous)
+                .ok_or_else(|| invalid("unknown replacement source"))?;
+            if old.slot.kind != ResourceKind::TaskRight
+                || old.slot.parent != parent
+                || old.slot.generation != generation
+                || old.slot.exec_generation >= exec_generation
+                || !matches!(
+                    old.disposition,
+                    Disposition::Acquired | Disposition::Settling
+                )
+            {
+                return Err(invalid("replacement source is not a retained right"));
+            }
+        }
         let id = SlotId {
             instance: state.instance,
             sequence,
@@ -199,6 +245,7 @@ impl Ledger {
             slot: Slot {
                 id,
                 parent,
+                replaces,
                 generation,
                 exec_generation,
                 kind,
@@ -353,6 +400,25 @@ impl Reservation {
         })
     }
 
+    /// Capture the first birth observation while the acquisition guard owns the
+    /// resource. A later conflicting identity poisons the ledger, never replaces it.
+    pub fn capture_birth(&self, birth: Option<(u64, u64)>) -> Result<()> {
+        let Some(birth) = birth else {
+            return Ok(());
+        };
+        self.update(|entry| {
+            let identity = entry
+                .identity
+                .as_mut()
+                .ok_or_else(|| invalid("birth observation before acquisition"))?;
+            if identity.birth.is_some_and(|previous| previous != birth) {
+                return Err(invalid("resource birth identity changed"));
+            }
+            identity.birth = Some(birth);
+            Ok(())
+        })
+    }
+
     /// The creation API definitively returned without creating a resource.
     pub fn never_created(&self) -> Result<()> {
         self.update(|entry| {
@@ -446,6 +512,67 @@ mod tests {
                 birth: None
             })
             .is_err());
+        assert!(ledger.freeze(Nonce::new_v4(), Duration::ZERO).is_err());
+    }
+    #[test]
+    fn shutdown_replacement_links_and_birth_identity_are_retained() {
+        let ledger = Ledger::new();
+        let tracee = ledger.reserve(ResourceKind::Tracee, None, 1, 0).unwrap();
+        tracee
+            .acquired(Identity {
+                pid: Some(123),
+                birth: None,
+            })
+            .unwrap();
+        tracee.capture_birth(Some((10, 20))).unwrap();
+        let old = ledger
+            .reserve(ResourceKind::TaskRight, Some(tracee.id()), 1, 0)
+            .unwrap();
+        old.acquired(Identity {
+            pid: Some(123),
+            birth: Some((10, 20)),
+        })
+        .unwrap();
+        let replacement = ledger
+            .reserve_replacement(tracee.id(), 1, 1, old.id())
+            .unwrap();
+        replacement
+            .acquired(Identity {
+                pid: Some(123),
+                birth: Some((10, 20)),
+            })
+            .unwrap();
+        replacement.confirm(Proof::Released).unwrap();
+        tracee
+            .confirm(Proof::Accounted {
+                evidence: "owned wait control".into(),
+                root_owned: true,
+                root_collected: true,
+            })
+            .unwrap();
+        let accepted = ledger.freeze(Nonce::new_v4(), Duration::ZERO).unwrap();
+        assert_eq!(accepted.slots[2].replaces, Some(old.id()));
+        assert!(!accepted
+            .confirms(&ledger.final_snapshot().unwrap())
+            .unwrap());
+        old.confirm(Proof::Released).unwrap();
+        let final_state = ledger.final_snapshot().unwrap();
+        assert_eq!(
+            final_state.entries[0].identity.as_ref().unwrap().birth,
+            Some((10, 20))
+        );
+        assert!(accepted.confirms(&final_state).unwrap());
+    }
+    #[test]
+    fn shutdown_birth_reuse_cannot_replace_a_captured_identity() {
+        let ledger = Ledger::new();
+        let slot = ledger.reserve(ResourceKind::Tracee, None, 1, 0).unwrap();
+        slot.acquired(Identity {
+            pid: Some(123),
+            birth: Some((10, 20)),
+        })
+        .unwrap();
+        assert!(slot.capture_birth(Some((10, 21))).is_err());
         assert!(ledger.freeze(Nonce::new_v4(), Duration::ZERO).is_err());
     }
 }

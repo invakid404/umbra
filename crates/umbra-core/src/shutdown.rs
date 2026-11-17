@@ -40,6 +40,8 @@ pub struct Slot {
     pub id: SlotId,
     /// Owning tracee reservation, when applicable.
     pub parent: Option<SlotId>,
+    /// Prior right retained until this exec replacement is acquired.
+    pub replaces: Option<SlotId>,
     /// Launch generation.
     pub generation: u64,
     /// Exec generation at reservation.
@@ -174,6 +176,22 @@ impl Accepted {
                     return Err(invalid("invalid reservation parent"));
                 }
             }
+            if let Some(previous) = slot.replaces {
+                let old = self
+                    .slots
+                    .iter()
+                    .find(|old| old.id == previous)
+                    .ok_or_else(|| invalid("unknown replacement source"))?;
+                if old.id.sequence >= slot.id.sequence
+                    || old.kind != ResourceKind::TaskRight
+                    || slot.kind != ResourceKind::TaskRight
+                    || old.parent != slot.parent
+                    || old.generation != slot.generation
+                    || old.exec_generation >= slot.exec_generation
+                {
+                    return Err(invalid("invalid right replacement"));
+                }
+            }
         }
         Ok(())
     }
@@ -248,6 +266,7 @@ mod tests {
                 sequence: 1,
             },
             parent: None,
+            replaces: None,
             generation: 1,
             exec_generation: 0,
             kind: ResourceKind::Tracee,

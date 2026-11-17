@@ -57,7 +57,10 @@ impl Task {
             pid: Some(pid),
             birth: None,
         })?;
-        task.1 = Some(slot);
+        task.1 = Some(slot.clone());
+        slot.capture_birth(
+            bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec)),
+        )?;
         Ok(task)
     }
     fn writable_pid_slot(&self, pointer: u64) -> bool {
@@ -631,6 +634,7 @@ impl Session {
         #[cfg(any(test, feature = "retirement-witness"))]
         crate::ownership::task(pid as u64, &task);
         let birth = bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
+        ownership.tracee.capture_birth(birth)?;
         #[cfg(feature = "mutation-probe-spawn-lifecycle")]
         if parent.is_some() {
             let registered = watchdog
@@ -3276,11 +3280,17 @@ impl MacosTraceBackend {
                 .ownership
                 .as_ref()
                 .ok_or_else(|| error("shutdown.ledger", "missing exec ownership"))?;
-            let right = owner.ledger.reserve(
-                umbra_core::shutdown::ResourceKind::TaskRight,
-                Some(owner.tracee.id()),
+            let previous = s
+                .task
+                .1
+                .as_ref()
+                .ok_or_else(|| error("shutdown.ledger", "unowned exec source right"))?
+                .id();
+            let right = owner.ledger.reserve_replacement(
+                owner.tracee.id(),
                 s.id.0.generation,
                 s.exec_generation,
+                previous,
             )?;
             let task = Arc::new(Task::acquire_owned(s.id.0.native_id as i32, right)?);
             #[cfg(any(test, feature = "retirement-witness"))]

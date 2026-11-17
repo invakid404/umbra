@@ -16,10 +16,11 @@ fn shutdown_native_root_ledger() {
     }
     let evidence = std::env::var_os("UMBRA_FIX_271_EVIDENCE_FILE")
         .expect("dedicated acquisition evidence path");
-    assert!(
-        !Path::new(&evidence).exists(),
-        "fresh reading, never overwrite"
-    );
+    // A whole qualification command may append observations from earlier tests.
+    // Keep those bytes and inspect only this serial test's newly appended span.
+    let witness_start = std::fs::metadata(&evidence)
+        .map(|metadata| metadata.len() as usize)
+        .unwrap_or(0);
     // Native control: exact owned terminal collection, including a non-success
     // status. This is independent of the provider's ledger and RSP replies.
     let mut control = std::process::Command::new("/bin/sleep")
@@ -96,8 +97,8 @@ fn shutdown_native_root_ledger() {
         closure.final_to_exit.unwrap() <= Duration::from_millis(50),
         "return to design gate: Final-to-exit exceeded 50ms"
     );
-    let records = std::fs::read_to_string(evidence)
-        .unwrap()
+    let evidence_text = std::fs::read_to_string(evidence).unwrap();
+    let records = evidence_text[witness_start..]
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
@@ -145,6 +146,23 @@ fn shutdown_native_root_ledger() {
     let final_state: shutdown::Final =
         serde_json::from_value(final_record["final"].clone()).unwrap();
     assert!(accepted.confirms(&final_state).unwrap());
+    let replacement = final_state
+        .entries
+        .iter()
+        .find(|entry| entry.slot.replaces.is_some())
+        .expect("exec replacement link");
+    assert!(final_state
+        .entries
+        .iter()
+        .any(|entry| Some(entry.slot.id) == replacement.slot.replaces));
+    assert!(
+        final_state
+            .entries
+            .iter()
+            .filter(|entry| entry.slot.kind != shutdown::ResourceKind::Tracer)
+            .all(|entry| entry.identity.as_ref().unwrap().birth.is_some()),
+        "retain captured native birth identities"
+    );
     // This witness is recorded immediately after each creation return, before
     // the ledger acquisition hook. Equality of two omitted inventories cannot
     // satisfy it; repeated task-right acquisitions retain multiplicity.
