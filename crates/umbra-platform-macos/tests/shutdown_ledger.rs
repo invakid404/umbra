@@ -108,6 +108,7 @@ fn shutdown_native_root_ledger() {
         .unwrap();
     let owner_thread = &constructed["thread"];
     let owner_pid = &constructed["writer_pid"];
+    assert!(constructed["writer_instance"].as_str().is_some());
     for name in ["owner-begin", "owner-drop", "owner-terminal", "acquired"] {
         let observations: Vec<_> = records
             .iter()
@@ -120,6 +121,7 @@ fn shutdown_native_root_ledger() {
         for record in observations {
             assert_eq!(&record["thread"], owner_thread);
             assert_eq!(&record["writer_pid"], owner_pid);
+            assert_eq!(record["writer_instance"], constructed["writer_instance"]);
         }
     }
     for name in ["transport-start", "transport-final"] {
@@ -142,6 +144,16 @@ fn shutdown_native_root_ledger() {
         .find(|record| record["event"] == "final-to-exit")
         .unwrap();
     assert_eq!(final_record["timing_origin"], "final-decoded");
+    let transport_final = &records[position("transport-final")];
+    assert_eq!(
+        transport_final["writer_instance"],
+        constructed["writer_instance"]
+    );
+    assert_eq!(transport_final["nonce"], final_record["nonce"]);
+    assert_eq!(
+        transport_final["instance"],
+        final_record["accepted"]["instance"]
+    );
     let accepted: shutdown::Accepted =
         serde_json::from_value(final_record["accepted"].clone()).unwrap();
     let final_state: shutdown::Final =

@@ -615,6 +615,8 @@ phase selector defaults as listed when a probe socket is supplied:
 The socket acknowledgment continues (`C`), injects the selected failure (`E`),
 or exits the provider without Drop (`P`). These controls belong to the fixture
 harness and change scheduling or failure behavior only in feature builds.
+The backend-drop probe retains the provider ledger across its replacement
+backend, so disposal cannot erase earlier acquisition obligations.
 
 With `shutdown-witness`, `UMBRA_FIX_271_EVIDENCE_FILE` selects an append-only
 JSONL file for acquisition, thread-order and closure timing observations. Unset

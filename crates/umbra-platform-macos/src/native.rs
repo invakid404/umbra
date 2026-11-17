@@ -2787,7 +2787,10 @@ impl MacosTraceBackend {
                 drop(self.sessions.pop().expect("registered Session"));
             }
             "backend-drop" => {
+                // The probe replaces backend state within the same provider.
+                let ledger = self.ledger.clone();
                 drop(std::mem::take(self));
+                self.ledger = ledger;
             }
             "terminate" => {
                 self.terminate(

@@ -269,7 +269,11 @@ fn serve_polls(
                     }
                     let final_state = final_state?;
                     #[cfg(feature = "shutdown-witness")]
-                    crate::shutdown::witness(serde_json::json!({"event": "transport-final"}));
+                    crate::shutdown::witness(serde_json::json!({
+                        "event": "transport-final",
+                        "nonce": accepted.nonce,
+                        "instance": accepted.instance,
+                    }));
                     connection.send(&Frame::Response {
                         id,
                         result: wire::encode(&Response::ShutdownPoll(Poll::Final(final_state))),

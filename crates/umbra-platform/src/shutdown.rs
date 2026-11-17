@@ -27,7 +27,7 @@ pub struct Closure {
     pub tree_terminated: bool,
     /// Closure error; never overwrites a preexisting event-loop primary error.
     pub error: Option<UmbraError>,
-    /// Test-side measurement from validated Final to owned provider exit.
+    /// Test-side measurement from decoded Final, including validation, to owned exit.
     pub final_to_exit: Option<Duration>,
 }
 
@@ -612,12 +612,17 @@ mod tests {
 #[doc(hidden)]
 pub fn witness(record: serde_json::Value) {
     use std::io::Write;
+    static WRITER_INSTANCE: std::sync::OnceLock<Nonce> = std::sync::OnceLock::new();
     let Some(path) = std::env::var_os("UMBRA_FIX_271_EVIDENCE_FILE") else {
         return;
     };
     let mut record = record;
     record["version"] = "shutdown-witness-v1".into();
     record["writer_pid"] = std::process::id().into();
+    record["writer_instance"] = WRITER_INSTANCE
+        .get_or_init(Nonce::new_v4)
+        .to_string()
+        .into();
     record["thread"] = format!("{:?}", std::thread::current().id()).into();
     let mut bytes = serde_json::to_vec(&record).expect("qualification evidence encoding");
     bytes.push(b'\n');
