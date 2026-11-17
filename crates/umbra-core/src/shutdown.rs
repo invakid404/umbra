@@ -42,7 +42,9 @@ pub struct Slot {
     pub parent: Option<SlotId>,
     /// Prior right retained until this exec replacement is acquired.
     pub replaces: Option<SlotId>,
-    /// Launch generation.
+    /// Generation fixed at reservation. Native child-creation reservations
+    /// retain their creator's generation; task rights and tracers use their
+    /// tracee's attachment generation.
     pub generation: u64,
     /// Exec generation at reservation.
     pub exec_generation: u64,
@@ -341,12 +343,22 @@ mod tests {
         accepted.slots.push(right.clone());
         accepted.high_water = 2;
         assert!(accepted.validate().is_ok());
-        for mutation in 0..3 {
+        for mutation in 0..2 {
             let mut malformed = accepted.clone();
             match mutation {
                 0 => malformed.slots[1].parent = None,
-                1 => malformed.slots[0].kind = ResourceKind::TaskRight,
-                2 => malformed.slots[1].generation += 1,
+                1 => {
+                    malformed.slots.push(Slot {
+                        id: SlotId {
+                            instance: accepted.instance,
+                            sequence: 3,
+                        },
+                        parent: Some(right.id),
+                        kind: ResourceKind::Tracee,
+                        ..root.clone()
+                    });
+                    malformed.high_water = 3;
+                }
                 _ => unreachable!(),
             }
             assert!(
