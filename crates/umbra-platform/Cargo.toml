@@ -6,6 +6,10 @@ license.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Test-only fault at the provider closure boundary.
+mutation-probe-spawn-lifecycle = []
+
 [dependencies]
 umbra-core = { path = "../umbra-core" }
 serde.workspace = true

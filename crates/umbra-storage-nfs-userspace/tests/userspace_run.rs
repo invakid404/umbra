@@ -16291,6 +16291,35 @@ fn fix_243_policy_deadline() {
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
+fn fix_271_shutdown_journal_and_inheritance() {
+    let Some(mut spawn) = slate_spawn("fix-271-shutdown-journal-and-inheritance") else {
+        return;
+    };
+    let mode = "c11-02-attributes";
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    spawn.provider_environment.push((
+        "UMBRA_FIX_271_MISSING_FINAL".into(),
+        "1".into(),
+    ));
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
+    let completed = journal_records_completion(&routed.run);
+    // Finish the existing ownership census before asserting the new verdict,
+    // preserving evidence even on the expected failing-first reading.
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+    assert!(
+        routed.run.stderr.contains("injected unconfirmed provider closure"),
+        "the closure fault must actually run: {}",
+        routed.run.stderr
+    );
+    assert!(!completed, "unconfirmed shutdown persisted successful completion");
+    assert_ne!(routed.run.status, Some(0), "unconfirmed shutdown succeeded");
+}
+
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
 fn fix_243_policy_session_drop() {
     fix_243_fault_reading(
         "fix-243-policy-session-drop",

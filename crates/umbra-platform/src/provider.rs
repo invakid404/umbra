@@ -652,6 +652,16 @@ pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) 
                     if result.is_ok() {
                         roots.retain(|root| *root != process);
                     }
+                    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                    let result = if std::env::var_os("UMBRA_FIX_271_MISSING_FINAL").is_some() {
+                        Err(UmbraError::new(
+                            ErrorKind::Io,
+                            "shutdown.probe",
+                            "injected unconfirmed provider closure",
+                        ))
+                    } else {
+                        result
+                    };
                     result.map(|()| Response::Unit)
                 }
                 request => control_request(&mut *platform.control, request),
