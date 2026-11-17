@@ -338,14 +338,16 @@ pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
                     }
                 }
                 Response::ShutdownPoll(Poll::Final(final_state)) => {
-                    proof = accepted.confirms(&final_state)?;
+                    // Measure from decoded-Final receipt, including validation.
                     let started = now();
+                    proof = accepted.confirms(&final_state)?;
                     let exit = client.confirm_provider_exit();
                     let elapsed = now().saturating_duration_since(started);
                     final_to_exit = Some(elapsed);
                     #[cfg(feature = "shutdown-witness")]
                     crate::shutdown::witness(serde_json::json!({
                         "event": "final-to-exit", "nonce": nonce,
+                        "timing_origin": "final-decoded",
                         "nanos": elapsed.as_nanos().to_string(), "exit_ok": exit.is_ok(),
                         "proof": proof, "accepted": accepted, "final": final_state,
                     }));

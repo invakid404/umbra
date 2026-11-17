@@ -141,6 +141,7 @@ fn shutdown_native_root_ledger() {
         .iter()
         .find(|record| record["event"] == "final-to-exit")
         .unwrap();
+    assert_eq!(final_record["timing_origin"], "final-decoded");
     let accepted: shutdown::Accepted =
         serde_json::from_value(final_record["accepted"].clone()).unwrap();
     let final_state: shutdown::Final =

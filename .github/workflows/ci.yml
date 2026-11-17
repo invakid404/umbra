@@ -290,6 +290,7 @@ jobs:
           exits = [row for row in rows if row["event"] == "final-to-exit"]
           assert exits, "no Final-to-exit readings"
           for row in exits:
+              assert row["timing_origin"] == "final-decoded", row
               print("shutdown Final-to-exit:", row["nanos"], "ns", "exit_ok:", row["exit_ok"])
               assert row["exit_ok"] and int(row["nanos"]) <= 50_000_000, row
           PY
@@ -693,6 +694,7 @@ jobs:
           exits = [row for row in rows if row["event"] == "final-to-exit"]
           assert exits, "no positive closure reading"
           for row in exits:
+              assert row["timing_origin"] == "final-decoded", row
               print("shutdown Final-to-exit:", row["nanos"], "ns", "exit_ok:", row["exit_ok"])
               assert row["exit_ok"] and int(row["nanos"]) <= 50_000_000, row
           PY

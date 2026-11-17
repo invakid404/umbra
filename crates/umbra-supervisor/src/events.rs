@@ -1980,17 +1980,6 @@ mod tests {
         }
     }
     impl TraceControl for Fake {
-        fn begin_shutdown(
-            &mut self,
-            nonce: umbra_core::shutdown::Nonce,
-        ) -> Result<umbra_platform::shutdown::Start> {
-            // This event-loop fake owns no native resources.
-            let ledger = umbra_platform::shutdown::Ledger::new();
-            Ok(umbra_platform::shutdown::Start::Local {
-                accepted: ledger.freeze(nonce, Duration::ZERO)?,
-                ledger,
-            })
-        }
         fn capabilities(&self) -> PlatformCapabilities {
             PlatformCapabilities::default()
         }
@@ -3113,6 +3102,12 @@ mod tests {
             };
             assert!(s.filesystem_queries.finish(&late, 0).is_none());
             let reason = failure.to_string();
+            // This case has no native resources and explicitly confirms closure.
+            // Other uses of Fake retain its unsupported-shutdown behavior.
+            s.platform.control = Box::new(shutdown_journal::ScriptedControl(
+                Some(shutdown_journal::confirmed()),
+                false,
+            ));
             let returned = crate::run::finish_supervision(s, Err(failure), &mut None).unwrap_err();
             assert_eq!(returned.to_string(), reason);
             assert_eq!(*cleanup.lock().unwrap(), vec![(true, reason)]);

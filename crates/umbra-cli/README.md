@@ -200,6 +200,13 @@ be released before the root is released for final shutdown. This test runs in se
 It records the executed provider path and SHA-256 and checks the
 `retirement-ownership` build marker immediately before launch.
 
+The `shutdown-witness` feature forwards test-only closure instrumentation to
+`umbra-platform`. With `UMBRA_FIX_271_EVIDENCE_FILE` set, it records validated
+ledger proof and decoded-Final-to-owned-exit timing, including validation.
+External fixtures that link the CLI
+library can enable `umbra-cli/shutdown-witness` through Cargo; the provider build
+needs its own `shutdown-witness` feature for acquisition and owner-thread records.
+
 `tests/isolation.rs` pins #193 on the production path. It compiles
 `experiments/fixtures/umbra-isolation-fixture.c` and the signal observer at test
 time, and runs when `UMBRA_TEST_ISOLATION` or `UMBRA_INTEGRATION_REQUIRED` is set.
