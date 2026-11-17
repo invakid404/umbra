@@ -195,18 +195,32 @@ fn declared_probe() -> Option<String> {
 
 /// Where the built binaries are.
 ///
-/// A test binary lives at `<target>/<profile>/deps/<name>-<hash>`, so its
-/// grandparent is the directory holding `umbra` and every provider executable.
+/// Locate the profile directory from either Cargo test artifact layout.
 /// `UMBRA_BIN_DIR` overrides it for a layout this does not describe.
 fn binaries() -> PathBuf {
     if let Some(explicit) = std::env::var_os("UMBRA_BIN_DIR") {
         return PathBuf::from(explicit);
     }
-    let test = std::env::current_exe().expect("this test binary's own path");
-    test.parent()
-        .and_then(Path::parent)
-        .expect("a test binary lives under <target>/<profile>/deps")
-        .to_path_buf()
+    let executable = std::env::current_exe().expect("test binary has a path");
+    let parent = executable.parent().expect("test binary has a parent");
+    // Cargo 1.100 uses <profile>/build/<package>/<hash>/out for tests.
+    // Older Cargo versions put them directly under <profile>/deps.
+    let path = if parent.ends_with("deps") {
+        parent.parent().expect("deps has a profile directory")
+    } else if parent.ends_with("out")
+        && parent
+            .ancestors()
+            .nth(3)
+            .is_some_and(|p| p.ends_with("build"))
+    {
+        parent
+            .ancestors()
+            .nth(4)
+            .expect("build has a profile directory")
+    } else {
+        parent
+    };
+    path.to_path_buf()
 }
 
 fn repository() -> PathBuf {

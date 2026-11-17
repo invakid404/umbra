@@ -55,10 +55,26 @@ impl RunObserver for Observer {
     }
 }
 fn bin(name: &str) -> BytePath {
-    let mut p = std::env::current_exe().unwrap();
-    p.pop();
-    p.pop();
-    let p = p.join(name);
+    let executable = std::env::current_exe().expect("test binary has a path");
+    let parent = executable.parent().expect("test binary has a parent");
+    // Cargo 1.100 uses <profile>/build/<package>/<hash>/out for tests.
+    // Older Cargo versions put them directly under <profile>/deps.
+    let path = if parent.ends_with("deps") {
+        parent.parent().expect("deps has a profile directory")
+    } else if parent.ends_with("out")
+        && parent
+            .ancestors()
+            .nth(3)
+            .is_some_and(|p| p.ends_with("build"))
+    {
+        parent
+            .ancestors()
+            .nth(4)
+            .expect("build has a profile directory")
+    } else {
+        parent
+    };
+    let p = path.join(name);
     assert!(p.is_file(), "{}", p.display());
     BytePath::new(p.as_os_str().as_bytes().to_vec()).unwrap()
 }
