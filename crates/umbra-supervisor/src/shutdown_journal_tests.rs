@@ -269,6 +269,9 @@ mod shutdown_journal {
         fault: Fault,
         partial_launch: bool,
     ) {
+        let closure_failure = closure
+            .as_ref()
+            .is_none_or(|closure| closure.error.is_some() || !closure.tree_terminated);
         let base_dir = tempfile::tempdir().unwrap();
         let shadow_dir = tempfile::tempdir().unwrap();
         let mut supervisor = supervisor();
@@ -403,7 +406,7 @@ mod shutdown_journal {
         });
         eprintln!("result={result:?}; completed={completed}; recovery={recovery:?}");
         let completion_visible = success || matches!(fault, Fault::CompletionFlush | Fault::Close);
-        let recovery_marker = !success && matches!(fault, Fault::None | Fault::MarkerFlush);
+        let recovery_marker = closure_failure && fault != Fault::MarkerAppend;
         assert_eq!(
             completed, completion_visible,
             "actual persisted completion at {fault:?}"
