@@ -180,3 +180,30 @@ fn collected_model_root(ledger: &umbra_platform::shutdown::Ledger) -> umbra_core
     .unwrap();
     root.id()
 }
+
+#[test]
+fn backend_drop_probe_retains_provider_ledger() {
+    let mut backend = MacosTraceBackend::default();
+    backend.generation = 9;
+    let root = collected_model_root(&backend.ledger);
+    backend
+        .probe_teardown("unit-model", "backend-drop")
+        .unwrap_err();
+    assert_eq!(backend.generation, 0, "the probe must replace the backend");
+    let accepted = backend
+        .ledger
+        .freeze(umbra_core::shutdown::Nonce::new_v4(), Duration::ZERO)
+        .unwrap();
+    assert_eq!(
+        accepted
+            .slots
+            .iter()
+            .map(|slot| slot.id)
+            .collect::<Vec<_>>(),
+        vec![root],
+        "backend disposal must retain the provider's resource history"
+    );
+    assert!(accepted
+        .confirms(&backend.ledger.final_snapshot().unwrap())
+        .unwrap());
+}

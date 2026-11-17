@@ -2772,7 +2772,11 @@ impl MacosTraceBackend {
     #[cfg(feature = "mutation-probe-spawn-lifecycle")]
     fn probe_teardown_trigger(&mut self, phase: &str) -> Result<()> {
         let trigger = std::env::var("UMBRA_FIX_243_PROBE_TRIGGER").unwrap_or_default();
-        match trigger.as_str() {
+        self.probe_teardown(phase, &trigger)
+    }
+    #[cfg(any(test, feature = "mutation-probe-spawn-lifecycle"))]
+    fn probe_teardown(&mut self, phase: &str, trigger: &str) -> Result<()> {
+        match trigger {
             "deadline" => {
                 self.deadline = Some(crate::clock::now());
                 self.check_deadline()?;
