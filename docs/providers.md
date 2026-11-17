@@ -133,9 +133,19 @@ both of which a version-2 provider would deserialize as absent -- launching a
 tracee that is neither interposed nor descriptor-fenced, which is exactly the
 silently-wrong start the version exists to prevent.
 
-Platform clients require `bounded-event-poll-v1` before Launch. `PollEvent`
+Platform clients require `bounded-event-poll-v1` and
+`platform.shutdown-ledger.v1` before Launch. `PollEvent`
 requests bound the wait to at most 100ms and a quarter of the registry deadline;
 Idle lets the supervisor renew the writer before re-issuing. Common protocol
 version 3 and legacy NextEvent/Event messages remain unchanged. The macOS
 session watchdog is an independent opt-in absolute limit, and its 1ms debugger-read
 floor means tiny registry timeouts can still fail closed.
+
+`BeginShutdown` freezes all resource reservations. Correlated `PollShutdown`
+requests receive Pending while the original owner destroys the platform, or
+Final after destruction completes. Polling preserves the existing owner cleanup
+envelope; it does not renew it. Accepted, an ordinary Terminate response, and EOF
+are not closure proof. The client validates every final obligation and collects
+its owned provider process before the supervisor records successful completion.
+Older providers lacking the shutdown capability are refused before launch;
+common protocol version 3 and the journal format remain unchanged.
