@@ -96,7 +96,10 @@ fn drop_during_latch_joins_after_release() {
 fn freeze_late_result() {
     use umbra_core::shutdown::{Identity, Nonce, Proof, ResourceKind};
     let ledger = umbra_platform::shutdown::Ledger::new();
-    let slot = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
+    let root = collected_model_root(&ledger);
+    let slot = ledger
+        .reserve(ResourceKind::Tracer, Some(root), 1, 0)
+        .unwrap();
     let (release_tx, release_rx) = mpsc::sync_channel(0);
     let worker = std::thread::spawn(move || {
         release_rx.recv().unwrap();
@@ -116,7 +119,9 @@ fn freeze_late_result() {
     assert!(!accepted
         .confirms(&ledger.final_snapshot().unwrap())
         .unwrap());
-    assert!(ledger.reserve(ResourceKind::Tracer, None, 1, 1).is_err());
+    assert!(ledger
+        .reserve(ResourceKind::Tracer, Some(root), 1, 1)
+        .is_err());
     release_tx.send(()).unwrap();
     worker.join().unwrap();
     assert!(accepted
@@ -128,11 +133,12 @@ fn freeze_late_result() {
 fn replacement_keeps_old_tracer_collection_obligation() {
     use umbra_core::shutdown::{Identity, Nonce, ResourceKind};
     let ledger = umbra_platform::shutdown::Ledger::new();
+    let root = collected_model_root(&ledger);
     let (mut old, _old_peer) = Rsp::retirement_test_pair();
     let (mut replacement, _replacement_peer) = Rsp::retirement_test_pair();
     for (generation, tracer) in [(0, &mut old), (1, &mut replacement)] {
         let slot = ledger
-            .reserve(ResourceKind::Tracer, None, 1, generation)
+            .reserve(ResourceKind::Tracer, Some(root), 1, generation)
             .unwrap();
         slot.acquired(Identity {
             pid: Some(tracer.tracer_pid()),
@@ -145,7 +151,7 @@ fn replacement_keeps_old_tracer_collection_obligation() {
     let accepted = ledger
         .freeze(Nonce::new_v4(), Duration::from_secs(1))
         .unwrap();
-    assert_eq!(accepted.slots.len(), 2);
+    assert_eq!(accepted.slots.len(), 3);
     assert!(
         !accepted
             .confirms(&ledger.final_snapshot().unwrap())
@@ -156,4 +162,21 @@ fn replacement_keeps_old_tracer_collection_obligation() {
     assert!(accepted
         .confirms(&ledger.final_snapshot().unwrap())
         .unwrap());
+}
+
+fn collected_model_root(ledger: &umbra_platform::shutdown::Ledger) -> umbra_core::shutdown::SlotId {
+    use umbra_core::shutdown::{Identity, Proof, ResourceKind};
+    let root = ledger.reserve(ResourceKind::Tracee, None, 1, 0).unwrap();
+    root.acquired(Identity {
+        pid: Some(123),
+        birth: None,
+    })
+    .unwrap();
+    root.confirm(Proof::Accounted {
+        evidence: "unit-model root collection".into(),
+        root_owned: true,
+        root_collected: true,
+    })
+    .unwrap();
+    root.id()
 }

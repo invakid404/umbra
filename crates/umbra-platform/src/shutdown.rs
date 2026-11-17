@@ -458,12 +458,32 @@ impl Reservation {
 }
 
 #[cfg(test)]
+pub(crate) fn collected_model_root(ledger: &Ledger) -> SlotId {
+    let root = ledger.reserve(ResourceKind::Tracee, None, 1, 0).unwrap();
+    root.acquired(Identity {
+        pid: Some(123),
+        birth: None,
+    })
+    .unwrap();
+    root.confirm(Proof::Accounted {
+        evidence: "unit-model root collection".into(),
+        root_owned: true,
+        root_collected: true,
+    })
+    .unwrap();
+    root.id()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn shutdown_late_result_and_retired_history_survive_freeze() {
         let ledger = Ledger::new();
-        let retired = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
+        let root = collected_model_root(&ledger);
+        let retired = ledger
+            .reserve(ResourceKind::Tracer, Some(root), 1, 0)
+            .unwrap();
         retired
             .acquired(Identity {
                 pid: Some(10),
@@ -476,13 +496,15 @@ mod tests {
             })
             .unwrap();
         let late = ledger
-            .reserve(ResourceKind::TaskRight, Some(retired.id()), 1, 1)
+            .reserve(ResourceKind::TaskRight, Some(root), 1, 1)
             .unwrap();
         let accepted = ledger
             .freeze(Nonce::new_v4(), Duration::from_secs(1))
             .unwrap();
-        assert_eq!(accepted.slots.len(), 2);
-        assert!(ledger.reserve(ResourceKind::Tracer, None, 1, 2).is_err());
+        assert_eq!(accepted.slots.len(), 3);
+        assert!(ledger
+            .reserve(ResourceKind::Tracer, Some(root), 1, 2)
+            .is_err());
         assert!(!accepted
             .confirms(&ledger.final_snapshot().unwrap())
             .unwrap());
@@ -493,7 +515,7 @@ mod tests {
         .unwrap();
         late.confirm(Proof::Released).unwrap();
         let final_state = ledger.final_snapshot().unwrap();
-        assert_eq!(final_state.entries.len(), 2);
+        assert_eq!(final_state.entries.len(), 3);
         assert!(accepted.confirms(&final_state).unwrap());
     }
     #[test]
@@ -509,7 +531,10 @@ mod tests {
     #[test]
     fn shutdown_terminal_slot_cannot_be_rewritten() {
         let ledger = Ledger::new();
-        let slot = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
+        let root = collected_model_root(&ledger);
+        let slot = ledger
+            .reserve(ResourceKind::Tracer, Some(root), 1, 0)
+            .unwrap();
         slot.never_created().unwrap();
         assert!(slot
             .acquired(Identity {

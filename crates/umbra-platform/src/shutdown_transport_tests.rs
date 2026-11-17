@@ -127,7 +127,10 @@ fn exercise(envelope: Duration, invalid_poll: bool) {
     let owner = std::thread::spawn(move || {
         let ledger = Ledger::new();
         ledger.record_threads(owner_log.clone());
-        let slot = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
+        let root = crate::shutdown::collected_model_root(&ledger);
+        let slot = ledger
+            .reserve(ResourceKind::Tracer, Some(root), 1, 0)
+            .unwrap();
         slot.acquired(Identity {
             pid: Some(123),
             birth: None,
@@ -298,7 +301,10 @@ fn scripted(script: Script) {
             panic!("begin phase")
         };
         let ledger = Ledger::new();
-        let slot = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
+        let root = crate::shutdown::collected_model_root(&ledger);
+        let slot = ledger
+            .reserve(ResourceKind::Tracer, Some(root), 1, 0)
+            .unwrap();
         slot.acquired(Identity {
             pid: Some(123),
             birth: None,
@@ -428,7 +434,10 @@ fn shutdown_affinity_failure_paths() {
             FAILURE.with(|value| value.set(failure));
             let ledger = Ledger::new();
             ledger.record_threads(owner_log.clone());
-            let slot = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
+            let root = crate::shutdown::collected_model_root(&ledger);
+            let slot = ledger
+                .reserve(ResourceKind::Tracer, Some(root), 1, 0)
+                .unwrap();
             slot.acquired(Identity {
                 pid: Some(123),
                 birth: None,
@@ -526,7 +535,10 @@ fn shutdown_poll_preserves_deadlines() {
     let owner = std::thread::spawn(move || {
         CLOCK.with(|value| *value.borrow_mut() = Some(owner_clock));
         let ledger = Ledger::new();
-        let slot = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
+        let root = crate::shutdown::collected_model_root(&ledger);
+        let slot = ledger
+            .reserve(ResourceKind::Tracer, Some(root), 1, 0)
+            .unwrap();
         slot.acquired(Identity {
             pid: Some(123),
             birth: None,

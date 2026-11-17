@@ -489,7 +489,21 @@ mod shutdown_journal {
         use umbra_core::shutdown::*;
         for mutation in 0..6 {
             let ledger = umbra_platform::shutdown::Ledger::new();
-            let slot = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
+            let root = ledger.reserve(ResourceKind::Tracee, None, 1, 0).unwrap();
+            root.acquired(Identity {
+                pid: Some(42),
+                birth: None,
+            })
+            .unwrap();
+            root.confirm(Proof::Accounted {
+                evidence: "unit-model root collection".into(),
+                root_owned: true,
+                root_collected: true,
+            })
+            .unwrap();
+            let slot = ledger
+                .reserve(ResourceKind::Tracer, Some(root.id()), 1, 0)
+                .unwrap();
             slot.acquired(Identity {
                 pid: Some(123),
                 birth: None,
@@ -505,11 +519,11 @@ mod shutdown_journal {
             let mut final_state = ledger.final_snapshot().unwrap();
             match mutation {
                 0 => final_state.entries.clear(),
-                1 => final_state.entries.push(final_state.entries[0].clone()),
-                2 => final_state.entries[0].slot.id.sequence += 1,
+                1 => final_state.entries.push(final_state.entries[1].clone()),
+                2 => final_state.entries[1].slot.id.sequence += 1,
                 3 => accepted.high_water += 1,
                 4 => final_state.generation += 1,
-                5 => final_state.entries[0].disposition = Disposition::Reserved,
+                5 => final_state.entries[1].disposition = Disposition::Reserved,
                 _ => unreachable!(),
             }
             let closure = umbra_platform::shutdown::Closure::from_final(&accepted, &final_state);

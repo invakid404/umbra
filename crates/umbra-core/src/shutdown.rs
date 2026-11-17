@@ -4,7 +4,7 @@
 
 use crate::{ErrorKind, Result, UmbraError};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 /// Negotiated platform closure protocol.
@@ -162,27 +162,33 @@ impl Accepted {
         if self.high_water != self.slots.len() as u64 {
             return Err(invalid("inventory count does not match high water"));
         }
-        let mut ids = BTreeSet::new();
+        let mut ids = BTreeMap::new();
         for slot in &self.slots {
             if slot.id.instance != self.instance
                 || slot.id.sequence == 0
                 || slot.id.sequence > self.high_water
-                || !ids.insert(slot.id)
+                || ids.insert(slot.id, slot).is_some()
             {
                 return Err(invalid("invalid or duplicate reservation identity"));
             }
         }
         for slot in &self.slots {
             if let Some(parent) = slot.parent {
-                if !ids.contains(&parent) || parent.sequence >= slot.id.sequence {
+                if !ids.contains_key(&parent) || parent.sequence >= slot.id.sequence {
                     return Err(invalid("invalid reservation parent"));
                 }
+                if ids
+                    .get(&parent)
+                    .is_none_or(|parent| parent.kind != ResourceKind::Tracee)
+                {
+                    return Err(invalid("reservation parent is not a tracee"));
+                }
+            } else if slot.kind != ResourceKind::Tracee {
+                return Err(invalid("resource reservation has no tracee owner"));
             }
             if let Some(previous) = slot.replaces {
-                let old = self
-                    .slots
-                    .iter()
-                    .find(|old| old.id == previous)
+                let old = ids
+                    .get(&previous)
                     .ok_or_else(|| invalid("unknown replacement source"))?;
                 if old.id.sequence >= slot.id.sequence
                     || old.kind != ResourceKind::TaskRight
@@ -208,16 +214,16 @@ impl Accepted {
         {
             return Err(invalid("final does not match accepted inventory"));
         }
+        let slots: BTreeMap<_, _> = self.slots.iter().map(|slot| (slot.id, slot)).collect();
         let mut seen = BTreeSet::new();
         let mut confirmed = true;
         for entry in &final_state.entries {
             if !seen.insert(entry.slot.id) {
                 return Err(invalid("duplicate final slot"));
             }
-            let expected = self
-                .slots
-                .iter()
-                .find(|slot| slot.id == entry.slot.id)
+            let expected = slots
+                .get(&entry.slot.id)
+                .copied()
                 .ok_or_else(|| invalid("unknown final slot"))?;
             if expected != &entry.slot {
                 return Err(invalid("final changed immutable reservation"));

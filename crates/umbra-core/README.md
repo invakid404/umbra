@@ -121,7 +121,10 @@ Slots retain parent, generation, captured identity and exec-replacement
 relationships. Never-created slots need explicit disposition; acquired tracees,
 owned tracers and Mach rights need their respective accounting, collection and
 release evidence. Validation rejects pending, omitted, duplicate, unknown or
-mismatched obligations. These records are ephemeral protocol data, with no
+mismatched obligations. Parents must be earlier tracee slots; every tracer and
+task right needs one. Native child reservations retain the creator's generation,
+while acquired rights and tracers use their tracee's attachment generation.
+These records are ephemeral protocol data, with no
 journal format change.
 
 After a validated platform Final, `Client::confirm_provider_exit` waits for its
