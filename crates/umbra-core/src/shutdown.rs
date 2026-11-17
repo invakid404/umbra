@@ -324,6 +324,39 @@ mod tests {
         }
     }
     #[test]
+    fn shutdown_requires_tracee_ownership_relationships() {
+        let (mut accepted, _) = inventory();
+        let root = accepted.slots[0].clone();
+        let right = Slot {
+            id: SlotId {
+                instance: accepted.instance,
+                sequence: 2,
+            },
+            parent: Some(root.id),
+            replaces: None,
+            generation: root.generation,
+            exec_generation: 0,
+            kind: ResourceKind::TaskRight,
+        };
+        accepted.slots.push(right.clone());
+        accepted.high_water = 2;
+        assert!(accepted.validate().is_ok());
+        for mutation in 0..3 {
+            let mut malformed = accepted.clone();
+            match mutation {
+                0 => malformed.slots[1].parent = None,
+                1 => malformed.slots[0].kind = ResourceKind::TaskRight,
+                2 => malformed.slots[1].generation += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                malformed.validate().is_err(),
+                "invalid ownership relationship {mutation} accepted"
+            );
+        }
+    }
+
+    #[test]
     fn shutdown_requires_every_obligation() {
         let (accepted, mut final_state) = inventory();
         for disposition in [
