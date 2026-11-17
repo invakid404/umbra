@@ -59,7 +59,12 @@ impl crate::PlatformSession {
     /// Consume every platform handle before returning a terminal run verdict.
     pub fn shutdown(self) -> Closure {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.shutdown_inner())) {
-            Ok(closure) => closure,
+            Ok(mut closure) => {
+                if !closure.tree_terminated && closure.error.is_none() {
+                    closure.error = Some(invalid("shutdown proof missing"));
+                }
+                closure
+            }
             Err(payload) => {
                 std::mem::forget(payload);
                 Closure::failed(invalid("shutdown owner panicked"))

@@ -1377,6 +1377,7 @@ mod unix {
             ..
         } = supervisor.into_parts();
         let closure = platform.shutdown();
+        let closure_failed = closure.error.is_some();
         drop(agent);
         let mut failure = match (loop_result, closure.error) {
             (Err(primary), secondary) => Some(with_cleanup(primary, secondary.map_or(Ok(()), Err))),
@@ -1392,8 +1393,10 @@ mod unix {
             }
         }
         if let Some(mut primary) = failure {
-            if let Some(journal) = terminal_journal {
-                primary = with_cleanup(primary, journal.recovery_required());
+            if closure_failed {
+                if let Some(journal) = terminal_journal {
+                    primary = with_cleanup(primary, journal.recovery_required());
+                }
             }
             return Err(fail(namespace, run_id, primary, closure.tree_terminated));
         }

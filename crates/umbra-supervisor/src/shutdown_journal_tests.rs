@@ -540,4 +540,10 @@ mod shutdown_journal {
     fn shutdown_confirmed_tree_does_not_erase_loop_error() {
         read_journal(Some(confirmed()), true, true, false);
     }
+    #[test]
+    fn shutdown_missing_proof_without_diagnostic_still_fails() {
+        let mut closure = confirmed();
+        closure.tree_terminated = false;
+        read_journal(Some(closure), false, false, false);
+    }
 }
