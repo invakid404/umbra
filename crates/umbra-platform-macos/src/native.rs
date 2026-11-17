@@ -50,8 +50,13 @@ impl Task {
             }
         };
         #[cfg(feature = "shutdown-witness")]
-        umbra_platform::shutdown::witness(serde_json::json!({"event": "acquired", "kind": "TaskRight", "pid": pid}));
-        slot.acquired(umbra_core::shutdown::Identity { pid: Some(pid), birth: None })?;
+        umbra_platform::shutdown::witness(
+            serde_json::json!({"event": "acquired", "kind": "TaskRight", "pid": pid}),
+        );
+        slot.acquired(umbra_core::shutdown::Identity {
+            pid: Some(pid),
+            birth: None,
+        })?;
         task.1 = Some(slot);
         Ok(task)
     }
@@ -128,9 +133,7 @@ impl Task {
 }
 impl Drop for Task {
     fn drop(&mut self) {
-        let result = unsafe {
-            mach2::mach_port::mach_port_deallocate(mach_task_self(), self.0)
-        };
+        let result = unsafe { mach2::mach_port::mach_port_deallocate(mach_task_self(), self.0) };
         if let Some(slot) = self.1.take() {
             if result == 0 {
                 let _ = slot.confirm(umbra_core::shutdown::Proof::Released);
@@ -619,7 +622,9 @@ impl Session {
     ) -> Result<Self> {
         let right = ownership.ledger.reserve(
             umbra_core::shutdown::ResourceKind::TaskRight,
-            Some(ownership.tracee.id()), generation, 0,
+            Some(ownership.tracee.id()),
+            generation,
+            0,
         )?;
         let task = Arc::new(Task::acquire_owned(pid, right)?);
         watchdog.add(task.clone());
@@ -639,7 +644,9 @@ impl Session {
         }
         let tracer = ownership.ledger.reserve(
             umbra_core::shutdown::ResourceKind::Tracer,
-            Some(ownership.tracee.id()), generation, 0,
+            Some(ownership.tracee.id()),
+            generation,
+            0,
         )?;
         let mut rsp = Rsp::connect_owned(options, deadline, tracer)?;
         let stop = rsp.request(&format!("vAttach;{pid:x}"))?;
@@ -1043,14 +1050,26 @@ impl Session {
         } else {
             self.temporary_breakpoint(gate)?;
         }
-        let creation = if matches!(kind, ReturnKind::Fork { .. } | ReturnKind::Spawn { .. } | ReturnKind::PackedSpawn) {
-            let owner = self.ownership.as_ref().ok_or_else(|| error("shutdown.ledger", "missing parent ownership"))?;
+        let creation = if matches!(
+            kind,
+            ReturnKind::Fork { .. } | ReturnKind::Spawn { .. } | ReturnKind::PackedSpawn
+        ) {
+            let owner = self
+                .ownership
+                .as_ref()
+                .ok_or_else(|| error("shutdown.ledger", "missing parent ownership"))?;
             Some(TraceOwnership {
                 ledger: owner.ledger.clone(),
-                tracee: owner.ledger.reserve(umbra_core::shutdown::ResourceKind::Tracee,
-                    Some(owner.tracee.id()), self.id.0.generation, self.exec_generation)?,
+                tracee: owner.ledger.reserve(
+                    umbra_core::shutdown::ResourceKind::Tracee,
+                    Some(owner.tracee.id()),
+                    self.id.0.generation,
+                    self.exec_generation,
+                )?,
             })
-        } else { None };
+        } else {
+            None
+        };
         self.pending.insert(
             thread,
             Pending {
@@ -1707,23 +1726,33 @@ fn u64at(b: &[u8], o: usize) -> Result<u64> {
 }
 impl Session {
     fn settle_tracee(&mut self) {
-        let Some(owner) = self.ownership.take() else { return; };
+        let Some(owner) = self.ownership.take() else {
+            return;
+        };
         if let Some(evidence) = &self.exit_evidence {
             if self.parent.is_some() || self.reaped {
-                let _ = owner.tracee.confirm(umbra_core::shutdown::Proof::Accounted {
-                    evidence: format!("{evidence:?}"),
-                    root_collected: self.reaped && self.parent.is_none(),
-                    root_owned: self.parent.is_none(),
-                });
+                let _ = owner
+                    .tracee
+                    .confirm(umbra_core::shutdown::Proof::Accounted {
+                        evidence: format!("{evidence:?}"),
+                        root_collected: self.reaped && self.parent.is_none(),
+                        root_owned: self.parent.is_none(),
+                    });
                 return;
             }
         }
         if self.parent.is_none() && self.reaped {
-            let _ = owner.tracee.confirm(umbra_core::shutdown::Proof::Accounted {
-                evidence: "exact root collection".into(), root_collected: true, root_owned: true,
-            });
+            let _ = owner
+                .tracee
+                .confirm(umbra_core::shutdown::Proof::Accounted {
+                    evidence: "exact root collection".into(),
+                    root_collected: true,
+                    root_owned: true,
+                });
         } else {
-            let _ = owner.tracee.unconfirmed("tracee exit accounting or owned root collection missing");
+            let _ = owner
+                .tracee
+                .unconfirmed("tracee exit accounting or owned root collection missing");
         }
     }
 }
@@ -1782,6 +1811,8 @@ impl Default for MacosTraceBackend {
 }
 impl MacosTraceBackend {
     pub fn new(options: Options) -> Self {
+        #[cfg(feature = "shutdown-witness")]
+        umbra_platform::shutdown::witness(serde_json::json!({"event": "owner-constructed"}));
         Self {
             ledger: umbra_platform::shutdown::Ledger::new(),
             poll_cursor: 0,
@@ -2422,8 +2453,12 @@ impl MacosTraceBackend {
             .map(|v| v.as_ptr() as *mut libc::c_char)
             .collect::<Vec<_>>();
         envp.push(std::ptr::null_mut());
-        let root_slot = self.ledger.reserve(umbra_core::shutdown::ResourceKind::Tracee,
-            None, self.generation + 1, 0)?;
+        let root_slot = self.ledger.reserve(
+            umbra_core::shutdown::ResourceKind::Tracee,
+            None,
+            self.generation + 1,
+            0,
+        )?;
         let mut pid = 0;
         // SAFETY: initialized spawn objects, owned NUL-terminated arrays and valid out pointers.
         unsafe {
@@ -2498,19 +2533,31 @@ impl MacosTraceBackend {
             }
         }
         #[cfg(feature = "shutdown-witness")]
-        umbra_platform::shutdown::witness(serde_json::json!({"event": "acquired", "kind": "Tracee", "pid": pid}));
+        umbra_platform::shutdown::witness(
+            serde_json::json!({"event": "acquired", "kind": "Tracee", "pid": pid}),
+        );
         self.generation += 1;
-        let session = root_slot.acquired(umbra_core::shutdown::Identity { pid: Some(pid), birth: None }).and_then(|()| Session::attach(
-            pid,
-            self.generation,
-            image,
-            None,
-            &self.options,
-            deadline,
-            self.watchdog.as_ref().unwrap(),
-            self.interposer.clone(),
-            TraceOwnership { ledger: self.ledger.clone(), tracee: root_slot.clone() },
-        ));
+        let session = root_slot
+            .acquired(umbra_core::shutdown::Identity {
+                pid: Some(pid),
+                birth: None,
+            })
+            .and_then(|()| {
+                Session::attach(
+                    pid,
+                    self.generation,
+                    image,
+                    None,
+                    &self.options,
+                    deadline,
+                    self.watchdog.as_ref().unwrap(),
+                    self.interposer.clone(),
+                    TraceOwnership {
+                        ledger: self.ledger.clone(),
+                        tracee: root_slot.clone(),
+                    },
+                )
+            });
         let session = match session {
             Ok(s) => s,
             Err(mut e) => {
@@ -2520,7 +2567,8 @@ impl MacosTraceBackend {
                     if e.launch_tree_terminated {
                         let _ = root_slot.confirm(umbra_core::shutdown::Proof::Accounted {
                             evidence: "exact root collection after failed attach".into(),
-                            root_collected: true, root_owned: true,
+                            root_collected: true,
+                            root_owned: true,
                         });
                     }
                 }
@@ -2871,10 +2919,16 @@ impl MacosTraceBackend {
                         slot
                     };
                     live.task.read(slot, &mut bytes)?;
-                    let ownership = creation.ok_or_else(|| error("shutdown.ledger", "unreserved spawn"))?;
+                    let ownership =
+                        creation.ok_or_else(|| error("shutdown.ledger", "unreserved spawn"))?;
                     #[cfg(feature = "shutdown-witness")]
-                    umbra_platform::shutdown::witness(serde_json::json!({"event": "acquired", "kind": "Tracee", "pid": i32::from_le_bytes(bytes)}));
-                    ownership.tracee.acquired(umbra_core::shutdown::Identity { pid: Some(i32::from_le_bytes(bytes)), birth: None })?;
+                    umbra_platform::shutdown::witness(
+                        serde_json::json!({"event": "acquired", "kind": "Tracee", "pid": i32::from_le_bytes(bytes)}),
+                    );
+                    ownership.tracee.acquired(umbra_core::shutdown::Identity {
+                        pid: Some(i32::from_le_bytes(bytes)),
+                        birth: None,
+                    })?;
                     let twin = std::mem::take(&mut spawn.twin);
                     self.attach_child(
                         index,
@@ -2885,7 +2939,9 @@ impl MacosTraceBackend {
                         ownership,
                     )?;
                 } else {
-                    if let Some(owner) = creation { owner.tracee.creation_failed(); }
+                    if let Some(owner) = creation {
+                        owner.tracee.creation_failed();
+                    }
                     self.events
                         .push_back(TraceEvent::SpawnAbort { authorization });
                 }
@@ -2909,10 +2965,16 @@ impl MacosTraceBackend {
             }
             ReturnKind::Fork { restore } => {
                 if let OperationOutcome::Success { return_value } = abi::outcome(&regs)? {
-                    let ownership = creation.ok_or_else(|| error("shutdown.ledger", "unreserved fork"))?;
+                    let ownership =
+                        creation.ok_or_else(|| error("shutdown.ledger", "unreserved fork"))?;
                     #[cfg(feature = "shutdown-witness")]
-                    umbra_platform::shutdown::witness(serde_json::json!({"event": "acquired", "kind": "Tracee", "pid": return_value as i32}));
-                    ownership.tracee.acquired(umbra_core::shutdown::Identity { pid: Some(return_value as i32), birth: None })?;
+                    umbra_platform::shutdown::witness(
+                        serde_json::json!({"event": "acquired", "kind": "Tracee", "pid": return_value as i32}),
+                    );
+                    ownership.tracee.acquired(umbra_core::shutdown::Identity {
+                        pid: Some(return_value as i32),
+                        birth: None,
+                    })?;
                     let twin = s.twin.clone();
                     self.attach_child(
                         index,
@@ -2922,7 +2984,9 @@ impl MacosTraceBackend {
                         Some(restore),
                         ownership,
                     )?;
-                } else if let Some(owner) = creation { owner.tracee.creation_failed(); }
+                } else if let Some(owner) = creation {
+                    owner.tracee.creation_failed();
+                }
                 self.sessions[index].continue_run()?;
             }
             ReturnKind::Spawn { pid_pointer, twin } => {
@@ -2935,10 +2999,16 @@ impl MacosTraceBackend {
                         pid_pointer
                     };
                     s.task.read(pid_pointer, &mut bytes)?;
-                    let ownership = creation.ok_or_else(|| error("shutdown.ledger", "unreserved spawn"))?;
+                    let ownership =
+                        creation.ok_or_else(|| error("shutdown.ledger", "unreserved spawn"))?;
                     #[cfg(feature = "shutdown-witness")]
-                    umbra_platform::shutdown::witness(serde_json::json!({"event": "acquired", "kind": "Tracee", "pid": i32::from_le_bytes(bytes)}));
-                    ownership.tracee.acquired(umbra_core::shutdown::Identity { pid: Some(i32::from_le_bytes(bytes)), birth: None })?;
+                    umbra_platform::shutdown::witness(
+                        serde_json::json!({"event": "acquired", "kind": "Tracee", "pid": i32::from_le_bytes(bytes)}),
+                    );
+                    ownership.tracee.acquired(umbra_core::shutdown::Identity {
+                        pid: Some(i32::from_le_bytes(bytes)),
+                        birth: None,
+                    })?;
                     self.attach_child(
                         index,
                         i32::from_le_bytes(bytes),
@@ -2947,7 +3017,9 @@ impl MacosTraceBackend {
                         None,
                         ownership,
                     )?;
-                } else if let Some(owner) = creation { owner.tracee.creation_failed(); }
+                } else if let Some(owner) = creation {
+                    owner.tracee.creation_failed();
+                }
                 self.sessions[index].continue_run()?;
             }
             // **This arm is the failed-exec return, by construction**: a
@@ -3139,7 +3211,8 @@ impl MacosTraceBackend {
             });
             // Root was spawned by this process. Debugserver hands it back on exit.
             if s.parent.is_none() {
-                s.reaped = wait_owned_terminal(s.id.0.native_id as i32, libc::WNOHANG).unwrap_or(false);
+                s.reaped =
+                    wait_owned_terminal(s.id.0.native_id as i32, libc::WNOHANG).unwrap_or(false);
             }
             // #186: take the teardown barrier's evidence now, while the exited
             // tracee is still a zombie someone has yet to reap.
@@ -3199,9 +3272,16 @@ impl MacosTraceBackend {
             s.entry.clear();
             s.exec_generation += 1;
             s.policy_exec_generation = s.exec_generation;
-            let owner = s.ownership.as_ref().ok_or_else(|| error("shutdown.ledger", "missing exec ownership"))?;
-            let right = owner.ledger.reserve(umbra_core::shutdown::ResourceKind::TaskRight,
-                Some(owner.tracee.id()), s.id.0.generation, s.exec_generation)?;
+            let owner = s
+                .ownership
+                .as_ref()
+                .ok_or_else(|| error("shutdown.ledger", "missing exec ownership"))?;
+            let right = owner.ledger.reserve(
+                umbra_core::shutdown::ResourceKind::TaskRight,
+                Some(owner.tracee.id()),
+                s.id.0.generation,
+                s.exec_generation,
+            )?;
             let task = Arc::new(Task::acquire_owned(s.id.0.native_id as i32, right)?);
             #[cfg(any(test, feature = "retirement-witness"))]
             crate::ownership::task(s.id.0.native_id, &task);
@@ -3407,7 +3487,9 @@ fn wait_owned_terminal(pid: i32, options: i32) -> std::io::Result<bool> {
     let mut status = 0;
     // SAFETY: owned PID and valid status output; no status is inferred from ECHILD.
     let result = unsafe { libc::waitpid(pid, &mut status, options) };
-    if result == -1 { return Err(std::io::Error::last_os_error()); }
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(result == pid && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)))
 }
 fn reap_launched_child(pid: i32) -> bool {
@@ -4184,6 +4266,8 @@ impl Drop for MacosTraceBackend {
     /// A dropped backend tears its sessions down in the same order `terminate`
     /// does, rather than leaving that to the `Vec`'s front-to-back drop.
     fn drop(&mut self) {
+        #[cfg(feature = "shutdown-witness")]
+        umbra_platform::shutdown::witness(serde_json::json!({"event": "owner-drop"}));
         if let Some(watchdog) = &self.watchdog {
             watchdog.terminate_registered();
         }
@@ -4435,24 +4519,37 @@ impl TraceBackend for MacosTraceBackend {
     }
 }
 impl TraceControl for MacosTraceBackend {
-    fn begin_shutdown(&mut self, nonce: umbra_core::shutdown::Nonce) -> Result<umbra_platform::shutdown::Start> {
+    fn begin_shutdown(
+        &mut self,
+        nonce: umbra_core::shutdown::Nonce,
+    ) -> Result<umbra_platform::shutdown::Start> {
+        #[cfg(feature = "shutdown-witness")]
+        umbra_platform::shutdown::witness(serde_json::json!({"event": "owner-begin"}));
         // Serial dispatch leaves no setup operation in flight. Existing retirement
         // deadlines are carried forward; no poll renews an obligation's window.
         let now = crate::clock::now();
-        let retirement = self.sessions.iter()
+        let retirement = self
+            .sessions
+            .iter()
             .filter_map(|s| s.retirement.as_ref())
             .filter(|r| r.outcome().is_none())
             .map(|r| r.deadline().saturating_duration_since(now))
-            .max().unwrap_or_default().max(rsp::TRACER_REAP_BOUND);
+            .max()
+            .unwrap_or_default()
+            .max(rsp::TRACER_REAP_BOUND);
         let mut remaining = retirement;
         for session in self.sessions.iter().chain(self.failed_retirements.iter()) {
             if session.live.is_some() && !session.torn_down {
-                remaining = remaining.checked_add(TEARDOWN_BOUND + rsp::TRACER_REAP_BOUND + TRACEE_REAP_BOUND)
+                remaining = remaining
+                    .checked_add(TEARDOWN_BOUND + rsp::TRACER_REAP_BOUND + TRACEE_REAP_BOUND)
                     .ok_or_else(|| error("shutdown", "cleanup schedule overflow"))?;
             }
         }
         let accepted = self.ledger.freeze(nonce, remaining)?;
-        Ok(umbra_platform::shutdown::Start::Local { accepted, ledger: self.ledger.clone() })
+        Ok(umbra_platform::shutdown::Start::Local {
+            accepted,
+            ledger: self.ledger.clone(),
+        })
     }
 
     fn capabilities(&self) -> PlatformCapabilities {

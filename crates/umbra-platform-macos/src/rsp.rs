@@ -55,10 +55,14 @@ struct SetupChild {
 }
 impl std::ops::Deref for SetupChild {
     type Target = std::process::Child;
-    fn deref(&self) -> &Self::Target { self.child.as_ref().unwrap() }
+    fn deref(&self) -> &Self::Target {
+        self.child.as_ref().unwrap()
+    }
 }
 impl std::ops::DerefMut for SetupChild {
-    fn deref_mut(&mut self) -> &mut Self::Target { self.child.as_mut().unwrap() }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child.as_mut().unwrap()
+    }
 }
 impl Drop for SetupChild {
     fn drop(&mut self) {
@@ -79,7 +83,9 @@ impl Drop for SetupChild {
                 Err(_) => break,
                 Ok(None) => {}
             }
-            if crate::clock::now() >= deadline { break; }
+            if crate::clock::now() >= deadline {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
         if let Some(slot) = &self.ownership {
@@ -181,9 +187,14 @@ impl Rsp {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| error("debugserver spawn", e))?;
-        let mut child = SetupChild { child: Some(child), ownership: ownership.clone() };
+        let mut child = SetupChild {
+            child: Some(child),
+            ownership: ownership.clone(),
+        };
         #[cfg(feature = "shutdown-witness")]
-        umbra_platform::shutdown::witness(serde_json::json!({"event": "acquired", "kind": "Tracer", "pid": child.id()}));
+        umbra_platform::shutdown::witness(
+            serde_json::json!({"event": "acquired", "kind": "Tracer", "pid": child.id()}),
+        );
         if let Some(slot) = &ownership {
             slot.acquired(umbra_core::shutdown::Identity {
                 pid: Some(child.id() as i32),
@@ -507,6 +518,9 @@ impl Rsp {
 }
 #[cfg(test)]
 impl Rsp {
+    pub(crate) fn set_test_ownership(&mut self, slot: umbra_platform::shutdown::Reservation) {
+        self.ownership = Some(slot);
+    }
     pub(crate) fn retirement_test() -> Self {
         Self::retirement_test_pair().0
     }

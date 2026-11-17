@@ -34,13 +34,21 @@ pub struct Closure {
 impl Closure {
     /// Missing proof, including failure before acceptance.
     pub fn failed(error: UmbraError) -> Self {
-        Self { tree_terminated: false, error: Some(error), final_to_exit: None }
+        Self {
+            tree_terminated: false,
+            error: Some(error),
+            final_to_exit: None,
+        }
     }
 
     /// Validate resource evidence independently of transport exit.
     pub fn from_final(accepted: &Accepted, final_state: &Final) -> Self {
         match accepted.confirms(final_state) {
-            Ok(true) => Self { tree_terminated: true, error: None, final_to_exit: None },
+            Ok(true) => Self {
+                tree_terminated: true,
+                error: None,
+                final_to_exit: None,
+            },
             Ok(false) => Self::failed(invalid("shutdown ledger has unconfirmed obligations")),
             Err(error) => Self::failed(error),
         }
@@ -50,6 +58,16 @@ impl Closure {
 impl crate::PlatformSession {
     /// Consume every platform handle before returning a terminal run verdict.
     pub fn shutdown(self) -> Closure {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.shutdown_inner())) {
+            Ok(closure) => closure,
+            Err(payload) => {
+                std::mem::forget(payload);
+                Closure::failed(invalid("shutdown owner panicked"))
+            }
+        }
+    }
+
+    fn shutdown_inner(self) -> Closure {
         let crate::PlatformSession { mut control, abi } = self;
         // Remote proxies share a Client: release the ABI before taking exclusive
         // control ownership. Native ABI destruction stays on this owner thread.
@@ -79,7 +97,12 @@ fn invalid(message: &str) -> UmbraError {
     UmbraError::new(ErrorKind::InvalidState, "platform.shutdown", message)
 }
 
+#[cfg(test)]
+type ThreadLog = Arc<Mutex<Vec<(&'static str, std::thread::ThreadId)>>>;
+
 struct State {
+    #[cfg(test)]
+    thread_log: Option<ThreadLog>,
     instance: Nonce,
     entries: Vec<Entry>,
     accepted: Option<Accepted>,
@@ -102,6 +125,8 @@ impl Ledger {
     /// Start a new provider instance, not a new launch in an existing provider.
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(State {
+            #[cfg(test)]
+            thread_log: None,
             instance: Nonce::new_v4(),
             entries: Vec::new(),
             accepted: None,
@@ -109,6 +134,19 @@ impl Ledger {
             diagnostics: Vec::new(),
             poisoned: false,
         })))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_threads(&self, log: ThreadLog) {
+        self.state().thread_log = Some(log);
+    }
+    #[cfg(test)]
+    pub(crate) fn transport_thread(&self) {
+        if let Some(log) = &self.state().thread_log {
+            log.lock()
+                .unwrap()
+                .push(("transport", std::thread::current().id()));
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -124,7 +162,9 @@ impl Ledger {
         let state = self.state();
         if state.accepted.is_some() || state.poisoned {
             Err(invalid("operation after closure or ledger failure"))
-        } else { Ok(()) }
+        } else {
+            Ok(())
+        }
     }
 
     /// Reserve before a creation-capable operation or resume. No post-freeze
@@ -138,24 +178,39 @@ impl Ledger {
     ) -> Result<Reservation> {
         let mut state = self.state();
         if state.accepted.is_some() || state.poisoned {
-            return Err(invalid("resource acquisition after closure or ledger failure"));
+            return Err(invalid(
+                "resource acquisition after closure or ledger failure",
+            ));
         }
         let sequence = u64::try_from(state.entries.len())
-            .ok().and_then(|n| n.checked_add(1))
+            .ok()
+            .and_then(|n| n.checked_add(1))
             .ok_or_else(|| invalid("reservation sequence exhausted"))?;
         if parent.is_some_and(|parent| {
             parent.instance != state.instance || parent.sequence == 0 || parent.sequence >= sequence
         }) {
             return Err(invalid("invalid acquisition parent"));
         }
-        let id = SlotId { instance: state.instance, sequence };
+        let id = SlotId {
+            instance: state.instance,
+            sequence,
+        };
         state.entries.push(Entry {
-            slot: Slot { id, parent, generation, exec_generation, kind },
+            slot: Slot {
+                id,
+                parent,
+                generation,
+                exec_generation,
+                kind,
+            },
             identity: None,
             disposition: Disposition::Reserved,
         });
         state.progress = state.progress.saturating_add(1);
-        Ok(Reservation { ledger: self.clone(), id })
+        Ok(Reservation {
+            ledger: self.clone(),
+            id,
+        })
     }
 
     /// Freeze the complete reservation set. The caller supplies only the
@@ -170,7 +225,11 @@ impl Ledger {
             instance: state.instance,
             generation: state.progress,
             high_water: state.entries.len() as u64,
-            slots: state.entries.iter().map(|entry| entry.slot.clone()).collect(),
+            slots: state
+                .entries
+                .iter()
+                .map(|entry| entry.slot.clone())
+                .collect(),
             remaining_millis: u64::try_from(remaining.as_millis())
                 .map_err(|_| invalid("cleanup schedule overflow"))?,
         };
@@ -196,16 +255,28 @@ impl Ledger {
     /// reservations remain explicit failures; this never manufactures proof.
     pub fn final_snapshot(&self) -> Result<Final> {
         let state = self.state();
-        let accepted = state.accepted.as_ref().ok_or_else(|| invalid("shutdown not accepted"))?;
+        let accepted = state
+            .accepted
+            .as_ref()
+            .ok_or_else(|| invalid("shutdown not accepted"))?;
         if state.poisoned {
             return Err(invalid("ledger ownership invariant failed"));
         }
-        let entries = state.entries.iter().cloned().map(|mut entry| {
-            if matches!(entry.disposition, Disposition::Reserved | Disposition::Acquired | Disposition::Settling) {
-                entry.disposition = Disposition::Unconfirmed("owner destroyed without terminal proof".into());
-            }
-            entry
-        }).collect();
+        let entries = state
+            .entries
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                if matches!(
+                    entry.disposition,
+                    Disposition::Reserved | Disposition::Acquired | Disposition::Settling
+                ) {
+                    entry.disposition =
+                        Disposition::Unconfirmed("owner destroyed without terminal proof".into());
+                }
+                entry
+            })
+            .collect();
         Ok(Final {
             nonce: accepted.nonce,
             generation: accepted.generation,
@@ -229,7 +300,8 @@ impl Reservation {
     pub fn creation_failed(&self) {
         let mut state = self.ledger.state();
         if let Some(entry) = state.entries.get_mut((self.id.sequence - 1) as usize) {
-            if entry.slot.id == self.id && entry.identity.is_none()
+            if entry.slot.id == self.id
+                && entry.identity.is_none()
                 && matches!(entry.disposition, Disposition::Reserved)
             {
                 entry.disposition = Disposition::NeverCreated;
@@ -244,14 +316,20 @@ impl Reservation {
 
     fn update(&self, f: impl FnOnce(&mut Entry) -> Result<()>) -> Result<()> {
         let mut state = self.ledger.state();
-        let index = usize::try_from(self.id.sequence - 1)
-            .map_err(|_| invalid("unknown reservation"))?;
-        let entry = state.entries.get_mut(index).ok_or_else(|| invalid("unknown reservation"))?;
+        let index =
+            usize::try_from(self.id.sequence - 1).map_err(|_| invalid("unknown reservation"))?;
+        let entry = state
+            .entries
+            .get_mut(index)
+            .ok_or_else(|| invalid("unknown reservation"))?;
         if entry.slot.id != self.id {
             state.poisoned = true;
             return Err(invalid("reservation identity mismatch"));
         }
-        if matches!(entry.disposition, Disposition::Confirmed(_) | Disposition::NeverCreated) {
+        if matches!(
+            entry.disposition,
+            Disposition::Confirmed(_) | Disposition::NeverCreated
+        ) {
             state.poisoned = true;
             return Err(invalid("terminal reservation changed"));
         }
@@ -315,14 +393,33 @@ mod tests {
     fn shutdown_late_result_and_retired_history_survive_freeze() {
         let ledger = Ledger::new();
         let retired = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
-        retired.acquired(Identity { pid: Some(10), birth: None }).unwrap();
-        retired.confirm(Proof::Collected { status: "exit 0".into() }).unwrap();
-        let late = ledger.reserve(ResourceKind::TaskRight, Some(retired.id()), 1, 1).unwrap();
-        let accepted = ledger.freeze(Nonce::new_v4(), Duration::from_secs(1)).unwrap();
+        retired
+            .acquired(Identity {
+                pid: Some(10),
+                birth: None,
+            })
+            .unwrap();
+        retired
+            .confirm(Proof::Collected {
+                status: "exit 0".into(),
+            })
+            .unwrap();
+        let late = ledger
+            .reserve(ResourceKind::TaskRight, Some(retired.id()), 1, 1)
+            .unwrap();
+        let accepted = ledger
+            .freeze(Nonce::new_v4(), Duration::from_secs(1))
+            .unwrap();
         assert_eq!(accepted.slots.len(), 2);
         assert!(ledger.reserve(ResourceKind::Tracer, None, 1, 2).is_err());
-        assert!(!accepted.confirms(&ledger.final_snapshot().unwrap()).unwrap());
-        late.acquired(Identity { pid: Some(11), birth: None }).unwrap();
+        assert!(!accepted
+            .confirms(&ledger.final_snapshot().unwrap())
+            .unwrap());
+        late.acquired(Identity {
+            pid: Some(11),
+            birth: None,
+        })
+        .unwrap();
         late.confirm(Proof::Released).unwrap();
         let final_state = ledger.final_snapshot().unwrap();
         assert_eq!(final_state.entries.len(), 2);
@@ -343,7 +440,12 @@ mod tests {
         let ledger = Ledger::new();
         let slot = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
         slot.never_created().unwrap();
-        assert!(slot.acquired(Identity { pid: Some(123), birth: None }).is_err());
+        assert!(slot
+            .acquired(Identity {
+                pid: Some(123),
+                birth: None
+            })
+            .is_err());
         assert!(ledger.freeze(Nonce::new_v4(), Duration::ZERO).is_err());
     }
 }
@@ -353,14 +455,20 @@ mod tests {
 #[doc(hidden)]
 pub fn witness(record: serde_json::Value) {
     use std::io::Write;
-    let Some(path) = std::env::var_os("UMBRA_FIX_271_EVIDENCE_FILE") else { return; };
+    let Some(path) = std::env::var_os("UMBRA_FIX_271_EVIDENCE_FILE") else {
+        return;
+    };
     let mut record = record;
     record["version"] = "shutdown-witness-v1".into();
     record["writer_pid"] = std::process::id().into();
     record["thread"] = format!("{:?}", std::thread::current().id()).into();
     let mut bytes = serde_json::to_vec(&record).expect("qualification evidence encoding");
     bytes.push(b'\n');
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
         .expect("qualification evidence file");
-    file.write_all(&bytes).expect("qualification evidence write");
+    file.write_all(&bytes)
+        .expect("qualification evidence write");
 }

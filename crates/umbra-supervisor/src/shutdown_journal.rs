@@ -12,13 +12,21 @@ pub(crate) struct TerminalJournal {
 
 impl TerminalJournal {
     pub(crate) fn wrap(journal: Box<dyn Journal>, epoch: LeaseEpoch) -> (Box<dyn Journal>, Self) {
-        let terminal = Self { journal: Arc::new(Mutex::new(journal)), epoch };
+        let terminal = Self {
+            journal: Arc::new(Mutex::new(journal)),
+            epoch,
+        };
         (Box::new(terminal.clone()), terminal)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Box<dyn Journal>>> {
-        self.journal.lock().map_err(|_| UmbraError::new(
-            ErrorKind::InvalidState, "run.shutdown-journal", "journal owner poisoned"))
+        self.journal.lock().map_err(|_| {
+            UmbraError::new(
+                ErrorKind::InvalidState,
+                "run.shutdown-journal",
+                "journal owner poisoned",
+            )
+        })
     }
 
     pub(crate) fn recovery_required(&self) -> Result<()> {
@@ -45,15 +53,25 @@ impl Journal for TerminalJournal {
     fn flush(&mut self, through: Sequence) -> Result<DurableSequence> {
         self.lock()?.flush(through)
     }
-    fn replay(&mut self, after: Sequence) -> Result<Box<dyn Iterator<Item = Result<JournalRecord>> + Send + '_>> {
+    fn replay(
+        &mut self,
+        after: Sequence,
+    ) -> Result<Box<dyn Iterator<Item = Result<JournalRecord>> + Send + '_>> {
         // Replay retains the mutable borrow of this forwarding session. The
         // terminal handle is private and used only after supervision stops.
-        Ok(Box::new(Replay { owner: self.clone(), after, page: VecDeque::new(), done: false }))
+        Ok(Box::new(Replay {
+            owner: self.clone(),
+            after,
+            page: VecDeque::new(),
+            done: false,
+        }))
     }
     fn write_checkpoint(&mut self, checkpoint: &Checkpoint) -> Result<CheckpointId> {
         self.lock()?.write_checkpoint(checkpoint)
     }
-    fn close(&mut self) -> Result<()> { self.lock()?.close() }
+    fn close(&mut self) -> Result<()> {
+        self.lock()?.close()
+    }
 }
 
 struct Replay {
@@ -68,18 +86,30 @@ impl Iterator for Replay {
         if self.page.is_empty() && !self.done {
             let result = (|| {
                 let mut journal = self.owner.lock()?;
-                let page = journal.replay(self.after)?.take(128).collect::<VecDeque<_>>();
+                let page = journal
+                    .replay(self.after)?
+                    .take(128)
+                    .collect::<VecDeque<_>>();
                 Ok(page)
             })();
             match result {
-                Ok(page) => { self.done = page.len() < 128; self.page = page; }
-                Err(error) => { self.done = true; return Some(Err(error)); }
+                Ok(page) => {
+                    self.done = page.len() < 128;
+                    self.page = page;
+                }
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
             }
         }
         let next = self.page.pop_front()?;
         match &next {
             Ok(record) => self.after = record.sequence,
-            Err(_) => { self.done = true; self.page.clear(); }
+            Err(_) => {
+                self.done = true;
+                self.page.clear();
+            }
         }
         Some(next)
     }

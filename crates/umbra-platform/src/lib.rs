@@ -231,10 +231,7 @@ pub trait SyscallAbi {
 pub trait TraceControl: TraceBackend {
     /// Freeze acquisitions and begin terminal provider closure. Default refusal
     /// prevents legacy controls from silently manufacturing an empty proof.
-    fn begin_shutdown(
-        &mut self,
-        _nonce: umbra_core::shutdown::Nonce,
-    ) -> Result<shutdown::Start> {
+    fn begin_shutdown(&mut self, _nonce: umbra_core::shutdown::Nonce) -> Result<shutdown::Start> {
         Err(umbra_core::UmbraError::new(
             umbra_core::ErrorKind::UnsupportedCapability,
             "platform.shutdown",

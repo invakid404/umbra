@@ -368,7 +368,9 @@ impl Client {
         let started = transport_now();
         let deadline = started + REAP_GRACE;
         self.connection.invalidate();
-        let child = self.child.as_mut()
+        let child = self
+            .child
+            .as_mut()
             .ok_or_else(|| protocol_error("platform provider has no owned exit waiter"))?;
         loop {
             match child.try_wait() {
@@ -384,7 +386,9 @@ impl Client {
                 Err(error) => return Err(unavailable(error)),
             }
             if transport_now() >= deadline {
-                return Err(protocol_error("provider exit was not confirmed within REAP_GRACE"));
+                return Err(protocol_error(
+                    "provider exit was not confirmed within REAP_GRACE",
+                ));
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -400,6 +404,18 @@ impl Client {
             welcome,
         }
     }
+    /// Explicit owned exit waiter for injected protocol contract tests.
+    /// The caller must supply the child that owns the peer connection.
+    #[cfg(feature = "test-owned-exit")]
+    pub fn from_owned_connection(connection: Connection, welcome: Welcome, child: Child) -> Self {
+        Self {
+            connection,
+            child: Some(child),
+            next_id: 1,
+            welcome,
+        }
+    }
+
     /// Validate provider registration and establish a private protocol session.
     pub fn connect(descriptor: &ProviderDescriptor, timeout_ms: u64) -> Result<Self> {
         descriptor.validate(&descriptor.role)?;

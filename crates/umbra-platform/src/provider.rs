@@ -184,7 +184,9 @@ struct Abi {
 pub fn connect(descriptor: &ProviderDescriptor, timeout_ms: u64) -> Result<PlatformSession> {
     descriptor.validate("platform")?;
     let mut descriptor = descriptor.clone();
-    descriptor.capabilities.insert(umbra_core::shutdown::CAPABILITY.into());
+    descriptor
+        .capabilities
+        .insert(umbra_core::shutdown::CAPABILITY.into());
     let mut client = Client::connect(&descriptor, timeout_ms)?;
     let capabilities = match client.call(&Request::Capabilities)? {
         Response::Capabilities(v) => v,
@@ -318,10 +320,13 @@ impl TraceBackend for Control {
 impl TraceControl for Control {
     fn begin_shutdown(&mut self, nonce: umbra_core::shutdown::Nonce) -> Result<shutdown::Start> {
         if Rc::strong_count(&self.client) != 1 {
-            return Err(protocol_error("shutdown requires exclusive platform ownership"));
+            return Err(protocol_error(
+                "shutdown requires exclusive platform ownership",
+            ));
         }
         Ok(shutdown::Start::Remote(closing::close_client(
-            &mut self.client.borrow_mut(), nonce,
+            &mut self.client.borrow_mut(),
+            nonce,
         )))
     }
     fn capabilities(&self) -> PlatformCapabilities {

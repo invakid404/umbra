@@ -6,6 +6,10 @@ license.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Explicit owned-child adapter for protocol contract tests only.
+test-owned-exit = []
+
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true

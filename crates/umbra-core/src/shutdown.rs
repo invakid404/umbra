@@ -194,23 +194,42 @@ impl Accepted {
             if !seen.insert(entry.slot.id) {
                 return Err(invalid("duplicate final slot"));
             }
-            let expected = self.slots.iter().find(|slot| slot.id == entry.slot.id)
+            let expected = self
+                .slots
+                .iter()
+                .find(|slot| slot.id == entry.slot.id)
                 .ok_or_else(|| invalid("unknown final slot"))?;
             if expected != &entry.slot {
                 return Err(invalid("final changed immutable reservation"));
             }
             confirmed &= match (&entry.slot.kind, &entry.disposition) {
                 (_, Disposition::NeverCreated) => entry.identity.is_none(),
-                (ResourceKind::Tracer, Disposition::Confirmed(Proof::Collected { status })) =>
-                    !status.is_empty() && entry.identity.as_ref().is_some_and(|id| id.pid.is_some_and(|pid| pid > 0)),
-                (ResourceKind::TaskRight, Disposition::Confirmed(Proof::Released)) =>
-                    entry.identity.is_some(),
-                (ResourceKind::Tracee, Disposition::Confirmed(Proof::Accounted {
-                    root_owned, root_collected, evidence,
-                })) => !evidence.is_empty()
-                    && *root_owned == entry.slot.parent.is_none()
-                    && (*root_owned == *root_collected)
-                    && entry.identity.as_ref().is_some_and(|id| id.pid.is_some_and(|pid| pid > 0)),
+                (ResourceKind::Tracer, Disposition::Confirmed(Proof::Collected { status })) => {
+                    !status.is_empty()
+                        && entry
+                            .identity
+                            .as_ref()
+                            .is_some_and(|id| id.pid.is_some_and(|pid| pid > 0))
+                }
+                (ResourceKind::TaskRight, Disposition::Confirmed(Proof::Released)) => {
+                    entry.identity.is_some()
+                }
+                (
+                    ResourceKind::Tracee,
+                    Disposition::Confirmed(Proof::Accounted {
+                        root_owned,
+                        root_collected,
+                        evidence,
+                    }),
+                ) => {
+                    !evidence.is_empty()
+                        && *root_owned == entry.slot.parent.is_none()
+                        && (*root_owned == *root_collected)
+                        && entry
+                            .identity
+                            .as_ref()
+                            .is_some_and(|id| id.pid.is_some_and(|pid| pid > 0))
+                }
                 _ => false,
             };
         }
@@ -223,15 +242,41 @@ mod tests {
     use super::*;
     fn inventory() -> (Accepted, Final) {
         let instance = Uuid::new_v4();
-        let slot = Slot { id: SlotId { instance, sequence: 1 }, parent: None,
-            generation: 1, exec_generation: 0, kind: ResourceKind::Tracee };
-        let accepted = Accepted { nonce: Uuid::new_v4(), instance, generation: 1,
-            high_water: 1, slots: vec![slot.clone()], remaining_millis: 100 };
-        let final_state = Final { nonce: accepted.nonce, generation: 1,
-            entries: vec![Entry { slot, identity: Some(Identity { pid: Some(123), birth: Some((1, 2)) }),
+        let slot = Slot {
+            id: SlotId {
+                instance,
+                sequence: 1,
+            },
+            parent: None,
+            generation: 1,
+            exec_generation: 0,
+            kind: ResourceKind::Tracee,
+        };
+        let accepted = Accepted {
+            nonce: Uuid::new_v4(),
+            instance,
+            generation: 1,
+            high_water: 1,
+            slots: vec![slot.clone()],
+            remaining_millis: 100,
+        };
+        let final_state = Final {
+            nonce: accepted.nonce,
+            generation: 1,
+            entries: vec![Entry {
+                slot,
+                identity: Some(Identity {
+                    pid: Some(123),
+                    birth: Some((1, 2)),
+                }),
                 disposition: Disposition::Confirmed(Proof::Accounted {
-                    evidence: "exact owned terminal wait".into(), root_owned: true, root_collected: true,
-                }) }], diagnostics: vec![] };
+                    evidence: "exact owned terminal wait".into(),
+                    root_owned: true,
+                    root_collected: true,
+                }),
+            }],
+            diagnostics: vec![],
+        };
         (accepted, final_state)
     }
     #[test]
@@ -253,17 +298,32 @@ mod tests {
                 8 => accepted.slots[0].parent = Some(accepted.slots[0].id),
                 _ => unreachable!(),
             }
-            assert!(accepted.confirms(&final_state).is_err(), "mutation {mutation}");
+            assert!(
+                accepted.confirms(&final_state).is_err(),
+                "mutation {mutation}"
+            );
         }
     }
     #[test]
     fn shutdown_requires_every_obligation() {
         let (accepted, mut final_state) = inventory();
-        for disposition in [Disposition::Reserved, Disposition::Acquired, Disposition::Settling,
-            Disposition::Unconfirmed("wait unavailable".into()), Disposition::NeverCreated,
+        for disposition in [
+            Disposition::Reserved,
+            Disposition::Acquired,
+            Disposition::Settling,
+            Disposition::Unconfirmed("wait unavailable".into()),
+            Disposition::NeverCreated,
             Disposition::Confirmed(Proof::Released),
-            Disposition::Confirmed(Proof::Accounted { evidence: "zombie".into(), root_owned: true, root_collected: false }),
-            Disposition::Confirmed(Proof::Accounted { evidence: "zombie".into(), root_owned: false, root_collected: false }),
+            Disposition::Confirmed(Proof::Accounted {
+                evidence: "zombie".into(),
+                root_owned: true,
+                root_collected: false,
+            }),
+            Disposition::Confirmed(Proof::Accounted {
+                evidence: "zombie".into(),
+                root_owned: false,
+                root_collected: false,
+            }),
         ] {
             final_state.entries[0].disposition = disposition;
             assert!(!accepted.confirms(&final_state).unwrap());

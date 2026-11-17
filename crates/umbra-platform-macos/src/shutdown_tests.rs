@@ -91,3 +91,69 @@ fn drop_during_latch_joins_after_release() {
     assert!(returned.load(Ordering::SeqCst), "Drop must join the latch");
     releaser.join().unwrap();
 }
+
+#[test]
+fn freeze_late_result() {
+    use umbra_core::shutdown::{Identity, Nonce, Proof, ResourceKind};
+    let ledger = umbra_platform::shutdown::Ledger::new();
+    let slot = ledger.reserve(ResourceKind::Tracer, None, 1, 0).unwrap();
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let worker = std::thread::spawn(move || {
+        release_rx.recv().unwrap();
+        slot.acquired(Identity {
+            pid: Some(123),
+            birth: None,
+        })
+        .unwrap();
+        slot.confirm(Proof::Collected {
+            status: "exit 0".into(),
+        })
+        .unwrap();
+    });
+    let accepted = ledger
+        .freeze(Nonce::new_v4(), Duration::from_secs(1))
+        .unwrap();
+    assert!(!accepted
+        .confirms(&ledger.final_snapshot().unwrap())
+        .unwrap());
+    assert!(ledger.reserve(ResourceKind::Tracer, None, 1, 1).is_err());
+    release_tx.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(accepted
+        .confirms(&ledger.final_snapshot().unwrap())
+        .unwrap());
+}
+
+#[test]
+fn replacement_keeps_old_tracer_collection_obligation() {
+    use umbra_core::shutdown::{Identity, Nonce, ResourceKind};
+    let ledger = umbra_platform::shutdown::Ledger::new();
+    let (mut old, _old_peer) = Rsp::retirement_test_pair();
+    let (mut replacement, _replacement_peer) = Rsp::retirement_test_pair();
+    for (generation, tracer) in [(0, &mut old), (1, &mut replacement)] {
+        let slot = ledger
+            .reserve(ResourceKind::Tracer, None, 1, generation)
+            .unwrap();
+        slot.acquired(Identity {
+            pid: Some(tracer.tracer_pid()),
+            birth: None,
+        })
+        .unwrap();
+        tracer.set_test_ownership(slot);
+    }
+    assert!(replacement.reap_tracer(Duration::ZERO));
+    let accepted = ledger
+        .freeze(Nonce::new_v4(), Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(accepted.slots.len(), 2);
+    assert!(
+        !accepted
+            .confirms(&ledger.final_snapshot().unwrap())
+            .unwrap(),
+        "replacement must not erase old tracer receipt"
+    );
+    assert!(old.reap_tracer(Duration::ZERO));
+    assert!(accepted
+        .confirms(&ledger.final_snapshot().unwrap())
+        .unwrap());
+}

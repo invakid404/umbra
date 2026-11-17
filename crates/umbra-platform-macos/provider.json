@@ -43,6 +43,6 @@
     111,
     115
   ],
-  "capabilities": ["bounded-event-poll-v1"],
+  "capabilities": ["bounded-event-poll-v1", "platform.shutdown-ledger.v1"],
   "options": []
 }

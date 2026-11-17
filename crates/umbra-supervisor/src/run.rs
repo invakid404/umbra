@@ -895,7 +895,7 @@ pub fn resume(_spec: ResumeSpec) -> Result<ResumeOutcome> {
 }
 
 #[cfg(all(test, unix))]
-pub(crate) use unix::finish_supervision;
+pub(crate) use unix::{finish_supervision, supervise_prepared};
 
 #[cfg(unix)]
 mod unix {
@@ -1201,7 +1201,8 @@ mod unix {
 
         // From here the namespace owns storage and journal; failures go through
         // its own fail path so one owner decides what is released.
-        let (journal, terminal_journal) = crate::shutdown_journal::TerminalJournal::wrap(journal, lease.epoch);
+        let (journal, terminal_journal) =
+            crate::shutdown_journal::TerminalJournal::wrap(journal, lease.epoch);
         let mut namespace = standard_namespace(storage, journal);
         // A routed run's tracee-visible root is not on this host at all, so the
         // profile's one write allowance names an empty per-run directory instead.
@@ -1340,12 +1341,20 @@ mod unix {
 
         let mut supervisor = Supervisor::with_namespace(run_id, platform, namespace, None);
         supervisor.terminal_journal = Some(terminal_journal);
-        if let Err(primary) = supervisor.launch_prepared(launch_spec, budget) {
-            return finish_supervision(supervisor, Err(primary), &mut observer);
-        }
+        supervise_prepared(supervisor, launch_spec, budget, &mut observer)
+    }
 
+    pub(crate) fn supervise_prepared(
+        mut supervisor: Supervisor,
+        launch_spec: LaunchSpec,
+        budget: RunBudget,
+        observer: &mut Option<Box<dyn RunObserver>>,
+    ) -> Result<()> {
+        if let Err(primary) = supervisor.launch_prepared(launch_spec, budget) {
+            return finish_supervision(supervisor, Err(primary), observer);
+        }
         let loop_result = supervisor.run();
-        finish_supervision(supervisor, loop_result, &mut observer)
+        finish_supervision(supervisor, loop_result, observer)
     }
 
     pub(crate) fn finish_supervision(
@@ -1360,7 +1369,13 @@ mod unix {
             processes_exited: supervisor.processes_exited(),
         };
         let preliminary = supervisor.terminate_tree(TerminationPolicy::Immediate);
-        let crate::SupervisorParts { platform, mut namespace, terminal_journal, agent, .. } = supervisor.into_parts();
+        let crate::SupervisorParts {
+            platform,
+            mut namespace,
+            terminal_journal,
+            agent,
+            ..
+        } = supervisor.into_parts();
         let closure = platform.shutdown();
         drop(agent);
         let mut failure = match (loop_result, closure.error) {

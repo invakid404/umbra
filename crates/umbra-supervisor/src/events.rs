@@ -2057,8 +2057,8 @@ mod tests {
     fn shutdown_failed_journal_finish_does_not_notify_observer_success() {
         use crate::run::{RunObserver, RunOutcome};
         use std::sync::{
-            Arc,
             atomic::{AtomicUsize, Ordering},
+            Arc,
         };
         struct Observer(Arc<AtomicUsize>);
         impl RunObserver for Observer {
@@ -2071,10 +2071,12 @@ mod tests {
             fn teardown_warning(&mut self, _: &UmbraError) {}
         }
         let finished = Arc::new(AtomicUsize::new(0));
-        let mut observer: Option<Box<dyn RunObserver>> =
-            Some(Box::new(Observer(finished.clone())));
+        let mut observer: Option<Box<dyn RunObserver>> = Some(Box::new(Observer(finished.clone())));
         let mut supervisor = supervisor();
-        supervisor.platform.control = Box::new(shutdown_journal::ScriptedControl(Some(shutdown_journal::confirmed())));
+        supervisor.platform.control = Box::new(shutdown_journal::ScriptedControl(
+            Some(shutdown_journal::confirmed()),
+            false,
+        ));
         supervisor
             .handle_event(TraceEvent::Exit {
                 task: task(1),
