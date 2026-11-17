@@ -1980,6 +1980,17 @@ mod tests {
         }
     }
     impl TraceControl for Fake {
+        fn begin_shutdown(
+            &mut self,
+            nonce: umbra_core::shutdown::Nonce,
+        ) -> Result<umbra_platform::shutdown::Start> {
+            // This event-loop fake owns no native resources.
+            let ledger = umbra_platform::shutdown::Ledger::new();
+            Ok(umbra_platform::shutdown::Start::Local {
+                accepted: ledger.freeze(nonce, Duration::ZERO)?,
+                ledger,
+            })
+        }
         fn capabilities(&self) -> PlatformCapabilities {
             PlatformCapabilities::default()
         }
