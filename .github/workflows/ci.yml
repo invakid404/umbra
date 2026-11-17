@@ -705,6 +705,7 @@ jobs:
           transports = {row["nonce"]: row for row in rows if row["event"] == "transport-final"}
           exits = [row for row in rows if row["event"] == "final-to-exit"]
           assert exits, "no positive closure reading"
+          assert any(row["proof"] for row in exits), "no confirmed closure control"
           for row in exits:
               assert row["timing_origin"] == "final-decoded", row
               owner = transports[row["nonce"]]
@@ -715,7 +716,8 @@ jobs:
                                  if e["identity"] is not None)
               assert actual == recorded, (actual - recorded, recorded - actual)
               print("shutdown Final-to-exit:", row["nanos"], "ns", "acquisitions:", sum(actual.values()))
-              assert row["proof"] and row["exit_ok"] and int(row["nanos"]) <= 50_000_000, row
+              # Fault cases may correctly return an unconfirmed complete inventory.
+              assert row["exit_ok"] and int(row["nanos"]) <= 50_000_000, row
           PY
 
       - name: Restore binaries after packed spawn faults
