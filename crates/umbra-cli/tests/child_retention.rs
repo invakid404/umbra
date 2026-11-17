@@ -202,6 +202,15 @@ fn fix_274_completed_children_census() {
         .args(["--experimental", "--local-dev", "--"])
         .arg(&fixture);
     let stderr = root.join("supervised.stderr");
+    if std::env::var_os("UMBRA_RETIREMENT_WITNESS").is_some() {
+        let provider = Path::new(env!("CARGO_BIN_EXE_umbra")).parent().unwrap().join("umbra-platform-macos");
+        let hash = Command::new("/usr/bin/shasum").args(["-a", "256"]).arg(&provider).output().unwrap();
+        assert!(hash.status.success());
+        eprintln!("retirement provider identity: {}", String::from_utf8_lossy(&hash.stdout));
+        let binary = std::fs::read(&provider).unwrap();
+        assert!(binary.windows(b"retirement-ownership".len()).any(|bytes| bytes == b"retirement-ownership"),
+            "executed provider is missing retirement-witness; no reading");
+    }
     let mut run = Run::start(command, &stderr);
     let tracee: u32 = run
         .marker("ready pid=")

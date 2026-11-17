@@ -107,7 +107,8 @@ impl Connection {
     pub fn begin(&mut self) {
         self.deadline = transport_now() + self.timeout;
     }
-    fn remaining(&self) -> Result<Duration> {
+    /// Remaining time in the current frame's original request deadline.
+    pub fn remaining(&self) -> Result<Duration> {
         if self.failed {
             return Err(unavailable("connection is closed"));
         }
@@ -120,6 +121,14 @@ impl Connection {
     pub fn invalidate(&mut self) {
         self.failed = true;
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+    /// Awake-time clock used by request deadlines and shutdown envelopes.
+    pub fn clock_now() -> Instant {
+        transport_now()
+    }
+    /// Existing configured request budget, without starting a new deadline.
+    pub fn request_timeout(&self) -> Duration {
+        self.timeout
     }
     fn read_progress(&mut self, out: &mut [u8], offset: usize) -> std::io::Result<usize> {
         #[cfg(test)]
@@ -346,6 +355,41 @@ impl Drop for Client {
     }
 }
 impl Client {
+    /// Whether this client can independently confirm its provider's exit.
+    /// Attached storage/journal clients remain valid for their own protocols.
+    pub fn owns_provider(&self) -> bool {
+        self.child.is_some()
+    }
+
+    /// After a validated Final, wait without signalling the owned provider.
+    /// Failure leaves the child owned for the existing emergency Drop path.
+    /// The returned duration is available to test-side Final-to-exit readings.
+    pub fn confirm_provider_exit(&mut self) -> Result<Duration> {
+        let started = transport_now();
+        let deadline = started + REAP_GRACE;
+        self.connection.invalidate();
+        let child = self.child.as_mut()
+            .ok_or_else(|| protocol_error("platform provider has no owned exit waiter"))?;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.child.take();
+                    if !status.success() {
+                        return Err(protocol_error(format!("provider exited with {status}")));
+                    }
+                    return Ok(transport_now().saturating_duration_since(started));
+                }
+                Ok(None) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(unavailable(error)),
+            }
+            if transport_now() >= deadline {
+                return Err(protocol_error("provider exit was not confirmed within REAP_GRACE"));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Attach an already handshaken private stream; intended for injected contract transports.
     /// The caller must establish identity, role, version and capability agreement first.
     pub fn from_connection(connection: Connection, welcome: Welcome) -> Self {

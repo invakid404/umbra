@@ -331,6 +331,7 @@ mod filesystem;
 
 /// Contracts only: no backend-kind enum, concrete backend import, or provider I/O.
 pub struct Supervisor {
+    terminal_journal: Option<crate::shutdown_journal::TerminalJournal>,
     platform: PlatformSession,
     namespace: Box<dyn NamespaceSession + Send>,
     agent: Option<Box<dyn Agent>>,
@@ -413,6 +414,7 @@ enum RoutedEffect {
 
 /// Returned ownership does not imply providers were closed or a clean shutdown.
 pub struct SupervisorParts {
+    pub(crate) terminal_journal: Option<crate::shutdown_journal::TerminalJournal>,
     /// Platform.
     pub platform: PlatformSession,
     /// Namespace.
@@ -449,6 +451,7 @@ impl Supervisor {
         agent: Option<Box<dyn Agent>>,
     ) -> Self {
         Self {
+            terminal_journal: None,
             platform,
             namespace,
             agent,
@@ -482,6 +485,7 @@ impl Supervisor {
     /// Into parts.
     pub fn into_parts(self) -> SupervisorParts {
         SupervisorParts {
+            terminal_journal: self.terminal_journal,
             platform: self.platform,
             namespace: self.namespace,
             agent: self.agent,
@@ -567,3 +571,5 @@ impl Supervisor {
         Self::resume(spec)
     }
 }
+
+mod shutdown_journal;

@@ -9,6 +9,8 @@ publish = false
 [features]
 # Qualification-only allocation witnesses; no fault injection.
 retirement-witness = []
+# Independent acquisition and Final-to-exit qualification records.
+shutdown-witness = ["umbra-platform/shutdown-witness"]
 # Mutation probes for the two syscall decode arms this crate owns, on the same
 # terms as `umbra-overlay`'s: each BREAKS one arm on purpose so a test can prove
 # an end-to-end case depends on it, both are compile-time only so no product

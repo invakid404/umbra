@@ -684,6 +684,7 @@ name = "umbra-platform"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "umbra-core",
  "uuid",
 ]

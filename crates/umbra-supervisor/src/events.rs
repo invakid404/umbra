@@ -2074,6 +2074,7 @@ mod tests {
         let mut observer: Option<Box<dyn RunObserver>> =
             Some(Box::new(Observer(finished.clone())));
         let mut supervisor = supervisor();
+        supervisor.platform.control = Box::new(shutdown_journal::ScriptedControl(Some(shutdown_journal::confirmed())));
         supervisor
             .handle_event(TraceEvent::Exit {
                 task: task(1),

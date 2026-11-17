@@ -19,6 +19,7 @@ fn slot(generation: u64, done: bool) -> (Session, std::net::TcpStream) {
     let (rsp, peer) = Rsp::retirement_test_pair();
     (
         Session {
+            ownership: None,
             id: TaskId(TaskIdentity {
                 native_id: pid,
                 generation,
@@ -115,6 +116,7 @@ fn retirement_release_owns_all_resources() {
     retiring.pending.insert(
         thread,
         Pending {
+            creation: None,
             thread,
             entry: 1,
             entry_breakpoint: breakpoint,
