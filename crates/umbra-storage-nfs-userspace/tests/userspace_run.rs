@@ -1350,6 +1350,12 @@ fn shadow_path(run: &Run) -> Vec<Vec<u8>> {
 /// before any payload is looked at. Every failure panics rather than answering
 /// `false`: a log this cannot read is not a log without a completion record.
 fn journal_records_completion(run: &Run) -> bool {
+    journal_has_lifecycle(run, |lifecycle| {
+        matches!(lifecycle, JournalLifecycle::RunCompleted { .. })
+    })
+}
+
+fn journal_has_lifecycle(run: &Run, predicate: impl Fn(&JournalLifecycle) -> bool) -> bool {
     let control = run.state_root().join("journal");
     let directory = PhysicalPath(BytePath::new(control.as_os_str().as_bytes().to_vec()).unwrap());
     let mut journal = FileJournal::new();
@@ -1373,7 +1379,7 @@ fn journal_records_completion(run: &Run) -> bool {
         .any(|record| {
             matches!(
                 record.payload,
-                JournalPayload::Lifecycle(JournalLifecycle::RunCompleted { .. })
+                JournalPayload::Lifecycle(ref lifecycle) if predicate(lifecycle)
             )
         });
     completed
@@ -10035,6 +10041,10 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
 /// What every routed leaf owes after its own oracles: no host effect, no
 /// mount, a reopen that takes writer authority, no SIGHUP anywhere observed.
 fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
+    slate_spawn_finish_reopen(spawn, routed, false);
+}
+
+fn slate_spawn_finish_reopen(spawn: &SlateSpawn, routed: &SlateRouted, unconfirmed: bool) {
     let reopened = slate_bounded(
         Command::new(binaries().join("umbra"))
             .args(["resume", "--registry"])
@@ -10055,7 +10065,25 @@ fn slate_spawn_finish(spawn: &SlateSpawn, routed: &SlateRouted) {
         ),
     )
     .unwrap();
-    assert!(reopened.status.success(), "writer authority reopen failed");
+    if unconfirmed {
+        assert!(
+            !reopened.status.success(),
+            "unconfirmed tree regained writer authority"
+        );
+        assert!(
+            String::from_utf8_lossy(&reopened.stderr).contains("LeaseLost during open_run"),
+            "unexpected reopen refusal: {}",
+            String::from_utf8_lossy(&reopened.stderr)
+        );
+        assert!(
+            journal_has_lifecycle(&routed.run, |lifecycle| {
+                matches!(lifecycle, JournalLifecycle::RecoveryRequired)
+            }),
+            "missing durable recovery-required marker"
+        );
+    } else {
+        assert!(reopened.status.success(), "writer authority reopen failed");
+    }
     assert_workspace_pristine(&routed.run);
     assert_host_write_root_empty(&routed.run);
     assert_eq!(
@@ -16310,7 +16338,7 @@ fn fix_271_shutdown_journal_and_inheritance() {
     let completed = journal_records_completion(&routed.run);
     // Finish the existing ownership census before asserting the new verdict,
     // preserving evidence even on the expected failing-first reading.
-    slate_spawn_finish(&spawn, &routed);
+    slate_spawn_finish_reopen(&spawn, &routed, true);
     slate_finish_cleanup();
     assert!(
         routed
