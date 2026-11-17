@@ -10,10 +10,15 @@ use umbra_core::shutdown::{Nonce, Poll};
 type Clock = std::sync::Arc<std::sync::Mutex<std::time::Instant>>;
 #[cfg(test)]
 thread_local! { static CLOCK: std::cell::RefCell<Option<Clock>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+thread_local! { static CLOCK_TICK: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) }; }
 fn now() -> std::time::Instant {
     #[cfg(test)]
     if let Some(clock) = CLOCK.with(|value| value.borrow().clone()) {
-        return *clock.lock().unwrap();
+        let mut clock = clock.lock().unwrap();
+        let current = *clock;
+        *clock += CLOCK_TICK.with(|tick| tick.get());
+        return current;
     }
     Connection::clock_now()
 }

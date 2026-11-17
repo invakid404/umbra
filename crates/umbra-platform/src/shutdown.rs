@@ -594,6 +594,63 @@ mod tests {
         assert!(accepted.confirms(&final_state).unwrap());
     }
     #[test]
+    fn shutdown_replacement_rejects_invalid_sources_without_reserving() {
+        for case in 0..10 {
+            let ledger = Ledger::new();
+            let root = collected_model_root(&ledger);
+            let old = ledger
+                .reserve(ResourceKind::TaskRight, Some(root), 1, 0)
+                .unwrap();
+            old.acquired(Identity {
+                pid: Some(123),
+                birth: None,
+            })
+            .unwrap();
+            let mut previous = old.id();
+            match case {
+                0 => previous.sequence = 0,
+                1 => previous.sequence = u64::MAX,
+                2 => previous.sequence += 1,
+                3 => previous.instance = Nonce::new_v4(),
+                4 => ledger.state().entries[1].slot.kind = ResourceKind::Tracer,
+                5 => ledger.state().entries[1].slot.parent = None,
+                6 => ledger.state().entries[1].slot.generation = 2,
+                7 => ledger.state().entries[1].slot.exec_generation = 1,
+                8 => ledger.state().entries[1].disposition = Disposition::Reserved,
+                9 => old.confirm(Proof::Released).unwrap(),
+                _ => unreachable!(),
+            }
+            let progress = ledger.state().progress;
+            assert!(
+                ledger.reserve_replacement(root, 1, 1, previous).is_err(),
+                "invalid replacement source case {case}"
+            );
+            assert_eq!(ledger.state().entries.len(), 2);
+            assert_eq!(ledger.state().progress, progress);
+        }
+        // Both retained dispositions remain eligible; the prior obligation
+        // stays present after allocating its replacement.
+        for settling in [false, true] {
+            let ledger = Ledger::new();
+            let root = collected_model_root(&ledger);
+            let old = ledger
+                .reserve(ResourceKind::TaskRight, Some(root), 1, 0)
+                .unwrap();
+            old.acquired(Identity {
+                pid: Some(123),
+                birth: None,
+            })
+            .unwrap();
+            if settling {
+                ledger.state().entries[1].disposition = Disposition::Settling;
+            }
+            let replacement = ledger.reserve_replacement(root, 1, 1, old.id()).unwrap();
+            assert_eq!(replacement.id().sequence, 3);
+            assert_eq!(ledger.state().entries[2].slot.replaces, Some(old.id()));
+            assert_eq!(ledger.state().entries[1].slot.id, old.id());
+        }
+    }
+    #[test]
     fn shutdown_birth_reuse_cannot_replace_a_captured_identity() {
         let ledger = Ledger::new();
         let slot = ledger.reserve(ResourceKind::Tracee, None, 1, 0).unwrap();

@@ -268,7 +268,7 @@ enum Script {
     PendingSlot,
 }
 
-fn scripted(script: Script) {
+fn scripted(script: Script) -> Closure {
     let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
     let mut child = std::process::Command::new(if matches!(script, Script::NonzeroExit) {
         "/usr/bin/false"
@@ -392,6 +392,18 @@ fn scripted(script: Script) {
             assert!(!closure.tree_terminated, "{script:?}");
         }
     }
+    closure
+}
+#[test]
+fn shutdown_success_reports_decoded_final_interval() {
+    // Advance only the shutdown clock. The independent exit wait uses its own
+    // clock, so returning that shorter measurement cannot satisfy this oracle.
+    CLOCK.with(|clock| *clock.borrow_mut() = Some(Arc::new(Mutex::new(std::time::Instant::now()))));
+    CLOCK_TICK.with(|tick| tick.set(Duration::from_secs(1)));
+    let closure = scripted(Script::Confirmed);
+    CLOCK.with(|clock| *clock.borrow_mut() = None);
+    CLOCK_TICK.with(|tick| tick.set(Duration::ZERO));
+    assert_eq!(closure.final_to_exit, Some(Duration::from_secs(1)));
 }
 #[test]
 fn shutdown_owned_provider_exit_is_required() {
