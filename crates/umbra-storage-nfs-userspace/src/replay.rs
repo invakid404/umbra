@@ -282,7 +282,7 @@ pub trait ReplayLog: Send {
 /// So [`crate::fake::FakeReplayLog`] is a complete implementation of this
 /// contract, not a shape fake like [`crate::fake::FakeTransport`] beside it: it
 /// holds records in memory because that is what the contract describes, and it
-/// marks the [`RetainedError`](crate::error::RetainedError) values it produces
+/// marks the [`RetainedError`] values it produces
 /// **non-durable**, which is the honest answer and the conservative one. Aliasing
 /// it under a production name is deliberate — duplicating the same map-backed
 /// logic under a second type would give two implementations to keep in step and

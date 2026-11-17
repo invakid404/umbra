@@ -461,12 +461,13 @@ impl NfsUserspaceStorage {
     ///
     /// # What earns the capability, and what does not
     ///
-    /// Binding a socket is not qualification. [`Self::probe_export`] reads the
+    /// With `transport-raw`, binding a socket is not qualification.
+    /// `probe_export` reads the
     /// export root filehandle and walks `export/` and `run_parent/`, requiring
     /// each to be a directory on the server, and only that sets
-    /// [`Self::validated`]. [`Self::capabilities`] then advertises
-    /// [`capabilities::STORAGE_USERSPACE_NFSV4_V1`] and
-    /// [`capabilities::STORAGE_USERSPACE_ROUTING_V1`], and advertises neither
+    /// the provider's `validated` flag. [`Self::capabilities`] then advertises
+    /// [`umbra_core::capabilities::STORAGE_USERSPACE_NFSV4_V1`] and
+    /// [`umbra_core::capabilities::STORAGE_USERSPACE_ROUTING_V1`], and advertises neither
     /// otherwise. The precedent is exact: `umbra-storage-nfs` gates
     /// `mounted-nfsv4-v1` on its own `validated` flag rather than on
     /// configuration.

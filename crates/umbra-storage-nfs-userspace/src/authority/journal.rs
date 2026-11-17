@@ -2,7 +2,7 @@
 //! caller is told anything.
 //!
 //! This is a thin, opinionated driver over the frozen
-//! [`ReplayLog`](crate::replay::ReplayLog). The facade already fixes the record
+//! [`ReplayLog`]. The facade already fixes the record
 //! shapes and the idempotency rules; what this module adds is the ordering the
 //! failure model demands and a type that makes it unskippable.
 //!
