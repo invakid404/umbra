@@ -22,6 +22,32 @@ The RSP client (`src/rsp.rs`) is a
 small, bounded reverse-connect implementation with framed `$…#CC` packets,
 RLE decode, and a per-request deadline.
 
+## Confirmed shutdown
+
+The provider advertises `platform.shutdown-ledger.v1`. Its ledger reserves slots
+before root/child creation, tracer launch and task-right acquisition, and keeps
+retired history through quiesce, resume and preliminary termination. Exec records
+replacement-right relationships without discarding the old right's release
+obligation. Captured process birth identities remain attached to their slots.
+Exact owned-child collection is distinct from descendant exit accounting:
+`ECHILD`, EOF and sending a signal are never collection receipts.
+
+Shutdown freezes admissions and destroys the backend on its original thread.
+A separate transport thread serves bounded polls from snapshots and emits Final
+only after all owner destruction. Existing session teardown, tracer/root reap
+and retirement windows determine the owner envelope; polling never restarts
+them. Synchronous kernel calls and cooperative watchdog cancellation/join assume
+kernel-call completion. An envelope overrun fails closure rather than claiming
+successful cleanup. No session-age, inactivity or cancellation policy is added.
+
+The shared monitor stores a typed terminal cause. Genuine explicit deadline
+expiry reports operation `watchdog`; owner loss, monitor failure and panic
+report `owner-observation`, regardless of which monitor reads the shared latch.
+The `shutdown-witness` test feature records acquisition identities, owner/thread
+ordering and Final-to-owned-exit duration to `UMBRA_FIX_271_EVIDENCE_FILE`.
+It adds no default production logging. Provider-loss limitations in #198 and
+#205 remain unqualified.
+
 ## Packed spawn descriptors (experimental)
 
 The bounded packed-descriptor path admits kernel-only CLOSE, DUP2 and INHERIT
@@ -1117,7 +1143,8 @@ sandbox qualification tests exercise a symlinked cache root.
 
 Failed attach and sandbox-handoff paths set `launch_tree_terminated` on the returned
 error only when `waitpid` confirms reaping every created tracee. Missing evidence
-remains false so the supervisor retains writer authority after uncertain launch failure.
+remains false. The supervisor decides writer release from the complete shutdown
+ledger and provider collection, rather than this flag alone.
 
 ## Routed filesystem metadata
 

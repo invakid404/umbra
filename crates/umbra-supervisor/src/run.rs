@@ -132,7 +132,7 @@ pub trait RunObserver {
     /// Neither `finished` nor `teardown_warning` is called after `prepared`
     /// fails. Panics in those other callbacks are not contained.
     fn prepared(&mut self, run_id: RunId) -> Result<()>;
-    /// Called once when the supervised tree has finished, before teardown result.
+    /// Called once after confirmed platform closure and successful journal finish.
     fn finished(&mut self, outcome: &RunOutcome);
     /// Provider bookkeeping failed after all processes reported exit.
     fn teardown_warning(&mut self, error: &UmbraError);

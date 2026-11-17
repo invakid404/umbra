@@ -266,7 +266,9 @@ Build its locked manifest into the workspace target. The supervisor's
 `observer_failure` tests require `UMBRA_TEST_OBSERVER` or
 `UMBRA_INTEGRATION_REQUIRED`; CI supplies required mode. A platform sentinel
 accepts the capability handshake and checks that failed preparation never
-requests Launch.
+requests Launch. It also speaks `platform.shutdown-ledger.v1` with an empty
+accepted inventory and matching Final, so the fixture remains compatible with
+the supervisor's pre-launch capability requirement.
 
 ## Filesystem metadata fixture
 

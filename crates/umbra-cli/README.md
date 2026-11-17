@@ -109,7 +109,8 @@ adds `TMPDIR`.
 
 Clap usage diagnostics exit 2. Every structured failure exits 1, including a
 supervised program that exited nonzero, which surfaces as `ProcessFailed` after a
-clean teardown. Exit 0 means the root process succeeded **and** the run's data,
+clean teardown. Exit 0 requires confirmed platform resource closure and collection
+of its provider process. It means the root process succeeded **and** the run's data,
 journal and writer lease were closed cleanly. The child's own exit code is not
 propagated: a 0 would describe the child while saying nothing about persistence.
 

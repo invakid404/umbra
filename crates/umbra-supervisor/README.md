@@ -8,7 +8,8 @@ run's durable journal state directly before reopening it. The suites that spawn
 the real provider executables skip when those are absent, and fail instead under
 `UMBRA_INTEGRATION_REQUIRED` (`tests/reopen.rs:38-67`).
 This crate owns `src/lib.rs`, `src/run.rs`, `src/events.rs`, `src/ofd.rs`,
-`src/base.rs`, `src/sandbox.rs`, `src/directory.rs`, `src/filesystem.rs`, `src/spawn.rs` and its manifest. `directory.rs` holds the
+`src/base.rs`, `src/sandbox.rs`, `src/directory.rs`, `src/filesystem.rs`,
+`src/spawn.rs`, `src/shutdown_journal.rs` and its manifest. `directory.rs` holds the
 `DirectoryEncoder` the overlay requires for `FsOp::ReadDir`: the engine resolves
 the merged entries and this side turns them into the native records the tracee's
 `getattrlistbulk` reply expects, using the wire format in `umbra_platform::dirents`
@@ -39,7 +40,7 @@ workspace checks, the refusal of any registry configuring a `namespace` role, th
 storage descriptor's persistence-mode capability, and the presence of the journal
 role. `validate` calls it and then adds what describes the *launch* — the
 `--experimental` acknowledgement, the `RunLaunch` shape,
-`experimental-open-rewrite-v1` and the two platform capabilities. `resume` calls it
+`experimental-open-rewrite-v1` and the required platform capabilities. `resume` calls it
 and adds nothing, because it resolves nothing, rewrites nothing, launches nothing
 and never connects the platform role; requiring capabilities it does not exercise
 would turn an unqualified claim into a passing check.
@@ -108,8 +109,10 @@ The staged order is fixed, and each stage's failure decides what may be released
 6. Render enforcement from the run's own root, re-verify the workspace inventory,
    then connect the platform, require exactly one advertised architecture and one
    matching ABI capability `<platform>-<arch>-abi-v<decimal version>`,
-   require `bounded-event-poll-v1`, and launch stopped.
-7. Drive events, then tear down in order: flush run data, append and flush a
+   require `bounded-event-poll-v1` and `platform.shutdown-ledger.v1`, and launch stopped.
+7. Drive events, then consume the platform session through confirmed shutdown:
+   freeze its resource inventory, validate every final disposition after backend
+   destruction, and collect the owned provider process. Only then flush run data, append and flush a
    completion record, close the journal, release the writer, close storage.
 
 `Ok(())` requires a successful root status **and** a clean teardown. A nonzero or
@@ -117,8 +120,8 @@ signalled child after a clean teardown is `ErrorKind::ProcessFailed`. A failure
 after the lease is taken releases writer authority only when the supervised tree
 is provably gone; otherwise the run is left recovery-required with the writer
 marker retained, and the primary error is preserved with cleanup damage appended.
-A failed launch releases writer authority only when the backend supplies explicit
-`launch_tree_terminated` evidence; an error category is never evidence.
+A failed launch uses the same shutdown barrier. The legacy
+`launch_tree_terminated` diagnostic alone cannot establish closure.
 
 `RunObserver::prepared` returns `Result<()>`. It runs after namespace preparation
 and the platform capability handshake, before target launch. A returned error or
@@ -130,10 +133,19 @@ is produced. A caught panic has a fixed diagnostic; its arbitrary payload is
 neither formatted nor dropped, preventing a second panic from interrupting
 cleanup. Other observer callbacks retain their existing behaviour.
 
-A provider bookkeeping error after all process exits preserves the run's success
-semantics and is reported through `RunObserver::teardown_warning` (or tracing
-when no observer is installed). A `finish_run` error enters the namespace failure
-path, preserving the original error and appending cleanup failures.
+A preliminary termination error may be superseded by a complete shutdown proof
+and provider collection; its diagnostic remains a teardown warning. Missing or
+invalid Final, unconfirmed obligations, and provider-exit failure prevent
+completion. A validated ledger retains `tree_terminated=true` even if provider
+collection fails. Loop errors stay primary, with closure diagnostics appended.
+
+Before failure cleanup, a supervisor-private forwarding journal appends and
+flushes the existing `RecoveryRequired` marker when platform closure fails.
+Marker-write failures remain errors and cannot permit completion. A loop refusal
+with confirmed closure does not add that marker. No journal format changes.
+`RunObserver::finished` runs only after `finish_run` succeeds. A finish error
+enters namespace failure cleanup; an error after a durable completion record
+cannot erase that record and still suppresses the success callback.
 
 Provider `timeout_ms` must be positive. Renewal is checked at every provider
 boundary and scheduled at half the lease interval, with a 100 ms floor.
