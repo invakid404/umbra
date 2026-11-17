@@ -34,12 +34,15 @@ fn shutdown_native_root_ledger() {
         options: serde_json::to_vec(&umbra_platform_macos::Options::default()).unwrap(),
     };
     let mut platform = umbra_platform::provider::connect(&descriptor, 5000).unwrap();
+    let shadow = tempfile::tempdir().unwrap();
+    let literal = format!("\"{}\"", shadow.path().display());
+    let profile = include_str!("../../../experiments/seatbelt/umbra.sb").replace("{{UMBRA_RUN_ROOT}}", &literal);
     let root = platform.control.launch(LaunchSpec {
         executable: path(Path::new("/bin/sleep")), argv: vec![b"sleep".to_vec(), b"60".to_vec()],
         environment: vec![], cwd: path(Path::new("/tmp")),
         policy: LaunchPolicy { persistence: PersistencePolicy::LocalDevelopment,
             inherited_fds: vec![], interpose: false, descriptor_limit: None },
-        sandbox: SandboxRequirement::UnsandboxedExperiment,
+        sandbox: SandboxRequirement::Required(SandboxProfile::new(SEATBELT_PROFILE_FORMAT, profile.into_bytes(), path(shadow.path())).unwrap()),
     }).unwrap();
     let preliminary = platform.control.terminate(root, TerminationPolicy::Immediate);
     eprintln!("preliminary termination: {preliminary:?}");
@@ -65,5 +68,5 @@ fn shutdown_native_root_ledger() {
     }).collect::<Vec<_>>();
     observed.sort(); accounted.sort();
     assert_eq!(observed, accounted, "creation-return witness must match every acquired ledger slot");
-    assert_eq!(observed.len(), 3, "root tracee, task right, and owned tracer");
+    assert_eq!(observed.len(), 4, "root tracee, initial and exec task rights, and owned tracer");
 }
