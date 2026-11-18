@@ -1293,8 +1293,22 @@ mod unix {
             Err(e) => return Err(fail(namespace, run_id, e, true)),
         };
         if let Some(observer) = observer.as_mut() {
-            if let Err(e) = observer.stdio_adopted() {
-                return Err(fail(namespace, run_id, e, true));
+            let adopted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.stdio_adopted()
+            }));
+            match adopted {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(fail(namespace, run_id, e, true)),
+                Err(payload) => {
+                    let e = error(
+                        ErrorKind::InvalidState,
+                        "run.observer",
+                        "stdio_adopted observer panicked",
+                    );
+                    let failure = fail(namespace, run_id, e, true);
+                    std::mem::forget(payload);
+                    return Err(failure);
+                }
             }
         }
         let capabilities = platform.control.capabilities();
