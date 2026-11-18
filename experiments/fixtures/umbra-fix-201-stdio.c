@@ -42,6 +42,14 @@ int main(int argc, char **argv) {
         dprintf(2, "F201 input matched exactly six bytes\n");
         return write(1, "f201-read-ok\n", 13) == 13 ? 0 : 25;
     }
+    if (!strcmp(argv[1], "self-pipe")) {
+        int ends[2];
+        signal(SIGPIPE, SIG_DFL);
+        if (pipe(ends)) return 34;
+        if (close(ends[0])) return 35;
+        (void)write(ends[1], "x", 1);
+        return 36;
+    }
     if (!strcmp(argv[1], "sigpipe")) {
         int ignored = argc > 2 && !strcmp(argv[2], "ignore");
         signal(SIGPIPE, ignored ? SIG_IGN : SIG_DFL);

@@ -173,10 +173,41 @@ fn f201_pipe_sigpipe() {
                 assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
             } else {
                 assert_eq!(out.status.code(), Some(1));
-                // The CLI keeps its exit contract; require the *tracee's* cause,
-                // not merely some nonzero supervisor result.
-                assert!(String::from_utf8_lossy(&out.stderr).contains("Signal(13)"));
+                fatal_sigpipe(&case, &out);
             }
+        }
+    });
+}
+
+fn fatal_sigpipe(root: &Path, out: &std::process::Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("tracee stop"), "{stderr}");
+    assert!(stderr.contains("fatal signal/exception: T0d"), "{stderr}");
+    let state = root.join("state");
+    let ids: Vec<_> = std::fs::read_dir(&state).unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter_map(|name| uuid::Uuid::parse_str(&name).ok()).collect();
+    assert_eq!(ids.len(), 1);
+    let run = Run {
+        run_id: RunId(ids[0]), status: out.status.code(), stderr: stderr.into_owned(),
+        destination: root.join("unused"), state, workspace: root.join("workspace"),
+        registry: root.join("unused-registry"),
+    };
+    assert!(!journal_records_completion(&run), "fatal stop recorded completion");
+}
+
+#[test]
+fn f201_self_pipe_sigpipe() {
+    pairs(|root, target, native| {
+        let out = command(root, target, native, "self-pipe")
+            .stdin(Stdio::null()).stdout(Stdio::null()).output().unwrap();
+        eprintln!("self-pipe native={native}: {:?}\n{}", out.status,
+            String::from_utf8_lossy(&out.stderr));
+        if native {
+            assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
+        } else {
+            fatal_sigpipe(root, &out);
         }
     });
 }
