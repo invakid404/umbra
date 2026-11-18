@@ -51,6 +51,20 @@ static void handled(int signo) {
 
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
+    if (!strcmp(argv[1], "mask-verify")) {
+        if (argc != 3) return 64;
+        sigset_t mask;
+        struct sigaction action;
+        if (sigprocmask(SIG_SETMASK, NULL, &mask) ||
+            sigismember(&mask, SIGUSR2) != atoi(argv[2]) ||
+            sigaction(SIGPIPE, NULL, &action) || action.sa_handler != SIG_DFL) return 104;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = handled;
+        if (sigaction(SIGUSR1, &action, NULL) || kill(getpid(), SIGUSR1) ||
+            deliveries != 1) return 105;
+        return 0;
+    }
     if (!strcmp(argv[1], "rate")) {
         if (argc != 3) return 64;
         rate_root = argv[2];

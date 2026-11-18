@@ -153,6 +153,166 @@ fn locks(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
+
+#[test]
+fn f284_same_process_overlap() {
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
+    if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none() {
+        eprintln!("SKIP qualified same-process signal overlap");
+        return;
+    }
+    fn actions() -> Vec<(usize, i32, libc::sigset_t)> {
+        [libc::SIGINT, libc::SIGPIPE, libc::SIGUSR1]
+            .into_iter()
+            .map(|sig| unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut action), 0);
+                (action.sa_sigaction, action.sa_flags, action.sa_mask)
+            })
+            .collect()
+    }
+    struct Hold {
+        ready: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        fault: u8,
+        executable: PathBuf,
+    }
+    impl RunObserver for Hold {
+        fn prepared(&mut self, _: RunId) -> umbra_core::Result<()> {
+            self.ready.send(()).unwrap();
+            self.release.recv().unwrap();
+            if self.fault == 1 {
+                std::fs::remove_file(&self.executable).unwrap();
+            }
+            if self.fault == 2 {
+                panic!("planned overlap observer unwind");
+            }
+            Ok(())
+        }
+    }
+    let host_actions = actions();
+    let fixture = std::env::var_os("UMBRA_F284_SIGNALS").expect("compile signal fixture");
+    for (first, fault) in [(0, 0), (1, 0), (0, 1), (0, 2)] {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut releases = Vec::new();
+        let mut results = Vec::new();
+        let mut threads = Vec::new();
+        for index in 0..2 {
+            let root = scratch.path().join(index.to_string());
+            std::fs::create_dir_all(&root).unwrap();
+            let workspace = root.join("workspace");
+            let store = root.join("store");
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::create_dir(&store).unwrap();
+            let exe = root.join("signal-fixture");
+            std::fs::copy(&fixture, &exe).unwrap();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            releases.push(release_tx);
+            results.push(done_rx);
+            threads.push(std::thread::spawn(move || unsafe {
+                let mut prior: libc::sigset_t = std::mem::zeroed();
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut prior),
+                    0
+                );
+                struct Restore(libc::sigset_t);
+                impl Drop for Restore {
+                    fn drop(&mut self) {
+                        unsafe {
+                            assert_eq!(
+                                libc::pthread_sigmask(
+                                    libc::SIG_SETMASK,
+                                    &self.0,
+                                    std::ptr::null_mut()
+                                ),
+                                0
+                            );
+                        }
+                    }
+                }
+                let _restore = Restore(prior);
+                let mut desired = prior;
+                if index == 0 {
+                    libc::sigdelset(&mut desired, libc::SIGUSR2);
+                } else {
+                    libc::sigaddset(&mut desired, libc::SIGUSR2);
+                }
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &desired, std::ptr::null_mut()),
+                    0
+                );
+                let before = actions();
+                let mut native = std::process::Command::new(&exe);
+                native.args(["mask-verify", &index.to_string()]);
+                native.pre_exec(|| {
+                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                    Ok(())
+                });
+                assert!(native.status().unwrap().success(), "native thread policy");
+                let spec = RunSpec {
+                    registry: registry(&store, true),
+                    launch: RunLaunch::Command(CommandLaunch {
+                        executable: BytePath::new(exe.as_os_str().as_bytes().to_vec()).unwrap(),
+                        argv: vec![
+                            b"signal-fixture".to_vec(),
+                            b"mask-verify".to_vec(),
+                            index.to_string().into_bytes(),
+                        ],
+                        environment: Vec::new(),
+                        cwd: BytePath::new(workspace.as_os_str().as_bytes().to_vec()).unwrap(),
+                    }),
+                    workspace,
+                    persistence: RunPersistence::LocalDevelopment,
+                    experimental: true,
+                    state_root: root.join("state"),
+                    observer: Some(Box::new(Hold {
+                        ready: ready_tx,
+                        release: release_rx,
+                        fault: if index == first { fault } else { 0 },
+                        executable: exe,
+                    })),
+                };
+                let outcome = catch_unwind(AssertUnwindSafe(|| umbra_supervisor::run(spec)));
+                let ok = matches!(&outcome, Ok(Ok(_)));
+                eprintln!("overlap first={first} fault={fault} thread={index}: {outcome:?}");
+                assert_eq!(actions(), before);
+                let mut after: libc::sigset_t = std::mem::zeroed();
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut after),
+                    0
+                );
+                assert_eq!(after, desired);
+                done_tx.send(ok).unwrap();
+            }));
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("prepared barrier");
+        }
+        assert_eq!(actions(), host_actions);
+        releases[first].send(()).unwrap();
+        let first_ok = results[first]
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(
+            actions(),
+            host_actions,
+            "first completion altered live second call"
+        );
+        releases[1 - first].send(()).unwrap();
+        let second_ok = results[1 - first]
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(first_ok, fault == 0);
+        assert!(second_ok);
+        assert_eq!(actions(), host_actions);
+    }
+}
 fn scenario(label: &str, failure: u8) {
     if std::env::var_os("UMBRA_TEST_OBSERVER").is_none()
         && std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none()
