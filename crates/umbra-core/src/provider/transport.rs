@@ -702,6 +702,38 @@ mod tests {
             capabilities: Default::default(),
         }
     }
+    fn queued_stdio(sender: &Connection) {
+        let file = tempfile::tempfile().unwrap();
+        crate::launch_stdio::LaunchStdio::new(std::array::from_fn(|_| {
+            file.try_clone().unwrap().into()
+        }))
+        .unwrap()
+        .send(&sender.stream)
+        .unwrap();
+    }
+    #[test]
+    fn ancillary_transfer_rejects_an_expired_request_before_receiving() {
+        let (mut receiver, sender) = pair(Duration::from_secs(5));
+        queued_stdio(&sender);
+        receiver.set_deadline(transport_now() - Duration::from_secs(1));
+        assert!(receiver.receive_launch_stdio().is_err());
+        assert!(receiver.failed, "expired request must invalidate transport");
+    }
+    #[test]
+    fn ancillary_transfer_refreshes_timeout_from_the_remaining_budget() {
+        let (mut receiver, sender) = pair(Duration::from_secs(5));
+        receiver
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        receiver.set_deadline(transport_now() + Duration::from_secs(1));
+        queued_stdio(&sender);
+        receiver.receive_launch_stdio().unwrap();
+        assert!(
+            receiver.stream.read_timeout().unwrap().unwrap() <= Duration::from_secs(1),
+            "ancillary receive reused the earlier frame's timeout"
+        );
+    }
     #[test]
     fn oversize_truncated_and_timed_out_frames_invalidate_connection() {
         let (mut receiver, mut sender) = pair(Duration::from_millis(30));
