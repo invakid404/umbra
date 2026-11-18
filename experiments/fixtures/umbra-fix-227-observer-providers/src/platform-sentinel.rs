@@ -13,6 +13,7 @@ fn main() {
             capabilities::PLATFORM_INTERPOSE_V1.to_owned(),
             capabilities::PLATFORM_BOUNDED_EVENT_POLL_V1.to_owned(),
             shutdown::CAPABILITY.to_owned(),
+            launch_stdio::CAPABILITY.to_owned(),
         ]
         .into_iter()
         .collect(),
@@ -29,6 +30,10 @@ fn main() {
         let request: Request = wire::decode(&payload).unwrap();
         let mut terminal = false;
         let result = match request {
+            Request::AdoptStdio => connection.receive_launch_stdio().map(|stdio| {
+                drop(stdio);
+                Response::Unit
+            }),
             Request::BeginShutdown { nonce } if accepted.is_none() => {
                 let snapshot = ledger.freeze(nonce, std::time::Duration::ZERO).unwrap();
                 accepted = Some(snapshot.clone());

@@ -114,14 +114,37 @@ of its provider process. It means the root process succeeded **and** the run's d
 journal and writer lease were closed cleanly. The child's own exit code is not
 propagated: a 0 would describe the child while saying nothing about persistence.
 
-Run status goes to stderr, so `umbra`'s own diagnostics never reach stdout. The
-supervised program's streams are not the caller's, though: it inherits fds 0-2
-from the platform provider process, which the provider transport starts with
-stdin and stdout on `/dev/null` and stderr inherited
-(`umbra-core/src/provider/transport.rs`). A supervised program's stderr
-therefore reaches the caller and its stdout is discarded — `/bin/cat` under
-`umbra run` exits 0 and prints nothing. Plumbing the tracee's stdout through to
-the caller is unimplemented.
+Run status and errors go to stderr. The root program receives the caller's
+stdin, stdout and stderr as the same open file descriptions: tty, pipe/FIFO,
+Unix stream socket, regular file (including offset and append flags), or
+`/dev/null`. Directories, other devices and other socket kinds are refused
+before provider launch with `UnsupportedCapability` at `stdio-endpoint-kind`.
+This also restricts fd 2 kinds that previously passed through unchecked.
+
+After the platform acknowledges ownership, the CLI releases its stdin/stdout
+references. It retains stderr for diagnostics; stderr EOF therefore waits for
+umbra and its providers to exit. Embedded callers retain their own descriptors.
+Rust startup replaces closed standard slots with `/dev/null` on the qualified
+macOS host; closed-slot EBADF behavior is not preserved.
+
+Inherited-stream bytes are host state: they are neither journaled nor replayed.
+`resume` currently reopens filesystem state without launching a program; it does
+not restore terminal descriptors, modes or input. A subsequent launch captures
+its invocation's current endpoints.
+
+Foreground terminal reads from fd 2 are supported. Background terminal reads
+from fd 2, and now stdin, encounter the existing fatal `T15` stop and CLI exit 1;
+stdin previously returned EOF. Job-control stop/continue parity is deferred.
+Opening `/dev/tty` and setting terminal modes remain unsupported. Existing
+SIGWINCH, SIGCONT and SIGCHLD absorption remains a limitation.
+
+SIGPIPE currently ends a supervised run with umbra's fatal-stop error
+(`tracee stop`, `fatal signal/exception: T0d`), exit 1, and no journal completion.
+For example, this can occur when piping output to `head -1`. It also occurs
+when the program ignores SIGPIPE, unlike native execution's EPIPE return;
+this affects programs such as Rust, Python and Node applications that ignore
+SIGPIPE. Signal delivery, including foreground SIGINT and SIGPIPE dispositions,
+is deferred to slice 2. No native signal-delivery parity is claimed.
 
 ### In launchd's session
 

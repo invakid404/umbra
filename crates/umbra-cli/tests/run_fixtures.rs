@@ -880,10 +880,11 @@ fn crash_case(crash: Crash) {
     // child's own status never becomes umbra's. A crashed tracee is exit 1 --
     // not 137, not 139, not the signal number, and not the child's code.
     assert_eq!(output.status.code(), Some(1), "{case}: {stderr}");
-    assert!(
-        output.stdout.is_empty(),
-        "{case}: diagnostics belong on stderr: {:?}",
-        String::from_utf8_lossy(&output.stdout)
+    // The tracee is this test executable: its harness banner now reaches the
+    // caller through inherited stdout. Umbra diagnostics remain on stderr.
+    assert_eq!(
+        output.stdout, b"\nrunning 1 test\n",
+        "{case}: tracee stdout"
     );
     assert!(!stderr.contains("panicked"), "{case} panicked: {stderr}");
     let id = uuid::Uuid::parse_str(prepared_id(&stderr).expect("prepared run ID")).unwrap();

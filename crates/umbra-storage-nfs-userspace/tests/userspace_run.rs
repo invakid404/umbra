@@ -3046,13 +3046,9 @@ fn a_non_empty_directory_removal_ends_the_run_rather_than_answering_enotempty_81
 // LIMITS item 6 in `umbra_interpose.c`), and a partial `ls` lists correct names
 // while exiting 1, which is a dishonest exit code rather than a cheap `ls`.
 //
-// **What is not asserted: printed stdout.** The provider transport points the
-// tracee's stdout at `/dev/null`, so a filter's output is not observable from
-// here -- and pinning it empty would pin that limitation rather than any
-// behaviour. `cat`'s proof is the pair of legs `run_fixtures.rs` established:
-// the present operand exits 0 with the host untouched, and the absent one makes
-// `cat` name itself, its operand and the verdict on stderr, which no program
-// that did not run can compose.
+// **What is not asserted here: printed stdout.** These utility controls retain
+// their filesystem/status contract. Exact inherited-stream bytes are covered by
+// `stdio201`; the directory fixture below separately checks decoded entries.
 // ---------------------------------------------------------------------------
 
 /// What one standard utility must leave behind after one routed `umbra run`.
@@ -3218,10 +3214,7 @@ const UTILITY_CASES: &[(&str, &str, Utility)] = &[
     // `"."` before it looks at the operand).
     //
     // **What this row proves is exit 0 and an untouched host, not the listing.**
-    // A traced tracee inherits the platform provider's standard output, which is
-    // `Stdio::null()`, so no test can read what `ls` printed. That is exactly
-    // why the design gate ratified asserting on *entries* instead of on the exit
-    // code, and the entries are proven by
+    // Decoded entries are independently proven by
     // `a_directory_listing_through_fts_reaches_the_tracee_over_the_userspace_client`
     // below, which drives the same `libsystem_c` `fts` code through the same
     // routed calls and writes what it read where the client can read it back.
@@ -3530,13 +3523,10 @@ fn every_mutation_probe_is_wired_into_the_userspace_job() {
 /// object kind still reported as a non-directory, the run exited 0 having listed
 /// nothing at all.
 ///
-/// **Why a fixture rather than `/bin/ls` itself.** A traced tracee inherits the
-/// platform provider's standard output, and providers are spawned with
-/// `Stdio::null()`, so no harness can read what a traced program printed.
-/// `/bin/ls` is therefore observable only by its exit status, which the
-/// paragraph above disqualifies. The fixture writes the names it read into the
-/// routed workspace instead, and this reads them back out of the export through
-/// the userspace NFSv4 client with nothing mounted.
+/// **Why a fixture rather than an exit-status assertion.** The fixture writes
+/// the names into the routed workspace, which this test reads back through the
+/// userspace NFSv4 client. This checks decoded entries and routed persistence;
+/// inherited stdout delivery has separate exact-byte controls in `stdio201`.
 ///
 /// **It is not a re-implementation of `ls`.** It calls `fts_open`/`fts_read`/
 /// `fts_children` with `FTS_PHYSICAL | FTS_NOSTAT` and `FTS_NAMEONLY` -- the

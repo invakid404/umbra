@@ -21,9 +21,10 @@ fn command(root: &Path, target: &(String, u16), native: bool, mode: &str) -> Com
         let registry = registry(root, &target.0, target.1);
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
-        config["providers"]["platform"]["options"] = serde_json::json!(
-            serde_json::to_vec(&serde_json::json!({"timeout_ms": 20_000})).unwrap()
-        );
+        config["providers"]["platform"]["options"] = serde_json::json!(serde_json::to_vec(
+            &serde_json::json!({"timeout_ms": 20_000})
+        )
+        .unwrap());
         std::fs::write(&registry, serde_json::to_vec(&config).unwrap()).unwrap();
         let mut c = Command::new(binaries().join("umbra"));
         c.args(["run", "--registry"])
@@ -167,7 +168,7 @@ fn f201_pipe_sigpipe() {
                 out.status,
                 String::from_utf8_lossy(&out.stderr)
             );
-            if ignored {
+            if native && ignored {
                 success(&out);
             } else if native {
                 assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
@@ -185,25 +186,40 @@ fn fatal_sigpipe(root: &Path, out: &std::process::Output) {
     assert!(stderr.contains("tracee stop"), "{stderr}");
     assert!(stderr.contains("fatal signal/exception: T0d"), "{stderr}");
     let state = root.join("state");
-    let ids: Vec<_> = std::fs::read_dir(&state).unwrap()
+    let ids: Vec<_> = std::fs::read_dir(&state)
+        .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter_map(|name| uuid::Uuid::parse_str(&name).ok()).collect();
+        .filter_map(|name| uuid::Uuid::parse_str(&name).ok())
+        .collect();
     assert_eq!(ids.len(), 1);
     let run = Run {
-        run_id: RunId(ids[0]), status: out.status.code(), stderr: stderr.into_owned(),
-        destination: root.join("unused"), state, workspace: root.join("workspace"),
+        run_id: RunId(ids[0]),
+        status: out.status.code(),
+        stderr: stderr.into_owned(),
+        destination: root.join("unused"),
+        state,
+        workspace: root.join("workspace"),
         registry: root.join("unused-registry"),
     };
-    assert!(!journal_records_completion(&run), "fatal stop recorded completion");
+    assert!(
+        !journal_records_completion(&run),
+        "fatal stop recorded completion"
+    );
 }
 
 #[test]
 fn f201_self_pipe_sigpipe() {
     pairs(|root, target, native| {
         let out = command(root, target, native, "self-pipe")
-            .stdin(Stdio::null()).stdout(Stdio::null()).output().unwrap();
-        eprintln!("self-pipe native={native}: {:?}\n{}", out.status,
-            String::from_utf8_lossy(&out.stderr));
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .output()
+            .unwrap();
+        eprintln!(
+            "self-pipe native={native}: {:?}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
         if native {
             assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
         } else {

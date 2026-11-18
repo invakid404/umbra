@@ -17,6 +17,8 @@ mod closing;
 /// Bounded polling is negotiated by capability; legacy messages remain supported.
 #[derive(Serialize, Deserialize)]
 pub enum Request {
+    /// One-shot ancillary descriptor adoption; its ordered response is the ACK.
+    AdoptStdio,
     /// Freeze the provider's complete resource inventory.
     BeginShutdown {
         /// Fresh client request identity.
@@ -182,12 +184,37 @@ struct Abi {
 
 /// Negotiate both proxies on one provider session; no architecture-based backend selection.
 pub fn connect(descriptor: &ProviderDescriptor, timeout_ms: u64) -> Result<PlatformSession> {
+    connect_inner(descriptor, timeout_ms, None)
+}
+
+/// Connect with owned root stdio; only the platform role receives these handles.
+pub fn connect_with_stdio(
+    descriptor: &ProviderDescriptor,
+    timeout_ms: u64,
+    stdio: umbra_core::launch_stdio::LaunchStdio,
+) -> Result<PlatformSession> {
+    connect_inner(descriptor, timeout_ms, Some(stdio))
+}
+
+fn connect_inner(
+    descriptor: &ProviderDescriptor,
+    timeout_ms: u64,
+    stdio: Option<umbra_core::launch_stdio::LaunchStdio>,
+) -> Result<PlatformSession> {
     descriptor.validate("platform")?;
     let mut descriptor = descriptor.clone();
     descriptor
         .capabilities
         .insert(umbra_core::shutdown::CAPABILITY.into());
+    if stdio.is_some() {
+        descriptor
+            .capabilities
+            .insert(umbra_core::launch_stdio::CAPABILITY.into());
+    }
     let mut client = Client::connect(&descriptor, timeout_ms)?;
+    if let Some(stdio) = stdio {
+        unit(client.call_with_stdio(&Request::AdoptStdio, stdio)?)?;
+    }
     let capabilities = match client.call(&Request::Capabilities)? {
         Response::Capabilities(v) => v,
         _ => return Err(protocol_error("platform.capabilities response")),
@@ -650,6 +677,10 @@ pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) 
             }
             previous = id;
             let result = match wire::decode(&payload)? {
+                Request::AdoptStdio => connection
+                    .receive_launch_stdio()
+                    .and_then(|stdio| platform.control.adopt_stdio(stdio))
+                    .map(|()| Response::Unit),
                 Request::BeginShutdown { nonce } => return Ok(Some((id, nonce))),
                 Request::Decode(regs) => {
                     let mut memory = Memory {

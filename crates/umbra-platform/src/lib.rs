@@ -50,6 +50,16 @@ pub enum EventPoll {
 /// after exec, and own sandbox installation, signal forwarding, and instruction
 /// repair. Failure must never permit an uncontrolled host-filesystem mutation.
 pub trait TraceBackend {
+    /// Adopt stdio for the next root launch. Unsupported backends reject it
+    /// before any tracee is spawned; ownership is dropped on rejection.
+    #[cfg(unix)]
+    fn adopt_stdio(&mut self, _stdio: umbra_core::launch_stdio::LaunchStdio) -> Result<()> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "platform.stdio",
+            "launch-scoped stdio is unsupported",
+        ))
+    }
     /// Launch under tracing, with enforcement and inherited-fd sanitation installed
     /// before unrestricted execution. Apply the policy in `spec` before resuming.
     fn launch(&mut self, spec: LaunchSpec) -> Result<ProcessHandle>;

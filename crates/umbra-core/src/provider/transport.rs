@@ -55,6 +55,14 @@ pub struct Connection {
     failed: bool,
 }
 impl Connection {
+    /// Receive the platform's one-shot owned descriptor payload.
+    pub fn receive_launch_stdio(&mut self) -> Result<crate::launch_stdio::LaunchStdio> {
+        let result = crate::launch_stdio::LaunchStdio::receive(&self.stream);
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
     /// Construct this value from the supplied configuration or fields.
     pub fn new(stream: UnixStream, timeout: Duration) -> Self {
         Self {
@@ -540,6 +548,35 @@ impl Client {
                 Err(protocol_error("unexpected response or request ID"))
             }
         }
+    }
+
+    /// Send a platform-only request followed by its owned descriptor payload.
+    /// The response is the ownership ACK; any uncertainty closes the transport.
+    pub fn call_with_stdio<Q: Serialize, R: serde::de::DeserializeOwned>(
+        &mut self,
+        request: &Q,
+        stdio: crate::launch_stdio::LaunchStdio,
+    ) -> Result<R> {
+        if self.welcome.role != "platform"
+            || !self
+                .welcome
+                .capabilities
+                .contains(crate::launch_stdio::CAPABILITY)
+        {
+            return Err(protocol_error("platform launch-stdio capability required"));
+        }
+        let result = (|| {
+            let id = self.start(request)?;
+            stdio.send(&self.connection.stream)?;
+            match self.connection.receive()? {
+                Frame::Response { id: got, result } if id == got => decode(&result?),
+                _ => Err(protocol_error("stdio ownership ACK mismatch")),
+            }
+        })();
+        if result.is_err() {
+            self.connection.invalidate();
+        }
+        result
     }
 }
 
