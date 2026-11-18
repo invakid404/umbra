@@ -168,6 +168,10 @@ fn provider_owned_stdio_handle_is_absent_from_tracee() {
     );
     let mut backend = MacosTraceBackend::default();
     backend.adopt_stdio(stdio).unwrap();
+    // Deliberately model a provider handle missing F1. This test isolates
+    // root-spawn CLOEXEC_DEFAULT (F2), not the per-handle admission fence.
+    assert_eq!(unsafe { libc::fcntl(high, libc::F_SETFD, 0) }, 0);
+    assert_eq!(unsafe { libc::fcntl(high, libc::F_GETFD) }, 0);
     let process = backend
         .launch(launch)
         .expect("sentinel reaches target exec");
