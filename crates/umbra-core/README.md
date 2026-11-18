@@ -15,8 +15,10 @@ an invalid transfer or uncertain acknowledgement invalidates the connection.
 The handles are runtime capabilities, never serialized run metadata.
 Owned sources in standard slots are duplicated above fd 2 before admission,
 preserving their open descriptions while preventing overlapping spawn mappings.
-Ancillary receive shares the frame's absolute request deadline: interrupts and
-early timeout wakes refresh the remaining budget instead of restarting it.
+Ancillary send and receive share the frame's absolute request deadline. Each
+attempt refreshes the remaining socket timeout instead of restarting the budget.
+Sends retry only no-payload EINTR/EAGAIN results; short sends and other uncertain
+outcomes invalidate the connection without resending descriptor rights.
 
 `capabilities` holds the open capability names crates negotiate over the provider
 handshake, so every consumer spells the same requirement the same way. They are
