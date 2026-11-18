@@ -6,7 +6,7 @@ use rustix::net::{
 };
 use std::fs::{File, OpenOptions};
 use std::io::{IoSlice, IoSliceMut, IsTerminal};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 
@@ -41,7 +41,15 @@ impl LaunchStdio {
     }
 
     /// Admit owned tty, pipe/FIFO, Unix stream, regular-file and null endpoints.
-    pub fn new(fds: [OwnedFd; 3]) -> Result<Self> {
+    pub fn new(mut fds: [OwnedFd; 3]) -> Result<Self> {
+        // Direct callers and SCM_RIGHTS receivers may own standard slots.
+        // Keep every source outside the spawn destinations so permutations
+        // such as [1, 0, 2] cannot overwrite a later dup2 source.
+        for fd in &mut fds {
+            if fd.as_raw_fd() <= 2 {
+                *fd = rustix::io::fcntl_dupfd_cloexec(&*fd, 3).map_err(io)?;
+            }
+        }
         let null = OpenOptions::new()
             .read(true)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
