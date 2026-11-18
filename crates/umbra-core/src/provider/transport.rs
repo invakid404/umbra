@@ -55,6 +55,30 @@ pub struct Connection {
     failed: bool,
 }
 impl Connection {
+    fn send_launch_stdio(&mut self, stdio: &crate::launch_stdio::LaunchStdio) -> Result<()> {
+        let result = stdio.send_with_budget(&self.stream, || {
+            self.stream
+                .set_write_timeout(Some(self.remaining()?))
+                .map_err(unavailable)
+        });
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
+
+    /// Receive the platform's one-shot owned descriptor payload.
+    pub fn receive_launch_stdio(&mut self) -> Result<crate::launch_stdio::LaunchStdio> {
+        let result = crate::launch_stdio::LaunchStdio::receive_with_budget(&self.stream, || {
+            self.stream
+                .set_read_timeout(Some(self.remaining()?))
+                .map_err(unavailable)
+        });
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
     /// Construct this value from the supplied configuration or fields.
     pub fn new(stream: UnixStream, timeout: Duration) -> Self {
         Self {
@@ -541,6 +565,35 @@ impl Client {
             }
         }
     }
+
+    /// Send a platform-only request followed by its owned descriptor payload.
+    /// The response is the ownership ACK; any uncertainty closes the transport.
+    pub fn call_with_stdio<Q: Serialize, R: serde::de::DeserializeOwned>(
+        &mut self,
+        request: &Q,
+        stdio: crate::launch_stdio::LaunchStdio,
+    ) -> Result<R> {
+        if self.welcome.role != "platform"
+            || !self
+                .welcome
+                .capabilities
+                .contains(crate::launch_stdio::CAPABILITY)
+        {
+            return Err(protocol_error("platform launch-stdio capability required"));
+        }
+        let result = (|| {
+            let id = self.start(request)?;
+            self.connection.send_launch_stdio(&stdio)?;
+            match self.connection.receive()? {
+                Frame::Response { id: got, result } if id == got => decode(&result?),
+                _ => Err(protocol_error("stdio ownership ACK mismatch")),
+            }
+        })();
+        if result.is_err() {
+            self.connection.invalidate();
+        }
+        result
+    }
 }
 
 /// Accept only the private endpoint and explicit timeout passed by the registry client.
@@ -665,6 +718,115 @@ mod tests {
             capabilities: Default::default(),
         }
     }
+    fn queued_stdio(sender: &Connection) {
+        let file = tempfile::tempfile().unwrap();
+        crate::launch_stdio::LaunchStdio::new(std::array::from_fn(|_| {
+            file.try_clone().unwrap().into()
+        }))
+        .unwrap()
+        .send(&sender.stream)
+        .unwrap();
+    }
+    #[test]
+    fn ancillary_send_expired_budget_transfers_no_rights() {
+        let (mut sender, receiver) = pair(Duration::from_secs(5));
+        let file = tempfile::tempfile().unwrap();
+        let stdio = crate::launch_stdio::LaunchStdio::new(std::array::from_fn(|_| {
+            file.try_clone().unwrap().into()
+        }))
+        .unwrap();
+        sender.set_deadline(transport_now() - Duration::from_secs(1));
+        let result = sender.send_launch_stdio(&stdio);
+        assert!(result.is_err(), "expired ancillary send transferred rights");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            unavailable("request deadline exceeded").to_string()
+        );
+        assert!(sender.failed);
+        // Shutdown must expose EOF, not an ancillary marker or rights.
+        let mut peer = receiver.stream;
+        let mut marker = [0];
+        assert_eq!(peer.read(&mut marker).unwrap(), 0);
+    }
+
+    #[test]
+    fn ancillary_send_no_progress_exhausts_remaining_budget() {
+        let (mut sender, receiver) = pair(Duration::from_secs(5));
+        sender
+            .stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let now = transport_now();
+        FIX264_CLOCK.with(|v| v.set(Some((now, now))));
+        sender.set_deadline(now + Duration::from_millis(30));
+        crate::launch_stdio::SEND_ATTEMPT.with(|v| {
+            v.set(Some(|| {
+                // A no-payload wake consumes the remaining awake-time budget.
+                let expired = transport_now() + Duration::from_millis(30);
+                FIX264_CLOCK.with(|v| v.set(Some((expired, expired))));
+                rustix::io::Errno::AGAIN
+            }))
+        });
+        let file = tempfile::tempfile().unwrap();
+        let stdio = crate::launch_stdio::LaunchStdio::new(std::array::from_fn(|_| {
+            file.try_clone().unwrap().into()
+        }))
+        .unwrap();
+        let result = sender.send_launch_stdio(&stdio);
+        crate::launch_stdio::SEND_ATTEMPT.with(|v| v.set(None));
+        FIX264_CLOCK.with(|v| v.set(None));
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            unavailable("request deadline exceeded").to_string()
+        );
+        assert!(sender.failed);
+        assert!(sender.stream.write_timeout().unwrap().unwrap() <= Duration::from_millis(30));
+        let mut peer = receiver.stream;
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn ancillary_send_refreshes_stale_timeout() {
+        let (mut sender, receiver) = pair(Duration::from_secs(5));
+        sender
+            .stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        sender.set_deadline(transport_now() + Duration::from_secs(1));
+        let file = tempfile::tempfile().unwrap();
+        let stdio = crate::launch_stdio::LaunchStdio::new(std::array::from_fn(|_| {
+            file.try_clone().unwrap().into()
+        }))
+        .unwrap();
+        sender.send_launch_stdio(&stdio).unwrap();
+        assert!(sender.stream.write_timeout().unwrap().unwrap() <= Duration::from_secs(1));
+        crate::launch_stdio::LaunchStdio::receive(&receiver.stream).unwrap();
+    }
+
+    #[test]
+    fn ancillary_transfer_rejects_an_expired_request_before_receiving() {
+        let (mut receiver, sender) = pair(Duration::from_secs(5));
+        queued_stdio(&sender);
+        receiver.set_deadline(transport_now() - Duration::from_secs(1));
+        assert!(receiver.receive_launch_stdio().is_err());
+        assert!(receiver.failed, "expired request must invalidate transport");
+    }
+    #[test]
+    fn ancillary_transfer_refreshes_timeout_from_the_remaining_budget() {
+        let (mut receiver, sender) = pair(Duration::from_secs(5));
+        receiver
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        receiver.set_deadline(transport_now() + Duration::from_secs(1));
+        queued_stdio(&sender);
+        receiver.receive_launch_stdio().unwrap();
+        assert!(
+            receiver.stream.read_timeout().unwrap().unwrap() <= Duration::from_secs(1),
+            "ancillary receive reused the earlier frame's timeout"
+        );
+    }
     #[test]
     fn oversize_truncated_and_timed_out_frames_invalidate_connection() {
         let (mut receiver, mut sender) = pair(Duration::from_millis(30));
@@ -709,6 +871,55 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::ProtocolMismatch, "{error}");
         assert!(client.call::<_, u32>(&2u32).is_err());
         worker.join().unwrap();
+    }
+    #[test]
+    fn ambiguous_stdio_ack_closes_transport_and_all_writer_copies() {
+        use crate::launch_stdio::{LaunchStdio, CAPABILITY};
+        for wrong_id in [false, true] {
+            let (connection, mut server) = pair(Duration::from_secs(2));
+            let (mut reader, writer) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let stdio = LaunchStdio::new([
+                writer.try_clone().unwrap().into(),
+                writer.try_clone().unwrap().into(),
+                writer.into(),
+            ])
+            .unwrap();
+            let worker = std::thread::spawn(move || {
+                let Frame::Request { id, .. } = server.receive().unwrap() else {
+                    panic!("expected adoption request")
+                };
+                let adopted = LaunchStdio::receive(&server.stream).unwrap();
+                if wrong_id {
+                    server
+                        .send(&Frame::Response {
+                            id: id + 1,
+                            result: Ok(encode(&()).unwrap()),
+                        })
+                        .unwrap();
+                    assert!(
+                        server.receive::<Frame>().is_err(),
+                        "client retried after uncertain ACK"
+                    );
+                }
+                // Missing ACK models provider loss after accepting the handles.
+                drop(adopted);
+            });
+            let mut hello = welcome();
+            hello.role = "platform".into();
+            hello.capabilities.insert(CAPABILITY.into());
+            let mut client = Client::from_connection(connection, hello);
+            assert!(client.call_with_stdio::<_, ()>(&"adopt", stdio).is_err());
+            assert!(client.call::<_, ()>(&"retry").is_err());
+            worker.join().unwrap();
+            assert_eq!(
+                reader.read(&mut [0]).unwrap(),
+                0,
+                "uncertain ACK retained a writer"
+            );
+        }
     }
     #[test]
     fn server_rejects_reused_request_ids_before_dispatch() {

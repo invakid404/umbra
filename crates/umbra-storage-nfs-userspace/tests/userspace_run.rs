@@ -132,6 +132,8 @@
 ))]
 
 use std::ffi::OsString;
+#[path = "stdio201/mod.rs"]
+mod stdio201;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -3044,13 +3046,9 @@ fn a_non_empty_directory_removal_ends_the_run_rather_than_answering_enotempty_81
 // LIMITS item 6 in `umbra_interpose.c`), and a partial `ls` lists correct names
 // while exiting 1, which is a dishonest exit code rather than a cheap `ls`.
 //
-// **What is not asserted: printed stdout.** The provider transport points the
-// tracee's stdout at `/dev/null`, so a filter's output is not observable from
-// here -- and pinning it empty would pin that limitation rather than any
-// behaviour. `cat`'s proof is the pair of legs `run_fixtures.rs` established:
-// the present operand exits 0 with the host untouched, and the absent one makes
-// `cat` name itself, its operand and the verdict on stderr, which no program
-// that did not run can compose.
+// **What is not asserted here: printed stdout.** These utility controls retain
+// their filesystem/status contract. Exact inherited-stream bytes are covered by
+// `stdio201`; the directory fixture below separately checks decoded entries.
 // ---------------------------------------------------------------------------
 
 /// What one standard utility must leave behind after one routed `umbra run`.
@@ -3216,10 +3214,7 @@ const UTILITY_CASES: &[(&str, &str, Utility)] = &[
     // `"."` before it looks at the operand).
     //
     // **What this row proves is exit 0 and an untouched host, not the listing.**
-    // A traced tracee inherits the platform provider's standard output, which is
-    // `Stdio::null()`, so no test can read what `ls` printed. That is exactly
-    // why the design gate ratified asserting on *entries* instead of on the exit
-    // code, and the entries are proven by
+    // Decoded entries are independently proven by
     // `a_directory_listing_through_fts_reaches_the_tracee_over_the_userspace_client`
     // below, which drives the same `libsystem_c` `fts` code through the same
     // routed calls and writes what it read where the client can read it back.
@@ -3528,13 +3523,10 @@ fn every_mutation_probe_is_wired_into_the_userspace_job() {
 /// object kind still reported as a non-directory, the run exited 0 having listed
 /// nothing at all.
 ///
-/// **Why a fixture rather than `/bin/ls` itself.** A traced tracee inherits the
-/// platform provider's standard output, and providers are spawned with
-/// `Stdio::null()`, so no harness can read what a traced program printed.
-/// `/bin/ls` is therefore observable only by its exit status, which the
-/// paragraph above disqualifies. The fixture writes the names it read into the
-/// routed workspace instead, and this reads them back out of the export through
-/// the userspace NFSv4 client with nothing mounted.
+/// **Why a fixture rather than an exit-status assertion.** The fixture writes
+/// the names into the routed workspace, which this test reads back through the
+/// userspace NFSv4 client. This checks decoded entries and routed persistence;
+/// inherited stdout delivery has separate exact-byte controls in `stdio201`.
 ///
 /// **It is not a re-implementation of `ls`.** It calls `fts_open`/`fts_read`/
 /// `fts_children` with `FTS_PHYSICAL | FTS_NOSTAT` and `FTS_NAMEONLY` -- the
@@ -6356,7 +6348,7 @@ const WALK_REACHED_SET_LEN: i32 = 155;
 /// answered to the caller as `ELOOP`(62), and since #167 what the ROUTED run
 /// exits for it too -- `o_nofollow_on_a_symlink_leaf_answers_eloop_to_the_tracee`
 /// asserts it positively, and that assertion is how the tracee's `ELOOP` is
-/// stated at all, the fixture having no stdio to report an errno through. Two
+/// stated at all, because the fixture reports its verdict only by exit status. Two
 /// further cases assert they did NOT exit it, which is how "the parent symlink
 /// was followed" and "the leaf opens without the flag" are stated.
 const WALK_REFUSED_AT_LEAF_OPEN: i32 = 153;
@@ -6533,8 +6525,8 @@ fn assert_walk_composed_through_to_set_len(run: &Run, host: &str, port: u16, cas
 /// runs on to its own exit.
 ///
 /// **The tracee's `ELOOP` is asserted through the fixture's exit code, because
-/// that is the only channel there is.** The fixture has no stdio by
-/// construction -- its verdict travels in its exit status alone -- and
+/// that is the only verdict channel this fixture uses.** Its verdict travels
+/// in its exit status alone -- it does not print the errno -- and
 /// `deny_to_tracee` logs nothing, so no stream anywhere carries the number 62.
 /// What `WALK_REFUSED_AT_LEAF_OPEN` says instead is that stage (b)'s `openat`
 /// returned an error AND the leaf was left byte-identical: the same arm of the
@@ -9551,14 +9543,14 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for retained shutdown history (#271): single_thread,
+    // Re-characterized for consumed stdio rejection (#201): single_thread,
     // Fork, and WaitPlan::Park are byte-identical to the characterized base.
     // The refusal oracle and runtime-witness limitation remain unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("05838e68faffc6e054c55477b8364bd161bddcdf6b291f1da6c4ccd8bcb9b370"),
+        Some("c797e936f01ddc6ffe1637d39c9eec48236d881829c21c7e81538d8c1f219762"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.

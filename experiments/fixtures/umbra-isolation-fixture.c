@@ -616,7 +616,7 @@ static void mshell(const char *dir, const char *tcase, char **cmd) {
     pid_t j = fork();
     if (j == 0) {
         setpgid(0, 0);
-        tcsetpgrp(0, getpid());
+        if (strcmp(tcase, "F201B")) tcsetpgrp(0, getpid());
         signal(SIGTTOU, SIG_DFL);
         signal(SIGTTIN, SIG_DFL);
         signal(SIGTSTP, SIG_DFL);
@@ -625,7 +625,7 @@ static void mshell(const char *dir, const char *tcase, char **cmd) {
         _exit(127);
     }
     setpgid(j, j);
-    tcsetpgrp(0, j);
+    if (strcmp(tcase, "F201B")) tcsetpgrp(0, j);
     fprintf(rec, "job=%d shell_pgid=%d\n", j, getpgrp());
     long long deadline = now_us() + 30000000LL, hup_until = 0;
     for (;;) {
@@ -721,7 +721,7 @@ static int pty_main(int argc, char **argv) {
         }
         if (ready_at && !induced && now_us() >= ready_at + 500000) {
             induced = 1;
-            if (!strcmp(tcase, "T1"))
+            if (!strcmp(tcase, "T1") || !strcmp(tcase, "F201B"))
                 (void)write(master, "hello\n", 6);
             else if (!strcmp(tcase, "T4"))
                 (void)write(master, "\x03", 1);

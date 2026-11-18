@@ -75,6 +75,10 @@ impl RunArgs {
 struct StderrStatus;
 
 impl RunObserver for StderrStatus {
+    fn stdio_adopted(&mut self) -> Result<()> {
+        umbra_core::launch_stdio::LaunchStdio::release_cli_streams()
+    }
+
     fn teardown_warning(&mut self, error: &UmbraError) {
         eprintln!("provider teardown warning: {error}");
     }

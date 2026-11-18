@@ -1601,9 +1601,8 @@ C10-13 uses a pipe-held child and an in-memory helper rendezvous. The parent
 records the focal WNOHANG result on inherited stderr, joins the helper, then
 writes the child release byte and reaps it. The child emits a post-release
 sentinel; the harness checks its exact status and the record order. This
-replaces the initial proposed external ledger protocol: routed tracee stdin
-and stdout are null, so that acknowledgment channel cannot reach it. Native
-and routed controls use the same amended protocol. No passing result is
+replaces the initial proposed external ledger protocol, which predated inherited
+stdio delivery. Native and routed controls retain the same amended protocol. No passing result is
 inferred from setup, compilation or a timeout.
 
 Local native/routed pairs for C10-07, C10-08, C10-11 and C10-16 passed their
@@ -1691,3 +1690,17 @@ mismatched identities and connections, and missing, duplicate or wrong terminal
 statuses. These parser controls run in the same `transport-raw` test target
 without requiring a live server; the lifecycle cases still require the live
 fixture and test the actual identity-object readback.
+
+## Inherited root streams
+
+The `stdio201` cases in `tests/userspace_run.rs` pair native controls with the
+production CLI over this registry. They require exact pipe/FIFO/socket/pty and
+regular-file bytes, preserved offsets/append behavior, fork/exec delivery,
+unsupported-endpoint refusal and EOF while a non-isolated control remains alive.
+The EOF case creates and verifies its own non-SID-1 session. Launchd's isolated
+EOF-at-exit behavior is qualified separately by the CLI's
+`f201_pipe_eof_isolated` case. Rust closed-slot sanitation is a native control.
+Default and ignored SIGPIPE pin the existing fatal T0d divergence, not signal
+delivery; a self-pipe control isolates that classification from inherited stdout.
+These streams bypass storage and are neither journaled nor replayed. The CLI
+README states the endpoint and terminal limitations.

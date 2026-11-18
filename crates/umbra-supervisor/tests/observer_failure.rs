@@ -27,7 +27,18 @@ struct Observer {
     callbacks: Arc<Mutex<Vec<&'static str>>>,
 }
 impl RunObserver for Observer {
+    fn stdio_adopted(&mut self) -> umbra_core::Result<()> {
+        match self.failure {
+            7 => panic!("stdio adoption observer failure"),
+            8 => std::panic::panic_any(HostilePayload),
+            _ => Ok(()),
+        }
+    }
     fn prepared(&mut self, run_id: RunId) -> umbra_core::Result<()> {
+        assert!(
+            !matches!(self.failure, 7 | 8),
+            "prepared after adoption failure"
+        );
         *self.id.lock().unwrap() = Some(run_id);
         match self.failure {
             1 => panic!("observer failure"),
@@ -222,7 +233,8 @@ fn scenario(label: &str, failure: u8) {
             callbacks: callbacks.clone(),
         })),
     };
-    let outcome = catch_unwind(AssertUnwindSafe(|| umbra_supervisor::run(spec)));
+    let outcome =
+        catch_unwind(AssertUnwindSafe(|| umbra_supervisor::run(spec))).map_err(std::mem::forget);
     match &outcome {
         Err(_) => eprintln!("PROBE {label}: run UNWOUND past run()"),
         Ok(r) => eprintln!("PROBE {label}: run returned {r:?}"),
@@ -230,7 +242,24 @@ fn scenario(label: &str, failure: u8) {
     let mut found = Vec::new();
     locks(&store, &mut found);
     eprintln!("PROBE {label}: writer.lock count={} {found:?}", found.len());
-    let run_id = id.lock().unwrap().expect("prepared reached");
+    let run_id = if matches!(failure, 7 | 8) {
+        assert!(id.lock().unwrap().is_none(), "prepared must not run");
+        let ids: Vec<_> = std::fs::read_dir(&store)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok())
+                    .map(RunId)
+            })
+            .collect();
+        assert_eq!(ids.len(), 1, "one run directory");
+        ids[0]
+    } else {
+        id.lock().unwrap().expect("prepared reached")
+    };
     assert!(
         !platform_marker.exists(),
         "prepared failure must not request a target launch"
@@ -331,4 +360,14 @@ fn prepared_error_preserves_writer_release_failure() {
 #[test]
 fn prepared_error_preserves_storage_close_failure() {
     scenario("storage-close-error", 6);
+}
+
+#[test]
+fn stdio_adopted_panic_returns_error_and_releases_writer() {
+    scenario("stdio-panic", 7);
+}
+
+#[test]
+fn stdio_adopted_hostile_panic_payload_cannot_prevent_cleanup() {
+    scenario("stdio-hostile-payload", 8);
 }

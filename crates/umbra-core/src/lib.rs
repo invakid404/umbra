@@ -6,6 +6,8 @@
 #![deny(missing_docs)]
 
 pub mod capabilities;
+#[cfg(unix)]
+pub mod launch_stdio;
 pub mod shutdown;
 pub mod storage;
 

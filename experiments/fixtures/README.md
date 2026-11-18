@@ -227,9 +227,8 @@ C10-13 uses a pipe-held child and an in-memory helper rendezvous. The parent
 records the focal WNOHANG result on inherited stderr, joins the helper, then
 writes the child release byte and reaps it. The child emits a post-release
 sentinel; the harness checks its exact status and the record order. This
-replaces the initial proposed external ledger protocol: routed tracee stdin
-and stdout are null, so that acknowledgment channel cannot reach it. Native
-and routed controls use the same amended protocol. No passing result is
+replaces the initial proposed external ledger protocol, which predated inherited
+stdio delivery. Native and routed controls retain the same amended protocol. No passing result is
 inferred from setup, compilation or a timeout.
 
 Local native/routed pairs for C10-07, C10-08, C10-11 and C10-16 passed their
@@ -268,14 +267,15 @@ Build its locked manifest into the workspace target. The supervisor's
 accepts the capability handshake and checks that failed preparation never
 requests Launch. It also speaks `platform.shutdown-ledger.v1` with an empty
 accepted inventory and matching Final, so the fixture remains compatible with
-the supervisor's pre-launch capability requirement.
+the supervisor's pre-launch capability requirement. It accepts and drops the
+`launch-stdio-v1` descriptor payload before failed preparation.
 
 ## Filesystem metadata fixture
 
 `umbra-fix-214-statfs.c` drives the `f214_` userspace tests. Native controls
 check host syscall relationships; routed descriptor results are compared
 byte-for-byte with the virtual filesystem contract. Path `statfs` remains native. Fork/exec phase markers use retained
-files because routed stdout is not an observation channel.
+files to check mediated persistence independently of inherited stdout.
 
 ## Packed-spawn fixtures
 
@@ -317,3 +317,17 @@ comparisons. The CLI requires Code(0) for an 8-second quiet interval; the native
 platform test requires Idle across child/exec phases and all exits successful.
 These tests require macOS arm64, a C compiler and debugger permission. They do
 not qualify arbitrary-duration runs beyond the platform session watchdog.
+
+## Inherited stdio controls (#201)
+
+`umbra-fix-201-stdio.c` supplies exact-byte pipe, FIFO, Unix stream, regular-file,
+null and private-pty controls, fork/exec inheritance, descriptor exclusion and
+EOF while a non-isolated CLI remains alive in a verified new session. The
+SID-1 CLI case separately checks delivery and EOF at exit. The additive isolation-fixture modes reuse
+the private terminal harness. `umbra-fix-201-sanitize.rs` establishes Rust's
+closed-standard-slot sanitation on the qualified host.
+
+The paired SIGPIPE controls distinguish native signal termination/EPIPE from
+the current routed fatal T0d classification, including ignored SIGPIPE. The
+self-pipe case establishes that this signal limitation is independent of
+inherited stdout. Fatal runs must have no decoded journal completion record.

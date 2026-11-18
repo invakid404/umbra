@@ -410,11 +410,9 @@ enum Expect {
     /// so the case does not distinguish a rewritten open from an unrewritten
     /// one. Which resolver answered is pinned by `Expect::Captured`.
     ///
-    /// What the utility *printed* is deliberately not asserted. A tracee
-    /// inherits fds 0-2 from the platform provider process, whose stdout the
-    /// provider transport sets to `/dev/null`
-    /// (`umbra-core/src/provider/transport.rs:322`), so a filter's output is not
-    /// observable from here today, and pinning it empty would pin that.
+    /// What the utility *printed* is deliberately not asserted by this
+    /// filesystem matrix. Inherited stdout has separate exact-byte stdio201
+    /// controls in the userspace routing suite.
     ///
     /// On its own this cannot tell "the utility ran" from "nothing ran": a
     /// no-op also exits zero and touches nothing. Its discriminating partner is
@@ -423,8 +421,7 @@ enum Expect {
     ReadOnly,
     /// The operand does not exist, so the utility fails and names it on stderr.
     ///
-    /// That line is the observable this matrix needs: a tracee's stderr *does*
-    /// reach the caller even though its stdout does not, so the message proves
+    /// That line is the observable this matrix needs: the message proves
     /// which program ran, that it received this exact operand, and that the
     /// operand was absent when it was resolved. Substituting a program that
     /// does nothing prints nothing and fails the case. umbra still reports its
@@ -867,7 +864,8 @@ fn crash_case(crash: Crash) {
         .args(["--env", "UMBRA_TEST_CRASH_TRACEE=1"])
         .arg("--")
         .arg(&child)
-        .args(["--exact", "crash_child"])
+        // Pin libtest's concurrent output mode even on a one-CPU host.
+        .args(["--exact", "crash_child", "--test-threads=2"])
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -880,10 +878,11 @@ fn crash_case(crash: Crash) {
     // child's own status never becomes umbra's. A crashed tracee is exit 1 --
     // not 137, not 139, not the signal number, and not the child's code.
     assert_eq!(output.status.code(), Some(1), "{case}: {stderr}");
-    assert!(
-        output.stdout.is_empty(),
-        "{case}: diagnostics belong on stderr: {:?}",
-        String::from_utf8_lossy(&output.stdout)
+    // The tracee is this test executable: its harness banner now reaches the
+    // caller through inherited stdout. Umbra diagnostics remain on stderr.
+    assert_eq!(
+        output.stdout, b"\nrunning 1 test\n",
+        "{case}: tracee stdout"
     );
     assert!(!stderr.contains("panicked"), "{case} panicked: {stderr}");
     let id = uuid::Uuid::parse_str(prepared_id(&stderr).expect("prepared run ID")).unwrap();

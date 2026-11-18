@@ -24,6 +24,25 @@ RLE decode, and a per-request deadline.
 
 ## Confirmed shutdown
 
+The platform advertises `launch-stdio-v1` for one-shot adoption of the caller's
+validated standard-stream descriptions. Root spawn duplicates the owned handles
+into 0/1/2 under `POSIX_SPAWN_CLOEXEC_DEFAULT`, then closes the platform's copies.
+Launch failures release them too. Provider and debugserver process streams
+remain separate; extra launch handles never reach the tracee or debugserver.
+The IPC adoption acknowledgement precedes root launch.
+
+The first launch attempt consumes adoption before validation. A rejected launch
+releases the descriptions and subsequent launches return `platform.stdio` /
+`launch stdio already consumed`; they cannot fall back to ambient streams.
+The explicit legacy path applies only to a backend that never adopted streams.
+`tests/launch_stdio.rs` covers direct and IPC retries, rollback, and a
+provider-owned high descriptor absent from a successfully executed tracee.
+
+This changes stream delivery, not signal handling. Default and ignored SIGPIPE
+still produce the existing fatal `tracee stop` / `T0d` error. Background terminal
+reads produce fatal `T15`; foreground fd 2 reads remain supported. The CLI's
+README describes the launchd relay/guardian retention limitation.
+
 The provider advertises `platform.shutdown-ledger.v1`. Its ledger reserves slots
 before root/child creation, tracer launch and task-right acquisition, and keeps
 retired history through quiesce, resume and preliminary termination. Exec records
@@ -751,6 +770,32 @@ UMBRA_TEST_FIXTURE_PATH=<abs> UMBRA_TEST_REDIRECT_ROOT=<abs> \
 
 <!-- memoria:section id="test-coverage" files="tests/**" guidance="../../docs/guides/reviewing-test-sections.md" -->
 ## Test coverage
+
+The tracing cases in `tests/launch_stdio.rs` require macOS arm64 and
+`UMBRA_INTEGRATION_REQUIRED=1`; otherwise they report an explicit skip.
+Its overlapping-standard-source case runs without debugger permission in an
+isolated subprocess, checking normalization above fd 2 and exact byte destinations.
+Build the tracing sentinel with
+`clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-201-stdio.c -o target/debug/umbra-fix-201-stdio`
+from the repository root, set `UMBRA_STDIO_FIXTURE` to that binary's absolute
+path, then run `cargo test -p umbra-platform-macos --test launch_stdio --
+--nocapture --test-threads=1`. It requires debugger permission. The sentinel
+must execute and exit zero with the provider-held descriptor absent; retry
+controls require the exact consumed-capability error, and rollback requires
+writer EOF while the backend remains alive.
+
+The root sentinel deliberately clears CLOEXEC on its provider-held copy to
+isolate the root's default-close spawn fence. Removing that spawn flag makes
+the sentinel exit 29 instead of zero. The separate helper identity control
+requires `/usr/sbin/lsof`: it compares descriptor device/inode identities in
+suspended, execed `shasum` and `codesign` images against the adopted endpoint.
+These signing helpers run before the adopted copies are dropped and rely on
+their per-handle CLOEXEC flags. Removing those flags exposes the identity in
+both helper images. The control uses a test-only suspended spawn with the same
+absence of a default-close fence; it does not invoke the signing workflow.
+Debugserver discovery/launch and dyld symbol helpers run after those copies
+are dropped. The core transfer unit test separately checks received CLOEXEC
+flags. Both production fences remain enabled.
 
 `tests/fixtures.rs` drives Track D's C fixtures through the Rust tracer.
 It reads `UMBRA_TEST_FIXTURE_PATH` (path to `umbra-test-child`) and

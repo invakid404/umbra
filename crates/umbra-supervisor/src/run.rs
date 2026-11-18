@@ -93,8 +93,9 @@ pub enum RunPersistence {
     StrictRemote,
 }
 
-/// An explicitly constructed command launch. Nothing is inherited implicitly:
-/// argv includes argv[0] and the environment is exactly what the caller built.
+/// An explicitly constructed executable, argument vector and environment.
+/// argv includes argv[0] and the environment is exactly what the caller built;
+/// [`run`] separately captures the caller's standard streams.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandLaunch {
     /// Absolute executable path; never resolved by scanning PATH.
@@ -121,6 +122,11 @@ pub enum RunLaunch {
 /// This exists so the supervisor never writes to a stream itself and never needs
 /// to read one. It reports; it cannot ask.
 pub trait RunObserver {
+    /// The platform owns the launch endpoints. Embedded callers retain their
+    /// original streams; CLI observers may release stdin and stdout here.
+    fn stdio_adopted(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Called once, after preparation succeeds and before the target launches.
     ///
     /// Returning `Err` aborts before launch through failure cleanup with
@@ -915,6 +921,7 @@ mod unix {
 
     pub fn run(mut spec: RunSpec) -> Result<()> {
         validate(&spec)?;
+        let launch_stdio = umbra_core::launch_stdio::LaunchStdio::capture()?;
         let mut observer = spec.observer.take();
         let run_id = RunId(Uuid::new_v4());
         let RunLaunch::Command(command) = spec.launch.clone() else {
@@ -1277,11 +1284,32 @@ mod unix {
             Err(e) => return Err(fail(namespace, run_id, e, true)),
         };
 
-        let platform =
-            match umbra_platform::provider::connect(spec.registry.get("platform")?, timeout) {
-                Ok(platform) => platform,
-                Err(e) => return Err(fail(namespace, run_id, e, true)),
-            };
+        let platform = match umbra_platform::provider::connect_with_stdio(
+            spec.registry.get("platform")?,
+            timeout,
+            launch_stdio,
+        ) {
+            Ok(platform) => platform,
+            Err(e) => return Err(fail(namespace, run_id, e, true)),
+        };
+        if let Some(observer) = observer.as_mut() {
+            let adopted =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.stdio_adopted()));
+            match adopted {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(fail(namespace, run_id, e, true)),
+                Err(payload) => {
+                    let e = error(
+                        ErrorKind::InvalidState,
+                        "run.observer",
+                        "stdio_adopted observer panicked",
+                    );
+                    let failure = fail(namespace, run_id, e, true);
+                    std::mem::forget(payload);
+                    return Err(failure);
+                }
+            }
+        }
         let capabilities = platform.control.capabilities();
         if !capabilities
             .capabilities

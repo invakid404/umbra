@@ -149,3 +149,20 @@ are not closure proof. The client validates every final obligation and collects
 its owned provider process before the supervisor records successful completion.
 Older providers lacking the shutdown capability are refused before launch;
 common protocol version 3 and the journal format remain unchanged.
+
+## Root launch streams
+
+Provider processes keep null stdin/stdout and inherited diagnostic stderr.
+The platform alone negotiates `launch-stdio-v1`: a typed `AdoptStdio` request
+transfers three owned descriptors over its private Unix connection. The response
+acknowledges ownership. Storage, journal and debugserver receive no launch
+copies. Transfer errors invalidate the connection and release owned copies.
+
+The macOS platform duplicates those descriptions into root slots 0/1/2 with
+explicit spawn actions and closes its copies after spawn. CLOEXEC_DEFAULT fences
+all other provider handles. Fork and exec inherit the resulting standard
+streams normally. Endpoints are validated by descriptor metadata, with a
+no-follow `/dev/null` reference for device identity; this grants no permission
+to reopen host paths. The CLI releases stdin/stdout after adoption, while
+embedding callers retain their originals. No endpoint metadata or bytes are
+persisted in run state.

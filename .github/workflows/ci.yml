@@ -270,6 +270,13 @@ jobs:
           git diff --stat -- experiments/fixtures/umbra-fix-227-observer-providers/Cargo.lock
           cargo build --locked --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           cargo test -p umbra-supervisor --test observer_failure -- --nocapture --test-threads=1
+      - name: Qualify adopted stdio ownership and launch consumption
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-201-stdio.c -o "$GITHUB_WORKSPACE/target/debug/umbra-fix-201-stdio"
+          export UMBRA_STDIO_FIXTURE="$GITHUB_WORKSPACE/target/debug/umbra-fix-201-stdio"
+          cargo test -p umbra-platform-macos --test launch_stdio -- --nocapture --test-threads=1
+          cargo test -p umbra-core ambiguous_stdio_ack_closes_transport_and_all_writer_copies -- --nocapture
       - name: Qualify completed-child resource retirement
         env:
           UMBRA_RETIREMENT_WITNESS: "1"
@@ -314,6 +321,8 @@ jobs:
         run: |
           cargo test -p umbra-isolation -- --nocapture --test-threads=1
           cargo test -p umbra-cli --test isolation -- --nocapture --test-threads=1
+          # Named SID-1 stdio contract: exact delivery and EOF by CLI exit.
+          cargo test -p umbra-cli --test isolation f201_pipe_eof_isolated -- --exact --nocapture --test-threads=1
 
   native-userspace-routing:
     name: Userspace-routed run over the live NFSv4 client
@@ -379,9 +388,8 @@ jobs:
           # The listing fixture reads a directory through `fts` with the flags
           # plain `/bin/ls` passes and writes the names it got into the routed
           # workspace. It is how the directory-read proofs assert on *entries*:
-          # a traced tracee inherits the provider's `Stdio::null()` standard
-          # output, so `ls`'s own listing is unreadable by any harness, and an
-          # exit code cannot tell a correct listing from an empty one.
+          # an exit code cannot tell a correct listing from an empty one.
+          # Inherited stdout has separate exact-byte stdio201 controls.
           clang -arch arm64 -O1 experiments/fixtures/umbra-userspace-listing.c \
             -o "$fixture_dir/umbra-userspace-listing"
           # The project-tree listing fixture is the control's sibling: it
@@ -804,6 +812,34 @@ jobs:
           # whatever runs on this persistent runner next.
           cargo build -p umbra-cli
           cargo build -p umbra-platform-macos
+
+      - name: Qualify inherited root stdio
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build --workspace --bins --features umbra-storage-nfs-userspace/transport-raw
+          cargo test -p umbra-storage-nfs-userspace --features transport-raw \
+            --test userspace_run -- \
+            stdio201::f201_pipe_bytes_eof \
+            stdio201::f201_socketpair_stdio \
+            stdio201::f201_regular_offset_append \
+            stdio201::f201_null_stdio \
+            stdio201::f201_pipe_sigpipe \
+            stdio201::f201_self_pipe_sigpipe \
+            stdio201::f201_pipe_eof_control_alive \
+            stdio201::f201_fork_exec_stdio \
+            stdio201::f201_rust_closed_slots \
+            stdio201::f201_fifo_stdio \
+            stdio201::f201_mixed_null_pipe \
+            stdio201::f201_directory_refused \
+            stdio201::f201_other_device_refused \
+            stdio201::f201_pty_stdin_stdout \
+            stdio201::f201_fd2_foreground \
+            stdio201::f201_fd2_background \
+            stdio201::f201_stdin_background \
+            stdio201::f201_parallel_ptys \
+            stdio201::f201_cloexec_sentinel \
+            stdio201::f201_spawn_failure_rollback \
+            --exact --nocapture --test-threads=1
 
       - name: Capture diagnostics on failure
         if: failure()
