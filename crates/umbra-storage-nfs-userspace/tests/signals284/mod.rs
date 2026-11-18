@@ -184,6 +184,74 @@ fn f284_sources() {
     }
 }
 
+#[test]
+#[ignore = "one rate reading per head; invoke explicitly with --ignored"]
+fn f284_return_window_rate() {
+    let Some(target) = fixture() else { return };
+    let evidence = std::env::var_os("UMBRA_F284_RATE_EVIDENCE")
+        .expect("rate reading needs a dedicated evidence file");
+    let mut evidence = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(evidence)
+        .expect("never overwrite a rate reading");
+    let scratch = tempfile::tempdir().unwrap();
+    const TRIALS: usize = 6;
+    let mut delivered = 0;
+    let mut refused = 0;
+    for native in [true, false] {
+        for trial in 0..TRIALS {
+            let root = scratch.path().join(format!("rate-{native}-{trial}"));
+            let mut cmd = command(&root, &target, native, "rate");
+            let workspace = root.join("workspace");
+            if native {
+                std::fs::create_dir(&workspace).unwrap();
+            }
+            let mut child = cmd.arg(workspace).spawn().unwrap();
+            let mut ready = String::new();
+            std::io::BufReader::new(child.stdout.as_mut().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            let pid: i32 = ready
+                .trim()
+                .strip_prefix("READY ")
+                .expect("no rate reading without fixture readiness")
+                .parse()
+                .unwrap();
+            assert!(pid > 1);
+            // PID comes from this owned fixture's pipe, not process-name discovery.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
+            let out = child.wait_with_output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let outcome = if out.status.success() && out.stdout == b"delivered=1\n" {
+                if !native {
+                    delivered += 1;
+                }
+                "delivered"
+            } else if !native
+                && out.status.code() == Some(1)
+                && stderr.contains("signal-during-return-window")
+            {
+                refused += 1;
+                "signal-during-return-window"
+            } else {
+                "other/no-reading"
+            };
+            let record = serde_json::json!({"native": native, "trial": trial, "threads": 2,
+                "sent": 1, "pid": pid, "status": out.status.code(), "outcome": outcome,
+                "stderr": stderr});
+            writeln!(evidence, "{record}").unwrap();
+            evidence.sync_all().unwrap();
+            eprintln!("{record}");
+            assert_ne!(
+                outcome, "other/no-reading",
+                "fixture did not produce a classified rate reading"
+            );
+        }
+    }
+    eprintln!("rate: N=2 K={TRIALS} delivered={delivered} refused={refused}");
+}
+
 fn unsafe_state(phase: &str, expected: &str) {
     let Some(target) = fixture() else { return };
     // CI builds the provider with signal-witness for this named command.

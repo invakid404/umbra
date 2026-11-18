@@ -9,10 +9,34 @@
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
 
 static volatile sig_atomic_t deliveries;
 static const char *handler_path;
 static volatile sig_atomic_t io_failed;
+static atomic_int rate_ready, rate_stop, rate_failed;
+static const char *rate_root;
+
+static void *rate_worker(void *arg) {
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &blocked, NULL);
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/thread-%ld", rate_root, (long)arg);
+    int announced = 0;
+    while (!atomic_load(&rate_stop)) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0 || write(fd, "io\n", 3) != 3 || close(fd)) {
+            atomic_store(&rate_failed, 1);
+            break;
+        }
+        if (!announced) { atomic_fetch_add(&rate_ready, 1); announced = 1; }
+    }
+    return NULL;
+}
 
 static void handled(int signo) {
     (void)signo;
@@ -27,6 +51,30 @@ static void handled(int signo) {
 
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
+    if (!strcmp(argv[1], "rate")) {
+        if (argc != 3) return 64;
+        rate_root = argv[2];
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = handled;
+        if (sigaction(SIGUSR1, &action, NULL)) return 100;
+        pthread_t workers[2];
+        for (long i = 0; i < 2; i++)
+            if (pthread_create(&workers[i], NULL, rate_worker, (void *)i)) return 101;
+        while (atomic_load(&rate_ready) != 2) {
+            if (atomic_load(&rate_failed)) return 102;
+            sched_yield();
+        }
+        printf("READY %d\n", getpid());
+        fflush(stdout);
+        while (!deliveries) sched_yield();
+        atomic_store(&rate_stop, 1);
+        for (int i = 0; i < 2; i++) pthread_join(workers[i], NULL);
+        if (atomic_load(&rate_failed)) return 103;
+        printf("delivered=%d\n", (int)deliveries);
+        return 0;
+    }
     if (!strcmp(argv[1], "concurrent")) {
         struct sigaction action;
         memset(&action, 0, sizeof(action));
