@@ -1784,6 +1784,7 @@ impl Drop for Session {
 pub struct MacosTraceBackend {
     launch_stdio: Option<umbra_core::launch_stdio::LaunchStdio>,
     stdio_adopted: bool,
+    stdio_consumed: bool,
     ledger: umbra_platform::shutdown::Ledger,
     poll_cursor: usize,
     spawn_sequence: u64,
@@ -1823,6 +1824,7 @@ impl MacosTraceBackend {
         Self {
             launch_stdio: None,
             stdio_adopted: false,
+            stdio_consumed: false,
             ledger: umbra_platform::shutdown::Ledger::new(),
             poll_cursor: 0,
             spawn_sequence: 0,
@@ -2245,6 +2247,10 @@ impl MacosTraceBackend {
     /// It accepts only [`SandboxRequirement::UnsandboxedExperiment`], so a caller
     /// holding a rendered profile cannot reach an unenforced launch through it.
     pub fn launch_experimental(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
+        if self.stdio_adopted {
+            self.consume_launch_stdio()?;
+            return Err(unsupported("adopted stdio requires a supervised launch"));
+        }
         if !matches!(spec.sandbox, SandboxRequirement::UnsandboxedExperiment) {
             return Err(unsupported(
                 "launch_experimental installs no policy; use the supervised launch",
@@ -2284,9 +2290,23 @@ impl MacosTraceBackend {
         }
         Ok(())
     }
+    fn consume_launch_stdio(&mut self) -> Result<Option<umbra_core::launch_stdio::LaunchStdio>> {
+        if !self.stdio_adopted {
+            // Legacy direct callers have never transferred launch endpoints.
+            return Ok(None);
+        }
+        if self.stdio_consumed {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidState,
+                "platform.stdio",
+                "launch stdio already consumed",
+            ));
+        }
+        self.stdio_consumed = true;
+        Ok(self.launch_stdio.take())
+    }
     fn launch_traced(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
-        // The transfer is one-shot even if validation or spawn fails.
-        let launch_stdio = self.launch_stdio.take();
+        let launch_stdio = self.consume_launch_stdio()?;
         Self::check_sandbox_shape(&spec)?;
         if self.launched {
             return Err(error("launch", "one run per backend"));
@@ -4322,7 +4342,7 @@ impl TraceBackend for MacosTraceBackend {
     }
     fn launch(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
         if matches!(spec.sandbox, SandboxRequirement::UnsandboxedExperiment) {
-            self.launch_stdio.take();
+            self.consume_launch_stdio()?;
             return Err(unsupported(
                 "supervised launch requires an installed sandbox",
             ));

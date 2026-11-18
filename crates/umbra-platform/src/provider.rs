@@ -665,6 +665,7 @@ pub fn serve_provider_on(
 /// Dispatch an already negotiated platform connection, retaining teardown diagnostics.
 pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) -> Result<()> {
     let mut roots = Vec::new();
+    let mut stdio_adopted = false;
     let result = (|| {
         let mut previous = 0;
         loop {
@@ -680,7 +681,15 @@ pub fn serve_session(mut connection: Connection, mut platform: PlatformSession) 
                 Request::AdoptStdio => connection
                     .receive_launch_stdio()
                     .and_then(|stdio| platform.control.adopt_stdio(stdio))
-                    .map(|()| Response::Unit),
+                    .map(|()| {
+                        stdio_adopted = true;
+                        Response::Unit
+                    }),
+                // The owning backend must consume the one-shot transfer even
+                // when it rejects the launch's sandbox requirement.
+                Request::Launch(spec) if stdio_adopted => {
+                    platform.control.launch(spec).map(Response::Process)
+                }
                 Request::BeginShutdown { nonce } => return Ok(Some((id, nonce))),
                 Request::Decode(regs) => {
                     let mut memory = Memory {
