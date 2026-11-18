@@ -9543,14 +9543,14 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for retained shutdown history (#271): single_thread,
+    // Re-characterized for root stdio delivery (#201): single_thread,
     // Fork, and WaitPlan::Park are byte-identical to the characterized base.
     // The refusal oracle and runtime-witness limitation remain unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("05838e68faffc6e054c55477b8364bd161bddcdf6b291f1da6c4ccd8bcb9b370"),
+        Some("68b586a07a9cfe051cba1cee3cb1c9fd3856973b45dcdde810d6d835b4672f64"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
