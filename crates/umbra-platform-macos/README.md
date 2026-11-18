@@ -781,6 +781,19 @@ must execute and exit zero with the provider-held descriptor absent; retry
 controls require the exact consumed-capability error, and rollback requires
 writer EOF while the backend remains alive.
 
+The root sentinel deliberately clears CLOEXEC on its provider-held copy to
+isolate the root's default-close spawn fence. Removing that spawn flag makes
+the sentinel exit 29 instead of zero. The separate helper identity control
+requires `/usr/sbin/lsof`: it compares descriptor device/inode identities in
+suspended, execed `shasum` and `codesign` images against the adopted endpoint.
+These signing helpers run before the adopted copies are dropped and rely on
+their per-handle CLOEXEC flags. Removing those flags exposes the identity in
+both helper images. The control uses a test-only suspended spawn with the same
+absence of a default-close fence; it does not invoke the signing workflow.
+Debugserver discovery/launch and dyld symbol helpers run after those copies
+are dropped. The core transfer unit test separately checks received CLOEXEC
+flags. Both production fences remain enabled.
+
 `tests/fixtures.rs` drives Track D's C fixtures through the Rust tracer.
 It reads `UMBRA_TEST_FIXTURE_PATH` (path to `umbra-test-child`) and
 `UMBRA_TEST_REDIRECT_ROOT` (shadow root); when either env var is unset,
