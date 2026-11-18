@@ -231,11 +231,24 @@ fn f201_self_pipe_sigpipe() {
 #[test]
 fn f201_pipe_eof_control_alive() {
     pairs(|root, target, native| {
-        let mut child = command(root, target, native, "close-output")
+        let mut command = command(root, target, native, "close-output");
+        // This assertion concerns non-isolated ownership even on a SID-1 runner.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        let sid = unsafe { libc::getsid(child.id() as libc::pid_t) };
+        assert_eq!(sid, child.id() as libc::pid_t);
+        assert_ne!(sid, 1, "early EOF is a non-isolated guarantee");
         let mut output = child.stdout.take().unwrap();
         let mut ready = libc::pollfd {
             fd: output.as_raw_fd(),

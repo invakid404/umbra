@@ -66,6 +66,15 @@ Every `LaunchSpec` carries a `SandboxRequirement`. A backend that accepts
 stopped before its first instruction; if it cannot prove that boundary it must
 fail the launch, and it must not advertise `sandboxed-stopped-launch-v1`.
 
+On Unix, supervised composition uses `provider::connect_with_stdio` to require
+`launch-stdio-v1` and transfer an owned `LaunchStdio` before root launch.
+`TraceBackend::adopt_stdio` defaults to refusal. Implementations that advertise
+support must consume the descriptors once, duplicate them into root slots 0/1/2,
+and release their copies on launch success, failure or owner loss. The adoption
+response acknowledges ownership, allowing the CLI to release its stdin/stdout.
+Provider process streams retain their own null stdin/stdout and diagnostic stderr.
+The payload is ancillary descriptor state, not serialized launch metadata.
+
 Every `Result` is `umbra_core::Result`; errors retain category, operation/context,
 and optional platform errno. `decode_entry` returns `None` only for a positively
 classified non-filesystem syscall. Unknown potential mutations and unsupported

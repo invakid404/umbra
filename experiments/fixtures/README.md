@@ -267,7 +267,8 @@ Build its locked manifest into the workspace target. The supervisor's
 accepts the capability handshake and checks that failed preparation never
 requests Launch. It also speaks `platform.shutdown-ledger.v1` with an empty
 accepted inventory and matching Final, so the fixture remains compatible with
-the supervisor's pre-launch capability requirement.
+the supervisor's pre-launch capability requirement. It accepts and drops the
+`launch-stdio-v1` descriptor payload before failed preparation.
 
 ## Filesystem metadata fixture
 
@@ -321,7 +322,8 @@ not qualify arbitrary-duration runs beyond the platform session watchdog.
 
 `umbra-fix-201-stdio.c` supplies exact-byte pipe, FIFO, Unix stream, regular-file,
 null and private-pty controls, fork/exec inheritance, descriptor exclusion and
-EOF while the CLI remains alive. The additive isolation-fixture modes reuse
+EOF while a non-isolated CLI remains alive in a verified new session. The
+SID-1 CLI case separately checks delivery and EOF at exit. The additive isolation-fixture modes reuse
 the private terminal harness. `umbra-fix-201-sanitize.rs` establishes Rust's
 closed-standard-slot sanitation on the qualified host.
 

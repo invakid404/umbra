@@ -121,8 +121,11 @@ Unix stream socket, regular file (including offset and append flags), or
 before provider launch with `UnsupportedCapability` at `stdio-endpoint-kind`.
 This also restricts fd 2 kinds that previously passed through unchecked.
 
-After the platform acknowledges ownership, the CLI releases its stdin/stdout
-references. It retains stderr for diagnostics; stderr EOF therefore waits for
+In terminal and other non-launchd sessions, the CLI releases its stdin/stdout
+references after the platform acknowledges ownership. Under launchd-session
+isolation, the relay and guardian retain stdin/stdout until umbra exits: EOF
+and SIGPIPE back-pressure follow that exit, including when the tracee closes
+stdout and continues running. The CLI retains stderr for diagnostics; stderr EOF waits for
 umbra and its providers to exit. Embedded callers retain their own descriptors.
 Rust startup replaces closed standard slots with `/dev/null` on the qualified
 macOS host; closed-slot EBADF behavior is not preserved.
@@ -308,7 +311,7 @@ LIMITS item 8.
 The two read utilities each run twice, on an operand that exists and on one that
 does not. The failure leg pins that the program ran at all, by requiring its own
 `No such file or directory` line on stderr: a tracee's stderr reaches the caller
-even though its stdout does not, so that line is evidence nothing a no-op could
+alongside inherited stdout, so that line is evidence nothing a no-op could
 produce. Neither leg pins *which* resolver answered — each operand is present or
 absent on the host exactly as it is in the run — so redirection into the shadow
 is pinned by the `/usr/bin/touch` case's exact-bytes assertion instead.
@@ -342,3 +345,8 @@ Launch requires runtime platform support for `bounded-event-poll-v1` and
 `platform.shutdown-ledger.v1` even
 when the registry omits that capability. Update the platform provider alongside
 the CLI; an old provider fails before Launch rather than waiting indefinitely.
+
+`f201_pipe_eof_isolated` separately qualifies exact stdin/stdout delivery and EOF
+at CLI exit in SID 1. It does not promise early EOF while the tracee remains
+alive. The userspace `f201_pipe_eof_control_alive` case creates and verifies a
+non-SID-1 session, where early EOF is guaranteed.

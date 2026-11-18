@@ -91,7 +91,9 @@ The staged order is fixed, and each stage's failure decides what may be released
    would silently discard it. `namespace-run-lifecycle-v1` names the capability
    such a provider will have to advertise, and an unqualified descriptor is told
    so first, but declaring it does not admit the run.
-2. Inventory the approved workspace and derive the run's `ImmutableBaseContract`.
+2. Capture and validate owned copies of the caller's standard streams, then
+   inventory the approved workspace and derive the run's `ImmutableBaseContract`.
+   This precedes provider creation; no stream bytes are read or recorded.
 3. Connect storage, `open_run(CreateNew)`, then `acquire_writer` with
    `TakeoverPolicy::Refuse`. There is no stale-writer takeover. The writer
    identity is the backend's when the backend already has one:
@@ -110,6 +112,11 @@ The staged order is fixed, and each stage's failure decides what may be released
    then connect the platform, require exactly one advertised architecture and one
    matching ABI capability `<platform>-<arch>-abi-v<decimal version>`,
    require `bounded-event-poll-v1` and `platform.shutdown-ledger.v1`, and launch stopped.
+   Before launch, the platform must acknowledge the one-shot `launch-stdio-v1`
+   transfer. `RunObserver::stdio_adopted` then allows the CLI to release its
+   stdin/stdout references. The default leaves embedding callers' originals
+   unchanged; stderr remains available for CLI diagnostics. Provider stdin/stdout
+   remain null. The platform consumes its received copies at root spawn.
 7. Drive events, then consume the platform session through confirmed shutdown:
    freeze its resource inventory, validate every final disposition after backend
    destruction, and collect the owned provider process. Only then flush run data, append and flush a

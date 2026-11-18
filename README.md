@@ -97,9 +97,8 @@ break one routing direction, routed call or cache invariant each and must make
 the case fail. The two oldest probes assert distinct exit codes; the three
 utility probes assert distinct observable pairs instead, because Apple's
 utilities all exit 1. The two directory probes assert on neither: they compare
-the *entry names* read back through the client, because a tracee inherits the
-provider's `Stdio::null()` standard output, so a listing is unreadable by any
-harness and an exit code cannot tell a correct listing from an empty one. One
+the *entry names* read back through the client, because an exit code cannot tell a correct listing from an empty one.
+Inherited standard streams have separate exact-byte controls. One
 corrupts the encoded names; the other stops a closed descriptor's cached
 directory page being evicted, so a second enumeration of the same directory
 comes back empty while the run still exits 0. What the routed

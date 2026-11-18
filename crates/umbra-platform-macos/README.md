@@ -24,6 +24,18 @@ RLE decode, and a per-request deadline.
 
 ## Confirmed shutdown
 
+The platform advertises `launch-stdio-v1` for one-shot adoption of the caller's
+validated standard-stream descriptions. Root spawn duplicates the owned handles
+into 0/1/2 under `POSIX_SPAWN_CLOEXEC_DEFAULT`, then closes the platform's copies.
+Launch failures release them too. Provider and debugserver process streams
+remain separate; extra launch handles never reach the tracee or debugserver.
+The IPC adoption acknowledgement precedes root launch.
+
+This changes stream delivery, not signal handling. Default and ignored SIGPIPE
+still produce the existing fatal `tracee stop` / `T0d` error. Background terminal
+reads produce fatal `T15`; foreground fd 2 reads remain supported. The CLI's
+README describes the launchd relay/guardian retention limitation.
+
 The provider advertises `platform.shutdown-ledger.v1`. Its ledger reserves slots
 before root/child creation, tracer launch and task-right acquisition, and keeps
 retired history through quiesce, resume and preliminary termination. Exec records

@@ -1389,3 +1389,63 @@ fn pty_t10_terminal_ioctls() {
         p.transcript
     );
 }
+
+/// Launchd relay/guardian retain stream copies until CLI exit (#201).
+#[test]
+fn f201_pipe_eof_isolated() {
+    use std::io::Write;
+    if !qualified() {
+        return;
+    }
+    if own_session() != 1 {
+        eprintln!(
+            "SID-1 prerequisite: not runnable from a worker terminal session; qualified on CI"
+        );
+        assert!(!set("UMBRA_REQUIRE_SID1"), "SID-1 qualification required");
+        return;
+    }
+    let (dir, _temp) = case_dir("f201_pipe_eof_isolated");
+    let program = dir.join("stdio-control");
+    let built = Command::new("clang")
+        .args(["-arch", "arm64", "-O1", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository().join("experiments/fixtures/umbra-fix-201-stdio.c"))
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let payload = b"isolated stdin/stdout\0\xff\n";
+    let mut argv = umbra_command(&dir, 20_000, &[]);
+    *argv.last_mut().unwrap() = program.into_os_string();
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .arg("copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(
+        procs()
+            .into_iter()
+            .find(|p| p.pid == child.id() as i32)
+            .unwrap()
+            .sid,
+        1
+    );
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    // wait_with_output drains to EOF and collects CLI exit. Early EOF is not
+    // promised here: relay and guardian may retain the writer until exit.
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, payload);
+    eprintln!("f201_pipe_eof_isolated: exact bytes and stdout EOF at CLI exit");
+}

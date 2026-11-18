@@ -6,6 +6,14 @@ StoragePath validate during deserialization, and write payloads have an explicit
 Storage types are available both at the root and through `storage` for compatibility.
 Core has no Umbra dependencies and forbids unsafe code.
 
+On Unix, `launch_stdio::LaunchStdio` owns validated copies of the caller's
+standard streams. It accepts tty, pipe/FIFO, Unix stream, regular-file and
+descriptor-identified null endpoints. Its private ancillary transfer preserves
+open descriptions and offsets, validates the three received handles, and sets
+CLOEXEC. Only a platform advertising `launch-stdio-v1` can receive this payload;
+an invalid transfer or uncertain acknowledgement invalidates the connection.
+The handles are runtime capabilities, never serialized run metadata.
+
 `capabilities` holds the open capability names crates negotiate over the provider
 handshake, so every consumer spells the same requirement the same way. They are
 configuration strings, not a backend enum: a name maps to no implementation, and
