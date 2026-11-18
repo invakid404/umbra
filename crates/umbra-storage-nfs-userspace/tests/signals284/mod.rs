@@ -134,19 +134,12 @@ fn f284_concurrency() {
     }
 }
 
-#[test]
-fn f284_unsafe_states() {
+fn unsafe_state(phase: &str, expected: &str) {
     let Some(target) = fixture() else { return };
     // CI builds the provider with signal-witness for this named command.
     // A missing witness is a failure, never an accepted refusal.
     let scratch = tempfile::tempdir().unwrap();
-    for (phase, expected) in [
-        ("entry", "signal-at-syscall-entry"),
-        ("return-window", "signal-during-return-window"),
-        ("exec", "signal-exec-transition"),
-        ("internal", "signal-during-internal-operation"),
-        ("park", "signal-during-return-window"),
-    ] {
+    {
         let native_root = scratch.path().join(format!("{phase}-native"));
         let mut native = command(&native_root, &target, true, "unsafe");
         native.args([phase, "native"]).stdin(Stdio::piped());
@@ -170,23 +163,31 @@ fn f284_unsafe_states() {
         let mut child = cmd.spawn().unwrap();
         if phase == "park" {
             let limit = std::time::Instant::now() + std::time::Duration::from_secs(15);
-            loop {
+            let ready = loop {
                 if std::fs::read(&record)
                     .ok()
                     .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                     .is_some()
                 {
-                    break;
+                    break true;
                 }
-                assert!(
-                    std::time::Instant::now() < limit,
-                    "missing parked-wait witness"
-                );
-                assert!(
-                    child.try_wait().unwrap().is_none(),
-                    "run exited before parking"
-                );
+                if child.try_wait().unwrap().is_some() {
+                    break false;
+                }
+                if std::time::Instant::now() >= limit {
+                    // Test instrumentation timeout, not a backend idle policy.
+                    child.kill().unwrap();
+                    break false;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            if !ready {
+                let out = child.wait_with_output().unwrap();
+                panic!(
+                    "no parked-wait reading: {:?}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
             }
             // Parent's debugger stop is still held; release its owned child.
             assert!(child.try_wait().unwrap().is_none());
@@ -270,4 +271,25 @@ fn f284_dispositions() {
         );
     }
     assert!(failures.is_empty(), "signal mismatches: {failures:?}");
+}
+
+#[test]
+fn f284_unsafe_entry() {
+    unsafe_state("entry", "signal-at-syscall-entry");
+}
+#[test]
+fn f284_unsafe_return_window() {
+    unsafe_state("return-window", "signal-during-return-window");
+}
+#[test]
+fn f284_unsafe_exec() {
+    unsafe_state("exec", "signal-exec-transition");
+}
+#[test]
+fn f284_unsafe_internal() {
+    unsafe_state("internal", "signal-during-internal-operation");
+}
+#[test]
+fn f284_unsafe_park() {
+    unsafe_state("park", "signal-during-return-window");
 }
