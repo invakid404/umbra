@@ -410,11 +410,9 @@ enum Expect {
     /// so the case does not distinguish a rewritten open from an unrewritten
     /// one. Which resolver answered is pinned by `Expect::Captured`.
     ///
-    /// What the utility *printed* is deliberately not asserted. A tracee
-    /// inherits fds 0-2 from the platform provider process, whose stdout the
-    /// provider transport sets to `/dev/null`
-    /// (`umbra-core/src/provider/transport.rs:322`), so a filter's output is not
-    /// observable from here today, and pinning it empty would pin that.
+    /// What the utility *printed* is deliberately not asserted by this
+    /// filesystem matrix. Inherited stdout has separate exact-byte stdio201
+    /// controls in the userspace routing suite.
     ///
     /// On its own this cannot tell "the utility ran" from "nothing ran": a
     /// no-op also exits zero and touches nothing. Its discriminating partner is
@@ -423,8 +421,7 @@ enum Expect {
     ReadOnly,
     /// The operand does not exist, so the utility fails and names it on stderr.
     ///
-    /// That line is the observable this matrix needs: a tracee's stderr *does*
-    /// reach the caller even though its stdout does not, so the message proves
+    /// That line is the observable this matrix needs: the message proves
     /// which program ran, that it received this exact operand, and that the
     /// operand was absent when it was resolved. Substituting a program that
     /// does nothing prints nothing and fails the case. umbra still reports its
