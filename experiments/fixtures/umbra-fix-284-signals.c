@@ -18,6 +18,24 @@ static const char *handler_path;
 static volatile sig_atomic_t io_failed;
 static atomic_int rate_ready, rate_stop, rate_failed;
 static const char *rate_root;
+static atomic_int directed_ready;
+static atomic_int directed_count, directed_wrong;
+static _Thread_local sig_atomic_t directed_is_worker;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "signal fixture requires lock-free int");
+
+static void directed_handler(int signo) {
+    (void)signo;
+    if (!directed_is_worker) atomic_store(&directed_wrong, 1);
+    atomic_fetch_add(&directed_count, 1);
+}
+
+static void *directed_worker(void *unused) {
+    (void)unused;
+    directed_is_worker = 1;
+    atomic_store(&directed_ready, 1);
+    while (!atomic_load(&directed_count)) sched_yield();
+    return NULL;
+}
 
 static void *rate_worker(void *arg) {
     sigset_t blocked;
@@ -53,6 +71,19 @@ static void handled(int signo) {
 
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
+    if (!strcmp(argv[1], "directed")) {
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = directed_handler;
+        if (sigaction(SIGUSR1, &action, NULL)) return 106;
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, directed_worker, NULL)) return 107;
+        while (!atomic_load(&directed_ready)) sched_yield();
+        if (pthread_kill(worker, SIGUSR1) || pthread_join(worker, NULL)) return 108;
+        if (atomic_load(&directed_wrong) || atomic_load(&directed_count) != 1) return 109;
+        return write(1, "directed once\n", 14) == 14 ? 0 : 110;
+    }
     if (!strcmp(argv[1], "mask-verify")) {
         if (argc != 3) return 64;
         sigset_t mask;

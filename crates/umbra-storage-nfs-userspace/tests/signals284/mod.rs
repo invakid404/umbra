@@ -167,6 +167,24 @@ fn f284_concurrency() {
 }
 
 #[test]
+fn f284_thread_delivery() {
+    let Some(target) = fixture() else { return };
+    let scratch = tempfile::tempdir().unwrap();
+    for native in [true, false] {
+        let root = scratch.path().join(format!("directed-{native}"));
+        let out = command(&root, &target, native, "directed")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"directed once\n");
+    }
+}
+
+#[test]
 fn f284_sources() {
     use std::os::fd::OwnedFd;
     let Some(target) = fixture() else { return };
@@ -360,6 +378,20 @@ fn unsafe_state(phase: &str, expected: &str) {
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
+        if matches!(phase, "identity" | "ambiguous") {
+            let fault: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(format!("{}.stop.json", record.display())).unwrap(),
+            )
+            .unwrap();
+            eprintln!("transport fault witness: {fault}");
+            assert!(fault["original"].as_str().unwrap().starts_with("T1e"));
+            assert_eq!(fault["fault"], phase);
+            if phase == "identity" {
+                assert!(!fault["dispatched"].as_str().unwrap().contains("thread:"));
+            } else {
+                assert_eq!(fault["interrupted"], true);
+            }
+        }
         assert_eq!(witness["phase"], phase);
         assert_eq!(witness["stopped"], true);
         match phase {
@@ -450,4 +482,13 @@ fn f284_unsafe_internal() {
 #[test]
 fn f284_unsafe_park() {
     unsafe_state("park", "signal-during-return-window");
+}
+
+#[test]
+fn f284_unsafe_identity() {
+    unsafe_state("identity", "signal-stop-identity");
+}
+#[test]
+fn f284_unsafe_ambiguous() {
+    unsafe_state("ambiguous", "ambiguous-interrupt-signal");
 }
