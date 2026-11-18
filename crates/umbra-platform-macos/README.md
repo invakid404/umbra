@@ -771,6 +771,16 @@ UMBRA_TEST_FIXTURE_PATH=<abs> UMBRA_TEST_REDIRECT_ROOT=<abs> \
 <!-- memoria:section id="test-coverage" files="tests/**" guidance="../../docs/guides/reviewing-test-sections.md" -->
 ## Test coverage
 
+`tests/launch_stdio.rs` requires macOS arm64 and `UMBRA_INTEGRATION_REQUIRED=1`;
+otherwise it reports an explicit skip. Build its sentinel with
+`clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-201-stdio.c -o target/debug/umbra-fix-201-stdio`
+from the repository root, set `UMBRA_STDIO_FIXTURE` to that binary's absolute
+path, then run `cargo test -p umbra-platform-macos --test launch_stdio --
+--nocapture --test-threads=1`. It requires debugger permission. The sentinel
+must execute and exit zero with the provider-held descriptor absent; retry
+controls require the exact consumed-capability error, and rollback requires
+writer EOF while the backend remains alive.
+
 `tests/fixtures.rs` drives Track D's C fixtures through the Rust tracer.
 It reads `UMBRA_TEST_FIXTURE_PATH` (path to `umbra-test-child`) and
 `UMBRA_TEST_REDIRECT_ROOT` (shadow root); when either env var is unset,
