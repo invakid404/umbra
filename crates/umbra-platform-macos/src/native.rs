@@ -3577,7 +3577,7 @@ impl MacosTraceBackend {
                 if matches!(phase.as_str(), "entry" | "identity" | "ambiguous")
                     && s.signal_probe(&phase)?
                 {
-                    s.continue_run()?;
+                    s.continue_absorbed(thread)?;
                     return Ok(());
                 }
             }
