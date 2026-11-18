@@ -351,3 +351,58 @@ fn adopted_endpoint_identity_is_absent_from_helper_images() {
         "adopted endpoint leaked to helper images: {leaked:?}"
     );
 }
+
+#[test]
+fn overlapping_standard_sources_are_preserved() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    if std::env::var_os("UMBRA_TEST_LOW_STDIO").is_some() {
+        // This subprocess exclusively owns its standard slots. The caller's
+        // [stdout, stdin, stderr] mapping must survive the destination overlap.
+        let adopted = LaunchStdio::new(unsafe {
+            [
+                OwnedFd::from_raw_fd(1),
+                OwnedFd::from_raw_fd(0),
+                OwnedFd::from_raw_fd(2),
+            ]
+        })
+        .unwrap();
+        if adopted.descriptors().iter().any(|fd| fd.as_raw_fd() <= 2) {
+            std::process::exit(91);
+        }
+        for (fd, bytes) in adopted.descriptors()[..2]
+            .iter()
+            .zip([b"stdout source", b"stdin source".as_slice()])
+        {
+            let mut file = std::fs::File::from(fd.try_clone().unwrap());
+            file.set_len(0).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(bytes).unwrap();
+        }
+        std::process::exit(0);
+    }
+    let mut input = tempfile::tempfile().unwrap();
+    let mut output = tempfile::tempfile().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "overlapping_standard_sources_are_preserved",
+            "--nocapture",
+        ])
+        .env("UMBRA_TEST_LOW_STDIO", "1")
+        .stdin(input.try_clone().unwrap())
+        .stdout(output.try_clone().unwrap())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "overlapping descriptor control: {status}");
+    for (file, expected) in [
+        (&mut input, b"stdin source".as_slice()),
+        (&mut output, b"stdout source".as_slice()),
+    ] {
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, expected);
+    }
+}
