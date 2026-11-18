@@ -77,9 +77,10 @@ requirement to import every allowed crate.
   closed backend enums are forbidden. Open provider IDs are configuration data;
   operation/event/error enums remain useful.
 - Native OS bindings and target-specific build settings stay in platform and
-  storage backends. The one exception is `umbra-isolation` (#193): the CLI must
-  move a run out of launchd's session before any supervisor or provider exists,
-  so that crate holds the process-session bindings and permits `unsafe`, and
+  storage backends, with two exceptions. Core uses safe Unix descriptor APIs
+  for owned launch stdio and its private platform transfer. `umbra-isolation`
+  (#193) moves a run out of launchd's session before any supervisor or provider
+  exists. That crate holds the process-session bindings and permits `unsafe`, and
   `umbra-cli` keeps `#![forbid(unsafe_code)]`.
   Shared DTOs belong in core, and per-trait protocols/factories in the trait crate.
 - Conformance helpers belong with contracts and use fakes or injected trait objects.
@@ -169,7 +170,9 @@ is counted against a group in launchd's session
 ([umbra-isolation](crates/umbra-isolation/README.md), #193).
 
 Providers are trusted supervisor components outside the tracee sandbox. Their
-private sockets/pipes and descriptors must never be inherited by tracees. Timeouts,
+private control sockets/pipes and descriptors must never be inherited by tracees.
+The platform separately adopts the caller's validated standard streams for one
+root launch; these are host endpoints, not provider control channels. Timeouts,
 backpressure and disconnect handling are mandatory. Loss of a required provider
 blocks mutations while retaining kernel enforcement; the platform keeps tracees
 stopped or terminates them safely on controller loss. There is no host-write fallback.
