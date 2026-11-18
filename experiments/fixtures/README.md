@@ -336,7 +336,7 @@ inherited stdout.
 
 `umbra-fix-284-signals.c` supplies default, ignored and handler dispositions,
 initial SIGPIPE state, timers, inherited sockets, handler filesystem I/O,
-fork/exec, thread-directed signals and a routed-read rate workload. Build with
+fork/exec, thread-directed signals and a routed-metadata rate workload. Build with
 `clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-284-signals.c -o target/debug/umbra-fix-284-signals`.
 The userspace-storage `signals284` suite accepts its absolute path through
 `UMBRA_F284_SIGNALS` and otherwise compiles it. Live cases require macOS arm64,

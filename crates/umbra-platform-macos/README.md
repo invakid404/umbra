@@ -673,6 +673,13 @@ With `shutdown-witness`, `UMBRA_FIX_271_EVIDENCE_FILE` selects an append-only
 JSONL file for acquisition, thread-order and closure timing observations. Unset
 means no witness output; builds without the feature do not read the variable.
 
+With `signal-witness`, `UMBRA_FIX284_PHASE` selects `entry`, `return-window`,
+`exec`, `internal`, `park`, `identity` or `ambiguous`. Unset means no probe.
+`UMBRA_FIX284_RECORD` must name a fresh witness file when a phase is selected.
+Identity and ambiguity probes also write a `.stop.json` companion with the
+original packet and injected dispatch metadata. Normal builds read neither
+variable.
+
 **Launch and enforcement.** `TraceBackend::launch` and `launch_experimental`
 share `native.rs::MacosTraceBackend::launch_traced`: both launch suspended,
 sanitize inherited descriptors, and install the same syscall interception loop

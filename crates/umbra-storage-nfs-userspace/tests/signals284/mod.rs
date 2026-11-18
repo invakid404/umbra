@@ -2,6 +2,14 @@ use super::*;
 use std::io::{BufRead, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 
+fn fixture() -> Option<(String, u16)> {
+    if declared_probe().is_some() {
+        eprintln!("SKIP: UMBRA_MUTATION_PROBE selects another routing experiment");
+        return None;
+    }
+    super::fixture()
+}
+
 fn command(root: &Path, target: &(String, u16), native: bool, mode: &str) -> Command {
     let mut c = super::stdio201::command_fixture(
         root,
@@ -409,6 +417,8 @@ fn unsafe_state(phase: &str, expected: &str) {
         assert_eq!(out.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&out.stderr).contains(expected));
         assert!(!String::from_utf8_lossy(&out.stdout).contains("unsafe returned"));
+        let run = super::stdio201::run_record(&root, &out);
+        assert!(!journal_records_completion(&run));
     }
 }
 
