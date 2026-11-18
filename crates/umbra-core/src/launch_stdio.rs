@@ -13,6 +13,12 @@ use std::os::unix::net::UnixStream;
 /// Negotiated capability for the platform's one-shot stdio adoption request.
 pub const CAPABILITY: &str = "launch-stdio-v1";
 
+#[cfg(test)]
+thread_local! {
+    static RECEIVE_ERRORS: std::cell::RefCell<std::collections::VecDeque<rustix::io::Errno>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
 fn io(error: impl std::fmt::Display) -> UmbraError {
     UmbraError::new(ErrorKind::Io, "launch.stdio", error.to_string())
 }
@@ -108,17 +114,50 @@ impl LaunchStdio {
 
     /// Receive and validate one ownership transfer. All received handles are
     /// closed on an invalid message or endpoint; acknowledgement comes later.
+    #[cfg(test)]
     pub(crate) fn receive(stream: &UnixStream) -> Result<Self> {
+        Self::receive_with_budget(stream, || Ok(()))
+    }
+
+    pub(crate) fn receive_with_budget(
+        stream: &UnixStream,
+        mut refresh_budget: impl FnMut() -> Result<()>,
+    ) -> Result<Self> {
         let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
         let mut ancillary = RecvAncillaryBuffer::new(&mut space);
         let mut marker = [0];
-        let message = recvmsg(
-            stream,
-            &mut [IoSliceMut::new(&mut marker)],
-            &mut ancillary,
-            RecvFlags::empty(),
-        )
-        .map_err(io)?;
+        let message = loop {
+            refresh_budget()?;
+            #[cfg(test)]
+            let injected = RECEIVE_ERRORS.with(|errors| errors.borrow_mut().pop_front());
+            #[cfg(not(test))]
+            let injected: Option<rustix::io::Errno> = None;
+            let attempt = if let Some(error) = injected {
+                Err(error)
+            } else {
+                recvmsg(
+                    stream,
+                    &mut [IoSliceMut::new(&mut marker)],
+                    &mut ancillary,
+                    RecvFlags::empty(),
+                )
+            };
+            match attempt {
+                Ok(message) => break message,
+                Err(error)
+                    if matches!(
+                        error,
+                        rustix::io::Errno::INTR
+                            | rustix::io::Errno::AGAIN
+                            | rustix::io::Errno::TIMEDOUT
+                    ) =>
+                {
+                    // No payload was consumed. Recheck the same absolute
+                    // request budget after an interrupt or early timeout.
+                }
+                Err(error) => return Err(io(error)),
+            }
+        };
         let mut fds = Vec::new();
         for item in ancillary.drain() {
             match item {
@@ -154,6 +193,43 @@ mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom, Write};
 
+    #[test]
+    fn ancillary_retries_refresh_budget_without_consuming_payload() {
+        let file = tempfile::tempfile().unwrap();
+        let stdio =
+            LaunchStdio::new(std::array::from_fn(|_| file.try_clone().unwrap().into())).unwrap();
+        for expire in [false, true] {
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            stdio.send(&sender).unwrap();
+            RECEIVE_ERRORS.with(|errors| {
+                *errors.borrow_mut() = [
+                    rustix::io::Errno::INTR,
+                    rustix::io::Errno::AGAIN,
+                    rustix::io::Errno::TIMEDOUT,
+                ]
+                .into();
+            });
+            let mut refreshes = 0;
+            let result = LaunchStdio::receive_with_budget(&receiver, || {
+                refreshes += 1;
+                if expire && refreshes == 4 {
+                    Err(io("test absolute budget exhausted"))
+                } else {
+                    Ok(())
+                }
+            });
+            RECEIVE_ERRORS.with(|errors| errors.borrow_mut().clear());
+            assert_eq!(refreshes, 4);
+            if expire {
+                assert!(result.is_err());
+                // No successful recv occurred before expiry: queued ownership
+                // remains intact for a separate receiver in this unit control.
+                LaunchStdio::receive(&receiver).unwrap();
+            } else {
+                result.unwrap();
+            }
+        }
+    }
     #[test]
     fn transfer_preserves_open_description_and_fences_received_handles() {
         let mut original = tempfile::tempfile().unwrap();

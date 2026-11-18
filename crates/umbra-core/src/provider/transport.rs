@@ -57,7 +57,11 @@ pub struct Connection {
 impl Connection {
     /// Receive the platform's one-shot owned descriptor payload.
     pub fn receive_launch_stdio(&mut self) -> Result<crate::launch_stdio::LaunchStdio> {
-        let result = crate::launch_stdio::LaunchStdio::receive(&self.stream);
+        let result = crate::launch_stdio::LaunchStdio::receive_with_budget(&self.stream, || {
+            self.stream
+                .set_read_timeout(Some(self.remaining()?))
+                .map_err(unavailable)
+        });
         if result.is_err() {
             self.invalidate();
         }
