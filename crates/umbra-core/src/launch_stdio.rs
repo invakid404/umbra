@@ -152,14 +152,11 @@ impl LaunchStdio {
             };
             match attempt {
                 Ok(message) => break message,
-                Err(error)
-                    if matches!(
-                        error,
-                        rustix::io::Errno::INTR
-                            | rustix::io::Errno::AGAIN
-                            | rustix::io::Errno::TIMEDOUT
-                    ) =>
-                {
+                Err(
+                    rustix::io::Errno::INTR
+                    | rustix::io::Errno::AGAIN
+                    | rustix::io::Errno::TIMEDOUT,
+                ) => {
                     // No payload was consumed. Recheck the same absolute
                     // request budget after an interrupt or early timeout.
                 }

@@ -13,6 +13,10 @@ open descriptions and offsets, validates the three received handles, and sets
 CLOEXEC. Only a platform advertising `launch-stdio-v1` can receive this payload;
 an invalid transfer or uncertain acknowledgement invalidates the connection.
 The handles are runtime capabilities, never serialized run metadata.
+Owned sources in standard slots are duplicated above fd 2 before admission,
+preserving their open descriptions while preventing overlapping spawn mappings.
+Ancillary receive shares the frame's absolute request deadline: interrupts and
+early timeout wakes refresh the remaining budget instead of restarting it.
 
 `capabilities` holds the open capability names crates negotiate over the provider
 handshake, so every consumer spells the same requirement the same way. They are
