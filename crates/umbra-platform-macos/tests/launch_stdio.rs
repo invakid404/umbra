@@ -239,3 +239,115 @@ fn rejected_launch_releases_adopted_writers_while_provider_lives() {
         consumed(backend.launch(spec()).unwrap_err());
     }
 }
+
+/// Observe actual helper images after exec but before they can exit. The only
+/// additional spawn flag is START_SUSPENDED; deliberately no default-close flag.
+#[test]
+fn adopted_endpoint_identity_is_absent_from_helper_images() {
+    if !qualified() {
+        return;
+    }
+    use std::os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::fs::MetadataExt,
+    };
+    use std::{ffi::CString, process::Command};
+    struct Child(libc::pid_t);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0, libc::SIGKILL);
+                let mut status = 0;
+                while libc::waitpid(self.0, &mut status, 0) < 0 {
+                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    fn identities(pid: libc::pid_t) -> Vec<(u64, u64)> {
+        let output = Command::new("/usr/sbin/lsof")
+            .args(["-nP", "-a", "-p", &pid.to_string(), "-FfDi"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "lsof: {:?}", output);
+        let text = String::from_utf8(output.stdout).unwrap();
+        let mut dev = None;
+        let mut numeric = false;
+        let mut found = Vec::new();
+        for line in text.lines() {
+            if let Some(fd) = line.strip_prefix('f') {
+                numeric = fd.parse::<u32>().is_ok();
+                dev = None;
+            } else if let Some(value) = line.strip_prefix('D') {
+                dev = Some(u64::from_str_radix(value.trim_start_matches("0x"), 16).unwrap());
+            } else if let Some(value) = line.strip_prefix('i') {
+                if numeric {
+                    if let Some(dev) = dev {
+                        found.push((dev, value.parse().unwrap()));
+                    }
+                }
+            }
+        }
+        found
+    }
+    let file = tempfile::tempfile().unwrap();
+    let metadata = file.metadata().unwrap();
+    let identity = (metadata.dev(), metadata.ino());
+    assert!(
+        identities(std::process::id() as i32).contains(&identity),
+        "census must recognize fstat identity"
+    );
+    let stdio = LaunchStdio::new(std::array::from_fn(|_| {
+        let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!(fd >= 200);
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }))
+    .unwrap();
+    drop(file);
+    let mut backend = MacosTraceBackend::default();
+    backend.adopt_stdio(stdio).unwrap();
+    let mut leaked = Vec::new();
+    // The pre-root helpers that run with adopted copies still alive. Codesign
+    // covers twin signing, twin verification and interposer verification.
+    for executable in ["/usr/bin/shasum", "/usr/bin/codesign"] {
+        let path = CString::new(executable).unwrap();
+        let mut pid = 0;
+        unsafe {
+            let mut attr = std::mem::zeroed();
+            assert_eq!(libc::posix_spawnattr_init(&mut attr), 0);
+            assert_eq!(
+                libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_START_SUSPENDED as i16),
+                0
+            );
+            let args = [path.as_ptr() as *mut libc::c_char, std::ptr::null_mut()];
+            let env = [std::ptr::null_mut()];
+            let result = libc::posix_spawn(
+                &mut pid,
+                path.as_ptr(),
+                std::ptr::null(),
+                &attr,
+                args.as_ptr(),
+                env.as_ptr(),
+            );
+            libc::posix_spawnattr_destroy(&mut attr);
+            assert_eq!(result, 0, "spawn {executable}");
+        }
+        let child = Child(pid);
+        let absent = !identities(pid).contains(&identity);
+        eprintln!(
+            "helper={executable} fstat_dev={} fstat_ino={} absent={absent}",
+            identity.0, identity.1
+        );
+        if !absent {
+            leaked.push(executable);
+        }
+        drop(child);
+    }
+    drop(backend);
+    assert!(
+        leaked.is_empty(),
+        "adopted endpoint leaked to helper images: {leaked:?}"
+    );
+}
