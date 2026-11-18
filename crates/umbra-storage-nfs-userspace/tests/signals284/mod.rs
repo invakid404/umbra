@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Write;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 
 fn command(root: &Path, target: &(String, u16), native: bool, mode: &str) -> Command {
@@ -72,6 +73,87 @@ fn f284_handler_io() {
                 b"host sentinel\n".as_slice()
             }
         );
+    }
+}
+
+#[test]
+fn f284_unsafe_states() {
+    let Some(target) = fixture() else { return };
+    // CI builds the provider with signal-witness for this named command.
+    // A missing witness is a failure, never an accepted refusal.
+    let scratch = tempfile::tempdir().unwrap();
+    for (phase, expected) in [
+        ("entry", "signal-at-syscall-entry"),
+        ("return-window", "signal-during-return-window"),
+        ("exec", "signal-exec-transition"),
+        ("internal", "signal-during-internal-operation"),
+        ("park", "signal-during-return-window"),
+    ] {
+        let native_root = scratch.path().join(format!("{phase}-native"));
+        let mut native = command(&native_root, &target, true, "unsafe");
+        native.args([phase, "native"]).stdin(Stdio::piped());
+        let mut child = native.spawn().unwrap();
+        if phase == "park" {
+            child.stdin.take().unwrap().write_all(b"q").unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "native {phase}: {:?}", out.status);
+        if phase != "exec" {
+            assert_eq!(out.stdout, b"unsafe returned count=1\n");
+        }
+
+        let root = scratch.path().join(format!("{phase}-routed"));
+        let mut cmd = command(&root, &target, false, "unsafe");
+        let record = root.join("witness.json");
+        cmd.args([phase, "routed"])
+            .env("UMBRA_FIX284_PHASE", phase)
+            .env("UMBRA_FIX284_RECORD", &record)
+            .stdin(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        if phase == "park" {
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if std::fs::read(&record)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .is_some()
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < limit,
+                    "missing parked-wait witness"
+                );
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "run exited before parking"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // Parent's debugger stop is still held; release its owned child.
+            assert!(child.try_wait().unwrap().is_none());
+            child.stdin.take().unwrap().write_all(b"q").unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        let witness: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).expect("missing state witness"))
+                .unwrap();
+        eprintln!(
+            "phase={phase} witness={witness} status={:?}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(witness["phase"], phase);
+        assert_eq!(witness["stopped"], true);
+        match phase {
+            "return-window" | "exec" => assert_eq!(witness["pending"], 1),
+            "park" => assert!(witness["waiting"].as_u64().unwrap() > 0),
+            "entry" => assert_eq!(witness["pending"], 0),
+            _ => {}
+        }
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains(expected));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("unsafe returned"));
     }
 }
 

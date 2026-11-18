@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 static volatile sig_atomic_t deliveries;
 static const char *handler_path;
@@ -24,6 +25,33 @@ static void handled(int signo) {
 
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
+    if (!strcmp(argv[1], "unsafe")) {
+        if (argc != 4) return 64;
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = handled;
+        if (sigaction(SIGUSR1, &action, NULL)) return 76;
+        if (!strcmp(argv[3], "native") && kill(getpid(), SIGUSR1)) return 77;
+        if (!strcmp(argv[2], "exec")) {
+            execl(argv[0], argv[0], "initial", (char *)NULL);
+            return 78;
+        }
+        pid_t child = fork();
+        if (child < 0) return 79;
+        if (!child) {
+            if (!strcmp(argv[2], "park")) {
+                char release;
+                if (read(0, &release, 1) != 1 || release != 'q') _exit(80);
+            }
+            _exit(0);
+        }
+        int status;
+        if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+            WEXITSTATUS(status)) return 81;
+        printf("unsafe returned count=%d\n", (int)deliveries);
+        return 0;
+    }
     if (!strcmp(argv[1], "handler-io")) {
         if (argc != 3) return 64;
         handler_path = argv[2];
