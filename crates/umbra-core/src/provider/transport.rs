@@ -55,6 +55,10 @@ pub struct Connection {
     failed: bool,
 }
 impl Connection {
+    fn send_launch_stdio(&mut self, stdio: &crate::launch_stdio::LaunchStdio) -> Result<()> {
+        stdio.send(&self.stream)
+    }
+
     /// Receive the platform's one-shot owned descriptor payload.
     pub fn receive_launch_stdio(&mut self) -> Result<crate::launch_stdio::LaunchStdio> {
         let result = crate::launch_stdio::LaunchStdio::receive_with_budget(&self.stream, || {
@@ -571,7 +575,7 @@ impl Client {
         }
         let result = (|| {
             let id = self.start(request)?;
-            stdio.send(&self.connection.stream)?;
+            self.connection.send_launch_stdio(&stdio)?;
             match self.connection.receive()? {
                 Frame::Response { id: got, result } if id == got => decode(&result?),
                 _ => Err(protocol_error("stdio ownership ACK mismatch")),
@@ -715,6 +719,46 @@ mod tests {
         .send(&sender.stream)
         .unwrap();
     }
+    #[test]
+    fn ancillary_send_expired_budget_transfers_no_rights() {
+        let (mut sender, receiver) = pair(Duration::from_secs(5));
+        let file = tempfile::tempfile().unwrap();
+        let stdio = crate::launch_stdio::LaunchStdio::new(std::array::from_fn(|_| {
+            file.try_clone().unwrap().into()
+        }))
+        .unwrap();
+        sender.set_deadline(transport_now() - Duration::from_secs(1));
+        let result = sender.send_launch_stdio(&stdio);
+        assert!(result.is_err(), "expired ancillary send transferred rights");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            unavailable("request deadline exceeded").to_string()
+        );
+        assert!(sender.failed);
+        // Shutdown must expose EOF, not an ancillary marker or rights.
+        let mut peer = receiver.stream;
+        let mut marker = [0];
+        assert_eq!(peer.read(&mut marker).unwrap(), 0);
+    }
+
+    #[test]
+    fn ancillary_send_refreshes_stale_timeout() {
+        let (mut sender, receiver) = pair(Duration::from_secs(5));
+        sender
+            .stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        sender.set_deadline(transport_now() + Duration::from_secs(1));
+        let file = tempfile::tempfile().unwrap();
+        let stdio = crate::launch_stdio::LaunchStdio::new(std::array::from_fn(|_| {
+            file.try_clone().unwrap().into()
+        }))
+        .unwrap();
+        sender.send_launch_stdio(&stdio).unwrap();
+        assert!(sender.stream.write_timeout().unwrap().unwrap() <= Duration::from_secs(1));
+        crate::launch_stdio::LaunchStdio::receive(&receiver.stream).unwrap();
+    }
+
     #[test]
     fn ancillary_transfer_rejects_an_expired_request_before_receiving() {
         let (mut receiver, sender) = pair(Duration::from_secs(5));
