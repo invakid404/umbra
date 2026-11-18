@@ -6348,7 +6348,7 @@ const WALK_REACHED_SET_LEN: i32 = 155;
 /// answered to the caller as `ELOOP`(62), and since #167 what the ROUTED run
 /// exits for it too -- `o_nofollow_on_a_symlink_leaf_answers_eloop_to_the_tracee`
 /// asserts it positively, and that assertion is how the tracee's `ELOOP` is
-/// stated at all, the fixture having no stdio to report an errno through. Two
+/// stated at all, because the fixture reports its verdict only by exit status. Two
 /// further cases assert they did NOT exit it, which is how "the parent symlink
 /// was followed" and "the leaf opens without the flag" are stated.
 const WALK_REFUSED_AT_LEAF_OPEN: i32 = 153;
@@ -6525,8 +6525,8 @@ fn assert_walk_composed_through_to_set_len(run: &Run, host: &str, port: u16, cas
 /// runs on to its own exit.
 ///
 /// **The tracee's `ELOOP` is asserted through the fixture's exit code, because
-/// that is the only channel there is.** The fixture has no stdio by
-/// construction -- its verdict travels in its exit status alone -- and
+/// that is the only verdict channel this fixture uses.** Its verdict travels
+/// in its exit status alone -- it does not print the errno -- and
 /// `deny_to_tracee` logs nothing, so no stream anywhere carries the number 62.
 /// What `WALK_REFUSED_AT_LEAF_OPEN` says instead is that stage (b)'s `openat`
 /// returned an error AND the leaf was left byte-identical: the same arm of the
