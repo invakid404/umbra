@@ -149,6 +149,8 @@ SIGPIPE permits the native EPIPE return and continued execution. Installed
 handlers run through normal filesystem mediation. Root spawn resets only
 SIGPIPE to default, matching a shell launch; programs can then install their
 own disposition. No caller mask or other disposition is changed by that reset.
+An invoker that deliberately ignores SIGPIPE therefore starts a tracee with
+default SIGPIPE under umbra.
 
 Delivery is limited to clean stable stops. A signal during an exposed return
 window, at an armed syscall entry, during bootstrap or exec, or with ambiguous

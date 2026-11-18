@@ -1712,8 +1712,8 @@ sources, fork/exec, completed-run reopen, concurrent runs and thread-directed
 delivery. They use the live raw-NFS setup above and compile
 `experiments/fixtures/umbra-fix-284-signals.c`, or use `UMBRA_F284_SIGNALS` as an
 absolute fixture override. The unsafe-stop cases also require a platform binary
-built with `signal-witness`; without it they explicitly skip. Each requires the
-matching owned-stop witness, named refusal and absence of journal completion.
+built with `signal-witness`; a missing witness fails the case. Each requires the
+matching owned-stop witness and named refusal.
 Identity and ambiguity cases inject metadata faults after a genuine signal
 packet; Park proves delayed observation after child release.
 
@@ -1721,6 +1721,6 @@ packet; Park proves delayed observation after child release.
 with `--exact --ignored --nocapture --test-threads=1` in the same `userspace_run`
 target and set `UMBRA_F284_RATE_EVIDENCE` to the output JSONL path. It attempts
 six routed metadata trials and records delivery, return-window refusal, or a
-separate non-signal failure with its diagnostic. The
-local qualification stopped before trial three reached READY; two delivered
-signals do not establish a representative rate.
+separate non-signal failure with its diagnostic. The two-worker local metadata
+reading delivered all six signals with no refusal or non-signal failure.
+This small workload does not establish a general refusal rate.
