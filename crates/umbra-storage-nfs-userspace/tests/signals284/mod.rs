@@ -77,7 +77,7 @@ fn f284_handler_io() {
 }
 
 #[test]
-fn f284_fork_exec_pending() {
+fn f284_fork_exec_resume() {
     let Some(target) = fixture() else { return };
     let scratch = tempfile::tempdir().unwrap();
     for (mode, expected) in [
@@ -94,6 +94,38 @@ fn f284_fork_exec_pending() {
             );
             assert!(out.status.success());
             assert_eq!(out.stdout, expected);
+            if !native {
+                let run = super::stdio201::run_record(&root, &out);
+                assert!(journal_records_completion(&run));
+                // A completed reopen must not require a platform or replay a signal.
+                let mut registry: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&run.registry).unwrap()).unwrap();
+                registry["providers"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("platform");
+                std::fs::write(&run.registry, serde_json::to_vec(&registry).unwrap()).unwrap();
+                let resumed = Command::new(binaries().join("umbra"))
+                    .arg("resume")
+                    .arg(run.run_id.0.to_string())
+                    .arg("--registry")
+                    .arg(&run.registry)
+                    .arg("--workspace")
+                    .arg(&run.workspace)
+                    .arg("--state-dir")
+                    .arg(&run.state)
+                    .output()
+                    .unwrap();
+                assert!(
+                    resumed.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&resumed.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&resumed.stderr).contains("requires no reconciliation")
+                );
+                assert!(resumed.stdout.is_empty());
+            }
         }
     }
 }
@@ -207,17 +239,25 @@ fn f284_return_window_rate() {
             if native {
                 std::fs::create_dir(&workspace).unwrap();
             }
+            for worker in 0..2 {
+                std::fs::write(workspace.join(format!("thread-{worker}")), b"io\n").unwrap();
+            }
             let mut child = cmd.arg(workspace).spawn().unwrap();
             let mut ready = String::new();
             std::io::BufReader::new(child.stdout.as_mut().unwrap())
                 .read_line(&mut ready)
                 .unwrap();
-            let pid: i32 = ready
-                .trim()
-                .strip_prefix("READY ")
-                .expect("no rate reading without fixture readiness")
-                .parse()
-                .unwrap();
+            let Some(pid) = ready.trim().strip_prefix("READY ") else {
+                let out = child.wait_with_output().unwrap();
+                let record = serde_json::json!({"native": native, "trial": trial,
+                    "threads": 2, "sent": 0, "outcome": "readiness-failure",
+                    "ready": ready, "status": out.status.code(),
+                    "stderr": String::from_utf8_lossy(&out.stderr)});
+                writeln!(evidence, "{record}").unwrap();
+                evidence.sync_all().unwrap();
+                panic!("no rate reading without fixture readiness: {record}");
+            };
+            let pid: i32 = pid.parse().unwrap();
             assert!(pid > 1);
             // PID comes from this owned fixture's pipe, not process-name discovery.
             assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);

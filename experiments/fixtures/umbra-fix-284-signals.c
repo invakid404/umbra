@@ -28,8 +28,10 @@ static void *rate_worker(void *arg) {
     snprintf(path, sizeof(path), "%s/thread-%ld", rate_root, (long)arg);
     int announced = 0;
     while (!atomic_load(&rate_stop)) {
-        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd < 0 || write(fd, "io\n", 3) != 3 || close(fd)) {
+        int fd = open(path, O_RDONLY);
+        char data[3];
+        if (fd < 0 || read(fd, data, sizeof(data)) != 3 ||
+            memcmp(data, "io\n", 3) || close(fd)) {
             atomic_store(&rate_failed, 1);
             break;
         }
