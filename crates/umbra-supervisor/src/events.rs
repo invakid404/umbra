@@ -448,8 +448,7 @@ impl Supervisor {
                 token,
             } => {
                 self.track_thread(task, thread, StopReason::Signal(signal))?;
-                self.service_renewal()?;
-                self.platform.control.resume(ResumeCommand {
+                self.resume_checked(ResumeCommand {
                     thread,
                     mode: ResumeMode::Signal(token),
                     signal: Some(signal),
