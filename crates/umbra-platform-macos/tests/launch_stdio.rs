@@ -69,10 +69,14 @@ fn adopted_stdio_rejected_launch_cannot_retry_direct() {
     if !qualified() {
         return;
     }
-    for kind in 0..2 {
+    for kind in 0..3 {
         let mut backend = MacosTraceBackend::new(Options::default());
         backend.adopt_stdio(streams()).unwrap();
-        assert!(backend.launch(rejected(kind)).is_err());
+        if kind == 2 {
+            assert!(backend.launch_experimental(spec()).is_err());
+        } else {
+            assert!(backend.launch(rejected(kind)).is_err());
+        }
         let result = backend.launch(spec());
         // Drop owns cleanup even if the broken implementation spawned a root.
         drop(backend);
