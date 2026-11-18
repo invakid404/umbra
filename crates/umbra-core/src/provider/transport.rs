@@ -742,35 +742,40 @@ mod tests {
     }
 
     #[test]
-    fn ancillary_send_backpressure_exhausts_remaining_budget() {
-        let (mut sender, _receiver) = pair(Duration::from_secs(5));
-        sender.stream.set_nonblocking(true).unwrap();
-        let bytes = [0u8; 4096];
-        loop {
-            match sender.stream.write(&bytes) {
-                Ok(n) => assert!(n > 0),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => panic!("fill socket: {e}"),
-            }
-        }
-        sender.stream.set_nonblocking(false).unwrap();
+    fn ancillary_send_no_progress_exhausts_remaining_budget() {
+        let (mut sender, receiver) = pair(Duration::from_secs(5));
         sender
             .stream
-            .set_write_timeout(Some(Duration::from_millis(200)))
+            .set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        sender.set_deadline(transport_now() + Duration::from_millis(30));
+        let now = transport_now();
+        FIX264_CLOCK.with(|v| v.set(Some((now, now))));
+        sender.set_deadline(now + Duration::from_millis(30));
+        crate::launch_stdio::SEND_ATTEMPT.with(|v| {
+            v.set(Some(|| {
+                // A no-payload wake consumes the remaining awake-time budget.
+                let expired = transport_now() + Duration::from_millis(30);
+                FIX264_CLOCK.with(|v| v.set(Some((expired, expired))));
+                rustix::io::Errno::AGAIN
+            }))
+        });
         let file = tempfile::tempfile().unwrap();
         let stdio = crate::launch_stdio::LaunchStdio::new(std::array::from_fn(|_| {
             file.try_clone().unwrap().into()
         }))
         .unwrap();
-        let error = sender.send_launch_stdio(&stdio).unwrap_err();
+        let result = sender.send_launch_stdio(&stdio);
+        crate::launch_stdio::SEND_ATTEMPT.with(|v| v.set(None));
+        FIX264_CLOCK.with(|v| v.set(None));
+        let error = result.unwrap_err();
         assert_eq!(
             error.to_string(),
             unavailable("request deadline exceeded").to_string()
         );
         assert!(sender.failed);
         assert!(sender.stream.write_timeout().unwrap().unwrap() <= Duration::from_millis(30));
+        let mut peer = receiver.stream;
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     }
 
     #[test]

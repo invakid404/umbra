@@ -15,6 +15,7 @@ pub const CAPABILITY: &str = "launch-stdio-v1";
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static SEND_ATTEMPT: std::cell::Cell<Option<fn() -> rustix::io::Errno>> = const { std::cell::Cell::new(None) };
     static RECEIVE_ERRORS: std::cell::RefCell<std::collections::VecDeque<rustix::io::Errno>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
@@ -106,6 +107,10 @@ impl LaunchStdio {
         let mut ancillary = SendAncillaryBuffer::new(&mut space);
         if !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
             return Err(io("stdio ancillary buffer too small"));
+        }
+        #[cfg(test)]
+        if let Some(attempt) = SEND_ATTEMPT.with(|v| v.get()) {
+            return Err(io(attempt()));
         }
         let sent = sendmsg(
             stream,
