@@ -11,8 +11,19 @@ use std::os::unix::process::ExitStatusExt;
 const PAYLOAD: &[u8] = b"stdio-201 exact bytes\n";
 
 fn command(root: &Path, target: &(String, u16), native: bool, mode: &str) -> Command {
+    command_fixture(root, target, native, mode, "umbra-fix-201-stdio", "UMBRA_F201_STDIO")
+}
+
+pub(super) fn command_fixture(
+    root: &Path,
+    target: &(String, u16),
+    native: bool,
+    mode: &str,
+    fixture_name: &str,
+    fixture_env: &str,
+) -> Command {
     std::fs::create_dir_all(root).unwrap();
-    let program = fixture_binary(root, "umbra-fix-201-stdio", "UMBRA_F201_STDIO");
+    let program = fixture_binary(root, fixture_name, fixture_env);
     let mut command = if native {
         Command::new(program)
     } else {
