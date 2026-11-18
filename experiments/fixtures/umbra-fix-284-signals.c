@@ -25,6 +25,64 @@ static void handled(int signo) {
 
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
+    if (!strcmp(argv[1], "concurrent")) {
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = handled;
+        if (sigaction(SIGUSR1, &action, NULL)) return 82;
+        if (write(1, "READY\n", 6) != 6) return 83;
+        char go;
+        if (read(0, &go, 1) != 1 || go != 'q') return 84;
+        if (kill(getpid(), SIGUSR1) || deliveries != 1) return 85;
+        return write(1, "ONE\n", 4) == 4 ? 0 : 86;
+    }
+    if (!strcmp(argv[1], "pending-exec") || !strcmp(argv[1], "pending-child")) {
+        sigset_t set, mask, pending;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = handled;
+        if (!strcmp(argv[1], "pending-exec")) {
+            if (sigaction(SIGUSR1, &action, NULL) ||
+                sigprocmask(SIG_BLOCK, &set, NULL) || kill(getpid(), SIGUSR1)) return 87;
+            pid_t child = fork();
+            if (child < 0) return 88;
+            if (!child) {
+                if (sigpending(&pending) || sigismember(&pending, SIGUSR1)) _exit(89);
+                _exit(0);
+            }
+            int status;
+            if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+                WEXITSTATUS(status)) return 90;
+            execl(argv[0], argv[0], "pending-child", (char *)NULL);
+            return 91;
+        }
+        if (sigprocmask(SIG_SETMASK, NULL, &mask) ||
+            !sigismember(&mask, SIGUSR1) || sigpending(&pending) ||
+            !sigismember(&pending, SIGUSR1)) return 92;
+        struct sigaction inherited;
+        if (sigaction(SIGUSR1, NULL, &inherited) || inherited.sa_handler != SIG_DFL) return 93;
+        if (sigaction(SIGUSR1, &action, NULL) ||
+            sigprocmask(SIG_UNBLOCK, &set, NULL) || deliveries != 1) return 94;
+        return write(1, "pending once\n", 13) == 13 ? 0 : 95;
+    }
+    if (!strcmp(argv[1], "ignore-exec") || !strcmp(argv[1], "ignore-child")) {
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        if (!strcmp(argv[1], "ignore-exec")) {
+            action.sa_handler = SIG_IGN;
+            if (sigaction(SIGUSR2, &action, NULL)) return 96;
+            execl(argv[0], argv[0], "ignore-child", (char *)NULL);
+            return 97;
+        }
+        if (sigaction(SIGUSR2, NULL, &action) || action.sa_handler != SIG_IGN ||
+            kill(getpid(), SIGUSR2)) return 98;
+        return write(1, "ignored after exec\n", 19) == 19 ? 0 : 99;
+    }
     if (!strcmp(argv[1], "unsafe")) {
         if (argc != 4) return 64;
         struct sigaction action;

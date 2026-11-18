@@ -1,5 +1,5 @@
 use super::*;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 
 fn command(root: &Path, target: &(String, u16), native: bool, mode: &str) -> Command {
@@ -73,6 +73,64 @@ fn f284_handler_io() {
                 b"host sentinel\n".as_slice()
             }
         );
+    }
+}
+
+#[test]
+fn f284_fork_exec_pending() {
+    let Some(target) = fixture() else { return };
+    let scratch = tempfile::tempdir().unwrap();
+    for (mode, expected) in [
+        ("pending-exec", b"pending once\n".as_slice()),
+        ("ignore-exec", b"ignored after exec\n".as_slice()),
+    ] {
+        for native in [true, false] {
+            let root = scratch.path().join(format!("{mode}-{native}"));
+            let out = command(&root, &target, native, mode).output().unwrap();
+            eprintln!(
+                "{mode} native={native} {:?}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success());
+            assert_eq!(out.stdout, expected);
+        }
+    }
+}
+
+#[test]
+fn f284_concurrency() {
+    let Some(target) = fixture() else { return };
+    let scratch = tempfile::tempdir().unwrap();
+    for native in [true, false] {
+        let mut children = Vec::new();
+        for index in 0..2 {
+            let root = scratch.path().join(format!("concurrent-{native}-{index}"));
+            let mut child = command(&root, &target, native, "concurrent")
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.as_mut().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "READY\n");
+            children.push(child);
+        }
+        // Both independent sessions are alive before either generates a signal.
+        for child in &mut children {
+            assert!(child.try_wait().unwrap().is_none());
+            child.stdin.take().unwrap().write_all(b"q").unwrap();
+        }
+        for child in children {
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, b"ONE\n");
+        }
     }
 }
 
