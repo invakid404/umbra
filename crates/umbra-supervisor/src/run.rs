@@ -93,8 +93,9 @@ pub enum RunPersistence {
     StrictRemote,
 }
 
-/// An explicitly constructed command launch. Nothing is inherited implicitly:
-/// argv includes argv[0] and the environment is exactly what the caller built.
+/// An explicitly constructed executable, argument vector and environment.
+/// argv includes argv[0] and the environment is exactly what the caller built;
+/// [`run`] separately captures the caller's standard streams.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandLaunch {
     /// Absolute executable path; never resolved by scanning PATH.
