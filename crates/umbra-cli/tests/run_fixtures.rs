@@ -864,7 +864,8 @@ fn crash_case(crash: Crash) {
         .args(["--env", "UMBRA_TEST_CRASH_TRACEE=1"])
         .arg("--")
         .arg(&child)
-        .args(["--exact", "crash_child"])
+        // Pin libtest's concurrent output mode even on a one-CPU host.
+        .args(["--exact", "crash_child", "--test-threads=2"])
         .stdin(Stdio::null())
         .output()
         .unwrap();
