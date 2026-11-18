@@ -179,23 +179,23 @@ fn f201_pipe_sigpipe() {
                 out.status,
                 String::from_utf8_lossy(&out.stderr)
             );
-            if native && ignored {
+            if ignored {
                 success(&out);
             } else if native {
                 assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
             } else {
                 assert_eq!(out.status.code(), Some(1));
-                fatal_sigpipe(&case, &out);
+                delivered_sigpipe(&case, &out);
             }
         }
     });
 }
 
-fn fatal_sigpipe(root: &Path, out: &std::process::Output) {
+fn delivered_sigpipe(root: &Path, out: &std::process::Output) {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("tracee stop"), "{stderr}");
-    assert!(stderr.contains("fatal signal/exception: T0d"), "{stderr}");
+    assert!(stderr.contains("ProcessFailed"), "{stderr}");
+    assert!(stderr.contains("Signal(13)"), "{stderr}");
     let state = root.join("state");
     let ids: Vec<_> = std::fs::read_dir(&state)
         .unwrap()
@@ -213,8 +213,8 @@ fn fatal_sigpipe(root: &Path, out: &std::process::Output) {
         registry: root.join("unused-registry"),
     };
     assert!(
-        !journal_records_completion(&run),
-        "fatal stop recorded completion"
+        journal_records_completion(&run),
+        "confirmed signal death did not record completion"
     );
 }
 
@@ -234,7 +234,7 @@ fn f201_self_pipe_sigpipe() {
         if native {
             assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
         } else {
-            fatal_sigpipe(root, &out);
+            delivered_sigpipe(root, &out);
         }
     });
 }

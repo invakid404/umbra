@@ -1,5 +1,6 @@
 /* Small same-binary native/routed signal controls for #284. */
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,14 +8,37 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t deliveries;
+static const char *handler_path;
+static volatile sig_atomic_t io_failed;
 
 static void handled(int signo) {
     (void)signo;
     ++deliveries;
+    if (handler_path) {
+        int fd = open(handler_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) { io_failed = 1; return; }
+        if (write(fd, "handler\n", 8) != 8) io_failed = 1;
+        if (close(fd)) io_failed = 1;
+    }
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
+    if (!strcmp(argv[1], "handler-io")) {
+        if (argc != 3) return 64;
+        handler_path = argv[2];
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = handled;
+        if (sigaction(SIGUSR1, &action, NULL) || kill(getpid(), SIGUSR1)) return 72;
+        if (deliveries != 1 || io_failed) return 73;
+        int fd = open(handler_path, O_RDONLY);
+        char data[8];
+        if (fd < 0 || read(fd, data, sizeof(data)) != 8 ||
+            memcmp(data, "handler\n", 8) || close(fd)) return 74;
+        return write(1, data, 8) == 8 ? 0 : 75;
+    }
     if (!strcmp(argv[1], "initial")) {
         struct sigaction action;
         sigset_t mask;

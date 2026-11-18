@@ -43,6 +43,39 @@ fn f284_initial_sigpipe_default() {
 }
 
 #[test]
+fn f284_handler_io() {
+    let Some(target) = fixture() else { return };
+    let scratch = tempfile::tempdir().unwrap();
+    for native in [true, false] {
+        let root = scratch.path().join(format!("handler-{native}"));
+        let mut cmd = command(&root, &target, native, "handler-io");
+        let workspace = root.join("workspace");
+        if native {
+            std::fs::create_dir(&workspace).unwrap();
+        }
+        let destination = workspace.join("handler.txt");
+        std::fs::write(&destination, b"host sentinel\n").unwrap();
+        let out = cmd.arg(&destination).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{:?}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The fixture reopens through ordinary mediation and compares the bytes.
+        assert_eq!(out.stdout, b"handler\n");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            if native {
+                b"handler\n".as_slice()
+            } else {
+                b"host sentinel\n".as_slice()
+            }
+        );
+    }
+}
+
+#[test]
 fn f284_dispositions() {
     let Some(target) = fixture() else { return };
     let scratch = tempfile::tempdir().unwrap();
