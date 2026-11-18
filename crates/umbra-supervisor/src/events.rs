@@ -2253,6 +2253,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn f284_poisoned_signal_refuses_resume() {
+        let mut s = supervisor();
+        let thread = ThreadId(task(1).0);
+        let token = SignalToken {
+            task: task(1),
+            thread,
+            exec_generation: 0,
+            sequence: 1,
+            signal: 30,
+        };
+        s.poisoned = true;
+        let error = s
+            .handle_event(TraceEvent::Signal {
+                task: task(1),
+                thread,
+                signal: 30,
+                token,
+            })
+            .unwrap_err();
+        assert_eq!(error.operation, "supervisor.resume");
+        assert!(s.is_poisoned());
+    }
+
     fn poisoned_spawn_event(arm: u8) {
         let mut s = supervisor();
         let token = SpawnToken {
