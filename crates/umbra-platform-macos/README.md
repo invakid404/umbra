@@ -771,8 +771,11 @@ UMBRA_TEST_FIXTURE_PATH=<abs> UMBRA_TEST_REDIRECT_ROOT=<abs> \
 <!-- memoria:section id="test-coverage" files="tests/**" guidance="../../docs/guides/reviewing-test-sections.md" -->
 ## Test coverage
 
-`tests/launch_stdio.rs` requires macOS arm64 and `UMBRA_INTEGRATION_REQUIRED=1`;
-otherwise it reports an explicit skip. Build its sentinel with
+The tracing cases in `tests/launch_stdio.rs` require macOS arm64 and
+`UMBRA_INTEGRATION_REQUIRED=1`; otherwise they report an explicit skip.
+Its overlapping-standard-source case runs without debugger permission in an
+isolated subprocess, checking normalization above fd 2 and exact byte destinations.
+Build the tracing sentinel with
 `clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-201-stdio.c -o target/debug/umbra-fix-201-stdio`
 from the repository root, set `UMBRA_STDIO_FIXTURE` to that binary's absolute
 path, then run `cargo test -p umbra-platform-macos --test launch_stdio --
