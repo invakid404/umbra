@@ -785,6 +785,7 @@ dependencies = [
 name = "umbra-supervisor"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tempfile",
  "tracing",
  "umbra-agent",

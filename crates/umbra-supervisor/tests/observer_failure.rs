@@ -179,6 +179,10 @@ fn f284_same_process_overlap() {
         executable: PathBuf,
     }
     impl RunObserver for Hold {
+        fn finished(&mut self, _: &RunOutcome) {}
+        fn teardown_warning(&mut self, error: &UmbraError) {
+            eprintln!("overlap teardown warning: {error}");
+        }
         fn prepared(&mut self, _: RunId) -> umbra_core::Result<()> {
             self.ready.send(()).unwrap();
             self.release.recv().unwrap();
