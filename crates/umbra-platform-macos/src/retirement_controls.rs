@@ -34,6 +34,9 @@ fn slot(generation: u64, done: bool) -> (Session, std::net::TcpStream) {
             exit_evidence: Some(BarrierEvidence::ReapedByPlatform),
             exit_report: Some("W00".into()),
             exec_generation: 0,
+            #[cfg(feature = "signal-witness")]
+            signal_probe_fired: false,
+            signals: crate::signals::Delivery::default(),
             policy_exec_generation: 0,
             initial: false,
             retirement: done.then(|| crate::retirement::Retirement::new(crate::clock::now())),

@@ -1107,6 +1107,8 @@ pub enum TraceEvent {
         thread: ThreadId,
         /// Signal.
         signal: i32,
+        /// Single-use authority for this exact stopped generation.
+        token: SignalToken,
     },
 }
 
@@ -1215,9 +1217,26 @@ pub struct LaunchSpec {
     pub sandbox: SandboxRequirement,
 }
 
+/// Single-use signal delivery authority issued by the trace backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalToken {
+    /// Issuing task, including its generation.
+    pub task: TaskId,
+    /// Stopping thread, including its generation.
+    pub thread: ThreadId,
+    /// Address-space generation at the stop.
+    pub exec_generation: u64,
+    /// Monotonic stop identity within the session.
+    pub sequence: u64,
+    /// Validated native signal number.
+    pub signal: i32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Resume mode.
 pub enum ResumeMode {
+    /// Deliver only the signal authorized by this exact stop.
+    Signal(SignalToken),
     /// Approve the captured spawn; only the issuing thread may reach its return gate.
     SpawnAuthorize(SpawnAuthorization),
     /// Child policy is applied; complete delivery and resource release before resuming.

@@ -504,6 +504,9 @@ struct Session {
     /// kept for [`BarrierEvidence::TracerReportedExit`].
     exit_report: Option<String>,
     exec_generation: u64,
+    #[cfg(feature = "signal-witness")]
+    signal_probe_fired: bool,
+    signals: crate::signals::Delivery,
     /// Generation visible in the supervisor's logical context. The trusted
     /// bootstrap's exec is consumed before that context exists, and child
     /// contexts inherit the parent's generation until a reported exec.
@@ -654,6 +657,12 @@ impl Session {
             0,
         )?;
         let mut rsp = Rsp::connect_owned(options, deadline, tracer)?;
+        let actions = rsp.request("vCont?")?;
+        if !actions.split(';').any(|action| action == "C") {
+            return Err(unsupported(
+                "signal-resume-capability: debugserver lacks vCont C",
+            ));
+        }
         let stop = rsp.request(&format!("vAttach;{pid:x}"))?;
         if !stop.starts_with('T') {
             return Err(error("attach", stop));
@@ -714,6 +723,9 @@ impl Session {
             exit_evidence: None,
             exit_report: None,
             exec_generation: 0,
+            #[cfg(feature = "signal-witness")]
+            signal_probe_fired: false,
+            signals: crate::signals::Delivery::default(),
             policy_exec_generation: 0,
             initial: true,
             retirement: None,
@@ -874,6 +886,36 @@ impl Session {
     }
     /// Resume every thread. The unqualified resume, for when no return window
     /// is open and the whole process may run.
+    #[cfg(feature = "signal-witness")]
+    fn signal_probe(&mut self, phase: &str) -> Result<bool> {
+        if self.signal_probe_fired
+            || self.parent.is_some()
+            || std::env::var("UMBRA_FIX284_PHASE").ok().as_deref() != Some(phase)
+        {
+            return Ok(false);
+        }
+        let path = std::env::var_os("UMBRA_FIX284_RECORD")
+            .ok_or_else(|| error("signal witness", "missing record"))?;
+        let regs = self.regs(self.thread)?;
+        let record = serde_json::json!({"phase": phase, "task": self.id,
+            "thread": self.thread, "exec_generation": self.exec_generation,
+            "pc": get(&regs, PC)?, "pending": self.pending.len(),
+            "waiting": self.waiting.len(), "stopped": self.stopped});
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| error("signal witness", e))?;
+        writeln!(file, "{record}").map_err(|e| error("signal witness", e))?;
+        file.sync_all().map_err(|e| error("signal witness", e))?;
+        self.signal_probe_fired = true;
+        // This is the owned stopped task, never a process-name census.
+        if unsafe { libc::kill(self.id.0.native_id as i32, libc::SIGUSR1) } != 0 {
+            return Err(error("signal witness", std::io::Error::last_os_error()));
+        }
+        Ok(true)
+    }
     fn continue_run(&mut self) -> Result<()> {
         self.rsp.send("c")?;
         self.stopped = false;
@@ -1093,6 +1135,19 @@ impl Session {
         // `c` that used to stand here is what let a sibling reach it unmediated.
         // Siblings resume at the first unqualified continue after
         // `finish_return` has re-armed the entry.
+        #[cfg(feature = "signal-witness")]
+        if !self.initial {
+            let phase = if self
+                .pending
+                .values()
+                .any(|p| matches!(p.kind, ReturnKind::Exec { .. }))
+            {
+                "exec"
+            } else {
+                "return-window"
+            };
+            self.signal_probe(phase)?;
+        }
         self.continue_thread(thread)
     }
     fn install(&mut self) -> Result<()> {
@@ -1359,6 +1414,8 @@ impl Session {
     /// loop does not know how to step over, and it would re-trap forever.
     fn run_to(&mut self, address: u64) -> Result<()> {
         self.temporary_breakpoint(address)?;
+        #[cfg(feature = "signal-witness")]
+        self.signal_probe("internal")?;
         loop {
             let stop = self.rsp.request("c")?;
             if !stop.starts_with('T') {
@@ -1376,6 +1433,12 @@ impl Session {
             // The tracee is stopped at its first instruction with one thread, so
             // the slot just assigned is the only thread there is to read.
             let regs = self.regs(self.thread)?;
+            let signal = rsp::number(&stop[1..3])? as i32;
+            if deliverable_signal(signal) {
+                return Err(unsupported(format!(
+                    "signal-during-internal-operation: signal={signal} stop={stop}"
+                )));
+            }
             if get(&regs, PC)? == address {
                 self.remove_breakpoint(address)?;
                 return Ok(());
@@ -1457,6 +1520,12 @@ impl Session {
             );
             // Pre-`main` dyld startup: one thread, just named by this stop.
             let regs = self.regs(self.thread)?;
+            let signal = rsp::number(&stop[1..3])? as i32;
+            if deliverable_signal(signal) {
+                return Err(unsupported(format!(
+                    "signal-during-internal-operation: signal={signal} stop={stop}"
+                )));
+            }
             if get(&regs, PC)? == notify {
                 self.remove_breakpoint(notify)?;
                 return Ok(());
@@ -2504,11 +2573,19 @@ impl MacosTraceBackend {
                 return Err(e);
             }
             let result = (|| {
+                let mut defaults: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut defaults);
+                libc::sigaddset(&mut defaults, libc::SIGPIPE);
+                errno(
+                    libc::posix_spawnattr_setsigdefault(&mut attr, &defaults),
+                    "spawn SIGPIPE default",
+                )?;
                 errno(
                     libc::posix_spawnattr_setflags(
                         &mut attr,
-                        (libc::POSIX_SPAWN_START_SUSPENDED | libc::POSIX_SPAWN_CLOEXEC_DEFAULT)
-                            as i16,
+                        (libc::POSIX_SPAWN_START_SUSPENDED
+                            | libc::POSIX_SPAWN_CLOEXEC_DEFAULT
+                            | libc::POSIX_SPAWN_SETSIGDEF) as i16,
                     ),
                     "spawn flags",
                 )?;
@@ -3170,6 +3247,8 @@ impl MacosTraceBackend {
                         s.single_thread()?;
                         s.waiting =
                             crate::ownership::Owned::new(children, s.id.0.native_id, "waiting");
+                        #[cfg(feature = "signal-witness")]
+                        s.signal_probe("park")?;
                     }
                     WaitPlan::Native => s.return_stop(thread, ReturnKind::Wait)?,
                 }
@@ -3240,6 +3319,7 @@ impl MacosTraceBackend {
             let status =
                 rsp::number(reply.get(1..3).ok_or_else(|| error("exit", "bad packet"))?)? as i32;
             let s = &mut self.sessions[index];
+            s.signals.invalidate();
             s.done = true;
             s.stopped = false;
             s.exit_report = Some(reply.clone());
@@ -3268,7 +3348,44 @@ impl MacosTraceBackend {
         if !reply.starts_with('T') {
             return Err(error("stop", reply));
         }
+        // Test-only transport fault injection, after a genuine signal stop.
+        #[cfg(feature = "signal-witness")]
+        let (reply, interrupted) = {
+            let phase = std::env::var("UMBRA_FIX284_PHASE").unwrap_or_default();
+            if reply.starts_with("T1e") && matches!(phase.as_str(), "identity" | "ambiguous") {
+                let original = reply.clone();
+                let reply = if phase == "identity" {
+                    format!(
+                        "{}{}",
+                        &reply[..3],
+                        reply[3..]
+                            .split(';')
+                            .filter(|field| !field.starts_with("thread:"))
+                            .collect::<Vec<_>>()
+                            .join(";")
+                    )
+                } else {
+                    reply
+                };
+                let interrupted = interrupted || phase == "ambiguous";
+                let path =
+                    std::env::var("UMBRA_FIX284_RECORD").map_err(|e| error("signal witness", e))?;
+                let record = serde_json::json!({"original": original, "dispatched": reply,
+                    "interrupted": interrupted, "fault": phase});
+                std::fs::write(format!("{path}.stop.json"), record.to_string())
+                    .map_err(|e| error("signal witness", e))?;
+                (reply, interrupted)
+            } else {
+                (reply, interrupted)
+            }
+        };
         let fields = rsp::fields(&reply[3..]);
+        let stopped_signal = rsp::number(&reply[1..3])? as i32;
+        if deliverable_signal(stopped_signal) && !fields.contains_key("thread") {
+            return Err(unsupported(format!(
+                "signal-stop-identity: signal={stopped_signal} stop={reply}"
+            )));
+        }
         let thread = rsp::number(
             fields
                 .get("thread")
@@ -3284,6 +3401,12 @@ impl MacosTraceBackend {
         // overwrites.
         let thread = s.thread;
         if fields.get("reason") == Some(&"exec") {
+            s.signals.invalidate();
+            if deliverable_signal(stopped_signal) {
+                return Err(unsupported(format!(
+                    "signal-exec-transition: signal={stopped_signal} stop={reply}"
+                )));
+            }
             // **The exec happened, so this is where the candidate is adopted.**
             // `intercept` recorded the resigned image on the pending value
             // rather than writing it into `twin`, precisely so a *failed*
@@ -3373,6 +3496,42 @@ impl MacosTraceBackend {
         let regs = s.regs(thread)?;
         let pc = get(&regs, PC)?;
         let signal = rsp::number(&reply[1..3])? as i32;
+        if deliverable_signal(signal) {
+            let refusal = if s.torn_down || s.signals.closed() {
+                Some("signal-during-teardown")
+            } else if interrupted {
+                Some("ambiguous-interrupt-signal")
+            } else if s
+                .pending
+                .values()
+                .any(|p| matches!(p.kind, ReturnKind::Exec { .. }))
+            {
+                Some("signal-exec-transition")
+            } else if !s.pending.is_empty() {
+                Some("signal-during-return-window")
+            } else if s.breaks.contains_key(&pc) || !s.entry.is_empty() {
+                Some("signal-at-syscall-entry")
+            } else if s.spawn.is_some() || s.initial {
+                Some("signal-during-internal-operation")
+            } else if s.signals.pending() || thread.0.native_id == 0 {
+                Some("signal-stop-identity")
+            } else {
+                None
+            };
+            if let Some(reason) = refusal {
+                return Err(unsupported(format!(
+                    "{reason}: signal={signal} stop={reply}"
+                )));
+            }
+            let token = s.signals.issue(s.id, thread, s.exec_generation, signal)?;
+            self.events.push_back(TraceEvent::Signal {
+                task: s.id,
+                thread,
+                signal,
+                token,
+            });
+            return Ok(());
+        }
         if s.pending.get(&thread).is_some_and(|p| p.gate == pc) {
             // A stop *at* the return gate is only a return when the breakpoint
             // planted there is what produced it. Accepting any signal here ate
@@ -3412,6 +3571,16 @@ impl MacosTraceBackend {
             return self.finish_return(index, thread, regs);
         }
         if s.breaks.contains_key(&pc) {
+            #[cfg(feature = "signal-witness")]
+            if !s.initial {
+                let phase = std::env::var("UMBRA_FIX284_PHASE").unwrap_or_default();
+                if matches!(phase.as_str(), "entry" | "identity" | "ambiguous")
+                    && s.signal_probe(&phase)?
+                {
+                    s.continue_run()?;
+                    return Ok(());
+                }
+            }
             return self.intercept(index, thread, regs);
         }
         // Continuing with no signal number suppresses these attach transients.
@@ -3439,6 +3608,13 @@ impl MacosTraceBackend {
 /// drift; they were written twice first, and the copy was wrong.
 const ARM_SEGMENT: &[u8; 16] = b"__DATA\0\0\0\0\0\0\0\0\0\0";
 const ARM_SECTION: &[u8; 16] = b"__umbra_arm\0\0\0\0\0";
+
+fn deliverable_signal(signal: i32) -> bool {
+    matches!(
+        signal,
+        libc::SIGPIPE | libc::SIGTERM | libc::SIGUSR1 | libc::SIGUSR2 | libc::SIGALRM
+    )
+}
 
 /// Signals a supervised stop absorbs rather than forwards or fails on.
 ///
@@ -4547,8 +4723,40 @@ impl TraceBackend for MacosTraceBackend {
         if !s.stopped || !s.waiting.is_empty() {
             return Err(error("resume", "not externally stopped"));
         }
-        if command.signal.is_some() {
-            return Err(unsupported("explicit signal forwarding is not qualified"));
+        if s.signals.closed() {
+            return Err(unsupported(
+                "signal-delivery-closed: no resume after ambiguous send or teardown",
+            ));
+        }
+        if let ResumeMode::Signal(token) = command.mode {
+            if s.torn_down
+                || s.done
+                || !deliverable_signal(token.signal)
+                || !s.pending.is_empty()
+                || !s.entry.is_empty()
+                || s.spawn.is_some()
+            {
+                return Err(unsupported("signal-stop-identity: unsafe delivery state"));
+            }
+            let live = s
+                .live
+                .as_mut()
+                .ok_or_else(|| unsupported("signal-stop-identity: retired task"))?;
+            s.signals.send(
+                token,
+                s.id,
+                command.thread,
+                s.exec_generation,
+                command.signal,
+                |packet| live.rsp.send(packet),
+            )?;
+            s.stopped = false;
+            return Ok(());
+        }
+        if command.signal.is_some() || s.signals.pending() {
+            return Err(unsupported(
+                "signal-stop-identity: missing delivery authority",
+            ));
         }
         if command.mode == ResumeMode::SingleStep {
             return Err(unsupported("external single stepping"));
@@ -4582,6 +4790,9 @@ impl TraceControl for MacosTraceBackend {
     ) -> Result<umbra_platform::shutdown::Start> {
         #[cfg(feature = "shutdown-witness")]
         umbra_platform::shutdown::witness(serde_json::json!({"event": "owner-begin"}));
+        for session in &mut self.sessions {
+            session.signals.close();
+        }
         // Serial dispatch leaves no setup operation in flight. Existing retirement
         // deadlines are carried forward; no poll renews an obligation's window.
         let now = crate::clock::now();
@@ -4826,6 +5037,9 @@ mod tests {
                 exit_evidence: Some(BarrierEvidence::ReapedByPlatform),
                 exit_report: Some("W00".into()),
                 exec_generation: 0,
+                #[cfg(feature = "signal-witness")]
+                signal_probe_fired: false,
+                signals: crate::signals::Delivery::default(),
                 policy_exec_generation: 0,
                 initial: false,
                 live: None,
@@ -4874,6 +5088,9 @@ mod tests {
                 exit_evidence: Some(BarrierEvidence::ReapedByPlatform),
                 exit_report: Some("W00".into()),
                 exec_generation: 0,
+                #[cfg(feature = "signal-witness")]
+                signal_probe_fired: false,
+                signals: crate::signals::Delivery::default(),
                 policy_exec_generation: 0,
                 initial: false,
                 retirement: Some(crate::retirement::Retirement::new(crate::clock::now())),
