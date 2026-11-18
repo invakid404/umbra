@@ -56,7 +56,15 @@ pub struct Connection {
 }
 impl Connection {
     fn send_launch_stdio(&mut self, stdio: &crate::launch_stdio::LaunchStdio) -> Result<()> {
-        stdio.send(&self.stream)
+        let result = stdio.send_with_budget(&self.stream, || {
+            self.stream
+                .set_write_timeout(Some(self.remaining()?))
+                .map_err(unavailable)
+        });
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
     }
 
     /// Receive the platform's one-shot owned descriptor payload.

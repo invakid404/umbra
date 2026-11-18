@@ -101,24 +101,46 @@ impl LaunchStdio {
 
     /// Transfer references on the already authenticated platform IPC stream.
     /// A fixed one-byte marker keeps this ancillary message separate from JSON.
+    #[cfg(test)]
     pub(crate) fn send(&self, stream: &UnixStream) -> Result<()> {
+        self.send_with_budget(stream, || Ok(()))
+    }
+
+    pub(crate) fn send_with_budget(
+        &self,
+        stream: &UnixStream,
+        mut refresh_budget: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         let fds: Vec<_> = self.fds.iter().map(AsFd::as_fd).collect();
         let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
         let mut ancillary = SendAncillaryBuffer::new(&mut space);
         if !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
             return Err(io("stdio ancillary buffer too small"));
         }
-        #[cfg(test)]
-        if let Some(attempt) = SEND_ATTEMPT.with(|v| v.get()) {
-            return Err(io(attempt()));
-        }
-        let sent = sendmsg(
-            stream,
-            &[IoSlice::new(b"S")],
-            &mut ancillary,
-            SendFlags::empty(),
-        )
-        .map_err(io)?;
+        let sent = loop {
+            refresh_budget()?;
+            #[cfg(test)]
+            let injected = SEND_ATTEMPT.with(|v| v.take()).map(|attempt| attempt());
+            #[cfg(not(test))]
+            let injected: Option<rustix::io::Errno> = None;
+            let attempt = if let Some(error) = injected {
+                Err(error)
+            } else {
+                sendmsg(
+                    stream,
+                    &[IoSlice::new(b"S")],
+                    &mut ancillary,
+                    SendFlags::empty(),
+                )
+            };
+            match attempt {
+                Ok(sent) => break sent,
+                // EINTR and EAGAIN report no bytes sent. A short successful
+                // send or any other uncertain outcome must never be resent.
+                Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
+                Err(error) => return Err(io(error)),
+            }
+        };
         if sent != 1 {
             return Err(io("incomplete stdio transfer"));
         }
