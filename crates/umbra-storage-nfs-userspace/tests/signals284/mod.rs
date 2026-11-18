@@ -134,6 +134,56 @@ fn f284_concurrency() {
     }
 }
 
+#[test]
+fn f284_sources() {
+    use std::os::fd::OwnedFd;
+    let Some(target) = fixture() else { return };
+    let scratch = tempfile::tempdir().unwrap();
+    for (mode, signal) in [
+        ("timer", libc::SIGALRM),
+        ("inherited-socket", libc::SIGPIPE),
+    ] {
+        for native in [true, false] {
+            for disposition in ["default", "ignored", "handler"] {
+                let root = scratch
+                    .path()
+                    .join(format!("{mode}-{native}-{disposition}"));
+                let mut cmd = command(&root, &target, native, mode);
+                cmd.arg(signal.to_string()).arg(disposition);
+                if mode == "inherited-socket" {
+                    let (writer, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                    drop(peer);
+                    cmd.stdout(Stdio::from(OwnedFd::from(writer)));
+                }
+                let out = cmd.output().unwrap();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "{mode} native={native} {disposition}: {:?}\n{stderr}",
+                    out.status
+                );
+                if disposition == "default" {
+                    if native {
+                        assert_eq!(out.status.signal(), Some(signal));
+                    } else {
+                        assert_eq!(out.status.code(), Some(1));
+                        assert!(stderr.contains("ProcessFailed"));
+                        assert!(stderr.contains(&format!("Signal({signal})")));
+                    }
+                } else {
+                    assert!(out.status.success());
+                    let count = if disposition == "handler" { 1 } else { 0 };
+                    let expected = format!("continued count={count}\n");
+                    if mode == "inherited-socket" {
+                        assert!(stderr.contains(&expected));
+                    } else {
+                        assert_eq!(out.stdout, expected.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn unsafe_state(phase: &str, expected: &str) {
     let Some(target) = fixture() else { return };
     // CI builds the provider with signal-witness for this named command.

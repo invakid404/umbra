@@ -7,6 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <time.h>
 
 static volatile sig_atomic_t deliveries;
 static const char *handler_path;
@@ -136,7 +138,8 @@ int main(int argc, char **argv) {
                sigismember(&mask, SIGPIPE));
         return 0;
     }
-    if (argc != 4 || strcmp(argv[1], "disposition")) return 64;
+    if (argc != 4 || (strcmp(argv[1], "disposition") &&
+                     strcmp(argv[1], "timer") && strcmp(argv[1], "inherited-socket"))) return 64;
     int signo = atoi(argv[2]);
     struct sigaction action;
     memset(&action, 0, sizeof(action));
@@ -148,16 +151,25 @@ int main(int argc, char **argv) {
     sigemptyset(&unblocked);
     sigaddset(&unblocked, signo);
     if (sigprocmask(SIG_UNBLOCK, &unblocked, NULL)) return 67;
-    if (signo == SIGPIPE) {
+    if (!strcmp(argv[1], "timer")) {
+        alarm(1);
+        struct timespec remain = { .tv_sec = 1, .tv_nsec = 200000000 };
+        while (nanosleep(&remain, &remain) && errno == EINTR) {}
+    } else if (signo == SIGPIPE) {
         int pair[2];
-        if (pipe(pair) || close(pair[0])) return 68;
+        int fd = 1;
+        if (strcmp(argv[1], "inherited-socket")) {
+            if (pipe(pair) || close(pair[0])) return 68;
+            fd = pair[1];
+        }
         errno = 0;
-        ssize_t count = write(pair[1], "x", 1);
+        ssize_t count = write(fd, "x", 1);
         if (count != -1 || errno != EPIPE) return 69;
-        close(pair[1]);
+        if (fd != 1) close(fd);
     } else {
         if (kill(getpid(), signo)) return 70;
     }
-    printf("continued count=%d\n", (int)deliveries);
+    dprintf(!strcmp(argv[1], "inherited-socket") ? 2 : 1,
+            "continued count=%d\n", (int)deliveries);
     return deliveries == (!strcmp(argv[3], "handler") ? 1 : 0) ? 0 : 71;
 }
