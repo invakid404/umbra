@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -44,17 +45,23 @@ static void *rate_worker(void *arg) {
     pthread_sigmask(SIG_BLOCK, &blocked, NULL);
     char path[4096];
     snprintf(path, sizeof(path), "%s/thread-%ld", rate_root, (long)arg);
-    int announced = 0;
+    int fd = open(path, O_RDONLY);
+    struct stat info;
+    if (fd < 0 || fstat(fd, &info) || info.st_size != 3) {
+        atomic_store(&rate_failed, 1);
+        return NULL;
+    }
+    atomic_fetch_add(&rate_ready, 1);
+    /* Let both workers finish setup before generating sustained routed calls. */
+    while (atomic_load(&rate_ready) != 2 && !atomic_load(&rate_failed))
+        sched_yield();
     while (!atomic_load(&rate_stop)) {
-        int fd = open(path, O_RDONLY);
-        char data[3];
-        if (fd < 0 || read(fd, data, sizeof(data)) != 3 ||
-            memcmp(data, "io\n", 3) || close(fd)) {
+        if (fstat(fd, &info) || info.st_size != 3) {
             atomic_store(&rate_failed, 1);
             break;
         }
-        if (!announced) { atomic_fetch_add(&rate_ready, 1); announced = 1; }
     }
+    if (close(fd)) atomic_store(&rate_failed, 1);
     return NULL;
 }
 
