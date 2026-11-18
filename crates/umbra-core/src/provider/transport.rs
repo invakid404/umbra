@@ -748,6 +748,55 @@ mod tests {
         worker.join().unwrap();
     }
     #[test]
+    fn ambiguous_stdio_ack_closes_transport_and_all_writer_copies() {
+        use crate::launch_stdio::{LaunchStdio, CAPABILITY};
+        for wrong_id in [false, true] {
+            let (connection, mut server) = pair(Duration::from_secs(2));
+            let (mut reader, writer) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let stdio = LaunchStdio::new([
+                writer.try_clone().unwrap().into(),
+                writer.try_clone().unwrap().into(),
+                writer.into(),
+            ])
+            .unwrap();
+            let worker = std::thread::spawn(move || {
+                let Frame::Request { id, .. } = server.receive().unwrap() else {
+                    panic!("expected adoption request")
+                };
+                let adopted = LaunchStdio::receive(&server.stream).unwrap();
+                if wrong_id {
+                    server
+                        .send(&Frame::Response {
+                            id: id + 1,
+                            result: Ok(encode(&()).unwrap()),
+                        })
+                        .unwrap();
+                    assert!(
+                        server.receive::<Frame>().is_err(),
+                        "client retried after uncertain ACK"
+                    );
+                }
+                // Missing ACK models provider loss after accepting the handles.
+                drop(adopted);
+            });
+            let mut hello = welcome();
+            hello.role = "platform".into();
+            hello.capabilities.insert(CAPABILITY.into());
+            let mut client = Client::from_connection(connection, hello);
+            assert!(client.call_with_stdio::<_, ()>(&"adopt", stdio).is_err());
+            assert!(client.call::<_, ()>(&"retry").is_err());
+            worker.join().unwrap();
+            assert_eq!(
+                reader.read(&mut [0]).unwrap(),
+                0,
+                "uncertain ACK retained a writer"
+            );
+        }
+    }
+    #[test]
     fn server_rejects_reused_request_ids_before_dispatch() {
         let (mut client, server) = pair(Duration::from_secs(2));
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
