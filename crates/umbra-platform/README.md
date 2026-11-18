@@ -178,8 +178,10 @@ slots before resource creation. The default refuses unsupported closure.
 Check this contract crate with `cargo check -p umbra-platform`, and compile its
 trait-object smoke example with `cargo test -p umbra-platform --doc`.
 
-The provider dispatcher rejects `UnsandboxedExperiment` before calling a backend:
-IPC launch is exclusively the supervised contract path. ABI capability identities
+Without adopted stdio, the provider dispatcher rejects `UnsandboxedExperiment`
+before calling a backend. After adoption it delegates launch validation to the
+owning backend, which must consume the capability even when refusing a launch.
+IPC launch remains exclusively the supervised contract path. ABI capability identities
 use `<platform>-<arch>-abi-v<decimal version>`; run composition requires exactly
 one for its negotiated architecture. Protocol version 3 rejects stale providers
 before decoding the required sandbox policy and rewrite messages.

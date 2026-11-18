@@ -270,6 +270,13 @@ jobs:
           git diff --stat -- experiments/fixtures/umbra-fix-227-observer-providers/Cargo.lock
           cargo build --locked --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           cargo test -p umbra-supervisor --test observer_failure -- --nocapture --test-threads=1
+      - name: Qualify adopted stdio ownership and launch consumption
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-201-stdio.c -o "$GITHUB_WORKSPACE/target/debug/umbra-fix-201-stdio"
+          export UMBRA_STDIO_FIXTURE="$GITHUB_WORKSPACE/target/debug/umbra-fix-201-stdio"
+          cargo test -p umbra-platform-macos --test launch_stdio -- --nocapture --test-threads=1
+          cargo test -p umbra-core ambiguous_stdio_ack_closes_transport_and_all_writer_copies -- --nocapture
       - name: Qualify completed-child resource retirement
         env:
           UMBRA_RETIREMENT_WITNESS: "1"

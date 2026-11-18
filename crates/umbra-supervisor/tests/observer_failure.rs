@@ -1,10 +1,10 @@
 //! Preparation failure must release writer ownership and permit reopening.
 #![cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use umbra_core::provider::{ProviderDescriptor, ProviderRegistry, encode};
+use umbra_core::provider::{encode, ProviderDescriptor, ProviderRegistry};
 use umbra_core::{BytePath, RunId, UmbraError};
 use umbra_supervisor::run::{CommandLaunch, RunLaunch, RunSpec};
 use umbra_supervisor::{ResumeSpec, RunObserver, RunOutcome, RunPersistence, Supervisor};

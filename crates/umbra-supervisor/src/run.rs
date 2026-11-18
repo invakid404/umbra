@@ -1293,9 +1293,8 @@ mod unix {
             Err(e) => return Err(fail(namespace, run_id, e, true)),
         };
         if let Some(observer) = observer.as_mut() {
-            let adopted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                observer.stdio_adopted()
-            }));
+            let adopted =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.stdio_adopted()));
             match adopted {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(fail(namespace, run_id, e, true)),

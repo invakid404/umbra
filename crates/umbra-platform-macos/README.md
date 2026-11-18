@@ -31,6 +31,13 @@ Launch failures release them too. Provider and debugserver process streams
 remain separate; extra launch handles never reach the tracee or debugserver.
 The IPC adoption acknowledgement precedes root launch.
 
+The first launch attempt consumes adoption before validation. A rejected launch
+releases the descriptions and subsequent launches return `platform.stdio` /
+`launch stdio already consumed`; they cannot fall back to ambient streams.
+The explicit legacy path applies only to a backend that never adopted streams.
+`tests/launch_stdio.rs` covers direct and IPC retries, rollback, and a
+provider-owned high descriptor absent from a successfully executed tracee.
+
 This changes stream delivery, not signal handling. Default and ignored SIGPIPE
 still produce the existing fatal `tracee stop` / `T0d` error. Background terminal
 reads produce fatal `T15`; foreground fd 2 reads remain supported. The CLI's

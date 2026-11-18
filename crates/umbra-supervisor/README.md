@@ -117,6 +117,10 @@ The staged order is fixed, and each stage's failure decides what may be released
    stdin/stdout references. The default leaves embedding callers' originals
    unchanged; stderr remains available for CLI diagnostics. Provider stdin/stdout
    remain null. The platform consumes its received copies at root spawn.
+   Ordinary and hostile-payload unwinds from `stdio_adopted` follow preparation
+   failure cleanup: close the journal and release writer ownership before
+   returning `run.observer`. As with `prepared`, this contains unwinding panics,
+   not a process configured to abort on panic.
 7. Drive events, then consume the platform session through confirmed shutdown:
    freeze its resource inventory, validate every final disposition after backend
    destruction, and collect the owned provider process. Only then flush run data, append and flush a
