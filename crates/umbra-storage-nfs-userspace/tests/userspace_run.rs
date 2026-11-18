@@ -132,10 +132,10 @@
 ))]
 
 use std::ffi::OsString;
-#[path = "stdio201/mod.rs"]
-mod stdio201;
 #[path = "signals284/mod.rs"]
 mod signals284;
+#[path = "stdio201/mod.rs"]
+mod stdio201;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

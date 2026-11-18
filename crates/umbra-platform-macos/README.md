@@ -38,10 +38,42 @@ The explicit legacy path applies only to a backend that never adopted streams.
 `tests/launch_stdio.rs` covers direct and IPC retries, rollback, and a
 provider-owned high descriptor absent from a successfully executed tracee.
 
-This changes stream delivery, not signal handling. Default and ignored SIGPIPE
-still produce the existing fatal `tracee stop` / `T0d` error. Background terminal
-reads produce fatal `T15`; foreground fd 2 reads remain supported. The CLI's
-README describes the launchd relay/guardian retention limitation.
+Safe stopped tasks can receive SIGPIPE, SIGTERM, SIGUSR1, SIGUSR2 and SIGALRM
+through `vCont C`, whose availability is checked before attach. The stop cause
+is classified before entry-PC dispatch. A `SignalToken` binds the task, thread,
+exec generation, signal and stop sequence; the supervisor returns it in
+`ResumeMode::Signal`. `signals::Delivery` consumes authority before transport
+send and closes normal admission on an ambiguous send. Exec invalidates tokens
+without changing the kernel pending set; shutdown closes admission. Tokens are
+session state and are never journaled or replayed. Root spawn resets only
+SIGPIPE via `POSIX_SPAWN_SETSIGDEF`; caller masks and other dispositions remain
+untouched.
+
+The kernel applies default, ignored or handler behavior. Handlers retain normal
+syscall/filesystem mediation. A confirmed signal exit follows normal ordered
+shutdown and completion; a refused or lost tracee cannot complete. The backend
+refuses signals during exposed return windows (including another thread's),
+at armed entry PCs, during bootstrap/internal operations or exec, and when stop
+identity or interrupt context is ambiguous. Diagnostics retain the stop packet.
+A parked wait remains debugger-stopped and unpolled: pending signals are observed
+only after the child finishes, often at an unsafe return window. No preemptive
+Park refusal or inactivity timer is added.
+
+SIGINT remains unchanged, including the internal interrupted-stop absorption;
+foreground Ctrl-C role protection is a later slice of #284. Background terminal
+reads retain fatal `T15`, and foreground fd 2 reads remain supported. The CLI's
+README describes the launchd relay/guardian retention limitation. SIGKILL and
+SIGSEGV retain their existing fail-closed crash classifications.
+
+`signal-witness` is test-only instrumentation. It records owned stop state before
+injecting SIGUSR1 at entry, return-window, exec, bootstrap and Park boundaries.
+Identity/interrupt tests fault-inject dispatch metadata after capturing a genuine
+SIGUSR1 packet; they do not claim a live interrupt race. Production builds do
+not contain these hooks. The userspace `signals284` cases cover native controls,
+handler shadow writes, thread ownership, concurrency, fork/exec pending state,
+completed-run reopen without a platform, and the exact refusal outcomes. The
+rate test is a separate ignored measurement explicitly invoked by CI, with no
+accepted refusal-rate threshold.
 
 The provider advertises `platform.shutdown-ledger.v1`. Its ledger reserves slots
 before root/child creation, tracer launch and task-right acquisition, and keeps

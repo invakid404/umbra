@@ -11,7 +11,14 @@ use std::os::unix::process::ExitStatusExt;
 const PAYLOAD: &[u8] = b"stdio-201 exact bytes\n";
 
 fn command(root: &Path, target: &(String, u16), native: bool, mode: &str) -> Command {
-    command_fixture(root, target, native, mode, "umbra-fix-201-stdio", "UMBRA_F201_STDIO")
+    command_fixture(
+        root,
+        target,
+        native,
+        mode,
+        "umbra-fix-201-stdio",
+        "UMBRA_F201_STDIO",
+    )
 }
 
 pub(super) fn command_fixture(
@@ -196,20 +203,29 @@ fn delivered_sigpipe(root: &Path, out: &std::process::Output) {
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("ProcessFailed"), "{stderr}");
     assert!(stderr.contains("Signal(13)"), "{stderr}");
-    assert!(journal_records_completion(&run_record(root, out)),
-        "confirmed signal death did not record completion");
+    assert!(
+        journal_records_completion(&run_record(root, out)),
+        "confirmed signal death did not record completion"
+    );
 }
 
 pub(super) fn run_record(root: &Path, out: &std::process::Output) -> Run {
     let state = root.join("state");
-    let ids: Vec<_> = std::fs::read_dir(&state).unwrap()
+    let ids: Vec<_> = std::fs::read_dir(&state)
+        .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter_map(|name| uuid::Uuid::parse_str(&name).ok()).collect();
+        .filter_map(|name| uuid::Uuid::parse_str(&name).ok())
+        .collect();
     assert_eq!(ids.len(), 1);
-    Run { run_id: RunId(ids[0]), status: out.status.code(),
+    Run {
+        run_id: RunId(ids[0]),
+        status: out.status.code(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        destination: root.join("unused"), state, workspace: root.join("workspace"),
-        registry: root.join("registry.json") }
+        destination: root.join("unused"),
+        state,
+        workspace: root.join("workspace"),
+        registry: root.join("registry.json"),
+    }
 }
 
 #[test]

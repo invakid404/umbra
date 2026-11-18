@@ -126,6 +126,13 @@ The staged order is fixed, and each stage's failure decides what may be released
    destruction, and collect the owned provider process. Only then flush run data, append and flush a
    completion record, close the journal, release the writer, close storage.
 
+A qualified signal event is resumed with the exact backend-issued token. The
+supervisor does not infer a disposition or retry a failed delivery. Handlers use
+the ordinary event/namespace path. Signal stops themselves are not journaled;
+a completed-run reopen does not replay delivery or launch a platform. The library
+installs no process-wide signal guard and does not change an embedding caller's
+dispositions or thread mask, including overlapping run calls.
+
 `Ok(())` requires a successful root status **and** a clean teardown. A nonzero or
 signalled child after a clean teardown is `ErrorKind::ProcessFailed`. A failure
 after the lease is taken releases writer authority only when the supervised tree

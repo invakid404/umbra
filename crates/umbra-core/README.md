@@ -38,6 +38,11 @@ provider-exit confirmation; this legacy flag cannot replace either.
 
 `ErrorKind::ProcessFailed` reports a supervised child that exited nonzero or was
 signalled, which is a run result rather than an Umbra malfunction.
+`TraceEvent::Signal` carries a single-use `SignalToken`; the matching
+`ResumeMode::Signal` must return its task, thread, exec generation, stop sequence
+and signal unchanged. A token is live backend authority, never durable replay
+state. Backend qualification determines which signals and stopped states admit
+delivery; the type alone does not grant a capability.
 `PersistencePolicy::NfsClientFsync` distinguishes a mounted run whose durability
 boundary is the client fsync from local development and from unqualified strict
 remote persistence. `StorageCapabilities::features` is the open extension point
