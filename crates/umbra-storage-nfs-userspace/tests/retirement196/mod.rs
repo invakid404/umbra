@@ -184,6 +184,15 @@ fn fix_196_failed_retirement_keeps_success_and_retries_the_same_key() {
     let answer = storage.execute(&request).unwrap();
     assert_eq!(observed.lock().unwrap().retire_calls, 1);
     assert_eq!(observed.lock().unwrap().records, 1);
+    let receipt = storage
+        .flush(&umbra_core::FlushRequest {
+            context: authorised(&storage, run, "maintenance-flush"),
+            scope: umbra_core::FlushScope::EntireRun,
+        })
+        .unwrap();
+    let evidence = String::from_utf8(receipt.evidence).unwrap();
+    assert!(evidence.contains("committed_writes=1"), "{evidence}");
+    assert!(evidence.contains("committed_bytes=6"), "{evidence}");
     // Maintenance cannot turn the authoritative successful answer into an error.
     assert_eq!(storage.execute(&request).unwrap(), answer);
     assert_eq!(observed.lock().unwrap().retire_calls, 2);
