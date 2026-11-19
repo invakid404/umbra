@@ -662,3 +662,26 @@ fn fix_196_absent_retry_discharges_obligation_before_failed_maintenance() {
         .close_run()
         .expect("proven absence must not hold writer release");
 }
+
+#[test]
+fn fix_196_retirement_diagnostic_failure_preserves_success() {
+    // A closed peer gives stderr EPIPE (Rust ignores EBADF on stdio).
+    let (stderr, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(peer);
+    let stderr: std::os::fd::OwnedFd = stderr.into();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "retirement196::fix_196_failed_retirement_keeps_success_and_retries_the_same_key",
+            "--nocapture",
+        ])
+        .stderr(std::process::Stdio::from(stderr))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "child failed: {:?} {}",
+        result.status,
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
