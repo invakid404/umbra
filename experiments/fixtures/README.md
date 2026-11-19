@@ -346,3 +346,17 @@ describes the paired acceptance bars and separately invoked rate measurement.
 The `transport-tree` mode keeps an owned child alive while the parent receives
 SIGUSR1, for uncertain-send cleanup qualification with `signal-witness` and
 `shutdown-witness`. The bounded launcher requires the owned group to disappear.
+
+## Replay retirement fixture
+
+`umbra-fix-196-writes.c` issues checked individual writes, cumulative payload
+beyond the replay budget, and ordered fork, spawn and exec transitions. Native
+and routed controls compare exact byte streams; exec also checks a CLOEXEC
+control. Build it with `clang -arch arm64 -O1 -Wall -Wextra -Werror
+experiments/fixtures/umbra-fix-196-writes.c -o umbra-fix-196-writes` and supply
+`UMBRA_FIX_196_WRITES_PATH`, or let the userspace harness build it.
+
+The existing `ofd-race` mode now issues 200 records per writer and checks all
+400 six-byte records while recording alternations. The listing-project fixture
+keeps its batched output and listing assertions. These cases target successful
+write retirement; failure-continuing workloads remain tracked under #196.
