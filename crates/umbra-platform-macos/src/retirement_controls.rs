@@ -66,12 +66,25 @@ fn register(backend: &mut MacosTraceBackend, s: Session) {
 
 #[test]
 fn f284_sibling_window_stop_refuses_before_delivery() {
+    signal_window_stop(false);
+}
+
+#[test]
+fn f284_signal_cause_precedes_return_pc() {
+    signal_window_stop(true);
+}
+
+fn signal_window_stop(owner_stopped: bool) {
     use std::io::Write;
     let mut owned = SelfTaskBackend(MacosTraceBackend::default());
     let (mut session, mut peer) = slot(100, false);
     let stopped = session.thread;
-    let sibling = tid(stopped.0.native_id + 1, stopped.0.generation);
-    assert_ne!(stopped, sibling);
+    let sibling = if owner_stopped {
+        stopped
+    } else {
+        tid(stopped.0.native_id + 1, stopped.0.generation)
+    };
+    assert_eq!(stopped == sibling, owner_stopped);
     session.pending.insert(
         sibling,
         Pending {
@@ -88,8 +101,8 @@ fn f284_sibling_window_stop_refuses_before_delivery() {
         },
     );
     owned.0.sessions.push(session);
-    // Controlled register reply: the stop PC is zero and belongs to no
-    // pending window on this thread. Only the sibling owns the window.
+    // Controlled register reply puts PC at zero, matching the window gate.
+    // Exercise both ownership cases without changing the genuine cause field.
     peer.write_all(b"$00#60").unwrap();
     let failure = owned
         .0
