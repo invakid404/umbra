@@ -164,6 +164,56 @@ fn f284_backend_rejects_duplicate_and_cross_exec_tokens() {
     assert!(sent.starts_with("$vCont;C1e:64;c#"));
     assert_eq!(sent.matches('$').count(), 1, "exactly one delivery packet");
 }
+
+#[test]
+fn f284_backend_transport_errors_close_normal_resume() {
+    for (accepted, reason) in [
+        (0, "timeout"),
+        (0, "disconnect"),
+        (5, "partial send"),
+        (usize::MAX, "possibly completed send"),
+    ] {
+        let mut owned = SelfTaskBackend(MacosTraceBackend::default());
+        let (mut session, mut peer) = slot(100, false);
+        let thread = session.thread;
+        let token = session.signals.issue(session.id, thread, 0, 30).unwrap();
+        owned.0.sessions.push(session);
+        crate::rsp::SIGNAL_WRITE_ATTEMPTS.with(|count| count.set(0));
+        crate::rsp::SIGNAL_WRITE_FAULT.with(|fault| fault.set(Some((accepted, reason))));
+        let failure = owned
+            .0
+            .resume(ResumeCommand {
+                thread,
+                mode: ResumeMode::Signal(token),
+                signal: Some(30),
+            })
+            .unwrap_err();
+        assert!(failure.to_string().contains(reason));
+        assert_eq!(
+            crate::rsp::SIGNAL_WRITE_ATTEMPTS.with(|count| count.get()),
+            1
+        );
+        assert!(owned.0.sessions[0].stopped);
+        assert!(owned
+            .0
+            .resume(ResumeCommand {
+                thread,
+                mode: ResumeMode::Continue,
+                signal: None,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("signal-delivery-closed"));
+        drop(owned);
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).unwrap();
+        let body = b"vCont;C1e:64;c";
+        let checksum = body.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        let packet = format!("${}#{checksum:02x}", std::str::from_utf8(body).unwrap());
+        assert_eq!(bytes, packet.as_bytes()[..accepted.min(packet.len())]);
+    }
+}
 // Controlled slots hold send rights to this test process. Clear the registry
 // and mark sessions done before backend Drop, including assertion unwinding.
 struct SelfTaskBackend(MacosTraceBackend);

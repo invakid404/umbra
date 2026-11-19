@@ -47,6 +47,14 @@ pub struct Rsp {
     torn_down: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    // A controlled transport can fail before, during or after accepting a
+    // signal packet. Count attempts even after the one-shot fault is consumed.
+    pub(crate) static SIGNAL_WRITE_FAULT: std::cell::Cell<Option<(usize, &'static str)>> = const { std::cell::Cell::new(None) };
+    pub(crate) static SIGNAL_WRITE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // Own the child immediately after spawn, before any fallible socket operation.
 // Once Rsp takes it, the existing ordered teardown owns cleanup instead.
 struct SetupChild {
@@ -262,6 +270,16 @@ impl Rsp {
         Ok(r)
     }
     fn write_packet(&mut self, bytes: &[u8], limit: Instant) -> Result<()> {
+        #[cfg(test)]
+        if bytes.starts_with(b"$vCont;C") {
+            SIGNAL_WRITE_ATTEMPTS.with(|count| count.set(count.get() + 1));
+            if let Some((accepted, reason)) = SIGNAL_WRITE_FAULT.with(|fault| fault.take()) {
+                self.stream
+                    .write_all(&bytes[..accepted.min(bytes.len())])
+                    .map_err(|e| error("rsp write", e))?;
+                return Err(error("rsp write", reason));
+            }
+        }
         let mut offset = 0;
         while offset < bytes.len() {
             let remaining = limit
