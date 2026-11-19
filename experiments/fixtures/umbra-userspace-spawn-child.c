@@ -199,7 +199,7 @@ static int race_write(const char *root, int output, int go, int ready) {
     do got = read(go, &token, 1);
     while (got < 0 && errno == EINTR);
     int short_writes = 0, first_errno = 0;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 200; i++) {
         char record[8];
         snprintf(record, sizeof record, "C%04d\n", i);
         errno = 0;
@@ -210,7 +210,7 @@ static int race_write(const char *root, int output, int go, int ready) {
         }
     }
     note("go result=%zd token=%c\n", got, got == 1 ? token : '?');
-    note("write-child records=10 short=%d first-errno=%d\n", short_writes, first_errno);
+    note("write-child records=200 short=%d first-errno=%d\n", short_writes, first_errno);
     flush(root);
     return got == 1 && token == 'G' && !short_writes ? 0 : 22;
 }

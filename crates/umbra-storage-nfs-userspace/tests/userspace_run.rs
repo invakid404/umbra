@@ -11706,9 +11706,8 @@ fn slate_c11_09_inherited_offset() {
 /// contended is recorded, not asserted: the alternation count goes into the
 /// classification record, and only a count of 3 or more shows the two writers'
 /// transfers interleaved (2 is one writer after the other). It exercises the
-/// schedules the scheduler happens to produce, not every schedule. Ten records
-/// a writer, not more, because the userspace store's replay budget ends a run
-/// that issues many more small writes (#196).
+/// schedules the scheduler happens to produce, not every schedule. Two hundred
+/// records per writer also exercise retirement beyond the replay-cache budget.
 #[test]
 fn a_parent_and_its_spawned_child_writing_one_descriptor_at_once_lose_no_record() {
     let Some(spawn) = slate_spawn("ofd-race") else {
@@ -11718,7 +11717,7 @@ fn a_parent_and_its_spawned_child_writing_one_descriptor_at_once_lose_no_record(
     let (root, native) = slate_spawn_native(&spawn, "ofd-race");
     assert!(native.status.success(), "native control: {}", native.status);
     let native_out = std::fs::read(root.join("out.txt")).unwrap();
-    assert_eq!(native_out.len(), 120, "native control length");
+    assert_eq!(native_out.len(), 2400, "native control length");
     assert_eq!(
         race_records(&native_out).as_ref(),
         Some(&expected),
@@ -11764,12 +11763,12 @@ fn a_parent_and_its_spawned_child_writing_one_descriptor_at_once_lose_no_record(
     );
     assert_eq!(
         stored.as_ref().map(Vec::len),
-        Some(120),
+        Some(2400),
         "two writers on one shared open file description lost or overwrote records"
     );
     assert!(
         intact,
-        "the 120 routed bytes are not the 20 records once each"
+        "the 2400 routed bytes are not the 400 records once each"
     );
     assert!(journal_records_completion(&routed.run));
     slate_spawn_finish(&spawn, &routed);
@@ -11777,7 +11776,7 @@ fn a_parent_and_its_spawned_child_writing_one_descriptor_at_once_lose_no_record(
 }
 
 fn race_expected() -> Vec<Vec<u8>> {
-    let mut all = (0..10)
+    let mut all = (0..200)
         .flat_map(|i| [format!("P{i:04}\n"), format!("C{i:04}\n")])
         .map(String::into_bytes)
         .collect::<Vec<_>>();
@@ -16795,4 +16794,90 @@ fn fix_274_identity_and_status_controls() {
     assert!(
         std::panic::catch_unwind(|| fix_274_descendant_status(log, b"80749\n", "W00")).is_err()
     );
+}
+
+// #196: each native/routed pair crosses a replay-capacity boundary. The
+// existing slate harness retains both raw readings and proves writer release.
+fn fix_196_writes(mode: &str, count: usize, size: usize, exits: usize) {
+    let Some(mut spawn) = slate_spawn(&format!("fix-196-{mode}")) else {
+        return;
+    };
+    spawn.program = fixture_binary(
+        spawn.scratch.path(),
+        "umbra-fix-196-writes",
+        "UMBRA_FIX_196_WRITES_PATH",
+    )
+    .canonicalize()
+    .unwrap();
+    spawn.helper = spawn.program.clone();
+    let digest = Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .arg(&spawn.program)
+        .output()
+        .unwrap();
+    assert!(digest.status.success());
+    std::fs::write(
+        spawn.evidence.join("fix-196-fixture-hash.txt"),
+        digest.stdout,
+    )
+    .unwrap();
+    let mut expected = b"BEGIN\n".to_vec();
+    for i in 0..count {
+        expected.extend(std::iter::repeat_n(b'a' + (i % 26) as u8, size));
+    }
+    expected.extend_from_slice(b"END\n");
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "native {mode}: {}", native.status);
+    assert_eq!(
+        std::fs::read(root.join("out.txt")).unwrap(),
+        expected,
+        "native bytes"
+    );
+    eprintln!(
+        "fix-196-{mode}: native exact bytes={} exit=0",
+        expected.len()
+    );
+    let routed = slate_spawn_routed(&spawn, mode, &["out.txt"]);
+    let complete = routed.run.status == Some(0)
+        && routed.run.stderr.contains(&format!(
+            "finished: Some(Code(0)) after {exits} process exits"
+        ));
+    let intact = routed.object("out.txt") == Some(expected.as_slice());
+    slate_record(
+        &spawn,
+        if complete && intact {
+            "SUPPORTED-AND-CORRECT"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({"mode": mode, "expected_bytes": expected.len(),
+            "actual_bytes": routed.object("out.txt").map(<[u8]>::len),
+            "complete": complete, "intact": intact, "run_id": routed.run.run_id.0.to_string()}),
+    );
+    assert!(complete, "routed {mode}: {}", routed.run.stderr);
+    assert!(intact, "routed {mode}: exact byte stream differs");
+    assert!(journal_records_completion(&routed.run));
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+#[test]
+fn fix_196_a_thousand_small_writes_complete() {
+    fix_196_writes("many", 1000, 6, 1);
+}
+#[test]
+fn fix_196_cumulative_payload_exceeds_replay_budget() {
+    fix_196_writes("payload", 8, 786432, 1);
+}
+#[test]
+fn fix_196_fork_inherits_descriptor_across_retirement() {
+    fix_196_writes("fork", 80, 6, 2);
+}
+#[test]
+fn fix_196_spawn_inherits_descriptor_across_retirement() {
+    fix_196_writes("spawn", 80, 6, 2);
+}
+#[test]
+fn fix_196_exec_preserves_only_surviving_descriptors() {
+    fix_196_writes("exec", 80, 6, 1);
 }

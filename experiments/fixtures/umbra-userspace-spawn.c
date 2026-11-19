@@ -466,7 +466,7 @@ static int escape(const char *root, const char *helper) {
  * at 0 and overwrite each other. Ten per writer keeps the run inside the
  * userspace store's replay budget (#196). The child reports ready before the
  * parent says go, so both writers are live when writing starts. */
-#define RACE_RECORDS 10
+#define RACE_RECORDS 200
 static int race(const char *root, const char *helper) {
     note("phase=pre-spawn mode=ofd-race\n");
     identity();
