@@ -17,6 +17,8 @@
 //! cannot be proven clean keeps the marker held rather than freeing the run over
 //! unsettled I/O.
 
+use std::io::Write as _;
+
 use serde::{Deserialize, Serialize};
 use umbra_core::provider::decode;
 use umbra_core::{
@@ -673,7 +675,8 @@ impl NfsUserspaceStorage {
             Err(error) => {
                 // Even an implementation that changed its map before returning
                 // Err has not acknowledged the transfer. Keep the proof.
-                eprintln!(
+                let _ = writeln!(
+                    std::io::stderr(),
                     "{}",
                     serde_json::json!({
                         "event": "replay_retirement_failed",
