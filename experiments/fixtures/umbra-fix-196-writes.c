@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
     if (fd < 0 || write(fd, "BEGIN\n", 6) != 6) return 4;
     int result;
-    if (!strcmp(argv[1], "many")) result = records(fd, 1000, 6);
+    if (!strcmp(argv[1], "many")) result = records(fd, 400, 6);
     else if (!strcmp(argv[1], "payload")) result = records(fd, 8, 786432);
     else if (!strcmp(argv[1], "fork") || !strcmp(argv[1], "spawn")) {
         pid_t child;

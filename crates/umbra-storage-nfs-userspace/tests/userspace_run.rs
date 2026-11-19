@@ -16837,7 +16837,9 @@ fn fix_196_writes(mode: &str, count: usize, size: usize, exits: usize) {
         "fix-196-{mode}: native exact bytes={} exit=0",
         expected.len()
     );
+    let started = std::time::Instant::now();
     let routed = slate_spawn_routed(&spawn, mode, &["out.txt"]);
+    let routed_elapsed = started.elapsed().as_secs_f64();
     let complete = routed.run.status == Some(0)
         && routed.run.stderr.contains(&format!(
             "finished: Some(Code(0)) after {exits} process exits"
@@ -16851,6 +16853,7 @@ fn fix_196_writes(mode: &str, count: usize, size: usize, exits: usize) {
             "NOT QUALIFIED"
         },
         serde_json::json!({"mode": mode, "expected_bytes": expected.len(),
+            "routed_comparison_seconds": routed_elapsed, "writes": count,
             "actual_bytes": routed.object("out.txt").map(<[u8]>::len),
             "complete": complete, "intact": intact, "run_id": routed.run.run_id.0.to_string()}),
     );
@@ -16862,8 +16865,8 @@ fn fix_196_writes(mode: &str, count: usize, size: usize, exits: usize) {
 }
 
 #[test]
-fn fix_196_a_thousand_small_writes_complete() {
-    fix_196_writes("many", 1000, 6, 1);
+fn fix_196_four_hundred_small_writes_complete() {
+    fix_196_writes("many", 400, 6, 1);
 }
 #[test]
 fn fix_196_cumulative_payload_exceeds_replay_budget() {

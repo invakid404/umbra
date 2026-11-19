@@ -349,7 +349,7 @@ SIGUSR1, for uncertain-send cleanup qualification with `signal-witness` and
 
 ## Replay retirement fixture
 
-`umbra-fix-196-writes.c` issues checked individual writes, cumulative payload
+`umbra-fix-196-writes.c` issues 400 checked six-byte writes, cumulative payload
 beyond the replay budget, and ordered fork, spawn and exec transitions. Native
 and routed controls compare exact byte streams; exec also checks a CLOEXEC
 control. Build it with `clang -arch arm64 -O1 -Wall -Wextra -Werror
