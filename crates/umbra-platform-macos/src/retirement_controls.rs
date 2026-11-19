@@ -112,10 +112,11 @@ fn signal_window_stop(owner_stopped: bool) {
     assert!(owned.0.events.is_empty(), "no signal or syscall event");
     assert!(!owned.0.sessions[0].signals.pending());
     assert!(owned.0.sessions[0].pending.contains_key(&sibling));
-    peer.set_nonblocking(true).unwrap();
-    let mut sent = [0; 1024];
-    let count = peer.read(&mut sent).unwrap();
-    let sent = std::str::from_utf8(&sent[..count]).unwrap();
+    drop(owned);
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut sent = Vec::new();
+    peer.read_to_end(&mut sent).unwrap();
+    let sent = std::str::from_utf8(&sent).unwrap();
     assert!(sent.starts_with("$g;thread:"));
     assert_eq!(sent.matches('$').count(), 1, "no resume or syscall packet");
 }
@@ -155,10 +156,11 @@ fn f284_backend_rejects_duplicate_and_cross_exec_tokens() {
             signal: Some(30),
         })
         .is_err());
-    peer.set_nonblocking(true).unwrap();
-    let mut bytes = [0; 1024];
-    let count = peer.read(&mut bytes).unwrap();
-    let sent = std::str::from_utf8(&bytes[..count]).unwrap();
+    drop(owned);
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut bytes = Vec::new();
+    peer.read_to_end(&mut bytes).unwrap();
+    let sent = std::str::from_utf8(&bytes).unwrap();
     assert!(sent.starts_with("$vCont;C1e:64;c#"));
     assert_eq!(sent.matches('$').count(), 1, "exactly one delivery packet");
 }
