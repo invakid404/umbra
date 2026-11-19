@@ -343,3 +343,6 @@ The userspace-storage `signals284` suite accepts its absolute path through
 debugger permission and the raw-NFS fixture; unsafe-stop cases additionally
 require the platform's `signal-witness` feature. The storage crate's README
 describes the paired acceptance bars and separately invoked rate measurement.
+The `transport-tree` mode keeps an owned child alive while the parent receives
+SIGUSR1, for uncertain-send cleanup qualification with `signal-witness` and
+`shutdown-witness`. The bounded launcher requires the owned group to disappear.

@@ -1724,3 +1724,13 @@ six routed metadata trials and records delivery, return-window refusal, or a
 separate non-signal failure with its diagnostic. The two-worker local metadata
 reading delivered all six signals with no refusal or non-signal failure.
 This small workload does not establish a general refusal rate.
+
+`f284_send_error_reaps_owned_tree` additionally requires `shutdown-witness`.
+It uses the existing bounded owned-group launcher, requires child-before-parent
+confirmed teardown after a possibly completed signal send, and rejects journal
+completion. Set `UMBRA_F284_CLEANUP_EVIDENCE` to a fresh directory to retain its
+shutdown records and cleanup census. Controlled-transport platform unit tests
+separately cover timeout, disconnect, partial acceptance, full acceptance with
+an error, duplicate tokens, exec-generation mismatch and cause-before-PC
+classification. The controlled sibling-window state test does not qualify a
+live sibling-in-window schedule.

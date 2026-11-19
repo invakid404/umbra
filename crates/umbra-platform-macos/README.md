@@ -680,6 +680,13 @@ Identity and ambiguity probes also write a `.stop.json` companion with the
 original packet and injected dispatch metadata. Normal builds read neither
 variable.
 
+With `signal-witness`, `UMBRA_FIX284_SEND_ERROR=completed` makes the first
+signal-delivery packet on each debugger connection report an error after the
+socket accepts it. It is a controlled uncertain-send seam for cleanup tests;
+normal builds do not read it. With `shutdown-witness`, the existing evidence
+file also receives ordered `teardown-report` records with tracee/tracer IDs,
+confirmation status and teardown steps.
+
 **Launch and enforcement.** `TraceBackend::launch` and `launch_experimental`
 share `native.rs::MacosTraceBackend::launch_traced`: both launch suspended,
 sanitize inherited descriptors, and install the same syscall interception loop

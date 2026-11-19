@@ -265,6 +265,9 @@ jobs:
           export UMBRA_F284_SIGNALS="$GITHUB_WORKSPACE/target/debug/umbra-fix-284-signals"
           echo "UMBRA_F284_SIGNALS=$UMBRA_F284_SIGNALS" >> "$GITHUB_ENV"
           cargo test -p umbra-platform-macos --lib signals::tests::f284_delivery_errors -- --exact --nocapture
+          for case in f284_sibling_window_stop_refuses_before_delivery f284_signal_cause_precedes_return_pc f284_backend_rejects_duplicate_and_cross_exec_tokens f284_transport_timeout f284_transport_disconnect f284_transport_partial f284_transport_completed; do
+            cargo test -p umbra-platform-macos --lib "native::retirement_controls::$case" -- --exact --nocapture
+          done
           cargo test -p umbra-supervisor --test observer_failure f284_same_process_overlap -- --exact --nocapture
 
       - name: Qualify enforcement, IPC, and the local run-fixture matrix
@@ -635,6 +638,7 @@ jobs:
         run: |
           cargo build --workspace --bins
           cargo build -p umbra-platform-macos --bin umbra-platform-macos --features signal-witness
+          cargo build -p umbra-platform-macos --bin umbra-platform-macos --features signal-witness,shutdown-witness
           cargo build -p umbra-cli --features probe-idle-renewal
           cargo build -p umbra-storage-nfs-userspace --features transport-raw --bins
           cargo test -p umbra-storage-nfs-userspace --features transport-raw \
@@ -642,7 +646,7 @@ jobs:
 
       - name: Signal native pairs and exact unsafe-state refusals
         run: |
-          for case in signals284::f284_initial_sigpipe_default signals284::f284_dispositions signals284::f284_sources signals284::f284_handler_io signals284::f284_fork_exec_resume signals284::f284_concurrency signals284::f284_thread_delivery signals284::f284_unsafe_entry signals284::f284_unsafe_return_window signals284::f284_unsafe_exec signals284::f284_unsafe_internal signals284::f284_unsafe_park signals284::f284_unsafe_identity signals284::f284_unsafe_ambiguous stdio201::f201_pipe_sigpipe stdio201::f201_self_pipe_sigpipe; do
+          for case in signals284::f284_initial_sigpipe_default signals284::f284_dispositions signals284::f284_sources signals284::f284_handler_io signals284::f284_fork_exec_resume signals284::f284_concurrency signals284::f284_thread_delivery signals284::f284_unsafe_entry signals284::f284_unsafe_return_window signals284::f284_unsafe_exec signals284::f284_unsafe_internal signals284::f284_unsafe_park signals284::f284_unsafe_identity signals284::f284_unsafe_ambiguous signals284::f284_send_error_reaps_owned_tree signals284::f284_teardown_confirmation_control stdio201::f201_pipe_sigpipe stdio201::f201_self_pipe_sigpipe; do
             cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run "$case" -- --exact --nocapture --test-threads=1
           done
 
