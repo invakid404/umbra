@@ -1898,11 +1898,6 @@ impl Storage for NfsUserspaceStorage {
                     return result;
                 }
                 crate::journal::Lookup::Fresh => {
-                    // Maintain the existing cache using each proof's original
-                    // identity, before any new run can admit a coincident key.
-                    while !self.pending_retirement.is_empty() {
-                        self.retry_retirement(0)?;
-                    }
                     // R4-001: a call whose server-side disposition this provider
                     // could not establish leaves the run in the failure model's
                     // RECOVERING posture — "stop new mutations and quiesce;
@@ -1927,6 +1922,11 @@ impl Storage for NfsUserspaceStorage {
                     // an obligation — for this key, and only for the phase where
                     // absence really does exclude a delayed write.
                     self.discharge_pre_intent(&request.context.idempotency_key);
+                    // Maintain the existing cache using each proof's original
+                    // identity, before any new run can admit a coincident key.
+                    while !self.pending_retirement.is_empty() {
+                        self.retry_retirement(0)?;
+                    }
                     if let Some(first) = self.unsettled.first() {
                         let refusal = UmbraError::new(
                             ErrorKind::InvalidState,
