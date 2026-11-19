@@ -456,7 +456,10 @@ Known recovery limitation (#294): if the durable success record persists but
 its reply is lost, a same-key retry returns that result without reconstructing
 barrier ledger evidence. The transient entry remains retained. After the retry
 discharges the effect obligation, `EntireRun` and empty object scopes may return
-receipts omitting that write; nonempty scopes naming the missing object refuse.
+receipts omitting that write. A nonempty object scope refuses only when the
+object has no ledger entry. If an earlier write already established an entry,
+`Data` or `DataAndMetadata` may return a receipt that omits the later recovered
+write as well (#294).
 The earlier matched COMMIT still proves the bytes durable. This receipt-evidence
 gap is characterized separately and is not repaired by replay retirement.
 
