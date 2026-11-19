@@ -2087,13 +2087,13 @@ impl Storage for NfsUserspaceStorage {
         // WRITE was accepted and its COMMIT matched, and a journal-settle failure
         // above has already returned before now. A failed write left the ledger
         // untouched and its evidence is instead in `unsettled`/`stable_write_failure`.
-        if outcome.is_ok() {
+        if let Ok(response) = &outcome {
             if let Some(settlement) = settlement {
                 self.ledger.record_write(&settlement);
                 self.pending_retirement.push(PendingRetirement {
                     run: request.context.run_id,
                     key: request.context.idempotency_key.clone(),
-                    response: outcome.as_ref().expect("successful write").clone(),
+                    response: response.clone(),
                     _settlement: settlement,
                 });
                 let index = self.pending_retirement.len() - 1;

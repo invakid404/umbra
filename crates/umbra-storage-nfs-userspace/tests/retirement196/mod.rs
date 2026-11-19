@@ -205,6 +205,8 @@ fn fix_196_failed_retirement_keeps_success_and_retries_the_same_key() {
 struct LoseSettlement {
     inner: FakeTransport,
     armed: Arc<Mutex<bool>>,
+    short: bool,
+    persist: bool,
 }
 impl RawTransport for LoseSettlement {
     fn wire_profile(&self) -> WireProfile {
@@ -236,6 +238,21 @@ impl RawTransport for LoseSettlement {
                 ))
             )
         });
+        if selected && *self.armed.lock().unwrap() && !self.persist {
+            *self.armed.lock().unwrap() = false;
+            return Err(
+                umbra_storage_nfs_userspace::error::TransportError::Disconnected {
+                    epoch: ConnectionEpoch(1),
+                    detail: "simulated settlement before persistence".into(),
+                },
+            );
+        }
+        let target = call
+            .ops
+            .iter()
+            .any(|op| matches!(op, Nfs4Op::Write { data, .. } if data == &vec![42; 6]));
+        self.inner
+            .set_write_cap(if self.short && target { Some(3) } else { None });
         let result = self.inner.submit(call, deadline);
         let mut armed = self.armed.lock().unwrap();
         if selected && *armed && result.is_ok() {
@@ -262,6 +279,17 @@ impl RawTransport for LoseSettlement {
 
 #[test]
 fn fix_196_interrupted_settlement_retains_bytes_and_characterizes_294() {
+    interrupted_settlement(false, true);
+}
+#[test]
+fn fix_196_short_interrupted_settlement_keeps_actual_count() {
+    interrupted_settlement(true, true);
+}
+#[test]
+fn fix_196_unpersisted_settlement_requires_recovery_proof() {
+    interrupted_settlement(false, false);
+}
+fn interrupted_settlement(short: bool, persist: bool) {
     let observed = Arc::new(Mutex::new(Observed::default()));
     let armed = Arc::new(Mutex::new(false));
     let mut storage = NfsUserspaceStorage::with_facades(
@@ -269,6 +297,8 @@ fn fix_196_interrupted_settlement_retains_bytes_and_characterizes_294() {
         Box::new(LoseSettlement {
             inner: fake_server(),
             armed: armed.clone(),
+            short,
+            persist,
         }),
         Box::new(Watching {
             inner: FakeReplayLog::default(),
@@ -295,8 +325,20 @@ fn fix_196_interrupted_settlement_retains_bytes_and_characterizes_294() {
         scope: umbra_core::FlushScope::EntireRun,
     };
     assert!(storage.flush(&flush).is_err());
+    if !persist {
+        let error = storage.execute(&request).unwrap_err();
+        eprintln!("unpersisted settlement recovery: {error:?}");
+        assert_eq!(error.kind, ErrorKind::InvalidState);
+        assert!(format!("{error:?}").contains("BLOCKED_RECOVERABLE"));
+        assert_eq!(observed.lock().unwrap().records, 1);
+        assert_eq!(observed.lock().unwrap().retire_calls, 0);
+        assert!(storage.execute(&write(&storage, run, 1, 6)).is_err());
+        assert!(storage.close_run().is_err());
+        return;
+    }
+    let count = if short { 3 } else { 6 };
     let answer = storage.execute(&request).unwrap();
-    assert_eq!(answer, umbra_core::StorageResponse::WriteAt(6));
+    assert_eq!(answer, umbra_core::StorageResponse::WriteAt(count));
     assert_eq!(storage.execute(&request).unwrap(), answer);
     let read = storage
         .execute(&StorageRequest {
@@ -308,7 +350,10 @@ fn fix_196_interrupted_settlement_retains_bytes_and_characterizes_294() {
             },
         })
         .unwrap();
-    assert_eq!(read, umbra_core::StorageResponse::ReadAt(vec![42; 6]));
+    assert_eq!(
+        read,
+        umbra_core::StorageResponse::ReadAt(vec![42; count as usize])
+    );
     let stat = storage
         .execute(&StorageRequest {
             context: authorised(&storage, run, "stat"),
@@ -352,10 +397,46 @@ fn fix_196_interrupted_settlement_retains_bytes_and_characterizes_294() {
     assert!(evidence.contains("committed_writes=0"), "#294: {evidence}");
     assert!(evidence.contains("committed_bytes=0"), "#294: {evidence}");
     assert_eq!(observed.lock().unwrap().records, 1);
+    // Repeated recovered successes accumulate; fresh accounted writes retire.
+    for index in 1..3 {
+        let repeated = write(&storage, run, index, 6);
+        *armed.lock().unwrap() = true;
+        assert!(storage.execute(&repeated).is_err());
+        assert_eq!(storage.execute(&repeated).unwrap(), answer);
+        assert_eq!(observed.lock().unwrap().records, index + 1);
+    }
+    storage
+        .execute(&create_file(
+            authorised(&storage, run, "create-fresh"),
+            b"fresh",
+        ))
+        .unwrap();
+    let mut fresh = write(&storage, run, 3, 6);
+    fresh.operation = StorageOperation::WriteAt {
+        path: path(b"fresh"),
+        offset: 0,
+        bytes: vec![42; 6],
+    };
+    assert_eq!(storage.execute(&fresh).unwrap(), answer);
+    assert_eq!(observed.lock().unwrap().records, 3);
+    let evidence = String::from_utf8(storage.flush(&flush).unwrap().evidence).unwrap();
+    assert!(evidence.contains("committed_writes=1"), "{evidence}");
+    assert!(
+        evidence.contains(&format!("committed_bytes={count}")),
+        "{evidence}"
+    );
+    assert!(storage
+        .flush(&umbra_core::FlushRequest {
+            scope: umbra_core::FlushScope::Data {
+                objects: vec![stat.object_id]
+            },
+            ..flush
+        })
+        .is_err());
     storage.close_run().unwrap();
     assert_eq!(
         observed.lock().unwrap().records,
-        1,
+        3,
         "close is not cache replacement"
     );
 }
@@ -377,7 +458,23 @@ fn fix_196_verifier_change_retains_payload_and_writer() {
             FaultAction::RotateVerifier(WriteVerifier([self.0; 8]))
         }
     }
-    let (mut storage, run, observed) = provider();
+    let shared = SharedFake::new(fake_server());
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let mut storage = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(shared.clone()),
+        Box::new(Watching {
+            inner: FakeReplayLog::default(),
+            observed: observed.clone(),
+        }),
+    )
+    .unwrap();
+    let run = fresh_run();
+    storage.open_run(&create_run(run)).unwrap();
+    storage
+        .execute(&create_file(authorised(&storage, run, "create"), b"out"))
+        .unwrap();
+    let held = shared.with(|t| marker_bytes(t, run));
     storage
         .transport()
         .unwrap()
@@ -389,6 +486,16 @@ fn fix_196_verifier_change_retains_payload_and_writer() {
     assert_eq!(o.retire_calls, 0);
     drop(o);
     assert!(storage.close_run().is_err());
+    assert_eq!(shared.with(|t| marker_bytes(t, run)), held);
+    let mut contender = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(shared.clone()),
+        Box::new(FakeReplayLog::default()),
+    )
+    .unwrap();
+    assert!(open_existing(&mut contender, run).is_err());
+    assert_eq!(shared.with(|t| marker_bytes(t, run)), held);
+    assert_eq!(observed.lock().unwrap().records, 1);
 }
 
 #[test]
@@ -428,4 +535,70 @@ fn fix_196_retired_write_retry_ignores_changed_target_and_rejects_identity_reuse
         *offset = 1;
     }
     assert!(storage.execute(&changed_request).is_err());
+}
+
+#[test]
+fn fix_196_new_provider_resume_preserves_journal_and_epoch_refusals() {
+    let shared = SharedFake::new(fake_server());
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let mut first = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(shared.clone()),
+        Box::new(Watching {
+            inner: FakeReplayLog::default(),
+            observed: observed.clone(),
+        }),
+    )
+    .unwrap();
+    let run = fresh_run();
+    first.open_run(&create_run(run)).unwrap();
+    first
+        .execute(&create_file(authorised(&first, run, "create"), b"out"))
+        .unwrap();
+    let old = write(&first, run, 0, 6);
+    assert_eq!(
+        first.execute(&old).unwrap(),
+        umbra_core::StorageResponse::WriteAt(6)
+    );
+    assert_eq!(observed.lock().unwrap().records, 0);
+    first.close_run().unwrap();
+    let released = shared.with(|t| marker_bytes(t, run));
+    let records = shared.with(|t| retry_records(t, run));
+    let next_observed = Arc::new(Mutex::new(Observed::default()));
+    let mut next = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(shared.clone()),
+        Box::new(Watching {
+            inner: FakeReplayLog::default(),
+            observed: next_observed.clone(),
+        }),
+    )
+    .unwrap();
+    open_existing(&mut next, run).unwrap();
+    assert_ne!(shared.with(|t| marker_bytes(t, run)), released);
+    assert_eq!(shared.with(|t| retry_records(t, run)), records);
+    // A new writer epoch cannot reuse the old request's authority. Changing
+    // that epoch also changes the exact durable request: neither is redispatch.
+    let old_error = next.execute(&old).unwrap_err();
+    eprintln!("resume old epoch: {old_error:?}");
+    assert_eq!(old_error.kind, ErrorKind::LeaseLost);
+    let mut reauthorized = old.clone();
+    reauthorized.context.writer_epoch = authorised(&next, run, "unused").writer_epoch;
+    let changed_error = next.execute(&reauthorized).unwrap_err();
+    eprintln!("resume changed epoch: {changed_error:?}");
+    assert_eq!(changed_error.kind, ErrorKind::InvalidInput);
+    assert_eq!(next_observed.lock().unwrap().high_records, 0);
+    assert_eq!(
+        next.execute(&StorageRequest {
+            context: authorised(&next, run, "read"),
+            operation: StorageOperation::ReadAt {
+                path: path(b"out"),
+                offset: 0,
+                len: 6
+            }
+        })
+        .unwrap(),
+        umbra_core::StorageResponse::ReadAt(vec![42; 6])
+    );
+    next.close_run().unwrap();
 }

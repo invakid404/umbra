@@ -399,6 +399,12 @@ known server errors, recovered successes after interrupted settlement, and reuse
 after unresolved old-run failures remain outside this bound (open issue #196).
 No age or inactivity limit is introduced.
 
+Same-authority retry is distinct from writer succession. A new provider opening
+a released run advances the writer epoch: the original request is refused as
+`LeaseLost`, while replacing its epoch makes it a different durable request and
+is refused as `InvalidInput`. The stored answer and bytes remain intact; this
+does not qualify successful retry-result retrieval across writer epochs.
+
 ### Capabilities
 
 `capability::CONTRACT_SURFACE` is the single source of truth for what each
