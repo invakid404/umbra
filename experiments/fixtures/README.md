@@ -327,7 +327,22 @@ SID-1 CLI case separately checks delivery and EOF at exit. The additive isolatio
 the private terminal harness. `umbra-fix-201-sanitize.rs` establishes Rust's
 closed-standard-slot sanitation on the qualified host.
 
-The paired SIGPIPE controls distinguish native signal termination/EPIPE from
-the current routed fatal T0d classification, including ignored SIGPIPE. The
-self-pipe case establishes that this signal limitation is independent of
-inherited stdout. Fatal runs must have no decoded journal completion record.
+The paired SIGPIPE controls require native signal termination and routed
+signal-13 completion for the default disposition, and EPIPE with continued
+execution when ignored. The self-pipe case checks delivery independently of
+inherited stdout.
+
+## Supervised signals (#284)
+
+`umbra-fix-284-signals.c` supplies default, ignored and handler dispositions,
+initial SIGPIPE state, timers, inherited sockets, handler filesystem I/O,
+fork/exec, thread-directed signals and a routed-metadata rate workload. Build with
+`clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-284-signals.c -o target/debug/umbra-fix-284-signals`.
+The userspace-storage `signals284` suite accepts its absolute path through
+`UMBRA_F284_SIGNALS` and otherwise compiles it. Live cases require macOS arm64,
+debugger permission and the raw-NFS fixture; unsafe-stop cases additionally
+require the platform's `signal-witness` feature. The storage crate's README
+describes the paired acceptance bars and separately invoked rate measurement.
+The `transport-tree` mode keeps an owned child alive while the parent receives
+SIGUSR1, for uncertain-send cleanup qualification with `signal-witness` and
+`shutdown-witness`. The bounded launcher requires the owned group to disappear.

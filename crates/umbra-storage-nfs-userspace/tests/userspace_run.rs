@@ -132,6 +132,8 @@
 ))]
 
 use std::ffi::OsString;
+#[path = "signals284/mod.rs"]
+mod signals284;
 #[path = "stdio201/mod.rs"]
 mod stdio201;
 use std::os::unix::ffi::OsStrExt;
@@ -8383,8 +8385,14 @@ fn slate_launch(
         .unwrap();
     };
     let ledgered = watch.is_some_and(|w| w.ledger);
+    // The #284 command's pre_exec creates and verifies a fresh session.
+    // Making it a group leader first would make that setsid fail with EPERM.
+    if !command.get_envs().any(|(key, value)| {
+        key == "UMBRA_F284_OWN_SESSION" && value == Some(std::ffi::OsStr::new("1"))
+    }) {
+        command.process_group(0);
+    }
     command
-        .process_group(0)
         .stdin(if ledgered {
             Stdio::piped()
         } else {
@@ -9543,14 +9551,15 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for consumed stdio rejection (#201): single_thread,
-    // Fork, and WaitPlan::Park are byte-identical to the characterized base.
+    // Re-characterized for signal cleanup witnesses (#284): single_thread
+    // and Fork are byte-identical to the base; Park retains its guard and
+    // transition, with only a cfg-gated signal-witness hook added.
     // The refusal oracle and runtime-witness limitation remain unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("c797e936f01ddc6ffe1637d39c9eec48236d881829c21c7e81538d8c1f219762"),
+        Some("e196c456eb5bdfc1ce8a5bca4ee6b993be079259973f5ca0f1a4ab5c26447d72"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.

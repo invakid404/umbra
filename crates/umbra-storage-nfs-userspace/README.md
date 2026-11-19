@@ -1700,7 +1700,37 @@ unsupported-endpoint refusal and EOF while a non-isolated control remains alive.
 The EOF case creates and verifies its own non-SID-1 session. Launchd's isolated
 EOF-at-exit behavior is qualified separately by the CLI's
 `f201_pipe_eof_isolated` case. Rust closed-slot sanitation is a native control.
-Default and ignored SIGPIPE pin the existing fatal T0d divergence, not signal
-delivery; a self-pipe control isolates that classification from inherited stdout.
+Default SIGPIPE requires a confirmed signal-13 exit and journal completion;
+ignored SIGPIPE requires EPIPE and continued execution. A self-pipe control
+checks the same behavior independently of inherited stdout.
 These streams bypass storage and are neither journaled nor replayed. The CLI
 README states the endpoint and terminal limitations.
+
+The `signals284` cases add native/routed disposition pairs for SIGPIPE, SIGTERM,
+SIGUSR1, SIGUSR2 and SIGALRM, handler filesystem I/O, timer and inherited-socket
+sources, fork/exec, completed-run reopen, concurrent runs and thread-directed
+delivery. They use the live raw-NFS setup above and compile
+`experiments/fixtures/umbra-fix-284-signals.c`, or use `UMBRA_F284_SIGNALS` as an
+absolute fixture override. The unsafe-stop cases also require a platform binary
+built with `signal-witness`; a missing witness fails the case. Each requires the
+matching owned-stop witness and named refusal.
+Identity and ambiguity cases inject metadata faults after a genuine signal
+packet; Park proves delayed observation after child release.
+
+`signals284::f284_return_window_rate` is ignored by default. Run it explicitly
+with `--exact --ignored --nocapture --test-threads=1` in the same `userspace_run`
+target and set `UMBRA_F284_RATE_EVIDENCE` to the output JSONL path. It attempts
+six routed metadata trials and records delivery, return-window refusal, or a
+separate non-signal failure with its diagnostic. The two-worker local metadata
+reading delivered all six signals with no refusal or non-signal failure.
+This small workload does not establish a general refusal rate.
+
+`f284_send_error_reaps_owned_tree` additionally requires `shutdown-witness`.
+It uses the existing bounded owned-group launcher, requires child-before-parent
+confirmed teardown after a possibly completed signal send, and rejects journal
+completion. Set `UMBRA_F284_CLEANUP_EVIDENCE` to a fresh directory to retain its
+shutdown records and cleanup census. Controlled-transport platform unit tests
+separately cover timeout, disconnect, partial acceptance, full acceptance with
+an error, duplicate tokens, exec-generation mismatch and cause-before-PC
+classification. The controlled sibling-window state test does not qualify a
+live sibling-in-window schedule.

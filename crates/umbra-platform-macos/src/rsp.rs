@@ -45,6 +45,16 @@ pub struct Rsp {
     /// Set once the owning session's ordered teardown has killed and reaped
     /// the tracer, so `Drop` does not do it a second time.
     torn_down: bool,
+    #[cfg(feature = "signal-witness")]
+    signal_fault_fired: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    // A controlled transport can fail before, during or after accepting a
+    // signal packet. Count attempts even after the one-shot fault is consumed.
+    pub(crate) static SIGNAL_WRITE_FAULT: std::cell::Cell<Option<(usize, &'static str)>> = const { std::cell::Cell::new(None) };
+    pub(crate) static SIGNAL_WRITE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // Own the child immediately after spawn, before any fallible socket operation.
@@ -243,6 +253,8 @@ impl Rsp {
             deadline,
             setup_deadline: Some(limit),
             torn_down: false,
+            #[cfg(feature = "signal-witness")]
+            signal_fault_fired: false,
         };
         r.write_packet(b"+", r.limit(Duration::from_secs(2)))?;
         r.ok("QStartNoAckMode")?;
@@ -262,6 +274,30 @@ impl Rsp {
         Ok(r)
     }
     fn write_packet(&mut self, bytes: &[u8], limit: Instant) -> Result<()> {
+        #[cfg(feature = "signal-witness")]
+        if !self.signal_fault_fired
+            && bytes.starts_with(b"$vCont;C")
+            && std::env::var("UMBRA_FIX284_SEND_ERROR").ok().as_deref() == Some("completed")
+        {
+            // The live pairing deliberately makes transport success uncertain:
+            // the owned debugger receives the packet, but its caller gets an
+            // error. No normal build consults this test-only switch.
+            self.signal_fault_fired = true;
+            self.stream
+                .write_all(bytes)
+                .map_err(|e| error("rsp write", e))?;
+            return Err(error("rsp write", "f284 possibly completed signal send"));
+        }
+        #[cfg(test)]
+        if bytes.starts_with(b"$vCont;C") {
+            SIGNAL_WRITE_ATTEMPTS.with(|count| count.set(count.get() + 1));
+            if let Some((accepted, reason)) = SIGNAL_WRITE_FAULT.with(|fault| fault.take()) {
+                self.stream
+                    .write_all(&bytes[..accepted.min(bytes.len())])
+                    .map_err(|e| error("rsp write", e))?;
+                return Err(error("rsp write", reason));
+            }
+        }
         let mut offset = 0;
         while offset < bytes.len() {
             let remaining = limit
@@ -542,6 +578,8 @@ impl Rsp {
                 deadline: None,
                 setup_deadline: None,
                 torn_down: false,
+                #[cfg(feature = "signal-witness")]
+                signal_fault_fired: false,
             },
             peer,
         )
@@ -687,6 +725,8 @@ mod poll_bound_tests {
             deadline: Some(crate::clock::now() + Duration::from_secs(2)),
             setup_deadline: None,
             torn_down: true,
+            #[cfg(feature = "signal-witness")]
+            signal_fault_fired: false,
         };
         peer.write_all(b"$T05thread:").unwrap();
         assert_eq!(rsp.poll(Duration::from_millis(2)).unwrap(), None);
@@ -739,6 +779,8 @@ mod early_packet_test {
             deadline: None,
             setup_deadline: None,
             torn_down: true,
+            #[cfg(feature = "signal-witness")]
+            signal_fault_fired: false,
         };
         peer.write_all(b"$T05thread:1;#00").unwrap();
         EARLY_PACKET.with(|v| v.set(true));

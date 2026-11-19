@@ -7,6 +7,8 @@ edition.workspace = true
 publish = false
 
 [features]
+# Deterministic signal-state witnesses; absent from production builds.
+signal-witness = []
 # Qualification-only allocation witnesses; no fault injection.
 retirement-witness = []
 # Independent acquisition and Final-to-exit qualification records.

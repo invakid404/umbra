@@ -141,13 +141,26 @@ stdin previously returned EOF. Job-control stop/continue parity is deferred.
 Opening `/dev/tty` and setting terminal modes remain unsupported. Existing
 SIGWINCH, SIGCONT and SIGCHLD absorption remains a limitation.
 
-SIGPIPE currently ends a supervised run with umbra's fatal-stop error
-(`tracee stop`, `fatal signal/exception: T0d`), exit 1, and no journal completion.
-For example, this can occur when piping output to `head -1`. It also occurs
-when the program ignores SIGPIPE, unlike native execution's EPIPE return;
-this affects programs such as Rust, Python and Node applications that ignore
-SIGPIPE. Signal delivery, including foreground SIGINT and SIGPIPE dispositions,
-is deferred to slice 2. No native signal-delivery parity is claimed.
+At safe stops, SIGPIPE, SIGTERM, SIGUSR1, SIGUSR2 and SIGALRM use the
+tracee's kernel disposition. A default SIGPIPE confirms a signal-13 exit;
+umbra reports `ProcessFailed` and exits 1 after ordered cleanup, with journal
+completion only after the tree and provider are confirmed finished. Ignoring
+SIGPIPE permits the native EPIPE return and continued execution. Installed
+handlers run through normal filesystem mediation. Root spawn resets only
+SIGPIPE to default, matching a shell launch; programs can then install their
+own disposition. No caller mask or other disposition is changed by that reset.
+An invoker that deliberately ignores SIGPIPE therefore starts a tracee with
+default SIGPIPE under umbra.
+
+Delivery is limited to clean stable stops. A signal during an exposed return
+window, at an armed syscall entry, during bootstrap or exec, or with ambiguous
+interrupt/stop identity is refused with a named capability error. Such refusals
+never record completion. A process in a synthetic parked wait cannot observe a
+signal until its child exits; the delayed stop is then classified, and may be
+refused at the return window. These are temporary limitations tracked by #284
+and its signal-progress follow-ups, not full native signal parity. Ctrl-C role
+protection and foreground SIGINT delivery remain slice 2 of #284; SIGINT keeps
+its existing behavior, including killing the CLI in the foreground pty case.
 
 ### In launchd's session
 

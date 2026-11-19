@@ -11,8 +11,26 @@ use std::os::unix::process::ExitStatusExt;
 const PAYLOAD: &[u8] = b"stdio-201 exact bytes\n";
 
 fn command(root: &Path, target: &(String, u16), native: bool, mode: &str) -> Command {
+    command_fixture(
+        root,
+        target,
+        native,
+        mode,
+        "umbra-fix-201-stdio",
+        "UMBRA_F201_STDIO",
+    )
+}
+
+pub(super) fn command_fixture(
+    root: &Path,
+    target: &(String, u16),
+    native: bool,
+    mode: &str,
+    fixture_name: &str,
+    fixture_env: &str,
+) -> Command {
     std::fs::create_dir_all(root).unwrap();
-    let program = fixture_binary(root, "umbra-fix-201-stdio", "UMBRA_F201_STDIO");
+    let program = fixture_binary(root, fixture_name, fixture_env);
     let mut command = if native {
         Command::new(program)
     } else {
@@ -168,23 +186,30 @@ fn f201_pipe_sigpipe() {
                 out.status,
                 String::from_utf8_lossy(&out.stderr)
             );
-            if native && ignored {
+            if ignored {
                 success(&out);
             } else if native {
                 assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
             } else {
                 assert_eq!(out.status.code(), Some(1));
-                fatal_sigpipe(&case, &out);
+                delivered_sigpipe(&case, &out);
             }
         }
     });
 }
 
-fn fatal_sigpipe(root: &Path, out: &std::process::Output) {
+fn delivered_sigpipe(root: &Path, out: &std::process::Output) {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("tracee stop"), "{stderr}");
-    assert!(stderr.contains("fatal signal/exception: T0d"), "{stderr}");
+    assert!(stderr.contains("ProcessFailed"), "{stderr}");
+    assert!(stderr.contains("Signal(13)"), "{stderr}");
+    assert!(
+        journal_records_completion(&run_record(root, out)),
+        "confirmed signal death did not record completion"
+    );
+}
+
+pub(super) fn run_record(root: &Path, out: &std::process::Output) -> Run {
     let state = root.join("state");
     let ids: Vec<_> = std::fs::read_dir(&state)
         .unwrap()
@@ -192,19 +217,15 @@ fn fatal_sigpipe(root: &Path, out: &std::process::Output) {
         .filter_map(|name| uuid::Uuid::parse_str(&name).ok())
         .collect();
     assert_eq!(ids.len(), 1);
-    let run = Run {
+    Run {
         run_id: RunId(ids[0]),
         status: out.status.code(),
-        stderr: stderr.into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         destination: root.join("unused"),
         state,
         workspace: root.join("workspace"),
-        registry: root.join("unused-registry"),
-    };
-    assert!(
-        !journal_records_completion(&run),
-        "fatal stop recorded completion"
-    );
+        registry: root.join("registry.json"),
+    }
 }
 
 #[test]
@@ -223,7 +244,7 @@ fn f201_self_pipe_sigpipe() {
         if native {
             assert_eq!(out.status.signal(), Some(libc::SIGPIPE));
         } else {
-            fatal_sigpipe(root, &out);
+            delivered_sigpipe(root, &out);
         }
     });
 }

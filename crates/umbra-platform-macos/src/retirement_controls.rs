@@ -34,6 +34,9 @@ fn slot(generation: u64, done: bool) -> (Session, std::net::TcpStream) {
             exit_evidence: Some(BarrierEvidence::ReapedByPlatform),
             exit_report: Some("W00".into()),
             exec_generation: 0,
+            #[cfg(feature = "signal-witness")]
+            signal_probe_fired: false,
+            signals: crate::signals::Delivery::default(),
             policy_exec_generation: 0,
             initial: false,
             retirement: done.then(|| crate::retirement::Retirement::new(crate::clock::now())),
@@ -59,6 +62,169 @@ fn slot(generation: u64, done: bool) -> (Session, std::net::TcpStream) {
 fn register(backend: &mut MacosTraceBackend, s: Session) {
     backend.watchdog.as_ref().unwrap().add(s.task.clone());
     backend.sessions.push(s);
+}
+
+#[test]
+fn f284_sibling_window_stop_refuses_before_delivery() {
+    signal_window_stop(false);
+}
+
+#[test]
+fn f284_signal_cause_precedes_return_pc() {
+    signal_window_stop(true);
+}
+
+fn signal_window_stop(owner_stopped: bool) {
+    use std::io::Write;
+    let mut owned = SelfTaskBackend(MacosTraceBackend::default());
+    let (mut session, mut peer) = slot(100, false);
+    let stopped = session.thread;
+    let sibling = if owner_stopped {
+        stopped
+    } else {
+        tid(stopped.0.native_id + 1, stopped.0.generation)
+    };
+    assert_eq!(stopped == sibling, owner_stopped);
+    session.pending.insert(
+        sibling,
+        Pending {
+            thread: sibling,
+            entry: 0,
+            entry_breakpoint: Breakpoint {
+                original: [0; 4],
+                raw: false,
+            },
+            gate: 0,
+            kind: ReturnKind::Syscall,
+            hardware: false,
+            creation: None,
+        },
+    );
+    owned.0.sessions.push(session);
+    // Controlled register reply puts PC at zero, matching the window gate.
+    // Exercise both ownership cases without changing the genuine cause field.
+    peer.write_all(b"$00#60").unwrap();
+    let failure = owned
+        .0
+        .stop(0, format!("T1ethread:{:x};", stopped.0.native_id), false)
+        .unwrap_err();
+    assert!(failure.to_string().contains("signal-during-return-window"));
+    assert!(owned.0.events.is_empty(), "no signal or syscall event");
+    assert!(!owned.0.sessions[0].signals.pending());
+    assert!(owned.0.sessions[0].pending.contains_key(&sibling));
+    drop(owned);
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut sent = Vec::new();
+    peer.read_to_end(&mut sent).unwrap();
+    let sent = std::str::from_utf8(&sent).unwrap();
+    assert!(sent.starts_with("$g;thread:"));
+    assert_eq!(sent.matches('$').count(), 1, "no resume or syscall packet");
+}
+
+#[test]
+fn f284_backend_rejects_duplicate_and_cross_exec_tokens() {
+    let mut owned = SelfTaskBackend(MacosTraceBackend::default());
+    let (session, mut peer) = slot(100, false);
+    let task = session.id;
+    let thread = session.thread;
+    owned.0.sessions.push(session);
+    let token = owned.0.sessions[0]
+        .signals
+        .issue(task, thread, 0, 30)
+        .unwrap();
+    let command = || ResumeCommand {
+        thread,
+        mode: ResumeMode::Signal(token),
+        signal: Some(30),
+    };
+    owned.0.resume(command()).unwrap();
+    // Model the next externally stopped state, preserving the consumed token.
+    owned.0.sessions[0].stopped = true;
+    assert!(owned.0.resume(command()).is_err());
+    let stale = owned.0.sessions[0]
+        .signals
+        .issue(task, thread, 0, 30)
+        .unwrap();
+    // Deliberately leave authority present: this isolates the generation
+    // comparison from the separate invalidation at an exec notification.
+    owned.0.sessions[0].exec_generation = 1;
+    assert!(owned
+        .0
+        .resume(ResumeCommand {
+            thread,
+            mode: ResumeMode::Signal(stale),
+            signal: Some(30),
+        })
+        .is_err());
+    drop(owned);
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut bytes = Vec::new();
+    peer.read_to_end(&mut bytes).unwrap();
+    let sent = std::str::from_utf8(&bytes).unwrap();
+    assert!(sent.starts_with("$vCont;C1e:64;c#"));
+    assert_eq!(sent.matches('$').count(), 1, "exactly one delivery packet");
+}
+
+#[test]
+fn f284_transport_timeout() {
+    signal_transport_failure(0, "timeout");
+}
+
+#[test]
+fn f284_transport_disconnect() {
+    signal_transport_failure(0, "disconnect");
+}
+
+#[test]
+fn f284_transport_partial() {
+    signal_transport_failure(5, "partial send");
+}
+
+#[test]
+fn f284_transport_completed() {
+    signal_transport_failure(usize::MAX, "possibly completed send");
+}
+
+fn signal_transport_failure(accepted: usize, reason: &'static str) {
+    let mut owned = SelfTaskBackend(MacosTraceBackend::default());
+    let (mut session, mut peer) = slot(100, false);
+    let thread = session.thread;
+    let token = session.signals.issue(session.id, thread, 0, 30).unwrap();
+    owned.0.sessions.push(session);
+    crate::rsp::SIGNAL_WRITE_ATTEMPTS.with(|count| count.set(0));
+    crate::rsp::SIGNAL_WRITE_FAULT.with(|fault| fault.set(Some((accepted, reason))));
+    let failure = owned
+        .0
+        .resume(ResumeCommand {
+            thread,
+            mode: ResumeMode::Signal(token),
+            signal: Some(30),
+        })
+        .unwrap_err();
+    assert!(failure.to_string().contains(reason));
+    assert_eq!(
+        crate::rsp::SIGNAL_WRITE_ATTEMPTS.with(|count| count.get()),
+        1
+    );
+    assert!(owned.0.sessions[0].stopped);
+    assert!(owned
+        .0
+        .resume(ResumeCommand {
+            thread,
+            mode: ResumeMode::Continue,
+            signal: None,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("signal-delivery-closed"));
+    drop(owned);
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut bytes = Vec::new();
+    peer.read_to_end(&mut bytes).unwrap();
+    let body = b"vCont;C1e:64;c";
+    let checksum = body.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    let packet = format!("${}#{checksum:02x}", std::str::from_utf8(body).unwrap());
+    assert_eq!(bytes, packet.as_bytes()[..accepted.min(packet.len())]);
 }
 // Controlled slots hold send rights to this test process. Clear the registry
 // and mark sessions done before backend Drop, including assertion unwinding.
