@@ -634,6 +634,12 @@ jobs:
           echo "UMBRA_R10_DEFERRED_PATH=$GITHUB_WORKSPACE/target/debug/umbra-slate-r10-deferred-threads" >> "$GITHUB_ENV"
           echo "UMBRA_R10_TOKIO_PATH=$GITHUB_WORKSPACE/target/debug/slate-r10-tokio" >> "$GITHUB_ENV"
 
+      - name: Build replay retirement fixture
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-196-writes.c -o "$GITHUB_WORKSPACE/target/debug/umbra-fix-196-writes"
+          echo "UMBRA_FIX_196_WRITES_PATH=$GITHUB_WORKSPACE/target/debug/umbra-fix-196-writes" >> "$GITHUB_ENV"
+
       - name: Proof 1 -- end to end, the toy and the Rust I/O fixture must exit 0
         run: |
           cargo build --workspace --bins

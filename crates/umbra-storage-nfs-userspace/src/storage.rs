@@ -17,6 +17,8 @@
 //! cannot be proven clean keeps the marker held rather than freeing the run over
 //! unsettled I/O.
 
+use std::io::Write as _;
+
 use serde::{Deserialize, Serialize};
 use umbra_core::provider::decode;
 use umbra_core::{
@@ -51,7 +53,7 @@ pub const FORMAT_VERSION: u32 = 1;
 ///
 /// [`Durability::Remote`] is what a *qualified* run claims: every `WriteAt`
 /// returns only after a COMMIT whose verifier matched its WRITE's, which per RFC
-/// 7530 §16.4 is the server's acknowledgement of stable storage, and the barrier
+/// 7530 §16.3 is the server's acknowledgement of stable storage, and the barrier
 /// certifies that none in scope is outstanding, indeterminate or latched-failed.
 ///
 /// What `Remote` asserts is exactly that acknowledgement and that barrier. It does
@@ -275,6 +277,9 @@ pub struct NfsUserspaceStorage {
     config: NfsUserspaceConfig,
     transport: Option<Box<dyn RawTransport>>,
     replay: Option<Box<dyn ReplayLog>>,
+    /// Proven transfers still awaiting cache maintenance. These belong to the
+    /// cache, survive close/open, and are not outstanding server I/O.
+    pending_retirement: Vec<PendingRetirement>,
     operations: Option<Operations>,
     /// Umbra-owned NFSv4.0 client state: client id, open owners, seqids, lease.
     state: ProtocolState,
@@ -347,6 +352,15 @@ pub struct NfsUserspaceStorage {
     /// beside `unsettled`, so a reopened run starts empty and its flush is scoped
     /// to what that incarnation wrote.
     ledger: RunLedger,
+}
+
+/// Constructed only after matched COMMIT, durable journal settlement and
+/// barrier accounting. A recorded result alone cannot construct this proof.
+struct PendingRetirement {
+    run: umbra_core::RunId,
+    key: IdempotencyKey,
+    response: StorageResponse,
+    _settlement: crate::ops::WriteSettlement,
 }
 
 /// How far a call had got when its server-side disposition became unknown.
@@ -505,6 +519,7 @@ impl NfsUserspaceStorage {
             config,
             transport: None,
             replay: None,
+            pending_retirement: Vec::new(),
             operations: None,
             state,
             dispatcher: crate::namespace::dispatch::TransportDispatcher::new(),
@@ -545,6 +560,7 @@ impl NfsUserspaceStorage {
         Self::probe_export(&mut *transport, &self.config)?;
         self.transport = Some(transport);
         self.replay = Some(Box::new(crate::replay::InProcessReplayLog::default()));
+        self.pending_retirement.clear();
         self.validated = true;
         Ok(())
     }
@@ -623,6 +639,7 @@ impl NfsUserspaceStorage {
             config,
             transport: Some(transport),
             replay: Some(replay),
+            pending_retirement: Vec::new(),
             operations: None,
             state,
             dispatcher: crate::namespace::dispatch::TransportDispatcher::new(),
@@ -641,6 +658,40 @@ impl NfsUserspaceStorage {
     /// The configuration this provider was built with.
     pub fn config(&self) -> &NfsUserspaceConfig {
         &self.config
+    }
+
+    fn retry_retirement(&mut self, index: usize) -> Result<()> {
+        let pending = &self.pending_retirement[index];
+        let result = self
+            .replay
+            .as_mut()
+            .expect("proof belongs to bound cache")
+            .retire(&pending.key);
+        match result {
+            Ok(()) => {
+                self.pending_retirement.remove(index);
+                Ok(())
+            }
+            Err(error) => {
+                // Even an implementation that changed its map before returning
+                // Err has not acknowledged the transfer. Keep the proof.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}",
+                    serde_json::json!({
+                        "event": "replay_retirement_failed",
+                        "run": format!("{:?}", pending.run),
+                        "key": format!("{:?}", pending.key),
+                        "error": format!("{error:?}")
+                    })
+                );
+                Err(UmbraError::new(
+                    ErrorKind::StorageUnavailable,
+                    "replay-maintenance",
+                    format!("pending replay retirement for {:?}: {error:?}", pending.key),
+                ))
+            }
+        }
     }
 
     /// The capability names this provider's live probe earned.
@@ -1840,6 +1891,13 @@ impl Storage for NfsUserspaceStorage {
                     // obligation still standing under it is discharged rather
                     // than left to refuse the run's next unrelated mutation.
                     self.discharge_settled(&request.context.idempotency_key);
+                    if let Some(index) = self.pending_retirement.iter().position(|pending| {
+                        pending.run == request.context.run_id
+                            && pending.key == request.context.idempotency_key
+                            && result.as_ref().ok() == Some(&pending.response)
+                    }) {
+                        let _ = self.retry_retirement(index);
+                    }
                     return result;
                 }
                 crate::journal::Lookup::Fresh => {
@@ -1867,6 +1925,11 @@ impl Storage for NfsUserspaceStorage {
                     // an obligation — for this key, and only for the phase where
                     // absence really does exclude a delayed write.
                     self.discharge_pre_intent(&request.context.idempotency_key);
+                    // Maintain the existing cache using each proof's original
+                    // identity, before any new run can admit a coincident key.
+                    while !self.pending_retirement.is_empty() {
+                        self.retry_retirement(0)?;
+                    }
                     if let Some(first) = self.unsettled.first() {
                         let refusal = UmbraError::new(
                             ErrorKind::InvalidState,
@@ -2027,9 +2090,17 @@ impl Storage for NfsUserspaceStorage {
         // WRITE was accepted and its COMMIT matched, and a journal-settle failure
         // above has already returned before now. A failed write left the ledger
         // untouched and its evidence is instead in `unsettled`/`stable_write_failure`.
-        if outcome.is_ok() {
+        if let Ok(response) = &outcome {
             if let Some(settlement) = settlement {
                 self.ledger.record_write(&settlement);
+                self.pending_retirement.push(PendingRetirement {
+                    run: request.context.run_id,
+                    key: request.context.idempotency_key.clone(),
+                    response: response.clone(),
+                    _settlement: settlement,
+                });
+                let index = self.pending_retirement.len() - 1;
+                let _ = self.retry_retirement(index);
             }
         }
         outcome
@@ -2040,7 +2111,7 @@ impl Storage for NfsUserspaceStorage {
     /// # This is a zero-I/O bookkeeping barrier, not a persistence mechanism
     ///
     /// Every `WriteAt` already performs WRITE(UNSTABLE) → COMMIT → verifier-compare
-    /// before it returns, and per RFC 7530 §16.4 a matched-verifier COMMIT places
+    /// before it returns, and per RFC 7530 §16.3 a matched-verifier COMMIT places
     /// the bytes on the server's stable storage permanently — a later server reboot
     /// does not un-commit them. So `flush` has nothing left to COMMIT: re-COMMITting
     /// would be N round trips for zero new evidence. It reads in-memory state only,

@@ -3336,3 +3336,6 @@ fn r5_p2_a_create_through_open_advances_the_parent_change() {
         "an OPEN that creates nothing must not move the parent's change attribute"
     );
 }
+
+#[path = "retirement196/mod.rs"]
+mod retirement196;

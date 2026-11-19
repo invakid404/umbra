@@ -462,11 +462,10 @@ static int escape(const char *root, const char *helper) {
  * the spawned child at the same time, with nothing ordering the writes. Each
  * record is ONE write(2), never retried, so a short or failed write is counted
  * rather than completed. With one shared open file description every record
- * lands once: 20 records, 120 bytes. With copied positions both writers start
- * at 0 and overwrite each other. Ten per writer keeps the run inside the
- * userspace store's replay budget (#196). The child reports ready before the
+ * lands once: 400 records, 2400 bytes. With copied positions both writers start
+ * at 0 and overwrite each other. The child reports ready before the
  * parent says go, so both writers are live when writing starts. */
-#define RACE_RECORDS 10
+#define RACE_RECORDS 200
 static int race(const char *root, const char *helper) {
     note("phase=pre-spawn mode=ofd-race\n");
     identity();

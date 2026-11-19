@@ -302,7 +302,7 @@ impl Operations {
     /// cycle across it; every other case degrades to [`Durability::Local`].
     /// What the qualified level then asserts is the per-write acknowledgement —
     /// every `WriteAt` returns only after a COMMIT whose verifier matched its
-    /// WRITE's, which per RFC 7530 §16.4 is the server's acknowledgement of
+    /// WRITE's, which per RFC 7530 §16.3 is the server's acknowledgement of
     /// stable storage — and the barrier `flush` certifies over it. Fencing still
     /// stays [`Fencing::ReadOnly`]: this node owns no independent termination
     /// verifier, and the barrier says nothing about fencing, an atomic snapshot,
@@ -863,7 +863,7 @@ impl Operations {
             return Err(error.to_umbra(operation));
         }
         // The write is settled: the COMMIT matched the WRITE's verifier, so per RFC
-        // 7530 §16.4 the bytes are on the server's stable storage. Record what that
+        // 7530 §16.3 the bytes are on the server's stable storage. Record what that
         // proved for the object so a later `flush` can state an aggregate barrier
         // over evidence already held, without any new I/O.
         let evidence = WriteSettlement {
