@@ -34,6 +34,27 @@ fn command(root: &Path, target: &(String, u16), native: bool, mode: &str) -> Com
 }
 
 #[test]
+fn f284_teardown_confirmation_control() {
+    // Exact step list from the first owned-tree reading. The original
+    // "Confirmed(" substring check falsely rejected the post-kill variant.
+    let retained = r#"[KillSent, Barrier(Unconfirmed("p_stat 2")), Warning("umbra-platform-macos: tracee termination unconfirmed; tracer killed: pid=52173 identity=Some((1795049801, 573799)) tracer=52175 barrier=Unconfirmed(\"p_stat 2\")"), TracerKilled, TracerReaped(true), ConfirmedAfterTracerKill(Zombie)]"#;
+    assert!(!retained.contains("Confirmed("));
+    assert!(teardown_confirmed(retained));
+    assert!(!teardown_confirmed(
+        r#"[KillSent, Barrier(Unconfirmed("p_stat 2")), TracerKilled, TracerReaped(true), UnconfirmedAfterTracerKill("p_stat 2")]"#
+    ));
+    assert!(!teardown_confirmed(
+        "[Barrier(Confirmed(Zombie)), TracerReaped(false)]"
+    ));
+}
+
+fn teardown_confirmed(steps: &str) -> bool {
+    (steps.contains("Barrier(Confirmed(") || steps.contains("ConfirmedAfterTracerKill("))
+        && steps.contains("TracerReaped(true)")
+        && !steps.contains("UnconfirmedAfterTracerKill(")
+}
+
+#[test]
 fn f284_send_error_reaps_owned_tree() {
     let Some(target) = fixture() else { return };
     let scratch = tempfile::tempdir().unwrap();
@@ -44,6 +65,22 @@ fn f284_send_error_reaps_owned_tree() {
         .env("UMBRA_FIX284_SEND_ERROR", "completed")
         .env("UMBRA_FIX_271_EVIDENCE_FILE", &witness);
     let captured = slate_bounded(&mut cmd, &root.join("owned-tree"));
+    if let Some(evidence) = std::env::var_os("UMBRA_F284_CLEANUP_EVIDENCE") {
+        let evidence = PathBuf::from(evidence);
+        std::fs::create_dir(&evidence).expect("fresh cleanup evidence");
+        for name in [
+            "shutdown.jsonl",
+            "owned-tree.stdout",
+            "owned-tree.stderr",
+            "owned-tree.cleanup",
+            "owned-tree.census.jsonl",
+        ] {
+            let source = root.join(name);
+            if source.exists() {
+                std::fs::copy(source, evidence.join(name)).unwrap();
+            }
+        }
+    }
     let out = std::process::Output {
         status: captured.status.0.expect("known CLI terminal status"),
         stdout: captured.stdout,
@@ -82,8 +119,7 @@ fn f284_send_error_reaps_owned_tree() {
         let report = reports[index];
         assert_eq!(report["unconfirmed"], false);
         let steps = report["steps"].as_str().unwrap();
-        assert!(steps.contains("Confirmed("), "{steps}");
-        assert!(steps.contains("TracerReaped(true)"), "{steps}");
+        assert!(teardown_confirmed(steps), "{steps}");
     }
     let run = super::stdio201::run_record(&root, &out);
     assert!(!journal_records_completion(&run));
