@@ -16823,7 +16823,13 @@ fn fix_196_writes(mode: &str, count: usize, size: usize, exits: usize) {
     .unwrap();
     let mut expected = b"BEGIN\n".to_vec();
     for i in 0..count {
-        expected.extend(std::iter::repeat_n(b'a' + (i % 26) as u8, size));
+        // Each side of the transition writes its own 80-record sequence.
+        let sequence = if matches!(mode, "fork" | "spawn" | "exec") {
+            i % 80
+        } else {
+            i
+        };
+        expected.extend(std::iter::repeat_n(b'a' + (sequence % 26) as u8, size));
     }
     expected.extend_from_slice(b"END\n");
     let (root, native) = slate_spawn_native(&spawn, mode);
@@ -16874,13 +16880,13 @@ fn fix_196_cumulative_payload_exceeds_replay_budget() {
 }
 #[test]
 fn fix_196_fork_inherits_descriptor_across_retirement() {
-    fix_196_writes("fork", 80, 6, 2);
+    fix_196_writes("fork", 160, 6, 2);
 }
 #[test]
 fn fix_196_spawn_inherits_descriptor_across_retirement() {
-    fix_196_writes("spawn", 80, 6, 2);
+    fix_196_writes("spawn", 160, 6, 2);
 }
 #[test]
 fn fix_196_exec_preserves_only_surviving_descriptors() {
-    fix_196_writes("exec", 80, 6, 1);
+    fix_196_writes("exec", 160, 6, 1);
 }

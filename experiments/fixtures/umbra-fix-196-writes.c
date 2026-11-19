@@ -49,6 +49,8 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "many")) result = records(fd, 400, 6);
     else if (!strcmp(argv[1], "payload")) result = records(fd, 8, 786432);
     else if (!strcmp(argv[1], "fork") || !strcmp(argv[1], "spawn")) {
+        result = records(fd, 80, 6);
+        if (result) return result;
         pid_t child;
         if (!strcmp(argv[1], "fork")) {
             child = fork();
@@ -71,6 +73,8 @@ int main(int argc, char **argv) {
         if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 29;
         result = 0;
     } else if (!strcmp(argv[1], "exec")) {
+        result = records(fd, 80, 6);
+        if (result) return result;
         int control = open(path, O_RDONLY | O_CLOEXEC);
         if (control < 0) return 30;
         char descriptor[16], closed[16];

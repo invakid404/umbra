@@ -460,6 +460,11 @@ receipts omitting that write; nonempty scopes naming the missing object refuse.
 The earlier matched COMMIT still proves the bytes durable. This receipt-evidence
 gap is characterized separately and is not repaired by replay retirement.
 
+The live fork, spawn and exec retirement cases write 80 six-byte records before
+and 80 after each boundary. Their witness for accumulation is the unchanged
+64-record budget, alongside exact bytes, completion and writer release. The
+exact one-entry high-water bound is asserted separately by provider tests.
+
 Namespace mutation — `Unlink`, `RemoveDirectory`, `Rename`, `Create` of a
 directory, `CreateParents`, `SetMetadata`, `Truncate` — was deferred while the
 frozen `transport::Nfs4Op` carried no argument variant for `REMOVE`, `RENAME`,
