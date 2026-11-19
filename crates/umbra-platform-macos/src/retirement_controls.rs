@@ -84,6 +84,7 @@ fn f284_sibling_window_stop_refuses_before_delivery() {
             gate: 0,
             kind: ReturnKind::Syscall,
             hardware: false,
+            creation: None,
         },
     );
     owned.0.sessions.push(session);
@@ -94,7 +95,7 @@ fn f284_sibling_window_stop_refuses_before_delivery() {
         .0
         .stop(0, format!("T1ethread:{:x};", stopped.0.native_id), false)
         .unwrap_err();
-    assert!(failure.message.contains("signal-during-return-window"));
+    assert!(failure.to_string().contains("signal-during-return-window"));
     assert!(owned.0.events.is_empty(), "no signal or syscall event");
     assert!(!owned.0.sessions[0].signals.pending());
     assert!(owned.0.sessions[0].pending.contains_key(&sibling));
