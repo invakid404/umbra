@@ -45,6 +45,8 @@ pub struct Rsp {
     /// Set once the owning session's ordered teardown has killed and reaped
     /// the tracer, so `Drop` does not do it a second time.
     torn_down: bool,
+    #[cfg(feature = "signal-witness")]
+    signal_fault_fired: bool,
 }
 
 #[cfg(test)]
@@ -251,6 +253,8 @@ impl Rsp {
             deadline,
             setup_deadline: Some(limit),
             torn_down: false,
+            #[cfg(feature = "signal-witness")]
+            signal_fault_fired: false,
         };
         r.write_packet(b"+", r.limit(Duration::from_secs(2)))?;
         r.ok("QStartNoAckMode")?;
@@ -270,6 +274,20 @@ impl Rsp {
         Ok(r)
     }
     fn write_packet(&mut self, bytes: &[u8], limit: Instant) -> Result<()> {
+        #[cfg(feature = "signal-witness")]
+        if !self.signal_fault_fired
+            && bytes.starts_with(b"$vCont;C")
+            && std::env::var("UMBRA_FIX284_SEND_ERROR").ok().as_deref() == Some("completed")
+        {
+            // The live pairing deliberately makes transport success uncertain:
+            // the owned debugger receives the packet, but its caller gets an
+            // error. No normal build consults this test-only switch.
+            self.signal_fault_fired = true;
+            self.stream
+                .write_all(bytes)
+                .map_err(|e| error("rsp write", e))?;
+            return Err(error("rsp write", "f284 possibly completed signal send"));
+        }
         #[cfg(test)]
         if bytes.starts_with(b"$vCont;C") {
             SIGNAL_WRITE_ATTEMPTS.with(|count| count.set(count.get() + 1));
@@ -560,6 +578,8 @@ impl Rsp {
                 deadline: None,
                 setup_deadline: None,
                 torn_down: false,
+                #[cfg(feature = "signal-witness")]
+                signal_fault_fired: false,
             },
             peer,
         )

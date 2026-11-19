@@ -78,6 +78,31 @@ static void handled(int signo) {
 
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
+    if (!strcmp(argv[1], "transport-tree")) {
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = handled;
+        if (sigaction(SIGUSR1, &action, NULL)) return 111;
+        int ready[2];
+        if (pipe(ready)) return 112;
+        pid_t child = fork();
+        if (child < 0) return 113;
+        if (!child) {
+            close(ready[0]);
+            if (write(ready[1], "r", 1) != 1) _exit(114);
+            for (;;) __asm__ volatile("yield");
+        }
+        close(ready[1]);
+        char byte;
+        if (read(ready[0], &byte, 1) != 1 || byte != 'r') return 115;
+        close(ready[0]);
+        printf("tree root=%d child=%d\n", getpid(), child);
+        fflush(stdout);
+        if (kill(getpid(), SIGUSR1)) return 116;
+        int status;
+        return waitpid(child, &status, 0) == child ? 117 : 118;
+    }
     if (!strcmp(argv[1], "directed")) {
         struct sigaction action;
         memset(&action, 0, sizeof(action));

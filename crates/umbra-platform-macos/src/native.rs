@@ -884,8 +884,6 @@ impl Session {
             },
         )
     }
-    /// Resume every thread. The unqualified resume, for when no return window
-    /// is open and the whole process may run.
     #[cfg(feature = "signal-witness")]
     fn signal_probe(&mut self, phase: &str) -> Result<bool> {
         if self.signal_probe_fired
@@ -916,6 +914,7 @@ impl Session {
         }
         Ok(true)
     }
+    /// Resume every thread when no return window is open.
     fn continue_run(&mut self) -> Result<()> {
         self.rsp.send("c")?;
         self.stopped = false;
@@ -4059,6 +4058,14 @@ impl TeardownReport {
 /// `UMBRA_RSP_LOG`, so routine runs keep their stderr exact. Timeout warnings
 /// are not opt-in: [`Session::ordered_teardown`] always writes them.
 fn log_teardown(report: &TeardownReport) {
+    #[cfg(feature = "shutdown-witness")]
+    umbra_platform::shutdown::witness(serde_json::json!({
+        "event": "teardown-report",
+        "pid": report.pid,
+        "tracer": report.tracer,
+        "unconfirmed": report.unconfirmed,
+        "steps": format!("{:?}", report.steps),
+    }));
     if std::env::var_os("UMBRA_TEARDOWN_LOG").is_some() {
         eprintln!("umbra-platform-macos: teardown {report:?}");
     }

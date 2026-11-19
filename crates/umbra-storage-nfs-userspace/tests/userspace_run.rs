@@ -8385,8 +8385,14 @@ fn slate_launch(
         .unwrap();
     };
     let ledgered = watch.is_some_and(|w| w.ledger);
+    // The #284 command's pre_exec creates and verifies a fresh session.
+    // Making it a group leader first would make that setsid fail with EPERM.
+    if !command.get_envs().any(|(key, value)| {
+        key == "UMBRA_F284_OWN_SESSION" && value == Some(std::ffi::OsStr::new("1"))
+    }) {
+        command.process_group(0);
+    }
     command
-        .process_group(0)
         .stdin(if ledgered {
             Stdio::piped()
         } else {

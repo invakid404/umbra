@@ -34,6 +34,63 @@ fn command(root: &Path, target: &(String, u16), native: bool, mode: &str) -> Com
 }
 
 #[test]
+fn f284_send_error_reaps_owned_tree() {
+    let Some(target) = fixture() else { return };
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("send-error");
+    let mut cmd = command(&root, &target, false, "transport-tree");
+    let witness = root.join("shutdown.jsonl");
+    cmd.env("UMBRA_F284_OWN_SESSION", "1")
+        .env("UMBRA_FIX284_SEND_ERROR", "completed")
+        .env("UMBRA_FIX_271_EVIDENCE_FILE", &witness);
+    let captured = slate_bounded(&mut cmd, &root.join("owned-tree"));
+    let out = std::process::Output {
+        status: captured.status.0.expect("known CLI terminal status"),
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+    };
+    eprintln!(
+        "send-error stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("f284 possibly completed signal send"));
+    let ids = String::from_utf8(out.stdout.clone()).unwrap();
+    let mut ids = ids
+        .trim()
+        .strip_prefix("tree root=")
+        .unwrap()
+        .split(" child=");
+    let parent: u64 = ids.next().unwrap().parse().unwrap();
+    let child: u64 = ids.next().unwrap().parse().unwrap();
+    assert_ne!(parent, child);
+    assert!(ids.next().is_none());
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&witness)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let reports: Vec<_> = records
+        .iter()
+        .filter(|record| record["event"] == "teardown-report")
+        .collect();
+    let child_index = reports.iter().position(|r| r["pid"] == child).unwrap();
+    let parent_index = reports.iter().position(|r| r["pid"] == parent).unwrap();
+    assert!(child_index < parent_index, "child-before-parent teardown");
+    for index in [child_index, parent_index] {
+        let report = reports[index];
+        assert_eq!(report["unconfirmed"], false);
+        let steps = report["steps"].as_str().unwrap();
+        assert!(steps.contains("Confirmed("), "{steps}");
+        assert!(steps.contains("TracerReaped(true)"), "{steps}");
+    }
+    let run = super::stdio201::run_record(&root, &out);
+    assert!(!journal_records_completion(&run));
+    slate_finish_cleanup();
+}
+
+#[test]
 fn f284_initial_sigpipe_default() {
     let Some(target) = fixture() else { return };
     let scratch = tempfile::tempdir().unwrap();
@@ -294,17 +351,26 @@ fn f284_return_window_rate() {
             assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
             let out = child.wait_with_output().unwrap();
             let stderr = String::from_utf8_lossy(&out.stderr);
+            let named_refusal = [
+                "signal-during-return-window",
+                "signal-at-syscall-entry",
+                "signal-exec-transition",
+                "signal-during-internal-operation",
+                "signal-during-teardown",
+                "ambiguous-interrupt-signal",
+                "signal-stop-identity",
+                "signal-delivery-closed",
+            ]
+            .into_iter()
+            .find(|name| stderr.contains(name));
             let outcome = if out.status.success() && out.stdout == b"delivered=1\n" {
                 if !native {
                     delivered += 1;
                 }
                 "delivered"
-            } else if !native
-                && out.status.code() == Some(1)
-                && stderr.contains("signal-during-return-window")
-            {
+            } else if !native && out.status.code() == Some(1) && named_refusal.is_some() {
                 refused += 1;
-                "signal-during-return-window"
+                named_refusal.unwrap()
             } else {
                 if !native {
                     non_signal_failures += 1;
