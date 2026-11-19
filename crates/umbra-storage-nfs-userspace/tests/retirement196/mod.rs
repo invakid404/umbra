@@ -611,3 +611,54 @@ fn fix_196_new_provider_resume_preserves_journal_and_epoch_refusals() {
     );
     next.close_run().unwrap();
 }
+
+#[test]
+fn fix_196_absent_retry_discharges_obligation_before_failed_maintenance() {
+    let (mut storage, run, observed) = provider();
+    observed.lock().unwrap().fail_retire = true;
+    let a = write(&storage, run, 0, 6);
+    let answer = storage.execute(&a).unwrap();
+    let b = write(&storage, run, 1, 6);
+    let before = retry_records(storage.transport().unwrap(), run);
+    storage
+        .transport()
+        .unwrap()
+        .install_faults(ScriptedFault::once(
+            FaultPoint::OnDeadline,
+            None,
+            FaultAction::DropReply,
+        ));
+    assert_eq!(
+        storage.execute(&b).unwrap_err().kind,
+        ErrorKind::StorageUnavailable
+    );
+    assert_eq!(retry_records(storage.transport().unwrap(), run), before);
+    let flush = umbra_core::FlushRequest {
+        context: authorised(&storage, run, "cr3-flush"),
+        scope: umbra_core::FlushScope::EntireRun,
+    };
+    assert!(
+        storage.flush(&flush).is_err(),
+        "B initially remains unresolved"
+    );
+    assert_eq!(
+        storage.execute(&b).unwrap_err().operation,
+        "replay-maintenance"
+    );
+    assert_eq!(
+        retry_records(storage.transport().unwrap(), run),
+        before,
+        "B must remain before intent while A cleanup fails"
+    );
+    assert_eq!(observed.lock().unwrap().records, 1);
+    let receipt = storage
+        .flush(&flush)
+        .expect("absence resolves B despite A maintenance");
+    let evidence = String::from_utf8(receipt.evidence).unwrap();
+    assert!(evidence.contains("committed_writes=1"), "{evidence}");
+    assert!(evidence.contains("committed_bytes=6"), "{evidence}");
+    assert_eq!(storage.execute(&a).unwrap(), answer);
+    storage
+        .close_run()
+        .expect("proven absence must not hold writer release");
+}
