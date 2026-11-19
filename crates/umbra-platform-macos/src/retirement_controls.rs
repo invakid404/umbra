@@ -106,6 +106,49 @@ fn f284_sibling_window_stop_refuses_before_delivery() {
     assert!(sent.starts_with("$g;thread:"));
     assert_eq!(sent.matches('$').count(), 1, "no resume or syscall packet");
 }
+
+#[test]
+fn f284_backend_rejects_duplicate_and_cross_exec_tokens() {
+    let mut owned = SelfTaskBackend(MacosTraceBackend::default());
+    let (session, mut peer) = slot(100, false);
+    let task = session.id;
+    let thread = session.thread;
+    owned.0.sessions.push(session);
+    let token = owned.0.sessions[0]
+        .signals
+        .issue(task, thread, 0, 30)
+        .unwrap();
+    let command = || ResumeCommand {
+        thread,
+        mode: ResumeMode::Signal(token),
+        signal: Some(30),
+    };
+    owned.0.resume(command()).unwrap();
+    // Model the next externally stopped state, preserving the consumed token.
+    owned.0.sessions[0].stopped = true;
+    assert!(owned.0.resume(command()).is_err());
+    let stale = owned.0.sessions[0]
+        .signals
+        .issue(task, thread, 0, 30)
+        .unwrap();
+    // Deliberately leave authority present: this isolates the generation
+    // comparison from the separate invalidation at an exec notification.
+    owned.0.sessions[0].exec_generation = 1;
+    assert!(owned
+        .0
+        .resume(ResumeCommand {
+            thread,
+            mode: ResumeMode::Signal(stale),
+            signal: Some(30),
+        })
+        .is_err());
+    peer.set_nonblocking(true).unwrap();
+    let mut bytes = [0; 1024];
+    let count = peer.read(&mut bytes).unwrap();
+    let sent = std::str::from_utf8(&bytes[..count]).unwrap();
+    assert!(sent.starts_with("$vCont;C1e:64;c#"));
+    assert_eq!(sent.matches('$').count(), 1, "exactly one delivery packet");
+}
 // Controlled slots hold send rights to this test process. Clear the registry
 // and mark sessions done before backend Drop, including assertion unwinding.
 struct SelfTaskBackend(MacosTraceBackend);
