@@ -725,6 +725,8 @@ mod poll_bound_tests {
             deadline: Some(crate::clock::now() + Duration::from_secs(2)),
             setup_deadline: None,
             torn_down: true,
+            #[cfg(feature = "signal-witness")]
+            signal_fault_fired: false,
         };
         peer.write_all(b"$T05thread:").unwrap();
         assert_eq!(rsp.poll(Duration::from_millis(2)).unwrap(), None);
@@ -777,6 +779,8 @@ mod early_packet_test {
             deadline: None,
             setup_deadline: None,
             torn_down: true,
+            #[cfg(feature = "signal-witness")]
+            signal_fault_fired: false,
         };
         peer.write_all(b"$T05thread:1;#00").unwrap();
         EARLY_PACKET.with(|v| v.set(true));
