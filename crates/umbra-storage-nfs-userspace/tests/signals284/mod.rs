@@ -19,13 +19,36 @@ fn command(root: &Path, target: &(String, u16), native: bool, mode: &str) -> Com
         "umbra-fix-284-signals",
         "UMBRA_F284_SIGNALS",
     );
+    let immediate_delivery = !matches!(mode, "pending-exec" | "ignore-exec");
     // Match a shell's default SIGPIPE, and avoid the runner's SID-1 lifecycle.
     unsafe {
-        c.pre_exec(|| {
+        c.pre_exec(move || {
             if libc::setsid() < 0 || libc::getsid(0) == 1 {
                 return Err(std::io::Error::last_os_error());
             }
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            // Runner masks must not stall immediate delivery. The inheritance
+            // controls retain their original setup and establish their own masks.
+            if immediate_delivery {
+                let mut delivered = std::mem::zeroed();
+                if libc::sigemptyset(&mut delivered) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for signal in [
+                    libc::SIGPIPE,
+                    libc::SIGTERM,
+                    libc::SIGUSR1,
+                    libc::SIGUSR2,
+                    libc::SIGALRM,
+                ] {
+                    if libc::sigaddset(&mut delivered, signal) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if libc::sigprocmask(libc::SIG_UNBLOCK, &delivered, std::ptr::null_mut()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
     }
