@@ -63,6 +63,48 @@ fn register(backend: &mut MacosTraceBackend, s: Session) {
     backend.watchdog.as_ref().unwrap().add(s.task.clone());
     backend.sessions.push(s);
 }
+
+#[test]
+fn f284_sibling_window_stop_refuses_before_delivery() {
+    use std::io::Write;
+    let mut owned = SelfTaskBackend(MacosTraceBackend::default());
+    let (mut session, mut peer) = slot(100, false);
+    let stopped = session.thread;
+    let sibling = tid(stopped.0.native_id + 1, stopped.0.generation);
+    assert_ne!(stopped, sibling);
+    session.pending.insert(
+        sibling,
+        Pending {
+            thread: sibling,
+            entry: 0,
+            entry_breakpoint: Breakpoint {
+                original: [0; 4],
+                raw: false,
+            },
+            gate: 0,
+            kind: ReturnKind::Syscall,
+            hardware: false,
+        },
+    );
+    owned.0.sessions.push(session);
+    // Controlled register reply: the stop PC is zero and belongs to no
+    // pending window on this thread. Only the sibling owns the window.
+    peer.write_all(b"$00#60").unwrap();
+    let failure = owned
+        .0
+        .stop(0, format!("T1ethread:{:x};", stopped.0.native_id), false)
+        .unwrap_err();
+    assert!(failure.message.contains("signal-during-return-window"));
+    assert!(owned.0.events.is_empty(), "no signal or syscall event");
+    assert!(!owned.0.sessions[0].signals.pending());
+    assert!(owned.0.sessions[0].pending.contains_key(&sibling));
+    peer.set_nonblocking(true).unwrap();
+    let mut sent = [0; 1024];
+    let count = peer.read(&mut sent).unwrap();
+    let sent = std::str::from_utf8(&sent[..count]).unwrap();
+    assert!(sent.starts_with("$g;thread:"));
+    assert_eq!(sent.matches('$').count(), 1, "no resume or syscall packet");
+}
 // Controlled slots hold send rights to this test process. Clear the registry
 // and mark sessions done before backend Drop, including assertion unwinding.
 struct SelfTaskBackend(MacosTraceBackend);
