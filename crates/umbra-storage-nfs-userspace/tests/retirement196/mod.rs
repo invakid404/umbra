@@ -199,3 +199,233 @@ fn fix_196_failed_retirement_keeps_success_and_retries_the_same_key() {
     storage.execute(&fresh).unwrap();
     assert_eq!(observed.lock().unwrap().records, 0);
 }
+
+/// Lose a successful retry-record WRITE reply after the server stored it.
+/// Decode the exact journal tuple, so payload data cannot select the fault.
+struct LoseSettlement {
+    inner: FakeTransport,
+    armed: Arc<Mutex<bool>>,
+}
+impl RawTransport for LoseSettlement {
+    fn wire_profile(&self) -> WireProfile {
+        self.inner.wire_profile()
+    }
+    fn limits(&self) -> TransportLimits {
+        self.inner.limits()
+    }
+    fn connection(&self) -> ConnectionState {
+        self.inner.connection()
+    }
+    fn submit(&mut self, call: Compound, deadline: Deadline) -> TransportResult<CompoundReply> {
+        let selected = call.ops.iter().any(|op| {
+            let Nfs4Op::Write { data, .. } = op else {
+                return false;
+            };
+            let record = serde_json::from_slice::<(
+                StorageRequest,
+                Option<umbra_core::Result<umbra_core::StorageResponse>>,
+            )>(data);
+            matches!(
+                record,
+                Ok((
+                    StorageRequest {
+                        operation: StorageOperation::WriteAt { .. },
+                        ..
+                    },
+                    Some(Ok(_))
+                ))
+            )
+        });
+        let result = self.inner.submit(call, deadline);
+        let mut armed = self.armed.lock().unwrap();
+        if selected && *armed && result.is_ok() {
+            *armed = false;
+            return Err(
+                umbra_storage_nfs_userspace::error::TransportError::Disconnected {
+                    epoch: ConnectionEpoch(1),
+                    detail: "simulated settlement reply loss".into(),
+                },
+            );
+        }
+        result
+    }
+    fn cancel(&mut self, token: CallToken) -> TransportResult<Retirement> {
+        self.inner.cancel(token)
+    }
+    fn reconnect(&mut self) -> TransportResult<ConnectionEpoch> {
+        self.inner.reconnect()
+    }
+    fn install_faults(&mut self, plan: Box<dyn FaultPlan>) {
+        self.inner.install_faults(plan)
+    }
+}
+
+#[test]
+fn fix_196_interrupted_settlement_retains_bytes_and_characterizes_294() {
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let armed = Arc::new(Mutex::new(false));
+    let mut storage = NfsUserspaceStorage::with_facades(
+        config(),
+        Box::new(LoseSettlement {
+            inner: fake_server(),
+            armed: armed.clone(),
+        }),
+        Box::new(Watching {
+            inner: FakeReplayLog::default(),
+            observed: observed.clone(),
+        }),
+    )
+    .unwrap();
+    let run = fresh_run();
+    storage.open_run(&create_run(run)).unwrap();
+    storage
+        .execute(&create_file(authorised(&storage, run, "create"), b"out"))
+        .unwrap();
+    let request = write(&storage, run, 0, 6);
+    *armed.lock().unwrap() = true;
+    assert_eq!(
+        storage.execute(&request).unwrap_err().kind,
+        ErrorKind::StorageUnavailable
+    );
+    assert!(!*armed.lock().unwrap(), "fault must fire");
+    assert_eq!(observed.lock().unwrap().records, 1);
+    assert_eq!(observed.lock().unwrap().bytes, 6);
+    let flush = umbra_core::FlushRequest {
+        context: authorised(&storage, run, "flush"),
+        scope: umbra_core::FlushScope::EntireRun,
+    };
+    assert!(storage.flush(&flush).is_err());
+    let answer = storage.execute(&request).unwrap();
+    assert_eq!(answer, umbra_core::StorageResponse::WriteAt(6));
+    assert_eq!(storage.execute(&request).unwrap(), answer);
+    let read = storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run, "readback"),
+            operation: StorageOperation::ReadAt {
+                path: path(b"out"),
+                offset: 0,
+                len: 6,
+            },
+        })
+        .unwrap();
+    assert_eq!(read, umbra_core::StorageResponse::ReadAt(vec![42; 6]));
+    let stat = storage
+        .execute(&StorageRequest {
+            context: authorised(&storage, run, "stat"),
+            operation: StorageOperation::Stat { path: path(b"out") },
+        })
+        .unwrap();
+    let umbra_core::StorageResponse::Stat(stat) = stat else {
+        panic!("stat response");
+    };
+    for scope in [
+        umbra_core::FlushScope::Data {
+            objects: vec![stat.object_id],
+        },
+        umbra_core::FlushScope::DataAndMetadata {
+            objects: vec![stat.object_id],
+        },
+    ] {
+        let error = storage
+            .flush(&umbra_core::FlushRequest {
+                scope,
+                ..flush.clone()
+            })
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::StorageUnavailable);
+    }
+    for scope in [
+        umbra_core::FlushScope::Data { objects: vec![] },
+        umbra_core::FlushScope::DataAndMetadata { objects: vec![] },
+    ] {
+        let receipt = storage
+            .flush(&umbra_core::FlushRequest {
+                scope: scope.clone(),
+                ..flush.clone()
+            })
+            .unwrap();
+        assert_eq!(receipt.scope, scope);
+    }
+    assert_eq!(observed.lock().unwrap().retire_calls, 0);
+    let receipt = storage.flush(&flush).unwrap();
+    let evidence = String::from_utf8(receipt.evidence).unwrap();
+    assert!(evidence.contains("committed_writes=0"), "#294: {evidence}");
+    assert!(evidence.contains("committed_bytes=0"), "#294: {evidence}");
+    assert_eq!(observed.lock().unwrap().records, 1);
+    storage.close_run().unwrap();
+    assert_eq!(
+        observed.lock().unwrap().records,
+        1,
+        "close is not cache replacement"
+    );
+}
+
+#[test]
+fn fix_196_verifier_change_retains_payload_and_writer() {
+    #[derive(Default)]
+    struct Rotate(u8);
+    impl FaultPlan for Rotate {
+        fn decide(
+            &mut self,
+            point: FaultPoint,
+            _: umbra_storage_nfs_userspace::transport::FaultContext,
+        ) -> FaultAction {
+            if point != FaultPoint::BeforeReturn {
+                return FaultAction::Proceed;
+            }
+            self.0 = self.0.wrapping_add(1);
+            FaultAction::RotateVerifier(WriteVerifier([self.0; 8]))
+        }
+    }
+    let (mut storage, run, observed) = provider();
+    storage
+        .transport()
+        .unwrap()
+        .install_faults(Box::new(Rotate::default()));
+    assert!(storage.execute(&write(&storage, run, 0, 6)).is_err());
+    let o = observed.lock().unwrap();
+    assert_eq!(o.records, 1);
+    assert_eq!(o.bytes, 6);
+    assert_eq!(o.retire_calls, 0);
+    drop(o);
+    assert!(storage.close_run().is_err());
+}
+
+#[test]
+fn fix_196_retired_write_retry_ignores_changed_target_and_rejects_identity_reuse() {
+    let (mut storage, run, observed) = provider();
+    let request = write(&storage, run, 0, 6);
+    let answer = storage.execute(&request).unwrap();
+    assert_eq!(observed.lock().unwrap().records, 0);
+    // Replace contents under a different operation identity.
+    let mut change = write(&storage, run, 0, 3);
+    change.context = authorised(&storage, run, "external-change");
+    if let StorageOperation::WriteAt { bytes, .. } = &mut change.operation {
+        *bytes = vec![17; 3];
+    }
+    storage.execute(&change).unwrap();
+    let calls = observed.lock().unwrap().retire_calls;
+    assert_eq!(storage.execute(&request).unwrap(), answer);
+    assert_eq!(observed.lock().unwrap().retire_calls, calls);
+    assert_eq!(
+        storage
+            .execute(&StorageRequest {
+                context: authorised(&storage, run, "read-changed"),
+                operation: StorageOperation::ReadAt {
+                    path: path(b"out"),
+                    offset: 0,
+                    len: 6
+                },
+            })
+            .unwrap(),
+        umbra_core::StorageResponse::ReadAt(vec![17, 17, 17, 42, 42, 42])
+    );
+    let mut collision = request.clone();
+    collision.context.idempotency_key = IdempotencyKey("other-key".into());
+    assert!(storage.execute(&collision).is_err());
+    let mut changed_request = request.clone();
+    if let StorageOperation::WriteAt { offset, .. } = &mut changed_request.operation {
+        *offset = 1;
+    }
+    assert!(storage.execute(&changed_request).is_err());
+}
