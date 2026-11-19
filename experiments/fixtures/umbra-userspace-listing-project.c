@@ -80,20 +80,11 @@
 // record of the same name length, and that branch of the encoder is otherwise
 // unexercised end to end.
 //
-// **The output is buffered, and that is a measured requirement rather than a
-// tidiness.** The control emits one `write` per name, which is fine for three
-// names. Measured here, at 239 entries over two passes: a run that issues one
-// routed `write` per name dies partway through the second pass with
-// `StorageUnavailable during execute.write_at: replay: replay buffer
-// exhausted: 64 records`. The in-process replay ledger a live provider binds
-// (`crates/umbra-storage-nfs-userspace/src/fake.rs`, `max_records: 64`) admits
-// an intent per mutation and applies backpressure before dispatch; records are
-// retired explicitly, not as a side effect of settling, so 482 distinct writes
-// in one session exhaust the budget. Nothing in the shipped suite had ever
-// approached it, because the control makes three.
-//
-// So lines accumulate in a buffer and are flushed once per pass -- two writes
-// instead of 482, and the same bytes in the same order. The flush loops on
+// **The output is buffered.** Lines accumulate and flush once per pass,
+// preserving the listing oracle and keeping this fixture focused on traversal.
+// Successful provider writes now retire their transient replay entries after
+// durability and durable retry settlement; umbra-fix-196-writes.c exercises
+// the unbatched path beyond the replay capacity. The flush loops on
 // partial writes rather than treating a short one as failure, because a routed
 // transfer is allowed to be short (this is the behaviour
 // `a_routed_transfer_past_the_backend_bound_is_short_rather_than_fatal`
@@ -240,8 +231,8 @@ static int enumerate(int out, char *dir) {
         return 7;
     }
     fts_close(tree);
-    // One routed write per pass. See the header: one per *name* exhausts the
-    // provider's 64-record replay budget partway through pass 2.
+    // One routed write per pass keeps this listing fixture focused on
+    // traversal and record encoding; the many-writes fixture covers write volume.
     if (flush_buffer(out) != 0) {
         fprintf(stderr, "flush: %s (errno=%d)\n", strerror(errno), errno);
         return 6;

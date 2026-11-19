@@ -12,6 +12,7 @@ struct Observed {
     high_bytes: usize,
     retire_calls: usize,
     fail_retire: bool,
+    fail_after_remove: bool,
 }
 struct Watching {
     inner: FakeReplayLog,
@@ -45,9 +46,13 @@ impl ReplayLog for Watching {
         if o.fail_retire {
             return Err(ReplayError::Indeterminate);
         }
+        let fail_after_remove = o.fail_after_remove;
         drop(o);
         let r = self.inner.retire(k);
         self.sample();
+        if fail_after_remove {
+            return Err(ReplayError::Indeterminate);
+        }
         r
     }
     fn pressure(&self) -> Backpressure {
@@ -59,6 +64,61 @@ impl ReplayLog for Watching {
     fn check_commit_verifier(&self, k: &IdempotencyKey, v: WriteVerifier) -> VerifierMatch {
         self.inner.check_commit_verifier(k, v)
     }
+}
+
+#[test]
+fn fix_196_retirement_error_after_removal_still_blocks_fresh_intent() {
+    let (mut storage, run, observed) = provider();
+    observed.lock().unwrap().fail_after_remove = true;
+    let request = write(&storage, run, 0, 6);
+    let answer = storage.execute(&request).unwrap();
+    assert_eq!(observed.lock().unwrap().records, 0);
+    assert_eq!(storage.execute(&request).unwrap(), answer);
+    let before = retry_records(storage.transport().unwrap(), run);
+    let error = storage.execute(&write(&storage, run, 1, 6)).unwrap_err();
+    assert_eq!(error.operation, "replay-maintenance");
+    assert_eq!(retry_records(storage.transport().unwrap(), run), before);
+    assert_eq!(observed.lock().unwrap().retire_calls, 3);
+    // Maintenance has no outstanding server I/O and cannot hold the writer.
+    storage.close_run().unwrap();
+}
+
+#[test]
+fn fix_196_clean_close_open_has_no_retained_successes() {
+    let (mut storage, run, observed) = provider();
+    storage.execute(&write(&storage, run, 0, 6)).unwrap();
+    storage.close_run().unwrap();
+    assert_eq!(observed.lock().unwrap().records, 0);
+    let next = fresh_run();
+    storage.open_run(&create_run(next)).unwrap();
+    storage
+        .execute(&create_file(authorised(&storage, next, "create"), b"out"))
+        .unwrap();
+    storage.execute(&write(&storage, next, 0, 6)).unwrap();
+    assert_eq!(observed.lock().unwrap().records, 0);
+    assert_eq!(observed.lock().unwrap().retire_calls, 2);
+    storage.close_run().unwrap();
+}
+
+#[test]
+fn fix_196_old_run_maintenance_precedes_new_run_coincident_key() {
+    let (mut storage, run, observed) = provider();
+    observed.lock().unwrap().fail_retire = true;
+    storage.execute(&write(&storage, run, 0, 6)).unwrap();
+    storage.close_run().unwrap();
+    let next = fresh_run();
+    storage.open_run(&create_run(next)).unwrap();
+    let before = retry_records(storage.transport().unwrap(), next);
+    assert!(storage.execute(&write(&storage, next, 0, 6)).is_err());
+    assert_eq!(retry_records(storage.transport().unwrap(), next), before);
+    assert_eq!(observed.lock().unwrap().records, 1);
+    observed.lock().unwrap().fail_retire = false;
+    storage
+        .execute(&create_file(authorised(&storage, next, "create"), b"out"))
+        .unwrap();
+    storage.execute(&write(&storage, next, 0, 6)).unwrap();
+    assert_eq!(observed.lock().unwrap().records, 0);
+    storage.close_run().unwrap();
 }
 fn provider() -> (NfsUserspaceStorage, RunId, Arc<Mutex<Observed>>) {
     let observed = Arc::new(Mutex::new(Observed::default()));
