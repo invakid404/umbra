@@ -71,8 +71,8 @@ int main(int argc, char **argv) {
         if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 29;
         result = 0;
     } else if (!strcmp(argv[1], "exec")) {
-        int control = dup(fd);
-        if (control < 0 || fcntl(control, F_SETFD, FD_CLOEXEC)) return 30;
+        int control = open(path, O_RDONLY | O_CLOEXEC);
+        if (control < 0) return 30;
         char descriptor[16], closed[16];
         snprintf(descriptor, sizeof descriptor, "%d", fd);
         snprintf(closed, sizeof closed, "%d", control);
