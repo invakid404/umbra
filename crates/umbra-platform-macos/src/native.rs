@@ -1716,8 +1716,36 @@ impl Session {
 /// The address of the `svc` each [`abi::TRACED_STUBS`] row breakpoints, read
 /// from this process's own copy of libsystem_kernel (the shared cache is
 /// system-wide on this native host, so the address is the tracee's too).
+///
+/// A row with [`abi::TRACED_STUB_ALIASES`] resolves every candidate name whose
+/// scan verifies and breakpoints each; it fails only if none verifies, and
+/// then reports every candidate's failure.
 fn traced_stub_sites(name: &str, number: u64) -> Result<Vec<u64>> {
-    traced_stub_site(name, number).map(|site| vec![site])
+    let aliases = abi::TRACED_STUB_ALIASES
+        .iter()
+        .filter(|(row, _)| *row == name)
+        .map(|(_, alias)| *alias);
+    let mut sites = Vec::new();
+    let mut failures = Vec::new();
+    for candidate in std::iter::once(name).chain(aliases) {
+        match traced_stub_site(candidate, number) {
+            Ok(site) if !sites.contains(&site) => sites.push(site),
+            Ok(_) => {}
+            Err(e) => failures.push(e),
+        }
+    }
+    match (sites.is_empty(), failures.len()) {
+        (false, _) => Ok(sites),
+        (true, 1) => Err(failures.remove(0)),
+        (true, _) => Err(error(
+            "symbol",
+            failures
+                .iter()
+                .map(|e| e.context.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )),
+    }
 }
 
 /// Scan one symbol for its `svc` and verify the syscall number it issues.
