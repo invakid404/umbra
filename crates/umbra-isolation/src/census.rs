@@ -1,7 +1,9 @@
 //! The macOS [`Host`] for the session sweep: process census, kernel-backed
 //! identity, and signal by audit token (#193 design R-8, T1 §3).
 
-use crate::sweep::{token_pid, token_version, Claimant, Host, Member, Signalled, Token};
+use crate::sweep::{
+    token_pid, token_version, Claimant, Host, Member, Signalled, Token, ZombieCheck,
+};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -120,6 +122,45 @@ fn bsd_info(pid: i32, zombie: bool) -> Option<libc::proc_bsdinfo> {
         )
     };
     (n == size).then_some(info)
+}
+
+/// [`bsd_info`], with the lookup's errno when it fails (0 for a short read).
+fn bsd_info_or_errno(pid: i32, zombie: bool) -> std::result::Result<libc::proc_bsdinfo, i32> {
+    // SAFETY: proc_bsdinfo is plain old data.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a proc_bsdinfo of `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            u64::from(zombie),
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if n == size {
+        return Ok(info);
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    Err(if n <= 0 { errno } else { 0 })
+}
+
+/// The final check of one seen member (#205) from its BSD lookup (status,
+/// parent pid, start; or the lookup's errno) and its recorded start.
+fn zombie_check(
+    found: std::result::Result<(u32, u32, (u64, u64)), i32>,
+    start: Option<(u64, u64)>,
+) -> ZombieCheck {
+    let Some(start) = start else {
+        return ZombieCheck::Clear;
+    };
+    match found {
+        Ok((status, ppid, birth)) if status == libc::SZOMB && ppid == 1 && birth == start => {
+            ZombieCheck::Zombie
+        }
+        Ok(_) | Err(_) => ZombieCheck::Clear,
+    }
 }
 
 /// Whether `pid`'s image is a debugger process (`debugserver`), for waiting
@@ -325,21 +366,57 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
         }
         signal_token(&token, libc::SIGKILL)
     }
-    fn launchd_zombie(&mut self, token: &Token) -> bool {
+    fn launchd_zombie(&mut self, token: &Token) -> ZombieCheck {
         let pid = token_pid(token);
-        let Some(start) = self.starts.get(&(pid, token_version(token))).copied() else {
-            return false;
-        };
-        bsd_info(pid, true).is_some_and(|info| {
-            info.pbi_status == libc::SZOMB
-                && info.pbi_ppid == 1
-                && (info.pbi_start_tvsec, info.pbi_start_tvusec) == start
-        })
+        let start = self.starts.get(&(pid, token_version(token))).copied();
+        let found = bsd_info_or_errno(pid, true).map(|info| {
+            (
+                info.pbi_status,
+                info.pbi_ppid,
+                (info.pbi_start_tvsec, info.pbi_start_tvusec),
+            )
+        });
+        zombie_check(found, start)
     }
     fn now(&self) -> Instant {
         Instant::now()
     }
     fn pause(&mut self) {
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #205 (CR-20): only a lookup that proves the member gone (ESRCH), or a
+    /// readable record that is not a zombie of its start under launchd, is
+    /// clear. Any other failed lookup, or a member with no recorded start, is
+    /// unreadable, never clear.
+    #[test]
+    fn a_failed_zombie_lookup_is_unreadable_unless_gone() {
+        let start = Some((100, 7));
+        let zombie = Ok((libc::SZOMB, 1, (100, 7)));
+        assert_eq!(zombie_check(zombie, start), ZombieCheck::Zombie);
+        assert_eq!(
+            zombie_check(Ok((libc::SZOMB, 1, (101, 0))), start),
+            ZombieCheck::Clear
+        );
+        assert_eq!(
+            zombie_check(Ok((libc::SZOMB, 42, (100, 7))), start),
+            ZombieCheck::Clear
+        );
+        assert_eq!(
+            zombie_check(Ok((2, 1, (100, 7))), start),
+            ZombieCheck::Clear
+        );
+        assert_eq!(zombie_check(Err(libc::ESRCH), start), ZombieCheck::Clear);
+        assert_eq!(
+            zombie_check(Err(libc::EPERM), start),
+            ZombieCheck::Unreadable
+        );
+        assert_eq!(zombie_check(Err(0), start), ZombieCheck::Unreadable);
+        assert_eq!(zombie_check(zombie, None), ZombieCheck::Unreadable);
     }
 }

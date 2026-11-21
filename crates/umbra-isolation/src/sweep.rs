@@ -90,8 +90,8 @@ pub trait Host {
     /// no ownership proof it signals nothing and answers `Stale`.
     fn end_supervisor(&mut self, pid: i32, sid: i32) -> Signalled;
     /// Whether the instance `token` names is now a zombie under launchd, which
-    /// nobody will collect (#205).
-    fn launchd_zombie(&mut self, token: &Token) -> bool;
+    /// nobody will collect (#205), or whether that could not be read.
+    fn launchd_zombie(&mut self, token: &Token) -> ZombieCheck;
     /// The monotonic clock.
     fn now(&self) -> Instant;
     /// Wait between passes.
@@ -294,7 +294,7 @@ pub fn end_run(
     outcome.drain_exceeded = drain_exceeded;
     let mut zombies: Vec<i32> = seen
         .iter()
-        .filter(|t| host.launchd_zombie(t))
+        .filter(|t| host.launchd_zombie(t) == ZombieCheck::Zombie)
         .map(token_pid)
         .collect();
     zombies.sort_unstable();
@@ -304,6 +304,19 @@ pub fn end_run(
     }
     outcome.launchd_zombies = zombies;
     outcome
+}
+
+/// The final check of one seen member (#205): a zombie under launchd with
+/// its recorded start, provably not one (gone, another start, or not a
+/// zombie), or unreadable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZombieCheck {
+    /// A zombie under launchd with the member's recorded start.
+    Zombie,
+    /// Gone (ESRCH), another start at its pid, or not such a zombie.
+    Clear,
+    /// The lookup failed otherwise, or no start was recorded.
+    Unreadable,
 }
 
 /// The drain of [`end_run`]: wait until no live member of `sid` is a debugger
@@ -408,6 +421,8 @@ mod tests {
         log: Vec<String>,
         /// Instances that ended as zombies under launchd.
         zombies: std::collections::BTreeSet<(i32, u32)>,
+        /// Instances whose final check cannot be read.
+        unreadable: std::collections::BTreeSet<(i32, u32)>,
     }
     impl Script {
         fn new(anchors: &[bool], censuses: Vec<Result<Vec<Claimant>, String>>) -> Self {
@@ -420,6 +435,7 @@ mod tests {
                 members: VecDeque::new(),
                 log: vec![],
                 zombies: Default::default(),
+                unreadable: Default::default(),
             }
         }
         fn with_members(mut self, members: Vec<Vec<Member>>) -> Self {
@@ -469,9 +485,15 @@ mod tests {
             self.log.push(format!("end-supervisor {pid}"));
             Signalled::Sent
         }
-        fn launchd_zombie(&mut self, token: &Token) -> bool {
-            self.zombies
-                .contains(&(token_pid(token), token_version(token)))
+        fn launchd_zombie(&mut self, token: &Token) -> ZombieCheck {
+            let id = (token_pid(token), token_version(token));
+            if self.zombies.contains(&id) {
+                ZombieCheck::Zombie
+            } else if self.unreadable.contains(&id) {
+                ZombieCheck::Unreadable
+            } else {
+                ZombieCheck::Clear
+            }
         }
         fn now(&self) -> Instant {
             self.clock
@@ -666,6 +688,31 @@ mod tests {
         assert_eq!(o.launchd_zombies, vec![21]);
         assert_ne!(o.kind, Kind::Complete);
         assert!(!o.drain_exceeded);
+    }
+
+    /// #205 (CR-20): a seen member whose final check cannot be read is not
+    /// known to be clear, so the outcome is not `Complete`, and the error
+    /// names it.
+    #[test]
+    fn an_unreadable_zombie_check_is_not_complete() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])])
+            .with_members(vec![vec![member(21, false, true, false)], vec![]]);
+        h.unreadable.insert((21, 1));
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(o.launchd_zombies.is_empty(), "{o:?}");
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
+        let error = o.error.unwrap_or_default();
+        assert!(
+            error.contains("launchd-zombie check unreadable") && error.contains("21"),
+            "{error}"
+        );
+        // A clear member keeps `Complete`.
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])])
+            .with_members(vec![vec![member(21, false, true, false)], vec![]]);
+        assert_eq!(
+            end_run(&mut h, 99, None, Duration::from_secs(3)).kind,
+            Kind::Complete
+        );
     }
 
     #[test]
