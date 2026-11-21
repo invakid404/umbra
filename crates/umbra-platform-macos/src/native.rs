@@ -3975,6 +3975,36 @@ fn settled_lookup(first: Lookup, reread: impl FnOnce() -> Lookup) -> Lookup {
 const UNENROLLED_FORK_SETTLE: Duration = Duration::from_millis(100);
 const UNENROLLED_FORK_BOUND: Duration = Duration::from_secs(1);
 
+/// The frozen shutdown allowance: the retirement windows already running,
+/// plus one teardown per live session, and the unenrolled fork-child sweep
+/// for `fork_windows` open fork windows (#205). No reservation is admitted
+/// after the freeze, so no window can open later.
+fn shutdown_allowance(
+    retirement: Duration,
+    live_sessions: usize,
+    fork_windows: usize,
+) -> Result<Duration> {
+    let overflow = || error("shutdown", "cleanup schedule overflow");
+    let mut remaining = retirement;
+    for _ in 0..live_sessions {
+        remaining = remaining
+            .checked_add(TEARDOWN_BOUND + rsp::TRACER_REAP_BOUND + TRACEE_REAP_BOUND)
+            .ok_or_else(overflow)?;
+    }
+    let _ = fork_windows;
+    Ok(remaining)
+}
+
+/// The fork windows of one live session that are still open: a fork return
+/// not yet processed, whose child's slot is reserved (#205).
+fn open_fork_windows(live: &LiveSession) -> Vec<ThreadId> {
+    live.pending
+        .iter()
+        .filter(|(_, p)| matches!(p.kind, ReturnKind::Fork { .. }) && p.creation.is_some())
+        .map(|(thread, _)| *thread)
+        .collect()
+}
+
 /// `PROC_FLAG_TRACED` in `proc_bsdinfo::pbi_flags` (`sys/proc_info.h`).
 const PROC_FLAG_TRACED: u32 = 0x2;
 
@@ -4761,12 +4791,7 @@ impl MacosTraceBackend {
             let Some(live) = self.sessions[index].live.as_deref() else {
                 continue;
             };
-            let open: Vec<ThreadId> = live
-                .pending
-                .iter()
-                .filter(|(_, p)| matches!(p.kind, ReturnKind::Fork { .. }) && p.creation.is_some())
-                .map(|(thread, _)| *thread)
-                .collect();
+            let open = open_fork_windows(live);
             if open.is_empty() {
                 continue;
             }
@@ -5219,14 +5244,19 @@ impl TraceControl for MacosTraceBackend {
             .max()
             .unwrap_or_default()
             .max(rsp::TRACER_REAP_BOUND);
-        let mut remaining = retirement;
-        for session in self.sessions.iter().chain(self.failed_retirements.iter()) {
-            if session.live.is_some() && !session.torn_down {
-                remaining = remaining
-                    .checked_add(TEARDOWN_BOUND + rsp::TRACER_REAP_BOUND + TRACEE_REAP_BOUND)
-                    .ok_or_else(|| error("shutdown", "cleanup schedule overflow"))?;
-            }
-        }
+        let live_sessions = self
+            .sessions
+            .iter()
+            .chain(self.failed_retirements.iter())
+            .filter(|session| session.live.is_some() && !session.torn_down)
+            .count();
+        let fork_windows = self
+            .sessions
+            .iter()
+            .filter_map(|session| session.live.as_deref())
+            .map(|live| open_fork_windows(live).len())
+            .sum();
+        let remaining = shutdown_allowance(retirement, live_sessions, fork_windows)?;
         let accepted = self.ledger.freeze(nonce, remaining)?;
         Ok(umbra_platform::shutdown::Start::Local {
             accepted,
@@ -5598,6 +5628,30 @@ mod tests {
     /// #205: a SIGKILLed unenrolled fork child is confirmed ended only by an
     /// absent pid, a replaced birth, or a zombie of its birth; a failed lookup
     /// is never read as disappearance.
+    #[test]
+    fn an_open_fork_window_is_budgeted_in_the_shutdown_allowance() {
+        use super::*;
+        // #205 (CR-11): the fork-child sweep runs inside the frozen shutdown
+        // envelope. Its worst case is one settle and one shared wait, once,
+        // whatever the number of open windows; with none open it adds nothing.
+        let retirement = Duration::from_millis(1500);
+        let per_session = TEARDOWN_BOUND + rsp::TRACER_REAP_BOUND + TRACEE_REAP_BOUND;
+        let none = shutdown_allowance(retirement, 3, 0).unwrap();
+        assert_eq!(
+            none,
+            retirement + per_session * 3,
+            "no window: nothing added"
+        );
+        let sweep = UNENROLLED_FORK_SETTLE + UNENROLLED_FORK_BOUND;
+        for windows in [1, 2, 17] {
+            assert_eq!(
+                shutdown_allowance(retirement, 3, windows).unwrap(),
+                none + sweep,
+                "{windows} open fork window(s): the sweep's worst case, once"
+            );
+        }
+    }
+
     #[test]
     fn an_unreadable_fork_child_is_never_confirmed_gone() {
         use super::*;
