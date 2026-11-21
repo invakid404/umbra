@@ -10231,7 +10231,7 @@ fn spawn_profile_qualified() -> bool {
 /// `records.child`, no `child.txt`, no `records.done`). For a `virtual-*` mode
 /// the victim keeps its `SEED`, natively and through the client.
 fn slate_spawn_profile_refusal(mode: &str) {
-    slate_spawn_profile_refusal_in(mode, mode, &[], |root| {
+    slate_spawn_profile_refusal_in(mode, mode, &[], false, |root| {
         let done = std::fs::read_to_string(root.join("records.done")).unwrap();
         if mode == "fix-243-threads" {
             assert_eq!(done.matches("result=0").count(), 2, "native control");
@@ -10254,6 +10254,7 @@ fn slate_spawn_profile_refusal_in(
     case: &str,
     mode: &str,
     environment: &[(&str, &str)],
+    group_kills_zero: bool,
     native: impl FnOnce(&Path),
 ) {
     let Some(mut spawn) = slate_spawn(case) else {
@@ -10302,6 +10303,17 @@ fn slate_spawn_profile_refusal_in(
         }),
     );
     assert!(exact, "{}", routed.run.stderr);
+    if group_kills_zero {
+        // As the qualified body asserts: nothing was group-killed or left.
+        let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+        let first = cleanup.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with("cleanup CLEAN")
+                && first.contains("group_kills=0")
+                && first.contains("zombies=\"\""),
+            "{cleanup}"
+        );
+    }
     if virtual_victim {
         assert_eq!(routed.object("victim.txt"), Some(b"SEED".as_slice()));
     }
@@ -10416,6 +10428,40 @@ fn fix_243_fault_profile_refusal(case: &str, mode: &str) {
     );
     assert!(!reached, "the probe was reached under a profile refusal");
     assert!(exact, "{}", routed.run.stderr);
+    // The cleanup oracle of the qualified body: nothing outlived the run.
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+    let first = cleanup.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with("cleanup CLEAN")
+            && first.contains("group_kills=0")
+            && first.contains("zombies=\"\""),
+        "{cleanup}"
+    );
+    if spawn.guardian {
+        let census = std::fs::read_to_string(spawn.evidence.join("routed.census.jsonl")).unwrap();
+        assert!(
+            census.contains("SESSION_READING"),
+            "guardian session was not observed"
+        );
+        let mut complete = false;
+        for entry in std::fs::read_dir(spawn.evidence.join("guardian")).unwrap() {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            for line in text.lines() {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                if record["event"] == "sweep" {
+                    assert_eq!(record["outcome"], "COMPLETE", "{record}");
+                    assert!(
+                        record["owned_alive"].as_array().is_some_and(Vec::is_empty),
+                        "{record}"
+                    );
+                    complete = true;
+                }
+            }
+        }
+        assert!(complete, "guardian COMPLETE sweep record missing");
+    }
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
 }
 fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRouted {
     let (host, port) = fixture().expect("live Ganesha required; no skipped qualification");
@@ -11073,6 +11119,7 @@ fn fix_243_distinct_parent_backing_overlap() {
                 ("UMBRA_FIX_243_REGION_TRACE", "1"),
                 ("UMBRA_FIX_243_OVERLAP_PARENTS", "2"),
             ],
+            false,
             |root| {
                 assert!(std::fs::read_to_string(root.join("records.done"))
                     .unwrap()
@@ -11146,6 +11193,7 @@ fn fix_243_provider_region_cap() {
                 ("UMBRA_FIX_243_REGION_TRACE", "1"),
                 ("UMBRA_FIX_243_OVERLAP_PARENTS", "17"),
             ],
+            true,
             |root| {
                 assert!(std::fs::read_to_string(root.join("records.done"))
                     .unwrap()
@@ -11339,6 +11387,7 @@ fn fix_243_region_allocation_failure() {
                 ("UMBRA_FIX_243_REGION_TRACE", "1"),
                 ("UMBRA_FIX_243_REGION_FAULT", "allocate"),
             ],
+            true,
             |root| {
                 assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
             },
@@ -11360,6 +11409,7 @@ fn fix_243_region_write_failure() {
                 ("UMBRA_FIX_243_REGION_TRACE", "1"),
                 ("UMBRA_FIX_243_REGION_FAULT", "write"),
             ],
+            true,
             |root| {
                 assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
             },
@@ -11378,6 +11428,7 @@ fn fix_243_region_success_error_cycles() {
             "fix-243-region-cycles",
             "fix-243-region-cycles",
             &[("UMBRA_FIX_243_REGION_TRACE", "1")],
+            false,
             |root| {
                 assert_eq!(
                     std::fs::read_to_string(root.join("records.done"))
