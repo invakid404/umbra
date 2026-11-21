@@ -266,7 +266,7 @@ jobs:
           previous="${RUNNER_TOOL_CACHE:-$HOME}/umbra-ci-zombies-end.txt"
           if [ -f "$previous" ]; then
             echo "born since the previous job's end census (report only):"
-            awk 'NR == FNR { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
+            awk 'FILENAME == ARGV[1] { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
                  !(($2 " " $5 " " $6 " " $7 " " $8 " " $9) in seen)' "$previous" "$census" || true
           fi
       - name: Build providers and fixture
@@ -375,9 +375,12 @@ jobs:
       # during it, listed by pid, start time and name, and on any live process
       # of the run left behind (the runner's own post-job cleanup would end such
       # a process after this step, and the next job would take the zombie as its
-      # baseline). A debugserver counts only when it is umbra's: its argv
-      # carries `--reverse-connect 127.0.0.1:`. Zombies are counted above, not
-      # again as leftovers.
+      # baseline). A live process of the run is an `umbra*` image, a traced
+      # program's resigned twin (its path is under ~/Library/Caches/umbra/twins,
+      # whatever its name), or umbra's debugserver (its argv carries
+      # `--reverse-connect 127.0.0.1:`). Zombies are counted above, not again as
+      # leftovers. The baseline is the first file by name, so an empty one
+      # still lets every new zombie through.
       - name: Zombie and leftover census at job end (#205)
         if: always()
         run: |
@@ -387,7 +390,7 @@ jobs:
             | awk -v u="$(id -un)" '$1 ~ /^Z/ && $3 == 1 && $4 == u' > "$end"
           cp "$end" "${RUNNER_TOOL_CACHE:-$HOME}/umbra-ci-zombies-end.txt" || true
           touch "$start"
-          new=$(awk 'NR == FNR { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
+          new=$(awk 'FILENAME == ARGV[1] { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
                      !(($2 " " $5 " " $6 " " $7 " " $8 " " $9) in seen)' "$start" "$end")
           job_start=$(cat "$RUNNER_TEMP/umbra-job-start.txt" 2>/dev/null || echo 0)
           window=$(( $(date +%s) - job_start ))
@@ -403,7 +406,8 @@ jobs:
             }
             $3 == u && $1 != me && $2 != me && $4 !~ /^Z/ && seconds($5) <= window {
               name = $6
-              if (name ~ /^umbra/ || (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
+              if (name ~ /^umbra/ || $0 ~ /\/Library\/Caches\/umbra\/twins\// ||
+                  (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
                 print
             }')
           status=0
@@ -461,7 +465,7 @@ jobs:
           previous="${RUNNER_TOOL_CACHE:-$HOME}/umbra-ci-zombies-end.txt"
           if [ -f "$previous" ]; then
             echo "born since the previous job's end census (report only):"
-            awk 'NR == FNR { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
+            awk 'FILENAME == ARGV[1] { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
                  !(($2 " " $5 " " $6 " " $7 " " $8 " " $9) in seen)' "$previous" "$census" || true
           fi
 
@@ -1056,9 +1060,12 @@ jobs:
       # during it, listed by pid, start time and name, and on any live process
       # of the run left behind (the runner's own post-job cleanup would end such
       # a process after this step, and the next job would take the zombie as its
-      # baseline). A debugserver counts only when it is umbra's: its argv
-      # carries `--reverse-connect 127.0.0.1:`. Zombies are counted above, not
-      # again as leftovers.
+      # baseline). A live process of the run is an `umbra*` image, a traced
+      # program's resigned twin (its path is under ~/Library/Caches/umbra/twins,
+      # whatever its name), or umbra's debugserver (its argv carries
+      # `--reverse-connect 127.0.0.1:`). Zombies are counted above, not again as
+      # leftovers. The baseline is the first file by name, so an empty one
+      # still lets every new zombie through.
       - name: Zombie and leftover census at job end (#205)
         if: always()
         run: |
@@ -1068,7 +1075,7 @@ jobs:
             | awk -v u="$(id -un)" '$1 ~ /^Z/ && $3 == 1 && $4 == u' > "$end"
           cp "$end" "${RUNNER_TOOL_CACHE:-$HOME}/umbra-ci-zombies-end.txt" || true
           touch "$start"
-          new=$(awk 'NR == FNR { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
+          new=$(awk 'FILENAME == ARGV[1] { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
                      !(($2 " " $5 " " $6 " " $7 " " $8 " " $9) in seen)' "$start" "$end")
           job_start=$(cat "$RUNNER_TEMP/umbra-job-start.txt" 2>/dev/null || echo 0)
           window=$(( $(date +%s) - job_start ))
@@ -1084,7 +1091,8 @@ jobs:
             }
             $3 == u && $1 != me && $2 != me && $4 !~ /^Z/ && seconds($5) <= window {
               name = $6
-              if (name ~ /^umbra/ || (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
+              if (name ~ /^umbra/ || $0 ~ /\/Library\/Caches\/umbra\/twins\// ||
+                  (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
                 print
             }')
           status=0
