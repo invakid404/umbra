@@ -8532,8 +8532,7 @@ fn slate_drain_never_reads_an_unavailable_census_as_empty() {
 /// anything: the run exited on its own (`exited`), it was not drained already,
 /// and members are left (`live` in its group or session, `escaped` from it).
 fn slate_drain_before_kill(drained: bool, exited: bool, live: usize, escaped: usize) -> bool {
-    let _ = (drained, exited, live, escaped);
-    false
+    !drained && exited && (live > 0 || escaped > 0)
 }
 
 /// #205 (D-A): after a normal exit that leaves members, the cleanup drains
