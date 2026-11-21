@@ -297,7 +297,6 @@ pub fn end_run(
         host.end_supervisor(pid, sid);
     }
     let (seen, tokenless, drain_exceeded) = drain(host, sid);
-    let _ = tokenless;
     let mut outcome = sweep(host, sid, budget);
     outcome.drain_exceeded = drain_exceeded;
     let mut zombies: Vec<i32> = vec![];
@@ -307,6 +306,17 @@ pub fn end_run(
             ZombieCheck::Zombie => zombies.push(token_pid(token)),
             ZombieCheck::Unreadable => unreadable.push(token_pid(token)),
             ZombieCheck::Clear => {}
+        }
+    }
+    // A member seen only without a token has no identity to check: its pid is
+    // checked instead, unless a seen token already covers that pid.
+    for pid in tokenless {
+        if seen.iter().any(|t| token_pid(t) == pid) {
+            continue;
+        }
+        match host.launchd_zombie_pid(pid) {
+            ZombieCheck::Clear => {}
+            ZombieCheck::Zombie | ZombieCheck::Unreadable => unreadable.push(pid),
         }
     }
     zombies.sort_unstable();

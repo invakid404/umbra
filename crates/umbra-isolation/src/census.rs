@@ -446,4 +446,19 @@ mod tests {
         assert_eq!(zombie_check(Err(0), start), ZombieCheck::Unreadable);
         assert_eq!(zombie_check(zombie, None), ZombieCheck::Unreadable);
     }
+
+    /// #205 (CR-25): a member seen without a token has no recorded identity,
+    /// so its pid is clear only when provably not a zombie under launchd now.
+    #[test]
+    fn a_tokenless_zombie_check_is_clear_only_when_provably_not_a_zombie() {
+        assert_eq!(zombie_check_pid(Err(libc::ESRCH)), ZombieCheck::Clear);
+        assert_eq!(zombie_check_pid(Ok((2, 42))), ZombieCheck::Clear);
+        assert_eq!(zombie_check_pid(Ok((libc::SZOMB, 42))), ZombieCheck::Clear);
+        assert_eq!(
+            zombie_check_pid(Ok((libc::SZOMB, 1))),
+            ZombieCheck::Unreadable
+        );
+        assert_eq!(zombie_check_pid(Err(libc::EPERM)), ZombieCheck::Unreadable);
+        assert_eq!(zombie_check_pid(Err(0)), ZombieCheck::Unreadable);
+    }
 }
