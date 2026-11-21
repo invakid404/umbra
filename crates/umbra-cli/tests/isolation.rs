@@ -1042,7 +1042,7 @@ fn sid1_p1_stopped_tracer_at_the_deadline() {
 /// gone 50 ms later), so the second step is exact rather than assumed: the
 /// debugserver's (pid, start) is recorded before the root's kill, and after the
 /// root's death it is either already gone, or killed by the test, or `kill`
-/// reports no such process and that same identity is proven gone. Anything
+/// fails with `ESRCH` and that same identity is proven gone. Anything
 /// else fails. The oracle is the SID-1 kill sequence's: no SIGHUP to umbra,
 /// the caller's group untouched, a status reported, nothing left, and no
 /// launchd-parented zombie.
@@ -1069,21 +1069,22 @@ fn sid1_p2_running_tracee_killed_then_its_tracer() {
     let ended = if !identity_live(tracer) {
         "ended by itself after its program's death"
     } else {
-        let out = Command::new("/bin/kill")
-            .args(["-KILL", &tracer.0.to_string()])
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if out.status.success() {
+        // SAFETY: plain libSystem call on a pid this harness discovered by
+        // parentage and whose (pid, start) was live just above.
+        if unsafe { libc::kill(tracer.0, libc::SIGKILL) } == 0 {
             "ended by the test"
-        } else if stderr.contains("No such process") {
-            assert!(
-                !identity_live(tracer),
-                "kill reported no such process, but {tracer:?} is still live"
-            );
-            "ended by itself after its program's death"
         } else {
-            panic!("kill -KILL {}: {stderr}", tracer.0);
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ESRCH) => {
+                    assert!(
+                        !identity_live(tracer),
+                        "kill reported ESRCH, but {tracer:?} is still live"
+                    );
+                    "ended by itself after its program's death"
+                }
+                _ => panic!("kill(SIGKILL) {}: {error}", tracer.0),
+            }
         }
     };
     eprintln!("P2: debugserver {tracer:?} {ended}");
