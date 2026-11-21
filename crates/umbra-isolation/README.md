@@ -103,11 +103,16 @@ until a reboot and counts against the user's process limit (platform README,
 3. **The sweep** of what is left, as below.
 
 Afterwards every member the drain saw is checked, including those a census
-cut at its deadline had already verified: one now a zombie under
+cut at its deadline had already verified, and so is every member the sweep
+signalled (a member created after the drain, say): one now a zombie under
 launchd is reported in `launchd_zombies`, and the outcome is then not
 `COMPLETE`. One whose final record cannot be read (a lookup failing other than
 with `ESRCH`, or no recorded start) is not known to be clear: it is named in
-the outcome's `error`, and the outcome is not `COMPLETE` either.
+the outcome's `error`, and the outcome is not `COMPLETE` either. A member the
+drain could read only without a token has no recorded identity, so its pid is
+checked instead: it is clear only when provably not a zombie under launchd now
+(gone, or readable and not one), and otherwise named in `error` in the same
+way.
 
 Who ends the run:
 

@@ -1062,6 +1062,11 @@ as a zombie nobody collects:
    (`slate_cleanup_budget`: the guardian's drain cap, its 3 s sweep and 1 s
    reap, and a 2 s margin), and the group kill follows.
 
+A run that exits on its own but leaves members (in its group or session, or
+escaped from it) is drained the same way, once, before the cleanup kills
+anything; the cleanup's 10 s grace pauses while that drain runs, and the
+members are read again before any kill (`slate_drain_before_kill`).
+
 Both slate launchers also fail a case on any zombie under launchd of one of
 this suite's fixtures (`umbra-userspace-*`, `umbra-slate-*`, `umbra-fix-*`,
 by the full process name, since the 15-byte short name cuts
