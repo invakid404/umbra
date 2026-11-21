@@ -829,7 +829,8 @@ jobs:
             fix_243_guardian_copyout_failure_loss fix_243_guardian_free_failure_loss \
             fix_243_distinct_parent_backing_overlap fix_243_provider_region_cap \
             fix_243_region_success_error_cycles fix_243_region_allocation_failure \
-            fix_243_region_write_failure --exact --nocapture --test-threads=1
+            fix_243_region_write_failure fix_205_refusal_with_an_unenrolled_fork_child \
+            --exact --nocapture --test-threads=1
 
       - name: Confirm routed shutdown before journal completion
         env:

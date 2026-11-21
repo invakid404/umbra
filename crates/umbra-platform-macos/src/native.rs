@@ -1924,6 +1924,10 @@ pub struct MacosTraceBackend {
     /// the tree, so a descendant execing the same image breakpoints the same trap
     /// sites. See `Session::interposer`.
     interposer: Option<(PathBuf, PathBuf, u32)>,
+    /// Test-only (#205): a session whose stops are not polled until the
+    /// instant, so a fork it opened stays in its window across a teardown.
+    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+    fork_window_hold: Option<(usize, Instant)>,
     _affine: PhantomData<Rc<()>>,
 }
 impl Default for MacosTraceBackend {
@@ -1955,6 +1959,8 @@ impl MacosTraceBackend {
             owner: None,
             generation: 0,
             interposer: None,
+            #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+            fork_window_hold: None,
             _affine: PhantomData,
         }
     }
@@ -3254,6 +3260,18 @@ impl MacosTraceBackend {
                 s.task.read(pc + 4, &mut original)?;
                 restore.insert(pc + 4, original);
                 s.return_stop(thread, ReturnKind::Fork { restore })?;
+                // Test-only (#205): hold a fork opened while another session
+                // exists in its window, so a sibling's refusal tears the run
+                // down while this fork's child is still unenrolled.
+                #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                if self.sessions.len() > 1
+                    && std::env::var_os("UMBRA_FIX_205_FORK_WINDOW_HOLD").is_some()
+                {
+                    let pid = self.sessions[index].id.0.native_id;
+                    eprintln!("fork-window-hold parent={pid}");
+                    self.fork_window_hold =
+                        Some((index, crate::clock::now() + Duration::from_secs(10)));
+                }
             }
             Some(abi::Delivery::Wait) => {
                 let wanted = get(&regs, 0)? as i32;
@@ -4776,6 +4794,13 @@ impl TraceBackend for MacosTraceBackend {
                     continue;
                 }
                 if self.sessions[i].stopped {
+                    continue;
+                }
+                #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                if self
+                    .fork_window_hold
+                    .is_some_and(|(held, until)| held == i && crate::clock::now() < until)
+                {
                     continue;
                 }
                 if let Some(reply) = self.sessions[i].rsp.poll(

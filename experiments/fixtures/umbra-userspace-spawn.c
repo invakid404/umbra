@@ -825,9 +825,55 @@ static int overlap_parents(const char *root, const char *helper, int count) {
     return 0;
 }
 
+/* #205: a refused spawn while a sibling fork is still unenrolled. The root
+ * forks a first child, which waits on a pipe, sleeps 1 s, then spawns with
+ * POSIX_SPAWN_SETSID (refused by umbra on every profile; natively it runs).
+ * The root writes the pipe and forks a second child at once, which only
+ * exits. Under umbra, the probe UMBRA_FIX_205_FORK_WINDOW_HOLD keeps the
+ * second fork in its window until the first child's refusal tears the run
+ * down, so the second child is never enrolled. */
+static int fork_window(const char *root, const char *helper) {
+    note("phase=pre-spawn mode=fix-205-fork-window\n");
+    flush(root, "records.pre");
+    int gate[2];
+    if (pipe(gate)) return 140;
+    pid_t first = fork();
+    if (first < 0) return 141;
+    if (!first) {
+        close(gate[1]);
+        char token;
+        ssize_t got;
+        do got = read(gate[0], &token, 1);
+        while (got < 0 && errno == EINTR);
+        if (got != 1) _exit(142);
+        struct timespec pause = {1, 0};
+        while (nanosleep(&pause, &pause) < 0 && errno == EINTR) {
+        }
+        posix_spawnattr_t attr;
+        if (posix_spawnattr_init(&attr) || posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID))
+            _exit(143);
+        char *args[] = {(char *)helper, "write-child", (char *)root, NULL};
+        pid_t child;
+        if (posix_spawn(&child, helper, NULL, &attr, args, environ)) _exit(144);
+        int status = 0;
+        _exit(reap(child, &status) ? 145 : 0);
+    }
+    close(gate[0]);
+    if (write(gate[1], "g", 1) != 1) return 146;
+    pid_t second = fork();
+    if (second < 0) return 147;
+    if (!second) _exit(0);
+    int status = 0;
+    if (reap(first, &status) || reap(second, &status)) return 148;
+    note("fork-window spawn result=0 completed=2\n");
+    flush(root, "records.done");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *mode = argv[1], *root = argv[2], *helper = argv[3];
+    if (!strcmp(mode, "fix-205-fork-window")) return fork_window(root, helper);
     if (!strcmp(mode, "fix-243-overlap")) return overlap_parents(root, helper, 2);
     if (!strcmp(mode, "fix-243-cap")) return overlap_parents(root, helper, 17);
     if (!strcmp(mode, "fix-243-region-cycles")) return region_cycles(root, helper);

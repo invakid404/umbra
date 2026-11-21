@@ -11261,6 +11261,71 @@ fn fix_243_region_fault(fault: &str) {
     slate_finish_cleanup();
 }
 
+/// #205: a packed spawn refused while a sibling fork is still in its window.
+/// The root forks a first child, which spawns with `POSIX_SPAWN_SETSID` (refused
+/// on every profile), and at once a second child. The probe
+/// `UMBRA_FIX_205_FORK_WINDOW_HOLD` keeps the second fork in its window, its
+/// child unenrolled and spinning at the return gate, until the refusal tears
+/// the run down. The refusal must be exact, and nothing may outlive umbra:
+/// cleanup clean with no group kill and no zombie.
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_205_refusal_with_an_unenrolled_fork_child() {
+    let Some(mut spawn) = slate_spawn("fix-205-fork-window") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-205-fork-window");
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("fork-window spawn result=0 completed=2"));
+    spawn
+        .provider_environment
+        .push(("UMBRA_FIX_205_FORK_WINDOW_HOLD".into(), "1".into()));
+    let routed = slate_spawn_routed(&spawn, "fix-205-fork-window", &["child.txt"]);
+    let diagnostic = if spawn_profile_qualified() {
+        "spawn unsupported attribute SETSID"
+    } else {
+        SLATE_SPAWN_PROFILE_REFUSAL
+    };
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+    let first = cleanup.lines().next().unwrap_or_default();
+    let held = routed.run.stderr.contains("fork-window-hold parent=");
+    let exact = routed.run.status != Some(0)
+        && routed.run.stderr.contains(diagnostic)
+        && !routed.run.stderr.contains("cleanup also failed")
+        && !routed.run.stderr.contains("finished:")
+        && routed.object("records.pre").is_some()
+        && ["records.child", "records.done", "child.txt"]
+            .iter()
+            .all(|name| routed.object(name).is_none());
+    let clean = first.starts_with("cleanup CLEAN")
+        && first.contains("group_kills=0")
+        && first.contains("zombies=\"\"");
+    slate_record(
+        &spawn,
+        if held && exact && clean {
+            "EXACT KNOWN REFUSAL"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({
+            "diagnostic": diagnostic, "fork_window_held": held, "cleanup": first,
+            "run_id": routed.run.run_id.0.to_string(),
+        }),
+    );
+    assert!(
+        held,
+        "the probe never held a fork window:\n{}",
+        routed.run.stderr
+    );
+    assert!(exact, "{}", routed.run.stderr);
+    assert!(clean, "something outlived umbra: {cleanup}");
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_region_allocation_failure() {
