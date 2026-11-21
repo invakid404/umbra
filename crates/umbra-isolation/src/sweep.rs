@@ -455,7 +455,7 @@ fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, Vec<i32>, bool) {
                 for t in cut.seen {
                     seen.insert((token_pid(&t), token_version(&t)), t);
                 }
-                let _ = cut.tokenless;
+                tokenless.extend(cut.tokenless);
                 cap.get_or_insert(start + drain_cap(1));
             }
         }
