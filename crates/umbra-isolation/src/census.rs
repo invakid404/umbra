@@ -166,6 +166,18 @@ fn zombie_check(
     }
 }
 
+/// The final check of a member seen without a token (#205), from its pid's
+/// BSD lookup (status and parent pid, or the lookup's errno). With no
+/// recorded identity a zombie under launchd at the pid cannot be proved to be
+/// that member or not, so it is unreadable, as is any failed lookup but ESRCH.
+fn zombie_check_pid(found: std::result::Result<(u32, u32), i32>) -> ZombieCheck {
+    match found {
+        Ok((status, 1)) if status == libc::SZOMB => ZombieCheck::Unreadable,
+        Ok(_) | Err(libc::ESRCH) => ZombieCheck::Clear,
+        Err(_) => ZombieCheck::Unreadable,
+    }
+}
+
 /// Whether `pid`'s image is a debugger process (`debugserver`), for waiting
 /// only. `None` when the path cannot be read.
 fn is_debugger(pid: i32) -> Option<bool> {
@@ -389,6 +401,9 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
             )
         });
         zombie_check(found, start)
+    }
+    fn launchd_zombie_pid(&mut self, pid: i32) -> ZombieCheck {
+        zombie_check_pid(bsd_info_or_errno(pid, true).map(|info| (info.pbi_status, info.pbi_ppid)))
     }
     fn now(&self) -> Instant {
         Instant::now()

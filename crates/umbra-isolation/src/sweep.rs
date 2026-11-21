@@ -93,6 +93,11 @@ pub trait Host {
     /// Whether the instance `token` names is now a zombie under launchd, which
     /// nobody will collect (#205), or whether that could not be read.
     fn launchd_zombie(&mut self, token: &Token) -> ZombieCheck;
+    /// The same check for a member seen without a token (#205), so with no
+    /// recorded identity: `Clear` only when its pid is provably not a zombie
+    /// under launchd now (gone, or readable and not one); otherwise
+    /// `Unreadable`, never `Zombie`.
+    fn launchd_zombie_pid(&mut self, pid: i32) -> ZombieCheck;
     /// The monotonic clock.
     fn now(&self) -> Instant;
     /// Wait between passes.
@@ -291,7 +296,8 @@ pub fn end_run(
     if let Some(pid) = supervisor {
         host.end_supervisor(pid, sid);
     }
-    let (seen, drain_exceeded) = drain(host, sid);
+    let (seen, tokenless, drain_exceeded) = drain(host, sid);
+    let _ = tokenless;
     let mut outcome = sweep(host, sid, budget);
     outcome.drain_exceeded = drain_exceeded;
     let mut zombies: Vec<i32> = vec![];
@@ -356,9 +362,11 @@ pub enum ZombieCheck {
 /// readable reading, to stopped members that are not traced, by tokens
 /// enrolled in a reading bracketed by two successful anchor checks (the
 /// sweep's own rule); a failed anchor check ends those attempts.
-fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, bool) {
+fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, Vec<i32>, bool) {
     let start = host.now();
     let mut seen: BTreeMap<(i32, u32), Token> = BTreeMap::new();
+    // Members read without a token (no identity), by pid.
+    let mut tokenless: std::collections::BTreeSet<i32> = Default::default();
     let mut cap: Option<Instant> = None;
     // The cap is sized by the first readable reading, and the SIGCONT pass
     // runs on the first readable reading bracketed by two successful anchor
@@ -382,8 +390,13 @@ fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, bool) {
         match reading {
             Ok(members) => {
                 for m in &members {
-                    if let Some(t) = m.claimant.token {
-                        seen.insert((token_pid(&t), token_version(&t)), t);
+                    match m.claimant.token {
+                        Some(t) => {
+                            seen.insert((token_pid(&t), token_version(&t)), t);
+                        }
+                        None => {
+                            tokenless.insert(m.claimant.pid);
+                        }
                     }
                 }
                 if !sized {
@@ -400,7 +413,11 @@ fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, bool) {
                     }
                 }
                 if !members.iter().any(|m| m.debugger || m.traced) {
-                    return (seen.into_values().collect(), false);
+                    return (
+                        seen.into_values().collect(),
+                        tokenless.into_iter().collect(),
+                        false,
+                    );
                 }
             }
             // No reading: keep reading until the cap. Unavailable is never
@@ -415,7 +432,11 @@ fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, bool) {
             }
         }
         if host.now() >= cap.expect("set by the first pass") {
-            return (seen.into_values().collect(), true);
+            return (
+                seen.into_values().collect(),
+                tokenless.into_iter().collect(),
+                true,
+            );
         }
         host.pause();
     }
@@ -456,6 +477,8 @@ mod tests {
         zombies: std::collections::BTreeSet<(i32, u32)>,
         /// Instances whose final check cannot be read.
         unreadable: std::collections::BTreeSet<(i32, u32)>,
+        /// Tokenless pids whose final check cannot be read.
+        unreadable_pids: std::collections::BTreeSet<i32>,
     }
     impl Script {
         fn new(anchors: &[bool], censuses: Vec<Result<Vec<Claimant>, String>>) -> Self {
@@ -469,6 +492,7 @@ mod tests {
                 log: vec![],
                 zombies: Default::default(),
                 unreadable: Default::default(),
+                unreadable_pids: Default::default(),
             }
         }
         fn with_members(mut self, members: Vec<Vec<Member>>) -> Self {
@@ -523,6 +547,13 @@ mod tests {
             if self.zombies.contains(&id) {
                 ZombieCheck::Zombie
             } else if self.unreadable.contains(&id) {
+                ZombieCheck::Unreadable
+            } else {
+                ZombieCheck::Clear
+            }
+        }
+        fn launchd_zombie_pid(&mut self, pid: i32) -> ZombieCheck {
+            if self.unreadable_pids.contains(&pid) {
                 ZombieCheck::Unreadable
             } else {
                 ZombieCheck::Clear
@@ -657,6 +688,39 @@ mod tests {
         }));
         end_run(&mut h, 99, None, Duration::from_secs(3));
         assert!(h.log.iter().any(|l| l == "cont 40"), "{:?}", h.log);
+    }
+
+    /// #205 (CR-25): a member read without a token (no identity) is still
+    /// checked at the end. Its pid is not provably clear, so the outcome is
+    /// not `Complete` and the error names it; a provably clear pid keeps
+    /// `Complete`.
+    #[test]
+    fn an_unreadable_tokenless_member_is_not_complete() {
+        let tokenless = Member {
+            claimant: Claimant {
+                pid: 30,
+                token: None,
+            },
+            debugger: false,
+            traced: false,
+            stopped: false,
+        };
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])])
+            .with_members(vec![vec![tokenless.clone()], vec![]]);
+        h.unreadable_pids.insert(30);
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
+        let error = o.error.unwrap_or_default();
+        assert!(
+            error.contains("launchd-zombie check unreadable") && error.contains("30"),
+            "{error}"
+        );
+        let mut h =
+            Script::new(&[true; 64], vec![Ok(vec![])]).with_members(vec![vec![tokenless], vec![]]);
+        assert_eq!(
+            end_run(&mut h, 99, None, Duration::from_secs(3)).kind,
+            Kind::Complete
+        );
     }
 
     /// #205 (U-1): a census cut at the deadline still hands over the members
