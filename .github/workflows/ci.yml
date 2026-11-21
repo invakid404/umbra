@@ -376,11 +376,14 @@ jobs:
       # of the run left behind (the runner's own post-job cleanup would end such
       # a process after this step, and the next job would take the zombie as its
       # baseline). A live process of the run is an `umbra*` image, a traced
-      # program's resigned twin (its path is under ~/Library/Caches/umbra/twins,
-      # whatever its name), or umbra's debugserver (its argv carries
-      # `--reverse-connect 127.0.0.1:`). Zombies are counted above, not again as
-      # leftovers. The baseline is the first file by name, so an empty one
-      # still lets every new zombie through.
+      # program's resigned twin (its command line, or its executable path read
+      # with proc_pidpath, is under ~/Library/Caches/umbra/twins, so a twin that
+      # keeps a vendor argv[0] is found too), or umbra's debugserver (its argv
+      # carries `--reverse-connect 127.0.0.1:`). A process whose executable path
+      # cannot be read is listed as a leftover; only one proven gone (ESRCH) is
+      # skipped. Zombies are counted above, not again as leftovers. The
+      # baseline is the first file by name, so an empty baseline still reports
+      # every new zombie.
       - name: Zombie and leftover census at job end (#205)
         if: always()
         run: |
@@ -395,7 +398,12 @@ jobs:
           job_start=$(cat "$RUNNER_TEMP/umbra-job-start.txt" 2>/dev/null || echo 0)
           window=$(( $(date +%s) - job_start ))
           me=$$
-          leftovers=$(ps -A -o pid=,ppid=,user=,stat=,etime=,ucomm=,command= | awk \
+          status=0
+          # awk marks the name and argv matches (1) and passes every other
+          # candidate (0) to proc_pidpath. The helper never spells the twin
+          # path in one literal, so its own command line cannot match it.
+          leftovers=$(set -o pipefail
+            ps -A -o pid=,ppid=,user=,stat=,etime=,ucomm=,command= | awk \
             -v u="$(id -un)" -v window="$window" -v me="$me" '
             function seconds(t,  n, a, d, h, m, s) {
               d = 0; h = 0
@@ -406,11 +414,32 @@ jobs:
             }
             $3 == u && $1 != me && $2 != me && $4 !~ /^Z/ && seconds($5) <= window {
               name = $6
-              if (name ~ /^umbra/ || $0 ~ /\/Library\/Caches\/umbra\/twins\// ||
-                  (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
-                print
-            }')
-          status=0
+              hit = (name ~ /^umbra/ || $0 ~ /\/Library\/Caches\/umbra\/twins\// ||
+                     (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
+              print (hit ? 1 : 0), $0
+            }' | python3 -I -c '
+          import ctypes, sys
+          libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+          libc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+          twins = "/Library/Caches/umbra/" "twins/"
+          for line in sys.stdin:
+              hit, _, row = line.rstrip("\n").partition(" ")
+              if hit == "1":
+                  print(row)
+                  continue
+              buf = ctypes.create_string_buffer(4096)
+              ctypes.set_errno(0)
+              n = libc.proc_pidpath(int(row.split()[0]), buf, 4096)
+              if n > 0:
+                  path = buf.raw[:n].decode("utf-8", "replace")
+                  if twins in path:
+                      print(row + "  [executable " + path + "]")
+              elif ctypes.get_errno() != 3:
+                  print(row + "  [executable path unreadable: errno %d]" % ctypes.get_errno())
+          ') || {
+            echo "::error::the leftover census produced no reading (#205)"
+            status=1
+          }
           if [ -n "$new" ]; then
             echo "::error::launchd-parented zombies born during this job (#205):"
             echo "$new"
@@ -1061,11 +1090,14 @@ jobs:
       # of the run left behind (the runner's own post-job cleanup would end such
       # a process after this step, and the next job would take the zombie as its
       # baseline). A live process of the run is an `umbra*` image, a traced
-      # program's resigned twin (its path is under ~/Library/Caches/umbra/twins,
-      # whatever its name), or umbra's debugserver (its argv carries
-      # `--reverse-connect 127.0.0.1:`). Zombies are counted above, not again as
-      # leftovers. The baseline is the first file by name, so an empty one
-      # still lets every new zombie through.
+      # program's resigned twin (its command line, or its executable path read
+      # with proc_pidpath, is under ~/Library/Caches/umbra/twins, so a twin that
+      # keeps a vendor argv[0] is found too), or umbra's debugserver (its argv
+      # carries `--reverse-connect 127.0.0.1:`). A process whose executable path
+      # cannot be read is listed as a leftover; only one proven gone (ESRCH) is
+      # skipped. Zombies are counted above, not again as leftovers. The
+      # baseline is the first file by name, so an empty baseline still reports
+      # every new zombie.
       - name: Zombie and leftover census at job end (#205)
         if: always()
         run: |
@@ -1080,7 +1112,12 @@ jobs:
           job_start=$(cat "$RUNNER_TEMP/umbra-job-start.txt" 2>/dev/null || echo 0)
           window=$(( $(date +%s) - job_start ))
           me=$$
-          leftovers=$(ps -A -o pid=,ppid=,user=,stat=,etime=,ucomm=,command= | awk \
+          status=0
+          # awk marks the name and argv matches (1) and passes every other
+          # candidate (0) to proc_pidpath. The helper never spells the twin
+          # path in one literal, so its own command line cannot match it.
+          leftovers=$(set -o pipefail
+            ps -A -o pid=,ppid=,user=,stat=,etime=,ucomm=,command= | awk \
             -v u="$(id -un)" -v window="$window" -v me="$me" '
             function seconds(t,  n, a, d, h, m, s) {
               d = 0; h = 0
@@ -1091,11 +1128,32 @@ jobs:
             }
             $3 == u && $1 != me && $2 != me && $4 !~ /^Z/ && seconds($5) <= window {
               name = $6
-              if (name ~ /^umbra/ || $0 ~ /\/Library\/Caches\/umbra\/twins\// ||
-                  (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
-                print
-            }')
-          status=0
+              hit = (name ~ /^umbra/ || $0 ~ /\/Library\/Caches\/umbra\/twins\// ||
+                     (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
+              print (hit ? 1 : 0), $0
+            }' | python3 -I -c '
+          import ctypes, sys
+          libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+          libc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+          twins = "/Library/Caches/umbra/" "twins/"
+          for line in sys.stdin:
+              hit, _, row = line.rstrip("\n").partition(" ")
+              if hit == "1":
+                  print(row)
+                  continue
+              buf = ctypes.create_string_buffer(4096)
+              ctypes.set_errno(0)
+              n = libc.proc_pidpath(int(row.split()[0]), buf, 4096)
+              if n > 0:
+                  path = buf.raw[:n].decode("utf-8", "replace")
+                  if twins in path:
+                      print(row + "  [executable " + path + "]")
+              elif ctypes.get_errno() != 3:
+                  print(row + "  [executable path unreadable: errno %d]" % ctypes.get_errno())
+          ') || {
+            echo "::error::the leftover census produced no reading (#205)"
+            status=1
+          }
           if [ -n "$new" ]; then
             echo "::error::launchd-parented zombies born during this job (#205):"
             echo "$new"
