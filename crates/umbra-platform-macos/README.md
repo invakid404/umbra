@@ -89,9 +89,10 @@ only after all owner destruction. Existing session teardown, tracer/root reap
 and retirement windows determine the owner envelope, plus the unenrolled
 fork-child sweep (100 ms + 1 s, added once) when any fork window is open at the
 freeze and nothing otherwise; no reservation is admitted after the freeze, so no
-window opens later. Polling never restarts them. Synchronous kernel calls and cooperative watchdog cancellation/join assume
-kernel-call completion. An envelope overrun fails closure rather than claiming
-successful cleanup. No session-age, inactivity or cancellation policy is added.
+window opens later. Polling never restarts them. Synchronous kernel calls and
+cooperative watchdog cancellation/join assume kernel-call completion. An
+envelope overrun fails closure rather than claiming successful cleanup. No
+session-age, inactivity or cancellation policy is added.
 
 The shared monitor stores a typed terminal cause. Genuine explicit deadline
 expiry reports operation `watchdog`; owner loss, monitor failure and panic
@@ -780,9 +781,12 @@ reservation. Every untraced child is SIGKILLed, and then all of them share one
 wait, bounded at 1 s: each is confirmed once a lookup shows no process at its
 pid, another birth there, or a zombie of its birth; a failed lookup is never
 taken as its end. The sweep's worst case is therefore 1.1 s whatever the number
-of open windows, which is what the owner envelope adds for it. A traced one is left to its debugger, debugger-last. Whatever cannot be
-confirmed is marked unconfirmed with a diagnostic naming the child, its parent
-and its state. Each outcome is also logged on stderr
+of open windows, which is what the owner envelope adds for it. A traced one is
+left to its debugger, debugger-last. Whatever cannot be confirmed is marked
+unconfirmed with a diagnostic naming the child, its parent and its state, and
+`terminate` then fails with that diagnostic beside any session failure (its
+callers read `Ok` as confirmed termination); a drop, which has no result,
+settles it through its reservation. Each outcome is also logged on stderr
 (`unenrolled fork child ended: pid=… of pid=… birth=…`, or `unconfirmed …`).
 The sweep covers fork windows only. A spawn's window (its child created
 suspended and untraced until the parent's return enrols it) is not swept yet;
@@ -1062,7 +1066,8 @@ Further #205 coverage:
   shared wait (17 children, one bound, on a scripted clock), and
   `native::tests::an_open_fork_window_is_budgeted_in_the_shutdown_allowance`
   pins that the frozen envelope adds that worst case once with any window open
-  and nothing with none.
+  and nothing with none; `native::tests::an_unconfirmed_fork_child_fails_termination`
+  pins that such a child fails `terminate`.
 - `rsp::tests::debugserver_ignores_terminal_signals` reads a live
   debugserver's ignored signals (no program attached) and sends each.
 - `tests/lifetime_signals.rs` sends the provider SIGHUP, SIGINT, SIGQUIT and

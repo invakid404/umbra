@@ -104,7 +104,9 @@ until a reboot and counts against the user's process limit (platform README,
 
 Afterwards every member the drain saw is checked: one now a zombie under
 launchd is reported in `launchd_zombies`, and the outcome is then not
-`COMPLETE`.
+`COMPLETE`. One whose final record cannot be read (a lookup failing other than
+with `ESRCH`, or no recorded start) is not known to be clear: it is named in
+the outcome's `error`, and the outcome is not `COMPLETE` either.
 
 Who ends the run:
 
@@ -116,8 +118,9 @@ Who ends the run:
   child) first, drains and sweeps S, reaps the supervisor within 1 s, records
   `relay-death` and exits.
 - **Relay fallback** (the guardian stopped, lost, malformed or slow): the relay
-  first SIGSTOPs a live guardian (recorded as `guardian-stop`), so it cannot
-  spawn a supervisor after the lookup. It names the supervisor (the pid
+  first SIGSTOPs a live guardian (recorded as `guardian-stop`, and what its
+  bounded wait observed as `guardian-stopped`), so it cannot spawn a
+  supervisor after the lookup. It names the supervisor (the pid
   `STARTED` reported, or, before `STARTED`, the guardian's only child in S,
   found while the guardian is still its unreaped child), then SIGKILLs the
   guardian by pid, but only while it is the relay's
@@ -344,7 +347,8 @@ Stated, not closed here:
     once with nothing to wait for, continues only stopped untraced members
     (still after a failed first reading), and scales its cap with the
     debugserver count; a member left as a zombie
-    under launchd is reported and keeps the outcome from `COMPLETE`;
+    under launchd is reported and keeps the outcome from `COMPLETE`, and so
+    does one whose final check cannot be read (named in `error`);
   - spawn: no SIGPIPE inheritance, a new session, exact descriptor passing.
 - `tests/t1_kernel.rs`, on the real kernel:
   - with the anchor forced off, claimants are reported `UNVERIFIABLE` and not
@@ -364,8 +368,8 @@ Stated, not closed here:
   - the fail-closed transitions that a scripted guardian can produce (EOF,
     malformed, oversized and unknown frames, a stopped, silent, hung or
     exited guardian, a wrong session claim);
-  - a live guardian stopped (`guardian-stop`) before its kill, in the fallback
-    (#205);
+  - a live guardian observed stopped (`guardian-stopped` with `Stopped`)
+    before its kill, in the fallback (#205);
   - the bounds.
 
   Every case that starts a guardian also checks that the single reap is the
