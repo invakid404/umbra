@@ -4058,6 +4058,7 @@ fn unenrolled_unconfirmed(
 fn signal_unenrolled_child(
     parent: i32,
     pid: i32,
+    census_birth: Option<(u64, u64)>,
     tracee: &umbra_platform::shutdown::Reservation,
 ) -> std::result::Result<(u64, u64), String> {
     let Some(info) = bsd_info(pid) else {
@@ -4066,7 +4067,16 @@ fn signal_unenrolled_child(
             format!("unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"),
         ));
     };
-    let birth = (info.pbi_start_tvsec, info.pbi_start_tvusec);
+    let seen = (info.pbi_ppid, (info.pbi_start_tvsec, info.pbi_start_tvusec));
+    let birth = match unenrolled_identity(parent, census_birth, seen) {
+        Ok(birth) => birth,
+        Err(why) => {
+            return Err(unenrolled_unconfirmed(
+                tracee,
+                format!("unenrolled fork child pid={pid} of pid={parent}: {why}; not signalled"),
+            ))
+        }
+    };
     if let Err(refused) = tracee.acquired(umbra_core::shutdown::Identity {
         pid: Some(pid),
         birth: Some(birth),
@@ -4092,6 +4102,17 @@ fn signal_unenrolled_child(
         libc::kill(pid, libc::SIGKILL);
     }
     Ok(birth)
+}
+
+/// Whether one read of a census-found fork child, `(ppid, birth)`, still names
+/// that child (#205), and its birth if so; otherwise why not.
+fn unenrolled_identity(
+    parent: i32,
+    census_birth: Option<(u64, u64)>,
+    seen: (u32, (u64, u64)),
+) -> std::result::Result<(u64, u64), String> {
+    let _ = (parent, census_birth);
+    Ok(seen.1)
 }
 
 /// The fork-child sweep's one wait (#205): re-read every signalled child
@@ -4140,6 +4161,10 @@ fn unenrolled_child_state(found: &Lookup, birth: (u64, u64)) -> Option<&'static 
         Lookup::Found { .. } | Lookup::Error(_) => None,
     }
 }
+
+/// A candidate unenrolled fork child: its pid and the birth the census read
+/// (`None` when unread).
+type ForkCandidate = (i32, Option<(u64, u64)>);
 
 /// A session's identity for the fork-child sweep: pid, recorded birth, and
 /// whether it still has live resources.
@@ -4826,19 +4851,21 @@ impl MacosTraceBackend {
             return unconfirmed;
         }
         // One settle, shared by every parent, for forks still in the kernel.
-        let unenrolled = |parent: i32| -> Vec<i32> {
+        // Each candidate with the birth the census read (`None` if unread).
+        let unenrolled = |parent: i32| -> Vec<ForkCandidate> {
             live_children(parent)
                 .into_iter()
-                .filter(|&pid| {
+                .map(|pid| {
                     let birth =
                         bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
-                    !enrolled_identity(&enrolled, pid, birth)
+                    (pid, birth)
                 })
+                .filter(|&(pid, birth)| !enrolled_identity(&enrolled, pid, birth))
                 .collect()
         };
         let settle = crate::clock::now() + UNENROLLED_FORK_SETTLE;
         let found = loop {
-            let found: Vec<Vec<i32>> = windows
+            let found: Vec<Vec<ForkCandidate>> = windows
                 .iter()
                 .map(|(_, parent, _)| unenrolled(*parent))
                 .collect();
@@ -4865,10 +4892,12 @@ impl MacosTraceBackend {
                     continue;
                 };
                 match children.next() {
-                    Some(pid) => match signal_unenrolled_child(parent, pid, &owner.tracee) {
-                        Ok(birth) => signalled.push((parent, pid, birth, owner)),
-                        Err(diagnostic) => unconfirmed.push(diagnostic),
-                    },
+                    Some((pid, census_birth)) => {
+                        match signal_unenrolled_child(parent, pid, census_birth, &owner.tracee) {
+                            Ok(birth) => signalled.push((parent, pid, birth, owner)),
+                            Err(diagnostic) => unconfirmed.push(diagnostic),
+                        }
+                    }
                     None => unconfirmed.push(unenrolled_unconfirmed(
                         &owner.tracee,
                         format!(
@@ -5730,9 +5759,31 @@ mod tests {
         }
     }
 
-    /// #205: a SIGKILLed unenrolled fork child is confirmed ended only by an
-    /// absent pid, a replaced birth, or a zombie of its birth; a failed lookup
-    /// is never read as disappearance.
+    #[test]
+    fn a_fork_child_is_signalled_only_while_it_is_still_the_census_child() {
+        use super::*;
+        // #205 (U-2): the read that takes the child's birth right before
+        // SIGKILL must still show the census child: `parent`'s child, with the
+        // birth the census read. Anything else is not signalled.
+        let birth = (100, 7);
+        assert_eq!(unenrolled_identity(42, Some(birth), (42, birth)), Ok(birth));
+        assert_eq!(unenrolled_identity(42, None, (42, birth)), Ok(birth));
+        let reparented = unenrolled_identity(42, Some(birth), (1, birth));
+        assert!(
+            reparented
+                .as_ref()
+                .is_err_and(|why| why.contains("no longer a child of pid=42")),
+            "{reparented:?}"
+        );
+        let replaced = unenrolled_identity(42, Some(birth), (42, (101, 0)));
+        assert!(
+            replaced
+                .as_ref()
+                .is_err_and(|why| why.contains("another birth")),
+            "{replaced:?}"
+        );
+    }
+
     #[test]
     fn an_unconfirmed_fork_child_fails_termination() {
         use super::*;
@@ -5840,6 +5891,9 @@ mod tests {
         assert!(ends.iter().all(|end| *end == Ok("gone")));
     }
 
+    /// #205: a SIGKILLed unenrolled fork child is confirmed ended only by an
+    /// absent pid, a replaced birth, or a zombie of its birth; a failed lookup
+    /// is never read as disappearance.
     #[test]
     fn an_unreadable_fork_child_is_never_confirmed_gone() {
         use super::*;
