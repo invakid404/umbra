@@ -172,6 +172,10 @@ Probe controls are listed under [Provider binary](#provider-binary).
   SIGHUP, SIGINT, SIGQUIT and SIGTERM, only where the process inherited their
   default action (#205; "Signals" under the provider binary). The provider
   binary calls it before its handshake.
+- `spawn_profile_qualified()` answers whether this host's packed-spawn ABI is
+  the qualified profile, by the exact predicate packed-spawn capture refuses
+  on. It is a read-only, `#[doc(hidden)]` seam for the userspace suite's
+  profile-conditional cases (#247); the backend never calls it.
 <!-- /memoria:section -->
 
 <!-- memoria:section id="shipped-mechanisms" files="src/interpose.rs src/rsp.rs src/native.rs src/abi.rs src/cache.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->
@@ -759,8 +763,10 @@ with `TerminationPolicy::Immediate`. Supervised closure then uses
 the provider process before recording completion.
 
 Termination tears each session down in order, children first (#186):
-- continue its debugserver (SIGCONT, unconditionally: a stopped debugserver
-  never answers `k`), recording `TracerContinued` when it was stopped (#205);
+- continue its debugserver (SIGCONT, unconditionally while it is unreaped: a
+  stopped debugserver never answers `k`, and a reaped one's pid may already
+  name another process), recording `TracerContinued` when it was stopped
+  (#205);
 - send RSP `k` to its debugserver;
 - wait for a barrier proving the tracee has passed its exit accounting:
   - a zombie with its attach-time start identity, under any parent but
@@ -852,9 +858,21 @@ launchd as a zombie nobody collects:
   (`QSetDetachOnError:0`) and exits about 2 s later, but finishes exiting
   while the tracee is still mid-exit, so the tracee is left to launchd. #198's
   1 s observation of a debugserver still holding the tracee is the start of
-  that window.
-- **R3:** a hung debugserver on the timeout path; the kill can hand its tracee
-  to launchd, and `Terminate` fails and names it.
+  that window. One trigger is umbra's own: the supervisor's platform client,
+  when dropped, closes the connection and SIGKILLs the provider at once
+  (`umbra-core`'s `Client::drop`). Its normal end does not reach that drop
+  while anything is held: it waits for the provider's `Final`. A shutdown
+  error before `Final` (the envelope deadline, a transport error) or a panic
+  while a session is live does, and is R2.
+- **R3:** a hung or slow debugserver on the timeout path; the kill can hand
+  its tracee to launchd, and `Terminate` fails and names it. Slow includes a
+  debugserver still inside its own kill of a running tracee: it first stops
+  the tracee with SIGSTOP and waits up to 2 s for that stop, then sends
+  `PT_KILL` and waits up to 1 s more (LLVM `MachProcess::Kill`,
+  `MachProcess::DoSIGSTOP`), longer than the 1.5 s per-session bound.
+  On CI, `sid1_p1`'s child, a running tracee whose debugserver was not the
+  stopped one, timed out on this path: its `k` was still unconfirmed after
+  1.5 s with the child running, and it was confirmed after the kill.
 
 `SIGKILL` or other cancellation that bypasses `Terminate` and drop reaches R1 or
 R2. In launchd's session none of these reaches a group there: #193 runs the
@@ -1004,6 +1022,9 @@ uses too.
 Further #205 coverage:
 - `native::tests::a_tracee_handed_to_launchd_is_never_confirmed` and
   `native::tests::the_teardown_opens_by_continuing_its_tracer` are pure units.
+  `native::tests::a_reaped_tracer_is_never_continued` pins that the
+  prologue never signals a reaped tracer's pid (a stopped process standing in
+  for its reuse stays stopped) and still continues an unreaped stopped one.
 - `rsp::tests::debugserver_ignores_terminal_signals` reads a live
   debugserver's ignored signals (no program attached) and sends each.
 - `tests/lifetime_signals.rs` sends the provider SIGHUP, SIGINT, SIGQUIT and

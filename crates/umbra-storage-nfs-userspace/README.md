@@ -49,6 +49,23 @@ remains ([#135](https://github.com/invakid404/umbra/issues/135)). The secondary-
 null-descriptor case bypasses `SpawnPrepare` and is a comparison control, not
 proof of lazy registration.
 
+Packed spawn is admitted only on the measured macOS 26.5.1 (25F80) profile. On
+any other spawn profile the platform refuses every packed spawn, failing
+closed. On macOS 27.2.1 (26B131) the private `posix_spawn` attribute block grew
+from 248 to 256 bytes, so packed spawn is refused there; requalifying it is
+[#247](https://github.com/invakid404/umbra/issues/247). The 24 cases that route
+a packed spawn (21 `fix_243_*`, both `slate_c11_02_empty_*` and
+`slate_c11_10_e8_pipe_refusal`) branch on the platform's own predicate, the one
+`capture_spawn` refuses on (`umbra_platform_macos::spawn_profile_qualified`),
+never on an OS version chosen by the test:
+
+- **On the qualified profile,** they make their positive assertions as above.
+- **On any other profile,** each asserts the exact refusal: the native control
+  spawns; the routed run fails with `UnsupportedCapability during macos: spawn
+  ABI profile mismatch (errno: None)` and reports no tracee completion; the
+  program reached its spawn, and nothing was spawned. That is no positive
+  coverage of packed spawn, only of its fail-closed refusal.
+
 The optional `mutation-probe-spawn-lifecycle` feature enables lifecycle fault
 tests. CI builds both the CLI and platform provider with that feature and
 builds the `umbra243relay` example for guardian cases. The selected tests cover
@@ -1007,9 +1024,12 @@ as a zombie nobody collects:
 
 1. The launched `umbra` is killed first. In launchd's session that is the
    relay, whose death starts the guardian's own debugger-last ending.
-2. The launcher waits until no live member of the run's group or session is a
-   debugserver or traced, capped at 3 s + 4 s per debugserver at the first
-   reading, and records a `DRAIN` census event.
+2. The launcher waits until a readable census shows no live member of the
+   run's group or session that is a debugserver or traced, capped at 3 s +
+   4 s per debugserver at the first readable census, and records a `DRAIN`
+   census event. A census that cannot be read never ends the wait: the drain
+   runs to its cap, reports `exceeded=true` unless a later census reads
+   nothing left, and records the error.
 3. The cleanup grace grows to at least 9 s + 4 s per debugserver
    (`slate_cleanup_budget`: the guardian's drain cap, its 3 s sweep and 1 s
    reap, and a 2 s margin), and the group kill follows.
