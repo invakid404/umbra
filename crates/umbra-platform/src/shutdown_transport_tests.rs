@@ -617,3 +617,23 @@ fn shutdown_poll_preserves_deadlines() {
     release_tx.send(()).unwrap();
     assert!(owner.join().unwrap().is_err());
 }
+
+/// #205: `close_client`'s unconfirmed-Final error names each unconfirmed
+/// entry (kind, pid or `?`, disposition), keeps the diagnostics and the exit
+/// result, and does not list a confirmed entry.
+#[test]
+fn the_close_client_message_names_its_obligations() {
+    let (accepted, final_state) = crate::shutdown::scripted_unconfirmed_final();
+    assert!(!accepted.confirms(&final_state).unwrap());
+    let exit: Result<Duration> = Ok(Duration::from_millis(3));
+    let message = super::unconfirmed_final(&final_state, &exit);
+    for named in [
+        "Tracee pid=4242 Unconfirmed(\"owner destroyed without terminal proof\")",
+        "TaskRight pid=? Unconfirmed(\"owner destroyed without terminal proof\")",
+        "poisoned: scripted ownership failure",
+        "exit: Ok(3ms)",
+    ] {
+        assert!(message.contains(named), "{named} missing from: {message}");
+    }
+    assert!(!message.contains("Tracer pid=5151"), "{message}");
+}
