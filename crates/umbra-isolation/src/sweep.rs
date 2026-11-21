@@ -405,8 +405,12 @@ fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, bool) {
             }
             // No reading: keep reading until the cap. Unavailable is never
             // read as "nothing left to wait for".
+            // The members a cut census verified are kept for the final zombie
+            // check only; they decide nothing here.
             Err(cut) => {
-                let _ = cut.seen;
+                for t in cut.seen {
+                    seen.insert((token_pid(&t), token_version(&t)), t);
+                }
                 cap.get_or_insert(start + drain_cap(1));
             }
         }
