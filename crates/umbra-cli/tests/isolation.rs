@@ -189,6 +189,21 @@ fn own_session() -> i32 {
         .sid
 }
 
+/// `(pid, start)` of a live (not zombie) process, from the census.
+fn identity(pid: i32) -> Option<(i32, i64)> {
+    procs()
+        .into_iter()
+        .find(|p| p.pid == pid && p.stat != SZOMB)
+        .map(|p| (p.pid, p.start_us))
+}
+
+/// Whether this exact process (pid and start) is still live, not a zombie.
+fn identity_live((pid, start): (i32, i64)) -> bool {
+    procs()
+        .iter()
+        .any(|p| p.pid == pid && p.start_us == start && p.stat != SZOMB)
+}
+
 /// Signal one pid this harness discovered by parentage.
 fn signal(pid: i32, sig: &str) {
     let ok = Command::new("/bin/kill")
@@ -1014,7 +1029,7 @@ fn sid1_p1_stopped_tracer_at_the_deadline() {
 }
 
 /// P2, reshaped for #205 (OD2): the running root is killed, then its
-/// debugserver 50 ms later.
+/// debugserver once the root is dead.
 ///
 /// It used to kill the root while it was **held** at a debugger stop and then
 /// the debugserver, which is #193's uncounted-reparent route: the held exit
@@ -1022,10 +1037,15 @@ fn sid1_p1_stopped_tracer_at_the_deadline() {
 /// half-exited tracee to launchd as a zombie nobody collects. That route is
 /// kernel behaviour with no software fix (#205 R1), and every run of it left a
 /// zombie, so it no longer has a SID-1 regression here. Now the root is in an
-/// ordinary blocking wait (`sleep`), so the kill ends it at once, its zombie is
-/// still its debugserver's child when that dies, and the kernel hands it back
-/// to the platform. The SID-1 kill sequence keeps its coverage: no SIGHUP to
-/// umbra, the caller's group untouched, a status reported, nothing left.
+/// ordinary blocking wait (`sleep`), so the kill ends it at once. Its
+/// debugserver then reports the exit and usually ends by itself (CI showed it
+/// gone 50 ms later), so the second step is exact rather than assumed: the
+/// debugserver's (pid, start) is recorded before the root's kill, and after the
+/// root's death it is either already gone, or killed by the test, or `kill`
+/// reports no such process and that same identity is proven gone. Anything
+/// else fails. The oracle is the SID-1 kill sequence's: no SIGHUP to umbra,
+/// the caller's group untouched, a status reported, nothing left, and no
+/// launchd-parented zombie.
 #[test]
 fn sid1_p2_running_tracee_killed_then_its_tracer() {
     if !qualified() || !in_launchd_session() {
@@ -1034,9 +1054,39 @@ fn sid1_p2_running_tracee_killed_then_its_tracer() {
     let mut run = Run::start("P2", false, true, 20_000, &["sleep"]);
     std::thread::sleep(Duration::from_millis(500));
     let tree = run.discover();
+    let root = identity(tree.root).expect("the root is live before its kill");
+    let tracer =
+        identity(tree.root_tracer).expect("its debugserver is live before the root's kill");
     signal(tree.root, "KILL");
-    std::thread::sleep(Duration::from_millis(50));
-    signal(tree.root_tracer, "KILL");
+    let end = Instant::now() + Duration::from_secs(5);
+    while identity_live(root) {
+        assert!(
+            Instant::now() < end,
+            "the root {root:?} survived its SIGKILL for 5 s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ended = if !identity_live(tracer) {
+        "ended by itself after its program's death"
+    } else {
+        let out = Command::new("/bin/kill")
+            .args(["-KILL", &tracer.0.to_string()])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() {
+            "ended by the test"
+        } else if stderr.contains("No such process") {
+            assert!(
+                !identity_live(tracer),
+                "kill reported no such process, but {tracer:?} is still live"
+            );
+            "ended by itself after its program's death"
+        } else {
+            panic!("kill -KILL {}: {stderr}", tracer.0);
+        }
+    };
+    eprintln!("P2: debugserver {tracer:?} {ended}");
     let o = run.finish(Duration::from_secs(45));
     assert_no_sighup_to_umbra(o);
     assert_caller_group_untouched(o);
