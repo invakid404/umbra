@@ -44,6 +44,15 @@ pub fn launchd_zombies(
         .args(["-A", "-o", "pid=,ppid=,stat="])
         .output()
         .expect("ps");
+    // A failed census is no reading, never "no zombies": report it as an entry,
+    // so a caller's emptiness assertion fails.
+    if !out.status.success() {
+        return vec![format!(
+            "ps failed ({}): no reading: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )];
+    }
     // SAFETY: getuid has no arguments.
     let uid = unsafe { libc::getuid() };
     let mut found = Vec::new();

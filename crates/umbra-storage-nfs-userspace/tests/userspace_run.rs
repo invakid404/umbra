@@ -8388,7 +8388,7 @@ struct SlateDrain {
 /// from the first readable census (`base + per` until there is one).
 fn slate_drain(
     mut members: impl FnMut(std::time::Instant) -> Result<String, String>,
-    traced: impl Fn(i32) -> bool,
+    traced: impl Fn(i32) -> Option<bool>,
     base: std::time::Duration,
     per: std::time::Duration,
 ) -> SlateDrain {
@@ -8415,7 +8415,9 @@ fn slate_drain(
                     .lines()
                     .filter(live)
                     .filter_map(|line| line.split_whitespace().next()?.parse().ok())
-                    .any(&traced);
+                    // A trace state that cannot be read is not "untraced": it
+                    // keeps the drain waiting, as an unreadable census does.
+                    .any(|pid| traced(pid) != Some(false));
                 let (d, cap) =
                     *first.get_or_insert_with(|| (debuggers, base + per * debuggers.max(1) as u32));
                 if debuggers == 0 && !any_traced {
@@ -8451,8 +8453,9 @@ fn slate_drain(
     }
 }
 
-/// Whether `pid` is traced (`PROC_FLAG_TRACED`), read-only.
-fn slate_traced(pid: i32) -> bool {
+/// Whether `pid` is traced (`PROC_FLAG_TRACED`), read-only; `None` when its
+/// record cannot be read.
+fn slate_traced(pid: i32) -> Option<bool> {
     // SAFETY: plain old data, filled by proc_pidinfo below.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
@@ -8466,7 +8469,7 @@ fn slate_traced(pid: i32) -> bool {
             size,
         )
     };
-    got == size && info.pbi_flags & 2 != 0 // PROC_FLAG_TRACED
+    (got == size).then_some(info.pbi_flags & 2 != 0) // PROC_FLAG_TRACED
 }
 
 /// #205: the drain never reads an unavailable census as nothing left.
@@ -8475,7 +8478,12 @@ fn slate_drain_never_reads_an_unavailable_census_as_empty() {
     use std::time::{Duration, Instant};
     let (base, per) = (Duration::from_millis(30), Duration::from_millis(40));
     let start = Instant::now();
-    let drain = slate_drain(|_| Err("census unavailable".into()), |_| false, base, per);
+    let drain = slate_drain(
+        |_| Err("census unavailable".into()),
+        |_| Some(false),
+        base,
+        per,
+    );
     assert!(drain.exceeded, "an unread census drained: {drain:?}");
     assert!(
         start.elapsed() >= base + per,
@@ -8492,7 +8500,7 @@ fn slate_drain_never_reads_an_unavailable_census_as_empty() {
                 Ok(String::new())
             }
         },
-        |_| false,
+        |_| Some(false),
         base,
         per,
     );
@@ -8500,11 +8508,24 @@ fn slate_drain_never_reads_an_unavailable_census_as_empty() {
     assert_eq!(drain.census_error.as_deref(), Some("transient"));
     let drain = slate_drain(
         |_| Ok("4242 1 4242 S /usr/bin/debugserver".into()),
-        |_| false,
+        |_| Some(false),
         base,
         per,
     );
     assert!(drain.exceeded && drain.debuggers == 1, "{drain:?}");
+    // A live member whose trace state cannot be read keeps the drain waiting.
+    let start = Instant::now();
+    let drain = slate_drain(
+        |_| Ok("4343 1 4343 S /bin/sleep".into()),
+        |_| None,
+        base,
+        per,
+    );
+    assert!(
+        drain.exceeded,
+        "an unreadable trace state drained: {drain:?}"
+    );
+    assert!(start.elapsed() >= base + per, "{drain:?}");
 }
 
 /// #205: the cleanup census's budget after a debugger-last ending with `d`
@@ -8525,7 +8546,8 @@ fn slate_zombie_window() -> (u64, u64) {
 
 /// #205 per-case guard: launchd-parented zombies of this user whose image is a
 /// fixture of this suite (`umbra-userspace-*`, `umbra-slate-*`, `umbra-fix-*`,
-/// by 16-character `ucomm` prefix) and that started inside the case's window.
+/// by process name, `pbi_name`) and that started inside the case's window. A
+/// failed census is reported as no reading.
 ///
 /// The group census accepts zombies that are still in the run's group as
 /// dead-table residue. A zombie **under launchd** is different: when a
@@ -8539,6 +8561,14 @@ fn slate_launchd_zombies(since: (u64, u64)) -> Vec<String> {
     else {
         return vec!["ps unavailable: no reading".into()];
     };
+    // A failed census is no reading, never "no zombies".
+    if !out.status.success() {
+        return vec![format!(
+            "ps failed ({}): no reading: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )];
+    }
     // SAFETY: getuid has no arguments.
     let uid = unsafe { libc::getuid() };
     let mut found = Vec::new();
@@ -8575,12 +8605,18 @@ fn slate_launchd_zombies(since: (u64, u64)) -> Vec<String> {
             continue;
         }
         let start = (info.pbi_start_tvsec, info.pbi_start_tvusec);
-        let name: String = info
-            .pbi_comm
-            .iter()
-            .take_while(|c| **c != 0)
-            .map(|c| *c as u8 as char)
-            .collect();
+        // `pbi_comm` keeps 15 bytes (`umbra-userspace-spawn` reads as
+        // `umbra-userspace`); `pbi_name` keeps the name to 32 bytes.
+        let c_name = |raw: &[libc::c_char]| -> String {
+            raw.iter()
+                .take_while(|c| **c != 0)
+                .map(|c| *c as u8 as char)
+                .collect()
+        };
+        let name = match c_name(&info.pbi_name) {
+            long if !long.is_empty() => long,
+            _ => c_name(&info.pbi_comm),
+        };
         let ours = ["umbra-userspace-", "umbra-slate-", "umbra-fix-"]
             .iter()
             .any(|prefix| name.starts_with(prefix));
@@ -10276,17 +10312,19 @@ fn slate_spawn_profile_refusal_in(
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string())),
     );
+    // `opened.txt` is what the refused OPEN action would have created; it is
+    // read for every mode and must be absent, as `fix_243_refusal` requires.
     let names: &[&str] = if virtual_victim {
-        &["child.txt", "victim.txt"]
+        &["child.txt", "opened.txt", "victim.txt"]
     } else {
-        &["child.txt"]
+        &["child.txt", "opened.txt"]
     };
     let routed = slate_spawn_routed(&spawn, mode, names);
     let exact = routed.run.status != Some(0)
         && routed.run.stderr.contains(SLATE_SPAWN_PROFILE_REFUSAL)
         && !routed.run.stderr.contains("finished:")
         && routed.object("records.pre").is_some()
-        && ["records.child", "records.done", "child.txt"]
+        && ["records.child", "records.done", "child.txt", "opened.txt"]
             .iter()
             .all(|name| routed.object(name).is_none());
     slate_record(
@@ -11341,6 +11379,12 @@ fn fix_205_refusal_with_an_unenrolled_fork_child() {
     let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
     let first = cleanup.lines().next().unwrap_or_default();
     let held = routed.run.stderr.contains("fork-window-hold parent=");
+    // The second fork really produced a child that stayed unenrolled in its
+    // window: the teardown found it by parentage and ended it.
+    let swept = routed
+        .run
+        .stderr
+        .contains("unenrolled fork child ended: pid=");
     let exact = routed.run.status != Some(0)
         && routed.run.stderr.contains(diagnostic)
         && !routed.run.stderr.contains("cleanup also failed")
@@ -11354,19 +11398,25 @@ fn fix_205_refusal_with_an_unenrolled_fork_child() {
         && first.contains("zombies=\"\"");
     slate_record(
         &spawn,
-        if held && exact && clean {
+        if held && swept && exact && clean {
             "EXACT KNOWN REFUSAL"
         } else {
             "NOT QUALIFIED"
         },
         serde_json::json!({
-            "diagnostic": diagnostic, "fork_window_held": held, "cleanup": first,
+            "diagnostic": diagnostic, "fork_window_held": held,
+            "unenrolled_child_swept": swept, "cleanup": first,
             "run_id": routed.run.run_id.0.to_string(),
         }),
     );
     assert!(
         held,
         "the probe never held a fork window:\n{}",
+        routed.run.stderr
+    );
+    assert!(
+        swept,
+        "no unenrolled fork child was found in the held window:\n{}",
         routed.run.stderr
     );
     assert!(exact, "{}", routed.run.stderr);

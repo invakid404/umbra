@@ -861,7 +861,13 @@ static int fork_window(const char *root, const char *helper) {
     close(gate[0]);
     if (write(gate[1], "g", 1) != 1) return 146;
     pid_t second = fork();
-    if (second < 0) return 147;
+    if (second < 0) {
+        /* The gate is already open (it must be, for the window): wait for the
+         * first child rather than leave it running past the root. */
+        int status = 0;
+        reap(first, &status);
+        return 147;
+    }
     if (!second) _exit(0);
     int status = 0;
     if (reap(first, &status) || reap(second, &status)) return 148;

@@ -1324,6 +1324,13 @@ fn sid1_sigterm_to_the_relay_cancels_the_run() {
         .find(|v| v["event"] == "relay-death")
         .expect("the guardian recorded relay death");
     assert_eq!(death["outcome"], "COMPLETE", "{death}");
+    // The guardian reports only members it enrolled; the finish census also
+    // counts a launchd-parented zombie of the run that was never enrolled.
+    assert!(
+        o.zombies.is_empty(),
+        "launchd-parented zombies of the run: {:?}",
+        o.zombies
+    );
 }
 
 /// Outside launchd's session nothing changes: no relay, no guardian; the

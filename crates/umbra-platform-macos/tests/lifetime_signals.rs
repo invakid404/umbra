@@ -354,15 +354,16 @@ fn provider_keeps_inherited_ignored_signals() {
                 "--test-threads=1",
             ])
             .env("UMBRA_FIX205_DISPOSITION_CASE", case);
-        if ignore {
-            // SAFETY: only async-signal-safe libc between fork and exec.
-            unsafe {
-                child.pre_exec(|| {
-                    libc::signal(libc::SIGHUP, libc::SIG_IGN);
-                    libc::signal(libc::SIGINT, libc::SIG_IGN);
-                    Ok(())
-                });
-            }
+        // Both cases set the dispositions explicitly, so the "default" case
+        // does not inherit an ignore this test process itself was started with.
+        let disposition = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };
+        // SAFETY: only async-signal-safe libc between fork and exec.
+        unsafe {
+            child.pre_exec(move || {
+                libc::signal(libc::SIGHUP, disposition);
+                libc::signal(libc::SIGINT, disposition);
+                Ok(())
+            });
         }
         let out = child.output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
