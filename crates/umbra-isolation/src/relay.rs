@@ -166,14 +166,25 @@ impl Relay {
             libc::kill(self.g, libc::SIGSTOP);
         }
         let end = Instant::now() + REAP;
-        while Instant::now() < end
-            && !matches!(
-                observe(self.g),
+        let observed = loop {
+            let seen = observe(self.g);
+            if matches!(
+                seen,
                 None | Some(Guardian::Stopped | Guardian::Exited | Guardian::Gone)
-            )
-        {
+            ) || Instant::now() >= end
+            {
+                break seen;
+            }
             std::thread::sleep(Duration::from_millis(5));
-        }
+        };
+        // What the stop achieved, not just that it was asked for.
+        self.rec.line(
+            "guardian-stopped",
+            serde_json::json!({
+                "pid": self.g,
+                "observed": observed.map_or_else(|| "none".to_owned(), |g| format!("{g:?}")),
+            }),
+        );
     }
     /// The single reap, bounded by REAP: the last numeric-pid operation
     /// (R-10). Only record I/O, stderr and this process's own exit follow it.
