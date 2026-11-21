@@ -381,16 +381,26 @@ jobs:
       # keeps a vendor argv[0] is found too), or umbra's debugserver (its argv
       # carries `--reverse-connect 127.0.0.1:`). A process whose executable path
       # cannot be read is listed as a leftover; only one proven gone (ESRCH) is
-      # skipped. Zombies are counted above, not again as leftovers. The
+      # skipped. Zombies are counted above, not again as leftovers. Both checks
+      # read ONE process table, so a process cannot be live in the zombie check
+      # and a zombie in the leftover check; a failed `ps` fails the step. The
       # baseline is the first file by name, so an empty baseline still reports
       # every new zombie.
       - name: Zombie and leftover census at job end (#205)
         if: always()
         run: |
+          set -o pipefail
           start="$RUNNER_TEMP/umbra-zombies-start.txt"
           end="$RUNNER_TEMP/umbra-zombies-end.txt"
-          ps -A -o stat=,pid=,ppid=,user=,lstart=,ucomm= \
-            | awk -v u="$(id -un)" '$1 ~ /^Z/ && $3 == 1 && $4 == u' > "$end"
+          snapshot="$RUNNER_TEMP/umbra-processes-end.txt"
+          # One process table for both checks. Its first nine fields match the
+          # start census (stat, pid, ppid, user, lstart), so the zombie keys
+          # ($2 and $5-$9) compare as before.
+          if ! ps -A -o stat=,pid=,ppid=,user=,lstart=,etime=,ucomm=,command= > "$snapshot"; then
+            echo "::error::the end census produced no reading (#205)"
+            exit 1
+          fi
+          awk -v u="$(id -un)" '$1 ~ /^Z/ && $3 == 1 && $4 == u' "$snapshot" > "$end"
           cp "$end" "${RUNNER_TOOL_CACHE:-$HOME}/umbra-ci-zombies-end.txt" || true
           touch "$start"
           new=$(awk 'FILENAME == ARGV[1] { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
@@ -403,8 +413,7 @@ jobs:
           # candidate (0) to proc_pidpath. The helper never spells the twin
           # path in one literal, so its own command line cannot match it.
           leftovers=$(set -o pipefail
-            ps -A -o pid=,ppid=,user=,stat=,etime=,ucomm=,command= | awk \
-            -v u="$(id -un)" -v window="$window" -v me="$me" '
+            awk -v u="$(id -un)" -v window="$window" -v me="$me" '
             function seconds(t,  n, a, d, h, m, s) {
               d = 0; h = 0
               if (index(t, "-") > 0) { split(t, a, "-"); d = a[1]; t = a[2] }
@@ -412,12 +421,12 @@ jobs:
               if (n == 3) { h = a[1]; m = a[2]; s = a[3] } else { m = a[1]; s = a[2] }
               return ((d * 24 + h) * 60 + m) * 60 + s
             }
-            $3 == u && $1 != me && $2 != me && $4 !~ /^Z/ && seconds($5) <= window {
-              name = $6
+            $4 == u && $2 != me && $3 != me && $1 !~ /^Z/ && seconds($10) <= window {
+              name = $11
               hit = (name ~ /^umbra/ || $0 ~ /\/Library\/Caches\/umbra\/twins\// ||
                      (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
               print (hit ? 1 : 0), $0
-            }' | python3 -I -c '
+            }' "$snapshot" | python3 -I -c '
           import ctypes, sys
           libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
           libc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
@@ -429,7 +438,7 @@ jobs:
                   continue
               buf = ctypes.create_string_buffer(4096)
               ctypes.set_errno(0)
-              n = libc.proc_pidpath(int(row.split()[0]), buf, 4096)
+              n = libc.proc_pidpath(int(row.split()[1]), buf, 4096)
               if n > 0:
                   path = buf.raw[:n].decode("utf-8", "replace")
                   if twins in path:
@@ -1095,16 +1104,26 @@ jobs:
       # keeps a vendor argv[0] is found too), or umbra's debugserver (its argv
       # carries `--reverse-connect 127.0.0.1:`). A process whose executable path
       # cannot be read is listed as a leftover; only one proven gone (ESRCH) is
-      # skipped. Zombies are counted above, not again as leftovers. The
+      # skipped. Zombies are counted above, not again as leftovers. Both checks
+      # read ONE process table, so a process cannot be live in the zombie check
+      # and a zombie in the leftover check; a failed `ps` fails the step. The
       # baseline is the first file by name, so an empty baseline still reports
       # every new zombie.
       - name: Zombie and leftover census at job end (#205)
         if: always()
         run: |
+          set -o pipefail
           start="$RUNNER_TEMP/umbra-zombies-start.txt"
           end="$RUNNER_TEMP/umbra-zombies-end.txt"
-          ps -A -o stat=,pid=,ppid=,user=,lstart=,ucomm= \
-            | awk -v u="$(id -un)" '$1 ~ /^Z/ && $3 == 1 && $4 == u' > "$end"
+          snapshot="$RUNNER_TEMP/umbra-processes-end.txt"
+          # One process table for both checks. Its first nine fields match the
+          # start census (stat, pid, ppid, user, lstart), so the zombie keys
+          # ($2 and $5-$9) compare as before.
+          if ! ps -A -o stat=,pid=,ppid=,user=,lstart=,etime=,ucomm=,command= > "$snapshot"; then
+            echo "::error::the end census produced no reading (#205)"
+            exit 1
+          fi
+          awk -v u="$(id -un)" '$1 ~ /^Z/ && $3 == 1 && $4 == u' "$snapshot" > "$end"
           cp "$end" "${RUNNER_TOOL_CACHE:-$HOME}/umbra-ci-zombies-end.txt" || true
           touch "$start"
           new=$(awk 'FILENAME == ARGV[1] { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
@@ -1117,8 +1136,7 @@ jobs:
           # candidate (0) to proc_pidpath. The helper never spells the twin
           # path in one literal, so its own command line cannot match it.
           leftovers=$(set -o pipefail
-            ps -A -o pid=,ppid=,user=,stat=,etime=,ucomm=,command= | awk \
-            -v u="$(id -un)" -v window="$window" -v me="$me" '
+            awk -v u="$(id -un)" -v window="$window" -v me="$me" '
             function seconds(t,  n, a, d, h, m, s) {
               d = 0; h = 0
               if (index(t, "-") > 0) { split(t, a, "-"); d = a[1]; t = a[2] }
@@ -1126,12 +1144,12 @@ jobs:
               if (n == 3) { h = a[1]; m = a[2]; s = a[3] } else { m = a[1]; s = a[2] }
               return ((d * 24 + h) * 60 + m) * 60 + s
             }
-            $3 == u && $1 != me && $2 != me && $4 !~ /^Z/ && seconds($5) <= window {
-              name = $6
+            $4 == u && $2 != me && $3 != me && $1 !~ /^Z/ && seconds($10) <= window {
+              name = $11
               hit = (name ~ /^umbra/ || $0 ~ /\/Library\/Caches\/umbra\/twins\// ||
                      (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
               print (hit ? 1 : 0), $0
-            }' | python3 -I -c '
+            }' "$snapshot" | python3 -I -c '
           import ctypes, sys
           libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
           libc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
@@ -1143,7 +1161,7 @@ jobs:
                   continue
               buf = ctypes.create_string_buffer(4096)
               ctypes.set_errno(0)
-              n = libc.proc_pidpath(int(row.split()[0]), buf, 4096)
+              n = libc.proc_pidpath(int(row.split()[1]), buf, 4096)
               if n > 0:
                   path = buf.raw[:n].decode("utf-8", "replace")
                   if twins in path:
