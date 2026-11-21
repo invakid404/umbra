@@ -4047,9 +4047,16 @@ fn unenrolled_unconfirmed(
 }
 
 /// Begin ending one fork child the platform never enrolled (#205): record its
-/// identity on its ledger reservation and SIGKILL it. The child is a live,
-/// unreaped child of `parent`, which still lives, so its pid cannot be reused
-/// meanwhile. It is untraced unless a debugger is attaching to it; then it is
+/// identity on its ledger reservation and SIGKILL it. The parent cannot reap
+/// it meanwhile: a fork needs a single-threaded parent (`single_thread`), and
+/// that one thread is in the fork or held at its return gate while the window
+/// is open; the child itself spins at that gate. So the pid can name another
+/// process only if something else ended the child, the parent died and
+/// launchd reaped the child, and the pid was reused. The read that takes its
+/// birth right before the signal therefore must still show `parent`'s child
+/// with the birth the census read ([`unenrolled_identity`]), or nothing is
+/// signalled and the slot is unconfirmed. It is untraced unless a debugger is
+/// attaching to it; then it is
 /// left to that debugger (debugger-last: a debugger's program is ended only
 /// through it) and its slot names why it stays unconfirmed. Returns the
 /// child's birth when it was signalled; its end is awaited by
@@ -4111,8 +4118,19 @@ fn unenrolled_identity(
     census_birth: Option<(u64, u64)>,
     seen: (u32, (u64, u64)),
 ) -> std::result::Result<(u64, u64), String> {
-    let _ = (parent, census_birth);
-    Ok(seen.1)
+    let (ppid, birth) = seen;
+    if i64::from(ppid) != i64::from(parent) {
+        return Err(format!(
+            "no longer a child of pid={parent} (parent pid={ppid})"
+        ));
+    }
+    if census_birth.is_some_and(|census| census != birth) {
+        return Err(format!(
+            "another birth at its pid ({}.{:06}) than the census read",
+            birth.0, birth.1
+        ));
+    }
+    Ok(birth)
 }
 
 /// The fork-child sweep's one wait (#205): re-read every signalled child
