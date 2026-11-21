@@ -153,13 +153,16 @@ fn zombie_check(
     start: Option<(u64, u64)>,
 ) -> ZombieCheck {
     let Some(start) = start else {
-        return ZombieCheck::Clear;
+        return ZombieCheck::Unreadable;
     };
     match found {
         Ok((status, ppid, birth)) if status == libc::SZOMB && ppid == 1 && birth == start => {
             ZombieCheck::Zombie
         }
-        Ok(_) | Err(_) => ZombieCheck::Clear,
+        Ok(_) => ZombieCheck::Clear,
+        // Gone: no process, so no zombie, holds the pid.
+        Err(libc::ESRCH) => ZombieCheck::Clear,
+        Err(_) => ZombieCheck::Unreadable,
     }
 }
 

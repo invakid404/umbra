@@ -278,8 +278,9 @@ pub fn drain_cap(debuggers: usize) -> Duration {
 ///    SIGCONT first, by enrolled token, so a stopped provider can finish.
 /// 3. [`sweep`] what is left within `budget`.
 ///
-/// The outcome reports every member seen that is now a zombie under launchd,
-/// and whether the drain reached its cap.
+/// The outcome reports every member seen that is now a zombie under launchd
+/// (and, in `error`, any whose final check could not be read; either keeps it
+/// from `Complete`), and whether the drain reached its cap.
 pub fn end_run(
     host: &mut impl Host,
     sid: i32,
@@ -292,15 +293,29 @@ pub fn end_run(
     let (seen, drain_exceeded) = drain(host, sid);
     let mut outcome = sweep(host, sid, budget);
     outcome.drain_exceeded = drain_exceeded;
-    let mut zombies: Vec<i32> = seen
-        .iter()
-        .filter(|t| host.launchd_zombie(t) == ZombieCheck::Zombie)
-        .map(token_pid)
-        .collect();
+    let mut zombies: Vec<i32> = vec![];
+    let mut unreadable: Vec<i32> = vec![];
+    for token in &seen {
+        match host.launchd_zombie(token) {
+            ZombieCheck::Zombie => zombies.push(token_pid(token)),
+            ZombieCheck::Unreadable => unreadable.push(token_pid(token)),
+            ZombieCheck::Clear => {}
+        }
+    }
     zombies.sort_unstable();
     zombies.dedup();
-    if !zombies.is_empty() && outcome.kind == Kind::Complete {
+    unreadable.sort_unstable();
+    unreadable.dedup();
+    // A member whose final check cannot be read is not known to be clear.
+    if (!zombies.is_empty() || !unreadable.is_empty()) && outcome.kind == Kind::Complete {
         outcome.kind = Kind::Incomplete;
+    }
+    if !unreadable.is_empty() {
+        let note = format!("launchd-zombie check unreadable for pids {unreadable:?}");
+        outcome.error = Some(match outcome.error.take() {
+            Some(error) => format!("{error}; {note}"),
+            None => note,
+        });
     }
     outcome.launchd_zombies = zombies;
     outcome
