@@ -873,6 +873,8 @@ launchd as a zombie nobody collects:
   On CI, `sid1_p1`'s child, a running tracee whose debugserver was not the
   stopped one, timed out on this path: its `k` was still unconfirmed after
   1.5 s with the child running, and it was confirmed after the kill.
+  Debugserver's own kill path fits that reading from source; the cause in
+  that run is not established.
 
 `SIGKILL` or other cancellation that bypasses `Terminate` and drop reaches R1 or
 R2. In launchd's session none of these reaches a group there: #193 runs the

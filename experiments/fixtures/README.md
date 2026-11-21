@@ -396,5 +396,6 @@ does.
 In pty mode, `umbra-isolation-fixture` no longer waits a fixed second before it
 counts survivors. It waits until the run's session holds no live debugserver,
 no traced member and no live platform provider, capped at 3 s + 4 s per
-debugserver at the first reading, so the run's own ordered teardown has its
-time.
+debugserver at the first readable census, so the run's own ordered teardown
+has its time. A census it cannot read never ends that wait: it waits to its
+cap and reports `ISO DRAIN census_unreadable=<n>` on stderr.

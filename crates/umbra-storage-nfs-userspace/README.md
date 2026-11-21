@@ -53,18 +53,24 @@ Packed spawn is admitted only on the measured macOS 26.5.1 (25F80) profile. On
 any other spawn profile the platform refuses every packed spawn, failing
 closed. On macOS 27.2.1 (26B131) the private `posix_spawn` attribute block grew
 from 248 to 256 bytes, so packed spawn is refused there; requalifying it is
-[#247](https://github.com/invakid404/umbra/issues/247). The 24 cases that route
-a packed spawn (21 `fix_243_*`, both `slate_c11_02_empty_*` and
-`slate_c11_10_e8_pipe_refusal`) branch on the platform's own predicate, the one
+[#247](https://github.com/invakid404/umbra/issues/247). Every case measured to
+route a packed spawn branches on the platform's own predicate, the one
 `capture_spawn` refuses on (`umbra_platform_macos::spawn_profile_qualified`),
-never on an OS version chosen by the test:
+never on an OS version chosen by the test. That is 24 cases in the main suite
+(21 `fix_243_*`, both `slate_c11_02_empty_*` and
+`slate_c11_10_e8_pipe_refusal`) and 29 under `mutation-probe-spawn-lifecycle`
+(the registered-attach, completion, inserted, acquired, policy and guardian
+probe cases, and the backing-overlap, region-cap and region-fault cases):
 
 - **On the qualified profile,** they make their positive assertions as above.
-- **On any other profile,** each asserts the exact refusal: the native control
-  spawns; the routed run fails with `UnsupportedCapability during macos: spawn
-  ABI profile mismatch (errno: None)` and reports no tracee completion; the
-  program reached its spawn, and nothing was spawned. That is no positive
-  coverage of packed spawn, only of its fail-closed refusal.
+- **On any other profile,** each asserts the exact refusal. The native control
+  spawns and writes the mode's own bytes (`child.txt`, `spawn result=0`, and a
+  `virtual-*` victim's `SEED`). The routed run fails with `UnsupportedCapability
+  during macos: spawn ABI profile mismatch (errno: None)` and reports no tracee
+  completion; the program reached its spawn, and nothing was spawned. A
+  `virtual-*` victim keeps its `SEED` through the client. A probe case also
+  arms its probe as usual and asserts that nothing ever reached it. That is no
+  positive coverage of packed spawn, only of its fail-closed refusal.
 
 The optional `mutation-probe-spawn-lifecycle` feature enables lifecycle fault
 tests. CI builds both the CLI and platform provider with that feature and
