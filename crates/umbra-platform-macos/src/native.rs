@@ -4006,11 +4006,19 @@ fn live_children(parent: i32) -> Vec<i32> {
 /// (debugger-last: a debugger's program is ended only through it) and its
 /// slot names why it stays unconfirmed. An untraced child is SIGKILLed and
 /// confirmed once it is gone or a zombie under its parent.
+/// Settle an unenrolled fork child's slot as unconfirmed, naming why, and say
+/// so on stderr beside the other teardown lines (#205).
+fn unenrolled_unconfirmed(tracee: &umbra_platform::shutdown::Reservation, diagnostic: String) {
+    eprintln!("umbra-platform-macos: unconfirmed {diagnostic}");
+    let _ = tracee.unconfirmed(diagnostic);
+}
+
 fn end_unenrolled_child(parent: i32, pid: i32, tracee: &umbra_platform::shutdown::Reservation) {
     let Some(info) = bsd_info(pid) else {
-        let _ = tracee.unconfirmed(format!(
-            "unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"
-        ));
+        unenrolled_unconfirmed(
+            tracee,
+            format!("unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"),
+        );
         return;
     };
     let birth = (info.pbi_start_tvsec, info.pbi_start_tvusec);
@@ -4024,9 +4032,12 @@ fn end_unenrolled_child(parent: i32, pid: i32, tracee: &umbra_platform::shutdown
         return;
     }
     if info.pbi_flags & PROC_FLAG_TRACED != 0 {
-        let _ = tracee.unconfirmed(format!(
-            "unenrolled fork child pid={pid} of pid={parent}: traced but not enrolled; left to its debugger"
-        ));
+        unenrolled_unconfirmed(
+            tracee,
+            format!(
+                "unenrolled fork child pid={pid} of pid={parent}: traced but not enrolled; left to its debugger"
+            ),
+        );
         return;
     }
     // SAFETY: plain libSystem call on an untraced, unreaped child of a live
@@ -4036,13 +4047,12 @@ fn end_unenrolled_child(parent: i32, pid: i32, tracee: &umbra_platform::shutdown
     }
     let limit = crate::clock::now() + UNENROLLED_FORK_BOUND;
     loop {
-        let state = match bsd_info(pid) {
-            None => Some("gone"),
-            Some(now) if (now.pbi_start_tvsec, now.pbi_start_tvusec) != birth => Some("gone"),
-            Some(now) if now.pbi_status == SZOMB => Some("a zombie under its parent"),
-            Some(_) => None,
-        };
-        if let Some(state) = state {
+        let last = lookup(pid);
+        if let Some(state) = unenrolled_child_state(&last, birth) {
+            eprintln!(
+                "umbra-platform-macos: unenrolled fork child ended: pid={pid} of pid={parent} birth={}.{:06} ({state})",
+                birth.0, birth.1
+            );
             let _ = tracee.confirm(umbra_core::shutdown::Proof::Accounted {
                 evidence: format!("unenrolled fork child SIGKILLed: {state}"),
                 root_owned: false,
@@ -4051,14 +4061,53 @@ fn end_unenrolled_child(parent: i32, pid: i32, tracee: &umbra_platform::shutdown
             return;
         }
         if crate::clock::now() >= limit {
-            let _ = tracee.unconfirmed(format!(
-                "unenrolled fork child pid={pid} of pid={parent}: still live {} ms after SIGKILL",
-                UNENROLLED_FORK_BOUND.as_millis()
-            ));
+            let state = match &last {
+                Lookup::Error(error) => format!("unreadable ({error})"),
+                _ => "still live".into(),
+            };
+            unenrolled_unconfirmed(
+                tracee,
+                format!(
+                    "unenrolled fork child pid={pid} of pid={parent}: {state} {} ms after SIGKILL",
+                    UNENROLLED_FORK_BOUND.as_millis()
+                ),
+            );
             return;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// Whether one lookup proves a SIGKILLed unenrolled fork child ended (#205):
+/// no process at its pid, a different process there (its birth replaced), or
+/// a zombie of the same birth. A failed lookup proves nothing: it is never
+/// read as disappearance.
+fn unenrolled_child_state(found: &Lookup, birth: (u64, u64)) -> Option<&'static str> {
+    match found {
+        Lookup::Absent => Some("gone"),
+        Lookup::Found { start, .. } if *start != birth => Some("gone"),
+        Lookup::Found { status, .. } if *status == SZOMB => Some("a zombie under its parent"),
+        Lookup::Found { .. } | Lookup::Error(_) => None,
+    }
+}
+
+/// A session's identity for the fork-child sweep: pid, recorded birth, and
+/// whether it still has live resources.
+type SessionIdentity = (i32, Option<(u64, u64)>, bool);
+
+/// Whether a live child of a session, with pid `pid` and birth `birth`, is an
+/// enrolled session (#205): a session with the same pid and the same birth,
+/// or, when a session recorded no birth, one that still has live resources.
+/// A retired session's pid alone never excludes a child, since that pid can
+/// have been reused by a new, unenrolled fork child.
+fn enrolled_identity(sessions: &[SessionIdentity], pid: i32, birth: Option<(u64, u64)>) -> bool {
+    sessions.iter().any(|(session, recorded, live)| {
+        *session == pid
+            && match recorded {
+                Some(recorded) => birth == Some(*recorded),
+                None => *live,
+            }
+    })
 }
 
 fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
@@ -4702,10 +4751,10 @@ impl MacosTraceBackend {
     /// [`end_unenrolled_child`], and its reservation settled. A window whose
     /// child cannot be found names itself as unconfirmed, never as nothing.
     fn end_unenrolled_fork_children(&mut self) {
-        let enrolled: std::collections::BTreeSet<i32> = self
+        let enrolled: Vec<SessionIdentity> = self
             .sessions
             .iter()
-            .map(|s| s.id.0.native_id as i32)
+            .map(|s| (s.id.0.native_id as i32, s.birth, s.live.is_some()))
             .collect();
         for index in 0..self.sessions.len() {
             // A retired session has no live resources, so no open window.
@@ -4726,7 +4775,11 @@ impl MacosTraceBackend {
             let children = loop {
                 let found: Vec<i32> = live_children(parent)
                     .into_iter()
-                    .filter(|pid| !enrolled.contains(pid))
+                    .filter(|&pid| {
+                        let birth =
+                            bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
+                        !enrolled_identity(&enrolled, pid, birth)
+                    })
                     .collect();
                 if found.len() >= open.len() || crate::clock::now() >= settle {
                     break found;
@@ -4745,12 +4798,13 @@ impl MacosTraceBackend {
                 };
                 match children.next() {
                     Some(pid) => end_unenrolled_child(parent, pid, &owner.tracee),
-                    None => {
-                        let _ = owner.tracee.unconfirmed(format!(
+                    None => unenrolled_unconfirmed(
+                        &owner.tracee,
+                        format!(
                             "fork child of pid={parent}: none found while its fork window was open \
                              (reserved, no identity)"
-                        ));
-                    }
+                        ),
+                    ),
                 }
             }
         }
@@ -5539,6 +5593,56 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// #205: a SIGKILLed unenrolled fork child is confirmed ended only by an
+    /// absent pid, a replaced birth, or a zombie of its birth; a failed lookup
+    /// is never read as disappearance.
+    #[test]
+    fn an_unreadable_fork_child_is_never_confirmed_gone() {
+        use super::*;
+        let birth = (100, 7);
+        let at = |status: u32, start: (u64, u64)| Lookup::Found {
+            status,
+            start,
+            ppid: 42,
+        };
+        assert_eq!(unenrolled_child_state(&Lookup::Absent, birth), Some("gone"));
+        assert_eq!(
+            unenrolled_child_state(&at(2, (101, 0)), birth),
+            Some("gone")
+        );
+        assert_eq!(
+            unenrolled_child_state(&at(SZOMB, birth), birth),
+            Some("a zombie under its parent")
+        );
+        assert_eq!(unenrolled_child_state(&at(2, birth), birth), None);
+        assert_eq!(
+            unenrolled_child_state(&Lookup::Error("EPERM".into()), birth),
+            None,
+            "a failed lookup is not disappearance"
+        );
+    }
+
+    /// #205: the fork-child sweep excludes a child only when an enrolled
+    /// session has its pid and birth (or, with no recorded birth, still has
+    /// live resources). A retired session's reused pid never hides a child.
+    #[test]
+    fn a_retired_sessions_pid_never_hides_a_fork_child() {
+        use super::*;
+        let child = Some((200, 3));
+        // A retired session (no live resources) whose pid a new child reused.
+        assert!(!enrolled_identity(
+            &[(77, Some((150, 1)), false)],
+            77,
+            child
+        ));
+        assert!(!enrolled_identity(&[(77, None, false)], 77, child));
+        // The same process, enrolled.
+        assert!(enrolled_identity(&[(77, Some((200, 3)), true)], 77, child));
+        assert!(enrolled_identity(&[(77, None, true)], 77, child));
+        // Another pid.
+        assert!(!enrolled_identity(&[(78, None, true)], 77, child));
     }
 
     #[test]
