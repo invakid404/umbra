@@ -381,6 +381,14 @@ zombie only a reboot clears. Build it with `clang -arch arm64 -O1 -Wall -Wextra
 and sign it with `umbra-fix-205-exitwin.entitlements` (get-task-allow), as CI
 does.
 
+`umbra-userspace-spawn` gains the mode `fix-205-fork-window`. The root forks a
+first child, which waits on a pipe, sleeps 1 s and then spawns the helper with
+`POSIX_SPAWN_SETSID`, and the root writes the pipe and forks a second child at
+once, which only exits. Natively it completes and records
+`fork-window spawn result=0 completed=2`. Under umbra the SETSID spawn is
+refused on every profile, and a test probe keeps the second fork unenrolled
+across that refusal.
+
 `umbra-test-child` gains two modes:
 
 - `--spin <unused>` loops without a system call after `main`, so a test can

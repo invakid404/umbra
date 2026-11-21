@@ -81,6 +81,19 @@ and allocation/write errors. Tests retain ownership observations separately from
 cleanup results. Guardian completion does not prove a child was reaped;
 provider-loss comparisons outside the guardian remain distinct
 ([#198](https://github.com/invakid404/umbra/issues/198)).
+
+`fix_205_refusal_with_an_unenrolled_fork_child` (#205) pins a refused spawn
+while a sibling fork is still in its window. The fixture mode
+`fix-205-fork-window` forks a first child that spawns with
+`POSIX_SPAWN_SETSID` (refused on every profile) and, at once, a second child.
+The test-only probe `UMBRA_FIX_205_FORK_WINDOW_HOLD` (in builds with the
+feature only) stops polling a fork opened while another session exists, for at
+most 10 s, so the second child is still unenrolled when the refusal arrives.
+The case asserts the exact refusal, that the probe held the window, and that
+nothing outlived umbra: cleanup `CLEAN` with `group_kills=0` and no zombie.
+The intermittent form of the same gap made the backing-overlap and region-cap
+cases fail with an unconfirmed cleanup and a group kill; the platform's
+teardown now ends such a child (platform README, "Termination").
 All live cases require the normal userspace integration prerequisites and a fresh
 `UMBRA_SLATE_EVIDENCE` directory. Probe controls are documented by the
 [platform provider](../umbra-platform-macos/README.md).

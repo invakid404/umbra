@@ -762,7 +762,22 @@ with `TerminationPolicy::Immediate`. Supervised closure then uses
 `BeginShutdown` and bounded `PollShutdown` replies, validates Final, and collects
 the provider process before recording completion.
 
-Termination tears each session down in order, children first (#186):
+Termination first ends every fork child the platform has not enrolled yet
+(#205). A fork entry opens a return window: the platform writes a
+branch-to-self at the return gate, reserves the child's ledger slot and
+resumes the parent, and the child spins at that gate, running and untraced,
+until the parent's fork return is processed and enrolls it. A termination that
+comes first (another session's refused spawn) used to leave that child running
+after umbra, and its slot reserved, so the run ended unconfirmed and
+recovery-required. Now, before any root is ended, each open window's child is
+found by parentage (a live child of the session that is not itself enrolled,
+after up to 100 ms for a fork still in the kernel). Its pid and birth go on the
+reservation. An untraced child is SIGKILLed and confirmed once it is gone or a
+zombie under its parent (bounded at 1 s). A traced one is left to its
+debugger, debugger-last. Whatever cannot be confirmed is marked unconfirmed
+with a diagnostic naming the child, its parent and its state.
+
+Termination then tears each session down in order, children first (#186):
 - continue its debugserver (SIGCONT, unconditionally while it is unreaped: a
   stopped debugserver never answers `k`, and a reaped one's pid may already
   name another process), recording `TracerContinued` when it was stopped

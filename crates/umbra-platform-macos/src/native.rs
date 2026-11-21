@@ -4708,7 +4708,11 @@ impl MacosTraceBackend {
             .map(|s| s.id.0.native_id as i32)
             .collect();
         for index in 0..self.sessions.len() {
-            let open: Vec<ThreadId> = self.sessions[index]
+            // A retired session has no live resources, so no open window.
+            let Some(live) = self.sessions[index].live.as_deref() else {
+                continue;
+            };
+            let open: Vec<ThreadId> = live
                 .pending
                 .iter()
                 .filter(|(_, p)| matches!(p.kind, ReturnKind::Fork { .. }) && p.creation.is_some())
@@ -4732,8 +4736,9 @@ impl MacosTraceBackend {
             let mut children = children.into_iter();
             for thread in open {
                 let Some(owner) = self.sessions[index]
-                    .pending
-                    .get_mut(&thread)
+                    .live
+                    .as_deref_mut()
+                    .and_then(|live| live.pending.get_mut(&thread))
                     .and_then(|pending| pending.creation.take())
                 else {
                     continue;
