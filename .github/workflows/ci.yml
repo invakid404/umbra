@@ -303,6 +303,7 @@ jobs:
           cargo test -p umbra-platform-macos --lib native::tests::every_traced_stub_resolves_on_this_host -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib native::tests::a_tracee_handed_to_launchd_is_never_confirmed -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib native::tests::the_teardown_opens_by_continuing_its_tracer -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib native::tests::a_reaped_tracer_is_never_continued -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib rsp::tests::debugserver_ignores_terminal_signals -- --exact --nocapture
           cargo test -p umbra-platform-macos --test lifetime_signals -- --nocapture --test-threads=1
           cargo test -p umbra-platform-macos --test owner_loss -- --nocapture --test-threads=1
