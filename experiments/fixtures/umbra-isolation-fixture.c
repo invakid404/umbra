@@ -558,14 +558,22 @@ static int kill_session(pid_t sid, long long before, FILE *out, pid_t spare) {
  * the first reading (the platform's worst case, emergency path included).
  * The provider tears its sessions down in order once its owner is gone; a
  * sweep that ends a debugserver while its program is held hands the program
- * to launchd as a zombie nobody collects. Returns the debugservers seen first. */
+ * to launchd as a zombie nobody collects. Returns the debugservers seen at the
+ * first readable census (0 if none was readable). */
 static int drain_session(pid_t sid) {
-    long long start = now_us(), cap = 0;
-    int first = -1;
+    /* 3 s + 4 s until a readable census gives the debugserver count. */
+    long long start = now_us(), cap = start + 7000000LL;
+    int first = -1, unreadable = 0;
     for (;;) {
         size_t n = 0;
         struct row *rows = table(&n);
-        int debuggers = 0, waiting = 0;
+        int readable = rows != NULL, debuggers = 0, waiting = 0;
+        if (!readable) {
+            /* A census that cannot be read is never "nothing to wait for":
+             * keep waiting to the cap, and report it below. */
+            unreadable++;
+            waiting = 1;
+        }
         for (size_t i = 0; rows && i < n; i++) {
             struct row *r = &rows[i];
             if (r->sid != sid || r->stat == 5 /* SZOMB */)
@@ -584,12 +592,16 @@ static int drain_session(pid_t sid) {
                 waiting = 1;
         }
         free(rows);
-        if (first < 0) {
+        if (readable && first < 0) {
             first = debuggers;
             cap = start + (3 + 4 * (long long)(debuggers > 0 ? debuggers : 1)) * 1000000LL;
         }
-        if (!waiting || now_us() >= cap)
-            return first;
+        if (!waiting || now_us() >= cap) {
+            if (unreadable)
+                fprintf(stderr, "ISO DRAIN census_unreadable=%d reached_cap=%d\n", unreadable,
+                        waiting);
+            return first < 0 ? 0 : first;
+        }
         usleep(20000);
     }
 }
