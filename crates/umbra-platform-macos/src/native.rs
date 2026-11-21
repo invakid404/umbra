@@ -4035,10 +4035,15 @@ fn live_children(parent: i32) -> Vec<i32> {
 }
 
 /// Settle an unenrolled fork child's slot as unconfirmed, naming why, and say
-/// so on stderr beside the other teardown lines (#205).
-fn unenrolled_unconfirmed(tracee: &umbra_platform::shutdown::Reservation, diagnostic: String) {
+/// so on stderr beside the other teardown lines (#205). Returns the
+/// diagnostic, which `terminate` also reports.
+fn unenrolled_unconfirmed(
+    tracee: &umbra_platform::shutdown::Reservation,
+    diagnostic: String,
+) -> String {
     eprintln!("umbra-platform-macos: unconfirmed {diagnostic}");
-    let _ = tracee.unconfirmed(diagnostic);
+    let _ = tracee.unconfirmed(diagnostic.clone());
+    diagnostic
 }
 
 /// Begin ending one fork child the platform never enrolled (#205): record its
@@ -4049,43 +4054,44 @@ fn unenrolled_unconfirmed(tracee: &umbra_platform::shutdown::Reservation, diagno
 /// through it) and its slot names why it stays unconfirmed. Returns the
 /// child's birth when it was signalled; its end is awaited by
 /// [`await_unenrolled_ends`], shared with every other signalled child.
+/// Otherwise returns the diagnostic of the unconfirmed slot.
 fn signal_unenrolled_child(
     parent: i32,
     pid: i32,
     tracee: &umbra_platform::shutdown::Reservation,
-) -> Option<(u64, u64)> {
+) -> std::result::Result<(u64, u64), String> {
     let Some(info) = bsd_info(pid) else {
-        unenrolled_unconfirmed(
+        return Err(unenrolled_unconfirmed(
             tracee,
             format!("unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"),
-        );
-        return None;
+        ));
     };
     let birth = (info.pbi_start_tvsec, info.pbi_start_tvusec);
-    if tracee
-        .acquired(umbra_core::shutdown::Identity {
-            pid: Some(pid),
-            birth: Some(birth),
-        })
-        .is_err()
-    {
-        return None;
+    if let Err(refused) = tracee.acquired(umbra_core::shutdown::Identity {
+        pid: Some(pid),
+        birth: Some(birth),
+    }) {
+        return Err(unenrolled_unconfirmed(
+            tracee,
+            format!(
+                "unenrolled fork child pid={pid} of pid={parent}: its identity was not recorded ({refused}); not signalled"
+            ),
+        ));
     }
     if info.pbi_flags & PROC_FLAG_TRACED != 0 {
-        unenrolled_unconfirmed(
+        return Err(unenrolled_unconfirmed(
             tracee,
             format!(
                 "unenrolled fork child pid={pid} of pid={parent}: traced but not enrolled; left to its debugger"
             ),
-        );
-        return None;
+        ));
     }
     // SAFETY: plain libSystem call on an untraced, unreaped child of a live
     // session; see above for why the pid names this child.
     unsafe {
         libc::kill(pid, libc::SIGKILL);
     }
-    Some(birth)
+    Ok(birth)
 }
 
 /// The fork-child sweep's one wait (#205): re-read every signalled child
@@ -4797,7 +4803,8 @@ impl MacosTraceBackend {
     /// sweep's worst case is one settle plus one wait, which
     /// [`shutdown_allowance`] budgets. A window whose child cannot be found
     /// names itself as unconfirmed, never as nothing.
-    fn end_unenrolled_fork_children(&mut self) {
+    #[must_use = "an unconfirmed fork child is a cleanup failure the caller must report"]
+    fn end_unenrolled_fork_children(&mut self) -> Vec<String> {
         let enrolled: Vec<SessionIdentity> = self
             .sessions
             .iter()
@@ -4814,8 +4821,9 @@ impl MacosTraceBackend {
                 (!open.is_empty()).then_some((index, s.id.0.native_id as i32, open))
             })
             .collect();
+        let mut unconfirmed = Vec::new();
         if windows.is_empty() {
-            return;
+            return unconfirmed;
         }
         // One settle, shared by every parent, for forks still in the kernel.
         let unenrolled = |parent: i32| -> Vec<i32> {
@@ -4857,23 +4865,22 @@ impl MacosTraceBackend {
                     continue;
                 };
                 match children.next() {
-                    Some(pid) => {
-                        if let Some(birth) = signal_unenrolled_child(parent, pid, &owner.tracee) {
-                            signalled.push((parent, pid, birth, owner));
-                        }
-                    }
-                    None => unenrolled_unconfirmed(
+                    Some(pid) => match signal_unenrolled_child(parent, pid, &owner.tracee) {
+                        Ok(birth) => signalled.push((parent, pid, birth, owner)),
+                        Err(diagnostic) => unconfirmed.push(diagnostic),
+                    },
+                    None => unconfirmed.push(unenrolled_unconfirmed(
                         &owner.tracee,
                         format!(
                             "fork child of pid={parent}: none found while its fork window was open \
                              (reserved, no identity)"
                         ),
-                    ),
+                    )),
                 }
             }
         }
         if signalled.is_empty() {
-            return;
+            return unconfirmed;
         }
         // One wait, shared by every signalled child.
         let identities: Vec<(i32, (u64, u64))> = signalled
@@ -4907,23 +4914,27 @@ impl MacosTraceBackend {
                         Lookup::Error(error) => format!("unreadable ({error})"),
                         _ => "still live".into(),
                     };
-                    unenrolled_unconfirmed(
+                    unconfirmed.push(unenrolled_unconfirmed(
                         &owner.tracee,
                         format!(
                             "unenrolled fork child pid={pid} of pid={parent}: {state} {} ms after SIGKILL",
                             UNENROLLED_FORK_BOUND.as_millis()
                         ),
-                    );
+                    ));
                 }
             }
         }
+        unconfirmed
     }
     /// Run [`Session::ordered_teardown`] for every session not yet torn down,
     /// children before parents (the reverse of creation order), so a child's
     /// zombie still has its original parent to be handed back to. It does not
     /// remove the sessions; callers clear them afterwards.
     fn tear_down_sessions(&mut self) -> Vec<TeardownReport> {
-        self.end_unenrolled_fork_children();
+        // Paths without a result of their own settle an unconfirmed fork
+        // child through its reservation; `terminate` runs the sweep first and
+        // reports it.
+        let _ = self.end_unenrolled_fork_children();
         self.drain_retirements();
         #[cfg(feature = "mutation-probe-spawn-lifecycle")]
         if std::env::var_os("UMBRA_FIX_243_OWNER_TRACE").is_some() {
@@ -5006,8 +5017,9 @@ impl Drop for MacosTraceBackend {
         #[cfg(feature = "shutdown-witness")]
         umbra_platform::shutdown::witness(serde_json::json!({"event": "owner-drop"}));
         // #205: an unenrolled fork child is found by parentage, so before any
-        // root is ended.
-        self.end_unenrolled_fork_children();
+        // root is ended. A drop has no result: an unconfirmed child is settled
+        // through its reservation (and named on stderr).
+        let _ = self.end_unenrolled_fork_children();
         if let Some(watchdog) = &self.watchdog {
             watchdog.terminate_registered();
         }
@@ -5480,8 +5492,8 @@ impl TraceControl for MacosTraceBackend {
             return Err(unsupported("graceful tree termination"));
         }
         // #205: an unenrolled fork child is found by parentage, so before any
-        // root is ended.
-        self.end_unenrolled_fork_children();
+        // root is ended. One it cannot confirm ended fails the termination.
+        let unenrolled = self.end_unenrolled_fork_children();
         if let Some(watchdog) = &self.watchdog {
             watchdog.terminate_registered();
         }
@@ -5510,7 +5522,7 @@ impl TraceControl for MacosTraceBackend {
             .filter(|r| r.unconfirmed || r.steps.iter().any(|step| matches!(step, TeardownStep::Retirement(outcome) if !outcome.success())))
             .map(TeardownReport::summary)
             .collect();
-        termination_result(unconfirmed, Vec::new())
+        termination_result(unconfirmed, unenrolled)
     }
 }
 
@@ -5519,15 +5531,15 @@ impl TraceControl for MacosTraceBackend {
 /// the sweep could not confirm ended. Callers treat `Ok` as confirmed
 /// termination (the provider forgets the root; `terminate_tree` reports it).
 fn termination_result(sessions: Vec<String>, unenrolled: Vec<String>) -> Result<()> {
-    let _ = unenrolled;
-    if sessions.is_empty() {
+    if sessions.is_empty() && unenrolled.is_empty() {
         return Ok(());
     }
+    let failures: Vec<String> = sessions.into_iter().chain(unenrolled).collect();
     Err(error(
         "terminate",
         format!(
-            "tree cleanup failed (tracee or retired tracer): {}",
-            sessions.join("; ")
+            "tree cleanup failed (tracee, retired tracer or unenrolled fork child): {}",
+            failures.join("; ")
         ),
     ))
 }
