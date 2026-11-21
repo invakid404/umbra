@@ -288,11 +288,23 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
                     continue;
                 }
             }
+            // Bind the start identity to the verified instance, as `members`
+            // does, so a member the sweep signals can be zombie-checked: read
+            // before and after the token, recorded only when both agree.
+            let start_of =
+                |pid| bsd_info(pid, false).map(|i| (i.pbi_start_tvsec, i.pbi_start_tvusec));
+            let before = start_of(pid);
             match verified_token(pid) {
-                Some((t, s)) if s == sid => out.push(Claimant {
-                    pid,
-                    token: Some(t),
-                }),
+                Some((t, s)) if s == sid => {
+                    if let Some(start) = before.filter(|start| start_of(pid) == Some(*start)) {
+                        self.starts
+                            .insert((token_pid(&t), token_version(&t)), start);
+                    }
+                    out.push(Claimant {
+                        pid,
+                        token: Some(t),
+                    })
+                }
                 Some(_) => {} // left the session in between: not a claimant
                 // SAFETY: as above.
                 None if unsafe { libc::getsid(pid) } == sid => {

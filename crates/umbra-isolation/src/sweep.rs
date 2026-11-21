@@ -166,6 +166,9 @@ pub struct Outcome {
     /// The drain reached its cap with a debugger or a traced member still
     /// live, and the sweep went ahead (#205).
     pub drain_exceeded: bool,
+    /// Tokens the sweep signalled, for [`end_run`]'s final zombie check
+    /// (#205); not part of any record.
+    pub signalled: Vec<Token>,
 }
 
 /// Sweep session `sid` within `budget` (a monotonic, operational deadline:
@@ -186,8 +189,10 @@ pub fn sweep(host: &mut impl Host, sid: i32, budget: Duration) -> Outcome {
         error: None,
         launchd_zombies: vec![],
         drain_exceeded: false,
+        signalled: vec![],
     };
     let mut any_census = false;
+    let mut signalled: BTreeMap<(i32, u32), Token> = BTreeMap::new();
     let mut last_owned_alive: Vec<i32> = vec![];
     let mut last_unverifiable: Vec<i32> = vec![];
     while host.now() < deadline {
@@ -214,6 +219,7 @@ pub fn sweep(host: &mut impl Host, sid: i32, budget: Duration) -> Outcome {
             outcome.owned_alive.clear();
             outcome.unverifiable.clear();
             outcome.frozen_at = frozen_at;
+            outcome.signalled = signalled.into_values().collect();
             return outcome;
         }
         if frozen_at.is_none() {
@@ -232,6 +238,7 @@ pub fn sweep(host: &mut impl Host, sid: i32, budget: Duration) -> Outcome {
             match known {
                 Some(t) if token_pid(&t) == c.pid => {
                     owned_alive.push(c.pid);
+                    signalled.insert((token_pid(&t), token_version(&t)), t);
                     match host.kill(&t) {
                         Signalled::Sent => outcome.sent += 1,
                         Signalled::Stale => outcome.stale += 1,
@@ -252,6 +259,7 @@ pub fn sweep(host: &mut impl Host, sid: i32, budget: Duration) -> Outcome {
     outcome.frozen_at = frozen_at;
     outcome.owned_alive = last_owned_alive;
     outcome.unverifiable = last_unverifiable;
+    outcome.signalled = signalled.into_values().collect();
     outcome.kind = if !any_census {
         Kind::Error
     } else if !outcome.unverifiable.is_empty() {
@@ -299,6 +307,7 @@ pub fn end_run(
     let (seen, tokenless, drain_exceeded) = drain(host, sid);
     let mut outcome = sweep(host, sid, budget);
     outcome.drain_exceeded = drain_exceeded;
+    let _ = &outcome.signalled;
     let mut zombies: Vec<i32> = vec![];
     let mut unreadable: Vec<i32> = vec![];
     for token in &seen {
@@ -698,6 +707,20 @@ mod tests {
         }));
         end_run(&mut h, 99, None, Duration::from_secs(3));
         assert!(h.log.iter().any(|l| l == "cont 40"), "{:?}", h.log);
+    }
+
+    /// #205 (CR-28): a member the sweep itself signalled (a member created
+    /// after the drain, say) is zombie-checked too: left as a launchd zombie,
+    /// it is reported and the outcome is not `Complete`.
+    #[test]
+    fn a_member_the_sweep_signalled_is_zombie_checked() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![claim(50, 1)]), Ok(vec![])])
+            .with_members(vec![vec![]]);
+        h.zombies.insert((50, 1));
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(h.log.iter().any(|l| l == "kill 50"), "{:?}", h.log);
+        assert_eq!(o.launchd_zombies, vec![50], "{o:?}");
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
     }
 
     /// #205 (CR-25): a member read without a token (no identity) is still
