@@ -400,8 +400,9 @@ fn a_silent_guardian_is_bounded() {
         "the guardian was not stopped before the kill: {ev:?}"
     );
     assert_no_signal_after_reap(&r);
-    // 2 s handshake + 1 s kill wait + 3 s sweep bound, plus process start-up.
-    assert!(r.elapsed < Duration::from_secs(7), "{:?}", r.elapsed);
+    // 2 s handshake + 1 s stop wait + 1 s kill wait + 3 s sweep bound, plus
+    // process start-up.
+    assert!(r.elapsed < Duration::from_secs(8), "{:?}", r.elapsed);
 }
 
 /// R-6: no blocking wait on a guardian that never exits after its outcome.
