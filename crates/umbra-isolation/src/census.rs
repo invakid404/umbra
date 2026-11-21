@@ -324,14 +324,21 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
         let pids = all_pids().map_err(|error| MembersCut {
             error,
             seen: vec![],
+            tokenless: vec![],
         })?;
         for pid in pids {
             if Instant::now() >= deadline {
-                // The members verified so far keep their tokens (and starts),
-                // so the final zombie check still covers them.
+                // The members read so far are handed over, those with tokens
+                // (and starts) and those without, so the final zombie check
+                // still covers them.
                 return Err(MembersCut {
                     error: "member census cut at the deadline".into(),
                     seen: out.iter().filter_map(|m| m.claimant.token).collect(),
+                    tokenless: out
+                        .iter()
+                        .filter(|m| m.claimant.token.is_none())
+                        .map(|m| m.claimant.pid)
+                        .collect(),
                 });
             }
             // SAFETY: getsid has no memory arguments.

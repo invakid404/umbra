@@ -363,6 +363,8 @@ pub struct MembersCut {
     pub error: String,
     /// Tokens of the members verified before it stopped.
     pub seen: Vec<Token>,
+    /// Pids of the members it read without a token before it stopped.
+    pub tokenless: Vec<i32>,
 }
 
 /// The final check of one seen member (#205): a zombie under launchd with
@@ -453,6 +455,7 @@ fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, Vec<i32>, bool) {
                 for t in cut.seen {
                     seen.insert((token_pid(&t), token_version(&t)), t);
                 }
+                let _ = cut.tokenless;
                 cap.get_or_insert(start + drain_cap(1));
             }
         }
@@ -710,6 +713,7 @@ mod tests {
         h.members.push_front(Err(MembersCut {
             error: "member census cut at the deadline".into(),
             seen: vec![],
+            tokenless: vec![],
         }));
         end_run(&mut h, 99, None, Duration::from_secs(3));
         assert!(h.log.iter().any(|l| l == "cont 40"), "{:?}", h.log);
@@ -762,6 +766,27 @@ mod tests {
         );
     }
 
+    /// #205 (B1): a census cut at the deadline also hands over the members it
+    /// read without a token. One first seen there whose pid is not provably
+    /// clear keeps the outcome from `Complete`, and the error names it.
+    #[test]
+    fn a_cut_census_still_checks_its_tokenless_members() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])]).with_members(vec![vec![]]);
+        h.members.push_front(Err(MembersCut {
+            error: "member census cut at the deadline".into(),
+            seen: vec![],
+            tokenless: vec![31],
+        }));
+        h.unreadable_pids.insert(31);
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
+        let error = o.error.unwrap_or_default();
+        assert!(
+            error.contains("launchd-zombie check unreadable") && error.contains("31"),
+            "{error}"
+        );
+    }
+
     /// #205 (U-1): a census cut at the deadline still hands over the members
     /// it verified. One first seen there that ends as a launchd zombie is
     /// reported, and the outcome is not `Complete`.
@@ -771,6 +796,7 @@ mod tests {
         h.members.push_front(Err(MembersCut {
             error: "member census cut at the deadline".into(),
             seen: vec![tok(21, 1)],
+            tokenless: vec![],
         }));
         h.zombies.insert((21, 1));
         let o = end_run(&mut h, 99, None, Duration::from_secs(3));
