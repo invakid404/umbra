@@ -80,8 +80,9 @@ pub trait Host {
     /// SIGKILL by audit token. Never by pid.
     fn kill(&mut self, token: &Token) -> Signalled;
     /// Every live member of `sid`, classified for the drain, or `Err` when the
-    /// census could not be taken. Must not run past `deadline` (#205).
-    fn members(&mut self, sid: i32, deadline: Instant) -> Result<Vec<Member>, String>;
+    /// census could not be taken, carrying the tokens it had already verified.
+    /// Must not run past `deadline` (#205).
+    fn members(&mut self, sid: i32, deadline: Instant) -> Result<Vec<Member>, MembersCut>;
     /// SIGCONT by audit token: it wakes a stopped member and cannot end one.
     fn cont(&mut self, token: &Token) -> Signalled;
     /// End the run's supervisor: SIGKILL by the audit token of `pid`, taken
@@ -321,6 +322,18 @@ pub fn end_run(
     outcome
 }
 
+/// A member census that produced no full reading (#205). `seen` holds the
+/// tokens of the members it had already verified (their start identities are
+/// recorded), so a member first seen in a cut census is still zombie-checked.
+/// They are never used for a drain decision (SIGCONT, cap, or emptiness).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MembersCut {
+    /// Why the census stopped.
+    pub error: String,
+    /// Tokens of the members verified before it stopped.
+    pub seen: Vec<Token>,
+}
+
 /// The final check of one seen member (#205): a zombie under launchd with
 /// its recorded start, provably not one (gone, another start, or not a
 /// zombie), or unreadable.
@@ -392,7 +405,8 @@ fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, bool) {
             }
             // No reading: keep reading until the cap. Unavailable is never
             // read as "nothing left to wait for".
-            Err(_) => {
+            Err(cut) => {
+                let _ = cut.seen;
                 cap.get_or_insert(start + drain_cap(1));
             }
         }
@@ -430,7 +444,7 @@ mod tests {
         clock: Instant,
         alive: std::collections::BTreeSet<(i32, u32)>,
         /// The drain's member readings, one per call; the last one repeats.
-        members: VecDeque<Result<Vec<Member>, String>>,
+        members: VecDeque<Result<Vec<Member>, MembersCut>>,
         /// Every host action in order: `members`, `kill <pid>`, `cont <pid>`,
         /// `end-supervisor <pid>`, `pause`.
         log: Vec<String>,
@@ -484,7 +498,7 @@ mod tests {
             self.log.push(format!("kill {}", token_pid(token)));
             Signalled::Sent
         }
-        fn members(&mut self, _sid: i32, _deadline: Instant) -> Result<Vec<Member>, String> {
+        fn members(&mut self, _sid: i32, _deadline: Instant) -> Result<Vec<Member>, MembersCut> {
             self.log.push("members".into());
             if self.members.len() > 1 {
                 self.members.pop_front().unwrap()
@@ -633,10 +647,28 @@ mod tests {
     fn a_failed_first_reading_still_continues_a_stopped_provider() {
         let mut h = Script::new(&[true; 64], vec![Ok(vec![])])
             .with_members(vec![vec![member(40, false, false, true)], vec![]]);
-        h.members
-            .push_front(Err("member census cut at the deadline".into()));
+        h.members.push_front(Err(MembersCut {
+            error: "member census cut at the deadline".into(),
+            seen: vec![],
+        }));
         end_run(&mut h, 99, None, Duration::from_secs(3));
         assert!(h.log.iter().any(|l| l == "cont 40"), "{:?}", h.log);
+    }
+
+    /// #205 (U-1): a census cut at the deadline still hands over the members
+    /// it verified. One first seen there that ends as a launchd zombie is
+    /// reported, and the outcome is not `Complete`.
+    #[test]
+    fn a_cut_census_still_checks_the_members_it_verified() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])]).with_members(vec![vec![]]);
+        h.members.push_front(Err(MembersCut {
+            error: "member census cut at the deadline".into(),
+            seen: vec![tok(21, 1)],
+        }));
+        h.zombies.insert((21, 1));
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert_eq!(o.launchd_zombies, vec![21], "{o:?}");
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
     }
 
     /// F5(e) (#205): the cap is 3 s + 4 s per debugger enrolled at the drain's

@@ -2,7 +2,7 @@
 //! identity, and signal by audit token (#193 design R-8, T1 §3).
 
 use crate::sweep::{
-    token_pid, token_version, Claimant, Host, Member, Signalled, Token, ZombieCheck,
+    token_pid, token_version, Claimant, Host, Member, MembersCut, Signalled, Token, ZombieCheck,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -294,12 +294,21 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
     fn kill(&mut self, token: &Token) -> Signalled {
         signal_token(token, libc::SIGKILL)
     }
-    fn members(&mut self, sid: i32, deadline: Instant) -> Result<Vec<Member>, String> {
+    fn members(&mut self, sid: i32, deadline: Instant) -> Result<Vec<Member>, MembersCut> {
         let me = std::process::id() as i32;
-        let mut out = vec![];
-        for pid in all_pids()? {
+        let mut out: Vec<Member> = vec![];
+        let pids = all_pids().map_err(|error| MembersCut {
+            error,
+            seen: vec![],
+        })?;
+        for pid in pids {
             if Instant::now() >= deadline {
-                return Err("member census cut at the deadline".into());
+                // The members verified so far keep their tokens (and starts),
+                // so the final zombie check still covers them.
+                return Err(MembersCut {
+                    error: "member census cut at the deadline".into(),
+                    seen: out.iter().filter_map(|m| m.claimant.token).collect(),
+                });
             }
             // SAFETY: getsid has no memory arguments.
             if pid <= 1 || pid == me || unsafe { libc::getsid(pid) } != sid {
