@@ -3970,6 +3970,97 @@ fn settled_lookup(first: Lookup, reread: impl FnOnce() -> Lookup) -> Lookup {
     }
 }
 
+/// How long the unenrolled-fork sweep waits for a fork still in the kernel to
+/// produce its child, and for a killed child to be gone or a zombie (#205).
+const UNENROLLED_FORK_SETTLE: Duration = Duration::from_millis(100);
+const UNENROLLED_FORK_BOUND: Duration = Duration::from_secs(1);
+
+/// `PROC_FLAG_TRACED` in `proc_bsdinfo::pbi_flags` (`sys/proc_info.h`).
+const PROC_FLAG_TRACED: u32 = 0x2;
+
+/// The live (not zombie) children of `parent`, read-only.
+fn live_children(parent: i32) -> Vec<i32> {
+    let mut pids = [0i32; 256];
+    // SAFETY: `pids` is writable for its size in bytes.
+    let count = unsafe {
+        libc::proc_listchildpids(
+            parent,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as i32,
+        )
+    };
+    if count <= 0 {
+        return Vec::new();
+    }
+    pids[..(count as usize).min(pids.len())]
+        .iter()
+        .copied()
+        .filter(|&pid| pid > 0 && bsd_info(pid).is_some_and(|info| info.pbi_status != SZOMB))
+        .collect()
+}
+
+/// End one fork child the platform never enrolled (#205), and settle its
+/// ledger reservation. The child is a live, unreaped child of `parent`, which
+/// still lives, so its pid cannot be reused meanwhile. It is untraced unless a
+/// debugger is attaching to it; then it is left to that debugger
+/// (debugger-last: a debugger's program is ended only through it) and its
+/// slot names why it stays unconfirmed. An untraced child is SIGKILLed and
+/// confirmed once it is gone or a zombie under its parent.
+fn end_unenrolled_child(parent: i32, pid: i32, tracee: &umbra_platform::shutdown::Reservation) {
+    let Some(info) = bsd_info(pid) else {
+        let _ = tracee.unconfirmed(format!(
+            "unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"
+        ));
+        return;
+    };
+    let birth = (info.pbi_start_tvsec, info.pbi_start_tvusec);
+    if tracee
+        .acquired(umbra_core::shutdown::Identity {
+            pid: Some(pid),
+            birth: Some(birth),
+        })
+        .is_err()
+    {
+        return;
+    }
+    if info.pbi_flags & PROC_FLAG_TRACED != 0 {
+        let _ = tracee.unconfirmed(format!(
+            "unenrolled fork child pid={pid} of pid={parent}: traced but not enrolled; left to its debugger"
+        ));
+        return;
+    }
+    // SAFETY: plain libSystem call on an untraced, unreaped child of a live
+    // session; see above for why the pid names this child.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let limit = crate::clock::now() + UNENROLLED_FORK_BOUND;
+    loop {
+        let state = match bsd_info(pid) {
+            None => Some("gone"),
+            Some(now) if (now.pbi_start_tvsec, now.pbi_start_tvusec) != birth => Some("gone"),
+            Some(now) if now.pbi_status == SZOMB => Some("a zombie under its parent"),
+            Some(_) => None,
+        };
+        if let Some(state) = state {
+            let _ = tracee.confirm(umbra_core::shutdown::Proof::Accounted {
+                evidence: format!("unenrolled fork child SIGKILLed: {state}"),
+                root_owned: false,
+                root_collected: false,
+            });
+            return;
+        }
+        if crate::clock::now() >= limit {
+            let _ = tracee.unconfirmed(format!(
+                "unenrolled fork child pid={pid} of pid={parent}: still live {} ms after SIGKILL",
+                UNENROLLED_FORK_BOUND.as_millis()
+            ));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
@@ -4599,11 +4690,72 @@ impl MacosTraceBackend {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+    /// End every fork child the platform has not enrolled yet (#205), before
+    /// any root is ended. A fork entry opens a return window: it writes a
+    /// branch-to-self at the return gate, reserves the child's ledger slot and
+    /// resumes the parent. The child spins at that gate, running and untraced,
+    /// until the parent's fork return is processed and enrolls it. A teardown
+    /// that comes first, such as another session's refused spawn, would leave
+    /// it running after umbra and its slot reserved. Each open window's child
+    /// is found by parentage while its parent still lives (after a short
+    /// settle, for a fork still in the kernel), ended and confirmed by
+    /// [`end_unenrolled_child`], and its reservation settled. A window whose
+    /// child cannot be found names itself as unconfirmed, never as nothing.
+    fn end_unenrolled_fork_children(&mut self) {
+        let enrolled: std::collections::BTreeSet<i32> = self
+            .sessions
+            .iter()
+            .map(|s| s.id.0.native_id as i32)
+            .collect();
+        for index in 0..self.sessions.len() {
+            let open: Vec<ThreadId> = self.sessions[index]
+                .pending
+                .iter()
+                .filter(|(_, p)| matches!(p.kind, ReturnKind::Fork { .. }) && p.creation.is_some())
+                .map(|(thread, _)| *thread)
+                .collect();
+            if open.is_empty() {
+                continue;
+            }
+            let parent = self.sessions[index].id.0.native_id as i32;
+            let settle = crate::clock::now() + UNENROLLED_FORK_SETTLE;
+            let children = loop {
+                let found: Vec<i32> = live_children(parent)
+                    .into_iter()
+                    .filter(|pid| !enrolled.contains(pid))
+                    .collect();
+                if found.len() >= open.len() || crate::clock::now() >= settle {
+                    break found;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let mut children = children.into_iter();
+            for thread in open {
+                let Some(owner) = self.sessions[index]
+                    .pending
+                    .get_mut(&thread)
+                    .and_then(|pending| pending.creation.take())
+                else {
+                    continue;
+                };
+                match children.next() {
+                    Some(pid) => end_unenrolled_child(parent, pid, &owner.tracee),
+                    None => {
+                        let _ = owner.tracee.unconfirmed(format!(
+                            "fork child of pid={parent}: none found while its fork window was open \
+                             (reserved, no identity)"
+                        ));
+                    }
+                }
+            }
+        }
+    }
     /// Run [`Session::ordered_teardown`] for every session not yet torn down,
     /// children before parents (the reverse of creation order), so a child's
     /// zombie still has its original parent to be handed back to. It does not
     /// remove the sessions; callers clear them afterwards.
     fn tear_down_sessions(&mut self) -> Vec<TeardownReport> {
+        self.end_unenrolled_fork_children();
         self.drain_retirements();
         #[cfg(feature = "mutation-probe-spawn-lifecycle")]
         if std::env::var_os("UMBRA_FIX_243_OWNER_TRACE").is_some() {
@@ -4685,6 +4837,9 @@ impl Drop for MacosTraceBackend {
     fn drop(&mut self) {
         #[cfg(feature = "shutdown-witness")]
         umbra_platform::shutdown::witness(serde_json::json!({"event": "owner-drop"}));
+        // #205: an unenrolled fork child is found by parentage, so before any
+        // root is ended.
+        self.end_unenrolled_fork_children();
         if let Some(watchdog) = &self.watchdog {
             watchdog.terminate_registered();
         }
@@ -5151,6 +5306,9 @@ impl TraceControl for MacosTraceBackend {
         if !matches!(policy, TerminationPolicy::Immediate) {
             return Err(unsupported("graceful tree termination"));
         }
+        // #205: an unenrolled fork child is found by parentage, so before any
+        // root is ended.
+        self.end_unenrolled_fork_children();
         if let Some(watchdog) = &self.watchdog {
             watchdog.terminate_registered();
         }
