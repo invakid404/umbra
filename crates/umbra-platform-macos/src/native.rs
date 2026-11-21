@@ -3991,7 +3991,12 @@ fn shutdown_allowance(
             .checked_add(TEARDOWN_BOUND + rsp::TRACER_REAP_BOUND + TRACEE_REAP_BOUND)
             .ok_or_else(overflow)?;
     }
-    let _ = fork_windows;
+    if fork_windows > 0 {
+        // One shared settle and one shared wait, whatever the count.
+        remaining = remaining
+            .checked_add(UNENROLLED_FORK_SETTLE + UNENROLLED_FORK_BOUND)
+            .ok_or_else(overflow)?;
+    }
     Ok(remaining)
 }
 
@@ -4029,13 +4034,6 @@ fn live_children(parent: i32) -> Vec<i32> {
         .collect()
 }
 
-/// End one fork child the platform never enrolled (#205), and settle its
-/// ledger reservation. The child is a live, unreaped child of `parent`, which
-/// still lives, so its pid cannot be reused meanwhile. It is untraced unless a
-/// debugger is attaching to it; then it is left to that debugger
-/// (debugger-last: a debugger's program is ended only through it) and its
-/// slot names why it stays unconfirmed. An untraced child is SIGKILLed and
-/// confirmed once it is gone or a zombie under its parent.
 /// Settle an unenrolled fork child's slot as unconfirmed, naming why, and say
 /// so on stderr beside the other teardown lines (#205).
 fn unenrolled_unconfirmed(tracee: &umbra_platform::shutdown::Reservation, diagnostic: String) {
@@ -4043,13 +4041,25 @@ fn unenrolled_unconfirmed(tracee: &umbra_platform::shutdown::Reservation, diagno
     let _ = tracee.unconfirmed(diagnostic);
 }
 
-fn end_unenrolled_child(parent: i32, pid: i32, tracee: &umbra_platform::shutdown::Reservation) {
+/// Begin ending one fork child the platform never enrolled (#205): record its
+/// identity on its ledger reservation and SIGKILL it. The child is a live,
+/// unreaped child of `parent`, which still lives, so its pid cannot be reused
+/// meanwhile. It is untraced unless a debugger is attaching to it; then it is
+/// left to that debugger (debugger-last: a debugger's program is ended only
+/// through it) and its slot names why it stays unconfirmed. Returns the
+/// child's birth when it was signalled; its end is awaited by
+/// [`await_unenrolled_ends`], shared with every other signalled child.
+fn signal_unenrolled_child(
+    parent: i32,
+    pid: i32,
+    tracee: &umbra_platform::shutdown::Reservation,
+) -> Option<(u64, u64)> {
     let Some(info) = bsd_info(pid) else {
         unenrolled_unconfirmed(
             tracee,
             format!("unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"),
         );
-        return;
+        return None;
     };
     let birth = (info.pbi_start_tvsec, info.pbi_start_tvusec);
     if tracee
@@ -4059,7 +4069,7 @@ fn end_unenrolled_child(parent: i32, pid: i32, tracee: &umbra_platform::shutdown
         })
         .is_err()
     {
-        return;
+        return None;
     }
     if info.pbi_flags & PROC_FLAG_TRACED != 0 {
         unenrolled_unconfirmed(
@@ -4068,44 +4078,48 @@ fn end_unenrolled_child(parent: i32, pid: i32, tracee: &umbra_platform::shutdown
                 "unenrolled fork child pid={pid} of pid={parent}: traced but not enrolled; left to its debugger"
             ),
         );
-        return;
+        return None;
     }
     // SAFETY: plain libSystem call on an untraced, unreaped child of a live
     // session; see above for why the pid names this child.
     unsafe {
         libc::kill(pid, libc::SIGKILL);
     }
-    let limit = crate::clock::now() + UNENROLLED_FORK_BOUND;
+    Some(birth)
+}
+
+/// The fork-child sweep's one wait (#205): re-read every signalled child
+/// `(pid, birth)` until each has ended or `limit` passes, whatever the number
+/// of children, so the sweep's worst case is one bound, not one per child.
+/// Returns, per child, its ending state ([`unenrolled_child_state`]) or the
+/// last lookup taken by the limit.
+fn await_unenrolled_ends(
+    children: &[(i32, (u64, u64))],
+    limit: Instant,
+    mut lookup: impl FnMut(i32) -> Lookup,
+    now: impl Fn() -> Instant,
+    mut pause: impl FnMut(),
+) -> Vec<std::result::Result<&'static str, Lookup>> {
+    let mut ended: Vec<Option<&'static str>> = vec![None; children.len()];
+    let mut last: Vec<Lookup> = vec![Lookup::Absent; children.len()];
     loop {
-        let last = lookup(pid);
-        if let Some(state) = unenrolled_child_state(&last, birth) {
-            eprintln!(
-                "umbra-platform-macos: unenrolled fork child ended: pid={pid} of pid={parent} birth={}.{:06} ({state})",
-                birth.0, birth.1
-            );
-            let _ = tracee.confirm(umbra_core::shutdown::Proof::Accounted {
-                evidence: format!("unenrolled fork child SIGKILLed: {state}"),
-                root_owned: false,
-                root_collected: false,
-            });
-            return;
+        for (index, (pid, birth)) in children.iter().enumerate() {
+            if ended[index].is_none() {
+                let found = lookup(*pid);
+                ended[index] = unenrolled_child_state(&found, *birth);
+                last[index] = found;
+            }
         }
-        if crate::clock::now() >= limit {
-            let state = match &last {
-                Lookup::Error(error) => format!("unreadable ({error})"),
-                _ => "still live".into(),
-            };
-            unenrolled_unconfirmed(
-                tracee,
-                format!(
-                    "unenrolled fork child pid={pid} of pid={parent}: {state} {} ms after SIGKILL",
-                    UNENROLLED_FORK_BOUND.as_millis()
-                ),
-            );
-            return;
+        if ended.iter().all(Option::is_some) || now() >= limit {
+            break;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        pause();
     }
+    ended
+        .into_iter()
+        .zip(last)
+        .map(|(state, last)| state.ok_or(last))
+        .collect()
 }
 
 /// Whether one lookup proves a SIGKILLed unenrolled fork child ended (#205):
@@ -4776,41 +4790,62 @@ impl MacosTraceBackend {
     /// until the parent's fork return is processed and enrolls it. A teardown
     /// that comes first, such as another session's refused spawn, would leave
     /// it running after umbra and its slot reserved. Each open window's child
-    /// is found by parentage while its parent still lives (after a short
-    /// settle, for a fork still in the kernel), ended and confirmed by
-    /// [`end_unenrolled_child`], and its reservation settled. A window whose
-    /// child cannot be found names itself as unconfirmed, never as nothing.
+    /// is found by parentage while its parent still lives (after one short
+    /// settle shared by every parent, for a fork still in the kernel), then
+    /// every child is signalled ([`signal_unenrolled_child`]) and all of them
+    /// are awaited by one shared wait ([`await_unenrolled_ends`]), so the
+    /// sweep's worst case is one settle plus one wait, which
+    /// [`shutdown_allowance`] budgets. A window whose child cannot be found
+    /// names itself as unconfirmed, never as nothing.
     fn end_unenrolled_fork_children(&mut self) {
         let enrolled: Vec<SessionIdentity> = self
             .sessions
             .iter()
             .map(|s| (s.id.0.native_id as i32, s.birth, s.live.is_some()))
             .collect();
-        for index in 0..self.sessions.len() {
-            // A retired session has no live resources, so no open window.
-            let Some(live) = self.sessions[index].live.as_deref() else {
-                continue;
-            };
-            let open = open_fork_windows(live);
-            if open.is_empty() {
-                continue;
+        // Every session with an open window. A retired session has no live
+        // resources, so no open window.
+        let windows: Vec<(usize, i32, Vec<ThreadId>)> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, s)| {
+                let open = open_fork_windows(s.live.as_deref()?);
+                (!open.is_empty()).then_some((index, s.id.0.native_id as i32, open))
+            })
+            .collect();
+        if windows.is_empty() {
+            return;
+        }
+        // One settle, shared by every parent, for forks still in the kernel.
+        let unenrolled = |parent: i32| -> Vec<i32> {
+            live_children(parent)
+                .into_iter()
+                .filter(|&pid| {
+                    let birth =
+                        bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
+                    !enrolled_identity(&enrolled, pid, birth)
+                })
+                .collect()
+        };
+        let settle = crate::clock::now() + UNENROLLED_FORK_SETTLE;
+        let found = loop {
+            let found: Vec<Vec<i32>> = windows
+                .iter()
+                .map(|(_, parent, _)| unenrolled(*parent))
+                .collect();
+            let complete = found
+                .iter()
+                .zip(&windows)
+                .all(|(children, (_, _, open))| children.len() >= open.len());
+            if complete || crate::clock::now() >= settle {
+                break found;
             }
-            let parent = self.sessions[index].id.0.native_id as i32;
-            let settle = crate::clock::now() + UNENROLLED_FORK_SETTLE;
-            let children = loop {
-                let found: Vec<i32> = live_children(parent)
-                    .into_iter()
-                    .filter(|&pid| {
-                        let birth =
-                            bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
-                        !enrolled_identity(&enrolled, pid, birth)
-                    })
-                    .collect();
-                if found.len() >= open.len() || crate::clock::now() >= settle {
-                    break found;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            };
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        // Signal every child, keeping each reservation until it is settled.
+        let mut signalled = Vec::new();
+        for ((index, parent, open), children) in windows.into_iter().zip(found) {
             let mut children = children.into_iter();
             for thread in open {
                 let Some(owner) = self.sessions[index]
@@ -4822,7 +4857,11 @@ impl MacosTraceBackend {
                     continue;
                 };
                 match children.next() {
-                    Some(pid) => end_unenrolled_child(parent, pid, &owner.tracee),
+                    Some(pid) => {
+                        if let Some(birth) = signal_unenrolled_child(parent, pid, &owner.tracee) {
+                            signalled.push((parent, pid, birth, owner));
+                        }
+                    }
                     None => unenrolled_unconfirmed(
                         &owner.tracee,
                         format!(
@@ -4830,6 +4869,51 @@ impl MacosTraceBackend {
                              (reserved, no identity)"
                         ),
                     ),
+                }
+            }
+        }
+        if signalled.is_empty() {
+            return;
+        }
+        // One wait, shared by every signalled child.
+        let identities: Vec<(i32, (u64, u64))> = signalled
+            .iter()
+            .map(|(_, pid, birth, _)| (*pid, *birth))
+            .collect();
+        let ends = await_unenrolled_ends(
+            &identities,
+            crate::clock::now() + UNENROLLED_FORK_BOUND,
+            lookup,
+            crate::clock::now,
+            || std::thread::sleep(Duration::from_millis(2)),
+        );
+        for ((parent, pid, birth, owner), end) in signalled.into_iter().zip(ends) {
+            match end {
+                Ok(state) => {
+                    eprintln!(
+                        "umbra-platform-macos: unenrolled fork child ended: pid={pid} of pid={parent} birth={}.{:06} ({state})",
+                        birth.0, birth.1
+                    );
+                    let _ = owner
+                        .tracee
+                        .confirm(umbra_core::shutdown::Proof::Accounted {
+                            evidence: format!("unenrolled fork child SIGKILLed: {state}"),
+                            root_owned: false,
+                            root_collected: false,
+                        });
+                }
+                Err(last) => {
+                    let state = match &last {
+                        Lookup::Error(error) => format!("unreadable ({error})"),
+                        _ => "still live".into(),
+                    };
+                    unenrolled_unconfirmed(
+                        &owner.tracee,
+                        format!(
+                            "unenrolled fork child pid={pid} of pid={parent}: {state} {} ms after SIGKILL",
+                            UNENROLLED_FORK_BOUND.as_millis()
+                        ),
+                    );
                 }
             }
         }
@@ -5650,6 +5734,69 @@ mod tests {
                 "{windows} open fork window(s): the sweep's worst case, once"
             );
         }
+    }
+
+    #[test]
+    fn the_fork_sweep_waits_once_for_every_child() {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+        // #205 (CR-11): 17 signalled children (the fix-243-cap shape's parent
+        // count) share one wait. Three end along the way, the rest never do:
+        // the wait still ends at one UNENROLLED_FORK_BOUND, not one per child.
+        let birth = (100, 7);
+        let children: Vec<(i32, (u64, u64))> = (1000..1017).map(|pid| (pid, birth)).collect();
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let reads = RefCell::new(std::collections::HashMap::<i32, u32>::new());
+        let lookup = |pid: i32| {
+            let mut reads = reads.borrow_mut();
+            let n = reads.entry(pid).or_default();
+            *n += 1;
+            match (pid, *n) {
+                (1000, _) => Lookup::Absent,
+                (1001, n) if n > 5 => Lookup::Found {
+                    status: SZOMB,
+                    start: birth,
+                    ppid: 42,
+                },
+                (1002, n) if n > 50 => Lookup::Error("transient".into()),
+                _ => Lookup::Found {
+                    status: 2,
+                    start: birth,
+                    ppid: 42,
+                },
+            }
+        };
+        let ends = await_unenrolled_ends(
+            &children,
+            start + UNENROLLED_FORK_BOUND,
+            lookup,
+            || clock.get(),
+            || clock.set(clock.get() + Duration::from_millis(2)),
+        );
+        let waited = clock.get() - start;
+        assert!(
+            waited >= UNENROLLED_FORK_BOUND
+                && waited < UNENROLLED_FORK_BOUND + Duration::from_millis(5),
+            "one shared wait: {waited:?}"
+        );
+        assert_eq!(ends[0], Ok("gone"));
+        assert_eq!(ends[1], Ok("a zombie under its parent"));
+        assert_eq!(ends[2], Err(Lookup::Error("transient".into())));
+        assert!(ends[3..]
+            .iter()
+            .all(|end| matches!(end, Err(Lookup::Found { .. }))));
+        // Every child ends early: the wait returns at once.
+        let clock = Cell::new(start);
+        let ends = await_unenrolled_ends(
+            &children,
+            start + UNENROLLED_FORK_BOUND,
+            |_| Lookup::Absent,
+            || clock.get(),
+            || clock.set(clock.get() + Duration::from_millis(2)),
+        );
+        assert_eq!(clock.get(), start, "nothing left to wait for");
+        assert!(ends.iter().all(|end| *end == Ok("gone")));
     }
 
     #[test]
