@@ -102,7 +102,8 @@ until a reboot and counts against the user's process limit (platform README,
    order.
 3. **The sweep** of what is left, as below.
 
-Afterwards every member the drain saw is checked: one now a zombie under
+Afterwards every member the drain saw is checked, including those a census
+cut at its deadline had already verified: one now a zombie under
 launchd is reported in `launchd_zombies`, and the outcome is then not
 `COMPLETE`. One whose final record cannot be read (a lookup failing other than
 with `ESRCH`, or no recorded start) is not known to be clear: it is named in

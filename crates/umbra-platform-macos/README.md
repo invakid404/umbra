@@ -768,27 +768,31 @@ the provider process before recording completion.
 
 Termination first ends every fork child the platform has not enrolled yet
 (#205). A fork entry opens a return window: the platform writes a
-branch-to-self at the return gate, reserves the child's ledger slot and
-resumes the parent, and the child spins at that gate, running and untraced,
-until the parent's fork return is processed and enrolls it. A termination that
-comes first (another session's refused spawn) used to leave that child running
-after umbra, and its slot reserved, so the run ended unconfirmed and
+branch-to-self at the return gate, reserves the child's ledger slot and resumes
+the parent, and the child spins at that gate, running and untraced, until the
+parent's fork return is processed and enrolls it. A termination that comes
+first (another session's refused spawn) used to leave that child running after
+umbra, and its slot reserved, so the run ended unconfirmed and
 recovery-required. Now, before any root is ended, each open window's child is
 found by parentage (a live child of the session that no enrolled session
 matches by pid and birth, after one settle of up to 100 ms, shared by every
 parent, for a fork still in the kernel). Its pid and birth go on the
-reservation. Every untraced child is SIGKILLed, and then all of them share one
-wait, bounded at 1 s: each is confirmed once a lookup shows no process at its
-pid, another birth there, or a zombie of its birth; a failed lookup is never
-taken as its end. The sweep's worst case is therefore 1.1 s whatever the number
-of open windows, which is what the owner envelope adds for it. A traced one is
-left to its debugger, debugger-last. Whatever cannot be confirmed is marked
-unconfirmed with a diagnostic naming the child, its parent and its state, and
-`terminate` then fails with that diagnostic beside any session failure (its
-callers read `Ok` as confirmed termination); a drop, which has no result,
-settles it through its reservation. Each outcome is also logged on stderr
-(`unenrolled fork child ended: pid=… of pid=… birth=…`, or `unconfirmed …`).
-The sweep covers fork windows only. A spawn's window (its child created
+reservation from one read taken right before the signal, which must still show
+the parent's child with the birth the census read; otherwise it is not
+signalled and its slot is unconfirmed. (The parent cannot reap it meanwhile: a
+fork needs a single-threaded parent, and that thread is held in the fork or at
+its return gate.) Every untraced child is SIGKILLed, and then all of them share
+one wait, bounded at 1 s: each is confirmed once a lookup shows no process at
+its pid, another birth there, or a zombie of its birth; a failed lookup is
+never taken as its end. The sweep's worst case is therefore 1.1 s whatever the
+number of open windows, which is what the owner envelope adds for it. A traced
+one is left to its debugger, debugger-last. Whatever cannot be confirmed is
+marked unconfirmed with a diagnostic naming the child, its parent and its
+state, and `terminate` then fails with that diagnostic beside any session
+failure (its callers read `Ok` as confirmed termination); a drop, which has no
+result, settles it through its reservation. Each outcome is also logged on
+stderr (`unenrolled fork child ended: pid=… of pid=… birth=…`, or `unconfirmed
+…`). The sweep covers fork windows only. A spawn's window (its child created
 suspended and untraced until the parent's return enrols it) is not swept yet;
 such a child would stay suspended after umbra, and its slot names itself as
 unconfirmed (#205 follow-up).
@@ -1067,7 +1071,9 @@ Further #205 coverage:
   `native::tests::an_open_fork_window_is_budgeted_in_the_shutdown_allowance`
   pins that the frozen envelope adds that worst case once with any window open
   and nothing with none; `native::tests::an_unconfirmed_fork_child_fails_termination`
-  pins that such a child fails `terminate`.
+  pins that such a child fails `terminate`, and
+  `native::tests::a_fork_child_is_signalled_only_while_it_is_still_the_census_child`
+  pins the parentage and birth check before the signal.
 - `rsp::tests::debugserver_ignores_terminal_signals` reads a live
   debugserver's ignored signals (no program attached) and sends each.
 - `tests/lifetime_signals.rs` sends the provider SIGHUP, SIGINT, SIGQUIT and
