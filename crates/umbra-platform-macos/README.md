@@ -777,6 +777,10 @@ reservation. An untraced child is SIGKILLed and confirmed once it is gone or a
 zombie under its parent (bounded at 1 s). A traced one is left to its
 debugger, debugger-last. Whatever cannot be confirmed is marked unconfirmed
 with a diagnostic naming the child, its parent and its state.
+The sweep covers fork windows only. A spawn's window (its child created
+suspended and untraced until the parent's return enrols it) is not swept yet;
+such a child would stay suspended after umbra, and its slot names itself as
+unconfirmed (#205 follow-up).
 
 Termination then tears each session down in order, children first (#186):
 - continue its debugserver (SIGCONT, unconditionally while it is unreaped: a

@@ -69,7 +69,12 @@ probe cases, and the backing-overlap, region-cap and region-fault cases):
   during macos: spawn ABI profile mismatch (errno: None)` and reports no tracee
   completion; the program reached its spawn, and nothing was spawned. A
   `virtual-*` victim keeps its `SEED` through the client. A probe case also
-  arms its probe as usual and asserts that nothing ever reached it. That is no
+  arms its probe as usual and asserts that nothing ever reached it. Each also
+  keeps its qualified body's cleanup oracle: a `CLEAN` cleanup record, with
+  no group kill and no zombie wherever the qualified body asserts that (every
+  probe case, the region-cap and both region-fault cases), a `COMPLETE`
+  guardian sweep for a guardian case, and a reopen that regains writer
+  authority. That is no
   positive coverage of packed spawn, only of its fail-closed refusal.
 
 The optional `mutation-probe-spawn-lifecycle` feature enables lifecycle fault
