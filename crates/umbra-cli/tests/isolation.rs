@@ -156,6 +156,30 @@ fn procs() -> Vec<Proc> {
         .collect()
 }
 
+/// #205 per-test guard: launchd-parented zombies attributable to this test.
+///
+/// When a debugger process ends while its program has started exiting (or is
+/// held at a breakpoint), the kernel hands the program to launchd as a zombie
+/// nobody ever collects; it stays until a reboot and counts against the
+/// user's process limit. Attribution follows the owner scope's rule: the
+/// fixture's image name (the 16-character `ucomm` of `umbra-isolation-fixture`,
+/// the traced program in these cases) and a start time inside the test's
+/// window, plus any recorded (pid, start) of this run. Counting only: nothing
+/// is signalled on this basis.
+fn launchd_zombies(since_us: i64, recorded: &[(i32, i64)]) -> Vec<Proc> {
+    procs()
+        .into_iter()
+        .filter(|p| {
+            p.stat == SZOMB
+                && p.ppid == 1
+                && ((p.start_us >= since_us && p.comm.starts_with("umbra-isolation-"))
+                    || recorded
+                        .iter()
+                        .any(|(pid, start)| *pid == p.pid && *start == p.start_us))
+        })
+        .collect()
+}
+
 fn own_session() -> i32 {
     let me = std::process::id() as i32;
     procs()
@@ -317,6 +341,8 @@ struct Outcome {
     status: Option<i32>,
     /// Live processes of this run after it ended (recorded pids, or session S).
     survivors: Vec<Proc>,
+    /// Launchd-parented zombies of this run after cleanup (#205).
+    zombies: Vec<Proc>,
     /// Signals the sentinel in the caller's group received: (signal, sender).
     sentinel: Vec<(i32, i32)>,
     /// The sampler's readings of the caller's group's `pg_jobc`.
@@ -353,6 +379,8 @@ struct Run {
     /// S and an instant when the guardian was seen as the relay's child.
     session: Option<(i32, i64)>,
     finished: Option<Outcome>,
+    /// When the run started: the window for the zombie count (#205).
+    since_us: i64,
 }
 
 impl Run {
@@ -365,6 +393,7 @@ impl Run {
         tracee: &[&str],
     ) -> Run {
         let (dir, temp) = case_dir(case);
+        let since_us = now_us();
         let mut command = Command::new(fixture());
         command
             .arg("launch")
@@ -424,6 +453,7 @@ impl Run {
             recorded: Vec::new(),
             session: None,
             finished: None,
+            since_us,
         }
     }
 
@@ -585,6 +615,9 @@ impl Run {
         }
         let survivors = self.live_of_this_run();
         self.cleanup();
+        // The kernel's exit bookkeeping for anything the cleanup ended.
+        std::thread::sleep(Duration::from_millis(300));
+        let zombies = launchd_zombies(self.since_us, &self.recorded);
         let sentinel = std::fs::read_to_string(self.dir.join("sentinel.log"))
             .unwrap_or_default()
             .lines()
@@ -604,6 +637,7 @@ impl Run {
         let outcome = Outcome {
             status,
             survivors,
+            zombies,
             sentinel,
             jobc,
             delivered,
@@ -889,6 +923,12 @@ fn assert_nothing_survives(o: &Outcome) {
         o.survivors,
         o.stderr
     );
+    assert!(
+        o.zombies.is_empty(),
+        "launchd-parented zombies of the run: {:?}\n{}",
+        o.zombies,
+        o.stderr
+    );
 }
 
 fn assert_no_sighup_to_umbra(o: &Outcome) {
@@ -929,16 +969,26 @@ fn sid1_p1_stopped_tracer_at_the_deadline() {
     assert_nothing_survives(o);
 }
 
-/// P2: the held root is killed, then its debugserver 50 ms later (the tracer
-/// dies with the tracee's exit pending; the tracee is handed to launchd).
+/// P2, reshaped for #205 (OD2): the running root is killed, then its
+/// debugserver 50 ms later.
+///
+/// It used to kill the root while it was **held** at a debugger stop and then
+/// the debugserver, which is #193's uncounted-reparent route: the held exit
+/// stays pending until the debugger dies, and the kernel then hands the
+/// half-exited tracee to launchd as a zombie nobody collects. That route is
+/// kernel behaviour with no software fix (#205 R1), and every run of it left a
+/// zombie, so it no longer has a SID-1 regression here. Now the root is in an
+/// ordinary blocking wait (`sleep`), so the kill ends it at once, its zombie is
+/// still its debugserver's child when that dies, and the kernel hands it back
+/// to the platform. The SID-1 kill sequence keeps its coverage: no SIGHUP to
+/// umbra, the caller's group untouched, a status reported, nothing left.
 #[test]
-fn sid1_p2_tracer_killed_with_the_exit_pending() {
+fn sid1_p2_running_tracee_killed_then_its_tracer() {
     if !qualified() || !in_launchd_session() {
         return;
     }
-    let mut run = Run::start("P2", false, true, 20_000, &["park"]);
-    run.line("ISO CHILD", Duration::from_secs(30));
-    std::thread::sleep(Duration::from_millis(300));
+    let mut run = Run::start("P2", false, true, 20_000, &["sleep"]);
+    std::thread::sleep(Duration::from_millis(500));
     let tree = run.discover();
     signal(tree.root, "KILL");
     std::thread::sleep(Duration::from_millis(50));
@@ -1213,6 +1263,8 @@ fn fresh_session_is_unchanged() {
 
 /// What the mini-shell recorded for one pty case, and the terminal transcript.
 struct Pty {
+    /// The fixture's one-line summary (`ISO PTY … survivors=N`).
+    summary: String,
     shell: String,
     transcript: String,
     /// argv of each debugserver in the pty's session when the tracee was ready.
@@ -1229,6 +1281,7 @@ fn pty(case: &str, tracee: &[&str]) -> Option<Pty> {
         return None;
     }
     let (dir, _temp) = case_dir(&format!("PTY-{case}"));
+    let since_us = now_us();
     let out = Command::new(fixture())
         .arg("pty")
         .arg(case)
@@ -1259,7 +1312,14 @@ fn pty(case: &str, tracee: &[&str]) -> Option<Pty> {
         debugservers.iter().all(|a| !a.contains(PIN)),
         "a terminal run's debugserver has {PIN}: {debugservers:?}"
     );
+    std::thread::sleep(Duration::from_millis(300));
+    let zombies = launchd_zombies(since_us, &[]);
+    assert!(
+        zombies.is_empty(),
+        "{case}: launchd-parented zombies of the run: {zombies:?}"
+    );
     Some(Pty {
+        summary,
         shell,
         transcript,
         debugservers,
@@ -1357,7 +1417,11 @@ fn pty_t7_window_change_is_absorbed() {
     );
 }
 
-/// The hangup's process leak is #198; this pins the status only.
+/// The hangup (#198, #205). umbra and the shell's job end with SIGHUP, as
+/// before. The platform provider no longer dies with the terminal: it ends
+/// with its owner and tears its session down in order first, so the harness
+/// finds nothing left to kill (`survivors=0`), and no launchd-parented zombie
+/// is left (checked in `pty`).
 #[test]
 fn pty_t8_hangup() {
     let Some(p) = pty("T8", &["wait", "8"]) else {
@@ -1366,6 +1430,11 @@ fn pty_t8_hangup() {
     inspected(&p);
     assert!(p.shell.lines().any(|l| l == "sighup"), "{}", p.shell);
     ended(&p, "signal:1");
+    assert!(
+        p.summary.contains("survivors=0"),
+        "the harness had processes of the run to kill: {}",
+        p.summary
+    );
 }
 
 #[test]
