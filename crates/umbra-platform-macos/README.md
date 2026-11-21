@@ -86,8 +86,10 @@ Exact owned-child collection is distinct from descendant exit accounting:
 Shutdown freezes admissions and destroys the backend on its original thread.
 A separate transport thread serves bounded polls from snapshots and emits Final
 only after all owner destruction. Existing session teardown, tracer/root reap
-and retirement windows determine the owner envelope; polling never restarts
-them. Synchronous kernel calls and cooperative watchdog cancellation/join assume
+and retirement windows determine the owner envelope, plus the unenrolled
+fork-child sweep (100 ms + 1 s, added once) when any fork window is open at the
+freeze and nothing otherwise; no reservation is admitted after the freeze, so no
+window opens later. Polling never restarts them. Synchronous kernel calls and cooperative watchdog cancellation/join assume
 kernel-call completion. An envelope overrun fails closure rather than claiming
 successful cleanup. No session-age, inactivity or cancellation policy is added.
 
@@ -772,11 +774,13 @@ comes first (another session's refused spawn) used to leave that child running
 after umbra, and its slot reserved, so the run ended unconfirmed and
 recovery-required. Now, before any root is ended, each open window's child is
 found by parentage (a live child of the session that no enrolled session
-matches by pid and birth, after up to 100 ms for a fork still in the kernel).
-Its pid and birth go on the reservation. An untraced child is SIGKILLed and
-confirmed once a lookup shows no process at its pid, another birth there, or a
-zombie of its birth (bounded at 1 s); a failed lookup is never taken as its
-end. A traced one is left to its debugger, debugger-last. Whatever cannot be
+matches by pid and birth, after one settle of up to 100 ms, shared by every
+parent, for a fork still in the kernel). Its pid and birth go on the
+reservation. Every untraced child is SIGKILLed, and then all of them share one
+wait, bounded at 1 s: each is confirmed once a lookup shows no process at its
+pid, another birth there, or a zombie of its birth; a failed lookup is never
+taken as its end. The sweep's worst case is therefore 1.1 s whatever the number
+of open windows, which is what the owner envelope adds for it. A traced one is left to its debugger, debugger-last. Whatever cannot be
 confirmed is marked unconfirmed with a diagnostic naming the child, its parent
 and its state. Each outcome is also logged on stderr
 (`unenrolled fork child ended: pid=… of pid=… birth=…`, or `unconfirmed …`).
@@ -1053,7 +1057,12 @@ Further #205 coverage:
   for its reuse stays stopped) and still continues an unreaped stopped one.
   `native::tests::an_unreadable_fork_child_is_never_confirmed_gone` and
   `native::tests::a_retired_sessions_pid_never_hides_a_fork_child` pin the
-  fork-child sweep's end and identity rules.
+  fork-child sweep's end and identity rules;
+  `native::tests::the_fork_sweep_waits_once_for_every_child` pins its one
+  shared wait (17 children, one bound, on a scripted clock), and
+  `native::tests::an_open_fork_window_is_budgeted_in_the_shutdown_allowance`
+  pins that the frozen envelope adds that worst case once with any window open
+  and nothing with none.
 - `rsp::tests::debugserver_ignores_terminal_signals` reads a live
   debugserver's ignored signals (no program attached) and sends each.
 - `tests/lifetime_signals.rs` sends the provider SIGHUP, SIGINT, SIGQUIT and
