@@ -9864,7 +9864,8 @@ fn slate_c10_10_fork_helper_refusal() {
     );
     // Re-characterized for #205 (launchd-zombie teardown, traced-stub
     // aliases, no SIGCONT to a reaped tracer, the unenrolled-fork-child
-    // sweep and its shared wait inside the shutdown envelope): single_thread and its Fork and WaitPlan::Park call sites are
+    // sweep and its shared wait inside the shutdown envelope): single_thread
+    // and its Fork and WaitPlan::Park call sites are
     // byte-identical to the #284 base (compared with six lines of context);
     // the Fork arm only gains a cfg-gated test probe after its return stop.
     // The refusal oracle and runtime-witness limitation remain unchanged.
