@@ -8353,70 +8353,158 @@ fn slate_bounded_for(
 /// group be killed: killing a debugserver while its program is held hands the
 /// program to launchd as a zombie nobody collects.
 ///
-/// Returns the debugservers seen first (D), the cap, and whether it was
-/// reached.
+/// Returns what the drain read ([`SlateDrain`]).
+///
+/// A census that cannot be read is never taken as "nothing left": the
+/// drain keeps waiting to its cap and records the error.
 fn slate_debugger_last(
     child: &mut std::process::Child,
     group: u32,
     run_session: &mut Option<SlateRunSession>,
-) -> (usize, std::time::Duration, bool) {
-    use std::time::{Duration, Instant};
+) -> SlateDrain {
+    use std::time::Duration;
     let _ = child.kill();
+    slate_drain(
+        |bound| slate_run_members(group, bound, run_session),
+        slate_traced,
+        Duration::from_secs(3),
+        Duration::from_secs(4),
+    )
+}
+
+/// What the debugger-last drain read (#205): the debugservers seen at the
+/// first readable census (D), the cap that followed from it, whether the cap
+/// was reached, and the last census error, if any census failed.
+#[derive(Debug)]
+struct SlateDrain {
+    debuggers: usize,
+    cap: std::time::Duration,
+    exceeded: bool,
+    census_error: Option<String>,
+}
+
+/// The drain loop behind [`slate_debugger_last`]: wait until a readable census
+/// shows no live debugserver and no traced member, capped at `base + per * D`
+/// from the first readable census (`base + per` until there is one).
+fn slate_drain(
+    mut members: impl FnMut(std::time::Instant) -> Result<String, String>,
+    traced: impl Fn(i32) -> bool,
+    base: std::time::Duration,
+    per: std::time::Duration,
+) -> SlateDrain {
+    use std::time::{Duration, Instant};
+    let live = |line: &&str| {
+        !line
+            .split_whitespace()
+            .nth(3)
+            .is_some_and(|stat| stat.starts_with('Z'))
+    };
     let start = Instant::now();
     let mut first: Option<(usize, Duration)> = None;
+    let mut census_error = None;
     loop {
-        let bound = first.map_or(start + Duration::from_secs(7), |(_, cap)| start + cap);
-        let members = slate_run_members(group, bound, run_session).unwrap_or_default();
-        let live: Vec<i32> = members
-            .lines()
-            .filter(|line| {
-                !line
-                    .split_whitespace()
-                    .nth(3)
-                    .is_some_and(|stat| stat.starts_with('Z'))
-            })
-            .filter_map(|line| line.split_whitespace().next()?.parse().ok())
-            .collect();
-        let debuggers = members
-            .lines()
-            .filter(|line| line.contains("debugserver"))
-            .filter(|line| {
-                !line
-                    .split_whitespace()
-                    .nth(3)
-                    .is_some_and(|stat| stat.starts_with('Z'))
-            })
-            .count();
-        let traced = live.iter().any(|&pid| {
-            // SAFETY: plain old data, filled by proc_pidinfo below.
-            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-            let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
-            // SAFETY: `info` is writable for `size` bytes.
-            let got = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDTBSDINFO,
-                    0,
-                    (&mut info as *mut libc::proc_bsdinfo).cast(),
-                    size,
-                )
-            };
-            got == size && info.pbi_flags & 2 != 0 // PROC_FLAG_TRACED
-        });
-        let (d, cap) = *first.get_or_insert_with(|| {
-            (
-                debuggers,
-                Duration::from_secs(3) + Duration::from_secs(4) * debuggers.max(1) as u32,
-            )
-        });
-        if debuggers == 0 && !traced {
-            return (d, cap, false);
-        }
-        if start.elapsed() >= cap {
-            return (d, cap, true);
+        let cap = first.map_or(base + per, |(_, cap)| cap);
+        match members(start + cap) {
+            Ok(members) => {
+                let debuggers = members
+                    .lines()
+                    .filter(live)
+                    .filter(|line| line.contains("debugserver"))
+                    .count();
+                let any_traced = members
+                    .lines()
+                    .filter(live)
+                    .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+                    .any(&traced);
+                let (d, cap) =
+                    *first.get_or_insert_with(|| (debuggers, base + per * debuggers.max(1) as u32));
+                if debuggers == 0 && !any_traced {
+                    return SlateDrain {
+                        debuggers: d,
+                        cap,
+                        exceeded: false,
+                        census_error,
+                    };
+                }
+                if start.elapsed() >= cap {
+                    return SlateDrain {
+                        debuggers: d,
+                        cap,
+                        exceeded: true,
+                        census_error,
+                    };
+                }
+            }
+            Err(error) => {
+                census_error = Some(error);
+                if start.elapsed() >= cap {
+                    return SlateDrain {
+                        debuggers: first.map_or(0, |(d, _)| d),
+                        cap,
+                        exceeded: true,
+                        census_error,
+                    };
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Whether `pid` is traced (`PROC_FLAG_TRACED`), read-only.
+fn slate_traced(pid: i32) -> bool {
+    // SAFETY: plain old data, filled by proc_pidinfo below.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` is writable for `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    got == size && info.pbi_flags & 2 != 0 // PROC_FLAG_TRACED
+}
+
+/// #205: the drain never reads an unavailable census as nothing left.
+#[test]
+fn slate_drain_never_reads_an_unavailable_census_as_empty() {
+    use std::time::{Duration, Instant};
+    let (base, per) = (Duration::from_millis(30), Duration::from_millis(40));
+    let start = Instant::now();
+    let drain = slate_drain(|_| Err("census unavailable".into()), |_| false, base, per);
+    assert!(drain.exceeded, "an unread census drained: {drain:?}");
+    assert!(
+        start.elapsed() >= base + per,
+        "returned before its cap: {drain:?}"
+    );
+    assert_eq!(drain.census_error.as_deref(), Some("census unavailable"));
+    let mut calls = 0;
+    let drain = slate_drain(
+        |_| {
+            calls += 1;
+            if calls == 1 {
+                Err("transient".into())
+            } else {
+                Ok(String::new())
+            }
+        },
+        |_| false,
+        base,
+        per,
+    );
+    assert!(!drain.exceeded, "a readable empty census drains: {drain:?}");
+    assert_eq!(drain.census_error.as_deref(), Some("transient"));
+    let drain = slate_drain(
+        |_| Ok("4242 1 4242 S /usr/bin/debugserver".into()),
+        |_| false,
+        base,
+        per,
+    );
+    assert!(drain.exceeded && drain.debuggers == 1, "{drain:?}");
 }
 
 /// #205: the cleanup census's budget after a debugger-last ending with `d`
@@ -8639,16 +8727,21 @@ fn slate_launch(
     if timed_out || census_error.is_some() {
         // #205: end the run debugger-last before the group kill, and give the
         // cleanup census room for the guardian's own drain and sweep in SID 1.
-        let (debuggers, cap, exceeded) = slate_debugger_last(&mut child, group, &mut run_session);
+        let SlateDrain {
+            debuggers,
+            cap,
+            exceeded,
+            census_error: drain_error,
+        } = slate_debugger_last(&mut child, group, &mut run_session);
         grace_budget = grace_budget.max(slate_cleanup_budget(debuggers));
         slate_census_event(
             "DRAIN",
             &format!(
-                "debuggers={debuggers} cap={cap:?} exceeded={exceeded} grace={grace_budget:?}"
+                "debuggers={debuggers} cap={cap:?} exceeded={exceeded} census_error={drain_error:?} grace={grace_budget:?}"
             ),
         );
         eprintln!(
-            "{}: #205 drain: D={debuggers} cap={cap:?} exceeded={exceeded} cleanup grace={grace_budget:?}",
+            "{}: #205 drain: D={debuggers} cap={cap:?} exceeded={exceeded} census_error={drain_error:?} cleanup grace={grace_budget:?}",
             evidence.display()
         );
         // SAFETY: this child was launched as leader of its own process group.
@@ -12815,16 +12908,21 @@ fn c13_launch(
     if timed_out || census_error.is_some() {
         // #205: end the run debugger-last before the group kill, and give the
         // cleanup census room for the guardian's own drain and sweep in SID 1.
-        let (debuggers, cap, exceeded) = slate_debugger_last(&mut child, group, &mut run_session);
+        let SlateDrain {
+            debuggers,
+            cap,
+            exceeded,
+            census_error: drain_error,
+        } = slate_debugger_last(&mut child, group, &mut run_session);
         grace_budget = grace_budget.max(slate_cleanup_budget(debuggers));
         slate_census_event(
             "DRAIN",
             &format!(
-                "debuggers={debuggers} cap={cap:?} exceeded={exceeded} grace={grace_budget:?}"
+                "debuggers={debuggers} cap={cap:?} exceeded={exceeded} census_error={drain_error:?} grace={grace_budget:?}"
             ),
         );
         eprintln!(
-            "{}: #205 drain: D={debuggers} cap={cap:?} exceeded={exceeded} cleanup grace={grace_budget:?}",
+            "{}: #205 drain: D={debuggers} cap={cap:?} exceeded={exceeded} census_error={drain_error:?} cleanup grace={grace_budget:?}",
             evidence.display()
         );
         // SAFETY: this child was launched as leader of its own process group.
