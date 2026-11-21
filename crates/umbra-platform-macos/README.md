@@ -680,6 +680,7 @@ phase selector defaults as listed when a probe socket is supplied:
 | `UMBRA_FIX_243_OVERLAP_PARENTS` | Holds 2–17 distinct parents before kernel execution and verifies their backing before release; the production cap refuses the seventeenth token. |
 | `UMBRA_FIX_243_OWNER_TRACE` | Reports retained Session identities at teardown entry. |
 | `UMBRA_FIX_271_MISSING_FINAL` | Any set value reports preliminary termination failure and withholds Final after owner destruction. |
+| `UMBRA_FIX_205_FORK_WINDOW_HOLD` | Any set value stops polling a session that opens a fork while another session exists, for at most 10 s, so that fork's child stays unenrolled in its return window across a sibling's teardown; reports `fork-window-hold parent=<pid>`. |
 
 The socket acknowledgment continues (`C`), injects the selected failure (`E`),
 or exits the provider without Drop (`P`). These controls belong to the fixture
