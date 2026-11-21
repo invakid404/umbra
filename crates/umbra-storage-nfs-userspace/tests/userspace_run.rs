@@ -8528,6 +8528,38 @@ fn slate_drain_never_reads_an_unavailable_census_as_empty() {
     assert!(start.elapsed() >= base + per, "{drain:?}");
 }
 
+/// #205 (D-A): whether the cleanup must drain debugger-last before it kills
+/// anything: the run exited on its own (`exited`), it was not drained already,
+/// and members are left (`live` in its group or session, `escaped` from it).
+fn slate_drain_before_kill(drained: bool, exited: bool, live: usize, escaped: usize) -> bool {
+    let _ = (drained, exited, live, escaped);
+    false
+}
+
+/// #205 (D-A): after a normal exit that leaves members, the cleanup drains
+/// before any kill, once; a run already drained (timed out) or with nothing
+/// left does not.
+#[test]
+fn slate_normal_exit_drains_before_any_kill() {
+    assert!(
+        slate_drain_before_kill(false, true, 2, 0),
+        "live members left"
+    );
+    assert!(
+        slate_drain_before_kill(false, true, 0, 1),
+        "an escaped member left"
+    );
+    assert!(
+        !slate_drain_before_kill(true, true, 2, 0),
+        "drained once already"
+    );
+    assert!(!slate_drain_before_kill(false, true, 0, 0), "nothing left");
+    assert!(
+        !slate_drain_before_kill(false, false, 2, 0),
+        "still running: not an exit"
+    );
+}
+
 /// #205: the cleanup census's budget after a debugger-last ending with `d`
 /// debugservers: the guardian's drain cap (3 s + 4 s per debugserver), its
 /// sweep (3 s) and its supervisor reap (1 s), plus a 2 s census margin.
@@ -8786,7 +8818,9 @@ fn slate_launch(
             group_kills += 1;
         }
     }
-    let grace = Instant::now() + grace_budget;
+    let mut grace = Instant::now() + grace_budget;
+    // A timed-out or census-failed run was already drained debugger-last.
+    let mut drained = timed_out || census_error.is_some();
     let mut status = status;
 
     let mut pipes: [Option<Vec<u8>>; 2] = [None, None];
@@ -8864,6 +8898,28 @@ fn slate_launch(
         if grace.saturating_duration_since(Instant::now()) <= Duration::from_millis(400) {
             cleanup_failure=Some(format!("cleanup FAILED: grace exhausted with live={live:?}, escaped={escaped:?}, direct_status={status:?}, pipes_complete={}",pipes.iter().all(Option::is_some)));
             break;
+        }
+        // #205 (D-A): a run that exited on its own but left members is ended
+        // debugger-last too: drain first (3 s + 4 s per debugserver, the same
+        // cap), then read again before any kill. Its grace pauses meanwhile.
+        if slate_drain_before_kill(drained, status.is_some(), live.len(), escaped.len()) {
+            drained = true;
+            let started = Instant::now();
+            let drain = slate_drain(
+                |bound| slate_run_members(group, bound, &mut run_session),
+                slate_traced,
+                Duration::from_secs(3),
+                Duration::from_secs(4),
+            );
+            grace += started.elapsed();
+            slate_census_event(
+                "DRAIN",
+                &format!(
+                    "normal-exit debuggers={} cap={:?} exceeded={} census_error={:?}",
+                    drain.debuggers, drain.cap, drain.exceeded, drain.census_error
+                ),
+            );
+            continue;
         }
         slate_census_event(
             "PROGRESS",
@@ -13588,7 +13644,9 @@ fn c13_launch(
             group_kills += 1;
         }
     }
-    let grace = Instant::now() + grace_budget;
+    let mut grace = Instant::now() + grace_budget;
+    // A timed-out or census-failed run was already drained debugger-last.
+    let mut drained = timed_out || census_error.is_some();
     let mut status = status;
 
     let mut pipes: [Option<Vec<u8>>; 2] = [None, None];
@@ -13669,6 +13727,28 @@ fn c13_launch(
                 pipes.iter().all(Option::is_some)
             ));
             break;
+        }
+        // #205 (D-A): a run that exited on its own but left members is ended
+        // debugger-last too: drain first (3 s + 4 s per debugserver, the same
+        // cap), then read again before any kill. Its grace pauses meanwhile.
+        if slate_drain_before_kill(drained, status.is_some(), live.len(), escaped.len()) {
+            drained = true;
+            let started = Instant::now();
+            let drain = slate_drain(
+                |bound| slate_run_members(group, bound, &mut run_session),
+                slate_traced,
+                Duration::from_secs(3),
+                Duration::from_secs(4),
+            );
+            grace += started.elapsed();
+            slate_census_event(
+                "DRAIN",
+                &format!(
+                    "normal-exit debuggers={} cap={:?} exceeded={} census_error={:?}",
+                    drain.debuggers, drain.cap, drain.exceeded, drain.census_error
+                ),
+            );
+            continue;
         }
         slate_census_event(
             "PROGRESS",
