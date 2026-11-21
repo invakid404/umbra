@@ -5510,17 +5510,26 @@ impl TraceControl for MacosTraceBackend {
             .filter(|r| r.unconfirmed || r.steps.iter().any(|step| matches!(step, TeardownStep::Retirement(outcome) if !outcome.success())))
             .map(TeardownReport::summary)
             .collect();
-        if !unconfirmed.is_empty() {
-            return Err(error(
-                "terminate",
-                format!(
-                    "tree cleanup failed (tracee or retired tracer): {}",
-                    unconfirmed.join("; ")
-                ),
-            ));
-        }
-        Ok(())
+        termination_result(unconfirmed, Vec::new())
     }
+}
+
+/// `terminate`'s result (#205): `Ok` only when nothing is left unconfirmed:
+/// no session report (tracee or retired tracer), and no unenrolled fork child
+/// the sweep could not confirm ended. Callers treat `Ok` as confirmed
+/// termination (the provider forgets the root; `terminate_tree` reports it).
+fn termination_result(sessions: Vec<String>, unenrolled: Vec<String>) -> Result<()> {
+    let _ = unenrolled;
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    Err(error(
+        "terminate",
+        format!(
+            "tree cleanup failed (tracee or retired tracer): {}",
+            sessions.join("; ")
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -5712,6 +5721,26 @@ mod tests {
     /// #205: a SIGKILLed unenrolled fork child is confirmed ended only by an
     /// absent pid, a replaced birth, or a zombie of its birth; a failed lookup
     /// is never read as disappearance.
+    #[test]
+    fn an_unconfirmed_fork_child_fails_termination() {
+        use super::*;
+        // #205 (CR-21): an unenrolled fork child the sweep could not confirm
+        // ended is a cleanup failure, even when every session tore down: the
+        // provider and `terminate_tree` treat `Ok` as confirmed termination.
+        let child = "unenrolled fork child pid=77 of pid=42: still live 1000 ms after SIGKILL";
+        let failed = termination_result(Vec::new(), vec![child.to_owned()])
+            .expect_err("an unconfirmed fork child is not a confirmed termination");
+        assert!(failed.to_string().contains(child), "{failed}");
+        let session = "Tracee pid=42: unconfirmed";
+        let both = termination_result(vec![session.to_owned()], vec![child.to_owned()])
+            .expect_err("both kinds fail");
+        assert!(
+            both.to_string().contains(session) && both.to_string().contains(child),
+            "{both}"
+        );
+        assert!(termination_result(Vec::new(), Vec::new()).is_ok());
+    }
+
     #[test]
     fn an_open_fork_window_is_budgeted_in_the_shutdown_allowance() {
         use super::*;
