@@ -10210,6 +10210,54 @@ impl SlateRouted {
     }
 }
 const SLATE_RECORDS: [&str; 3] = ["records.pre", "records.done", "records.child"];
+
+/// The exact refusal of a packed spawn on an unqualified spawn profile.
+const SLATE_SPAWN_PROFILE_REFUSAL: &str =
+    "UnsupportedCapability during macos: spawn ABI profile mismatch (errno: None)";
+
+/// Whether this host's packed-spawn ABI is the qualified profile, by the
+/// platform's own predicate: the one `capture_spawn` refuses on.
+fn spawn_profile_qualified() -> bool {
+    umbra_platform_macos::spawn_profile_qualified()
+}
+
+/// A packed-spawn case on an unqualified spawn profile (#205, #247): the
+/// native control still spawns, and the routed run refuses exactly, in the
+/// shape of [`fix_243_refusal`]. Its supervisor fails with the profile
+/// diagnostic and reports no tracee completion; the program reached its spawn
+/// (`records.pre`), and no program was spawned (no `records.child`, no
+/// `child.txt`, no `records.done`).
+fn slate_spawn_profile_refusal(mode: &str) {
+    let Some(spawn) = slate_spawn(mode) else {
+        return;
+    };
+    let (_root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "native control: {}", native.status);
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt"]);
+    let exact = routed.run.status != Some(0)
+        && routed.run.stderr.contains(SLATE_SPAWN_PROFILE_REFUSAL)
+        && !routed.run.stderr.contains("finished:")
+        && routed.object("records.pre").is_some()
+        && ["records.child", "records.done", "child.txt"]
+            .iter()
+            .all(|name| routed.object(name).is_none());
+    slate_record(
+        &spawn,
+        if exact {
+            "EXACT KNOWN REFUSAL"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({
+            "diagnostic": SLATE_SPAWN_PROFILE_REFUSAL,
+            "spawn_profile": "unqualified",
+            "run_id": routed.run.run_id.0.to_string(),
+        }),
+    );
+    assert!(exact, "{}", routed.run.stderr);
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
 fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRouted {
     let (host, port) = fixture().expect("live Ganesha required; no skipped qualification");
     let workspace = spawn.scratch.path().join("workspace");
@@ -10625,12 +10673,22 @@ fn slate_c11_02_empty_actions() {
 /// C11-02, attributes only: an initialized, empty attribute object.
 #[test]
 fn slate_c11_02_empty_attributes() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("c11-02-attributes");
+        return;
+    }
     slate_spawn_shape("c11-02-attributes", true);
 }
 
 /// C11-02, both objects initialized and empty.
 #[test]
 fn slate_c11_02_empty_both() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("c11-02-both");
+        return;
+    }
     slate_spawn_shape("c11-02-both", true);
 }
 
@@ -10678,6 +10736,11 @@ fn fix_243_signal(mode: &str, child_record: &str, flags: &str) {
 
 #[test]
 fn fix_243_sigpipe_default() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-sigdefault");
+        return;
+    }
     fix_243_signal(
         "fix-243-sigdefault",
         "child-signal default=1 ignored=0 blocked=1",
@@ -10687,6 +10750,11 @@ fn fix_243_sigpipe_default() {
 
 #[test]
 fn fix_243_sigpipe_mask() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-sigmask");
+        return;
+    }
     fix_243_signal(
         "fix-243-sigmask",
         "child-signal default=0 ignored=1 blocked=0",
@@ -10778,19 +10846,39 @@ fn fix_243_pipe(mode: &str) {
 
 #[test]
 fn fix_243_inherit_cloexec_kernel_fd() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-inherit-cloexec");
+        return;
+    }
     fix_243_pipe("fix-243-inherit-cloexec");
 }
 #[test]
 fn fix_243_close_before_dup_cloexec_default() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-close-before-dup");
+        return;
+    }
     fix_243_pipe("fix-243-close-before-dup");
 }
 #[test]
 fn fix_243_dup_before_close_cloexec_default() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-dup-before-close");
+        return;
+    }
     fix_243_pipe("fix-243-dup-before-close");
 }
 
 #[test]
 fn fix_243_kernel_pipe_actions() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-pipe");
+        return;
+    }
     fix_243_pipe("fix-243-pipe");
 }
 
@@ -11064,6 +11152,11 @@ fn fix_243_region_success_error_cycles() {
 
 #[test]
 fn fix_243_same_parent_threads() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-threads");
+        return;
+    }
     let Some(spawn) = slate_spawn("fix-243-threads") else {
         return;
     };
@@ -11081,11 +11174,21 @@ fn fix_243_same_parent_threads() {
 
 #[test]
 fn fix_243_cloexec_default_prunes_logical_descriptors() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-cloexec");
+        return;
+    }
     fix_243_pipe("fix-243-cloexec");
 }
 
 #[test]
 fn fix_243_kernel_error_then_success() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-error-recovery");
+        return;
+    }
     fix_243_pipe("fix-243-error-recovery");
 }
 
@@ -11127,6 +11230,11 @@ fn fix_243_refusal(mode: &str, diagnostic: &str) {
 
 #[test]
 fn fix_243_refuses_setsid() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-setsid");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-setsid",
         "spawn unsupported attribute SETSID",
@@ -11134,6 +11242,11 @@ fn fix_243_refuses_setsid() {
 }
 #[test]
 fn fix_243_refuses_setpgroup() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-setpgroup");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-setpgroup",
         "spawn unsupported attribute SETPGROUP",
@@ -11141,6 +11254,11 @@ fn fix_243_refuses_setpgroup() {
 }
 #[test]
 fn fix_243_refuses_resetids() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-resetids");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-resetids",
         "spawn unsupported attribute RESETIDS",
@@ -11148,6 +11266,11 @@ fn fix_243_refuses_resetids() {
 }
 #[test]
 fn fix_243_refuses_fileport_dup2() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-fileport");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-fileport",
         "spawn unsupported action FILEPORT_DUP2",
@@ -11155,14 +11278,29 @@ fn fix_243_refuses_fileport_dup2() {
 }
 #[test]
 fn fix_243_refuses_open() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-open");
+        return;
+    }
     fix_243_refusal("fix-243-refuse-open", "spawn unsupported action OPEN");
 }
 #[test]
 fn fix_243_refuses_chdir() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-chdir");
+        return;
+    }
     fix_243_refusal("fix-243-refuse-chdir", "spawn unsupported action CHDIR");
 }
 #[test]
 fn fix_243_refuses_late_chdir() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-late-chdir");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-late-chdir",
         "spawn unsupported action CHDIR",
@@ -11170,10 +11308,20 @@ fn fix_243_refuses_late_chdir() {
 }
 #[test]
 fn fix_243_refuses_fchdir() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-fchdir");
+        return;
+    }
     fix_243_refusal("fix-243-refuse-fchdir", "spawn unsupported action FCHDIR");
 }
 #[test]
 fn fix_243_refuses_virtual_before_chdir() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-virtual-before-chdir");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-virtual-before-chdir",
         "spawn virtual descriptor action",
@@ -11181,6 +11329,11 @@ fn fix_243_refuses_virtual_before_chdir() {
 }
 #[test]
 fn fix_243_refuses_chdir_before_virtual() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-chdir-before-virtual");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-chdir-before-virtual",
         "spawn unsupported action CHDIR",
@@ -11188,6 +11341,11 @@ fn fix_243_refuses_chdir_before_virtual() {
 }
 #[test]
 fn fix_243_refuses_virtual_source() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-virtual-source");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-virtual-source",
         "spawn virtual descriptor action",
@@ -11195,6 +11353,11 @@ fn fix_243_refuses_virtual_source() {
 }
 #[test]
 fn fix_243_refuses_virtual_destination() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-virtual-destination");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-virtual-destination",
         "spawn virtual descriptor action",
@@ -12095,6 +12258,11 @@ fn race_alternations(bytes: &[u8]) -> usize {
 /// never composition support.
 #[test]
 fn slate_c11_10_e8_pipe_refusal() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("c11-10");
+        return;
+    }
     let Some(spawn) = slate_spawn("c11-10") else {
         return;
     };

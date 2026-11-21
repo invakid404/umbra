@@ -765,6 +765,7 @@ dependencies = [
  "umbra-journal",
  "umbra-journal-file",
  "umbra-platform",
+ "umbra-platform-macos",
  "umbra-storage",
  "uuid",
 ]
