@@ -771,12 +771,15 @@ until the parent's fork return is processed and enrolls it. A termination that
 comes first (another session's refused spawn) used to leave that child running
 after umbra, and its slot reserved, so the run ended unconfirmed and
 recovery-required. Now, before any root is ended, each open window's child is
-found by parentage (a live child of the session that is not itself enrolled,
-after up to 100 ms for a fork still in the kernel). Its pid and birth go on the
-reservation. An untraced child is SIGKILLed and confirmed once it is gone or a
-zombie under its parent (bounded at 1 s). A traced one is left to its
-debugger, debugger-last. Whatever cannot be confirmed is marked unconfirmed
-with a diagnostic naming the child, its parent and its state.
+found by parentage (a live child of the session that no enrolled session
+matches by pid and birth, after up to 100 ms for a fork still in the kernel).
+Its pid and birth go on the reservation. An untraced child is SIGKILLed and
+confirmed once a lookup shows no process at its pid, another birth there, or a
+zombie of its birth (bounded at 1 s); a failed lookup is never taken as its
+end. A traced one is left to its debugger, debugger-last. Whatever cannot be
+confirmed is marked unconfirmed with a diagnostic naming the child, its parent
+and its state. Each outcome is also logged on stderr
+(`unenrolled fork child ended: pid=… of pid=… birth=…`, or `unconfirmed …`).
 The sweep covers fork windows only. A spawn's window (its child created
 suspended and untraced until the parent's return enrols it) is not swept yet;
 such a child would stay suspended after umbra, and its slot names itself as
@@ -1039,7 +1042,8 @@ tracer was reaped and that no child of the test process remains.
 Each of the five also counts launchd-parented zombies of `umbra-test-child`
 started in its window, or at its recorded pids, and fails on any (#205). The
 count is the shared `tests/zombies/mod.rs`, which `tests/lifetime_signals.rs`
-uses too.
+uses too. A `ps` that fails is reported as an entry (no reading), so the case
+fails rather than reading as no zombies.
 
 Further #205 coverage:
 - `native::tests::a_tracee_handed_to_launchd_is_never_confirmed` and
@@ -1047,11 +1051,15 @@ Further #205 coverage:
   `native::tests::a_reaped_tracer_is_never_continued` pins that the
   prologue never signals a reaped tracer's pid (a stopped process standing in
   for its reuse stays stopped) and still continues an unreaped stopped one.
+  `native::tests::an_unreadable_fork_child_is_never_confirmed_gone` and
+  `native::tests::a_retired_sessions_pid_never_hides_a_fork_child` pin the
+  fork-child sweep's end and identity rules.
 - `rsp::tests::debugserver_ignores_terminal_signals` reads a live
   debugserver's ignored signals (no program attached) and sends each.
 - `tests/lifetime_signals.rs` sends the provider SIGHUP, SIGINT, SIGQUIT and
   SIGTERM with a live owner, then during a teardown, and pins that a launched
-  program keeps the caller's ignored dispositions.
+  program keeps the caller's ignored dispositions (each case sets SIGHUP and
+  SIGINT explicitly, ignored or default, so neither inherits the test's own).
 - `native_debugger_last_hands_the_program_back` is the native control
   (`experiments/fixtures/umbra-fix-205-exitwin.c`, the orderings that leave
   nothing behind only).

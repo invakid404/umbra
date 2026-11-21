@@ -79,16 +79,21 @@ kernel hand the program to launchd as a zombie nobody ever collects: it stays
 until a reboot and counts against the user's process limit (platform README,
 "Ordered teardown"). So a run is ended in three steps (`sweep::end_run`):
 
-1. **The supervisor first**, when it is still alive, by its own audit token.
-   The platform provider, whose owner it is, then tears its sessions down in
+1. **The supervisor first**, when it is still alive, by its own audit token,
+   taken between two successful anchor checks (the anchor rule below); without
+   that proof it is not signalled. The platform provider, whose owner it is,
+   then tears its sessions down in
    order: only debugserver ends a held program, and debugserver is ended only
    once the program is gone.
 2. **A drain:** wait until no live member of S is a debugserver and none is
    traced (`PROC_FLAG_TRACED`), capped at 3 s + 4 s per debugserver seen at the
-   first reading (the platform's worst case, its emergency path included). It
-   sends no terminating signal. Its one signal is SIGCONT, at the first
-   reading, to stopped members that are not traced (a stopped provider), by
-   tokens enrolled under the anchor rule below. The image names it uses
+   first readable reading (the platform's worst case, its emergency path
+   included; 7 s until a reading succeeds). It sends no terminating signal. Its
+   one signal is SIGCONT, at the first readable reading, to stopped members
+   that are not traced (a stopped provider), by tokens enrolled under the
+   anchor rule below; a failed reading delays it, and a failed anchor check
+   ends it. Each member's start identity is bound to its verified token (read
+   again after the token; on a mismatch the member keeps no token). The image names it uses
    (`debugserver`) are for waiting only; the platform provider's image is not
    used, so a substitute provider cannot end it early. Reaching the cap is
    recorded as `drain_exceeded`, and the sweep then goes ahead. Its known
@@ -111,9 +116,11 @@ Who ends the run:
   child) first, drains and sweeps S, reaps the supervisor within 1 s, records
   `relay-death` and exits.
 - **Relay fallback** (the guardian stopped, lost, malformed or slow): the relay
-  names the supervisor (the pid `STARTED` reported, or, before `STARTED`, the
-  guardian's only child in S, found while the guardian is still its unreaped
-  child), then SIGKILLs the guardian by pid, but only while it is the relay's
+  first SIGSTOPs a live guardian (recorded as `guardian-stop`), so it cannot
+  spawn a supervisor after the lookup. It names the supervisor (the pid
+  `STARTED` reported, or, before `STARTED`, the guardian's only child in S,
+  found while the guardian is still its unreaped child), then SIGKILLs the
+  guardian by pid, but only while it is the relay's
   own unreaped child. It then ends the supervisor by token, drains and sweeps
   S, writes its `relay-fallback` line, reaps the guardian once, records the
   reap in a `guardian-reaped` line and exits 1.
@@ -220,10 +227,11 @@ deadline:
 | Wait | Bound |
 |---|---|
 | each startup handshake phase (`ISOLATED`, then `STARTED`) | 2 s |
-| the drain before a sweep (#205; until no live debugserver or traced member) | 3 s + 4 s per debugserver at its first reading; `drain_exceeded` when reached |
+| the drain before a sweep (#205; until no live debugserver or traced member) | 3 s + 4 s per debugserver at its first readable reading; `drain_exceeded` when reached |
 | a sweep (census passes, kills, pauses) | 3 s, plus the overrun below |
 | the guardian's reap of the supervisor after relay death | 1 s |
 | the guardian's exit after its `OUTCOME` | 1 s |
+| the relay's wait for a SIGSTOPped live guardian to stop, before it names the supervisor (#205) | 1 s |
 | the relay's wait for a SIGKILLed guardian to exit | 1 s |
 | the relay's reap of the guardian | 1 s |
 
@@ -333,14 +341,17 @@ Stated, not closed here:
   - the debugger-last ending (#205), scripted: the supervisor is ended before
     any sweep kill, on every path that can name it (the relay's fallback
     included); the drain waits to its cap while a debugserver lives, ends at
-    once with nothing to wait for, continues only stopped untraced members,
-    and scales its cap with the debugserver count; a member left as a zombie
+    once with nothing to wait for, continues only stopped untraced members
+    (still after a failed first reading), and scales its cap with the
+    debugserver count; a member left as a zombie
     under launchd is reported and keeps the outcome from `COMPLETE`;
   - spawn: no SIGPIPE inheritance, a new session, exact descriptor passing.
 - `tests/t1_kernel.rs`, on the real kernel:
   - with the anchor forced off, claimants are reported `UNVERIFIABLE` and not
     signalled, and with it held they are killed (the frozen-set half of T1);
   - a stale token is refused;
+  - the supervisor is not signalled with the anchor forced off, and is killed
+    by its token with it held (#205);
   - a sanity check that a zombie leader stays a zombie while new sessions are
     created. It attempts no pid reuse, so it does not show the anchor.
 - The anchor-held half of T1 (no process can obtain a zombie leader's pid or
@@ -353,6 +364,8 @@ Stated, not closed here:
   - the fail-closed transitions that a scripted guardian can produce (EOF,
     malformed, oversized and unknown frames, a stopped, silent, hung or
     exited guardian, a wrong session claim);
+  - a live guardian stopped (`guardian-stop`) before its kill, in the fallback
+    (#205);
   - the bounds.
 
   Every case that starts a guardian also checks that the single reap is the

@@ -290,9 +290,10 @@ The harness signals only pids it found by parentage from its own launcher, and
 cleans up by the run's session. Its cleanup is debugger-last (#205): it ends
 the supervisor first, waits (capped at 3 s + 4 s per debugserver) until no
 recorded debugserver is live, and only then kills what is left. Every case
-that asserts nothing survives, and every pty case, also counts zombies whose
-parent is launchd, by the fixture's name and a start time inside the case's
-window, and fails on any.
+that asserts nothing survives, every pty case, and
+`sid1_sigterm_to_the_relay_cancels_the_run`, also count zombies whose parent is
+launchd, by the fixture's name and a start time inside the case's window, and
+fail on any.
 
 `tests/run_fixtures.rs`'s `local_utility_matrix` and `nfs_utility_matrix` run
 standard utilities behind the same gating as its fixture cases — `/usr/bin/touch`,

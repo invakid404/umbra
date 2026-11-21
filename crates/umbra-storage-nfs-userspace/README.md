@@ -67,7 +67,8 @@ probe cases, and the backing-overlap, region-cap and region-fault cases):
   spawns and writes the mode's own bytes (`child.txt`, `spawn result=0`, and a
   `virtual-*` victim's `SEED`). The routed run fails with `UnsupportedCapability
   during macos: spawn ABI profile mismatch (errno: None)` and reports no tracee
-  completion; the program reached its spawn, and nothing was spawned. A
+  completion; the program reached its spawn, and nothing was spawned (neither
+  `child.txt` nor the refused open's `opened.txt` exists afterwards). A
   `virtual-*` victim keeps its `SEED` through the client. A probe case also
   arms its probe as usual and asserts that nothing ever reached it. Each also
   keeps its qualified body's cleanup oracle: a `CLEAN` cleanup record, with
@@ -94,8 +95,10 @@ while a sibling fork is still in its window. The fixture mode
 The test-only probe `UMBRA_FIX_205_FORK_WINDOW_HOLD` (in builds with the
 feature only) stops polling a fork opened while another session exists, for at
 most 10 s, so the second child is still unenrolled when the refusal arrives.
-The case asserts the exact refusal, that the probe held the window, and that
-nothing outlived umbra: cleanup `CLEAN` with `group_kills=0` and no zombie.
+The case asserts the exact refusal, that the probe held the window, that the
+platform's teardown found and ended the unenrolled second child (its
+`unenrolled fork child ended` line), and that nothing outlived umbra: cleanup
+`CLEAN` with `group_kills=0` and no zombie.
 The intermittent form of the same gap made the backing-overlap and region-cap
 cases fail with an unconfirmed cleanup and a group kill; the platform's
 teardown now ends such a child (platform README, "Termination").
@@ -1053,14 +1056,17 @@ as a zombie nobody collects:
    4 s per debugserver at the first readable census, and records a `DRAIN`
    census event. A census that cannot be read never ends the wait: the drain
    runs to its cap, reports `exceeded=true` unless a later census reads
-   nothing left, and records the error.
+   nothing left, and records the error. A member whose trace state cannot be
+   read counts as traced, so it also keeps the drain waiting.
 3. The cleanup grace grows to at least 9 s + 4 s per debugserver
    (`slate_cleanup_budget`: the guardian's drain cap, its 3 s sweep and 1 s
    reap, and a 2 s margin), and the group kill follows.
 
 Both slate launchers also fail a case on any zombie under launchd of one of
-this suite's fixtures (`umbra-userspace-*`, `umbra-slate-*`, `umbra-fix-*`)
-that started in the case's window (`slate_launchd_zombies`). The group census
+this suite's fixtures (`umbra-userspace-*`, `umbra-slate-*`, `umbra-fix-*`,
+by the full process name, since the 15-byte short name cuts
+`umbra-userspace-spawn` to `umbra-userspace`) that started in the case's window
+(`slate_launchd_zombies`). A `ps` that fails is no reading, and fails the case. The group census
 still accepts zombies inside the run's group as dead-table residue.
 
 In launchd's session (CI's self-hosted runner) a supervised `umbra run` stays
