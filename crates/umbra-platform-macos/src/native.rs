@@ -1716,7 +1716,6 @@ impl Session {
         Ok(())
     }
 }
-/// Load address of the tracee's main executable (`MH_EXECUTE`).
 /// The address of the `svc` each [`abi::TRACED_STUBS`] row breakpoints, read
 /// from this process's own copy of libsystem_kernel (the shared cache is
 /// system-wide on this native host, so the address is the tracee's too).
@@ -1803,6 +1802,7 @@ fn traced_stub_site(name: &str, number: u64) -> Result<u64> {
     Ok(start + offset as u64 * 4)
 }
 
+/// Load address of the tracee's main executable (`MH_EXECUTE`).
 fn main_image_base(images: &[serde_json::Value]) -> Result<u64> {
     images
         .iter()
@@ -4198,7 +4198,8 @@ fn post_kill_unconfirmed(after_kill: Option<&BarrierReading>, root: bool, reaped
 }
 
 /// Continue a tracer before its teardown (#205 A1(b)). `true` when it was
-/// stopped, for the record only: the continue itself is unconditional.
+/// stopped, for the record only: the continue itself is unconditional while
+/// the tracer is unreaped.
 trait ContinueTracer {
     fn continue_tracer(&mut self) -> bool;
 }
@@ -4215,6 +4216,11 @@ fn teardown_prologue(tracer: &mut impl ContinueTracer) -> Option<TeardownStep> {
 
 impl ContinueTracer for Rsp {
     fn continue_tracer(&mut self) -> bool {
+        // Once reaped, the tracer's pid may already belong to another process;
+        // while unreaped, its zombie keeps the pid from being reused.
+        if crate::retirement::Tracer::already_reaped(self) {
+            return false;
+        }
         let pid = self.tracer_pid();
         let stopped = bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SSTOP);
         // SAFETY: plain libSystem call on our own child; SIGCONT ends nothing.
@@ -5298,6 +5304,53 @@ mod tests {
         };
         assert_eq!(teardown_prologue(&mut running), None);
         assert_eq!(running.continued, 1, "the continue is unconditional");
+    }
+
+    /// #205: the prologue never signals a reaped tracer's pid, which may
+    /// already name another process; an unreaped stopped tracer is continued.
+    #[test]
+    fn a_reaped_tracer_is_never_continued() {
+        use super::*;
+        fn stop(pid: i32) {
+            // SAFETY: plain libSystem call on this test's own child.
+            unsafe { libc::kill(pid, libc::SIGSTOP) };
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while bsd_info(pid).map(|i| i.pbi_status) != Some(libc::SSTOP) {
+                assert!(std::time::Instant::now() < end, "{pid} never stopped");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let other = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        stop(other.id() as i32);
+        let mut reaped = Rsp::retirement_test();
+        reaped.retirement_reused_pid(other);
+        let pid = reaped.tracer_pid();
+        assert_eq!(teardown_prologue(&mut reaped), None);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            bsd_info(pid).map(|i| i.pbi_status),
+            Some(libc::SSTOP),
+            "the prologue signalled a reaped tracer's pid"
+        );
+        let mut live = Rsp::retirement_test();
+        live.retirement_live_child();
+        let pid = live.tracer_pid();
+        stop(pid);
+        assert_eq!(
+            teardown_prologue(&mut live),
+            Some(TeardownStep::TracerContinued)
+        );
+        let end = std::time::Instant::now() + Duration::from_secs(1);
+        while bsd_info(pid).map(|i| i.pbi_status) == Some(libc::SSTOP) {
+            assert!(
+                std::time::Instant::now() < end,
+                "a live stopped tracer was not continued"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

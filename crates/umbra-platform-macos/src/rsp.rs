@@ -626,6 +626,12 @@ impl Rsp {
         self.child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         self.reaped = false;
     }
+    /// A tracer recorded as reaped whose pid now names another live process:
+    /// the pid-reuse case the teardown prologue must never signal (#205).
+    pub(crate) fn retirement_reused_pid(&mut self, other: Child) {
+        assert!(self.reaped);
+        self.child = other;
+    }
     /// Delay visibility, never fabricate a successful owned wait status.
     pub(crate) fn retirement_wait_gate(&mut self, observations: usize) {
         self.reaped = false;
