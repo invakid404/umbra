@@ -858,6 +858,73 @@ static int mt_spawn(const char *first, const char *second)
     return result;
 }
 
+/* #205 OD1: spin without any system call after `main`, so a test can prove
+ * the program is running (not held at a debugger stop) by its CPU time
+ * advancing, then end its debugger. Never returns; the test ends it. */
+static volatile unsigned long long spin_counter;
+static int spin(void)
+{
+    for (;;)
+        spin_counter++;
+}
+
+#ifndef AT_SYMLINK_NOFOLLOW_ANY
+#define AT_SYMLINK_NOFOLLOW_ANY 0x0800
+#endif
+
+/* #205 N3: fchmodat with the flags whose handling differs across hosts. On
+ * macOS 27.2.1 the public `fchmodat` is a wrapper that calls `__fchmodat` and
+ * retries it with masked flags when the first call fails, so each case may
+ * issue more than one system call. Each case is recorded as one line,
+ * `<label> rc=<rc> errno=<errno> mode=<octal>`, in `<root>/fchmodat.txt`, so a
+ * native run and a traced run can be compared byte for byte. */
+static int fchmodat_cases(const char *root)
+{
+    char target[PATH_MAX], link[PATH_MAX], out[PATH_MAX];
+    if (snprintf(target, sizeof target, "%s/target", root) >= (int)sizeof target ||
+        snprintf(link, sizeof link, "%s/link", root) >= (int)sizeof link ||
+        snprintf(out, sizeof out, "%s/fchmodat.txt", root) >= (int)sizeof out)
+        return error_line("fchmodat path", ENAMETOOLONG);
+    int fd = open(target, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return error_line("open target", errno);
+    close(fd);
+    unlink(link);
+    if (symlink("target", link) != 0)
+        return error_line("symlink", errno);
+    struct {
+        const char *label;
+        const char *path;
+        int flags;
+    } cases[] = {
+        {"plain-target", target, 0},
+        {"nofollow-link", link, AT_SYMLINK_NOFOLLOW},
+        {"nofollow-any-target", target, AT_SYMLINK_NOFOLLOW_ANY},
+        {"nofollow-any-link", link, AT_SYMLINK_NOFOLLOW_ANY},
+    };
+    char text[1024];
+    size_t used = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        errno = 0;
+        int rc = fchmodat(AT_FDCWD, cases[i].path, 0600, cases[i].flags);
+        int saved = rc == 0 ? 0 : errno;
+        struct stat st;
+        unsigned mode = stat(target, &st) == 0 ? (unsigned)(st.st_mode & 07777) : 0;
+        int n = snprintf(text + used, sizeof text - used, "%s rc=%d errno=%d mode=%o\n",
+                         cases[i].label, rc, saved, mode);
+        if (n < 0 || (size_t)n >= sizeof text - used)
+            return error_line("fchmodat record", ENOSPC);
+        used += (size_t)n;
+        chmod(target, 0644);
+    }
+    fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return error_line("open record", errno);
+    int failed = write_all(fd, text, used);
+    close(fd);
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3)
@@ -902,6 +969,16 @@ int main(int argc, char **argv)
             return error_line("usage: umbra-test-child --argv0-check <path> "
                               "<vendor-argv0>", EINVAL);
         return argv0_check(argv[0], argv[3], path);
+    }
+    if (strcmp(command, "--spin") == 0) {
+        if (argc != 3)
+            return error_line("usage: umbra-test-child --spin <unused>", EINVAL);
+        return spin();
+    }
+    if (strcmp(command, "--fchmodat") == 0) {
+        if (argc != 3)
+            return error_line("usage: umbra-test-child --fchmodat <root>", EINVAL);
+        return fchmodat_cases(path);
     }
     if (argc != 3)
         return error_line("usage: umbra-test-child <subcommand> <path>", EINVAL);

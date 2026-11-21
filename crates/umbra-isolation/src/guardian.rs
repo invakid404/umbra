@@ -89,7 +89,7 @@ pub fn run(spec: &std::ffi::OsStr) -> ! {
     let relay_alive = send(up, &Msg::Started(supervisor)).is_ok();
 
     let finish_relay_dead = |mut rec: Record<record::FdSink>, why: &str| -> ! {
-        let outcome = sweep::sweep(&mut MacHost { anchor: || true }, me, SWEEP);
+        let outcome = sweep::sweep(&mut MacHost::new(|| true), me, SWEEP);
         let mut st = 0;
         let end = Instant::now() + REAP;
         let mut reaped = false;
@@ -131,7 +131,7 @@ pub fn run(spec: &std::ffi::OsStr) -> ! {
         // SAFETY: a valid out-pointer; only the supervisor is waited on (C-3).
         let r = unsafe { libc::waitpid(supervisor, &mut st, libc::WNOHANG) };
         if r == supervisor {
-            let outcome = sweep::sweep(&mut MacHost { anchor: || true }, me, SWEEP);
+            let outcome = sweep::sweep(&mut MacHost::new(|| true), me, SWEEP);
             rec.line(
                 "sweep",
                 serde_json::json!({ "why": "supervisor-exit", "sid": me, "supervisor_status": st,
@@ -163,7 +163,7 @@ pub fn run(spec: &std::ffi::OsStr) -> ! {
         }
         if r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             // R-7: a permanent wait error fails closed.
-            let outcome = sweep::sweep(&mut MacHost { anchor: || true }, me, SWEEP);
+            let outcome = sweep::sweep(&mut MacHost::new(|| true), me, SWEEP);
             rec.line(
                 "wait-error",
                 serde_json::json!({ "sid": me, "outcome": outcome.kind.as_str() }),

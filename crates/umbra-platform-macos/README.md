@@ -434,7 +434,7 @@ continuing with an inert one.
 | `symlinkat` | 474 | `symlinkat` | x0 target, x1 dirfd, x2 name | `FsOp::Symlink` |
 | `mkdirat` | 475 | `mkdirat` | x0 dirfd, x1 path, x2 mode | `FsOp::Mkdir` |
 | `faccessat` | 466 | `faccessat` | x0 dirfd, x1 path, x2 mode, x3 flags | `FsOp::Access` |
-| `fchmodat` | 467 | `fchmodat` | x0 dirfd, x1 path, x2 mode, x3 flags | `FsOp::Chmod` |
+| `fchmodat` | 467 | `fchmodat`, `__fchmodat` (each that holds the verified `svc`) | x0 dirfd, x1 path, x2 mode, x3 flags | `FsOp::Chmod` |
 | `fchownat` | 468 | `fchownat` | x0 dirfd, x1 path, x2 uid, x3 gid, x4 flags | `FsOp::Fchownat` |
 | `fstatat` | 469 | `__fstatat` | x0 dirfd, x1 path, x2 buffer, x3 flags | `FsOp::Stat` |
 | `fstatat64` | 470 | `fstatat` | same layout | `FsOp::Stat` |
@@ -489,7 +489,16 @@ planted fell through to the interceptor's refusal and stopped the run. Stub
 names are the ones that actually carry the `svc`, and the number beside each is
 **verified against the resolved symbol on every launch** rather than trusted —
 `install()` reads the `movz x16, #imm` preceding the `svc` and refuses to plant
-a breakpoint if it disagrees. Several have no `__`-prefixed form; `unlinkat`'s public wrapper
+a breakpoint if it disagrees. A row may also name raw-stub aliases
+(`abi::TRACED_STUB_ALIASES`): on macOS 27.2.1 `fchmodat` is a wrapper that calls
+`__fchmodat`, up to three times with progressively masked flags, and carries no
+`svc` of its own. Every candidate whose scan verifies the row's number gets a
+breakpoint, so a host where both names are separate stubs loses neither, and the
+row fails the launch only if no candidate verifies. Breaking on `__fchmodat` also
+catches libsystem-internal callers of the raw call, which older hosts reached only
+through the public name; each retry the wrapper makes is routed as its own call,
+so the routed answer must be the host's errno for the wrapper to behave as it does
+natively. Several have no `__`-prefixed form; `unlinkat`'s public wrapper
 carries its own `svc` instead of tail-calling `__unlinkat`, so both are
 installed. `fstatat` and `fstatat64` are **one symbol reaching 470**, while
 `__fstatat` is a separate stub reaching 469 — libc's `fstatat()` does not reach

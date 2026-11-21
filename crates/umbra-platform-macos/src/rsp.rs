@@ -696,6 +696,102 @@ mod tests {
         let host = rsp.request("qHostInfo").unwrap();
         assert_eq!(fields(&host).get("ostype"), Some(&"macosx"));
     }
+
+    /// `kp_proc.p_sigignore` of `pid`, from `sysctl(KERN_PROC_PID)`.
+    /// `struct kinfo_proc` is 648 bytes on arm64 Darwin with `p_sigignore` at
+    /// offset 232 (measured with `offsetof` against the SDK headers; the
+    /// `libc` crate does not define `kinfo_proc` for Apple targets). The test
+    /// validates the read on a known case before relying on it.
+    fn sigignore_of(pid: i32) -> Option<u32> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        let mut buf = [0u8; 648];
+        let mut len = buf.len();
+        // SAFETY: `buf` is writable for `len` bytes; the name has 4 components.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                4,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && len == buf.len()).then(|| u32::from_ne_bytes(buf[232..236].try_into().unwrap()))
+    }
+
+    fn sig_bit(signal: i32) -> u32 {
+        1 << (signal - 1)
+    }
+
+    /// F11 (#205 A2b): debugserver is a member of the terminal job's group,
+    /// so ^C, ^\ and `kill -INT/-QUIT/-TERM -pgid` reach it, and the shipped
+    /// debugserver ends on all three (it handles only SIGPIPE and SIGHUP). If
+    /// it ends while its program is held at an intercepted call, the kernel
+    /// hands the program to launchd as a zombie nobody collects. umbra
+    /// therefore spawns it with those three ignored. Nothing is traced here.
+    #[test]
+    fn debugserver_ignores_terminal_signals() {
+        use std::os::unix::process::CommandExt;
+        let path = discover_debugserver();
+        if !path.as_ref().is_some_and(|p| p.is_file()) {
+            eprintln!("SKIP debugserver_ignores_terminal_signals: debugserver missing at {path:?}");
+            return;
+        }
+        // The instrument on a known case first: a child with SIGUSR1 ignored.
+        let mut known = Command::new("/bin/sleep");
+        known.arg("30");
+        // SAFETY: only async-signal-safe libc between fork and exec.
+        unsafe {
+            known.pre_exec(|| {
+                libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut known = known.spawn().unwrap();
+        let read = sigignore_of(known.id() as i32);
+        let _ = known.kill();
+        let _ = known.wait();
+        let read = read.expect("p_sigignore of a known child");
+        assert!(
+            read & sig_bit(libc::SIGUSR1) != 0 && read & sig_bit(libc::SIGUSR2) == 0,
+            "p_sigignore read {read:#x} does not show the known SIGUSR1 ignore"
+        );
+        let mut rsp = Rsp::connect(
+            &Options::default(),
+            Some(crate::clock::now() + Duration::from_secs(10)),
+        )
+        .unwrap();
+        let pid = rsp.tracer_pid();
+        let mask = sigignore_of(pid);
+        let mut failures = Vec::new();
+        for (name, signal) in [
+            ("SIGINT", libc::SIGINT),
+            ("SIGQUIT", libc::SIGQUIT),
+            ("SIGTERM", libc::SIGTERM),
+        ] {
+            if mask.is_none_or(|m| m & sig_bit(signal) == 0) {
+                failures.push(format!("{name} not ignored (p_sigignore {mask:x?})"));
+            }
+        }
+        // Behaviourally too, so the test still holds if the field ever reads
+        // empty: send each, and debugserver must still be running 1 s later.
+        if failures.is_empty() {
+            for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                // SAFETY: our own child, with no program attached.
+                unsafe { libc::kill(pid, signal) };
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            if let Ok(Some(status)) = rsp.child.try_wait() {
+                rsp.reaped = true;
+                failures.push(format!("debugserver ended: {status}"));
+            }
+        }
+        rsp.kill_tracer();
+        let reaped = rsp.reaped || rsp.reap_tracer(Duration::from_secs(2));
+        assert!(reaped, "debugserver {pid} not reaped");
+        assert!(failures.is_empty(), "debugserver {pid}: {failures:?}");
+    }
 }
 
 // SO_RCVTIMEO has an intentional 1ms floor. A tiny RPC budget can fail closed.

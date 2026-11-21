@@ -169,13 +169,7 @@ impl Relay {
             }
         }
         let g = self.g;
-        let outcome = sweep::sweep(
-            &mut MacHost {
-                anchor: || anchor(g),
-            },
-            g,
-            SWEEP,
-        );
+        let outcome = sweep::sweep(&mut MacHost::new(|| anchor(g)), g, SWEEP);
         self.rec.line(
             "relay-fallback",
             serde_json::json!({
@@ -424,6 +418,20 @@ pub(crate) fn run_with(exe: PathBuf, args: Vec<std::ffi::OsString>, dir: PathBuf
     std::process::exit(1)
 }
 
+/// The supervisor the relay's fallback ends first (#205 A-4, N-d): the pid
+/// `STARTED` named, else the guardian's only `umbra` child in S, found by
+/// parentage while the guardian is still unreaped (the guardian spawns the
+/// supervisor before it sends `STARTED`). `None`: there is no supervisor to
+/// end, and the sweep runs as before.
+#[allow(dead_code)] // scaffold: the fallback calls it in the next commit
+fn fallback_supervisor(
+    started: Option<i32>,
+    by_parentage: impl FnOnce() -> Option<i32>,
+) -> Option<i32> {
+    let _ = (started, by_parentage);
+    None
+}
+
 fn unsafe_getpgrp() -> i32 {
     // SAFETY: getpgrp has no arguments and cannot fail.
     unsafe { libc::getpgrp() }
@@ -451,5 +459,19 @@ mod tests {
         // SAFETY: our own unreaped child.
         unsafe { libc::kill(g, libc::SIGKILL) };
         assert!(reap(g, REAP));
+    }
+
+    /// F5b (#205 A-4, N-d): the relay's fallback ends the supervisor first.
+    /// It takes the pid `STARTED` named; before `STARTED`, the guardian's only
+    /// `umbra` child in S, found by parentage; with neither there is no
+    /// supervisor and the sweep runs as before.
+    #[test]
+    fn the_fallback_ends_the_supervisor_it_can_name() {
+        assert_eq!(
+            fallback_supervisor(Some(10), || panic!("STARTED named it")),
+            Some(10)
+        );
+        assert_eq!(fallback_supervisor(None, || Some(11)), Some(11));
+        assert_eq!(fallback_supervisor(None, || None), None);
     }
 }

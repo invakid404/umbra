@@ -1230,53 +1230,9 @@ impl Session {
         // reads to decide what to do when one of these breakpoints fires. One
         // table, two gates -- see that table for why it exists.
         for (name, number, _) in abi::TRACED_STUBS {
-            let name_c = cstr(name.as_bytes())?;
-            let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name_c.as_ptr()) };
-            if ptr.is_null() {
-                return Err(error("symbol", format!("missing {name}")));
+            for site in traced_stub_sites(name, *number)? {
+                self.breakpoint(site, false)?;
             }
-            // Strip arm64e function pointer authentication; only inspect local executable memory.
-            let start = (ptr as u64) & 0x0000_ffff_ffff_ffff;
-            let mut code = [0; 96];
-            let me = Task(unsafe { mach_task_self() }, None);
-            let result = me.read(start, &mut code);
-            std::mem::forget(me);
-            result?;
-            let words = code.as_chunks::<4>().0;
-            let offset = words
-                .iter()
-                .position(|b| *b == [1, 16, 0, 212])
-                .ok_or_else(|| error("symbol", format!("no svc in {name}")))?;
-            // **Verify the table's number against this host before planting the
-            // breakpoint.** The stub's `svc` is preceded by a `movz x16, #imm`
-            // that sets the syscall number, and that immediate -- not this
-            // table -- is what the kernel will act on. `intercept()` dispatches
-            // on the number, so a row whose number is wrong for this libc plants
-            // a breakpoint whose firing is dispatched as something else, or
-            // refused outright. Checking it here turns that into a launch
-            // failure naming the symbol, rather than a run that dies at an
-            // arbitrary later instruction.
-            //
-            // The *last* `movz x16` before the `svc` is the operative one:
-            // `__fork` carries its `svc` at +16 and `unlinkat` at +48, with
-            // setup instructions in between.
-            let carried = words[..offset]
-                .iter()
-                .rev()
-                .find_map(|word| {
-                    let instruction = u32::from_le_bytes(*word);
-                    // `movz x16, #imm16, lsl #0`: sf=1 opc=10 100101 hw=00, Rd=16.
-                    (instruction & 0xffe0_001f == 0xd280_0010)
-                        .then(|| u64::from((instruction >> 5) & 0xffff))
-                })
-                .ok_or_else(|| error("symbol", format!("no syscall number in {name}")))?;
-            if carried != *number {
-                return Err(error(
-                    "symbol",
-                    format!("{name} issues syscall {carried}, not the {number} umbra traces it as"),
-                ));
-            }
-            self.breakpoint(start + offset as u64 * 4, false)?;
         }
         let main = main_image_base(&self.loaded_images()?)?;
         self.install_image(main)?;
@@ -1757,6 +1713,92 @@ impl Session {
     }
 }
 /// Load address of the tracee's main executable (`MH_EXECUTE`).
+/// The address of the `svc` each [`abi::TRACED_STUBS`] row breakpoints, read
+/// from this process's own copy of libsystem_kernel (the shared cache is
+/// system-wide on this native host, so the address is the tracee's too).
+///
+/// A row with [`abi::TRACED_STUB_ALIASES`] resolves every candidate name whose
+/// scan verifies and breakpoints each; it fails only if none verifies, and
+/// then reports every candidate's failure.
+fn traced_stub_sites(name: &str, number: u64) -> Result<Vec<u64>> {
+    let aliases = abi::TRACED_STUB_ALIASES
+        .iter()
+        .filter(|(row, _)| *row == name)
+        .map(|(_, alias)| *alias);
+    let mut sites = Vec::new();
+    let mut failures = Vec::new();
+    for candidate in std::iter::once(name).chain(aliases) {
+        match traced_stub_site(candidate, number) {
+            Ok(site) if !sites.contains(&site) => sites.push(site),
+            Ok(_) => {}
+            Err(e) => failures.push(e),
+        }
+    }
+    match (sites.is_empty(), failures.len()) {
+        (false, _) => Ok(sites),
+        (true, 1) => Err(failures.remove(0)),
+        (true, _) => Err(error(
+            "symbol",
+            failures
+                .iter()
+                .map(|e| e.context.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )),
+    }
+}
+
+/// Scan one symbol for its `svc` and verify the syscall number it issues.
+fn traced_stub_site(name: &str, number: u64) -> Result<u64> {
+    let name_c = cstr(name.as_bytes())?;
+    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name_c.as_ptr()) };
+    if ptr.is_null() {
+        return Err(error("symbol", format!("missing {name}")));
+    }
+    // Strip arm64e function pointer authentication; only inspect local executable memory.
+    let start = (ptr as u64) & 0x0000_ffff_ffff_ffff;
+    let mut code = [0; 96];
+    let me = Task(unsafe { mach_task_self() }, None);
+    let result = me.read(start, &mut code);
+    std::mem::forget(me);
+    result?;
+    let words = code.as_chunks::<4>().0;
+    let offset = words
+        .iter()
+        .position(|b| *b == [1, 16, 0, 212])
+        .ok_or_else(|| error("symbol", format!("no svc in {name}")))?;
+    // **Verify the table's number against this host before planting the
+    // breakpoint.** The stub's `svc` is preceded by a `movz x16, #imm`
+    // that sets the syscall number, and that immediate -- not this
+    // table -- is what the kernel will act on. `intercept()` dispatches
+    // on the number, so a row whose number is wrong for this libc plants
+    // a breakpoint whose firing is dispatched as something else, or
+    // refused outright. Checking it here turns that into a launch
+    // failure naming the symbol, rather than a run that dies at an
+    // arbitrary later instruction.
+    //
+    // The *last* `movz x16` before the `svc` is the operative one:
+    // `__fork` carries its `svc` at +16 and `unlinkat` at +48, with
+    // setup instructions in between.
+    let carried = words[..offset]
+        .iter()
+        .rev()
+        .find_map(|word| {
+            let instruction = u32::from_le_bytes(*word);
+            // `movz x16, #imm16, lsl #0`: sf=1 opc=10 100101 hw=00, Rd=16.
+            (instruction & 0xffe0_001f == 0xd280_0010)
+                .then(|| u64::from((instruction >> 5) & 0xffff))
+        })
+        .ok_or_else(|| error("symbol", format!("no syscall number in {name}")))?;
+    if carried != number {
+        return Err(error(
+            "symbol",
+            format!("{name} issues syscall {carried}, not the {number} umbra traces it as"),
+        ));
+    }
+    Ok(start + offset as u64 * 4)
+}
+
 fn main_image_base(images: &[serde_json::Value]) -> Result<u64> {
     images
         .iter()
@@ -3764,12 +3806,20 @@ const TEARDOWN_BOUND: Duration = Duration::from_millis(1500);
 const TRACEE_REAP_BOUND: Duration = Duration::from_millis(250);
 /// `p_stat` value of a process awaiting collection (`bsd/sys/proc.h:159`).
 const SZOMB: u32 = 5;
+/// How long a zombie under launchd is given before it counts as handed to
+/// launchd uncollected (#205 A1(a)): a kernel-reaped orphan passes through
+/// SZOMB with ppid 1 on its way to the system reap.
+const LAUNCHD_ZOMBIE_SETTLE: Duration = Duration::from_millis(50);
 
 /// One barrier lookup of a pid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Lookup {
-    /// The process, with its `p_stat` and start identity.
-    Found { status: u32, start: (u64, u64) },
+    /// The process, with its `p_stat`, start identity and parent pid.
+    Found {
+        status: u32,
+        start: (u64, u64),
+        ppid: i32,
+    },
     /// `ESRCH`: no process holds this pid.
     Absent,
     /// Any other failure, or a short or unreadable record.
@@ -3844,6 +3894,7 @@ fn lookup(pid: i32) -> Lookup {
         return Lookup::Found {
             status: info.pbi_status,
             start: (info.pbi_start_tvsec, info.pbi_start_tvusec),
+            ppid: info.pbi_ppid as i32,
         };
     }
     let error = std::io::Error::last_os_error();
@@ -3854,6 +3905,12 @@ fn lookup(pid: i32) -> Lookup {
     } else {
         Lookup::Error(format!("short record: {got} of {size} bytes"))
     }
+}
+
+/// The barrier's lookup after the launchd-zombie settle (#205 A1(a)).
+fn settled_lookup(first: Lookup, reread: impl FnOnce() -> Lookup) -> Lookup {
+    let _ = reread;
+    first
 }
 
 fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
@@ -3991,6 +4048,10 @@ pub enum BarrierReading {
 /// One step of a session's ordered teardown, in the order it happened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TeardownStep {
+    /// The tracer was stopped when its teardown began, and was continued
+    /// before `k` (#205 A1(b)). The continue is sent whether or not it was
+    /// stopped; this step records only that it was.
+    TracerContinued,
     /// RSP `k` was written.
     KillSent,
     /// No `k`: the tracer already reported the tracee's exit.
@@ -4071,6 +4132,28 @@ fn log_teardown(report: &TeardownReport) {
     }
 }
 
+/// Whether a teardown ends unconfirmed once the tracer is gone: the one
+/// post-kill reading, and for a root (the platform's own child) whether it was
+/// collected (#205 A1(a)).
+fn post_kill_unconfirmed(after_kill: Option<&BarrierReading>, root: bool, reaped: bool) -> bool {
+    let _ = (root, reaped);
+    matches!(after_kill, Some(BarrierReading::Unconfirmed(_)))
+}
+
+/// Continue a tracer before its teardown (#205 A1(b)). `true` when it was
+/// stopped, for the record only: the continue itself is unconditional.
+trait ContinueTracer {
+    #[allow(dead_code)] // scaffold: called by the teardown prologue in the next commit
+    fn continue_tracer(&mut self) -> bool;
+}
+
+/// The teardown's first step: `TracerContinued` when the tracer was stopped.
+#[allow(dead_code)] // scaffold: called from ordered_teardown_inner in the next commit
+fn teardown_prologue(tracer: &mut impl ContinueTracer) -> Option<TeardownStep> {
+    let _ = tracer;
+    None
+}
+
 impl Session {
     /// Keep the original failure and append one explicit bounded emergency attempt.
     fn finalize_failed_retirement(&mut self) {
@@ -4122,7 +4205,11 @@ impl Session {
             self.reaped = true;
             return BarrierReading::Confirmed(BarrierEvidence::ReapedByPlatform);
         }
-        barrier_decision(self.exit_report.as_deref(), self.birth, &lookup(pid))
+        let found = settled_lookup(lookup(pid), || {
+            std::thread::sleep(LAUNCHD_ZOMBIE_SETTLE);
+            lookup(pid)
+        });
+        barrier_decision(self.exit_report.as_deref(), self.birth, &found)
     }
 
     /// Tear this session down in the #186 order: RSP `k`, the barrier, and only
@@ -4263,7 +4350,7 @@ impl Session {
         }
         steps.push(TeardownStep::TracerReaped(tracer_reaped));
         self.rsp.mark_torn_down();
-        let mut unconfirmed = false;
+        let post_kill = after_kill.clone();
         match after_kill {
             Some(BarrierReading::Confirmed(evidence)) => {
                 eprintln!(
@@ -4275,7 +4362,6 @@ impl Session {
             }
             Some(BarrierReading::Unconfirmed(why)) => {
                 steps.push(TeardownStep::UnconfirmedAfterTracerKill(why));
-                unconfirmed = true;
             }
             None => {}
         }
@@ -4293,6 +4379,8 @@ impl Session {
             }
             steps.push(TeardownStep::TraceeReaped(self.reaped));
         }
+        let unconfirmed =
+            post_kill_unconfirmed(post_kill.as_ref(), self.parent.is_none(), self.reaped);
         TeardownReport {
             pid,
             identity: self.birth,
@@ -5001,6 +5089,144 @@ impl TraceControl for MacosTraceBackend {
 
 #[cfg(test)]
 mod tests {
+    /// F2 (#205): every `TRACED_STUBS` row resolves to at least one verified
+    /// `svc` site in this process's own libsystem_kernel. This reads local
+    /// memory only and traces nothing, so it runs on hosted runners too.
+    ///
+    /// Failing before the macOS 27 fix: on macOS 27.2.1 `fchmodat` is a C
+    /// wrapper that calls `__fchmodat`, with no `svc` in its first 96 bytes,
+    /// so the row fails with `no svc in fchmodat` and every traced launch
+    /// fails with it.
+    #[test]
+    fn every_traced_stub_resolves_on_this_host() {
+        use super::*;
+        let mut failures = Vec::new();
+        for (name, number, _) in abi::TRACED_STUBS {
+            match traced_stub_sites(name, *number) {
+                Ok(sites) if !sites.is_empty() => {}
+                Ok(_) => failures.push(format!("{name}({number}): no site")),
+                Err(e) => failures.push(format!("{name}({number}): {e}")),
+            }
+        }
+        assert!(failures.is_empty(), "unresolved stubs: {failures:?}");
+    }
+
+    /// F1 (#205 A1(a)): a tracee found as a zombie whose parent is launchd is
+    /// never exit evidence, whatever the tracer reported. The kernel leaves
+    /// such a zombie to launchd, which never collects it, and its original
+    /// parent's `waitpid` gets ECHILD (measured natively during the design).
+    /// A zombie still under its debugger stays `Zombie` evidence.
+    ///
+    /// The settle re-reads a zombie under launchd once: a kernel-reaped orphan
+    /// passes through SZOMB with ppid 1 on its way to the system reap, and is
+    /// then `Absent`, which is the existing reaped-proven evidence.
+    ///
+    /// After the tracer kill, a root the platform did not collect is
+    /// unconfirmed, whatever the post-kill reading said (the false `Ok` the
+    /// base returned with `ConfirmedAfterTracerKill(Zombie)` then
+    /// `TraceeReaped(false)`). A child session is not the platform's to collect.
+    #[test]
+    fn a_tracee_handed_to_launchd_is_never_confirmed() {
+        use super::*;
+        let birth = Some((1_000, 7));
+        let at = |status: u32, ppid: i32| Lookup::Found {
+            status,
+            start: (1_000, 7),
+            ppid,
+        };
+        assert_eq!(
+            barrier_decision(None, birth, &at(SZOMB, 4242)),
+            BarrierReading::Confirmed(BarrierEvidence::Zombie)
+        );
+        for report in [None, Some("X09")] {
+            let reading = barrier_decision(report, birth, &at(SZOMB, 1));
+            assert!(
+                matches!(&reading, BarrierReading::Unconfirmed(why) if why.contains("handed to launchd")),
+                "report {report:?}: {reading:?}"
+            );
+        }
+        // A pid reused by another process is still proof of the reap.
+        assert!(matches!(
+            barrier_decision(
+                None,
+                birth,
+                &Lookup::Found {
+                    status: SZOMB,
+                    start: (2_000, 1),
+                    ppid: 1,
+                }
+            ),
+            BarrierReading::Confirmed(BarrierEvidence::ReapedProven { .. })
+        ));
+        // The settle: a zombie under launchd is read again; one that is gone
+        // by then was a kernel-reaped orphan.
+        assert_eq!(
+            settled_lookup(at(SZOMB, 1), || Lookup::Absent),
+            Lookup::Absent
+        );
+        assert_eq!(
+            settled_lookup(at(SZOMB, 1), || at(SZOMB, 1)),
+            at(SZOMB, 1),
+            "a zombie still under launchd after the settle stays one"
+        );
+        assert_eq!(
+            settled_lookup(at(SZOMB, 4242), || panic!(
+                "only a zombie under launchd is re-read"
+            )),
+            at(SZOMB, 4242)
+        );
+        assert_eq!(
+            settled_lookup(at(2, 1), || panic!("only a zombie is re-read")),
+            at(2, 1)
+        );
+        // After the tracer kill.
+        let zombie = BarrierReading::Confirmed(BarrierEvidence::Zombie);
+        let unconfirmed = BarrierReading::Unconfirmed("p_stat 2".into());
+        assert!(post_kill_unconfirmed(Some(&zombie), true, false));
+        assert!(post_kill_unconfirmed(None, true, false));
+        assert!(!post_kill_unconfirmed(Some(&zombie), true, true));
+        assert!(!post_kill_unconfirmed(None, true, true));
+        assert!(!post_kill_unconfirmed(Some(&zombie), false, false));
+        assert!(post_kill_unconfirmed(Some(&unconfirmed), false, false));
+        assert!(post_kill_unconfirmed(Some(&unconfirmed), true, true));
+    }
+
+    /// The mutation discriminator for #205 A1(b): the teardown opens by
+    /// continuing its tracer, unconditionally, and records `TracerContinued`
+    /// only when it was stopped. A stopped debugserver never answers `k`; a
+    /// teardown that then kills it while its tracee is held at a breakpoint
+    /// hands the tracee to launchd.
+    #[test]
+    fn the_teardown_opens_by_continuing_its_tracer() {
+        use super::*;
+        #[allow(dead_code)] // scaffold: read once the prologue continues (next commit)
+        struct Fake {
+            stopped: bool,
+            continued: u32,
+        }
+        impl ContinueTracer for Fake {
+            fn continue_tracer(&mut self) -> bool {
+                self.continued += 1;
+                std::mem::replace(&mut self.stopped, false)
+            }
+        }
+        let mut stopped = Fake {
+            stopped: true,
+            continued: 0,
+        };
+        assert_eq!(
+            teardown_prologue(&mut stopped),
+            Some(TeardownStep::TracerContinued)
+        );
+        assert_eq!(stopped.continued, 1);
+        let mut running = Fake {
+            stopped: false,
+            continued: 0,
+        };
+        assert_eq!(teardown_prologue(&mut running), None);
+        assert_eq!(running.continued, 1, "the continue is unconditional");
+    }
+
     #[test]
     fn retirement_failure_does_not_end_the_session() {
         use super::*;
@@ -5538,7 +5764,13 @@ mod tests {
     #[test]
     fn the_teardown_barrier_decides_from_report_identity_and_lookup() {
         let birth = Some((1_000, 7));
-        let found = |status: u32, start: (u64, u64)| Lookup::Found { status, start };
+        // Under its debugger (any parent but launchd), as the barrier sees a
+        // tracee before the hand-back.
+        let found = |status: u32, start: (u64, u64)| Lookup::Found {
+            status,
+            start,
+            ppid: 4242,
+        };
         let reported = Some("X09");
         let unconfirmed = |r: &BarrierReading| matches!(r, BarrierReading::Unconfirmed(_));
         // A done session (the tracer reported W/X).

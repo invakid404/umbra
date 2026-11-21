@@ -8343,6 +8343,83 @@ fn slate_bounded_for(
 ) -> (SlateOutput, bool) {
     slate_launch(command, evidence, timeout, None)
 }
+/// #205: the start of a case's window for [`slate_launchd_zombies`], in the
+/// units `proc_bsdinfo` reports start times in.
+fn slate_zombie_window() -> (u64, u64) {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    (d.as_secs(), u64::from(d.subsec_micros()))
+}
+
+/// #205 per-case guard: launchd-parented zombies of this user whose image is a
+/// fixture of this suite (`umbra-userspace-*`, `umbra-slate-*`, `umbra-fix-*`,
+/// by 16-character `ucomm` prefix) and that started inside the case's window.
+///
+/// The group census accepts zombies that are still in the run's group as
+/// dead-table residue. A zombie **under launchd** is different: when a
+/// debugger process ends while its program has started exiting, the kernel
+/// hands the program to launchd, which never collects it, and it stays until a
+/// reboot. Counting only: nothing is signalled on this basis.
+fn slate_launchd_zombies(since: (u64, u64)) -> Vec<String> {
+    let Ok(out) = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,ppid=,stat="])
+        .output()
+    else {
+        return vec!["ps unavailable: no reading".into()];
+    };
+    // SAFETY: getuid has no arguments.
+    let uid = unsafe { libc::getuid() };
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [pid, ppid, stat] = fields[..] else {
+            continue;
+        };
+        if ppid != "1" || !stat.starts_with('Z') {
+            continue;
+        }
+        let Ok(pid) = pid.parse::<i32>() else {
+            continue;
+        };
+        // SAFETY: plain old data, filled by proc_pidinfo below.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: `info` is writable for `size` bytes; arg 1 asks for the
+        // zombie fallback.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if got != size
+            || info.pbi_status != libc::SZOMB
+            || info.pbi_ppid != 1
+            || info.pbi_uid != uid
+        {
+            continue;
+        }
+        let start = (info.pbi_start_tvsec, info.pbi_start_tvusec);
+        let name: String = info
+            .pbi_comm
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8 as char)
+            .collect();
+        let ours = ["umbra-userspace-", "umbra-slate-", "umbra-fix-"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+        if ours && start >= since {
+            found.push(format!("{pid} {name} start={}.{:06}", start.0, start.1));
+        }
+    }
+    found
+}
+
 fn slate_launch(
     command: &mut Command,
     evidence: &Path,
@@ -8352,6 +8429,7 @@ fn slate_launch(
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
+    let zombie_window = slate_zombie_window();
     SLATE_CENSUS_EVIDENCE
         .with(|slot| *slot.borrow_mut() = Some(evidence.with_extension("census.jsonl")));
     std::fs::write(evidence.with_extension("census.jsonl"), "").unwrap();
@@ -8606,6 +8684,12 @@ fn slate_launch(
     drop(buffered);
     std::fs::write(evidence.with_extension("stdout"), &output.stdout).unwrap();
     std::fs::write(evidence.with_extension("stderr"), &output.stderr).unwrap();
+    let launchd_zombies = slate_launchd_zombies(zombie_window);
+    if !launchd_zombies.is_empty() && cleanup_failure.is_none() {
+        cleanup_failure = Some(format!(
+            "cleanup FAILED: launchd-parented zombies of this case (#205): {launchd_zombies:?}"
+        ));
+    }
     if let Some(error) = cleanup_failure {
         slate_census_event(
             if error.contains("UNMEASURABLE") {
@@ -12511,6 +12595,7 @@ fn c13_launch(
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
+    let zombie_window = slate_zombie_window();
     SLATE_CENSUS_EVIDENCE
         .with(|slot| *slot.borrow_mut() = Some(evidence.with_extension("census.jsonl")));
     std::fs::write(evidence.with_extension("census.jsonl"), "").unwrap();
@@ -12763,6 +12848,12 @@ fn c13_launch(
     drop(buffered);
     std::fs::write(evidence.with_extension("stdout"), &output.stdout).unwrap();
     std::fs::write(evidence.with_extension("stderr"), &output.stderr).unwrap();
+    let launchd_zombies = slate_launchd_zombies(zombie_window);
+    if !launchd_zombies.is_empty() && cleanup_failure.is_none() {
+        cleanup_failure = Some(format!(
+            "cleanup FAILED: launchd-parented zombies of this case (#205): {launchd_zombies:?}"
+        ));
+    }
     if let Some(error) = cleanup_failure {
         slate_census_event(
             if error.contains("UNMEASURABLE") {

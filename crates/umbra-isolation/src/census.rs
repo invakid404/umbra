@@ -1,7 +1,8 @@
 //! The macOS [`Host`] for the session sweep: process census, kernel-backed
 //! identity, and signal by audit token (#193 design R-8, T1 §3).
 
-use crate::sweep::{Claimant, Host, Signalled, Token};
+use crate::sweep::{token_pid, token_version, Claimant, Host, Member, Signalled, Token};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 extern "C" {
@@ -99,12 +100,66 @@ fn is_zombie(pid: i32) -> Option<bool> {
     Some(info.pbi_status == libc::SZOMB)
 }
 
+/// `pbi_flags` bit for a traced process (`PROC_FLAG_TRACED`, `P_LTRACED`;
+/// bsd/sys/proc_info.h).
+const PROC_FLAG_TRACED: u32 = 2;
+
+/// `proc_bsdinfo` of `pid`; `zombie` asks for the zombie fallback (`arg = 1`).
+fn bsd_info(pid: i32, zombie: bool) -> Option<libc::proc_bsdinfo> {
+    // SAFETY: proc_bsdinfo is plain old data.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a proc_bsdinfo of `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            u64::from(zombie),
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (n == size).then_some(info)
+}
+
+/// Whether `pid`'s image is a debugger process (`debugserver`), for waiting
+/// only. `None` when the path cannot be read.
+fn is_debugger(pid: i32) -> Option<bool> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is writable for its length.
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| buf[..n as usize].ends_with(b"/debugserver"))
+}
+
 /// The macOS process table, with a pluggable anchor check.
 pub struct MacHost<A: FnMut() -> bool> {
     /// The ownership proof (the zombie anchor; README, Cleanup and
     /// ownership): the relay's checks its unreaped guardian; the guardian's
     /// own sweep passes `|| true`.
     pub anchor: A,
+    /// Start identity of every member instance the drain saw, keyed by
+    /// (pid, pid version), so a later zombie check compares the same instance.
+    starts: HashMap<(i32, u32), (u64, u64)>,
+}
+
+impl<A: FnMut() -> bool> MacHost<A> {
+    /// A host with the given anchor check.
+    pub fn new(anchor: A) -> Self {
+        MacHost {
+            anchor,
+            starts: HashMap::new(),
+        }
+    }
+}
+
+fn signal_token(token: &Token, signal: libc::c_int) -> Signalled {
+    let mut t = *token;
+    // SAFETY: `t` is a valid audit_token_t for the duration of the call.
+    match unsafe { proc_signal_with_audittoken(&mut t, signal) } {
+        0 => Signalled::Sent,
+        libc::ESRCH => Signalled::Stale,
+        e => Signalled::Refused(e),
+    }
 }
 
 impl<A: FnMut() -> bool> Host for MacHost<A> {
@@ -162,13 +217,75 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
         Ok(out)
     }
     fn kill(&mut self, token: &Token) -> Signalled {
-        let mut t = *token;
-        // SAFETY: `t` is a valid audit_token_t for the duration of the call.
-        match unsafe { proc_signal_with_audittoken(&mut t, libc::SIGKILL) } {
-            0 => Signalled::Sent,
-            libc::ESRCH => Signalled::Stale,
-            e => Signalled::Refused(e),
+        signal_token(token, libc::SIGKILL)
+    }
+    fn members(&mut self, sid: i32, deadline: Instant) -> Result<Vec<Member>, String> {
+        let me = std::process::id() as i32;
+        let mut out = vec![];
+        for pid in all_pids()? {
+            if Instant::now() >= deadline {
+                return Err("member census cut at the deadline".into());
+            }
+            // SAFETY: getsid has no memory arguments.
+            if pid <= 1 || pid == me || unsafe { libc::getsid(pid) } != sid {
+                continue;
+            }
+            let Some(info) = bsd_info(pid, false) else {
+                // Unreadable but still in S: the drain waits on it rather
+                // than assuming it is not a debugger.
+                // SAFETY: getsid has no memory arguments.
+                if unsafe { libc::getsid(pid) } == sid {
+                    out.push(Member {
+                        claimant: Claimant { pid, token: None },
+                        debugger: true,
+                        traced: false,
+                        stopped: false,
+                    });
+                }
+                continue;
+            };
+            if info.pbi_status == libc::SZOMB {
+                continue;
+            }
+            let token = match verified_token(pid) {
+                Some((t, s)) if s == sid => Some(t),
+                Some(_) => continue, // left the session in between
+                None => None,
+            };
+            if let Some(t) = token {
+                self.starts.insert(
+                    (token_pid(&t), token_version(&t)),
+                    (info.pbi_start_tvsec, info.pbi_start_tvusec),
+                );
+            }
+            out.push(Member {
+                claimant: Claimant { pid, token },
+                debugger: is_debugger(pid).unwrap_or(true),
+                traced: info.pbi_flags & PROC_FLAG_TRACED != 0,
+                stopped: info.pbi_status == libc::SSTOP,
+            });
         }
+        Ok(out)
+    }
+    fn cont(&mut self, token: &Token) -> Signalled {
+        signal_token(token, libc::SIGCONT)
+    }
+    fn end_supervisor(&mut self, pid: i32, sid: i32) -> Signalled {
+        match verified_token(pid) {
+            Some((t, s)) if s == sid => signal_token(&t, libc::SIGKILL),
+            _ => Signalled::Stale,
+        }
+    }
+    fn launchd_zombie(&mut self, token: &Token) -> bool {
+        let pid = token_pid(token);
+        let Some(start) = self.starts.get(&(pid, token_version(token))).copied() else {
+            return false;
+        };
+        bsd_info(pid, true).is_some_and(|info| {
+            info.pbi_status == libc::SZOMB
+                && info.pbi_ppid == 1
+                && (info.pbi_start_tvsec, info.pbi_start_tvusec) == start
+        })
     }
     fn now(&self) -> Instant {
         Instant::now()
