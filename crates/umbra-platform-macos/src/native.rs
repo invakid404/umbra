@@ -1230,53 +1230,9 @@ impl Session {
         // reads to decide what to do when one of these breakpoints fires. One
         // table, two gates -- see that table for why it exists.
         for (name, number, _) in abi::TRACED_STUBS {
-            let name_c = cstr(name.as_bytes())?;
-            let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name_c.as_ptr()) };
-            if ptr.is_null() {
-                return Err(error("symbol", format!("missing {name}")));
+            for site in traced_stub_sites(name, *number)? {
+                self.breakpoint(site, false)?;
             }
-            // Strip arm64e function pointer authentication; only inspect local executable memory.
-            let start = (ptr as u64) & 0x0000_ffff_ffff_ffff;
-            let mut code = [0; 96];
-            let me = Task(unsafe { mach_task_self() }, None);
-            let result = me.read(start, &mut code);
-            std::mem::forget(me);
-            result?;
-            let words = code.as_chunks::<4>().0;
-            let offset = words
-                .iter()
-                .position(|b| *b == [1, 16, 0, 212])
-                .ok_or_else(|| error("symbol", format!("no svc in {name}")))?;
-            // **Verify the table's number against this host before planting the
-            // breakpoint.** The stub's `svc` is preceded by a `movz x16, #imm`
-            // that sets the syscall number, and that immediate -- not this
-            // table -- is what the kernel will act on. `intercept()` dispatches
-            // on the number, so a row whose number is wrong for this libc plants
-            // a breakpoint whose firing is dispatched as something else, or
-            // refused outright. Checking it here turns that into a launch
-            // failure naming the symbol, rather than a run that dies at an
-            // arbitrary later instruction.
-            //
-            // The *last* `movz x16` before the `svc` is the operative one:
-            // `__fork` carries its `svc` at +16 and `unlinkat` at +48, with
-            // setup instructions in between.
-            let carried = words[..offset]
-                .iter()
-                .rev()
-                .find_map(|word| {
-                    let instruction = u32::from_le_bytes(*word);
-                    // `movz x16, #imm16, lsl #0`: sf=1 opc=10 100101 hw=00, Rd=16.
-                    (instruction & 0xffe0_001f == 0xd280_0010)
-                        .then(|| u64::from((instruction >> 5) & 0xffff))
-                })
-                .ok_or_else(|| error("symbol", format!("no syscall number in {name}")))?;
-            if carried != *number {
-                return Err(error(
-                    "symbol",
-                    format!("{name} issues syscall {carried}, not the {number} umbra traces it as"),
-                ));
-            }
-            self.breakpoint(start + offset as u64 * 4, false)?;
         }
         let main = main_image_base(&self.loaded_images()?)?;
         self.install_image(main)?;
@@ -1757,6 +1713,64 @@ impl Session {
     }
 }
 /// Load address of the tracee's main executable (`MH_EXECUTE`).
+/// The address of the `svc` each [`abi::TRACED_STUBS`] row breakpoints, read
+/// from this process's own copy of libsystem_kernel (the shared cache is
+/// system-wide on this native host, so the address is the tracee's too).
+fn traced_stub_sites(name: &str, number: u64) -> Result<Vec<u64>> {
+    traced_stub_site(name, number).map(|site| vec![site])
+}
+
+/// Scan one symbol for its `svc` and verify the syscall number it issues.
+fn traced_stub_site(name: &str, number: u64) -> Result<u64> {
+    let name_c = cstr(name.as_bytes())?;
+    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name_c.as_ptr()) };
+    if ptr.is_null() {
+        return Err(error("symbol", format!("missing {name}")));
+    }
+    // Strip arm64e function pointer authentication; only inspect local executable memory.
+    let start = (ptr as u64) & 0x0000_ffff_ffff_ffff;
+    let mut code = [0; 96];
+    let me = Task(unsafe { mach_task_self() }, None);
+    let result = me.read(start, &mut code);
+    std::mem::forget(me);
+    result?;
+    let words = code.as_chunks::<4>().0;
+    let offset = words
+        .iter()
+        .position(|b| *b == [1, 16, 0, 212])
+        .ok_or_else(|| error("symbol", format!("no svc in {name}")))?;
+    // **Verify the table's number against this host before planting the
+    // breakpoint.** The stub's `svc` is preceded by a `movz x16, #imm`
+    // that sets the syscall number, and that immediate -- not this
+    // table -- is what the kernel will act on. `intercept()` dispatches
+    // on the number, so a row whose number is wrong for this libc plants
+    // a breakpoint whose firing is dispatched as something else, or
+    // refused outright. Checking it here turns that into a launch
+    // failure naming the symbol, rather than a run that dies at an
+    // arbitrary later instruction.
+    //
+    // The *last* `movz x16` before the `svc` is the operative one:
+    // `__fork` carries its `svc` at +16 and `unlinkat` at +48, with
+    // setup instructions in between.
+    let carried = words[..offset]
+        .iter()
+        .rev()
+        .find_map(|word| {
+            let instruction = u32::from_le_bytes(*word);
+            // `movz x16, #imm16, lsl #0`: sf=1 opc=10 100101 hw=00, Rd=16.
+            (instruction & 0xffe0_001f == 0xd280_0010)
+                .then(|| u64::from((instruction >> 5) & 0xffff))
+        })
+        .ok_or_else(|| error("symbol", format!("no syscall number in {name}")))?;
+    if carried != number {
+        return Err(error(
+            "symbol",
+            format!("{name} issues syscall {carried}, not the {number} umbra traces it as"),
+        ));
+    }
+    Ok(start + offset as u64 * 4)
+}
+
 fn main_image_base(images: &[serde_json::Value]) -> Result<u64> {
     images
         .iter()
@@ -5001,6 +5015,28 @@ impl TraceControl for MacosTraceBackend {
 
 #[cfg(test)]
 mod tests {
+    /// F2 (#205): every `TRACED_STUBS` row resolves to at least one verified
+    /// `svc` site in this process's own libsystem_kernel. This reads local
+    /// memory only and traces nothing, so it runs on hosted runners too.
+    ///
+    /// Failing before the macOS 27 fix: on macOS 27.2.1 `fchmodat` is a C
+    /// wrapper that calls `__fchmodat`, with no `svc` in its first 96 bytes,
+    /// so the row fails with `no svc in fchmodat` and every traced launch
+    /// fails with it.
+    #[test]
+    fn every_traced_stub_resolves_on_this_host() {
+        use super::*;
+        let mut failures = Vec::new();
+        for (name, number, _) in abi::TRACED_STUBS {
+            match traced_stub_sites(name, *number) {
+                Ok(sites) if !sites.is_empty() => {}
+                Ok(_) => failures.push(format!("{name}({number}): no site")),
+                Err(e) => failures.push(format!("{name}({number}): {e}")),
+            }
+        }
+        assert!(failures.is_empty(), "unresolved stubs: {failures:?}");
+    }
+
     #[test]
     fn retirement_failure_does_not_end_the_session() {
         use super::*;
