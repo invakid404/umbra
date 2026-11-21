@@ -149,6 +149,32 @@ impl Relay {
             }
         }
     }
+    /// Stop a live guardian before its supervisor is named (#205), so it
+    /// cannot spawn one after the lookup. It is still our unreaped child, so
+    /// its pid names it; the wait for the stop is bounded by REAP.
+    fn stop_guardian(&mut self) {
+        let allowed = matches!(self.state, Guardian::Live);
+        self.rec.line(
+            "guardian-stop",
+            serde_json::json!({ "pid": self.g, "state": format!("{:?}", self.state), "sent": allowed }),
+        );
+        if !allowed {
+            return;
+        }
+        // SAFETY: `g` is our unreaped child (see `kill_guardian`).
+        unsafe {
+            libc::kill(self.g, libc::SIGSTOP);
+        }
+        let end = Instant::now() + REAP;
+        while Instant::now() < end
+            && !matches!(
+                observe(self.g),
+                None | Some(Guardian::Stopped | Guardian::Exited | Guardian::Gone)
+            )
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     /// The single reap, bounded by REAP: the last numeric-pid operation
     /// (R-10). Only record I/O, stderr and this process's own exit follow it.
     fn reap(&mut self) -> bool {
@@ -164,8 +190,13 @@ impl Relay {
     /// under the anchor, write the final record line, reap, exit 1.
     fn fallback(mut self, reason: &str) -> ! {
         let g = self.g;
-        // #205: name the supervisor while the guardian is still our unreaped
-        // child (its pid cannot be reused, and its child is still its child).
+        // #205: stop a live guardian first, so it cannot spawn a supervisor
+        // after the lookup below; then name the supervisor while the guardian
+        // is still our unreaped child (its pid cannot be reused, and its child
+        // is still its child).
+        if matches!(self.state, Guardian::Live) {
+            self.stop_guardian();
+        }
         let supervisor = fallback_supervisor(self.supervisor, || {
             matches!(self.state, Guardian::Live | Guardian::Stopped)
                 .then(|| crate::census::only_child_in_session(g, g))

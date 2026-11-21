@@ -283,11 +283,18 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
                 Some(_) => continue, // left the session in between
                 None => None,
             };
+            // Bind the start identity to the verified instance: a pid reused
+            // between the first read and the token would otherwise pair one
+            // process's token with another's start. On a mismatch the member
+            // keeps no token (counted, never signalled or matched by it).
+            let start = (info.pbi_start_tvsec, info.pbi_start_tvusec);
+            let token = token.filter(|_| {
+                bsd_info(pid, false)
+                    .is_some_and(|after| (after.pbi_start_tvsec, after.pbi_start_tvusec) == start)
+            });
             if let Some(t) = token {
-                self.starts.insert(
-                    (token_pid(&t), token_version(&t)),
-                    (info.pbi_start_tvsec, info.pbi_start_tvusec),
-                );
+                self.starts
+                    .insert((token_pid(&t), token_version(&t)), start);
             }
             out.push(Member {
                 claimant: Claimant { pid, token },
@@ -302,10 +309,21 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
         signal_token(token, libc::SIGCONT)
     }
     fn end_supervisor(&mut self, pid: i32, sid: i32) -> Signalled {
-        match verified_token(pid) {
-            Some((t, s)) if s == sid => signal_token(&t, libc::SIGKILL),
-            _ => Signalled::Stale,
+        // The sweep's anchor rule: the token is taken between two successful
+        // anchor checks, so its session id still names this run's session.
+        // Without that proof (an anchor lost to identity reuse) the supervisor
+        // is not signalled at all.
+        if !(self.anchor)() {
+            return Signalled::Stale;
         }
+        let token = match verified_token(pid) {
+            Some((t, s)) if s == sid => t,
+            _ => return Signalled::Stale,
+        };
+        if !(self.anchor)() {
+            return Signalled::Stale;
+        }
+        signal_token(&token, libc::SIGKILL)
     }
     fn launchd_zombie(&mut self, token: &Token) -> bool {
         let pid = token_pid(token);

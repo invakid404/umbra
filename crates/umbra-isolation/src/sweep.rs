@@ -85,7 +85,9 @@ pub trait Host {
     /// SIGCONT by audit token: it wakes a stopped member and cannot end one.
     fn cont(&mut self, token: &Token) -> Signalled;
     /// End the run's supervisor: SIGKILL by the audit token of `pid`, taken
-    /// so that its session is checked to be `sid` for that same instance.
+    /// so that its session is checked to be `sid` for that same instance, and
+    /// only between two successful anchor checks (the sweep's own rule); with
+    /// no ownership proof it signals nothing and answers `Stale`.
     fn end_supervisor(&mut self, pid: i32, sid: i32) -> Signalled;
     /// Whether the instance `token` names is now a zombie under launchd, which
     /// nobody will collect (#205).
@@ -306,21 +308,36 @@ pub fn end_run(
 
 /// The drain of [`end_run`]: wait until no live member of `sid` is a debugger
 /// and none is traced, capped by [`drain_cap`] for the debuggers of its first
-/// reading. Returns every member token it saw, and whether it reached the cap.
+/// readable reading (and by `drain_cap(1)` until there is one). Returns every
+/// member token it saw, and whether it reached the cap.
 ///
 /// It sends no terminating signal. Its one signal is SIGCONT, at the first
-/// reading, to stopped members that are not traced, by tokens enrolled in a
-/// reading bracketed by two successful anchor checks (the sweep's own rule).
+/// readable reading, to stopped members that are not traced, by tokens
+/// enrolled in a reading bracketed by two successful anchor checks (the
+/// sweep's own rule); a failed anchor check ends those attempts.
 fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, bool) {
     let start = host.now();
     let mut seen: BTreeMap<(i32, u32), Token> = BTreeMap::new();
     let mut cap: Option<Instant> = None;
+    // The cap is sized by the first readable reading, and the SIGCONT pass
+    // runs on the first readable reading bracketed by two successful anchor
+    // checks. A failed reading delays both, it never skips them; a failed
+    // anchor check ends the SIGCONT attempts (the owned set is frozen).
+    let mut sized = false;
+    let mut continued = false;
+    let mut anchor_lost = false;
     loop {
-        let first = cap.is_none();
         let bound = cap.unwrap_or(start + drain_cap(1));
-        let anchored_before = first && host.anchor_ok();
+        let try_cont = !continued && !anchor_lost;
+        let anchored_before = try_cont && host.anchor_ok();
+        if try_cont && !anchored_before {
+            anchor_lost = true;
+        }
         let reading = host.members(sid, bound);
         let anchored = anchored_before && host.anchor_ok();
+        if anchored_before && !anchored {
+            anchor_lost = true;
+        }
         match reading {
             Ok(members) => {
                 for m in &members {
@@ -328,14 +345,16 @@ fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, bool) {
                         seen.insert((token_pid(&t), token_version(&t)), t);
                     }
                 }
-                if first {
+                if !sized {
+                    sized = true;
                     let debuggers = members.iter().filter(|m| m.debugger).count();
                     cap = Some(start + drain_cap(debuggers));
-                    if anchored {
-                        for m in members.iter().filter(|m| m.stopped && !m.traced) {
-                            if let Some(t) = m.claimant.token {
-                                host.cont(&t);
-                            }
+                }
+                if try_cont && anchored {
+                    continued = true;
+                    for m in members.iter().filter(|m| m.stopped && !m.traced) {
+                        if let Some(t) = m.claimant.token {
+                            host.cont(&t);
                         }
                     }
                 }
@@ -568,6 +587,19 @@ mod tests {
         end_run(&mut h, 99, None, Duration::from_secs(3));
         assert!(h.log.iter().any(|l| l == "cont 40"), "{:?}", h.log);
         assert!(!h.log.iter().any(|l| l == "cont 41"), "{:?}", h.log);
+    }
+
+    /// #205: a failed first reading delays the drain's SIGCONT pass, it never
+    /// skips it. A stopped, untraced member found on the next readable reading
+    /// is still continued, so a stopped provider can finish its teardown.
+    #[test]
+    fn a_failed_first_reading_still_continues_a_stopped_provider() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])])
+            .with_members(vec![vec![member(40, false, false, true)], vec![]]);
+        h.members
+            .push_front(Err("member census cut at the deadline".into()));
+        end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(h.log.iter().any(|l| l == "cont 40"), "{:?}", h.log);
     }
 
     /// F5(e) (#205): the cap is 3 s + 4 s per debugger enrolled at the drain's

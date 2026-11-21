@@ -235,3 +235,33 @@ fn a_zombie_leader_is_not_a_claimant() {
     assert_eq!(o.sent, 0);
     reap(s);
 }
+
+/// #205: the supervisor is ended only under the anchor rule. With the anchor
+/// forced off (ownership of the session id not proved, as after identity
+/// reuse) `end_supervisor` signals nothing; with it held, the same process is
+/// ended by its verified token.
+#[test]
+fn the_supervisor_is_never_ended_without_the_anchor() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id() as i32;
+    let session = sid(pid);
+    let refused = MacHost::new(|| false).end_supervisor(pid, session);
+    assert_eq!(refused, Signalled::Stale);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "a supervisor was signalled without the anchor"
+    );
+    assert_eq!(
+        MacHost::new(|| true).end_supervisor(pid, session),
+        Signalled::Sent
+    );
+    let status = child.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
+}

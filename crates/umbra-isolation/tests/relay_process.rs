@@ -390,6 +390,15 @@ fn a_silent_guardian_is_bounded() {
         r.stderr
     );
     assert_eq!(signals_sent(&r), 1);
+    // #205: a live guardian is stopped before its supervisor is looked up,
+    // then killed.
+    let ev = events(&r);
+    let stop = ev.iter().position(|e| e == "guardian-stop");
+    let kill = ev.iter().position(|e| e == "guardian-signal");
+    assert!(
+        stop.is_some() && stop < kill,
+        "the guardian was not stopped before the kill: {ev:?}"
+    );
     assert_no_signal_after_reap(&r);
     // 2 s handshake + 1 s kill wait + 3 s sweep bound, plus process start-up.
     assert!(r.elapsed < Duration::from_secs(7), "{:?}", r.elapsed);
