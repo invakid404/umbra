@@ -754,9 +754,13 @@ with `TerminationPolicy::Immediate`. Supervised closure then uses
 the provider process before recording completion.
 
 Termination tears each session down in order, children first (#186):
+- continue its debugserver (SIGCONT, unconditionally: a stopped debugserver
+  never answers `k`), recording `TracerContinued` when it was stopped (#205);
 - send RSP `k` to its debugserver;
 - wait for a barrier proving the tracee has passed its exit accounting:
-  - a zombie with its attach-time start identity;
+  - a zombie with its attach-time start identity, under any parent but
+    launchd (#205: a zombie under launchd, still there after a 50 ms settle,
+    is never evidence);
   - a reap by this process, or by its traced parent;
   - no process at the pid, or a different process at it (a reused pid). The
     pid stays hashed until the process is reaped, so either proves the tracee
@@ -764,12 +768,40 @@ Termination tears each session down in order, children first (#186):
     (`ReapedProven` / `TracerReportedExit`);
 - only then kill and reap debugserver.
 
-Killing debugserver first lets the kernel hand a half-exited tracee to launchd
-without job-control accounting, which orphans the run's process group with
-SIGHUP when it shares launchd's session. Since #193, `umbra run` started in
-launchd's session moves the whole run into a session of its own
-([umbra-isolation](../umbra-isolation/README.md)), so such an exit can no longer
-be counted against a group in launchd's session.
+**Killing debugserver while it holds its tracee hands the tracee to launchd as a
+zombie nobody collects (#205).** A held tracee (at an intercepted call, or with a
+kill or exit pending) does not start exiting while it is held; on macOS 27.2.1
+`task_terminate` returns `KERN_FAILURE` for it. Debugserver's death releases the
+hold before debugserver's own exit walks its children. If the tracee starts
+exiting in that gap, the walk finds it no longer traced and hands it to launchd
+with its original parent still recorded (xnu-12377.121.6 `kern_exit.c:2278`,
+`:2610-2614`). Its exit then notifies launchd (`:2748`, `:2779`) rather than
+being reaped by the kernel (`:2784-2817`). launchd never waits for it, and its
+original parent's `waitpid` gets ECHILD, so it stays until a reboot and counts
+against the user's `kern.maxprocperuid`. The same exit does no job-control
+accounting, which orphaned the run's process group with SIGHUP in launchd's
+session (#186); since #193 an `umbra run` there moves the whole run into a
+session of its own ([umbra-isolation](../umbra-isolation/README.md)).
+
+So only debugserver ends a held tracee, through `k`, and debugserver is ended
+only once the barrier confirms. Every umbra-owned sweep is debugger-last
+([umbra-isolation](../umbra-isolation/README.md#cleanup-and-ownership)): it ends
+the supervisor first, drains until no debugserver and no traced member is live
+(capped at 3 s + 4 s per debugserver, recorded as `drain_exceeded` when
+reached), and only then sweeps.
+
+**Signals.** In a terminal the provider and debugserver are members of the
+run's job, so a hangup, ^C, ^\ or `kill -pgid` reaches both.
+- The provider installs a no-op `SA_RESTART` handler for SIGHUP, SIGINT, SIGQUIT
+  and SIGTERM where it inherited their default action. It ends with its owner,
+  not the terminal: when the supervisor ends, the drop runs this ordered
+  teardown. An inherited ignore (`nohup`, a background command of a
+  non-interactive shell) is kept. A caught handler resets at `execve`, so the
+  program starts with the dispositions it would have natively.
+- debugserver ends on SIGINT, SIGQUIT and SIGTERM (it handles only SIGPIPE and
+  SIGHUP), so it is started with those three ignored. The program is spawned by
+  the provider, not by debugserver, and never inherits them. SIGTSTP stops
+  debugserver with the job, and the teardown's SIGCONT continues it.
 
 The `k` plus the barrier is bounded at 1.5 s per session, and each reap at
 250 ms (at most 2 s per session). On a timeout the provider writes
@@ -780,38 +812,47 @@ and runs one post-kill barrier inside the 250 ms tracer reap:
   unconfirmed and no retirement failure is retained.
 - **Still unconfirmed:** `Terminate` returns the warning as its error. If final
   shutdown cannot confirm every obligation, the run is left recovery-required.
+- **Handed to launchd:** a root the provider did not collect once its
+  debugserver was gone, or a tracee found as a zombie under launchd, is
+  unconfirmed and named in the error (#205). The tracer kill on this path is the
+  last resort for a debugserver that is hung rather than stopped (#205 R3); it
+  can leave such a zombie, and `Terminate` fails rather than reporting success.
 
-Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome, or
+Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome (and any
+`task_terminate` result other than success), or
 `UMBRA_RSP_LOG` to log sent packets and received bytes to stderr. Both are off
 when unset and enabled by any value. `UMBRA_DEBUGSERVER` overrides debugger
 discovery when `Options.debugserver` is absent; `HOME` supplies the default
 twin and interposer cache roots when `Options.twin_cache` is absent.
 
-The timeout path is still reachable by ordinary failure paths, not only abnormal
-ones. A session whose debugserver neither confirms the exit nor answers `k`
-within the bound gets there, and in launchd's session the #186 race can recur on
-it. The tests pin these cases:
+The timeout path is still reachable, by a debugserver that is hung (not just
+stopped, which the SIGCONT handles) or already dead. The tests pin these cases:
 - a live child whose root has exited now confirms without a warning;
-- an unresponsive or dead debugserver takes the timeout path, and the post-kill
-  result must match the tracee's end state: past its exit means
-  `ConfirmedAfterTracerKill` and `Ok`, a tracee still live means `Err`, and an
-  end state the test cannot read (a lookup error other than ESRCH) fails the
-  test. Measured, both are confirmed after the kill.
+- a stopped debugserver is continued and confirms before the tracer kill;
+- a dead debugserver takes the timeout path, and the post-kill result must
+  match the tracee's end state: past its exit means `ConfirmedAfterTracerKill`
+  and `Ok`, a tracee still live means `Err`, and an end state the test cannot
+  read (a lookup error other than ESRCH) fails the test.
 
-These paths can still hand a tracee to launchd uncounted:
-- the timeout path above;
-- a tracer crash while its tracee is mid-exit (the crash itself, before
-  `Terminate`);
-- provider death;
-- `SIGKILL` or other cancellation that bypasses `Terminate` and drop;
-- the attach/connect failure fallback, whose tracer kill is not shown safe.
+**Residuals (#205), each tracked in #205.** These can still leave a tracee to
+launchd as a zombie nobody collects:
+- **R1:** debugserver ended by SIGKILL (or a signal whose disposition umbra
+  cannot set) while its tracee is held. This is kernel behaviour with no
+  software fix: the kernel decides inside debugserver's own exit. It includes a
+  tracer crash while its tracee is held, and the attach/connect failure
+  fallback's tracer kill.
+- **R2:** the provider ended by a fatal signal (SIGKILL, or one it does not
+  handle) while its tracee is held. debugserver then neither ends nor detaches
+  the held tracee (observed for 1 s in #198), and a later kill is R1.
+- **R3:** a hung debugserver on the timeout path; the kill can hand its tracee
+  to launchd, and `Terminate` fails and names it.
 
-In launchd's session they no longer reach any group there: #193 runs the whole
-run in a session of its own, with session 1 regression tests for the first four
-(`umbra-cli`'s `tests/isolation.rs`). The remote platform provider now detects
-supervisor death independently through its owner monitor. Provider death and
-unconfirmed teardown remain separate limits; a monitor inside the provider
-cannot survive that provider's death.
+`SIGKILL` or other cancellation that bypasses `Terminate` and drop reaches R1 or
+R2. In launchd's session none of these reaches a group there: #193 runs the
+whole run in a session of its own, with session 1 regression tests
+(`umbra-cli`'s `tests/isolation.rs`). The remote platform provider detects
+supervisor death independently through its owner monitor; a monitor inside the
+provider cannot survive that provider's death.
 
 `tests/provider_ipc.rs` exercises the socketpair handshake and real `open-libc`
 capture through these requests, including stopped and running quiescence.
@@ -941,10 +982,26 @@ tracer was reaped and that no child of the test process remains.
 | Test | Pass bar |
 |---|---|
 | `teardown_confirms_exit_before_killing_tracer` | `terminate` returns `Ok`; steps `KillSent`, a confirmed barrier, then `TracerKilled`; no warning; tracer and tracee both reaped |
-| `teardown_times_out_on_unresponsive_tracer` | debugserver stopped with `SIGSTOP`; the timeout path runs in 1.5–2.5 s and the warning step precedes `TracerKilled`. Exactly one post-kill step follows the kill: `ConfirmedAfterTracerKill` with `terminate` returning `Ok`, or `UnconfirmedAfterTracerKill` with `Err` containing `tracee termination unconfirmed; tracer killed`. The step must match the tracee's end state as `terminate` returns: a zombie with the attach identity, nothing at the pid (ESRCH), or a reused pid requires `ConfirmedAfterTracerKill`; the attached process still live requires `UnconfirmedAfterTracerKill`; any other lookup failure fails the test |
-| `teardown_reports_dead_tracer_without_waiting` | debugserver killed first; the timeout path runs in under 1 s, after a `KillSendFailed` or `ConnectionClosed` step; the warning precedes `TracerKilled`; the same post-kill split as above |
+| `teardown_times_out_on_unresponsive_tracer` | debugserver stopped with `SIGSTOP` (#205 re-pin): `TracerContinued`, then a confirmed barrier, then `TracerKilled`; no warning, no timeout, under 1.5 s; `terminate` returns `Ok`; tracer and tracee both reaped; no launchd-parented zombie |
+| `teardown_reports_dead_tracer_without_waiting` | the root first proved running (`--spin`: `p_stat` SRUN and CPU time advancing), then debugserver killed (#205 reshape: a held root would be handed to launchd, R1); the timeout path runs in under 1 s, after a `KillSendFailed` or `ConnectionClosed` step; the warning precedes `TracerKilled`; exactly one post-kill step, `ConfirmedAfterTracerKill` with `Ok` or `UnconfirmedAfterTracerKill` with `Err`, matching the tracee's end state as `terminate` returns; the root handed back and reaped (`TraceeReaped(true)`); no launchd-parented zombie |
 | `teardown_confirms_a_live_orphaned_child_without_warning` | `--mt-spawn` stopped at the root's `Exit`, with the traced child live; `terminate` returns `Ok`; no report timed out; the child's barrier is confirmed before `TracerKilled` (`ReapedProven`, or `Zombie`); a stop reply is followed directly by `KillResent` |
 | `teardown_confirms_a_live_child_while_its_root_is_alive` | `--mt-spawn` stopped at the `Child` event; `terminate` returns `Ok`; both reports confirm with no warning |
+
+Each of the five also counts launchd-parented zombies of `umbra-test-child`
+started in its window, or at its recorded pids, and fails on any (#205).
+
+Further #205 coverage:
+- `native::tests::a_tracee_handed_to_launchd_is_never_confirmed` and
+  `native::tests::the_teardown_opens_by_continuing_its_tracer` are pure units.
+- `rsp::tests::debugserver_ignores_terminal_signals` reads a live
+  debugserver's ignored signals (no program attached) and sends each.
+- `tests/lifetime_signals.rs` sends the provider SIGHUP, SIGINT, SIGQUIT and
+  SIGTERM with a live owner, then during a teardown, and pins that a launched
+  program keeps the caller's ignored dispositions.
+- `native_debugger_last_hands_the_program_back` is the native control
+  (`experiments/fixtures/umbra-fix-205-exitwin.c`, the orderings that leave
+  nothing behind only).
+- `fchmodat_traced_matches_native` runs `fchmodat` traced and natively.
 
 `native::tests::the_teardown_barrier_decides_from_report_identity_and_lookup`
 is the barrier's decision table. It is a pure unit test that needs no
@@ -1362,8 +1419,10 @@ RSP retains connect/request/poll caps. These bound individual operations, not a
 healthy session's lifetime. Owner loss during work not released by task termination
 (such as a signing subprocess or connect) can wait for that operation's budget.
 A direct in-process backend has no external owner watch; its containing process's
-SIGKILL cannot run Rust cleanup. Provider/group/guardian-loss residuals in #198,
-#199 and #202 remain; this does not implement #268's public cancellation API.
+SIGKILL cannot run Rust cleanup. The provider survives SIGHUP, SIGINT, SIGQUIT and
+SIGTERM from a terminal or a process-group kill and ends with its owner (#205).
+Provider loss to SIGKILL (#205 R2), and the guardian-loss residuals in #199 and
+#202, remain; this does not implement #268's public cancellation API.
 
 CI runs `owner_loss` only with `UMBRA_INTEGRATION_REQUIRED` on self-hosted
 native-qualification. The default-options 35-second native/routed control is

@@ -129,10 +129,14 @@ impl Task {
         }
         Ok(())
     }
-    fn kill(&self) {
-        unsafe {
-            libc::task_terminate(self.0);
-        }
+    /// `task_terminate`, returning its result. Measured on macOS 27.2.1
+    /// (#205): it does not end a tracee its debugger holds at an exception
+    /// (it returns `KERN_FAILURE`, 5, and the tracee stays traced and not
+    /// exiting); only the debugger's release lets an exit run.
+    #[must_use]
+    fn kill(&self) -> i32 {
+        // SAFETY: an owned task port; no memory is passed.
+        unsafe { libc::task_terminate(self.0) }
     }
 }
 impl Drop for Task {
@@ -175,7 +179,7 @@ trait KillOwned {
 }
 impl KillOwned for Arc<Task> {
     fn kill_owned(&self) {
-        self.kill();
+        let _ = self.kill();
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,7 +305,7 @@ impl Watchdog {
             .iter()
             .rev()
         {
-            task.kill();
+            let _ = task.kill();
         }
     }
     fn replace(&self, old: &Arc<Task>, new: Arc<Task>) {
@@ -1874,7 +1878,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.done && self.live.is_some() {
-            self.task.kill();
+            let _ = self.task.kill();
         }
         // Every backend path tears its sessions down in order first, children
         // before parents (`MacosTraceBackend::tear_down_sessions`). This only
@@ -2345,7 +2349,7 @@ impl MacosTraceBackend {
         if self.deadline.is_some_and(|d| crate::clock::now() >= d) {
             for s in &self.sessions {
                 if let Some(live) = &s.live {
-                    live.task.kill();
+                    let _ = live.task.kill();
                 }
             }
             return Err(error("watchdog", "session timed out"));
@@ -2743,7 +2747,7 @@ impl MacosTraceBackend {
                 // boundary: the caller would have no handle to terminate it with.
                 for session in &self.sessions {
                     if let Some(live) = &session.live {
-                        live.task.kill();
+                        let _ = live.task.kill();
                     }
                 }
                 self.tear_down_sessions();
@@ -3769,18 +3773,30 @@ fn reap_launched_child(pid: i32) -> bool {
 
 // ---- Ordered teardown (#186; cause-gate ruling F1-revised, R2, R3) ----
 //
-// **Why the order matters.** A debugger-held tracee cannot finish exiting while
-// its debugserver holds it: `task_terminate` only aborts its threads
-// (xnu-12377.121.6 `osfmk/kern/task.c:3063-3094`, `thread_act.c:285-320`). So
-// killing debugserver both releases the tracee's exit and runs debugserver's
-// own exit concurrently. If debugserver's child loop reaches the tracee after
-// the tracee's `proc_prepareexit` cleared `P_LTRACED` (`kern_exit.c:2278`), the
-// tracee goes to launchd through the untraced branch, which does no job-control
-// accounting (`kern_exit.c:2610-2614`, `proc_reparentlocked` `:3549-3594`). The
-// tracee's own `fixjobc` (`kern_exit.c:2505`) then counts launchd as a
-// qualifying parent whenever the run's process group is in launchd's session,
-// takes `pg_jobc` from 1 to 0 and `orphanpg` sends SIGHUP+SIGCONT to the whole
-// group, supervisor included (`kern_proc.c:3203-3211`, `:3321-3383`).
+// **Why the order matters.** A debugger-held tracee does not start exiting while
+// its debugserver holds it: a SIGKILL, another thread's `_exit` and
+// `task_terminate` all wait, and on macOS 27.2.1 `task_terminate` returns
+// KERN_FAILURE for it (#205, measured natively). Killing debugserver releases
+// the hold before debugserver's own child loop runs. If the tracee then starts
+// exiting (an exit was pending, or it was held at a breakpoint and traps again)
+// before that loop reaches it, its `proc_prepareexit` has cleared `P_LTRACED`
+// (`kern_exit.c:2278`) and the loop takes the untraced branch: launchd becomes
+// its parent with `p_oppid` still set (`kern_exit.c:2610-2614`). Two things
+// follow:
+// - **#205:** the tracee's exit takes the notify-the-parent branch because of
+//   `p_oppid` (`kern_exit.c:2748`, SZOMB `:2773`, SIGCHLD to launchd `:2779`),
+//   not the kernel's system reap (`:2784-2817`). launchd never waits for it and
+//   its original parent's `waitpid` gets ECHILD, so it stays a zombie until a
+//   reboot. `barrier_decision` therefore never counts a zombie under launchd.
+// - **#186:** the untraced branch does no job-control accounting
+//   (`proc_reparentlocked` `:3549-3594`). The tracee's own `fixjobc`
+//   (`kern_exit.c:2505`) then counts launchd as a qualifying parent whenever the
+//   run's process group is in launchd's session, takes `pg_jobc` from 1 to 0,
+//   and `orphanpg` sends SIGHUP+SIGCONT to the whole group, supervisor included
+//   (`kern_proc.c:3203-3211`, `:3321-3383`).
+//
+// The teardown therefore opens by continuing its debugserver (a stopped one
+// never answers `k`), and only debugserver ends the held tracee.
 //
 // **The order, per session.** RSP `k` over the existing connection (re-sent
 // once after a stale stop reply), then a state barrier that proves the tracee
@@ -3790,11 +3806,22 @@ fn reap_launched_child(pid: i32) -> bool {
 // **The timeout path (ruling R3 option (i), review ruling 1 V3).** If the
 // barrier does not confirm within the bound, the warning goes to stderr, the
 // tracer is killed anyway, and one post-kill barrier decides: confirmed means
-// `terminate` succeeds, still unconfirmed means it fails. In launchd's session
-// the #186 race can recur on that path. That is a residual, tracked in #193
-// together with what this code never reaches: the provider dying first, the
-// supervisor or a provider being `SIGKILL`ed, any cancellation that bypasses
+// `terminate` succeeds, still unconfirmed means it fails, and a tracee handed
+// to launchd is never confirmed. The tracer kill on this path is the last
+// resort for a hung debugserver (#205 R3): it can hand the tracee to launchd,
+// and `terminate` then fails and names it. What this code never reaches stays
+// residual (#205 R1, R2): debugserver ended by SIGKILL while its tracee is held,
+// the provider ended by a fatal signal, any cancellation that bypasses
 // `terminate`/`Drop`, and `Rsp`'s attach/connect failure fallback.
+
+/// Record a teardown's `task_terminate` result in the teardown log
+/// (`UMBRA_TEARDOWN_LOG`). Anything but success is expected for a tracee its
+/// debugger holds; the ordered teardown that follows is what ends it.
+fn record_task_terminate(pid: i32, result: i32) {
+    if result != 0 && std::env::var_os("UMBRA_TEARDOWN_LOG").is_some() {
+        eprintln!("umbra-platform-macos: task_terminate(pid={pid}) returned {result}");
+    }
+}
 
 /// Bound on the RSP `k` send and reply plus the barrier, per session. Measured
 /// replies took 16-91 ms (#186 arc, E4 K arm). With the two reap bounds, one
@@ -3907,10 +3934,22 @@ fn lookup(pid: i32) -> Lookup {
     }
 }
 
-/// The barrier's lookup after the launchd-zombie settle (#205 A1(a)).
+/// The barrier's lookup after the launchd-zombie settle (#205 A1(a)): a
+/// zombie under launchd is read once more, after `reread` waits
+/// [`LAUNCHD_ZOMBIE_SETTLE`]. A kernel-reaped orphan passes through SZOMB with
+/// ppid 1 on its way to the system reap (`kern_exit.c:2803` before `:2815`) and
+/// is then gone; one still there was handed to launchd uncollected. The
+/// settle is defensive: the system reap holds `proc_list_lock` across that
+/// window, so the transient should be all but invisible to a lookup.
 fn settled_lookup(first: Lookup, reread: impl FnOnce() -> Lookup) -> Lookup {
-    let _ = reread;
-    first
+    match first {
+        Lookup::Found {
+            status: SZOMB,
+            ppid: 1,
+            ..
+        } => reread(),
+        other => other,
+    }
 }
 
 fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
@@ -3970,6 +4009,21 @@ fn barrier_decision(
                 lookup: ReportedExitLookup::PidReused { start: *start },
                 admitted_by: ADMITTED_REUSED,
             })
+        }
+        // #205: a zombie under launchd is never exit evidence. The kernel hands
+        // a traced program to launchd, uncollected and with its original
+        // parent left set, when its debugger finishes exiting after the
+        // program started exiting (kern_exit.c:2610-2614, `:2748`); launchd
+        // never waits for it and the original parent's `waitpid` gets ECHILD.
+        // `settled_lookup` has already re-read it once, so a kernel-reaped
+        // orphan passing through SZOMB on its way to the system reap is not
+        // judged here.
+        (Lookup::Found { status, ppid, .. }, _) if *status == SZOMB && *ppid == 1 => {
+            BarrierReading::Unconfirmed(
+                "handed to launchd uncollected: a zombie under launchd with the attach-time \
+                 identity"
+                    .into(),
+            )
         }
         (Lookup::Found { status, .. }, _) if *status == SZOMB => {
             BarrierReading::Confirmed(BarrierEvidence::Zombie)
@@ -4135,23 +4189,40 @@ fn log_teardown(report: &TeardownReport) {
 /// Whether a teardown ends unconfirmed once the tracer is gone: the one
 /// post-kill reading, and for a root (the platform's own child) whether it was
 /// collected (#205 A1(a)).
+///
+/// A root not collected once its tracer is gone was not handed back: that is
+/// the shape in which the kernel gives it to launchd, and the post-kill
+/// barrier's `Zombie` reading of it was the false `Ok` #205 found.
 fn post_kill_unconfirmed(after_kill: Option<&BarrierReading>, root: bool, reaped: bool) -> bool {
-    let _ = (root, reaped);
-    matches!(after_kill, Some(BarrierReading::Unconfirmed(_)))
+    matches!(after_kill, Some(BarrierReading::Unconfirmed(_))) || (root && !reaped)
 }
 
 /// Continue a tracer before its teardown (#205 A1(b)). `true` when it was
 /// stopped, for the record only: the continue itself is unconditional.
 trait ContinueTracer {
-    #[allow(dead_code)] // scaffold: called by the teardown prologue in the next commit
     fn continue_tracer(&mut self) -> bool;
 }
 
-/// The teardown's first step: `TracerContinued` when the tracer was stopped.
-#[allow(dead_code)] // scaffold: called from ordered_teardown_inner in the next commit
+/// The teardown's first step: continue the tracer, unconditionally (harmless
+/// when it runs; no check-then-act gap), and report `TracerContinued` when it
+/// was stopped. A stopped debugserver never answers `k`, and killing it while
+/// its tracee is held at a breakpoint hands the tracee to launchd (#205).
 fn teardown_prologue(tracer: &mut impl ContinueTracer) -> Option<TeardownStep> {
-    let _ = tracer;
-    None
+    tracer
+        .continue_tracer()
+        .then_some(TeardownStep::TracerContinued)
+}
+
+impl ContinueTracer for Rsp {
+    fn continue_tracer(&mut self) -> bool {
+        let pid = self.tracer_pid();
+        let stopped = bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SSTOP);
+        // SAFETY: plain libSystem call on our own child; SIGCONT ends nothing.
+        unsafe {
+            libc::kill(pid, libc::SIGCONT);
+        }
+        stopped
+    }
 }
 
 impl Session {
@@ -4226,6 +4297,9 @@ impl Session {
         let pid = self.id.0.native_id as i32;
         let tracer = self.rsp.tracer_pid();
         let mut steps = Vec::new();
+        // #205 A1(b): before `k`, and before the emergency-retirement path,
+        // which comes through here too.
+        steps.extend(teardown_prologue(&mut self.rsp));
         // R3.4: an unsendable `k`, or a connection that closes before any
         // reply, goes to the timeout path without waiting for the barrier.
         let mut abandoned: Option<String> = None;
@@ -4592,7 +4666,7 @@ impl Drop for MacosTraceBackend {
         }
         for s in self.sessions.iter().rev() {
             if !s.done {
-                s.task.kill();
+                record_task_terminate(s.id.0.native_id as i32, s.task.kill());
             }
         }
         self.tear_down_sessions();
@@ -5011,7 +5085,7 @@ impl TraceControl for MacosTraceBackend {
                 // A failed interrupt/ack must not leave part of the tree running.
                 for s in &self.sessions {
                     if let Some(live) = &s.live {
-                        live.task.kill();
+                        let _ = live.task.kill();
                     }
                 }
                 return Err(e);
@@ -5051,7 +5125,7 @@ impl TraceControl for MacosTraceBackend {
         }
         for s in self.sessions.iter().rev() {
             if !s.done {
-                s.task.kill();
+                record_task_terminate(s.id.0.native_id as i32, s.task.kill());
             }
         }
         let reports = self.tear_down_sessions();
@@ -5199,7 +5273,6 @@ mod tests {
     #[test]
     fn the_teardown_opens_by_continuing_its_tracer() {
         use super::*;
-        #[allow(dead_code)] // scaffold: read once the prologue continues (next commit)
         struct Fake {
             stopped: bool,
             continued: u32,

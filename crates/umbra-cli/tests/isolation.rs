@@ -381,6 +381,10 @@ struct Run {
     finished: Option<Outcome>,
     /// When the run started: the window for the zombie count (#205).
     since_us: i64,
+    /// The supervisor and the debugservers, as (pid, start), from `discover`
+    /// (#205: the cleanup ends the supervisor first and waits on these).
+    supervisor: Option<(i32, i64)>,
+    debuggers: Vec<(i32, i64)>,
 }
 
 impl Run {
@@ -454,6 +458,8 @@ impl Run {
             session: None,
             finished: None,
             since_us,
+            supervisor: None,
+            debuggers: Vec::new(),
         }
     }
 
@@ -546,6 +552,17 @@ impl Run {
                 self.recorded.push((p, r.start_us));
             }
         }
+        let start_of = |pid: i32| {
+            rows.iter()
+                .find(|r| r.pid == pid)
+                .map(|r| (pid, r.start_us))
+        };
+        self.supervisor = start_of(tree.supervisor);
+        self.debuggers = tree
+            .debugservers
+            .iter()
+            .filter_map(|d| start_of(*d))
+            .collect();
         assert!(
             tree.platform > 0 && tree.journal > 0 && tree.storage > 0,
             "providers not found: {tree:?}"
@@ -653,6 +670,33 @@ impl Run {
     /// Kill what is left of this run (recorded pids; session S before the
     /// observed instant), then stop the launcher, sentinel and sampler.
     fn cleanup(&mut self) {
+        // #205: end the run debugger-last. The supervisor goes first, so the
+        // platform provider tears its sessions down in order; then wait, capped
+        // at 3 s + 4 s per recorded debugserver, until none of them is live.
+        // Only then are the survivors killed: killing a debugserver while its
+        // program is held hands the program to launchd as a zombie nobody
+        // collects.
+        let live = self.live_of_this_run();
+        if !live.is_empty() {
+            let alive = |live: &[Proc], (pid, start): (i32, i64)| {
+                live.iter().any(|p| p.pid == pid && p.start_us == start)
+            };
+            if let Some(supervisor) = self.supervisor.filter(|s| alive(&live, *s)) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", &supervisor.0.to_string()])
+                    .status();
+            }
+            let cap = Duration::from_secs(3)
+                + Duration::from_secs(4) * self.debuggers.len().max(1) as u32;
+            let end = Instant::now() + cap;
+            while Instant::now() < end {
+                let live = self.live_of_this_run();
+                if !self.debuggers.iter().any(|d| alive(&live, *d)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         for p in self.live_of_this_run() {
             if self
                 .recorded
@@ -1176,9 +1220,11 @@ fn sid1_killpg_with_a_stopped_tracer_leaves_nothing() {
         .status()
         .unwrap();
     assert!(ok.success());
-    // The guardian's bounds: relay loss is seen within ~10 ms, the sweep is
-    // bounded by 3 s and the supervisor reap by 1 s.
-    let left = run.drained(Duration::from_secs(8));
+    // The guardian's bounds: relay loss is seen within ~10 ms; it ends the
+    // supervisor first, drains for at most 3 s + 4 s per debugserver (three
+    // sessions here, #205), sweeps within 3 s and reaps the supervisor within
+    // 1 s: T(3) = 19 s.
+    let left = run.drained(Duration::from_secs(20));
     let decoy_alive = decoy.try_wait().unwrap().is_none();
     let _ = decoy.kill();
     let _ = decoy.wait();
@@ -1214,8 +1260,9 @@ fn sid1_sigterm_to_the_relay_cancels_the_run() {
     std::thread::sleep(Duration::from_millis(500));
     let tree = run.discover();
     signal(tree.relay.expect("a relay in SID 1"), "TERM");
-    // Relay loss is seen within ~10 ms; sweep 3 s; supervisor reap 1 s.
-    let left = run.drained(Duration::from_secs(6));
+    // Relay loss is seen within ~10 ms; #205's drain (at most 3 s + 4 s for
+    // one debugserver), the 3 s sweep and the 1 s supervisor reap: T(1) = 11 s.
+    let left = run.drained(Duration::from_secs(12));
     let o = run.finish(Duration::from_secs(5));
     assert!(left.is_empty(), "the run survived its relay: {left:?}");
     assert_eq!(o.term_signal(), Some(15), "{o:?}");

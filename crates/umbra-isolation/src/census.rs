@@ -131,6 +131,37 @@ fn is_debugger(pid: i32) -> Option<bool> {
     (n > 0).then(|| buf[..n as usize].ends_with(b"/debugserver"))
 }
 
+/// The only child of `parent` whose session is `sid`, if there is exactly
+/// one (#205). The relay uses it, while the guardian is still its unreaped
+/// child, to name the supervisor the guardian spawned before `STARTED`
+/// arrived: the guardian spawns nothing else. Naming only: the supervisor is
+/// then ended by its own audit token.
+pub fn only_child_in_session(parent: i32, sid: i32) -> Option<i32> {
+    let mut pids = [0i32; 64];
+    // SAFETY: `pids` is writable for its size in bytes.
+    let n = unsafe {
+        libc::proc_listchildpids(
+            parent,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as libc::c_int,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    // libproc returns the number of pids it wrote.
+    let children: Vec<i32> = pids[..(n as usize).min(pids.len())]
+        .iter()
+        .copied()
+        // SAFETY: getsid has no memory arguments.
+        .filter(|&pid| pid > 1 && unsafe { libc::getsid(pid) } == sid)
+        .collect();
+    match children[..] {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
 /// The macOS process table, with a pluggable anchor check.
 pub struct MacHost<A: FnMut() -> bool> {
     /// The ownership proof (the zombie anchor; README, Cleanup and

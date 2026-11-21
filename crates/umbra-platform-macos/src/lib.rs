@@ -63,7 +63,7 @@ pub struct Options {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod owner;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use owner::OwnerIdentity;
+pub use owner::{keep_lifetime_with_owner, OwnerIdentity};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod clock;

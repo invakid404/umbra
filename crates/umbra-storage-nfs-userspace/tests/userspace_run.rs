@@ -8343,6 +8343,89 @@ fn slate_bounded_for(
 ) -> (SlateOutput, bool) {
     slate_launch(command, evidence, timeout, None)
 }
+/// #205: end a timed-out run debugger-last. The launched `umbra` (in a
+/// terminal, the supervisor; in launchd's session, the relay, whose death
+/// starts the guardian's own debugger-last ending of session S) is ended
+/// first, so the platform provider tears its sessions down in order. Then
+/// wait until no live member of the run's group or session is a debugserver
+/// or traced, capped at 3 s + 4 s per debugserver seen at the first reading
+/// (the platform's worst case, emergency path included). Only then may the
+/// group be killed: killing a debugserver while its program is held hands the
+/// program to launchd as a zombie nobody collects.
+///
+/// Returns the debugservers seen first (D), the cap, and whether it was
+/// reached.
+fn slate_debugger_last(
+    child: &mut std::process::Child,
+    group: u32,
+    run_session: &mut Option<SlateRunSession>,
+) -> (usize, std::time::Duration, bool) {
+    use std::time::{Duration, Instant};
+    let _ = child.kill();
+    let start = Instant::now();
+    let mut first: Option<(usize, Duration)> = None;
+    loop {
+        let bound = first.map_or(start + Duration::from_secs(7), |(_, cap)| start + cap);
+        let members = slate_run_members(group, bound, run_session).unwrap_or_default();
+        let live: Vec<i32> = members
+            .lines()
+            .filter(|line| {
+                !line
+                    .split_whitespace()
+                    .nth(3)
+                    .is_some_and(|stat| stat.starts_with('Z'))
+            })
+            .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+            .collect();
+        let debuggers = members
+            .lines()
+            .filter(|line| line.contains("debugserver"))
+            .filter(|line| {
+                !line
+                    .split_whitespace()
+                    .nth(3)
+                    .is_some_and(|stat| stat.starts_with('Z'))
+            })
+            .count();
+        let traced = live.iter().any(|&pid| {
+            // SAFETY: plain old data, filled by proc_pidinfo below.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+            // SAFETY: `info` is writable for `size` bytes.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    size,
+                )
+            };
+            got == size && info.pbi_flags & 2 != 0 // PROC_FLAG_TRACED
+        });
+        let (d, cap) = *first.get_or_insert_with(|| {
+            (
+                debuggers,
+                Duration::from_secs(3) + Duration::from_secs(4) * debuggers.max(1) as u32,
+            )
+        });
+        if debuggers == 0 && !traced {
+            return (d, cap, false);
+        }
+        if start.elapsed() >= cap {
+            return (d, cap, true);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// #205: the cleanup census's budget after a debugger-last ending with `d`
+/// debugservers: the guardian's drain cap (3 s + 4 s per debugserver), its
+/// sweep (3 s) and its supervisor reap (1 s), plus a 2 s census margin.
+fn slate_cleanup_budget(d: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(9) + std::time::Duration::from_secs(4) * d.max(1) as u32
+}
+
 /// #205: the start of a case's window for [`slate_launchd_zombies`], in the
 /// units `proc_bsdinfo` reports start times in.
 fn slate_zombie_window() -> (u64, u64) {
@@ -8552,14 +8635,29 @@ fn slate_launch(
     // The ledger's stdin is closed here, so a fixture still waiting for an
     // acknowledgment reads EOF rather than blocking past its own process.
     drop(watched.input.take());
-    let grace = Instant::now() + Duration::from_secs(10);
+    let mut grace_budget = Duration::from_secs(10);
     if timed_out || census_error.is_some() {
+        // #205: end the run debugger-last before the group kill, and give the
+        // cleanup census room for the guardian's own drain and sweep in SID 1.
+        let (debuggers, cap, exceeded) = slate_debugger_last(&mut child, group, &mut run_session);
+        grace_budget = grace_budget.max(slate_cleanup_budget(debuggers));
+        slate_census_event(
+            "DRAIN",
+            &format!(
+                "debuggers={debuggers} cap={cap:?} exceeded={exceeded} grace={grace_budget:?}"
+            ),
+        );
+        eprintln!(
+            "{}: #205 drain: D={debuggers} cap={cap:?} exceeded={exceeded} cleanup grace={grace_budget:?}",
+            evidence.display()
+        );
         // SAFETY: this child was launched as leader of its own process group.
         unsafe {
             libc::kill(-(group as i32), libc::SIGKILL);
             group_kills += 1;
         }
     }
+    let grace = Instant::now() + grace_budget;
     let mut status = status;
 
     let mut pipes: [Option<Vec<u8>>; 2] = [None, None];
@@ -12713,14 +12811,29 @@ fn c13_launch(
     // The ledger's stdin is closed here, so a fixture still waiting for an
     // acknowledgment reads EOF rather than blocking past its own process.
     drop(watched.input.take());
-    let grace = Instant::now() + Duration::from_secs(5);
+    let mut grace_budget = Duration::from_secs(5);
     if timed_out || census_error.is_some() {
+        // #205: end the run debugger-last before the group kill, and give the
+        // cleanup census room for the guardian's own drain and sweep in SID 1.
+        let (debuggers, cap, exceeded) = slate_debugger_last(&mut child, group, &mut run_session);
+        grace_budget = grace_budget.max(slate_cleanup_budget(debuggers));
+        slate_census_event(
+            "DRAIN",
+            &format!(
+                "debuggers={debuggers} cap={cap:?} exceeded={exceeded} grace={grace_budget:?}"
+            ),
+        );
+        eprintln!(
+            "{}: #205 drain: D={debuggers} cap={cap:?} exceeded={exceeded} cleanup grace={grace_budget:?}",
+            evidence.display()
+        );
         // SAFETY: this child was launched as leader of its own process group.
         unsafe {
             libc::kill(-(group as i32), libc::SIGKILL);
             group_kills += 1;
         }
     }
+    let grace = Instant::now() + grace_budget;
     let mut status = status;
 
     let mut pipes: [Option<Vec<u8>>; 2] = [None, None];

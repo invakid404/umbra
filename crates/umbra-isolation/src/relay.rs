@@ -127,6 +127,8 @@ struct Relay {
     rec: Record<FdSink>,
     g: i32,
     state: Guardian,
+    /// The supervisor's pid, once `STARTED` named it (#205).
+    supervisor: Option<i32>,
 }
 
 impl Relay {
@@ -161,6 +163,14 @@ impl Relay {
     /// Fail closed: end the guardian if it is still ours to signal, sweep S
     /// under the anchor, write the final record line, reap, exit 1.
     fn fallback(mut self, reason: &str) -> ! {
+        let g = self.g;
+        // #205: name the supervisor while the guardian is still our unreaped
+        // child (its pid cannot be reused, and its child is still its child).
+        let supervisor = fallback_supervisor(self.supervisor, || {
+            matches!(self.state, Guardian::Live | Guardian::Stopped)
+                .then(|| crate::census::only_child_in_session(g, g))
+                .flatten()
+        });
         if matches!(self.state, Guardian::Live | Guardian::Stopped) {
             self.kill_guardian();
             let end = Instant::now() + REAP;
@@ -168,8 +178,9 @@ impl Relay {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        let g = self.g;
-        let outcome = sweep::sweep(&mut MacHost::new(|| anchor(g)), g, SWEEP);
+        // #205: end the supervisor first, drain until the platform's teardown
+        // is done, then sweep.
+        let outcome = sweep::end_run(&mut MacHost::new(|| anchor(g)), g, supervisor, SWEEP);
         self.rec.line(
             "relay-fallback",
             serde_json::json!({
@@ -177,6 +188,8 @@ impl Relay {
                 "owned_alive": outcome.owned_alive, "unverifiable": outcome.unverifiable,
                 "sent": outcome.sent, "stale": outcome.stale, "passes": outcome.passes,
                 "frozen_at": outcome.frozen_at, "error": outcome.error,
+                "supervisor": supervisor, "launchd_zombies": outcome.launchd_zombies,
+                "drain_exceeded": outcome.drain_exceeded,
             }),
         );
         let reaped = self.reap();
@@ -266,6 +279,7 @@ pub(crate) fn run_with(exe: PathBuf, args: Vec<std::ffi::OsString>, dir: PathBuf
         rec,
         g,
         state: Guardian::Live,
+        supervisor: None,
     };
     let mut reader = Reader::new(up_r);
 
@@ -303,6 +317,7 @@ pub(crate) fn run_with(exe: PathBuf, args: Vec<std::ffi::OsString>, dir: PathBuf
         Read::Timeout => relay.fallback("supervisor start not confirmed in time"),
         Read::Lost(e) => relay.fallback(&format!("supervisor did not start: {e}")),
     };
+    relay.supervisor = Some(supervisor);
     relay.rec.line(
         "started",
         serde_json::json!({ "sid": g, "supervisor": supervisor, "guardian": g }),
@@ -423,13 +438,11 @@ pub(crate) fn run_with(exe: PathBuf, args: Vec<std::ffi::OsString>, dir: PathBuf
 /// parentage while the guardian is still unreaped (the guardian spawns the
 /// supervisor before it sends `STARTED`). `None`: there is no supervisor to
 /// end, and the sweep runs as before.
-#[allow(dead_code)] // scaffold: the fallback calls it in the next commit
 fn fallback_supervisor(
     started: Option<i32>,
     by_parentage: impl FnOnce() -> Option<i32>,
 ) -> Option<i32> {
-    let _ = (started, by_parentage);
-    None
+    started.or_else(by_parentage)
 }
 
 fn unsafe_getpgrp() -> i32 {

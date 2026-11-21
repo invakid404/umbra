@@ -284,10 +284,76 @@ pub fn end_run(
     supervisor: Option<i32>,
     budget: Duration,
 ) -> Outcome {
-    // Scaffold: the next commit adds the supervisor's end, the drain and the
-    // zombie report. Until then this is the one-pass sweep.
-    let _ = supervisor;
-    sweep(host, sid, budget)
+    if let Some(pid) = supervisor {
+        host.end_supervisor(pid, sid);
+    }
+    let (seen, drain_exceeded) = drain(host, sid);
+    let mut outcome = sweep(host, sid, budget);
+    outcome.drain_exceeded = drain_exceeded;
+    let mut zombies: Vec<i32> = seen
+        .iter()
+        .filter(|t| host.launchd_zombie(t))
+        .map(token_pid)
+        .collect();
+    zombies.sort_unstable();
+    zombies.dedup();
+    if !zombies.is_empty() && outcome.kind == Kind::Complete {
+        outcome.kind = Kind::Incomplete;
+    }
+    outcome.launchd_zombies = zombies;
+    outcome
+}
+
+/// The drain of [`end_run`]: wait until no live member of `sid` is a debugger
+/// and none is traced, capped by [`drain_cap`] for the debuggers of its first
+/// reading. Returns every member token it saw, and whether it reached the cap.
+///
+/// It sends no terminating signal. Its one signal is SIGCONT, at the first
+/// reading, to stopped members that are not traced, by tokens enrolled in a
+/// reading bracketed by two successful anchor checks (the sweep's own rule).
+fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, bool) {
+    let start = host.now();
+    let mut seen: BTreeMap<(i32, u32), Token> = BTreeMap::new();
+    let mut cap: Option<Instant> = None;
+    loop {
+        let first = cap.is_none();
+        let bound = cap.unwrap_or(start + drain_cap(1));
+        let anchored_before = first && host.anchor_ok();
+        let reading = host.members(sid, bound);
+        let anchored = anchored_before && host.anchor_ok();
+        match reading {
+            Ok(members) => {
+                for m in &members {
+                    if let Some(t) = m.claimant.token {
+                        seen.insert((token_pid(&t), token_version(&t)), t);
+                    }
+                }
+                if first {
+                    let debuggers = members.iter().filter(|m| m.debugger).count();
+                    cap = Some(start + drain_cap(debuggers));
+                    if anchored {
+                        for m in members.iter().filter(|m| m.stopped && !m.traced) {
+                            if let Some(t) = m.claimant.token {
+                                host.cont(&t);
+                            }
+                        }
+                    }
+                }
+                if !members.iter().any(|m| m.debugger || m.traced) {
+                    return (seen.into_values().collect(), false);
+                }
+            }
+            // No reading: keep reading until the cap. Unavailable is never
+            // read as "nothing left to wait for".
+            Err(_) => {
+                cap.get_or_insert(start + drain_cap(1));
+            }
+        }
+        if host.now() >= cap.expect("set by the first pass") {
+            return (seen.into_values().collect(), true);
+        }
+        host.pause();
+    }
 }
 
 #[cfg(test)]

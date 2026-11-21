@@ -375,7 +375,8 @@ jobs:
       # of the run left behind (the runner's own post-job cleanup would end such
       # a process after this step, and the next job would take the zombie as its
       # baseline). A debugserver counts only when it is umbra's: its argv
-      # carries `--reverse-connect 127.0.0.1:`.
+      # carries `--reverse-connect 127.0.0.1:`. Zombies are counted above, not
+      # again as leftovers.
       - name: Zombie and leftover census at job end (#205)
         if: always()
         run: |
@@ -390,7 +391,7 @@ jobs:
           job_start=$(cat "$RUNNER_TEMP/umbra-job-start.txt" 2>/dev/null || echo 0)
           window=$(( $(date +%s) - job_start ))
           me=$$
-          leftovers=$(ps -A -o pid=,ppid=,user=,etime=,ucomm=,command= | awk \
+          leftovers=$(ps -A -o pid=,ppid=,user=,stat=,etime=,ucomm=,command= | awk \
             -v u="$(id -un)" -v window="$window" -v me="$me" '
             function seconds(t,  n, a, d, h, m, s) {
               d = 0; h = 0
@@ -399,8 +400,8 @@ jobs:
               if (n == 3) { h = a[1]; m = a[2]; s = a[3] } else { m = a[1]; s = a[2] }
               return ((d * 24 + h) * 60 + m) * 60 + s
             }
-            $3 == u && $1 != me && $2 != me && seconds($4) <= window {
-              name = $5
+            $3 == u && $1 != me && $2 != me && $4 !~ /^Z/ && seconds($5) <= window {
+              name = $6
               if (name ~ /^umbra/ || (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
                 print
             }')
@@ -1054,7 +1055,8 @@ jobs:
       # of the run left behind (the runner's own post-job cleanup would end such
       # a process after this step, and the next job would take the zombie as its
       # baseline). A debugserver counts only when it is umbra's: its argv
-      # carries `--reverse-connect 127.0.0.1:`.
+      # carries `--reverse-connect 127.0.0.1:`. Zombies are counted above, not
+      # again as leftovers.
       - name: Zombie and leftover census at job end (#205)
         if: always()
         run: |
@@ -1069,7 +1071,7 @@ jobs:
           job_start=$(cat "$RUNNER_TEMP/umbra-job-start.txt" 2>/dev/null || echo 0)
           window=$(( $(date +%s) - job_start ))
           me=$$
-          leftovers=$(ps -A -o pid=,ppid=,user=,etime=,ucomm=,command= | awk \
+          leftovers=$(ps -A -o pid=,ppid=,user=,stat=,etime=,ucomm=,command= | awk \
             -v u="$(id -un)" -v window="$window" -v me="$me" '
             function seconds(t,  n, a, d, h, m, s) {
               d = 0; h = 0
@@ -1078,8 +1080,8 @@ jobs:
               if (n == 3) { h = a[1]; m = a[2]; s = a[3] } else { m = a[1]; s = a[2] }
               return ((d * 24 + h) * 60 + m) * 60 + s
             }
-            $3 == u && $1 != me && $2 != me && seconds($4) <= window {
-              name = $5
+            $3 == u && $1 != me && $2 != me && $4 !~ /^Z/ && seconds($5) <= window {
+              name = $6
               if (name ~ /^umbra/ || (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
                 print
             }')

@@ -188,15 +188,39 @@ impl Rsp {
         let address = listener
             .local_addr()
             .map_err(|e| error("debugserver listen", e))?;
-        let child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .args(["--reverse-connect", &address.to_string()])
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| error("debugserver spawn", e))?;
+            .stderr(Stdio::inherit());
+        // #205 A2b: debugserver is a member of the terminal job's process
+        // group, so ^C, ^\ and `kill -INT/-QUIT/-TERM -pgid` reach it, and it
+        // ends on all three (it handles only SIGPIPE and SIGHUP). Ended while
+        // its program is held at an intercepted call, it would leave the
+        // program to the kernel, which hands it to launchd as a zombie nobody
+        // collects. It starts with those three ignored: an ignored disposition
+        // survives its `execve`, and nothing in debugserver re-enables the
+        // default. The program is spawned by this provider, not by
+        // debugserver, so it never inherits this. The platform still ends
+        // debugserver with SIGKILL.
+        //
+        // `pre_exec` makes `std` fork and exec rather than `posix_spawn`. The
+        // closure runs only `signal`, which is async-signal-safe.
+        // SAFETY: only async-signal-safe libc between fork and exec.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+                for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                    if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().map_err(|e| error("debugserver spawn", e))?;
         let mut child = SetupChild {
             child: Some(child),
             ownership: ownership.clone(),
@@ -218,7 +242,11 @@ impl Rsp {
         let stream = loop {
             match listener.accept() {
                 Ok((s, _)) => break s,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
                 Err(e) => {
                     return Err(error("debugserver accept", e));
                 }
@@ -538,6 +566,8 @@ impl Rsp {
                     return true;
                 }
                 Ok(None) => {}
+                // A caught signal can interrupt the wait (#205 A2a): try again.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => return false,
             }
             if crate::clock::now() >= limit {
@@ -649,10 +679,12 @@ impl Drop for Rsp {
     ///
     /// **Not shown safe.** Measured in the #186 arc: when a tracer dies while
     /// holding an attached, not-yet-terminated inferior, the inferior has been
-    /// seen as a PPID-1 zombie within 5 ms. It was not handed back to its
-    /// original parent, and the reason is not established. So in launchd's
-    /// session this fallback may take the #186 route. It is a residual tracked
-    /// in #193.
+    /// seen as a PPID-1 zombie within 5 ms. #205 established why: the tracer's
+    /// death releases its hold before the tracer's child loop runs, the held
+    /// inferior (at a breakpoint, or with an exit pending) starts exiting
+    /// first, and the loop hands it to launchd with its original parent still
+    /// recorded, so it is never collected. This fallback can therefore leave
+    /// such a zombie (#205 R1) and, in launchd's session, take the #186 route.
     fn drop(&mut self) {
         if self.torn_down {
             return;

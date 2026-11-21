@@ -89,7 +89,9 @@ pub fn run(spec: &std::ffi::OsStr) -> ! {
     let relay_alive = send(up, &Msg::Started(supervisor)).is_ok();
 
     let finish_relay_dead = |mut rec: Record<record::FdSink>, why: &str| -> ! {
-        let outcome = sweep::sweep(&mut MacHost::new(|| true), me, SWEEP);
+        // #205: the supervisor is still alive here; end it first, so the
+        // platform tears its sessions down in order before anything is swept.
+        let outcome = sweep::end_run(&mut MacHost::new(|| true), me, Some(supervisor), SWEEP);
         let mut st = 0;
         let end = Instant::now() + REAP;
         let mut reaped = false;
@@ -109,7 +111,8 @@ pub fn run(spec: &std::ffi::OsStr) -> ! {
         rec.line(
             "relay-death",
             serde_json::json!({ "why": why, "sid": me, "outcome": kind.as_str(), "supervisor_reaped": reaped,
-                "owned_alive": outcome.owned_alive, "unverifiable": outcome.unverifiable, "error": outcome.error }),
+                "owned_alive": outcome.owned_alive, "unverifiable": outcome.unverifiable, "error": outcome.error,
+                "launchd_zombies": outcome.launchd_zombies, "drain_exceeded": outcome.drain_exceeded }),
         );
         // R-4: no caller left. The inherited stderr is the only report when
         // the record itself failed.
@@ -131,13 +134,15 @@ pub fn run(spec: &std::ffi::OsStr) -> ! {
         // SAFETY: a valid out-pointer; only the supervisor is waited on (C-3).
         let r = unsafe { libc::waitpid(supervisor, &mut st, libc::WNOHANG) };
         if r == supervisor {
-            let outcome = sweep::sweep(&mut MacHost::new(|| true), me, SWEEP);
+            // #205: drain until the platform's teardown is done, then sweep.
+            let outcome = sweep::end_run(&mut MacHost::new(|| true), me, None, SWEEP);
             rec.line(
                 "sweep",
                 serde_json::json!({ "why": "supervisor-exit", "sid": me, "supervisor_status": st,
                     "outcome": outcome.kind.as_str(), "owned_alive": outcome.owned_alive,
                     "unverifiable": outcome.unverifiable, "sent": outcome.sent, "stale": outcome.stale,
-                    "passes": outcome.passes, "error": outcome.error }),
+                    "passes": outcome.passes, "error": outcome.error,
+                    "launchd_zombies": outcome.launchd_zombies, "drain_exceeded": outcome.drain_exceeded }),
             );
             let record_errno = rec.failed().unwrap_or(0);
             // R-4: with the relay gone and the record failed, the inherited
@@ -162,11 +167,13 @@ pub fn run(spec: &std::ffi::OsStr) -> ! {
             });
         }
         if r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            // R-7: a permanent wait error fails closed.
-            let outcome = sweep::sweep(&mut MacHost::new(|| true), me, SWEEP);
+            // R-7: a permanent wait error fails closed. The supervisor may
+            // still be alive: it is ended first (#205).
+            let outcome = sweep::end_run(&mut MacHost::new(|| true), me, Some(supervisor), SWEEP);
             rec.line(
                 "wait-error",
-                serde_json::json!({ "sid": me, "outcome": outcome.kind.as_str() }),
+                serde_json::json!({ "sid": me, "outcome": outcome.kind.as_str(),
+                    "launchd_zombies": outcome.launchd_zombies, "drain_exceeded": outcome.drain_exceeded }),
             );
             let _ = send(
                 up,
