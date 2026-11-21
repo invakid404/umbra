@@ -168,6 +168,10 @@ Probe controls are listed under [Provider binary](#provider-binary).
   and `tracer_pids()` the live sessions' debugserver pids. Both are read-only,
   `#[doc(hidden)]` seams for the acceptance tests; the backend never consults
   them.
+- `keep_lifetime_with_owner()` installs the provider's no-op handler for
+  SIGHUP, SIGINT, SIGQUIT and SIGTERM, only where the process inherited their
+  default action (#205; "Signals" under the provider binary). The provider
+  binary calls it before its handshake.
 <!-- /memoria:section -->
 
 <!-- memoria:section id="shipped-mechanisms" files="src/interpose.rs src/rsp.rs src/native.rs src/abi.rs src/cache.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->
@@ -639,7 +643,8 @@ exposed that; the raw-`svc` leg with high bits set in `x2` guards it.
 <!-- memoria:section id="provider-binary" files="src/main.rs" guidance="../../docs/guides/reviewing-provider-binary.md" -->
 ## Provider binary
 
-`src/main.rs` is the shipped provider binary. It captures its parent identity,
+`src/main.rs` is the shipped provider binary. It calls
+`keep_lifetime_with_owner()` (below, "Signals"), captures its parent identity,
 accepts the `macos` handshake, installs the owner watch, and calls
 `umbra_platform::provider::serve_session` with a
 `PlatformSession { control: MacosTraceBackend, abi: DarwinArm64Abi }`.
@@ -842,8 +847,12 @@ launchd as a zombie nobody collects:
   tracer crash while its tracee is held, and the attach/connect failure
   fallback's tracer kill.
 - **R2:** the provider ended by a fatal signal (SIGKILL, or one it does not
-  handle) while its tracee is held. debugserver then neither ends nor detaches
-  the held tracee (observed for 1 s in #198), and a later kill is R1.
+  handle) while its tracee is held. Measured once on macOS 27.2.1 (#205):
+  debugserver, having lost its connection, ends the tracee by itself
+  (`QSetDetachOnError:0`) and exits about 2 s later, but finishes exiting
+  while the tracee is still mid-exit, so the tracee is left to launchd. #198's
+  1 s observation of a debugserver still holding the tracee is the start of
+  that window.
 - **R3:** a hung debugserver on the timeout path; the kill can hand its tracee
   to launchd, and `Terminate` fails and names it.
 
@@ -988,7 +997,9 @@ tracer was reaped and that no child of the test process remains.
 | `teardown_confirms_a_live_child_while_its_root_is_alive` | `--mt-spawn` stopped at the `Child` event; `terminate` returns `Ok`; both reports confirm with no warning |
 
 Each of the five also counts launchd-parented zombies of `umbra-test-child`
-started in its window, or at its recorded pids, and fails on any (#205).
+started in its window, or at its recorded pids, and fails on any (#205). The
+count is the shared `tests/zombies/mod.rs`, which `tests/lifetime_signals.rs`
+uses too.
 
 Further #205 coverage:
 - `native::tests::a_tracee_handed_to_launchd_is_never_confirmed` and

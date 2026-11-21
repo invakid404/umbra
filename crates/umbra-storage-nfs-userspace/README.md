@@ -1000,6 +1000,25 @@ a PPID-1 zombie: 21/21 runs in the arc's E1/E2, and 3 of 4 cases on the pre-fix
 readings of this assertion. In launchd's session that orphaned the group with
 SIGHUP.
 
+A run that reaches its deadline, or whose census fails, is ended
+debugger-last before the group kill (#205, `slate_debugger_last`), because
+killing a debugserver while its program is held hands the program to launchd
+as a zombie nobody collects:
+
+1. The launched `umbra` is killed first. In launchd's session that is the
+   relay, whose death starts the guardian's own debugger-last ending.
+2. The launcher waits until no live member of the run's group or session is a
+   debugserver or traced, capped at 3 s + 4 s per debugserver at the first
+   reading, and records a `DRAIN` census event.
+3. The cleanup grace grows to at least 9 s + 4 s per debugserver
+   (`slate_cleanup_budget`: the guardian's drain cap, its 3 s sweep and 1 s
+   reap, and a 2 s margin), and the group kill follows.
+
+Both slate launchers also fail a case on any zombie under launchd of one of
+this suite's fixtures (`umbra-userspace-*`, `umbra-slate-*`, `umbra-fix-*`)
+that started in the case's window (`slate_launchd_zombies`). The group census
+still accepts zombies inside the run's group as dead-table residue.
+
 In launchd's session (CI's self-hosted runner) a supervised `umbra run` stays
 in the launched group only as a relay; the run itself is in the session its
 guardian leads ([umbra-isolation](../umbra-isolation/README.md), #193). So the

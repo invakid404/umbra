@@ -330,6 +330,12 @@ Stated, not closed here:
   - the sweep's interleavings, scripted: the last witness lost mid-sweep, a
     registry refresh after the loss, and a reused pid or unknown claimant never
     signalled;
+  - the debugger-last ending (#205), scripted: the supervisor is ended before
+    any sweep kill, on every path that can name it (the relay's fallback
+    included); the drain waits to its cap while a debugserver lives, ends at
+    once with nothing to wait for, continues only stopped untraced members,
+    and scales its cap with the debugserver count; a member left as a zombie
+    under launchd is reported and keeps the outcome from `COMPLETE`;
   - spawn: no SIGPIPE inheritance, a new session, exact descriptor passing.
 - `tests/t1_kernel.rs`, on the real kernel:
   - with the anchor forced off, claimants are reported `UNVERIFIABLE` and not

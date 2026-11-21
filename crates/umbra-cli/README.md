@@ -266,7 +266,10 @@ into two groups:
   reading, a failed listing, or own entries that disagree fail the case. The
   cases are:
   - P1 to P4 (no SIGHUP to `umbra`, its providers or the caller's group, the
-    group never orphaned, nothing left);
+    group never orphaned, nothing left). P2 kills a *running* tracee and then
+    its debugserver: killing a debugserver while its tracee is held hands the
+    tracee to launchd as a zombie nobody collects (#205), which no software
+    can prevent, so that order is no longer exercised;
   - the run's topology, the mirrored status, the isolation record, and
     debugserver's arguments left as on master (no `--kill-on-error`);
   - a descendant refused entry to the caller's group, and the tracee's own
@@ -276,10 +279,16 @@ into two groups:
 - **Other cases.** A fresh-session run (no relay) and ten pty cases run
   in any session. The pty cases put `umbra run` under a mini job-control shell
   and pin today's terminal semantics: Ctrl-C, Ctrl-Z then `fg`, Ctrl-\,
-  TOSTOP, SIGWINCH, hangup, exit status and terminal ioctls.
+  TOSTOP, SIGWINCH, hangup, exit status and terminal ioctls. After a hangup
+  the harness finds nothing of the run left to kill (`survivors=0`): the
+  platform provider ends with its owner, not the terminal (#198, #205).
 
 The harness signals only pids it found by parentage from its own launcher, and
-cleans up by the run's session.
+cleans up by the run's session. Its cleanup is debugger-last (#205): it ends
+the supervisor first, waits (capped at 3 s + 4 s per debugserver) until no
+recorded debugserver is live, and only then kills what is left. Every case
+also counts zombies whose parent is launchd, by the fixture's name and a start
+time inside the case's window, and fails on any.
 
 `tests/run_fixtures.rs`'s `local_utility_matrix` and `nfs_utility_matrix` run
 standard utilities behind the same gating as its fixture cases — `/usr/bin/touch`,
