@@ -292,9 +292,10 @@ pub fn drain_cap(debuggers: usize) -> Duration {
 ///    SIGCONT first, by enrolled token, so a stopped provider can finish.
 /// 3. [`sweep`] what is left within `budget`.
 ///
-/// The outcome reports every member seen that is now a zombie under launchd
-/// (and, in `error`, any whose final check could not be read; either keeps it
-/// from `Complete`), and whether the drain reached its cap.
+/// The outcome reports every member seen (by the drain, or signalled by the
+/// sweep) that is now a zombie under launchd (and, in `error`, any whose final
+/// check could not be read; either keeps it from `Complete`), and whether the
+/// drain reached its cap.
 pub fn end_run(
     host: &mut impl Host,
     sid: i32,
@@ -307,7 +308,12 @@ pub fn end_run(
     let (seen, tokenless, drain_exceeded) = drain(host, sid);
     let mut outcome = sweep(host, sid, budget);
     outcome.drain_exceeded = drain_exceeded;
-    let _ = &outcome.signalled;
+    // Every member the drain saw, and every member the sweep signalled.
+    let mut checked: BTreeMap<(i32, u32), Token> = BTreeMap::new();
+    for t in seen.iter().chain(outcome.signalled.iter()) {
+        checked.insert((token_pid(t), token_version(t)), *t);
+    }
+    let seen: Vec<Token> = checked.into_values().collect();
     let mut zombies: Vec<i32> = vec![];
     let mut unreadable: Vec<i32> = vec![];
     for token in &seen {
