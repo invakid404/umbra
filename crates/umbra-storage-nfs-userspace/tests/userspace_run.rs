@@ -9864,16 +9864,17 @@ fn slate_c10_10_fork_helper_refusal() {
     );
     // Re-characterized for #205 (launchd-zombie teardown, traced-stub
     // aliases, no SIGCONT to a reaped tracer, the unenrolled-fork-child
-    // sweep and its shared wait inside the shutdown envelope): single_thread
-    // and its Fork and WaitPlan::Park call sites are
-    // byte-identical to the #284 base (compared with six lines of context);
+    // sweep, its shared wait inside the shutdown envelope and its report
+    // from terminate): single_thread and its Fork and WaitPlan::Park call
+    // sites are byte-identical to the #284 base (compared with six lines of
+    // context);
     // the Fork arm only gains a cfg-gated test probe after its return stop.
     // The refusal oracle and runtime-witness limitation remain unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("ba6145316c5e53d50971b25f3d7fcaafad26eac961102281a25559f4b3d67064"),
+        Some("90e76c320c1660785710f5d8035461caf1b20f9b3c46f4539dc145332a83b027"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
