@@ -507,6 +507,8 @@ mod tests {
         unreadable: std::collections::BTreeSet<(i32, u32)>,
         /// Tokenless pids whose final check cannot be read.
         unreadable_pids: std::collections::BTreeSet<i32>,
+        /// Tokenless pids whose final check reads a zombie.
+        zombie_pids: std::collections::BTreeSet<i32>,
     }
     impl Script {
         fn new(anchors: &[bool], censuses: Vec<Result<Vec<Claimant>, String>>) -> Self {
@@ -521,6 +523,7 @@ mod tests {
                 zombies: Default::default(),
                 unreadable: Default::default(),
                 unreadable_pids: Default::default(),
+                zombie_pids: Default::default(),
             }
         }
         fn with_members(mut self, members: Vec<Vec<Member>>) -> Self {
@@ -581,7 +584,9 @@ mod tests {
             }
         }
         fn launchd_zombie_pid(&mut self, pid: i32) -> ZombieCheck {
-            if self.unreadable_pids.contains(&pid) {
+            if self.zombie_pids.contains(&pid) {
+                ZombieCheck::Zombie
+            } else if self.unreadable_pids.contains(&pid) {
                 ZombieCheck::Unreadable
             } else {
                 ZombieCheck::Clear
@@ -763,6 +768,36 @@ mod tests {
         assert_eq!(
             end_run(&mut h, 99, None, Duration::from_secs(3)).kind,
             Kind::Complete
+        );
+    }
+
+    /// #205 (N1): a tokenless sighting is checked by pid even when a seen
+    /// token has the same pid. After pid reuse the two need not be the same
+    /// instance, so a token that reads `Clear` never vouches for the tokenless
+    /// one.
+    #[test]
+    fn a_tokenless_sighting_is_checked_even_beside_a_token_at_its_pid() {
+        let tokenless = Member {
+            claimant: Claimant {
+                pid: 21,
+                token: None,
+            },
+            debugger: false,
+            traced: false,
+            stopped: false,
+        };
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])]).with_members(vec![
+            vec![member(21, false, false, false), tokenless],
+            vec![],
+        ]);
+        h.zombie_pids.insert(21);
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(o.launchd_zombies.is_empty(), "the token reads Clear: {o:?}");
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
+        let error = o.error.unwrap_or_default();
+        assert!(
+            error.contains("launchd-zombie check unreadable") && error.contains("21"),
+            "{error}"
         );
     }
 
