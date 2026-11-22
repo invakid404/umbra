@@ -363,3 +363,47 @@ The existing `ofd-race` mode now issues 200 records per writer and checks all
 400 six-byte records while recording alternations. The listing-project fixture
 keeps its batched output and listing assertions. These cases target successful
 write retirement; failure-continuing workloads remain tracked under #196.
+
+## Launchd-zombie teardown (#205)
+
+`umbra-fix-205-exitwin.c` is a native control with no umbra code. It shows how
+the kernel hands a debugger-held program back when its debugger process ends.
+It forks a program and a debugger process that attaches as debugserver does
+(`task_for_pid`, its own exception port, `PT_ATTACHEXC`) and holds the attach
+stop. Its four modes are the orderings that leave nothing behind:
+`exit-held-release`, `kill-held-release`, `term-held-release` and `held-end`.
+Each ends with `RESULT mode=<mode> C=<pid> <outcome>`, and a correct run
+reports the program collected by its original parent. The orderings that leak a
+zombie under launchd (the debugger ending while the program has an exit pending
+or is held at a breakpoint) are deliberately absent: each run of one leaves a
+zombie only a reboot clears. Build it with `clang -arch arm64 -O1 -Wall -Wextra
+-Werror experiments/fixtures/umbra-fix-205-exitwin.c -o umbra-fix-205-exitwin`
+and sign it with `umbra-fix-205-exitwin.entitlements` (get-task-allow), as CI
+does.
+
+`umbra-userspace-spawn` gains the mode `fix-205-fork-window`. The root forks a
+first child, which waits on a pipe, sleeps 1 s and then spawns the helper with
+`POSIX_SPAWN_SETSID`, and the root writes the pipe and forks a second child at
+once, which only exits. Natively it completes and records
+`fork-window spawn result=0 completed=2`. Under umbra the SETSID spawn is
+refused on every profile, and a test probe keeps the second fork unenrolled
+across that refusal.
+
+`umbra-test-child` gains two modes:
+
+- `--spin <unused>` loops without a system call after `main`, so a test can
+  prove the program is running, not held, by its CPU time advancing. It never
+  returns; the test ends it.
+- `--fchmodat <root>` runs `fchmodat` on a file and on a symlink to it with no
+  flag, `AT_SYMLINK_NOFOLLOW` and `AT_SYMLINK_NOFOLLOW_ANY`. It records one
+  `<label> rc=<rc> errno=<errno> mode=<octal>` line per case in
+  `<root>/fchmodat.txt`, so a traced run compares byte for byte with a native
+  one. On macOS 27.2.1 `fchmodat` is a wrapper that calls `__fchmodat` and can
+  retry it with masked flags, so a case may issue more than one system call.
+
+In pty mode, `umbra-isolation-fixture` no longer waits a fixed second before it
+counts survivors. It waits until the run's session holds no live debugserver,
+no traced member and no live platform provider, capped at 3 s + 4 s per
+debugserver at the first readable census, so the run's own ordered teardown
+has its time. A census it cannot read never ends that wait: it waits to its
+cap and reports `ISO DRAIN census_unreadable=<n>` on stderr.

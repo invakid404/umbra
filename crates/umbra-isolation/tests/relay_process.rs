@@ -390,9 +390,29 @@ fn a_silent_guardian_is_bounded() {
         r.stderr
     );
     assert_eq!(signals_sent(&r), 1);
+    // #205: a live guardian is stopped before its supervisor is looked up,
+    // then killed. The relay must have observed the stop, not only asked for
+    // it, before the kill.
+    let ev = events(&r);
+    let stop = ev.iter().position(|e| e == "guardian-stop");
+    let kill = ev.iter().position(|e| e == "guardian-signal");
+    assert!(
+        stop.is_some() && stop < kill,
+        "the guardian was not stopped before the kill: {ev:?}"
+    );
+    let stopped = r
+        .record
+        .iter()
+        .position(|v| v["event"] == "guardian-stopped" && v["observed"] == "Stopped");
+    assert!(
+        stopped.is_some() && stopped < kill,
+        "no observed stop before the kill: {:?}",
+        r.record
+    );
     assert_no_signal_after_reap(&r);
-    // 2 s handshake + 1 s kill wait + 3 s sweep bound, plus process start-up.
-    assert!(r.elapsed < Duration::from_secs(7), "{:?}", r.elapsed);
+    // 2 s handshake + 1 s stop wait + 1 s kill wait + 3 s sweep bound, plus
+    // process start-up.
+    assert!(r.elapsed < Duration::from_secs(8), "{:?}", r.elapsed);
 }
 
 /// R-6: no blocking wait on a guardian that never exits after its outcome.

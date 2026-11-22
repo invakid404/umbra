@@ -75,3 +75,6 @@ umbra-storage = { path = "../umbra-storage" }
 umbra-storage-local = { path = "../umbra-storage-local" }
 umbra-supervisor = { path = "../umbra-supervisor" }
 uuid.workspace = true
+# `tests/isolation.rs` (sid1_p2) tells "no such process" from any other kill
+# failure by errno, not by `/bin/kill`'s message text (#205).
+libc = "=0.2.191"

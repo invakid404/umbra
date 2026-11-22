@@ -39,6 +39,24 @@ pub struct Claimant {
     pub token: Option<Token>,
 }
 
+/// One live member of the swept session as the run's ending sees it (#205).
+///
+/// The classification is for **waiting and counting only**: whether the drain
+/// may stop waiting, and which zombies to report. Nothing is ever signalled on
+/// its basis; signals still go only to tokens enrolled under the anchor rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    /// Its pid and audit token, as a census claimant.
+    pub claimant: Claimant,
+    /// Its image is a debugger process (`debugserver`), or it could not be
+    /// read: the drain waits while such a member lives.
+    pub debugger: bool,
+    /// It is traced (`P_LTRACED`): the drain waits while such a member lives.
+    pub traced: bool,
+    /// It is stopped (`SSTOP`).
+    pub stopped: bool,
+}
+
 /// What a signal by audit token did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signalled {
@@ -61,6 +79,25 @@ pub trait Host {
     fn census(&mut self, sid: i32, deadline: Instant) -> Result<Vec<Claimant>, String>;
     /// SIGKILL by audit token. Never by pid.
     fn kill(&mut self, token: &Token) -> Signalled;
+    /// Every live member of `sid`, classified for the drain, or `Err` when the
+    /// census could not be taken, carrying the tokens it had already verified.
+    /// Must not run past `deadline` (#205).
+    fn members(&mut self, sid: i32, deadline: Instant) -> Result<Vec<Member>, MembersCut>;
+    /// SIGCONT by audit token: it wakes a stopped member and cannot end one.
+    fn cont(&mut self, token: &Token) -> Signalled;
+    /// End the run's supervisor: SIGKILL by the audit token of `pid`, taken
+    /// so that its session is checked to be `sid` for that same instance, and
+    /// only between two successful anchor checks (the sweep's own rule); with
+    /// no ownership proof it signals nothing and answers `Stale`.
+    fn end_supervisor(&mut self, pid: i32, sid: i32) -> Signalled;
+    /// Whether the instance `token` names is now a zombie under launchd, which
+    /// nobody will collect (#205), or whether that could not be read.
+    fn launchd_zombie(&mut self, token: &Token) -> ZombieCheck;
+    /// The same check for a member seen without a token (#205), so with no
+    /// recorded identity: `Clear` only when its pid is provably not a zombie
+    /// under launchd now (gone, or readable and not one); otherwise
+    /// `Unreadable`, never `Zombie`.
+    fn launchd_zombie_pid(&mut self, pid: i32) -> ZombieCheck;
     /// The monotonic clock.
     fn now(&self) -> Instant;
     /// Wait between passes.
@@ -123,6 +160,15 @@ pub struct Outcome {
     pub frozen_at: Option<u32>,
     /// The last census error, if any.
     pub error: Option<String>,
+    /// Members seen while the run was ended that are now zombies under
+    /// launchd, which nobody collects (#205). `Complete` requires none.
+    pub launchd_zombies: Vec<i32>,
+    /// The drain reached its cap with a debugger or a traced member still
+    /// live, and the sweep went ahead (#205).
+    pub drain_exceeded: bool,
+    /// Tokens the sweep signalled, for [`end_run`]'s final zombie check
+    /// (#205); not part of any record.
+    pub signalled: Vec<Token>,
 }
 
 /// Sweep session `sid` within `budget` (a monotonic, operational deadline:
@@ -141,8 +187,12 @@ pub fn sweep(host: &mut impl Host, sid: i32, budget: Duration) -> Outcome {
         passes: 0,
         frozen_at: None,
         error: None,
+        launchd_zombies: vec![],
+        drain_exceeded: false,
+        signalled: vec![],
     };
     let mut any_census = false;
+    let mut signalled: BTreeMap<(i32, u32), Token> = BTreeMap::new();
     let mut last_owned_alive: Vec<i32> = vec![];
     let mut last_unverifiable: Vec<i32> = vec![];
     while host.now() < deadline {
@@ -169,6 +219,7 @@ pub fn sweep(host: &mut impl Host, sid: i32, budget: Duration) -> Outcome {
             outcome.owned_alive.clear();
             outcome.unverifiable.clear();
             outcome.frozen_at = frozen_at;
+            outcome.signalled = signalled.into_values().collect();
             return outcome;
         }
         if frozen_at.is_none() {
@@ -187,6 +238,7 @@ pub fn sweep(host: &mut impl Host, sid: i32, budget: Duration) -> Outcome {
             match known {
                 Some(t) if token_pid(&t) == c.pid => {
                     owned_alive.push(c.pid);
+                    signalled.insert((token_pid(&t), token_version(&t)), t);
                     match host.kill(&t) {
                         Signalled::Sent => outcome.sent += 1,
                         Signalled::Stale => outcome.stale += 1,
@@ -207,6 +259,7 @@ pub fn sweep(host: &mut impl Host, sid: i32, budget: Duration) -> Outcome {
     outcome.frozen_at = frozen_at;
     outcome.owned_alive = last_owned_alive;
     outcome.unverifiable = last_unverifiable;
+    outcome.signalled = signalled.into_values().collect();
     outcome.kind = if !any_census {
         Kind::Error
     } else if !outcome.unverifiable.is_empty() {
@@ -215,6 +268,204 @@ pub fn sweep(host: &mut impl Host, sid: i32, budget: Duration) -> Outcome {
         Kind::Incomplete
     };
     outcome
+}
+
+/// How long the drain waits for a session holding `debuggers` live debugger
+/// processes (#205): the platform's own worst case, 2 s for its retirements
+/// plus up to 4 s per traced session (its ordered teardown, then the emergency
+/// attempt for a failed retirement), and a margin: 3 s + 4 s per debugger, at
+/// least one.
+pub fn drain_cap(debuggers: usize) -> Duration {
+    Duration::from_secs(3) + Duration::from_secs(4) * debuggers.max(1) as u32
+}
+
+/// End a run's session `sid` debugger-last (#205).
+///
+/// 1. End the run's `supervisor`, the platform provider's owner, if it is
+///    still alive. The provider then tears its sessions down in order: only
+///    debugserver ends a held program, through RSP `k`, and debugserver is
+///    ended only once the program is gone.
+/// 2. Drain: wait, capped by [`drain_cap`], until no live member of `sid` is a
+///    debugger and none is traced. Those are the processes whose ending order
+///    decides whether the kernel hands a half-exited program to launchd as a
+///    zombie nobody collects. Stopped members that are not traced are sent
+///    SIGCONT first, by enrolled token, so a stopped provider can finish.
+/// 3. [`sweep`] what is left within `budget`.
+///
+/// The outcome reports every member seen (by the drain, or signalled by the
+/// sweep) that is now a zombie under launchd (and, in `error`, any whose final
+/// check could not be read; either keeps it from `Complete`), and whether the
+/// drain reached its cap.
+pub fn end_run(
+    host: &mut impl Host,
+    sid: i32,
+    supervisor: Option<i32>,
+    budget: Duration,
+) -> Outcome {
+    if let Some(pid) = supervisor {
+        host.end_supervisor(pid, sid);
+    }
+    let (seen, tokenless, drain_exceeded) = drain(host, sid);
+    let mut outcome = sweep(host, sid, budget);
+    outcome.drain_exceeded = drain_exceeded;
+    // Every member the drain saw, and every member the sweep signalled.
+    let mut checked: BTreeMap<(i32, u32), Token> = BTreeMap::new();
+    for t in seen.iter().chain(outcome.signalled.iter()) {
+        checked.insert((token_pid(t), token_version(t)), *t);
+    }
+    let seen: Vec<Token> = checked.into_values().collect();
+    let mut zombies: Vec<i32> = vec![];
+    let mut unreadable: Vec<i32> = vec![];
+    for token in &seen {
+        match host.launchd_zombie(token) {
+            ZombieCheck::Zombie => zombies.push(token_pid(token)),
+            ZombieCheck::Unreadable => unreadable.push(token_pid(token)),
+            ZombieCheck::Clear => {}
+        }
+    }
+    // A member seen without a token has no identity to check: its pid is
+    // checked instead, always. A seen token at the same pid may name another
+    // instance (the pid reused), so it never vouches for the tokenless one.
+    for pid in tokenless {
+        match host.launchd_zombie_pid(pid) {
+            ZombieCheck::Clear => {}
+            ZombieCheck::Zombie | ZombieCheck::Unreadable => unreadable.push(pid),
+        }
+    }
+    zombies.sort_unstable();
+    zombies.dedup();
+    unreadable.sort_unstable();
+    unreadable.dedup();
+    // A member whose final check cannot be read is not known to be clear.
+    if (!zombies.is_empty() || !unreadable.is_empty()) && outcome.kind == Kind::Complete {
+        outcome.kind = Kind::Incomplete;
+    }
+    if !unreadable.is_empty() {
+        let note = format!("launchd-zombie check unreadable for pids {unreadable:?}");
+        outcome.error = Some(match outcome.error.take() {
+            Some(error) => format!("{error}; {note}"),
+            None => note,
+        });
+    }
+    outcome.launchd_zombies = zombies;
+    outcome
+}
+
+/// A member census that produced no full reading (#205). `seen` holds the
+/// tokens of the members it had already verified (their start identities are
+/// recorded), so a member first seen in a cut census is still zombie-checked.
+/// They are never used for a drain decision (SIGCONT, cap, or emptiness).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MembersCut {
+    /// Why the census stopped.
+    pub error: String,
+    /// Tokens of the members verified before it stopped.
+    pub seen: Vec<Token>,
+    /// Pids of the members it read without a token before it stopped.
+    pub tokenless: Vec<i32>,
+}
+
+/// The final check of one seen member (#205): a zombie under launchd with
+/// its recorded start, provably not one (gone, another start, or not a
+/// zombie), or unreadable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZombieCheck {
+    /// A zombie under launchd with the member's recorded start.
+    Zombie,
+    /// Gone (ESRCH), another start at its pid, or not such a zombie.
+    Clear,
+    /// The lookup failed otherwise, or no start was recorded.
+    Unreadable,
+}
+
+/// The drain of [`end_run`]: wait until no live member of `sid` is a debugger
+/// and none is traced, capped by [`drain_cap`] for the debuggers of its first
+/// readable reading (and by `drain_cap(1)` until there is one). Returns every
+/// member token it saw, and whether it reached the cap.
+///
+/// It sends no terminating signal. Its one signal is SIGCONT, at the first
+/// readable reading, to stopped members that are not traced, by tokens
+/// enrolled in a reading bracketed by two successful anchor checks (the
+/// sweep's own rule); a failed anchor check ends those attempts.
+fn drain(host: &mut impl Host, sid: i32) -> (Vec<Token>, Vec<i32>, bool) {
+    let start = host.now();
+    let mut seen: BTreeMap<(i32, u32), Token> = BTreeMap::new();
+    // Members read without a token (no identity), by pid.
+    let mut tokenless: std::collections::BTreeSet<i32> = Default::default();
+    let mut cap: Option<Instant> = None;
+    // The cap is sized by the first readable reading, and the SIGCONT pass
+    // runs on the first readable reading bracketed by two successful anchor
+    // checks. A failed reading delays both, it never skips them; a failed
+    // anchor check ends the SIGCONT attempts (the owned set is frozen).
+    let mut sized = false;
+    let mut continued = false;
+    let mut anchor_lost = false;
+    loop {
+        let bound = cap.unwrap_or(start + drain_cap(1));
+        let try_cont = !continued && !anchor_lost;
+        let anchored_before = try_cont && host.anchor_ok();
+        if try_cont && !anchored_before {
+            anchor_lost = true;
+        }
+        let reading = host.members(sid, bound);
+        let anchored = anchored_before && host.anchor_ok();
+        if anchored_before && !anchored {
+            anchor_lost = true;
+        }
+        match reading {
+            Ok(members) => {
+                for m in &members {
+                    match m.claimant.token {
+                        Some(t) => {
+                            seen.insert((token_pid(&t), token_version(&t)), t);
+                        }
+                        None => {
+                            tokenless.insert(m.claimant.pid);
+                        }
+                    }
+                }
+                if !sized {
+                    sized = true;
+                    let debuggers = members.iter().filter(|m| m.debugger).count();
+                    cap = Some(start + drain_cap(debuggers));
+                }
+                if try_cont && anchored {
+                    continued = true;
+                    for m in members.iter().filter(|m| m.stopped && !m.traced) {
+                        if let Some(t) = m.claimant.token {
+                            host.cont(&t);
+                        }
+                    }
+                }
+                if !members.iter().any(|m| m.debugger || m.traced) {
+                    return (
+                        seen.into_values().collect(),
+                        tokenless.into_iter().collect(),
+                        false,
+                    );
+                }
+            }
+            // No reading: keep reading until the cap. Unavailable is never
+            // read as "nothing left to wait for".
+            // The members a cut census verified are kept for the final zombie
+            // check only; they decide nothing here.
+            Err(cut) => {
+                for t in cut.seen {
+                    seen.insert((token_pid(&t), token_version(&t)), t);
+                }
+                tokenless.extend(cut.tokenless);
+                cap.get_or_insert(start + drain_cap(1));
+            }
+        }
+        if host.now() >= cap.expect("set by the first pass") {
+            return (
+                seen.into_values().collect(),
+                tokenless.into_iter().collect(),
+                true,
+            );
+        }
+        host.pause();
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +494,19 @@ mod tests {
         killed: Vec<Token>,
         clock: Instant,
         alive: std::collections::BTreeSet<(i32, u32)>,
+        /// The drain's member readings, one per call; the last one repeats.
+        members: VecDeque<Result<Vec<Member>, MembersCut>>,
+        /// Every host action in order: `members`, `kill <pid>`, `cont <pid>`,
+        /// `end-supervisor <pid>`, `pause`.
+        log: Vec<String>,
+        /// Instances that ended as zombies under launchd.
+        zombies: std::collections::BTreeSet<(i32, u32)>,
+        /// Instances whose final check cannot be read.
+        unreadable: std::collections::BTreeSet<(i32, u32)>,
+        /// Tokenless pids whose final check cannot be read.
+        unreadable_pids: std::collections::BTreeSet<i32>,
+        /// Tokenless pids whose final check reads a zombie.
+        zombie_pids: std::collections::BTreeSet<i32>,
     }
     impl Script {
         fn new(anchors: &[bool], censuses: Vec<Result<Vec<Claimant>, String>>) -> Self {
@@ -252,7 +516,23 @@ mod tests {
                 killed: vec![],
                 clock: Instant::now(),
                 alive: Default::default(),
+                members: VecDeque::new(),
+                log: vec![],
+                zombies: Default::default(),
+                unreadable: Default::default(),
+                unreadable_pids: Default::default(),
+                zombie_pids: Default::default(),
             }
+        }
+        fn with_members(mut self, members: Vec<Vec<Member>>) -> Self {
+            self.members = members.into_iter().map(Ok).collect();
+            self
+        }
+        fn first(&self, prefix: &str) -> Option<usize> {
+            self.log.iter().position(|l| l.starts_with(prefix))
+        }
+        fn last(&self, prefix: &str) -> Option<usize> {
+            self.log.iter().rposition(|l| l.starts_with(prefix))
         }
     }
     impl Host for Script {
@@ -272,14 +552,380 @@ mod tests {
         }
         fn kill(&mut self, token: &Token) -> Signalled {
             self.killed.push(*token);
+            self.log.push(format!("kill {}", token_pid(token)));
             Signalled::Sent
+        }
+        fn members(&mut self, _sid: i32, _deadline: Instant) -> Result<Vec<Member>, MembersCut> {
+            self.log.push("members".into());
+            if self.members.len() > 1 {
+                self.members.pop_front().unwrap()
+            } else {
+                self.members.front().cloned().unwrap_or_else(|| Ok(vec![]))
+            }
+        }
+        fn cont(&mut self, token: &Token) -> Signalled {
+            self.log.push(format!("cont {}", token_pid(token)));
+            Signalled::Sent
+        }
+        fn end_supervisor(&mut self, pid: i32, _sid: i32) -> Signalled {
+            self.log.push(format!("end-supervisor {pid}"));
+            Signalled::Sent
+        }
+        fn launchd_zombie(&mut self, token: &Token) -> ZombieCheck {
+            let id = (token_pid(token), token_version(token));
+            if self.zombies.contains(&id) {
+                ZombieCheck::Zombie
+            } else if self.unreadable.contains(&id) {
+                ZombieCheck::Unreadable
+            } else {
+                ZombieCheck::Clear
+            }
+        }
+        fn launchd_zombie_pid(&mut self, pid: i32) -> ZombieCheck {
+            if self.zombie_pids.contains(&pid) {
+                ZombieCheck::Zombie
+            } else if self.unreadable_pids.contains(&pid) {
+                ZombieCheck::Unreadable
+            } else {
+                ZombieCheck::Clear
+            }
         }
         fn now(&self) -> Instant {
             self.clock
         }
         fn pause(&mut self) {
+            self.log.push("pause".into());
             self.clock += Duration::from_millis(20);
         }
+    }
+
+    fn member(pid: i32, debugger: bool, traced: bool, stopped: bool) -> Member {
+        Member {
+            claimant: claim(pid, 1),
+            debugger,
+            traced,
+            stopped,
+        }
+    }
+
+    /// F5(a) (#205): the run's ending ends the supervisor first, then drains
+    /// while a debugger or a traced member lives, and signals nothing until the
+    /// drain is over. Ending debugserver and its held program together (the
+    /// one-pass sweep) is how the kernel comes to hand the program to launchd.
+    #[test]
+    fn the_supervisor_ends_first_and_the_session_drains_before_any_sweep() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![claim(30, 1)]), Ok(vec![])])
+            .with_members(vec![
+                vec![
+                    member(10, false, false, false),
+                    member(20, true, false, false),
+                    member(21, false, true, false),
+                ],
+                vec![
+                    member(20, true, false, false),
+                    member(21, false, true, false),
+                ],
+                vec![],
+            ]);
+        let o = end_run(&mut h, 99, Some(10), Duration::from_secs(3));
+        assert_eq!(
+            h.log.first().map(String::as_str),
+            Some("end-supervisor 10"),
+            "{:?}",
+            h.log
+        );
+        let drained = h.last("members").expect("a drain");
+        let first_kill = h.first("kill").expect("a sweep");
+        assert!(
+            first_kill > drained,
+            "signalled before the drain ended: {:?}",
+            h.log
+        );
+        assert!(!o.drain_exceeded);
+        assert_eq!(o.kind, Kind::Complete);
+    }
+
+    /// F5(b) (#205): no platform image is needed for the drain to wait. With a
+    /// debugger live and nothing ending it (the platform already gone, or a
+    /// substitute provider), the drain waits to its cap, reports it, and only
+    /// then sweeps; it never ends early for want of a platform member.
+    #[test]
+    fn the_drain_waits_to_its_cap_while_a_debugger_lives_without_a_platform() {
+        let mut h = Script::new(&[true; 1024], vec![Ok(vec![claim(20, 1)]), Ok(vec![])])
+            .with_members(vec![vec![member(20, true, false, false)]]);
+        let start = h.clock;
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(o.drain_exceeded, "{:?}", h.log);
+        let first_kill = h.first("kill").expect("the sweep ran after the cap");
+        let pauses_before_kill = h.log[..first_kill].iter().filter(|l| *l == "pause").count();
+        let waited = Duration::from_millis(20) * pauses_before_kill as u32;
+        assert!(waited >= drain_cap(1), "waited {waited:?}");
+        assert!(
+            waited < drain_cap(1) + Duration::from_millis(100),
+            "waited {waited:?}"
+        );
+        let _ = start;
+    }
+
+    /// F5(c) (#205): with no debugger and no traced member there is nothing to
+    /// wait for; the drain ends at once and a clean end costs nothing.
+    #[test]
+    fn the_drain_ends_at_once_with_nothing_to_wait_for() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![claim(30, 1)]), Ok(vec![])])
+            .with_members(vec![vec![member(30, false, false, false)]]);
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert_eq!(
+            h.log.iter().filter(|l| *l == "members").count(),
+            1,
+            "{:?}",
+            h.log
+        );
+        let first_kill = h.first("kill").expect("a sweep");
+        assert!(
+            !h.log[..first_kill].iter().any(|l| l == "pause"),
+            "{:?}",
+            h.log
+        );
+        assert!(!o.drain_exceeded);
+    }
+
+    /// F5(d) (#205 N-c): a stopped member that is not traced (a stopped
+    /// provider) is continued at drain start, by its enrolled token; a stopped
+    /// traced member's stop belongs to its debugger and is left alone.
+    #[test]
+    fn the_drain_continues_stopped_untraced_members_only() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])]).with_members(vec![
+            vec![
+                member(40, false, false, true),
+                member(41, false, true, true),
+            ],
+            vec![],
+        ]);
+        end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(h.log.iter().any(|l| l == "cont 40"), "{:?}", h.log);
+        assert!(!h.log.iter().any(|l| l == "cont 41"), "{:?}", h.log);
+    }
+
+    /// #205: a failed first reading delays the drain's SIGCONT pass, it never
+    /// skips it. A stopped, untraced member found on the next readable reading
+    /// is still continued, so a stopped provider can finish its teardown.
+    #[test]
+    fn a_failed_first_reading_still_continues_a_stopped_provider() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])])
+            .with_members(vec![vec![member(40, false, false, true)], vec![]]);
+        h.members.push_front(Err(MembersCut {
+            error: "member census cut at the deadline".into(),
+            seen: vec![],
+            tokenless: vec![],
+        }));
+        end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(h.log.iter().any(|l| l == "cont 40"), "{:?}", h.log);
+    }
+
+    /// #205 (CR-28): a member the sweep itself signalled (a member created
+    /// after the drain, say) is zombie-checked too: left as a launchd zombie,
+    /// it is reported and the outcome is not `Complete`.
+    #[test]
+    fn a_member_the_sweep_signalled_is_zombie_checked() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![claim(50, 1)]), Ok(vec![])])
+            .with_members(vec![vec![]]);
+        h.zombies.insert((50, 1));
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(h.log.iter().any(|l| l == "kill 50"), "{:?}", h.log);
+        assert_eq!(o.launchd_zombies, vec![50], "{o:?}");
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
+    }
+
+    /// #205 (CR-25): a member read without a token (no identity) is still
+    /// checked at the end. Its pid is not provably clear, so the outcome is
+    /// not `Complete` and the error names it; a provably clear pid keeps
+    /// `Complete`.
+    #[test]
+    fn an_unreadable_tokenless_member_is_not_complete() {
+        let tokenless = Member {
+            claimant: Claimant {
+                pid: 30,
+                token: None,
+            },
+            debugger: false,
+            traced: false,
+            stopped: false,
+        };
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])])
+            .with_members(vec![vec![tokenless.clone()], vec![]]);
+        h.unreadable_pids.insert(30);
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
+        let error = o.error.unwrap_or_default();
+        assert!(
+            error.contains("launchd-zombie check unreadable") && error.contains("30"),
+            "{error}"
+        );
+        let mut h =
+            Script::new(&[true; 64], vec![Ok(vec![])]).with_members(vec![vec![tokenless], vec![]]);
+        assert_eq!(
+            end_run(&mut h, 99, None, Duration::from_secs(3)).kind,
+            Kind::Complete
+        );
+    }
+
+    /// #205 (N1): a tokenless sighting is checked by pid even when a seen
+    /// token has the same pid. After pid reuse the two need not be the same
+    /// instance, so a token that reads `Clear` never vouches for the tokenless
+    /// one.
+    #[test]
+    fn a_tokenless_sighting_is_checked_even_beside_a_token_at_its_pid() {
+        let tokenless = Member {
+            claimant: Claimant {
+                pid: 21,
+                token: None,
+            },
+            debugger: false,
+            traced: false,
+            stopped: false,
+        };
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])]).with_members(vec![
+            vec![member(21, false, false, false), tokenless],
+            vec![],
+        ]);
+        h.zombie_pids.insert(21);
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(o.launchd_zombies.is_empty(), "the token reads Clear: {o:?}");
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
+        let error = o.error.unwrap_or_default();
+        assert!(
+            error.contains("launchd-zombie check unreadable") && error.contains("21"),
+            "{error}"
+        );
+    }
+
+    /// #205 (B1): a census cut at the deadline also hands over the members it
+    /// read without a token. One first seen there whose pid is not provably
+    /// clear keeps the outcome from `Complete`, and the error names it.
+    #[test]
+    fn a_cut_census_still_checks_its_tokenless_members() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])]).with_members(vec![vec![]]);
+        h.members.push_front(Err(MembersCut {
+            error: "member census cut at the deadline".into(),
+            seen: vec![],
+            tokenless: vec![31],
+        }));
+        h.unreadable_pids.insert(31);
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
+        let error = o.error.unwrap_or_default();
+        assert!(
+            error.contains("launchd-zombie check unreadable") && error.contains("31"),
+            "{error}"
+        );
+    }
+
+    /// #205 (U-1): a census cut at the deadline still hands over the members
+    /// it verified. One first seen there that ends as a launchd zombie is
+    /// reported, and the outcome is not `Complete`.
+    #[test]
+    fn a_cut_census_still_checks_the_members_it_verified() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])]).with_members(vec![vec![]]);
+        h.members.push_front(Err(MembersCut {
+            error: "member census cut at the deadline".into(),
+            seen: vec![tok(21, 1)],
+            tokenless: vec![],
+        }));
+        h.zombies.insert((21, 1));
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert_eq!(o.launchd_zombies, vec![21], "{o:?}");
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
+    }
+
+    /// F5(e) (#205): the cap is 3 s + 4 s per debugger enrolled at the drain's
+    /// first reading.
+    #[test]
+    fn the_drain_cap_follows_the_debugger_count() {
+        assert_eq!(drain_cap(0), Duration::from_secs(7));
+        assert_eq!(drain_cap(1), Duration::from_secs(7));
+        assert_eq!(drain_cap(2), Duration::from_secs(11));
+        let mut h = Script::new(&[true; 2048], vec![Ok(vec![])]).with_members(vec![vec![
+            member(20, true, false, false),
+            member(22, true, false, false),
+        ]]);
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(o.drain_exceeded);
+        let first_census = h.log.iter().rposition(|l| l == "members").unwrap();
+        let pauses = h.log[..first_census]
+            .iter()
+            .filter(|l| *l == "pause")
+            .count();
+        let waited = Duration::from_millis(20) * pauses as u32;
+        assert!(
+            waited >= drain_cap(2) - Duration::from_millis(20),
+            "waited {waited:?}"
+        );
+        assert!(
+            waited < drain_cap(2) + Duration::from_millis(100),
+            "waited {waited:?}"
+        );
+    }
+
+    /// F5b (#205 A-6): the relay-death path, where the supervisor is still
+    /// alive. It is ended first; the drain then waits on the debugger it
+    /// leaves, and only then does the sweep signal anything.
+    #[test]
+    fn the_relay_death_path_ends_the_live_supervisor_first() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![claim(30, 1)]), Ok(vec![])])
+            .with_members(vec![
+                vec![
+                    member(10, false, false, false),
+                    member(20, true, false, false),
+                ],
+                vec![],
+            ]);
+        let o = end_run(&mut h, 99, Some(10), Duration::from_secs(3));
+        assert_eq!(h.first("end-supervisor 10"), Some(0), "{:?}", h.log);
+        assert!(
+            h.first("kill").unwrap() > h.last("members").unwrap(),
+            "{:?}",
+            h.log
+        );
+        assert_eq!(o.kind, Kind::Complete);
+    }
+
+    /// F6 (#205): a member seen during the run's ending that is now a zombie
+    /// under launchd is reported, and the outcome is not `Complete`: nobody
+    /// will ever collect it, so the cleanup did not complete.
+    #[test]
+    fn a_member_left_as_a_launchd_zombie_is_reported() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])])
+            .with_members(vec![vec![member(21, false, true, false)], vec![]]);
+        h.zombies.insert((21, 1));
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert_eq!(o.launchd_zombies, vec![21]);
+        assert_ne!(o.kind, Kind::Complete);
+        assert!(!o.drain_exceeded);
+    }
+
+    /// #205 (CR-20): a seen member whose final check cannot be read is not
+    /// known to be clear, so the outcome is not `Complete`, and the error
+    /// names it.
+    #[test]
+    fn an_unreadable_zombie_check_is_not_complete() {
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])])
+            .with_members(vec![vec![member(21, false, true, false)], vec![]]);
+        h.unreadable.insert((21, 1));
+        let o = end_run(&mut h, 99, None, Duration::from_secs(3));
+        assert!(o.launchd_zombies.is_empty(), "{o:?}");
+        assert_ne!(o.kind, Kind::Complete, "{o:?}");
+        let error = o.error.unwrap_or_default();
+        assert!(
+            error.contains("launchd-zombie check unreadable") && error.contains("21"),
+            "{error}"
+        );
+        // A clear member keeps `Complete`.
+        let mut h = Script::new(&[true; 64], vec![Ok(vec![])])
+            .with_members(vec![vec![member(21, false, true, false)], vec![]]);
+        assert_eq!(
+            end_run(&mut h, 99, None, Duration::from_secs(3)).kind,
+            Kind::Complete
+        );
     }
 
     #[test]

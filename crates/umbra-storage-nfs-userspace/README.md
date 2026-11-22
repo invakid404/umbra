@@ -49,6 +49,35 @@ remains ([#135](https://github.com/invakid404/umbra/issues/135)). The secondary-
 null-descriptor case bypasses `SpawnPrepare` and is a comparison control, not
 proof of lazy registration.
 
+Packed spawn is admitted only on the measured macOS 26.5.1 (25F80) profile. On
+any other spawn profile the platform refuses every packed spawn, failing
+closed. On macOS 27.2.1 (26B131) the private `posix_spawn` attribute block grew
+from 248 to 256 bytes, so packed spawn is refused there; requalifying it is
+[#247](https://github.com/invakid404/umbra/issues/247). Every case measured to
+route a packed spawn branches on the platform's own predicate, the one
+`capture_spawn` refuses on (`umbra_platform_macos::spawn_profile_qualified`),
+never on an OS version chosen by the test. That is 24 cases in the main suite
+(21 `fix_243_*`, both `slate_c11_02_empty_*` and
+`slate_c11_10_e8_pipe_refusal`) and 29 under `mutation-probe-spawn-lifecycle`
+(the registered-attach, completion, inserted, acquired, policy and guardian
+probe cases, and the backing-overlap, region-cap and region-fault cases):
+
+- **On the qualified profile,** they make their positive assertions as above.
+- **On any other profile,** each asserts the exact refusal. The native control
+  spawns and writes the mode's own bytes (`child.txt`, `spawn result=0`, and a
+  `virtual-*` victim's `SEED`). The routed run fails with `UnsupportedCapability
+  during macos: spawn ABI profile mismatch (errno: None)` and reports no tracee
+  completion; the program reached its spawn, and nothing was spawned (neither
+  `child.txt` nor the refused open's `opened.txt` exists afterwards). A
+  `virtual-*` victim keeps its `SEED` through the client. A probe case also
+  arms its probe as usual and asserts that nothing ever reached it. Each also
+  keeps its qualified body's cleanup oracle: a `CLEAN` cleanup record, with
+  no group kill and no zombie wherever the qualified body asserts that (every
+  probe case, the region-cap and both region-fault cases), a `COMPLETE`
+  guardian sweep for a guardian case, and a reopen that regains writer
+  authority. That is no
+  positive coverage of packed spawn, only of its fail-closed refusal.
+
 The optional `mutation-probe-spawn-lifecycle` feature enables lifecycle fault
 tests. CI builds both the CLI and platform provider with that feature and
 builds the `umbra243relay` example for guardian cases. The selected tests cover
@@ -58,6 +87,21 @@ and allocation/write errors. Tests retain ownership observations separately from
 cleanup results. Guardian completion does not prove a child was reaped;
 provider-loss comparisons outside the guardian remain distinct
 ([#198](https://github.com/invakid404/umbra/issues/198)).
+
+`fix_205_refusal_with_an_unenrolled_fork_child` (#205) pins a refused spawn
+while a sibling fork is still in its window. The fixture mode
+`fix-205-fork-window` forks a first child that spawns with
+`POSIX_SPAWN_SETSID` (refused on every profile) and, at once, a second child.
+The test-only probe `UMBRA_FIX_205_FORK_WINDOW_HOLD` (in builds with the
+feature only) stops polling a fork opened while another session exists, for at
+most 10 s, so the second child is still unenrolled when the refusal arrives.
+The case asserts the exact refusal, that the probe held the window, that the
+platform's teardown found and ended the unenrolled second child (its
+`unenrolled fork child ended` line), and that nothing outlived umbra: cleanup
+`CLEAN` with `group_kills=0` and no zombie.
+The intermittent form of the same gap made the backing-overlap and region-cap
+cases fail with an unconfirmed cleanup and a group kill; the platform's
+teardown now ends such a child (platform README, "Termination").
 All live cases require the normal userspace integration prerequisites and a fresh
 `UMBRA_SLATE_EVIDENCE` directory. Probe controls are documented by the
 [platform provider](../umbra-platform-macos/README.md).
@@ -999,6 +1043,36 @@ a member of the run's group with PPID 1, and cleanup ends `cleanup CLEAN`. Befor
 a PPID-1 zombie: 21/21 runs in the arc's E1/E2, and 3 of 4 cases on the pre-fix
 readings of this assertion. In launchd's session that orphaned the group with
 SIGHUP.
+
+A run that reaches its deadline, or whose census fails, is ended
+debugger-last before the group kill (#205, `slate_debugger_last`), because
+killing a debugserver while its program is held hands the program to launchd
+as a zombie nobody collects:
+
+1. The launched `umbra` is killed first. In launchd's session that is the
+   relay, whose death starts the guardian's own debugger-last ending.
+2. The launcher waits until a readable census shows no live member of the
+   run's group or session that is a debugserver or traced, capped at 3 s +
+   4 s per debugserver at the first readable census, and records a `DRAIN`
+   census event. A census that cannot be read never ends the wait: the drain
+   runs to its cap, reports `exceeded=true` unless a later census reads
+   nothing left, and records the error. A member whose trace state cannot be
+   read counts as traced, so it also keeps the drain waiting.
+3. The cleanup grace grows to at least 9 s + 4 s per debugserver
+   (`slate_cleanup_budget`: the guardian's drain cap, its 3 s sweep and 1 s
+   reap, and a 2 s margin), and the group kill follows.
+
+A run that exits on its own but leaves members (in its group or session, or
+escaped from it) is drained the same way, once, before the cleanup kills
+anything; the cleanup's 10 s grace pauses while that drain runs, and the
+members are read again before any kill (`slate_drain_before_kill`).
+
+Both slate launchers also fail a case on any zombie under launchd of one of
+this suite's fixtures (`umbra-userspace-*`, `umbra-slate-*`, `umbra-fix-*`,
+by the full process name, since the 15-byte short name cuts
+`umbra-userspace-spawn` to `umbra-userspace`) that started in the case's window
+(`slate_launchd_zombies`). A `ps` that fails is no reading, and fails the case. The group census
+still accepts zombies inside the run's group as dead-table residue.
 
 In launchd's session (CI's self-hosted runner) a supervised `umbra run` stays
 in the launched group only as a relay; the run itself is in the session its

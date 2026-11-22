@@ -156,6 +156,30 @@ fn procs() -> Vec<Proc> {
         .collect()
 }
 
+/// #205 per-test guard: launchd-parented zombies attributable to this test.
+///
+/// When a debugger process ends while its program has started exiting (or is
+/// held at a breakpoint), the kernel hands the program to launchd as a zombie
+/// nobody ever collects; it stays until a reboot and counts against the
+/// user's process limit. Attribution follows the owner scope's rule: the
+/// fixture's image name (the 16-character `ucomm` of `umbra-isolation-fixture`,
+/// the traced program in these cases) and a start time inside the test's
+/// window, plus any recorded (pid, start) of this run. Counting only: nothing
+/// is signalled on this basis.
+fn launchd_zombies(since_us: i64, recorded: &[(i32, i64)]) -> Vec<Proc> {
+    procs()
+        .into_iter()
+        .filter(|p| {
+            p.stat == SZOMB
+                && p.ppid == 1
+                && ((p.start_us >= since_us && p.comm.starts_with("umbra-isolation-"))
+                    || recorded
+                        .iter()
+                        .any(|(pid, start)| *pid == p.pid && *start == p.start_us))
+        })
+        .collect()
+}
+
 fn own_session() -> i32 {
     let me = std::process::id() as i32;
     procs()
@@ -163,6 +187,21 @@ fn own_session() -> i32 {
         .find(|p| p.pid == me)
         .expect("this process in the table")
         .sid
+}
+
+/// `(pid, start)` of a live (not zombie) process, from the census.
+fn identity(pid: i32) -> Option<(i32, i64)> {
+    procs()
+        .into_iter()
+        .find(|p| p.pid == pid && p.stat != SZOMB)
+        .map(|p| (p.pid, p.start_us))
+}
+
+/// Whether this exact process (pid and start) is still live, not a zombie.
+fn identity_live((pid, start): (i32, i64)) -> bool {
+    procs()
+        .iter()
+        .any(|p| p.pid == pid && p.start_us == start && p.stat != SZOMB)
 }
 
 /// Signal one pid this harness discovered by parentage.
@@ -317,6 +356,8 @@ struct Outcome {
     status: Option<i32>,
     /// Live processes of this run after it ended (recorded pids, or session S).
     survivors: Vec<Proc>,
+    /// Launchd-parented zombies of this run after cleanup (#205).
+    zombies: Vec<Proc>,
     /// Signals the sentinel in the caller's group received: (signal, sender).
     sentinel: Vec<(i32, i32)>,
     /// The sampler's readings of the caller's group's `pg_jobc`.
@@ -353,6 +394,12 @@ struct Run {
     /// S and an instant when the guardian was seen as the relay's child.
     session: Option<(i32, i64)>,
     finished: Option<Outcome>,
+    /// When the run started: the window for the zombie count (#205).
+    since_us: i64,
+    /// The supervisor and the debugservers, as (pid, start), from `discover`
+    /// (#205: the cleanup ends the supervisor first and waits on these).
+    supervisor: Option<(i32, i64)>,
+    debuggers: Vec<(i32, i64)>,
 }
 
 impl Run {
@@ -365,6 +412,7 @@ impl Run {
         tracee: &[&str],
     ) -> Run {
         let (dir, temp) = case_dir(case);
+        let since_us = now_us();
         let mut command = Command::new(fixture());
         command
             .arg("launch")
@@ -424,6 +472,9 @@ impl Run {
             recorded: Vec::new(),
             session: None,
             finished: None,
+            since_us,
+            supervisor: None,
+            debuggers: Vec::new(),
         }
     }
 
@@ -516,6 +567,17 @@ impl Run {
                 self.recorded.push((p, r.start_us));
             }
         }
+        let start_of = |pid: i32| {
+            rows.iter()
+                .find(|r| r.pid == pid)
+                .map(|r| (pid, r.start_us))
+        };
+        self.supervisor = start_of(tree.supervisor);
+        self.debuggers = tree
+            .debugservers
+            .iter()
+            .filter_map(|d| start_of(*d))
+            .collect();
         assert!(
             tree.platform > 0 && tree.journal > 0 && tree.storage > 0,
             "providers not found: {tree:?}"
@@ -585,6 +647,9 @@ impl Run {
         }
         let survivors = self.live_of_this_run();
         self.cleanup();
+        // The kernel's exit bookkeeping for anything the cleanup ended.
+        std::thread::sleep(Duration::from_millis(300));
+        let zombies = launchd_zombies(self.since_us, &self.recorded);
         let sentinel = std::fs::read_to_string(self.dir.join("sentinel.log"))
             .unwrap_or_default()
             .lines()
@@ -604,6 +669,7 @@ impl Run {
         let outcome = Outcome {
             status,
             survivors,
+            zombies,
             sentinel,
             jobc,
             delivered,
@@ -619,6 +685,33 @@ impl Run {
     /// Kill what is left of this run (recorded pids; session S before the
     /// observed instant), then stop the launcher, sentinel and sampler.
     fn cleanup(&mut self) {
+        // #205: end the run debugger-last. The supervisor goes first, so the
+        // platform provider tears its sessions down in order; then wait, capped
+        // at 3 s + 4 s per recorded debugserver, until none of them is live.
+        // Only then are the survivors killed: killing a debugserver while its
+        // program is held hands the program to launchd as a zombie nobody
+        // collects.
+        let live = self.live_of_this_run();
+        if !live.is_empty() {
+            let alive = |live: &[Proc], (pid, start): (i32, i64)| {
+                live.iter().any(|p| p.pid == pid && p.start_us == start)
+            };
+            if let Some(supervisor) = self.supervisor.filter(|s| alive(&live, *s)) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", &supervisor.0.to_string()])
+                    .status();
+            }
+            let cap = Duration::from_secs(3)
+                + Duration::from_secs(4) * self.debuggers.len().max(1) as u32;
+            let end = Instant::now() + cap;
+            while Instant::now() < end {
+                let live = self.live_of_this_run();
+                if !self.debuggers.iter().any(|d| alive(&live, *d)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         for p in self.live_of_this_run() {
             if self
                 .recorded
@@ -889,6 +982,12 @@ fn assert_nothing_survives(o: &Outcome) {
         o.survivors,
         o.stderr
     );
+    assert!(
+        o.zombies.is_empty(),
+        "launchd-parented zombies of the run: {:?}\n{}",
+        o.zombies,
+        o.stderr
+    );
 }
 
 fn assert_no_sighup_to_umbra(o: &Outcome) {
@@ -929,20 +1028,66 @@ fn sid1_p1_stopped_tracer_at_the_deadline() {
     assert_nothing_survives(o);
 }
 
-/// P2: the held root is killed, then its debugserver 50 ms later (the tracer
-/// dies with the tracee's exit pending; the tracee is handed to launchd).
+/// P2, reshaped for #205 (OD2): the running root is killed, then its
+/// debugserver once the root is dead.
+///
+/// It used to kill the root while it was **held** at a debugger stop and then
+/// the debugserver, which is #193's uncounted-reparent route: the held exit
+/// stays pending until the debugger dies, and the kernel then hands the
+/// half-exited tracee to launchd as a zombie nobody collects. That route is
+/// kernel behaviour with no software fix (#205 R1), and every run of it left a
+/// zombie, so it no longer has a SID-1 regression here. Now the root is in an
+/// ordinary blocking wait (`sleep`), so the kill ends it at once. Its
+/// debugserver then reports the exit and usually ends by itself (CI showed it
+/// gone 50 ms later), so the second step is exact rather than assumed: the
+/// debugserver's (pid, start) is recorded before the root's kill, and after the
+/// root's death it is either already gone, or killed by the test, or `kill`
+/// fails with `ESRCH` and that same identity is proven gone. Anything
+/// else fails. The oracle is the SID-1 kill sequence's: no SIGHUP to umbra,
+/// the caller's group untouched, a status reported, nothing left, and no
+/// launchd-parented zombie.
 #[test]
-fn sid1_p2_tracer_killed_with_the_exit_pending() {
+fn sid1_p2_running_tracee_killed_then_its_tracer() {
     if !qualified() || !in_launchd_session() {
         return;
     }
-    let mut run = Run::start("P2", false, true, 20_000, &["park"]);
-    run.line("ISO CHILD", Duration::from_secs(30));
-    std::thread::sleep(Duration::from_millis(300));
+    let mut run = Run::start("P2", false, true, 20_000, &["sleep"]);
+    std::thread::sleep(Duration::from_millis(500));
     let tree = run.discover();
+    let root = identity(tree.root).expect("the root is live before its kill");
+    let tracer =
+        identity(tree.root_tracer).expect("its debugserver is live before the root's kill");
     signal(tree.root, "KILL");
-    std::thread::sleep(Duration::from_millis(50));
-    signal(tree.root_tracer, "KILL");
+    let end = Instant::now() + Duration::from_secs(5);
+    while identity_live(root) {
+        assert!(
+            Instant::now() < end,
+            "the root {root:?} survived its SIGKILL for 5 s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ended = if !identity_live(tracer) {
+        "ended by itself after its program's death"
+    } else {
+        // SAFETY: plain libSystem call on a pid this harness discovered by
+        // parentage and whose (pid, start) was live just above.
+        if unsafe { libc::kill(tracer.0, libc::SIGKILL) } == 0 {
+            "ended by the test"
+        } else {
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ESRCH) => {
+                    assert!(
+                        !identity_live(tracer),
+                        "kill reported ESRCH, but {tracer:?} is still live"
+                    );
+                    "ended by itself after its program's death"
+                }
+                _ => panic!("kill(SIGKILL) {}: {error}", tracer.0),
+            }
+        }
+    };
+    eprintln!("P2: debugserver {tracer:?} {ended}");
     let o = run.finish(Duration::from_secs(45));
     assert_no_sighup_to_umbra(o);
     assert_caller_group_untouched(o);
@@ -1126,9 +1271,11 @@ fn sid1_killpg_with_a_stopped_tracer_leaves_nothing() {
         .status()
         .unwrap();
     assert!(ok.success());
-    // The guardian's bounds: relay loss is seen within ~10 ms, the sweep is
-    // bounded by 3 s and the supervisor reap by 1 s.
-    let left = run.drained(Duration::from_secs(8));
+    // The guardian's bounds: relay loss is seen within ~10 ms; it ends the
+    // supervisor first, drains for at most 3 s + 4 s per debugserver (three
+    // sessions here, #205), sweeps within 3 s and reaps the supervisor within
+    // 1 s: T(3) = 19 s.
+    let left = run.drained(Duration::from_secs(20));
     let decoy_alive = decoy.try_wait().unwrap().is_none();
     let _ = decoy.kill();
     let _ = decoy.wait();
@@ -1164,8 +1311,9 @@ fn sid1_sigterm_to_the_relay_cancels_the_run() {
     std::thread::sleep(Duration::from_millis(500));
     let tree = run.discover();
     signal(tree.relay.expect("a relay in SID 1"), "TERM");
-    // Relay loss is seen within ~10 ms; sweep 3 s; supervisor reap 1 s.
-    let left = run.drained(Duration::from_secs(6));
+    // Relay loss is seen within ~10 ms; #205's drain (at most 3 s + 4 s for
+    // one debugserver), the 3 s sweep and the 1 s supervisor reap: T(1) = 11 s.
+    let left = run.drained(Duration::from_secs(12));
     let o = run.finish(Duration::from_secs(5));
     assert!(left.is_empty(), "the run survived its relay: {left:?}");
     assert_eq!(o.term_signal(), Some(15), "{o:?}");
@@ -1176,6 +1324,13 @@ fn sid1_sigterm_to_the_relay_cancels_the_run() {
         .find(|v| v["event"] == "relay-death")
         .expect("the guardian recorded relay death");
     assert_eq!(death["outcome"], "COMPLETE", "{death}");
+    // The guardian reports only members it enrolled; the finish census also
+    // counts a launchd-parented zombie of the run that was never enrolled.
+    assert!(
+        o.zombies.is_empty(),
+        "launchd-parented zombies of the run: {:?}",
+        o.zombies
+    );
 }
 
 /// Outside launchd's session nothing changes: no relay, no guardian; the
@@ -1213,6 +1368,8 @@ fn fresh_session_is_unchanged() {
 
 /// What the mini-shell recorded for one pty case, and the terminal transcript.
 struct Pty {
+    /// The fixture's one-line summary (`ISO PTY … survivors=N`).
+    summary: String,
     shell: String,
     transcript: String,
     /// argv of each debugserver in the pty's session when the tracee was ready.
@@ -1229,6 +1386,7 @@ fn pty(case: &str, tracee: &[&str]) -> Option<Pty> {
         return None;
     }
     let (dir, _temp) = case_dir(&format!("PTY-{case}"));
+    let since_us = now_us();
     let out = Command::new(fixture())
         .arg("pty")
         .arg(case)
@@ -1259,7 +1417,14 @@ fn pty(case: &str, tracee: &[&str]) -> Option<Pty> {
         debugservers.iter().all(|a| !a.contains(PIN)),
         "a terminal run's debugserver has {PIN}: {debugservers:?}"
     );
+    std::thread::sleep(Duration::from_millis(300));
+    let zombies = launchd_zombies(since_us, &[]);
+    assert!(
+        zombies.is_empty(),
+        "{case}: launchd-parented zombies of the run: {zombies:?}"
+    );
     Some(Pty {
+        summary,
         shell,
         transcript,
         debugservers,
@@ -1357,7 +1522,11 @@ fn pty_t7_window_change_is_absorbed() {
     );
 }
 
-/// The hangup's process leak is #198; this pins the status only.
+/// The hangup (#198, #205). umbra and the shell's job end with SIGHUP, as
+/// before. The platform provider no longer dies with the terminal: it ends
+/// with its owner and tears its session down in order first, so the harness
+/// finds nothing left to kill (`survivors=0`), and no launchd-parented zombie
+/// is left (checked in `pty`).
 #[test]
 fn pty_t8_hangup() {
     let Some(p) = pty("T8", &["wait", "8"]) else {
@@ -1366,6 +1535,11 @@ fn pty_t8_hangup() {
     inspected(&p);
     assert!(p.shell.lines().any(|l| l == "sighup"), "{}", p.shell);
     ended(&p, "signal:1");
+    assert!(
+        p.summary.contains("survivors=0"),
+        "the harness had processes of the run to kill: {}",
+        p.summary
+    );
 }
 
 #[test]

@@ -1,7 +1,10 @@
 //! The macOS [`Host`] for the session sweep: process census, kernel-backed
 //! identity, and signal by audit token (#193 design R-8, T1 §3).
 
-use crate::sweep::{Claimant, Host, Signalled, Token};
+use crate::sweep::{
+    token_pid, token_version, Claimant, Host, Member, MembersCut, Signalled, Token, ZombieCheck,
+};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 extern "C" {
@@ -99,12 +102,151 @@ fn is_zombie(pid: i32) -> Option<bool> {
     Some(info.pbi_status == libc::SZOMB)
 }
 
+/// `pbi_flags` bit for a traced process (`PROC_FLAG_TRACED`, `P_LTRACED`;
+/// bsd/sys/proc_info.h).
+const PROC_FLAG_TRACED: u32 = 2;
+
+/// `proc_bsdinfo` of `pid`; `zombie` asks for the zombie fallback (`arg = 1`).
+fn bsd_info(pid: i32, zombie: bool) -> Option<libc::proc_bsdinfo> {
+    // SAFETY: proc_bsdinfo is plain old data.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a proc_bsdinfo of `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            u64::from(zombie),
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (n == size).then_some(info)
+}
+
+/// [`bsd_info`], with the lookup's errno when it fails (0 for a short read).
+fn bsd_info_or_errno(pid: i32, zombie: bool) -> std::result::Result<libc::proc_bsdinfo, i32> {
+    // SAFETY: proc_bsdinfo is plain old data.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a proc_bsdinfo of `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            u64::from(zombie),
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if n == size {
+        return Ok(info);
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    Err(if n <= 0 { errno } else { 0 })
+}
+
+/// The final check of one seen member (#205) from its BSD lookup (status,
+/// parent pid, start; or the lookup's errno) and its recorded start.
+fn zombie_check(
+    found: std::result::Result<(u32, u32, (u64, u64)), i32>,
+    start: Option<(u64, u64)>,
+) -> ZombieCheck {
+    let Some(start) = start else {
+        return ZombieCheck::Unreadable;
+    };
+    match found {
+        Ok((status, ppid, birth)) if status == libc::SZOMB && ppid == 1 && birth == start => {
+            ZombieCheck::Zombie
+        }
+        Ok(_) => ZombieCheck::Clear,
+        // Gone: no process, so no zombie, holds the pid.
+        Err(libc::ESRCH) => ZombieCheck::Clear,
+        Err(_) => ZombieCheck::Unreadable,
+    }
+}
+
+/// The final check of a member seen without a token (#205), from its pid's
+/// BSD lookup (status and parent pid, or the lookup's errno). With no
+/// recorded identity a zombie under launchd at the pid cannot be proved to be
+/// that member or not, so it is unreadable, as is any failed lookup but ESRCH.
+fn zombie_check_pid(found: std::result::Result<(u32, u32), i32>) -> ZombieCheck {
+    match found {
+        Ok((status, 1)) if status == libc::SZOMB => ZombieCheck::Unreadable,
+        Ok(_) | Err(libc::ESRCH) => ZombieCheck::Clear,
+        Err(_) => ZombieCheck::Unreadable,
+    }
+}
+
+/// Whether `pid`'s image is a debugger process (`debugserver`), for waiting
+/// only. `None` when the path cannot be read.
+fn is_debugger(pid: i32) -> Option<bool> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is writable for its length.
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| buf[..n as usize].ends_with(b"/debugserver"))
+}
+
+/// The only child of `parent` whose session is `sid`, if there is exactly
+/// one (#205). The relay uses it, while the guardian is still its unreaped
+/// child, to name the supervisor the guardian spawned before `STARTED`
+/// arrived: the guardian spawns nothing else. Naming only: the supervisor is
+/// then ended by its own audit token.
+pub fn only_child_in_session(parent: i32, sid: i32) -> Option<i32> {
+    let mut pids = [0i32; 64];
+    // SAFETY: `pids` is writable for its size in bytes.
+    let n = unsafe {
+        libc::proc_listchildpids(
+            parent,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as libc::c_int,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    // libproc returns the number of pids it wrote.
+    let children: Vec<i32> = pids[..(n as usize).min(pids.len())]
+        .iter()
+        .copied()
+        // SAFETY: getsid has no memory arguments.
+        .filter(|&pid| pid > 1 && unsafe { libc::getsid(pid) } == sid)
+        .collect();
+    match children[..] {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
 /// The macOS process table, with a pluggable anchor check.
 pub struct MacHost<A: FnMut() -> bool> {
     /// The ownership proof (the zombie anchor; README, Cleanup and
     /// ownership): the relay's checks its unreaped guardian; the guardian's
     /// own sweep passes `|| true`.
     pub anchor: A,
+    /// Start identity of every member instance the drain saw, keyed by
+    /// (pid, pid version), so a later zombie check compares the same instance.
+    starts: HashMap<(i32, u32), (u64, u64)>,
+}
+
+impl<A: FnMut() -> bool> MacHost<A> {
+    /// A host with the given anchor check.
+    pub fn new(anchor: A) -> Self {
+        MacHost {
+            anchor,
+            starts: HashMap::new(),
+        }
+    }
+}
+
+fn signal_token(token: &Token, signal: libc::c_int) -> Signalled {
+    let mut t = *token;
+    // SAFETY: `t` is a valid audit_token_t for the duration of the call.
+    match unsafe { proc_signal_with_audittoken(&mut t, signal) } {
+        0 => Signalled::Sent,
+        libc::ESRCH => Signalled::Stale,
+        e => Signalled::Refused(e),
+    }
 }
 
 impl<A: FnMut() -> bool> Host for MacHost<A> {
@@ -146,11 +288,23 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
                     continue;
                 }
             }
+            // Bind the start identity to the verified instance, as `members`
+            // does, so a member the sweep signals can be zombie-checked: read
+            // before and after the token, recorded only when both agree.
+            let start_of =
+                |pid| bsd_info(pid, false).map(|i| (i.pbi_start_tvsec, i.pbi_start_tvusec));
+            let before = start_of(pid);
             match verified_token(pid) {
-                Some((t, s)) if s == sid => out.push(Claimant {
-                    pid,
-                    token: Some(t),
-                }),
+                Some((t, s)) if s == sid => {
+                    if let Some(start) = before.filter(|start| start_of(pid) == Some(*start)) {
+                        self.starts
+                            .insert((token_pid(&t), token_version(&t)), start);
+                    }
+                    out.push(Claimant {
+                        pid,
+                        token: Some(t),
+                    })
+                }
                 Some(_) => {} // left the session in between: not a claimant
                 // SAFETY: as above.
                 None if unsafe { libc::getsid(pid) } == sid => {
@@ -162,18 +316,168 @@ impl<A: FnMut() -> bool> Host for MacHost<A> {
         Ok(out)
     }
     fn kill(&mut self, token: &Token) -> Signalled {
-        let mut t = *token;
-        // SAFETY: `t` is a valid audit_token_t for the duration of the call.
-        match unsafe { proc_signal_with_audittoken(&mut t, libc::SIGKILL) } {
-            0 => Signalled::Sent,
-            libc::ESRCH => Signalled::Stale,
-            e => Signalled::Refused(e),
+        signal_token(token, libc::SIGKILL)
+    }
+    fn members(&mut self, sid: i32, deadline: Instant) -> Result<Vec<Member>, MembersCut> {
+        let me = std::process::id() as i32;
+        let mut out: Vec<Member> = vec![];
+        let pids = all_pids().map_err(|error| MembersCut {
+            error,
+            seen: vec![],
+            tokenless: vec![],
+        })?;
+        for pid in pids {
+            if Instant::now() >= deadline {
+                // The members read so far are handed over, those with tokens
+                // (and starts) and those without, so the final zombie check
+                // still covers them.
+                return Err(MembersCut {
+                    error: "member census cut at the deadline".into(),
+                    seen: out.iter().filter_map(|m| m.claimant.token).collect(),
+                    tokenless: out
+                        .iter()
+                        .filter(|m| m.claimant.token.is_none())
+                        .map(|m| m.claimant.pid)
+                        .collect(),
+                });
+            }
+            // SAFETY: getsid has no memory arguments.
+            if pid <= 1 || pid == me || unsafe { libc::getsid(pid) } != sid {
+                continue;
+            }
+            let Some(info) = bsd_info(pid, false) else {
+                // Unreadable but still in S: the drain waits on it rather
+                // than assuming it is not a debugger.
+                // SAFETY: getsid has no memory arguments.
+                if unsafe { libc::getsid(pid) } == sid {
+                    out.push(Member {
+                        claimant: Claimant { pid, token: None },
+                        debugger: true,
+                        traced: false,
+                        stopped: false,
+                    });
+                }
+                continue;
+            };
+            if info.pbi_status == libc::SZOMB {
+                continue;
+            }
+            let token = match verified_token(pid) {
+                Some((t, s)) if s == sid => Some(t),
+                Some(_) => continue, // left the session in between
+                None => None,
+            };
+            // Bind the start identity to the verified instance: a pid reused
+            // between the first read and the token would otherwise pair one
+            // process's token with another's start. On a mismatch the member
+            // keeps no token (counted, never signalled or matched by it).
+            let start = (info.pbi_start_tvsec, info.pbi_start_tvusec);
+            let token = token.filter(|_| {
+                bsd_info(pid, false)
+                    .is_some_and(|after| (after.pbi_start_tvsec, after.pbi_start_tvusec) == start)
+            });
+            if let Some(t) = token {
+                self.starts
+                    .insert((token_pid(&t), token_version(&t)), start);
+            }
+            out.push(Member {
+                claimant: Claimant { pid, token },
+                debugger: is_debugger(pid).unwrap_or(true),
+                traced: info.pbi_flags & PROC_FLAG_TRACED != 0,
+                stopped: info.pbi_status == libc::SSTOP,
+            });
         }
+        Ok(out)
+    }
+    fn cont(&mut self, token: &Token) -> Signalled {
+        signal_token(token, libc::SIGCONT)
+    }
+    fn end_supervisor(&mut self, pid: i32, sid: i32) -> Signalled {
+        // The sweep's anchor rule: the token is taken between two successful
+        // anchor checks, so its session id still names this run's session.
+        // Without that proof (an anchor lost to identity reuse) the supervisor
+        // is not signalled at all.
+        if !(self.anchor)() {
+            return Signalled::Stale;
+        }
+        let token = match verified_token(pid) {
+            Some((t, s)) if s == sid => t,
+            _ => return Signalled::Stale,
+        };
+        if !(self.anchor)() {
+            return Signalled::Stale;
+        }
+        signal_token(&token, libc::SIGKILL)
+    }
+    fn launchd_zombie(&mut self, token: &Token) -> ZombieCheck {
+        let pid = token_pid(token);
+        let start = self.starts.get(&(pid, token_version(token))).copied();
+        let found = bsd_info_or_errno(pid, true).map(|info| {
+            (
+                info.pbi_status,
+                info.pbi_ppid,
+                (info.pbi_start_tvsec, info.pbi_start_tvusec),
+            )
+        });
+        zombie_check(found, start)
+    }
+    fn launchd_zombie_pid(&mut self, pid: i32) -> ZombieCheck {
+        zombie_check_pid(bsd_info_or_errno(pid, true).map(|info| (info.pbi_status, info.pbi_ppid)))
     }
     fn now(&self) -> Instant {
         Instant::now()
     }
     fn pause(&mut self) {
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #205 (CR-20): only a lookup that proves the member gone (ESRCH), or a
+    /// readable record that is not a zombie of its start under launchd, is
+    /// clear. Any other failed lookup, or a member with no recorded start, is
+    /// unreadable, never clear.
+    #[test]
+    fn a_failed_zombie_lookup_is_unreadable_unless_gone() {
+        let start = Some((100, 7));
+        let zombie = Ok((libc::SZOMB, 1, (100, 7)));
+        assert_eq!(zombie_check(zombie, start), ZombieCheck::Zombie);
+        assert_eq!(
+            zombie_check(Ok((libc::SZOMB, 1, (101, 0))), start),
+            ZombieCheck::Clear
+        );
+        assert_eq!(
+            zombie_check(Ok((libc::SZOMB, 42, (100, 7))), start),
+            ZombieCheck::Clear
+        );
+        assert_eq!(
+            zombie_check(Ok((2, 1, (100, 7))), start),
+            ZombieCheck::Clear
+        );
+        assert_eq!(zombie_check(Err(libc::ESRCH), start), ZombieCheck::Clear);
+        assert_eq!(
+            zombie_check(Err(libc::EPERM), start),
+            ZombieCheck::Unreadable
+        );
+        assert_eq!(zombie_check(Err(0), start), ZombieCheck::Unreadable);
+        assert_eq!(zombie_check(zombie, None), ZombieCheck::Unreadable);
+    }
+
+    /// #205 (CR-25): a member seen without a token has no recorded identity,
+    /// so its pid is clear only when provably not a zombie under launchd now.
+    #[test]
+    fn a_tokenless_zombie_check_is_clear_only_when_provably_not_a_zombie() {
+        assert_eq!(zombie_check_pid(Err(libc::ESRCH)), ZombieCheck::Clear);
+        assert_eq!(zombie_check_pid(Ok((2, 42))), ZombieCheck::Clear);
+        assert_eq!(zombie_check_pid(Ok((libc::SZOMB, 42))), ZombieCheck::Clear);
+        assert_eq!(
+            zombie_check_pid(Ok((libc::SZOMB, 1))),
+            ZombieCheck::Unreadable
+        );
+        assert_eq!(zombie_check_pid(Err(libc::EPERM)), ZombieCheck::Unreadable);
+        assert_eq!(zombie_check_pid(Err(0)), ZombieCheck::Unreadable);
     }
 }

@@ -73,17 +73,66 @@ A sweep kills every process of S by **audit token**, never by pid
 name port before and after `getsid`. A process that exits and has its pid reused
 fails the kernel's pid-version check, so the kill is refused as stale.
 
-Who sweeps:
+**Every sweep is debugger-last (#205).** Killing a debugserver while its
+program is held (at an intercepted call, or with an exit pending) lets the
+kernel hand the program to launchd as a zombie nobody ever collects: it stays
+until a reboot and counts against the user's process limit (platform README,
+"Ordered teardown"). So a run is ended in three steps (`sweep::end_run`):
+
+1. **The supervisor first**, when it is still alive, by its own audit token,
+   taken between two successful anchor checks (the anchor rule below); without
+   that proof it is not signalled. The platform provider, whose owner it is,
+   then tears its sessions down in
+   order: only debugserver ends a held program, and debugserver is ended only
+   once the program is gone.
+2. **A drain:** wait until no live member of S is a debugserver and none is
+   traced (`PROC_FLAG_TRACED`), capped at 3 s + 4 s per debugserver seen at the
+   first readable reading (the platform's worst case, its emergency path
+   included; 7 s until a reading succeeds). It sends no terminating signal. Its
+   one signal is SIGCONT, at the first readable reading, to stopped members
+   that are not traced (a stopped provider), by tokens enrolled under the
+   anchor rule below; a failed reading delays it, and a failed anchor check
+   ends it. Each member's start identity is bound to its verified token (read
+   again after the token; on a mismatch the member keeps no token). The image names it uses
+   (`debugserver`) are for waiting only; the platform provider's image is not
+   used, so a substitute provider cannot end it early. Reaching the cap is
+   recorded as `drain_exceeded`, and the sweep then goes ahead. Its known
+   causes are a stuck provider, and a member traced by a debugger umbra does
+   not own (a user's lldb attached to a child), which umbra cannot end in
+   order.
+3. **The sweep** of what is left, as below.
+
+Afterwards every member the drain saw is checked, including those a census
+cut at its deadline had already verified, and so is every member the sweep
+signalled (a member created after the drain, say): one now a zombie under
+launchd is reported in `launchd_zombies`, and the outcome is then not
+`COMPLETE`. One whose final record cannot be read (a lookup failing other than
+with `ESRCH`, or no recorded start) is not known to be clear: it is named in
+the outcome's `error`, and the outcome is not `COMPLETE` either. A member the
+drain could read only without a token has no recorded identity, so its pid is
+checked instead: it is clear only when provably not a zombie under launchd now
+(gone, or readable and not one), and otherwise named in `error` in the same
+way.
+
+Who ends the run:
 
 - **Supervisor exit:** the guardian is the only process that waits on the
-  supervisor. It sweeps S and then sends `OUTCOME`. While the guardian runs, S
-  exists (its leader is a member), so the guardian needs no further proof.
-- **Relay gone** (life-pipe EOF): the guardian sweeps S, reaps the supervisor
-  within 1 s, records `relay-death` and exits.
+  supervisor. It drains and sweeps S and then sends `OUTCOME`. While the
+  guardian runs, S exists (its leader is a member), so the guardian needs no
+  further proof.
+- **Relay gone** (life-pipe EOF): the guardian ends the supervisor (its own
+  child) first, drains and sweeps S, reaps the supervisor within 1 s, records
+  `relay-death` and exits.
 - **Relay fallback** (the guardian stopped, lost, malformed or slow): the relay
-  SIGKILLs the guardian by pid, but only while it is the relay's own unreaped
-  child. It then sweeps S, writes its `relay-fallback` line, reaps the
-  guardian once, records the reap in a `guardian-reaped` line and exits 1.
+  first SIGSTOPs a live guardian (recorded as `guardian-stop`, and what its
+  bounded wait observed as `guardian-stopped`), so it cannot spawn a
+  supervisor after the lookup. It names the supervisor (the pid
+  `STARTED` reported, or, before `STARTED`, the guardian's only child in S,
+  found while the guardian is still its unreaped child), then SIGKILLs the
+  guardian by pid, but only while it is the relay's
+  own unreaped child. It then ends the supervisor by token, drains and sweeps
+  S, writes its `relay-fallback` line, reaps the guardian once, records the
+  reap in a `guardian-reaped` line and exits 1.
 
 The relay's sweep rests on the **zombie anchor**. The relay reaps the guardian
 only after its sweep and that sweep's `relay-fallback` (or, on the normal path,
@@ -120,8 +169,10 @@ traced process that does so is still killed by its debugserver if the
 connection to the platform is lost while it runs: `umbra-platform-macos` sends
 `QSetDetachOnError:0` on every connection before attaching, and fails the
 connection unless debugserver answers `OK` (platform README). If its tracer
-dies, the kernel kills it (`kern_exit.c:2556-2608`). An untraced process that
-escapes S is not cleaned up.
+dies while it runs, the kernel kills it (`kern_exit.c:2556-2608`). If its
+tracer dies while it is held at a breakpoint or with an exit pending, the
+kernel instead hands it to launchd as a zombie nobody collects (#205; platform
+README). An untraced process that escapes S is not cleaned up.
 
 ## Exit status
 
@@ -130,7 +181,8 @@ exit code, or the same signal, re-raised. `umbra`'s own exit-code rules are
 unchanged ([CLI README](../umbra-cli/README.md#exit-codes-and-streams)). The
 relay exits 1 instead, with a line on stderr, in these cases:
 
-1. the sweep ended other than `COMPLETE`:
+1. the sweep ended other than `COMPLETE`, which includes a member left as a
+   zombie under launchd (#205):
    `umbra: run isolation cleanup <KIND> (session S); supervisor status <N>`;
 2. any record write or `fsync` failed, in the relay or the guardian:
    `umbra: isolation record write failed (guardian errno …, relay errno …); supervisor status <N>`;
@@ -165,6 +217,10 @@ are covered.
   inherited stderr is the only report:
   `umbra: run guardian: relay gone, cleanup <KIND>, isolation record write failed (errno N)`.
   This is a limit of the design, not something it hides.
+- **Ending fields (#205):** the `sweep`, `relay-death`, `wait-error` and
+  `relay-fallback` lines carry `launchd_zombies` (pids of members left as
+  zombies under launchd) and `drain_exceeded`; `relay-fallback` also carries the
+  `supervisor` it ended first, if any.
 - **Retention:** at relay start, only the newest 50 records are kept. Only
   regular files in that directory whose names match the record pattern exactly
   are deleted.
@@ -180,9 +236,11 @@ deadline:
 | Wait | Bound |
 |---|---|
 | each startup handshake phase (`ISOLATED`, then `STARTED`) | 2 s |
+| the drain before a sweep (#205; until no live debugserver or traced member) | 3 s + 4 s per debugserver at its first readable reading; `drain_exceeded` when reached |
 | a sweep (census passes, kills, pauses) | 3 s, plus the overrun below |
 | the guardian's reap of the supervisor after relay death | 1 s |
 | the guardian's exit after its `OUTCOME` | 1 s |
+| the relay's wait for a SIGSTOPped live guardian to stop, before it names the supervisor (#205) | 1 s |
 | the relay's wait for a SIGKILLed guardian to exit | 1 s |
 | the relay's reap of the guardian | 1 s |
 
@@ -289,11 +347,21 @@ Stated, not closed here:
   - the sweep's interleavings, scripted: the last witness lost mid-sweep, a
     registry refresh after the loss, and a reused pid or unknown claimant never
     signalled;
+  - the debugger-last ending (#205), scripted: the supervisor is ended before
+    any sweep kill, on every path that can name it (the relay's fallback
+    included); the drain waits to its cap while a debugserver lives, ends at
+    once with nothing to wait for, continues only stopped untraced members
+    (still after a failed first reading), and scales its cap with the
+    debugserver count; a member left as a zombie
+    under launchd is reported and keeps the outcome from `COMPLETE`, and so
+    does one whose final check cannot be read (named in `error`);
   - spawn: no SIGPIPE inheritance, a new session, exact descriptor passing.
 - `tests/t1_kernel.rs`, on the real kernel:
   - with the anchor forced off, claimants are reported `UNVERIFIABLE` and not
     signalled, and with it held they are killed (the frozen-set half of T1);
   - a stale token is refused;
+  - the supervisor is not signalled with the anchor forced off, and is killed
+    by its token with it held (#205);
   - a sanity check that a zombie leader stays a zombie while new sessions are
     created. It attempts no pid reuse, so it does not show the anchor.
 - The anchor-held half of T1 (no process can obtain a zombie leader's pid or
@@ -306,6 +374,8 @@ Stated, not closed here:
   - the fail-closed transitions that a scripted guardian can produce (EOF,
     malformed, oversized and unknown frames, a stopped, silent, hung or
     exited guardian, a wrong session claim);
+  - a live guardian observed stopped (`guardian-stopped` with `Stopped`)
+    before its kill, in the fallback (#205);
   - the bounds.
 
   Every case that starts a guardian also checks that the single reap is the

@@ -249,6 +249,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # #205: launchd-parented zombies of this user, at the start of the job.
+      # A traced program the kernel hands to launchd when its debugger ends
+      # mid-exit is never collected; it stays until a reboot and counts
+      # against kern.maxprocperuid. The census is per user, so a local run by
+      # anyone on this host during the job is counted too.
+      - name: Zombie census at job start (#205)
+        run: |
+          census="$RUNNER_TEMP/umbra-zombies-start.txt"
+          ps -A -o stat=,pid=,ppid=,user=,lstart=,ucomm= \
+            | awk -v u="$(id -un)" '$1 ~ /^Z/ && $3 == 1 && $4 == u' > "$census"
+          date +%s > "$RUNNER_TEMP/umbra-job-start.txt"
+          echo "launchd-parented zombies of $(id -un) at job start: $(wc -l < "$census")"
+          cat "$census"
+          # Report only: zombies born since the previous job on this runner ended.
+          previous="${RUNNER_TOOL_CACHE:-$HOME}/umbra-ci-zombies-end.txt"
+          if [ -f "$previous" ]; then
+            echo "born since the previous job's end census (report only):"
+            awk 'FILENAME == ARGV[1] { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
+                 !(($2 " " $5 " " $6 " " $7 " " $8 " " $9) in seen)' "$previous" "$census" || true
+          fi
       - name: Build providers and fixture
         run: |
           test "$(uname -m)" = arm64
@@ -258,6 +278,11 @@ jobs:
           mkdir "$fixture_dir/shadow"
           echo "UMBRA_TEST_FIXTURE_PATH=$fixture_dir/umbra-test-child" >> "$GITHUB_ENV"
           echo "UMBRA_TEST_REDIRECT_ROOT=$fixture_dir/shadow" >> "$GITHUB_ENV"
+          # #205 native control: debugger-last orderings, signed so its own
+          # debugger process may attach to its child (get-task-allow).
+          clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-205-exitwin.c -o "$fixture_dir/umbra-fix-205-exitwin"
+          codesign --force --sign - --entitlements experiments/fixtures/umbra-fix-205-exitwin.entitlements "$fixture_dir/umbra-fix-205-exitwin"
+          echo "UMBRA_FIX205_EXITWIN=$fixture_dir/umbra-fix-205-exitwin" >> "$GITHUB_ENV"
       - name: Signal authority and overlapping library calls
         run: |
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
@@ -273,6 +298,14 @@ jobs:
       - name: Qualify enforcement, IPC, and the local run-fixture matrix
         run: |
           cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures --test idle_poll -- --nocapture --test-threads=1
+          # #205: the launchd-zombie and teardown decisions, the stub resolution,
+          # debugserver's ignored terminal signals, and the provider's lifetime.
+          cargo test -p umbra-platform-macos --lib native::tests::every_traced_stub_resolves_on_this_host -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib native::tests::a_tracee_handed_to_launchd_is_never_confirmed -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib native::tests::the_teardown_opens_by_continuing_its_tracer -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib native::tests::a_reaped_tracer_is_never_continued -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib rsp::tests::debugserver_ignores_terminal_signals -- --exact --nocapture
+          cargo test -p umbra-platform-macos --test lifetime_signals -- --nocapture --test-threads=1
           cargo test -p umbra-platform-macos --test owner_loss -- --nocapture --test-threads=1
           cargo test -p umbra-cli --test run_fixtures --test resume_cli --test fix_262_idle -- --nocapture --test-threads=1
           cargo test -p umbra-supervisor --test reopen -- --nocapture --test-threads=1
@@ -328,6 +361,9 @@ jobs:
       # session is a failure, not a skip. The pty cases pin today's terminal
       # semantics, which the isolation must leave alone.
       - name: Qualify run isolation in launchd's session
+        # #205: run even when an earlier step failed, so the SID-1 cases always
+        # give their reading (a failing step otherwise hides every later one).
+        if: ${{ !cancelled() }}
         env:
           UMBRA_REQUIRE_SID1: "1"
         run: |
@@ -335,6 +371,96 @@ jobs:
           cargo test -p umbra-cli --test isolation -- --nocapture --test-threads=1
           # Named SID-1 stdio contract: exact delivery and EOF by CLI exit.
           cargo test -p umbra-cli --test isolation f201_pipe_eof_isolated -- --exact --nocapture --test-threads=1
+      # #205: fail the job on any launchd-parented zombie of this user born
+      # during it, listed by pid, start time and name, and on any live process
+      # of the run left behind (the runner's own post-job cleanup would end such
+      # a process after this step, and the next job would take the zombie as its
+      # baseline). A live process of the run is an `umbra*` image, a traced
+      # program's resigned twin (its command line, or its executable path read
+      # with proc_pidpath, is under ~/Library/Caches/umbra/twins, so a twin that
+      # keeps a vendor argv[0] is found too), or umbra's debugserver (its argv
+      # carries `--reverse-connect 127.0.0.1:`). A process whose executable path
+      # cannot be read is listed as a leftover; only one proven gone (ESRCH) is
+      # skipped. Zombies are counted above, not again as leftovers. Both checks
+      # read ONE process table, so a process cannot be live in the zombie check
+      # and a zombie in the leftover check; a failed `ps` fails the step. The
+      # baseline is the first file by name, so an empty baseline still reports
+      # every new zombie.
+      - name: Zombie and leftover census at job end (#205)
+        if: always()
+        run: |
+          set -o pipefail
+          start="$RUNNER_TEMP/umbra-zombies-start.txt"
+          end="$RUNNER_TEMP/umbra-zombies-end.txt"
+          snapshot="$RUNNER_TEMP/umbra-processes-end.txt"
+          # One process table for both checks. Its first nine fields match the
+          # start census (stat, pid, ppid, user, lstart), so the zombie keys
+          # ($2 and $5-$9) compare as before.
+          if ! ps -A -o stat=,pid=,ppid=,user=,lstart=,etime=,ucomm=,command= > "$snapshot"; then
+            echo "::error::the end census produced no reading (#205)"
+            exit 1
+          fi
+          awk -v u="$(id -un)" '$1 ~ /^Z/ && $3 == 1 && $4 == u' "$snapshot" > "$end"
+          cp "$end" "${RUNNER_TOOL_CACHE:-$HOME}/umbra-ci-zombies-end.txt" || true
+          touch "$start"
+          new=$(awk 'FILENAME == ARGV[1] { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
+                     !(($2 " " $5 " " $6 " " $7 " " $8 " " $9) in seen)' "$start" "$end")
+          job_start=$(cat "$RUNNER_TEMP/umbra-job-start.txt" 2>/dev/null || echo 0)
+          window=$(( $(date +%s) - job_start ))
+          me=$$
+          status=0
+          # awk marks the name and argv matches (1) and passes every other
+          # candidate (0) to proc_pidpath. The helper never spells the twin
+          # path in one literal, so its own command line cannot match it.
+          leftovers=$(set -o pipefail
+            awk -v u="$(id -un)" -v window="$window" -v me="$me" '
+            function seconds(t,  n, a, d, h, m, s) {
+              d = 0; h = 0
+              if (index(t, "-") > 0) { split(t, a, "-"); d = a[1]; t = a[2] }
+              n = split(t, a, ":")
+              if (n == 3) { h = a[1]; m = a[2]; s = a[3] } else { m = a[1]; s = a[2] }
+              return ((d * 24 + h) * 60 + m) * 60 + s
+            }
+            $4 == u && $2 != me && $3 != me && $1 !~ /^Z/ && seconds($10) <= window {
+              name = $11
+              hit = (name ~ /^umbra/ || $0 ~ /\/Library\/Caches\/umbra\/twins\// ||
+                     (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
+              print (hit ? 1 : 0), $0
+            }' "$snapshot" | python3 -I -c '
+          import ctypes, sys
+          libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+          libc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+          twins = "/Library/Caches/umbra/" "twins/"
+          for line in sys.stdin:
+              hit, _, row = line.rstrip("\n").partition(" ")
+              if hit == "1":
+                  print(row)
+                  continue
+              buf = ctypes.create_string_buffer(4096)
+              ctypes.set_errno(0)
+              n = libc.proc_pidpath(int(row.split()[1]), buf, 4096)
+              if n > 0:
+                  path = buf.raw[:n].decode("utf-8", "replace")
+                  if twins in path:
+                      print(row + "  [executable " + path + "]")
+              elif ctypes.get_errno() != 3:
+                  print(row + "  [executable path unreadable: errno %d]" % ctypes.get_errno())
+          ') || {
+            echo "::error::the leftover census produced no reading (#205)"
+            status=1
+          }
+          if [ -n "$new" ]; then
+            echo "::error::launchd-parented zombies born during this job (#205):"
+            echo "$new"
+            status=1
+          fi
+          if [ -n "$leftovers" ]; then
+            echo "::error::live processes of the run left at job end (#205):"
+            echo "$leftovers"
+            status=1
+          fi
+          [ "$status" -eq 0 ] && echo "no new launchd-parented zombie and no leftover"
+          exit "$status"
 
   native-userspace-routing:
     name: Userspace-routed run over the live NFSv4 client
@@ -360,6 +486,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # #205: launchd-parented zombies of this user, at the start of the job.
+      # A traced program the kernel hands to launchd when its debugger ends
+      # mid-exit is never collected; it stays until a reboot and counts
+      # against kern.maxprocperuid. The census is per user, so a local run by
+      # anyone on this host during the job is counted too.
+      - name: Zombie census at job start (#205)
+        run: |
+          census="$RUNNER_TEMP/umbra-zombies-start.txt"
+          ps -A -o stat=,pid=,ppid=,user=,lstart=,ucomm= \
+            | awk -v u="$(id -un)" '$1 ~ /^Z/ && $3 == 1 && $4 == u' > "$census"
+          date +%s > "$RUNNER_TEMP/umbra-job-start.txt"
+          echo "launchd-parented zombies of $(id -un) at job start: $(wc -l < "$census")"
+          cat "$census"
+          # Report only: zombies born since the previous job on this runner ended.
+          previous="${RUNNER_TOOL_CACHE:-$HOME}/umbra-ci-zombies-end.txt"
+          if [ -f "$previous" ]; then
+            echo "born since the previous job's end census (report only):"
+            awk 'FILENAME == ARGV[1] { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
+                 !(($2 " " $5 " " $6 " " $7 " " $8 " " $9) in seen)' "$previous" "$census" || true
+          fi
 
       - name: Verify libnfs.pin matches workflow constant
         run: |
@@ -725,7 +871,8 @@ jobs:
             fix_243_guardian_copyout_failure_loss fix_243_guardian_free_failure_loss \
             fix_243_distinct_parent_backing_overlap fix_243_provider_region_cap \
             fix_243_region_success_error_cycles fix_243_region_allocation_failure \
-            fix_243_region_write_failure --exact --nocapture --test-threads=1
+            fix_243_region_write_failure fix_205_refusal_with_an_unenrolled_fork_child \
+            --exact --nocapture --test-threads=1
 
       - name: Confirm routed shutdown before journal completion
         env:
@@ -947,3 +1094,93 @@ jobs:
           docker compose \
             -f experiments/nfs-raw/docker-compose.yml \
             down -v
+      # #205: fail the job on any launchd-parented zombie of this user born
+      # during it, listed by pid, start time and name, and on any live process
+      # of the run left behind (the runner's own post-job cleanup would end such
+      # a process after this step, and the next job would take the zombie as its
+      # baseline). A live process of the run is an `umbra*` image, a traced
+      # program's resigned twin (its command line, or its executable path read
+      # with proc_pidpath, is under ~/Library/Caches/umbra/twins, so a twin that
+      # keeps a vendor argv[0] is found too), or umbra's debugserver (its argv
+      # carries `--reverse-connect 127.0.0.1:`). A process whose executable path
+      # cannot be read is listed as a leftover; only one proven gone (ESRCH) is
+      # skipped. Zombies are counted above, not again as leftovers. Both checks
+      # read ONE process table, so a process cannot be live in the zombie check
+      # and a zombie in the leftover check; a failed `ps` fails the step. The
+      # baseline is the first file by name, so an empty baseline still reports
+      # every new zombie.
+      - name: Zombie and leftover census at job end (#205)
+        if: always()
+        run: |
+          set -o pipefail
+          start="$RUNNER_TEMP/umbra-zombies-start.txt"
+          end="$RUNNER_TEMP/umbra-zombies-end.txt"
+          snapshot="$RUNNER_TEMP/umbra-processes-end.txt"
+          # One process table for both checks. Its first nine fields match the
+          # start census (stat, pid, ppid, user, lstart), so the zombie keys
+          # ($2 and $5-$9) compare as before.
+          if ! ps -A -o stat=,pid=,ppid=,user=,lstart=,etime=,ucomm=,command= > "$snapshot"; then
+            echo "::error::the end census produced no reading (#205)"
+            exit 1
+          fi
+          awk -v u="$(id -un)" '$1 ~ /^Z/ && $3 == 1 && $4 == u' "$snapshot" > "$end"
+          cp "$end" "${RUNNER_TOOL_CACHE:-$HOME}/umbra-ci-zombies-end.txt" || true
+          touch "$start"
+          new=$(awk 'FILENAME == ARGV[1] { seen[$2 " " $5 " " $6 " " $7 " " $8 " " $9] = 1; next }
+                     !(($2 " " $5 " " $6 " " $7 " " $8 " " $9) in seen)' "$start" "$end")
+          job_start=$(cat "$RUNNER_TEMP/umbra-job-start.txt" 2>/dev/null || echo 0)
+          window=$(( $(date +%s) - job_start ))
+          me=$$
+          status=0
+          # awk marks the name and argv matches (1) and passes every other
+          # candidate (0) to proc_pidpath. The helper never spells the twin
+          # path in one literal, so its own command line cannot match it.
+          leftovers=$(set -o pipefail
+            awk -v u="$(id -un)" -v window="$window" -v me="$me" '
+            function seconds(t,  n, a, d, h, m, s) {
+              d = 0; h = 0
+              if (index(t, "-") > 0) { split(t, a, "-"); d = a[1]; t = a[2] }
+              n = split(t, a, ":")
+              if (n == 3) { h = a[1]; m = a[2]; s = a[3] } else { m = a[1]; s = a[2] }
+              return ((d * 24 + h) * 60 + m) * 60 + s
+            }
+            $4 == u && $2 != me && $3 != me && $1 !~ /^Z/ && seconds($10) <= window {
+              name = $11
+              hit = (name ~ /^umbra/ || $0 ~ /\/Library\/Caches\/umbra\/twins\// ||
+                     (name == "debugserver" && $0 ~ /--reverse-connect 127\.0\.0\.1:/))
+              print (hit ? 1 : 0), $0
+            }' "$snapshot" | python3 -I -c '
+          import ctypes, sys
+          libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+          libc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+          twins = "/Library/Caches/umbra/" "twins/"
+          for line in sys.stdin:
+              hit, _, row = line.rstrip("\n").partition(" ")
+              if hit == "1":
+                  print(row)
+                  continue
+              buf = ctypes.create_string_buffer(4096)
+              ctypes.set_errno(0)
+              n = libc.proc_pidpath(int(row.split()[1]), buf, 4096)
+              if n > 0:
+                  path = buf.raw[:n].decode("utf-8", "replace")
+                  if twins in path:
+                      print(row + "  [executable " + path + "]")
+              elif ctypes.get_errno() != 3:
+                  print(row + "  [executable path unreadable: errno %d]" % ctypes.get_errno())
+          ') || {
+            echo "::error::the leftover census produced no reading (#205)"
+            status=1
+          }
+          if [ -n "$new" ]; then
+            echo "::error::launchd-parented zombies born during this job (#205):"
+            echo "$new"
+            status=1
+          fi
+          if [ -n "$leftovers" ]; then
+            echo "::error::live processes of the run left at job end (#205):"
+            echo "$leftovers"
+            status=1
+          fi
+          [ "$status" -eq 0 ] && echo "no new launchd-parented zombie and no leftover"
+          exit "$status"

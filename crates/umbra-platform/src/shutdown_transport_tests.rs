@@ -266,6 +266,9 @@ enum Script {
     PendingBeforeAccepted,
     WrongNonce,
     PendingSlot,
+    /// #205: a pending tracer, an unacquired task right and one poisoned
+    /// diagnostic, for the named unconfirmed-obligation message.
+    NamedObligations,
 }
 
 fn scripted(script: Script) -> Closure {
@@ -310,7 +313,12 @@ fn scripted(script: Script) -> Closure {
             birth: None,
         })
         .unwrap();
-        if !matches!(script, Script::PendingSlot) {
+        if matches!(script, Script::NamedObligations) {
+            ledger
+                .reserve(ResourceKind::TaskRight, Some(root), 1, 0)
+                .unwrap();
+        }
+        if !matches!(script, Script::PendingSlot | Script::NamedObligations) {
             slot.confirm(Proof::Collected {
                 status: "exit 0".into(),
             })
@@ -349,6 +357,11 @@ fn scripted(script: Script) -> Closure {
         let mut final_state = ledger.final_snapshot().unwrap();
         if matches!(script, Script::WrongNonce) {
             final_state.nonce = Nonce::new_v4();
+        }
+        if matches!(script, Script::NamedObligations) {
+            final_state
+                .diagnostics
+                .push("poisoned: scripted ownership failure".into());
         }
         let response = if matches!(script, Script::DuplicateAccepted) {
             Response::ShutdownAccepted(accepted)
@@ -616,4 +629,43 @@ fn shutdown_poll_preserves_deadlines() {
     assert!(error.context.contains("owner-progress failure"));
     release_tx.send(()).unwrap();
     assert!(owner.join().unwrap().is_err());
+}
+
+/// #205: `close_client`'s unconfirmed-Final error names each unconfirmed
+/// entry (kind, pid or `?`, disposition), keeps the diagnostics and the exit
+/// result, and does not list a confirmed entry.
+#[test]
+fn the_close_client_message_names_its_obligations() {
+    let (accepted, final_state) = crate::shutdown::scripted_unconfirmed_final();
+    assert!(!accepted.confirms(&final_state).unwrap());
+    let exit: Result<Duration> = Ok(Duration::from_millis(3));
+    let message = super::unconfirmed_final(&final_state, &exit);
+    for named in [
+        "Tracee pid=4242 Unconfirmed(\"owner destroyed without terminal proof\")",
+        "TaskRight pid=? Unconfirmed(\"owner destroyed without terminal proof\")",
+        "poisoned: scripted ownership failure",
+        "exit: Ok(3ms)",
+    ] {
+        assert!(message.contains(named), "{named} missing from: {message}");
+    }
+    assert!(!message.contains("Tracer pid=5151"), "{message}");
+}
+
+/// #205: `close_client` itself, driven through a scripted provider, names each
+/// unconfirmed obligation at its call site (kind, pid or `?`, disposition),
+/// keeps the diagnostics and the exit result, and does not list the confirmed
+/// root.
+#[test]
+fn close_client_names_its_unconfirmed_obligations() {
+    let closure = scripted(Script::NamedObligations);
+    let message = closure.error.expect("unconfirmed closure").to_string();
+    for named in [
+        "Tracer pid=123 Unconfirmed(\"owner destroyed without terminal proof\")",
+        "TaskRight pid=? Unconfirmed(\"owner destroyed without terminal proof\")",
+        "poisoned: scripted ownership failure",
+        "exit: Ok(",
+    ] {
+        assert!(message.contains(named), "{named} missing from: {message}");
+    }
+    assert!(!message.contains("Tracee pid=123"), "{message}");
 }

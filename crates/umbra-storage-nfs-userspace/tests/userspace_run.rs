@@ -8343,6 +8343,321 @@ fn slate_bounded_for(
 ) -> (SlateOutput, bool) {
     slate_launch(command, evidence, timeout, None)
 }
+/// #205: end a timed-out run debugger-last. The launched `umbra` (in a
+/// terminal, the supervisor; in launchd's session, the relay, whose death
+/// starts the guardian's own debugger-last ending of session S) is ended
+/// first, so the platform provider tears its sessions down in order. Then
+/// wait until no live member of the run's group or session is a debugserver
+/// or traced, capped at 3 s + 4 s per debugserver seen at the first reading
+/// (the platform's worst case, emergency path included). Only then may the
+/// group be killed: killing a debugserver while its program is held hands the
+/// program to launchd as a zombie nobody collects.
+///
+/// Returns what the drain read ([`SlateDrain`]).
+///
+/// A census that cannot be read is never taken as "nothing left": the
+/// drain keeps waiting to its cap and records the error.
+fn slate_debugger_last(
+    child: &mut std::process::Child,
+    group: u32,
+    run_session: &mut Option<SlateRunSession>,
+) -> SlateDrain {
+    use std::time::Duration;
+    let _ = child.kill();
+    slate_drain(
+        |bound| slate_run_members(group, bound, run_session),
+        slate_traced,
+        Duration::from_secs(3),
+        Duration::from_secs(4),
+    )
+}
+
+/// What the debugger-last drain read (#205): the debugservers seen at the
+/// first readable census (D), the cap that followed from it, whether the cap
+/// was reached, and the last census error, if any census failed.
+#[derive(Debug)]
+struct SlateDrain {
+    debuggers: usize,
+    cap: std::time::Duration,
+    exceeded: bool,
+    census_error: Option<String>,
+}
+
+/// The drain loop behind [`slate_debugger_last`]: wait until a readable census
+/// shows no live debugserver and no traced member, capped at `base + per * D`
+/// from the first readable census (`base + per` until there is one).
+fn slate_drain(
+    mut members: impl FnMut(std::time::Instant) -> Result<String, String>,
+    traced: impl Fn(i32) -> Option<bool>,
+    base: std::time::Duration,
+    per: std::time::Duration,
+) -> SlateDrain {
+    use std::time::{Duration, Instant};
+    let live = |line: &&str| {
+        !line
+            .split_whitespace()
+            .nth(3)
+            .is_some_and(|stat| stat.starts_with('Z'))
+    };
+    let start = Instant::now();
+    let mut first: Option<(usize, Duration)> = None;
+    let mut census_error = None;
+    loop {
+        let cap = first.map_or(base + per, |(_, cap)| cap);
+        match members(start + cap) {
+            Ok(members) => {
+                let debuggers = members
+                    .lines()
+                    .filter(live)
+                    .filter(|line| line.contains("debugserver"))
+                    .count();
+                let any_traced = members
+                    .lines()
+                    .filter(live)
+                    .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+                    // A trace state that cannot be read is not "untraced": it
+                    // keeps the drain waiting, as an unreadable census does.
+                    .any(|pid| traced(pid) != Some(false));
+                let (d, cap) =
+                    *first.get_or_insert_with(|| (debuggers, base + per * debuggers.max(1) as u32));
+                if debuggers == 0 && !any_traced {
+                    return SlateDrain {
+                        debuggers: d,
+                        cap,
+                        exceeded: false,
+                        census_error,
+                    };
+                }
+                if start.elapsed() >= cap {
+                    return SlateDrain {
+                        debuggers: d,
+                        cap,
+                        exceeded: true,
+                        census_error,
+                    };
+                }
+            }
+            Err(error) => {
+                census_error = Some(error);
+                if start.elapsed() >= cap {
+                    return SlateDrain {
+                        debuggers: first.map_or(0, |(d, _)| d),
+                        cap,
+                        exceeded: true,
+                        census_error,
+                    };
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether `pid` is traced (`PROC_FLAG_TRACED`), read-only; `None` when its
+/// record cannot be read.
+fn slate_traced(pid: i32) -> Option<bool> {
+    // SAFETY: plain old data, filled by proc_pidinfo below.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` is writable for `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (got == size).then_some(info.pbi_flags & 2 != 0) // PROC_FLAG_TRACED
+}
+
+/// #205: the drain never reads an unavailable census as nothing left.
+#[test]
+fn slate_drain_never_reads_an_unavailable_census_as_empty() {
+    use std::time::{Duration, Instant};
+    let (base, per) = (Duration::from_millis(30), Duration::from_millis(40));
+    let start = Instant::now();
+    let drain = slate_drain(
+        |_| Err("census unavailable".into()),
+        |_| Some(false),
+        base,
+        per,
+    );
+    assert!(drain.exceeded, "an unread census drained: {drain:?}");
+    assert!(
+        start.elapsed() >= base + per,
+        "returned before its cap: {drain:?}"
+    );
+    assert_eq!(drain.census_error.as_deref(), Some("census unavailable"));
+    let mut calls = 0;
+    let drain = slate_drain(
+        |_| {
+            calls += 1;
+            if calls == 1 {
+                Err("transient".into())
+            } else {
+                Ok(String::new())
+            }
+        },
+        |_| Some(false),
+        base,
+        per,
+    );
+    assert!(!drain.exceeded, "a readable empty census drains: {drain:?}");
+    assert_eq!(drain.census_error.as_deref(), Some("transient"));
+    let drain = slate_drain(
+        |_| Ok("4242 1 4242 S /usr/bin/debugserver".into()),
+        |_| Some(false),
+        base,
+        per,
+    );
+    assert!(drain.exceeded && drain.debuggers == 1, "{drain:?}");
+    // A live member whose trace state cannot be read keeps the drain waiting.
+    let start = Instant::now();
+    let drain = slate_drain(
+        |_| Ok("4343 1 4343 S /bin/sleep".into()),
+        |_| None,
+        base,
+        per,
+    );
+    assert!(
+        drain.exceeded,
+        "an unreadable trace state drained: {drain:?}"
+    );
+    assert!(start.elapsed() >= base + per, "{drain:?}");
+}
+
+/// #205 (D-A): whether the cleanup must drain debugger-last before it kills
+/// anything: the run exited on its own (`exited`), it was not drained already,
+/// and members are left (`live` in its group or session, `escaped` from it).
+fn slate_drain_before_kill(drained: bool, exited: bool, live: usize, escaped: usize) -> bool {
+    !drained && exited && (live > 0 || escaped > 0)
+}
+
+/// #205 (D-A): after a normal exit that leaves members, the cleanup drains
+/// before any kill, once; a run already drained (timed out) or with nothing
+/// left does not.
+#[test]
+fn slate_normal_exit_drains_before_any_kill() {
+    assert!(
+        slate_drain_before_kill(false, true, 2, 0),
+        "live members left"
+    );
+    assert!(
+        slate_drain_before_kill(false, true, 0, 1),
+        "an escaped member left"
+    );
+    assert!(
+        !slate_drain_before_kill(true, true, 2, 0),
+        "drained once already"
+    );
+    assert!(!slate_drain_before_kill(false, true, 0, 0), "nothing left");
+    assert!(
+        !slate_drain_before_kill(false, false, 2, 0),
+        "still running: not an exit"
+    );
+}
+
+/// #205: the cleanup census's budget after a debugger-last ending with `d`
+/// debugservers: the guardian's drain cap (3 s + 4 s per debugserver), its
+/// sweep (3 s) and its supervisor reap (1 s), plus a 2 s census margin.
+fn slate_cleanup_budget(d: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(9) + std::time::Duration::from_secs(4) * d.max(1) as u32
+}
+
+/// #205: the start of a case's window for [`slate_launchd_zombies`], in the
+/// units `proc_bsdinfo` reports start times in.
+fn slate_zombie_window() -> (u64, u64) {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    (d.as_secs(), u64::from(d.subsec_micros()))
+}
+
+/// #205 per-case guard: launchd-parented zombies of this user whose image is a
+/// fixture of this suite (`umbra-userspace-*`, `umbra-slate-*`, `umbra-fix-*`,
+/// by process name, `pbi_name`) and that started inside the case's window. A
+/// failed census is reported as no reading.
+///
+/// The group census accepts zombies that are still in the run's group as
+/// dead-table residue. A zombie **under launchd** is different: when a
+/// debugger process ends while its program has started exiting, the kernel
+/// hands the program to launchd, which never collects it, and it stays until a
+/// reboot. Counting only: nothing is signalled on this basis.
+fn slate_launchd_zombies(since: (u64, u64)) -> Vec<String> {
+    let Ok(out) = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,ppid=,stat="])
+        .output()
+    else {
+        return vec!["ps unavailable: no reading".into()];
+    };
+    // A failed census is no reading, never "no zombies".
+    if !out.status.success() {
+        return vec![format!(
+            "ps failed ({}): no reading: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )];
+    }
+    // SAFETY: getuid has no arguments.
+    let uid = unsafe { libc::getuid() };
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [pid, ppid, stat] = fields[..] else {
+            continue;
+        };
+        if ppid != "1" || !stat.starts_with('Z') {
+            continue;
+        }
+        let Ok(pid) = pid.parse::<i32>() else {
+            continue;
+        };
+        // SAFETY: plain old data, filled by proc_pidinfo below.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: `info` is writable for `size` bytes; arg 1 asks for the
+        // zombie fallback.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if got != size
+            || info.pbi_status != libc::SZOMB
+            || info.pbi_ppid != 1
+            || info.pbi_uid != uid
+        {
+            continue;
+        }
+        let start = (info.pbi_start_tvsec, info.pbi_start_tvusec);
+        // `pbi_comm` keeps 15 bytes (`umbra-userspace-spawn` reads as
+        // `umbra-userspace`); `pbi_name` keeps the name to 32 bytes.
+        let c_name = |raw: &[libc::c_char]| -> String {
+            raw.iter()
+                .take_while(|c| **c != 0)
+                .map(|c| *c as u8 as char)
+                .collect()
+        };
+        let name = match c_name(&info.pbi_name) {
+            long if !long.is_empty() => long,
+            _ => c_name(&info.pbi_comm),
+        };
+        let ours = ["umbra-userspace-", "umbra-slate-", "umbra-fix-"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+        if ours && start >= since {
+            found.push(format!("{pid} {name} start={}.{:06}", start.0, start.1));
+        }
+    }
+    found
+}
+
 fn slate_launch(
     command: &mut Command,
     evidence: &Path,
@@ -8352,6 +8667,7 @@ fn slate_launch(
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
+    let zombie_window = slate_zombie_window();
     SLATE_CENSUS_EVIDENCE
         .with(|slot| *slot.borrow_mut() = Some(evidence.with_extension("census.jsonl")));
     std::fs::write(evidence.with_extension("census.jsonl"), "").unwrap();
@@ -8474,14 +8790,36 @@ fn slate_launch(
     // The ledger's stdin is closed here, so a fixture still waiting for an
     // acknowledgment reads EOF rather than blocking past its own process.
     drop(watched.input.take());
-    let grace = Instant::now() + Duration::from_secs(10);
+    let mut grace_budget = Duration::from_secs(10);
     if timed_out || census_error.is_some() {
+        // #205: end the run debugger-last before the group kill, and give the
+        // cleanup census room for the guardian's own drain and sweep in SID 1.
+        let SlateDrain {
+            debuggers,
+            cap,
+            exceeded,
+            census_error: drain_error,
+        } = slate_debugger_last(&mut child, group, &mut run_session);
+        grace_budget = grace_budget.max(slate_cleanup_budget(debuggers));
+        slate_census_event(
+            "DRAIN",
+            &format!(
+                "debuggers={debuggers} cap={cap:?} exceeded={exceeded} census_error={drain_error:?} grace={grace_budget:?}"
+            ),
+        );
+        eprintln!(
+            "{}: #205 drain: D={debuggers} cap={cap:?} exceeded={exceeded} census_error={drain_error:?} cleanup grace={grace_budget:?}",
+            evidence.display()
+        );
         // SAFETY: this child was launched as leader of its own process group.
         unsafe {
             libc::kill(-(group as i32), libc::SIGKILL);
             group_kills += 1;
         }
     }
+    let mut grace = Instant::now() + grace_budget;
+    // A timed-out or census-failed run was already drained debugger-last.
+    let mut drained = timed_out || census_error.is_some();
     let mut status = status;
 
     let mut pipes: [Option<Vec<u8>>; 2] = [None, None];
@@ -8560,6 +8898,28 @@ fn slate_launch(
             cleanup_failure=Some(format!("cleanup FAILED: grace exhausted with live={live:?}, escaped={escaped:?}, direct_status={status:?}, pipes_complete={}",pipes.iter().all(Option::is_some)));
             break;
         }
+        // #205 (D-A): a run that exited on its own but left members is ended
+        // debugger-last too: drain first (3 s + 4 s per debugserver, the same
+        // cap), then read again before any kill. Its grace pauses meanwhile.
+        if slate_drain_before_kill(drained, status.is_some(), live.len(), escaped.len()) {
+            drained = true;
+            let started = Instant::now();
+            let drain = slate_drain(
+                |bound| slate_run_members(group, bound, &mut run_session),
+                slate_traced,
+                Duration::from_secs(3),
+                Duration::from_secs(4),
+            );
+            grace += started.elapsed();
+            slate_census_event(
+                "DRAIN",
+                &format!(
+                    "normal-exit debuggers={} cap={:?} exceeded={} census_error={:?}",
+                    drain.debuggers, drain.cap, drain.exceeded, drain.census_error
+                ),
+            );
+            continue;
+        }
         slate_census_event(
             "PROGRESS",
             "poll/reap direct child, drain pipes and signal survivors with grace remaining",
@@ -8606,6 +8966,12 @@ fn slate_launch(
     drop(buffered);
     std::fs::write(evidence.with_extension("stdout"), &output.stdout).unwrap();
     std::fs::write(evidence.with_extension("stderr"), &output.stderr).unwrap();
+    let launchd_zombies = slate_launchd_zombies(zombie_window);
+    if !launchd_zombies.is_empty() && cleanup_failure.is_none() {
+        cleanup_failure = Some(format!(
+            "cleanup FAILED: launchd-parented zombies of this case (#205): {launchd_zombies:?}"
+        ));
+    }
     if let Some(error) = cleanup_failure {
         slate_census_event(
             if error.contains("UNMEASURABLE") {
@@ -9551,15 +9917,19 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for signal cleanup witnesses (#284): single_thread
-    // and Fork are byte-identical to the base; Park retains its guard and
-    // transition, with only a cfg-gated signal-witness hook added.
+    // Re-characterized for #205 (launchd-zombie teardown, traced-stub
+    // aliases, no SIGCONT to a reaped tracer, the unenrolled-fork-child
+    // sweep, its shared wait inside the shutdown envelope, its report from
+    // terminate and its census-child check before the signal): single_thread
+    // and its Fork and WaitPlan::Park call sites are byte-identical to the
+    // #284 base (compared with six lines of context);
+    // the Fork arm only gains a cfg-gated test probe after its return stop.
     // The refusal oracle and runtime-witness limitation remain unchanged.
     // The structural unit ran in the affected-crate suite; this case repeats it
     // and the native/routed fork refusal below. The witness limitation remains.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("e196c456eb5bdfc1ce8a5bca4ee6b993be079259973f5ca0f1a4ab5c26447d72"),
+        Some("8bab4559527e4e56399f7f452ed07eb53908999610cc06b8f4efa84f284dba5b"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
@@ -9935,6 +10305,259 @@ impl SlateRouted {
     }
 }
 const SLATE_RECORDS: [&str; 3] = ["records.pre", "records.done", "records.child"];
+
+/// The exact refusal of a packed spawn on an unqualified spawn profile.
+const SLATE_SPAWN_PROFILE_REFUSAL: &str =
+    "UnsupportedCapability during macos: spawn ABI profile mismatch (errno: None)";
+
+/// Whether this host's packed-spawn ABI is the qualified profile, by the
+/// platform's own predicate: the one `capture_spawn` refuses on.
+fn spawn_profile_qualified() -> bool {
+    umbra_platform_macos::spawn_profile_qualified()
+}
+
+/// A packed-spawn case on an unqualified spawn profile (#205, #247): the
+/// native control spawns and writes the mode's own bytes, and the routed run
+/// refuses exactly, in the shape of [`fix_243_refusal`]. Its supervisor fails
+/// with the profile diagnostic and reports no tracee completion; the program
+/// reached its spawn (`records.pre`), and no program was spawned (no
+/// `records.child`, no `child.txt`, no `records.done`). For a `virtual-*` mode
+/// the victim keeps its `SEED`, natively and through the client.
+fn slate_spawn_profile_refusal(mode: &str) {
+    slate_spawn_profile_refusal_in(mode, mode, &[], false, |root| {
+        let done = std::fs::read_to_string(root.join("records.done")).unwrap();
+        if mode == "fix-243-threads" {
+            assert_eq!(done.matches("result=0").count(), 2, "native control");
+            return;
+        }
+        let child: &[u8] = if mode == "c11-10" {
+            b"C11-10-CHILD:e8-nonce"
+        } else {
+            b"CHILD"
+        };
+        assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), child);
+        assert!(done.contains("spawn result=0"), "native control: {done}");
+    });
+}
+
+/// [`slate_spawn_profile_refusal`] for a case whose evidence name, routed mode,
+/// provider environment or native control differ: `native` checks the native
+/// control's root before the routed run.
+fn slate_spawn_profile_refusal_in(
+    case: &str,
+    mode: &str,
+    environment: &[(&str, &str)],
+    group_kills_zero: bool,
+    native: impl FnOnce(&Path),
+) {
+    let Some(mut spawn) = slate_spawn(case) else {
+        return;
+    };
+    let (root, native_run) = slate_spawn_native(&spawn, mode);
+    assert!(
+        native_run.status.success(),
+        "native control: {}",
+        native_run.status
+    );
+    native(&root);
+    let virtual_victim = mode.contains("virtual-");
+    if virtual_victim {
+        assert_eq!(std::fs::read(root.join("victim.txt")).unwrap(), b"SEED");
+    }
+    spawn.provider_environment.extend(
+        environment
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
+    // `opened.txt` is what the refused OPEN action would have created; it is
+    // read for every mode and must be absent, as `fix_243_refusal` requires.
+    let names: &[&str] = if virtual_victim {
+        &["child.txt", "opened.txt", "victim.txt"]
+    } else {
+        &["child.txt", "opened.txt"]
+    };
+    let routed = slate_spawn_routed(&spawn, mode, names);
+    let exact = routed.run.status != Some(0)
+        && routed.run.stderr.contains(SLATE_SPAWN_PROFILE_REFUSAL)
+        && !routed.run.stderr.contains("finished:")
+        && routed.object("records.pre").is_some()
+        && ["records.child", "records.done", "child.txt", "opened.txt"]
+            .iter()
+            .all(|name| routed.object(name).is_none());
+    slate_record(
+        &spawn,
+        if exact {
+            "EXACT KNOWN REFUSAL"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({
+            "diagnostic": SLATE_SPAWN_PROFILE_REFUSAL,
+            "spawn_profile": "unqualified",
+            "run_id": routed.run.run_id.0.to_string(),
+        }),
+    );
+    assert!(exact, "{}", routed.run.stderr);
+    if group_kills_zero {
+        // As the qualified body asserts: nothing was group-killed or left.
+        let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+        let first = cleanup.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with("cleanup CLEAN")
+                && first.contains("group_kills=0")
+                && first.contains("zombies=\"\""),
+            "{cleanup}"
+        );
+    }
+    if virtual_victim {
+        assert_eq!(routed.object("victim.txt"), Some(b"SEED".as_slice()));
+    }
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
+/// A [`fix_243_fault_reading`] case on an unqualified spawn profile (#205,
+/// #247): the probe is armed exactly as there, the native control spawns, and
+/// the routed run refuses exactly (the profile diagnostic, no tracee
+/// completion, `records.pre` and no spawned effect), so the probe is never
+/// reached: nothing ever connected to its socket.
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+fn fix_243_fault_profile_refusal(case: &str, mode: &str) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    let Some(mut spawn) = slate_spawn(case) else {
+        return;
+    };
+    spawn.guardian = case.starts_with("fix-243-guardian-");
+    if case.ends_with("-failure-loss") {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_PROBE_AFTER_FAILURE".into(), "1".into()));
+    }
+    let (root, native) = slate_spawn_native(&spawn, mode);
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("spawn result=0"));
+    if case.ends_with("-watchdog") {
+        spawn.platform_timeout_ms = Some(10_000);
+    }
+    let phase = match case {
+        "fix-243-guardian-unregistered" => "unregistered",
+        "fix-243-guardian-copyout-failure-loss" => "caller-copyout",
+        "fix-243-guardian-free-failure-loss" => "remote-free",
+        "fix-243-copyout-error" => "caller-copyout",
+        "fix-243-free-error" => "remote-free",
+        "fix-243-register-error" => "register-commit",
+        name if name.starts_with("fix-243-policy-") => "policy-ready",
+        name if name.starts_with("fix-243-inserted-") => "inserted",
+        name if name.starts_with("fix-243-unregistered-") => "unregistered",
+        _ => "task-acquired",
+    };
+    if case == "fix-243-policy-error" {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_OWNER_TRACE".into(), "1".into()));
+    }
+    spawn
+        .provider_environment
+        .push(("UMBRA_FIX_243_PROBE_PHASE".into(), phase.into()));
+    if let Some(trigger) = case
+        .strip_prefix("fix-243-inserted-")
+        .or_else(|| case.strip_prefix("fix-243-acquired-"))
+        .or_else(|| case.strip_prefix("fix-243-policy-"))
+    {
+        spawn
+            .provider_environment
+            .push(("UMBRA_FIX_243_PROBE_TRIGGER".into(), trigger.into()));
+    }
+    let socket = spawn
+        .evidence
+        .parent()
+        .unwrap()
+        .join(format!("{}.sock", case.trim_start_matches("fix-243-")));
+    match std::fs::remove_file(&socket) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove stale probe socket {}: {error}", socket.display()),
+    }
+    let listener = UnixListener::bind(&socket).unwrap();
+    spawn.provider_environment.push((
+        "UMBRA_FIX_243_PROBE_SOCKET".into(),
+        socket.to_str().unwrap().into(),
+    ));
+    let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
+    let mut pollfd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: a single initialized pollfd; a zero-timeout check, no wait. The
+    // run has ended, so any probe connection would already be queued.
+    let polled = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    std::fs::remove_file(&socket).unwrap();
+    assert!(polled >= 0, "probe socket poll failed");
+    let reached = polled != 0;
+    let exact = routed.run.status != Some(0)
+        && routed.run.stderr.contains(SLATE_SPAWN_PROFILE_REFUSAL)
+        && !routed.run.stderr.contains("finished:")
+        && routed.object("records.pre").is_some()
+        && ["records.child", "records.done", "child.txt", "parent.txt"]
+            .iter()
+            .all(|name| routed.object(name).is_none())
+        && !reached;
+    slate_record(
+        &spawn,
+        if exact {
+            "EXACT KNOWN REFUSAL"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({
+            "diagnostic": SLATE_SPAWN_PROFILE_REFUSAL,
+            "spawn_profile": "unqualified",
+            "probe_reached": reached,
+            "run_id": routed.run.run_id.0.to_string(),
+        }),
+    );
+    assert!(!reached, "the probe was reached under a profile refusal");
+    assert!(exact, "{}", routed.run.stderr);
+    // The cleanup oracle of the qualified body: nothing outlived the run.
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+    let first = cleanup.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with("cleanup CLEAN")
+            && first.contains("group_kills=0")
+            && first.contains("zombies=\"\""),
+        "{cleanup}"
+    );
+    if spawn.guardian {
+        let census = std::fs::read_to_string(spawn.evidence.join("routed.census.jsonl")).unwrap();
+        assert!(
+            census.contains("SESSION_READING"),
+            "guardian session was not observed"
+        );
+        let mut complete = false;
+        for entry in std::fs::read_dir(spawn.evidence.join("guardian")).unwrap() {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            for line in text.lines() {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                if record["event"] == "sweep" {
+                    assert_eq!(record["outcome"], "COMPLETE", "{record}");
+                    assert!(
+                        record["owned_alive"].as_array().is_some_and(Vec::is_empty),
+                        "{record}"
+                    );
+                    complete = true;
+                }
+            }
+        }
+        assert!(complete, "guardian COMPLETE sweep record missing");
+    }
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
 fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRouted {
     let (host, port) = fixture().expect("live Ganesha required; no skipped qualification");
     let workspace = spawn.scratch.path().join("workspace");
@@ -10350,12 +10973,22 @@ fn slate_c11_02_empty_actions() {
 /// C11-02, attributes only: an initialized, empty attribute object.
 #[test]
 fn slate_c11_02_empty_attributes() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("c11-02-attributes");
+        return;
+    }
     slate_spawn_shape("c11-02-attributes", true);
 }
 
 /// C11-02, both objects initialized and empty.
 #[test]
 fn slate_c11_02_empty_both() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("c11-02-both");
+        return;
+    }
     slate_spawn_shape("c11-02-both", true);
 }
 
@@ -10403,6 +11036,11 @@ fn fix_243_signal(mode: &str, child_record: &str, flags: &str) {
 
 #[test]
 fn fix_243_sigpipe_default() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-sigdefault");
+        return;
+    }
     fix_243_signal(
         "fix-243-sigdefault",
         "child-signal default=1 ignored=0 blocked=1",
@@ -10412,6 +11050,11 @@ fn fix_243_sigpipe_default() {
 
 #[test]
 fn fix_243_sigpipe_mask() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-sigmask");
+        return;
+    }
     fix_243_signal(
         "fix-243-sigmask",
         "child-signal default=0 ignored=1 blocked=0",
@@ -10503,19 +11146,39 @@ fn fix_243_pipe(mode: &str) {
 
 #[test]
 fn fix_243_inherit_cloexec_kernel_fd() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-inherit-cloexec");
+        return;
+    }
     fix_243_pipe("fix-243-inherit-cloexec");
 }
 #[test]
 fn fix_243_close_before_dup_cloexec_default() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-close-before-dup");
+        return;
+    }
     fix_243_pipe("fix-243-close-before-dup");
 }
 #[test]
 fn fix_243_dup_before_close_cloexec_default() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-dup-before-close");
+        return;
+    }
     fix_243_pipe("fix-243-dup-before-close");
 }
 
 #[test]
 fn fix_243_kernel_pipe_actions() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-pipe");
+        return;
+    }
     fix_243_pipe("fix-243-pipe");
 }
 
@@ -10542,6 +11205,24 @@ fn fix_243_second_thread_null_spawn() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_distinct_parent_backing_overlap() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal_in(
+            "fix-243-overlap",
+            "fix-243-overlap",
+            &[
+                ("UMBRA_FIX_243_REGION_TRACE", "1"),
+                ("UMBRA_FIX_243_OVERLAP_PARENTS", "2"),
+            ],
+            false,
+            |root| {
+                assert!(std::fs::read_to_string(root.join("records.done"))
+                    .unwrap()
+                    .contains("completed=2"));
+            },
+        );
+        return;
+    }
     let Some(mut spawn) = slate_spawn("fix-243-overlap") else {
         return;
     };
@@ -10598,6 +11279,24 @@ fn fix_243_distinct_parent_backing_overlap() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_provider_region_cap() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal_in(
+            "fix-243-cap",
+            "fix-243-cap",
+            &[
+                ("UMBRA_FIX_243_REGION_TRACE", "1"),
+                ("UMBRA_FIX_243_OVERLAP_PARENTS", "17"),
+            ],
+            true,
+            |root| {
+                assert!(std::fs::read_to_string(root.join("records.done"))
+                    .unwrap()
+                    .contains("completed=17"));
+            },
+        );
+        return;
+    }
     let Some(mut spawn) = slate_spawn("fix-243-cap") else {
         return;
     };
@@ -10706,21 +11405,149 @@ fn fix_243_region_fault(fault: &str) {
     slate_finish_cleanup();
 }
 
+/// #205: a packed spawn refused while a sibling fork is still in its window.
+/// The root forks a first child, which spawns with `POSIX_SPAWN_SETSID` (refused
+/// on every profile), and at once a second child. The probe
+/// `UMBRA_FIX_205_FORK_WINDOW_HOLD` keeps the second fork in its window, its
+/// child unenrolled and spinning at the return gate, until the refusal tears
+/// the run down. The refusal must be exact, and nothing may outlive umbra:
+/// cleanup clean with no group kill and no zombie.
+#[cfg(feature = "mutation-probe-spawn-lifecycle")]
+#[test]
+fn fix_205_refusal_with_an_unenrolled_fork_child() {
+    let Some(mut spawn) = slate_spawn("fix-205-fork-window") else {
+        return;
+    };
+    let (root, native) = slate_spawn_native(&spawn, "fix-205-fork-window");
+    assert!(native.status.success(), "native control: {}", native.status);
+    assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("fork-window spawn result=0 completed=2"));
+    spawn
+        .provider_environment
+        .push(("UMBRA_FIX_205_FORK_WINDOW_HOLD".into(), "1".into()));
+    let routed = slate_spawn_routed(&spawn, "fix-205-fork-window", &["child.txt"]);
+    let diagnostic = if spawn_profile_qualified() {
+        "spawn unsupported attribute SETSID"
+    } else {
+        SLATE_SPAWN_PROFILE_REFUSAL
+    };
+    let cleanup = std::fs::read_to_string(spawn.evidence.join("routed.cleanup")).unwrap();
+    let first = cleanup.lines().next().unwrap_or_default();
+    let held = routed.run.stderr.contains("fork-window-hold parent=");
+    // The second fork really produced a child that stayed unenrolled in its
+    // window: the teardown found it by parentage and ended it.
+    let swept = routed
+        .run
+        .stderr
+        .contains("unenrolled fork child ended: pid=");
+    let exact = routed.run.status != Some(0)
+        && routed.run.stderr.contains(diagnostic)
+        && !routed.run.stderr.contains("cleanup also failed")
+        && !routed.run.stderr.contains("finished:")
+        && routed.object("records.pre").is_some()
+        && ["records.child", "records.done", "child.txt"]
+            .iter()
+            .all(|name| routed.object(name).is_none());
+    let clean = first.starts_with("cleanup CLEAN")
+        && first.contains("group_kills=0")
+        && first.contains("zombies=\"\"");
+    slate_record(
+        &spawn,
+        if held && swept && exact && clean {
+            "EXACT KNOWN REFUSAL"
+        } else {
+            "NOT QUALIFIED"
+        },
+        serde_json::json!({
+            "diagnostic": diagnostic, "fork_window_held": held,
+            "unenrolled_child_swept": swept, "cleanup": first,
+            "run_id": routed.run.run_id.0.to_string(),
+        }),
+    );
+    assert!(
+        held,
+        "the probe never held a fork window:\n{}",
+        routed.run.stderr
+    );
+    assert!(
+        swept,
+        "no unenrolled fork child was found in the held window:\n{}",
+        routed.run.stderr
+    );
+    assert!(exact, "{}", routed.run.stderr);
+    assert!(clean, "something outlived umbra: {cleanup}");
+    slate_spawn_finish(&spawn, &routed);
+    slate_finish_cleanup();
+}
+
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_region_allocation_failure() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal_in(
+            "fix-243-region-allocate",
+            "c11-02-attributes",
+            &[
+                ("UMBRA_FIX_243_REGION_TRACE", "1"),
+                ("UMBRA_FIX_243_REGION_FAULT", "allocate"),
+            ],
+            true,
+            |root| {
+                assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+            },
+        );
+        return;
+    }
     fix_243_region_fault("allocate");
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_region_write_failure() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal_in(
+            "fix-243-region-write",
+            "c11-02-attributes",
+            &[
+                ("UMBRA_FIX_243_REGION_TRACE", "1"),
+                ("UMBRA_FIX_243_REGION_FAULT", "write"),
+            ],
+            true,
+            |root| {
+                assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
+            },
+        );
+        return;
+    }
     fix_243_region_fault("write");
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_region_success_error_cycles() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal_in(
+            "fix-243-region-cycles",
+            "fix-243-region-cycles",
+            &[("UMBRA_FIX_243_REGION_TRACE", "1")],
+            false,
+            |root| {
+                assert_eq!(
+                    std::fs::read_to_string(root.join("records.done"))
+                        .unwrap()
+                        .matches("success=0")
+                        .count(),
+                    8
+                );
+            },
+        );
+        return;
+    }
     let Some(mut spawn) = slate_spawn("fix-243-region-cycles") else {
         return;
     };
@@ -10789,6 +11616,11 @@ fn fix_243_region_success_error_cycles() {
 
 #[test]
 fn fix_243_same_parent_threads() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-threads");
+        return;
+    }
     let Some(spawn) = slate_spawn("fix-243-threads") else {
         return;
     };
@@ -10806,11 +11638,21 @@ fn fix_243_same_parent_threads() {
 
 #[test]
 fn fix_243_cloexec_default_prunes_logical_descriptors() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-cloexec");
+        return;
+    }
     fix_243_pipe("fix-243-cloexec");
 }
 
 #[test]
 fn fix_243_kernel_error_then_success() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-error-recovery");
+        return;
+    }
     fix_243_pipe("fix-243-error-recovery");
 }
 
@@ -10852,6 +11694,11 @@ fn fix_243_refusal(mode: &str, diagnostic: &str) {
 
 #[test]
 fn fix_243_refuses_setsid() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-setsid");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-setsid",
         "spawn unsupported attribute SETSID",
@@ -10859,6 +11706,11 @@ fn fix_243_refuses_setsid() {
 }
 #[test]
 fn fix_243_refuses_setpgroup() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-setpgroup");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-setpgroup",
         "spawn unsupported attribute SETPGROUP",
@@ -10866,6 +11718,11 @@ fn fix_243_refuses_setpgroup() {
 }
 #[test]
 fn fix_243_refuses_resetids() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-resetids");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-resetids",
         "spawn unsupported attribute RESETIDS",
@@ -10873,6 +11730,11 @@ fn fix_243_refuses_resetids() {
 }
 #[test]
 fn fix_243_refuses_fileport_dup2() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-fileport");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-fileport",
         "spawn unsupported action FILEPORT_DUP2",
@@ -10880,14 +11742,29 @@ fn fix_243_refuses_fileport_dup2() {
 }
 #[test]
 fn fix_243_refuses_open() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-open");
+        return;
+    }
     fix_243_refusal("fix-243-refuse-open", "spawn unsupported action OPEN");
 }
 #[test]
 fn fix_243_refuses_chdir() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-chdir");
+        return;
+    }
     fix_243_refusal("fix-243-refuse-chdir", "spawn unsupported action CHDIR");
 }
 #[test]
 fn fix_243_refuses_late_chdir() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-late-chdir");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-late-chdir",
         "spawn unsupported action CHDIR",
@@ -10895,10 +11772,20 @@ fn fix_243_refuses_late_chdir() {
 }
 #[test]
 fn fix_243_refuses_fchdir() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-fchdir");
+        return;
+    }
     fix_243_refusal("fix-243-refuse-fchdir", "spawn unsupported action FCHDIR");
 }
 #[test]
 fn fix_243_refuses_virtual_before_chdir() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-virtual-before-chdir");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-virtual-before-chdir",
         "spawn virtual descriptor action",
@@ -10906,6 +11793,11 @@ fn fix_243_refuses_virtual_before_chdir() {
 }
 #[test]
 fn fix_243_refuses_chdir_before_virtual() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-chdir-before-virtual");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-chdir-before-virtual",
         "spawn unsupported action CHDIR",
@@ -10913,6 +11805,11 @@ fn fix_243_refuses_chdir_before_virtual() {
 }
 #[test]
 fn fix_243_refuses_virtual_source() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-virtual-source");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-virtual-source",
         "spawn virtual descriptor action",
@@ -10920,6 +11817,11 @@ fn fix_243_refuses_virtual_source() {
 }
 #[test]
 fn fix_243_refuses_virtual_destination() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("fix-243-refuse-virtual-destination");
+        return;
+    }
     fix_243_refusal(
         "fix-243-refuse-virtual-destination",
         "spawn virtual descriptor action",
@@ -11269,30 +12171,55 @@ fn fix_243_provider_loss_null_reading() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_registered_attach_failure() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-attach-error", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading("fix-243-attach-error", "c11-02-attributes", false, b'E');
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_completion_copyout_failure() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-copyout-error", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading("fix-243-copyout-error", "c11-02-attributes", false, b'E');
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_completion_free_failure() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-free-error", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading("fix-243-free-error", "c11-02-attributes", false, b'E');
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_completion_register_failure() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-register-error", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading("fix-243-register-error", "c11-02-attributes", false, b'E');
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_inserted_deadline() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-inserted-deadline", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-inserted-deadline",
         "c11-02-attributes",
@@ -11304,6 +12231,11 @@ fn fix_243_inserted_deadline() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_inserted_session_drop() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-inserted-session-drop", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-inserted-session-drop",
         "c11-02-attributes",
@@ -11315,6 +12247,11 @@ fn fix_243_inserted_session_drop() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_inserted_backend_drop() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-inserted-backend-drop", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-inserted-backend-drop",
         "c11-02-attributes",
@@ -11326,6 +12263,11 @@ fn fix_243_inserted_backend_drop() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_inserted_terminate() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-inserted-terminate", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-inserted-terminate",
         "c11-02-attributes",
@@ -11337,6 +12279,11 @@ fn fix_243_inserted_terminate() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_inserted_watchdog() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-inserted-watchdog", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-inserted-watchdog",
         "c11-02-attributes",
@@ -11365,18 +12312,33 @@ fn fix_243_unregistered_packed_reading() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_policy_before_ready_failure() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-policy-error", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading("fix-243-policy-error", "c11-02-attributes", false, b'E');
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_policy_watchdog() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-policy-watchdog", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading("fix-243-policy-watchdog", "c11-02-attributes", false, b'E');
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_acquired_deadline() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-acquired-deadline", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-acquired-deadline",
         "c11-02-attributes",
@@ -11388,6 +12350,11 @@ fn fix_243_acquired_deadline() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_acquired_session_drop() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-acquired-session-drop", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-acquired-session-drop",
         "c11-02-attributes",
@@ -11399,6 +12366,11 @@ fn fix_243_acquired_session_drop() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_acquired_backend_drop() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-acquired-backend-drop", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-acquired-backend-drop",
         "c11-02-attributes",
@@ -11410,6 +12382,11 @@ fn fix_243_acquired_backend_drop() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_acquired_terminate() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-acquired-terminate", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-acquired-terminate",
         "c11-02-attributes",
@@ -11421,6 +12398,11 @@ fn fix_243_acquired_terminate() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_acquired_watchdog() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-acquired-watchdog", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-acquired-watchdog",
         "c11-02-attributes",
@@ -11820,6 +12802,11 @@ fn race_alternations(bytes: &[u8]) -> usize {
 /// never composition support.
 #[test]
 fn slate_c11_10_e8_pipe_refusal() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        slate_spawn_profile_refusal("c11-10");
+        return;
+    }
     let Some(spawn) = slate_spawn("c11-10") else {
         return;
     };
@@ -12511,6 +13498,7 @@ fn c13_launch(
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
+    let zombie_window = slate_zombie_window();
     SLATE_CENSUS_EVIDENCE
         .with(|slot| *slot.borrow_mut() = Some(evidence.with_extension("census.jsonl")));
     std::fs::write(evidence.with_extension("census.jsonl"), "").unwrap();
@@ -12628,14 +13616,36 @@ fn c13_launch(
     // The ledger's stdin is closed here, so a fixture still waiting for an
     // acknowledgment reads EOF rather than blocking past its own process.
     drop(watched.input.take());
-    let grace = Instant::now() + Duration::from_secs(5);
+    let mut grace_budget = Duration::from_secs(5);
     if timed_out || census_error.is_some() {
+        // #205: end the run debugger-last before the group kill, and give the
+        // cleanup census room for the guardian's own drain and sweep in SID 1.
+        let SlateDrain {
+            debuggers,
+            cap,
+            exceeded,
+            census_error: drain_error,
+        } = slate_debugger_last(&mut child, group, &mut run_session);
+        grace_budget = grace_budget.max(slate_cleanup_budget(debuggers));
+        slate_census_event(
+            "DRAIN",
+            &format!(
+                "debuggers={debuggers} cap={cap:?} exceeded={exceeded} census_error={drain_error:?} grace={grace_budget:?}"
+            ),
+        );
+        eprintln!(
+            "{}: #205 drain: D={debuggers} cap={cap:?} exceeded={exceeded} census_error={drain_error:?} cleanup grace={grace_budget:?}",
+            evidence.display()
+        );
         // SAFETY: this child was launched as leader of its own process group.
         unsafe {
             libc::kill(-(group as i32), libc::SIGKILL);
             group_kills += 1;
         }
     }
+    let mut grace = Instant::now() + grace_budget;
+    // A timed-out or census-failed run was already drained debugger-last.
+    let mut drained = timed_out || census_error.is_some();
     let mut status = status;
 
     let mut pipes: [Option<Vec<u8>>; 2] = [None, None];
@@ -12717,6 +13727,28 @@ fn c13_launch(
             ));
             break;
         }
+        // #205 (D-A): a run that exited on its own but left members is ended
+        // debugger-last too: drain first (3 s + 4 s per debugserver, the same
+        // cap), then read again before any kill. Its grace pauses meanwhile.
+        if slate_drain_before_kill(drained, status.is_some(), live.len(), escaped.len()) {
+            drained = true;
+            let started = Instant::now();
+            let drain = slate_drain(
+                |bound| slate_run_members(group, bound, &mut run_session),
+                slate_traced,
+                Duration::from_secs(3),
+                Duration::from_secs(4),
+            );
+            grace += started.elapsed();
+            slate_census_event(
+                "DRAIN",
+                &format!(
+                    "normal-exit debuggers={} cap={:?} exceeded={} census_error={:?}",
+                    drain.debuggers, drain.cap, drain.exceeded, drain.census_error
+                ),
+            );
+            continue;
+        }
         slate_census_event(
             "PROGRESS",
             "poll/reap direct child, drain pipes and signal survivors with grace remaining",
@@ -12763,6 +13795,12 @@ fn c13_launch(
     drop(buffered);
     std::fs::write(evidence.with_extension("stdout"), &output.stdout).unwrap();
     std::fs::write(evidence.with_extension("stderr"), &output.stderr).unwrap();
+    let launchd_zombies = slate_launchd_zombies(zombie_window);
+    if !launchd_zombies.is_empty() && cleanup_failure.is_none() {
+        cleanup_failure = Some(format!(
+            "cleanup FAILED: launchd-parented zombies of this case (#205): {launchd_zombies:?}"
+        ));
+    }
     if let Some(error) = cleanup_failure {
         slate_census_event(
             if error.contains("UNMEASURABLE") {
@@ -16314,6 +17352,11 @@ fn fix_227_sibling_progress_without_kernel_wait_proof() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_policy_deadline() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-policy-deadline", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading("fix-243-policy-deadline", "c11-02-attributes", false, b'E');
 }
 
@@ -16358,6 +17401,11 @@ fn fix_271_shutdown_journal_and_inheritance() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_policy_session_drop() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-policy-session-drop", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-policy-session-drop",
         "c11-02-attributes",
@@ -16369,6 +17417,11 @@ fn fix_243_policy_session_drop() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_policy_backend_drop() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-policy-backend-drop", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-policy-backend-drop",
         "c11-02-attributes",
@@ -16380,18 +17433,33 @@ fn fix_243_policy_backend_drop() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_policy_terminate() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-policy-terminate", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading("fix-243-policy-terminate", "c11-02-attributes", false, b'E');
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_guardian_provider_loss() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-guardian-loss", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading("fix-243-guardian-loss", "c11-02-attributes", false, b'P');
 }
 
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_guardian_unregistered() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-guardian-unregistered", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-guardian-unregistered",
         "c11-02-attributes",
@@ -16403,6 +17471,11 @@ fn fix_243_guardian_unregistered() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_guardian_copyout_failure_loss() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-guardian-copyout-failure-loss", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-guardian-copyout-failure-loss",
         "c11-02-attributes",
@@ -16414,6 +17487,11 @@ fn fix_243_guardian_copyout_failure_loss() {
 #[cfg(feature = "mutation-probe-spawn-lifecycle")]
 #[test]
 fn fix_243_guardian_free_failure_loss() {
+    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
+    if !spawn_profile_qualified() {
+        fix_243_fault_profile_refusal("fix-243-guardian-free-failure-loss", "c11-02-attributes");
+        return;
+    }
     fix_243_fault_reading(
         "fix-243-guardian-free-failure-loss",
         "c11-02-attributes",

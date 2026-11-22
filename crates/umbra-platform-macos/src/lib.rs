@@ -63,7 +63,17 @@ pub struct Options {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod owner;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use owner::OwnerIdentity;
+pub use owner::{keep_lifetime_with_owner, OwnerIdentity};
+
+/// Whether this host's packed-spawn ABI is the qualified profile: exactly the
+/// predicate `capture_spawn` refuses on (`spawn_host::qualify`), read-only.
+/// A seam for the userspace suite's profile-conditional cases (#205, #247);
+/// the backend never calls it.
+#[doc(hidden)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn spawn_profile_qualified() -> bool {
+    spawn_host::qualify().is_ok()
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod clock;

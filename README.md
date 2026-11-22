@@ -67,7 +67,11 @@ skipping. It requires debugger permission. Its jobs run in launchd's session,
 where `umbra run` moves the run into a session of its own
 ([umbra-isolation](crates/umbra-isolation/README.md), #193), so the same job also
 runs the isolation suites with `UMBRA_REQUIRE_SID1=1`: a session other than
-launchd's fails them instead of skipping. The
+launchd's fails them instead of skipping. Both self-hosted jobs also count the
+runner user's zombies whose parent is launchd, at their first and last step,
+and fail on any zombie or live process a run leaves behind (#205): such a
+zombie is never collected and stays until a reboot. The count is per user, so
+a local run on that host during a job is counted too. The
 NFS-backed CLI matrices (`nfs_fixture_matrix` and `nfs_utility_matrix`) are
 opted out of CI via `UMBRA_TEST_SKIP_NFS_MATRIX` because the current storage-nfs
 adapter needs a real NFSv4 kernel mount and macOS Sequoia/Tahoe blocks that path

@@ -66,6 +66,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <libproc.h>
 #include <mach-o/dyld.h>
 #include <poll.h>
 #include <pwd.h>
@@ -76,6 +77,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/proc_info.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -551,6 +553,59 @@ static int kill_session(pid_t sid, long long before, FILE *out, pid_t spare) {
     return killed;
 }
 
+/* #205: wait until session `sid` holds no live debugserver, no traced member
+ * and no live platform provider, capped at 3 s + 4 s per debugserver seen at
+ * the first reading (the platform's worst case, emergency path included).
+ * The provider tears its sessions down in order once its owner is gone; a
+ * sweep that ends a debugserver while its program is held hands the program
+ * to launchd as a zombie nobody collects. Returns the debugservers seen at the
+ * first readable census (0 if none was readable). */
+static int drain_session(pid_t sid) {
+    /* 3 s + 4 s until a readable census gives the debugserver count. */
+    long long start = now_us(), cap = start + 7000000LL;
+    int first = -1, unreadable = 0;
+    for (;;) {
+        size_t n = 0;
+        struct row *rows = table(&n);
+        int readable = rows != NULL, debuggers = 0, waiting = 0;
+        if (!readable) {
+            /* A census that cannot be read is never "nothing to wait for":
+             * keep waiting to the cap, and report it below. */
+            unreadable++;
+            waiting = 1;
+        }
+        for (size_t i = 0; rows && i < n; i++) {
+            struct row *r = &rows[i];
+            if (r->sid != sid || r->stat == 5 /* SZOMB */)
+                continue;
+            if (!strcmp(r->comm, "debugserver")) {
+                debuggers++;
+                waiting = 1;
+                continue;
+            }
+            /* ucomm is cut at 16 characters: umbra-platform-macos. */
+            if (!strcmp(r->comm, "umbra-platform-m"))
+                waiting = 1;
+            struct proc_bsdinfo b;
+            if (proc_pidinfo(r->pid, PROC_PIDTBSDINFO, 0, &b, sizeof b) == (int)sizeof b &&
+                (b.pbi_flags & PROC_FLAG_TRACED))
+                waiting = 1;
+        }
+        free(rows);
+        if (readable && first < 0) {
+            first = debuggers;
+            cap = start + (3 + 4 * (long long)(debuggers > 0 ? debuggers : 1)) * 1000000LL;
+        }
+        if (!waiting || now_us() >= cap) {
+            if (unreadable)
+                fprintf(stderr, "ISO DRAIN census_unreadable=%d reached_cap=%d\n", unreadable,
+                        waiting);
+            return first < 0 ? 0 : first;
+        }
+        usleep(20000);
+    }
+}
+
 /* Write the argv of every debugserver in session `sid` to `path`, one line
  * each (read-only; `ps` prints the argv of a process this user owns). */
 static void debugserver_args(pid_t sid, const char *path) {
@@ -756,7 +811,9 @@ static int pty_main(int argc, char **argv) {
         }
     }
     if (transcript) fclose(transcript);
-    sleep(1);
+    /* #205: give the run's own ordered teardown its time instead of a fixed
+     * second, then count survivors. */
+    drain_session(m);
     /* M is unreaped, so its session id cannot be reused: everything in it is
      * this harness's. Count survivors (live, non-zombie) and kill them. */
     char kpath[1024];

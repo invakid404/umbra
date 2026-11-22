@@ -341,6 +341,27 @@ pub const TRACED_STUBS: &[(&str, u64, Delivery)] = &[
     ("close", 6, Delivery::Namespace),
 ];
 
+/// Raw-stub names a [`TRACED_STUBS`] row may also be found under (#205).
+///
+/// On macOS 27.2.1 `fchmodat` stopped being the stub: it is a C wrapper that
+/// calls `__fchmodat` (up to three times, retrying with masked flags when the
+/// first call fails) and carries no `svc` of its own, while `__fchmodat` holds
+/// `movz x16, #467; svc #0x80` at +0/+4. Older hosts have `fchmodat` as the
+/// stub.
+///
+/// Every candidate, the row's own name and its aliases, that `dlsym` finds and
+/// whose scan verifies the row's number gets a breakpoint, and the row fails
+/// the launch only if none does. Preferring the alias alone would be unsafe on
+/// a host where both names are separate stubs: calls to the public name would
+/// then reach the kernel without a breakpoint. Each candidate's `svc` is still
+/// verified against the row's number, so an alias can never plant a breakpoint
+/// that `intercept` would dispatch as a different call.
+///
+/// Breaking on `__fchmodat` also catches libsystem-internal callers of the raw
+/// call, which on older hosts reached the `fchmodat` stub only if they called
+/// it by its public name.
+pub const TRACED_STUB_ALIASES: &[(&str, &str)] = &[("fchmodat", "__fchmodat")];
+
 /// What `intercept()` must do with a breakpointed syscall number, or `None` for
 /// a number no stub in [`TRACED_STUBS`] issues.
 ///

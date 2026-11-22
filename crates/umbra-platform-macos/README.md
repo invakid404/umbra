@@ -86,10 +86,13 @@ Exact owned-child collection is distinct from descendant exit accounting:
 Shutdown freezes admissions and destroys the backend on its original thread.
 A separate transport thread serves bounded polls from snapshots and emits Final
 only after all owner destruction. Existing session teardown, tracer/root reap
-and retirement windows determine the owner envelope; polling never restarts
-them. Synchronous kernel calls and cooperative watchdog cancellation/join assume
-kernel-call completion. An envelope overrun fails closure rather than claiming
-successful cleanup. No session-age, inactivity or cancellation policy is added.
+and retirement windows determine the owner envelope, plus the unenrolled
+fork-child sweep (100 ms + 1 s, added once) when any fork window is open at the
+freeze and nothing otherwise; no reservation is admitted after the freeze, so no
+window opens later. Polling never restarts them. Synchronous kernel calls and
+cooperative watchdog cancellation/join assume kernel-call completion. An
+envelope overrun fails closure rather than claiming successful cleanup. No
+session-age, inactivity or cancellation policy is added.
 
 The shared monitor stores a typed terminal cause. Genuine explicit deadline
 expiry reports operation `watchdog`; owner loss, monitor failure and panic
@@ -168,6 +171,14 @@ Probe controls are listed under [Provider binary](#provider-binary).
   and `tracer_pids()` the live sessions' debugserver pids. Both are read-only,
   `#[doc(hidden)]` seams for the acceptance tests; the backend never consults
   them.
+- `keep_lifetime_with_owner()` installs the provider's no-op handler for
+  SIGHUP, SIGINT, SIGQUIT and SIGTERM, only where the process inherited their
+  default action (#205; "Signals" under the provider binary). The provider
+  binary calls it before its handshake.
+- `spawn_profile_qualified()` answers whether this host's packed-spawn ABI is
+  the qualified profile, by the exact predicate packed-spawn capture refuses
+  on. It is a read-only, `#[doc(hidden)]` seam for the userspace suite's
+  profile-conditional cases (#247); the backend never calls it.
 <!-- /memoria:section -->
 
 <!-- memoria:section id="shipped-mechanisms" files="src/interpose.rs src/rsp.rs src/native.rs src/abi.rs src/cache.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->
@@ -434,7 +445,7 @@ continuing with an inert one.
 | `symlinkat` | 474 | `symlinkat` | x0 target, x1 dirfd, x2 name | `FsOp::Symlink` |
 | `mkdirat` | 475 | `mkdirat` | x0 dirfd, x1 path, x2 mode | `FsOp::Mkdir` |
 | `faccessat` | 466 | `faccessat` | x0 dirfd, x1 path, x2 mode, x3 flags | `FsOp::Access` |
-| `fchmodat` | 467 | `fchmodat` | x0 dirfd, x1 path, x2 mode, x3 flags | `FsOp::Chmod` |
+| `fchmodat` | 467 | `fchmodat`, `__fchmodat` (each that holds the verified `svc`) | x0 dirfd, x1 path, x2 mode, x3 flags | `FsOp::Chmod` |
 | `fchownat` | 468 | `fchownat` | x0 dirfd, x1 path, x2 uid, x3 gid, x4 flags | `FsOp::Fchownat` |
 | `fstatat` | 469 | `__fstatat` | x0 dirfd, x1 path, x2 buffer, x3 flags | `FsOp::Stat` |
 | `fstatat64` | 470 | `fstatat` | same layout | `FsOp::Stat` |
@@ -489,7 +500,16 @@ planted fell through to the interceptor's refusal and stopped the run. Stub
 names are the ones that actually carry the `svc`, and the number beside each is
 **verified against the resolved symbol on every launch** rather than trusted —
 `install()` reads the `movz x16, #imm` preceding the `svc` and refuses to plant
-a breakpoint if it disagrees. Several have no `__`-prefixed form; `unlinkat`'s public wrapper
+a breakpoint if it disagrees. A row may also name raw-stub aliases
+(`abi::TRACED_STUB_ALIASES`): on macOS 27.2.1 `fchmodat` is a wrapper that calls
+`__fchmodat`, up to three times with progressively masked flags, and carries no
+`svc` of its own. Every candidate whose scan verifies the row's number gets a
+breakpoint, so a host where both names are separate stubs loses neither, and the
+row fails the launch only if no candidate verifies. Breaking on `__fchmodat` also
+catches libsystem-internal callers of the raw call, which older hosts reached only
+through the public name; each retry the wrapper makes is routed as its own call,
+so the routed answer must be the host's errno for the wrapper to behave as it does
+natively. Several have no `__`-prefixed form; `unlinkat`'s public wrapper
 carries its own `svc` instead of tail-calling `__unlinkat`, so both are
 installed. `fstatat` and `fstatat64` are **one symbol reaching 470**, while
 `__fstatat` is a separate stub reaching 469 — libc's `fstatat()` does not reach
@@ -630,7 +650,8 @@ exposed that; the raw-`svc` leg with high bits set in `x2` guards it.
 <!-- memoria:section id="provider-binary" files="src/main.rs" guidance="../../docs/guides/reviewing-provider-binary.md" -->
 ## Provider binary
 
-`src/main.rs` is the shipped provider binary. It captures its parent identity,
+`src/main.rs` is the shipped provider binary. It calls
+`keep_lifetime_with_owner()` (below, "Signals"), captures its parent identity,
 accepts the `macos` handshake, installs the owner watch, and calls
 `umbra_platform::provider::serve_session` with a
 `PlatformSession { control: MacosTraceBackend, abi: DarwinArm64Abi }`.
@@ -662,6 +683,7 @@ phase selector defaults as listed when a probe socket is supplied:
 | `UMBRA_FIX_243_OVERLAP_PARENTS` | Holds 2–17 distinct parents before kernel execution and verifies their backing before release; the production cap refuses the seventeenth token. |
 | `UMBRA_FIX_243_OWNER_TRACE` | Reports retained Session identities at teardown entry. |
 | `UMBRA_FIX_271_MISSING_FINAL` | Any set value reports preliminary termination failure and withholds Final after owner destruction. |
+| `UMBRA_FIX_205_FORK_WINDOW_HOLD` | Any set value stops polling a session that opens a fork while another session exists, for at most 10 s, so that fork's child stays unenrolled in its return window across a sibling's teardown; reports `fork-window-hold parent=<pid>`. |
 
 The socket acknowledgment continues (`C`), injects the selected failure (`E`),
 or exits the provider without Drop (`P`). These controls belong to the fixture
@@ -744,10 +766,47 @@ with `TerminationPolicy::Immediate`. Supervised closure then uses
 `BeginShutdown` and bounded `PollShutdown` replies, validates Final, and collects
 the provider process before recording completion.
 
-Termination tears each session down in order, children first (#186):
+Termination first ends every fork child the platform has not enrolled yet
+(#205). A fork entry opens a return window: the platform writes a
+branch-to-self at the return gate, reserves the child's ledger slot and resumes
+the parent, and the child spins at that gate, running and untraced, until the
+parent's fork return is processed and enrolls it. A termination that comes
+first (another session's refused spawn) used to leave that child running after
+umbra, and its slot reserved, so the run ended unconfirmed and
+recovery-required. Now, before any root is ended, each open window's child is
+found by parentage (a live child of the session that no enrolled session
+matches by pid and birth, after one settle of up to 100 ms, shared by every
+parent, for a fork still in the kernel). Its pid and birth go on the
+reservation from one read taken right before the signal, which must still show
+the parent's child with the birth the census read; otherwise it is not
+signalled and its slot is unconfirmed. (The parent cannot reap it meanwhile: a
+fork needs a single-threaded parent, and that thread is held in the fork or at
+its return gate.) Every untraced child is SIGKILLed, and then all of them share
+one wait, bounded at 1 s: each is confirmed once a lookup shows no process at
+its pid, another birth there, or a zombie of its birth; a failed lookup is
+never taken as its end. The sweep's worst case is therefore 1.1 s whatever the
+number of open windows, which is what the owner envelope adds for it. A traced
+one is left to its debugger, debugger-last. Whatever cannot be confirmed is
+marked unconfirmed with a diagnostic naming the child, its parent and its
+state, and `terminate` then fails with that diagnostic beside any session
+failure (its callers read `Ok` as confirmed termination); a drop, which has no
+result, settles it through its reservation. Each outcome is also logged on
+stderr (`unenrolled fork child ended: pid=… of pid=… birth=…`, or `unconfirmed
+…`). The sweep covers fork windows only. A spawn's window (its child created
+suspended and untraced until the parent's return enrols it) is not swept yet;
+such a child would stay suspended after umbra, and its slot names itself as
+unconfirmed (#205 follow-up).
+
+Termination then tears each session down in order, children first (#186):
+- continue its debugserver (SIGCONT, unconditionally while it is unreaped: a
+  stopped debugserver never answers `k`, and a reaped one's pid may already
+  name another process), recording `TracerContinued` when it was stopped
+  (#205);
 - send RSP `k` to its debugserver;
 - wait for a barrier proving the tracee has passed its exit accounting:
-  - a zombie with its attach-time start identity;
+  - a zombie with its attach-time start identity, under any parent but
+    launchd (#205: a zombie under launchd, still there after a 50 ms settle,
+    is never evidence);
   - a reap by this process, or by its traced parent;
   - no process at the pid, or a different process at it (a reused pid). The
     pid stays hashed until the process is reaped, so either proves the tracee
@@ -755,12 +814,40 @@ Termination tears each session down in order, children first (#186):
     (`ReapedProven` / `TracerReportedExit`);
 - only then kill and reap debugserver.
 
-Killing debugserver first lets the kernel hand a half-exited tracee to launchd
-without job-control accounting, which orphans the run's process group with
-SIGHUP when it shares launchd's session. Since #193, `umbra run` started in
-launchd's session moves the whole run into a session of its own
-([umbra-isolation](../umbra-isolation/README.md)), so such an exit can no longer
-be counted against a group in launchd's session.
+**Killing debugserver while it holds its tracee hands the tracee to launchd as a
+zombie nobody collects (#205).** A held tracee (at an intercepted call, or with a
+kill or exit pending) does not start exiting while it is held; on macOS 27.2.1
+`task_terminate` returns `KERN_FAILURE` for it. Debugserver's death releases the
+hold before debugserver's own exit walks its children. If the tracee starts
+exiting in that gap, the walk finds it no longer traced and hands it to launchd
+with its original parent still recorded (xnu-12377.121.6 `kern_exit.c:2278`,
+`:2610-2614`). Its exit then notifies launchd (`:2748`, `:2779`) rather than
+being reaped by the kernel (`:2784-2817`). launchd never waits for it, and its
+original parent's `waitpid` gets ECHILD, so it stays until a reboot and counts
+against the user's `kern.maxprocperuid`. The same exit does no job-control
+accounting, which orphaned the run's process group with SIGHUP in launchd's
+session (#186); since #193 an `umbra run` there moves the whole run into a
+session of its own ([umbra-isolation](../umbra-isolation/README.md)).
+
+So only debugserver ends a held tracee, through `k`, and debugserver is ended
+only once the barrier confirms. Every umbra-owned sweep is debugger-last
+([umbra-isolation](../umbra-isolation/README.md#cleanup-and-ownership)): it ends
+the supervisor first, drains until no debugserver and no traced member is live
+(capped at 3 s + 4 s per debugserver, recorded as `drain_exceeded` when
+reached), and only then sweeps.
+
+**Signals.** In a terminal the provider and debugserver are members of the
+run's job, so a hangup, ^C, ^\ or `kill -pgid` reaches both.
+- The provider installs a no-op `SA_RESTART` handler for SIGHUP, SIGINT, SIGQUIT
+  and SIGTERM where it inherited their default action. It ends with its owner,
+  not the terminal: when the supervisor ends, the drop runs this ordered
+  teardown. An inherited ignore (`nohup`, a background command of a
+  non-interactive shell) is kept. A caught handler resets at `execve`, so the
+  program starts with the dispositions it would have natively.
+- debugserver ends on SIGINT, SIGQUIT and SIGTERM (it handles only SIGPIPE and
+  SIGHUP), so it is started with those three ignored. The program is spawned by
+  the provider, not by debugserver, and never inherits them. SIGTSTP stops
+  debugserver with the job, and the teardown's SIGCONT continues it.
 
 The `k` plus the barrier is bounded at 1.5 s per session, and each reap at
 250 ms (at most 2 s per session). On a timeout the provider writes
@@ -771,38 +858,65 @@ and runs one post-kill barrier inside the 250 ms tracer reap:
   unconfirmed and no retirement failure is retained.
 - **Still unconfirmed:** `Terminate` returns the warning as its error. If final
   shutdown cannot confirm every obligation, the run is left recovery-required.
+- **Handed to launchd:** a root the provider did not collect once its
+  debugserver was gone, or a tracee found as a zombie under launchd, is
+  unconfirmed and named in the error (#205). The tracer kill on this path is the
+  last resort for a debugserver that is hung rather than stopped (#205 R3); it
+  can leave such a zombie, and `Terminate` fails rather than reporting success.
 
-Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome, or
+Set `UMBRA_TEARDOWN_LOG` to log every session's barrier outcome (and any
+`task_terminate` result other than success), or
 `UMBRA_RSP_LOG` to log sent packets and received bytes to stderr. Both are off
 when unset and enabled by any value. `UMBRA_DEBUGSERVER` overrides debugger
 discovery when `Options.debugserver` is absent; `HOME` supplies the default
 twin and interposer cache roots when `Options.twin_cache` is absent.
 
-The timeout path is still reachable by ordinary failure paths, not only abnormal
-ones. A session whose debugserver neither confirms the exit nor answers `k`
-within the bound gets there, and in launchd's session the #186 race can recur on
-it. The tests pin these cases:
+The timeout path is still reachable, by a debugserver that is hung (not just
+stopped, which the SIGCONT handles) or already dead. The tests pin these cases:
 - a live child whose root has exited now confirms without a warning;
-- an unresponsive or dead debugserver takes the timeout path, and the post-kill
-  result must match the tracee's end state: past its exit means
-  `ConfirmedAfterTracerKill` and `Ok`, a tracee still live means `Err`, and an
-  end state the test cannot read (a lookup error other than ESRCH) fails the
-  test. Measured, both are confirmed after the kill.
+- a stopped debugserver is continued and confirms before the tracer kill;
+- a dead debugserver takes the timeout path, and the post-kill result must
+  match the tracee's end state: past its exit means `ConfirmedAfterTracerKill`
+  and `Ok`, a tracee still live means `Err`, and an end state the test cannot
+  read (a lookup error other than ESRCH) fails the test.
 
-These paths can still hand a tracee to launchd uncounted:
-- the timeout path above;
-- a tracer crash while its tracee is mid-exit (the crash itself, before
-  `Terminate`);
-- provider death;
-- `SIGKILL` or other cancellation that bypasses `Terminate` and drop;
-- the attach/connect failure fallback, whose tracer kill is not shown safe.
+**Residuals (#205), each tracked in #205.** These can still leave a tracee to
+launchd as a zombie nobody collects:
+- **R1:** debugserver ended by SIGKILL (or a signal whose disposition umbra
+  cannot set) while its tracee is held. This is kernel behaviour with no
+  software fix: the kernel decides inside debugserver's own exit. It includes a
+  tracer crash while its tracee is held, and the attach/connect failure
+  fallback's tracer kill.
+- **R2:** the provider ended by a fatal signal (SIGKILL, or one it does not
+  handle) while its tracee is held. Measured once on macOS 27.2.1 (#205):
+  debugserver, having lost its connection, ends the tracee by itself
+  (`QSetDetachOnError:0`) and exits about 2 s later, but finishes exiting
+  while the tracee is still mid-exit, so the tracee is left to launchd. #198's
+  1 s observation of a debugserver still holding the tracee is the start of
+  that window. One trigger is umbra's own: the supervisor's platform client,
+  when dropped, closes the connection and SIGKILLs the provider at once
+  (`umbra-core`'s `Client::drop`). Its normal end does not reach that drop
+  while anything is held: it waits for the provider's `Final`. A shutdown
+  error before `Final` (the envelope deadline, a transport error) or a panic
+  while a session is live does, and is R2.
+- **R3:** a hung or slow debugserver on the timeout path; the kill can hand
+  its tracee to launchd, and `Terminate` fails and names it. Slow includes a
+  debugserver still inside its own kill of a running tracee: it first stops
+  the tracee with SIGSTOP and waits up to 2 s for that stop, then sends
+  `PT_KILL` and waits up to 1 s more (LLVM `MachProcess::Kill`,
+  `MachProcess::DoSIGSTOP`), longer than the 1.5 s per-session bound.
+  On CI, `sid1_p1`'s child, a running tracee whose debugserver was not the
+  stopped one, timed out on this path: its `k` was still unconfirmed after
+  1.5 s with the child running, and it was confirmed after the kill.
+  Debugserver's own kill path fits that reading from source; the cause in
+  that run is not established.
 
-In launchd's session they no longer reach any group there: #193 runs the whole
-run in a session of its own, with session 1 regression tests for the first four
-(`umbra-cli`'s `tests/isolation.rs`). The remote platform provider now detects
-supervisor death independently through its owner monitor. Provider death and
-unconfirmed teardown remain separate limits; a monitor inside the provider
-cannot survive that provider's death.
+`SIGKILL` or other cancellation that bypasses `Terminate` and drop reaches R1 or
+R2. In launchd's session none of these reaches a group there: #193 runs the
+whole run in a session of its own, with session 1 regression tests
+(`umbra-cli`'s `tests/isolation.rs`). The remote platform provider detects
+supervisor death independently through its owner monitor; a monitor inside the
+provider cannot survive that provider's death.
 
 `tests/provider_ipc.rs` exercises the socketpair handshake and real `open-libc`
 capture through these requests, including stopped and running quiescence.
@@ -932,10 +1046,44 @@ tracer was reaped and that no child of the test process remains.
 | Test | Pass bar |
 |---|---|
 | `teardown_confirms_exit_before_killing_tracer` | `terminate` returns `Ok`; steps `KillSent`, a confirmed barrier, then `TracerKilled`; no warning; tracer and tracee both reaped |
-| `teardown_times_out_on_unresponsive_tracer` | debugserver stopped with `SIGSTOP`; the timeout path runs in 1.5–2.5 s and the warning step precedes `TracerKilled`. Exactly one post-kill step follows the kill: `ConfirmedAfterTracerKill` with `terminate` returning `Ok`, or `UnconfirmedAfterTracerKill` with `Err` containing `tracee termination unconfirmed; tracer killed`. The step must match the tracee's end state as `terminate` returns: a zombie with the attach identity, nothing at the pid (ESRCH), or a reused pid requires `ConfirmedAfterTracerKill`; the attached process still live requires `UnconfirmedAfterTracerKill`; any other lookup failure fails the test |
-| `teardown_reports_dead_tracer_without_waiting` | debugserver killed first; the timeout path runs in under 1 s, after a `KillSendFailed` or `ConnectionClosed` step; the warning precedes `TracerKilled`; the same post-kill split as above |
+| `teardown_times_out_on_unresponsive_tracer` | debugserver stopped with `SIGSTOP` (#205 re-pin): `TracerContinued`, then a confirmed barrier, then `TracerKilled`; no warning, no timeout, under 1.5 s; `terminate` returns `Ok`; tracer and tracee both reaped; no launchd-parented zombie |
+| `teardown_reports_dead_tracer_without_waiting` | the root first proved running (`--spin`: `p_stat` SRUN and CPU time advancing), then debugserver killed (#205 reshape: a held root would be handed to launchd, R1); the timeout path runs in under 1 s, after a `KillSendFailed` or `ConnectionClosed` step; the warning precedes `TracerKilled`; exactly one post-kill step, `ConfirmedAfterTracerKill` with `Ok` or `UnconfirmedAfterTracerKill` with `Err`, matching the tracee's end state as `terminate` returns; the root handed back and reaped (`TraceeReaped(true)`); no launchd-parented zombie |
 | `teardown_confirms_a_live_orphaned_child_without_warning` | `--mt-spawn` stopped at the root's `Exit`, with the traced child live; `terminate` returns `Ok`; no report timed out; the child's barrier is confirmed before `TracerKilled` (`ReapedProven`, or `Zombie`); a stop reply is followed directly by `KillResent` |
 | `teardown_confirms_a_live_child_while_its_root_is_alive` | `--mt-spawn` stopped at the `Child` event; `terminate` returns `Ok`; both reports confirm with no warning |
+
+Each of the five also counts launchd-parented zombies of `umbra-test-child`
+started in its window, or at its recorded pids, and fails on any (#205). The
+count is the shared `tests/zombies/mod.rs`, which `tests/lifetime_signals.rs`
+uses too. A `ps` that fails is reported as an entry (no reading), so the case
+fails rather than reading as no zombies.
+
+Further #205 coverage:
+- `native::tests::a_tracee_handed_to_launchd_is_never_confirmed` and
+  `native::tests::the_teardown_opens_by_continuing_its_tracer` are pure units.
+  `native::tests::a_reaped_tracer_is_never_continued` pins that the
+  prologue never signals a reaped tracer's pid (a stopped process standing in
+  for its reuse stays stopped) and still continues an unreaped stopped one.
+  `native::tests::an_unreadable_fork_child_is_never_confirmed_gone` and
+  `native::tests::a_retired_sessions_pid_never_hides_a_fork_child` pin the
+  fork-child sweep's end and identity rules;
+  `native::tests::the_fork_sweep_waits_once_for_every_child` pins its one
+  shared wait (17 children, one bound, on a scripted clock), and
+  `native::tests::an_open_fork_window_is_budgeted_in_the_shutdown_allowance`
+  pins that the frozen envelope adds that worst case once with any window open
+  and nothing with none; `native::tests::an_unconfirmed_fork_child_fails_termination`
+  pins that such a child fails `terminate`, and
+  `native::tests::a_fork_child_is_signalled_only_while_it_is_still_the_census_child`
+  pins the parentage and birth check before the signal.
+- `rsp::tests::debugserver_ignores_terminal_signals` reads a live
+  debugserver's ignored signals (no program attached) and sends each.
+- `tests/lifetime_signals.rs` sends the provider SIGHUP, SIGINT, SIGQUIT and
+  SIGTERM with a live owner, then during a teardown, and pins that a launched
+  program keeps the caller's ignored dispositions (each case sets SIGHUP and
+  SIGINT explicitly, ignored or default, so neither inherits the test's own).
+- `native_debugger_last_hands_the_program_back` is the native control
+  (`experiments/fixtures/umbra-fix-205-exitwin.c`, the orderings that leave
+  nothing behind only).
+- `fchmodat_traced_matches_native` runs `fchmodat` traced and natively.
 
 `native::tests::the_teardown_barrier_decides_from_report_identity_and_lookup`
 is the barrier's decision table. It is a pure unit test that needs no
@@ -1353,8 +1501,10 @@ RSP retains connect/request/poll caps. These bound individual operations, not a
 healthy session's lifetime. Owner loss during work not released by task termination
 (such as a signing subprocess or connect) can wait for that operation's budget.
 A direct in-process backend has no external owner watch; its containing process's
-SIGKILL cannot run Rust cleanup. Provider/group/guardian-loss residuals in #198,
-#199 and #202 remain; this does not implement #268's public cancellation API.
+SIGKILL cannot run Rust cleanup. The provider survives SIGHUP, SIGINT, SIGQUIT and
+SIGTERM from a terminal or a process-group kill and ends with its owner (#205).
+Provider loss to SIGKILL (#205 R2), and the guardian-loss residuals in #199 and
+#202, remain; this does not implement #268's public cancellation API.
 
 CI runs `owner_loss` only with `UMBRA_INTEGRATION_REQUIRED` on self-hosted
 native-qualification. The default-options 35-second native/routed control is

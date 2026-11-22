@@ -129,10 +129,14 @@ impl Task {
         }
         Ok(())
     }
-    fn kill(&self) {
-        unsafe {
-            libc::task_terminate(self.0);
-        }
+    /// `task_terminate`, returning its result. Measured on macOS 27.2.1
+    /// (#205): it does not end a tracee its debugger holds at an exception
+    /// (it returns `KERN_FAILURE`, 5, and the tracee stays traced and not
+    /// exiting); only the debugger's release lets an exit run.
+    #[must_use]
+    fn kill(&self) -> i32 {
+        // SAFETY: an owned task port; no memory is passed.
+        unsafe { libc::task_terminate(self.0) }
     }
 }
 impl Drop for Task {
@@ -175,7 +179,7 @@ trait KillOwned {
 }
 impl KillOwned for Arc<Task> {
     fn kill_owned(&self) {
-        self.kill();
+        let _ = self.kill();
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,7 +305,7 @@ impl Watchdog {
             .iter()
             .rev()
         {
-            task.kill();
+            let _ = task.kill();
         }
     }
     fn replace(&self, old: &Arc<Task>, new: Arc<Task>) {
@@ -1230,53 +1234,9 @@ impl Session {
         // reads to decide what to do when one of these breakpoints fires. One
         // table, two gates -- see that table for why it exists.
         for (name, number, _) in abi::TRACED_STUBS {
-            let name_c = cstr(name.as_bytes())?;
-            let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name_c.as_ptr()) };
-            if ptr.is_null() {
-                return Err(error("symbol", format!("missing {name}")));
+            for site in traced_stub_sites(name, *number)? {
+                self.breakpoint(site, false)?;
             }
-            // Strip arm64e function pointer authentication; only inspect local executable memory.
-            let start = (ptr as u64) & 0x0000_ffff_ffff_ffff;
-            let mut code = [0; 96];
-            let me = Task(unsafe { mach_task_self() }, None);
-            let result = me.read(start, &mut code);
-            std::mem::forget(me);
-            result?;
-            let words = code.as_chunks::<4>().0;
-            let offset = words
-                .iter()
-                .position(|b| *b == [1, 16, 0, 212])
-                .ok_or_else(|| error("symbol", format!("no svc in {name}")))?;
-            // **Verify the table's number against this host before planting the
-            // breakpoint.** The stub's `svc` is preceded by a `movz x16, #imm`
-            // that sets the syscall number, and that immediate -- not this
-            // table -- is what the kernel will act on. `intercept()` dispatches
-            // on the number, so a row whose number is wrong for this libc plants
-            // a breakpoint whose firing is dispatched as something else, or
-            // refused outright. Checking it here turns that into a launch
-            // failure naming the symbol, rather than a run that dies at an
-            // arbitrary later instruction.
-            //
-            // The *last* `movz x16` before the `svc` is the operative one:
-            // `__fork` carries its `svc` at +16 and `unlinkat` at +48, with
-            // setup instructions in between.
-            let carried = words[..offset]
-                .iter()
-                .rev()
-                .find_map(|word| {
-                    let instruction = u32::from_le_bytes(*word);
-                    // `movz x16, #imm16, lsl #0`: sf=1 opc=10 100101 hw=00, Rd=16.
-                    (instruction & 0xffe0_001f == 0xd280_0010)
-                        .then(|| u64::from((instruction >> 5) & 0xffff))
-                })
-                .ok_or_else(|| error("symbol", format!("no syscall number in {name}")))?;
-            if carried != *number {
-                return Err(error(
-                    "symbol",
-                    format!("{name} issues syscall {carried}, not the {number} umbra traces it as"),
-                ));
-            }
-            self.breakpoint(start + offset as u64 * 4, false)?;
         }
         let main = main_image_base(&self.loaded_images()?)?;
         self.install_image(main)?;
@@ -1756,6 +1716,92 @@ impl Session {
         Ok(())
     }
 }
+/// The address of the `svc` each [`abi::TRACED_STUBS`] row breakpoints, read
+/// from this process's own copy of libsystem_kernel (the shared cache is
+/// system-wide on this native host, so the address is the tracee's too).
+///
+/// A row with [`abi::TRACED_STUB_ALIASES`] resolves every candidate name whose
+/// scan verifies and breakpoints each; it fails only if none verifies, and
+/// then reports every candidate's failure.
+fn traced_stub_sites(name: &str, number: u64) -> Result<Vec<u64>> {
+    let aliases = abi::TRACED_STUB_ALIASES
+        .iter()
+        .filter(|(row, _)| *row == name)
+        .map(|(_, alias)| *alias);
+    let mut sites = Vec::new();
+    let mut failures = Vec::new();
+    for candidate in std::iter::once(name).chain(aliases) {
+        match traced_stub_site(candidate, number) {
+            Ok(site) if !sites.contains(&site) => sites.push(site),
+            Ok(_) => {}
+            Err(e) => failures.push(e),
+        }
+    }
+    match (sites.is_empty(), failures.len()) {
+        (false, _) => Ok(sites),
+        (true, 1) => Err(failures.remove(0)),
+        (true, _) => Err(error(
+            "symbol",
+            failures
+                .iter()
+                .map(|e| e.context.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )),
+    }
+}
+
+/// Scan one symbol for its `svc` and verify the syscall number it issues.
+fn traced_stub_site(name: &str, number: u64) -> Result<u64> {
+    let name_c = cstr(name.as_bytes())?;
+    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name_c.as_ptr()) };
+    if ptr.is_null() {
+        return Err(error("symbol", format!("missing {name}")));
+    }
+    // Strip arm64e function pointer authentication; only inspect local executable memory.
+    let start = (ptr as u64) & 0x0000_ffff_ffff_ffff;
+    let mut code = [0; 96];
+    let me = Task(unsafe { mach_task_self() }, None);
+    let result = me.read(start, &mut code);
+    std::mem::forget(me);
+    result?;
+    let words = code.as_chunks::<4>().0;
+    let offset = words
+        .iter()
+        .position(|b| *b == [1, 16, 0, 212])
+        .ok_or_else(|| error("symbol", format!("no svc in {name}")))?;
+    // **Verify the table's number against this host before planting the
+    // breakpoint.** The stub's `svc` is preceded by a `movz x16, #imm`
+    // that sets the syscall number, and that immediate -- not this
+    // table -- is what the kernel will act on. `intercept()` dispatches
+    // on the number, so a row whose number is wrong for this libc plants
+    // a breakpoint whose firing is dispatched as something else, or
+    // refused outright. Checking it here turns that into a launch
+    // failure naming the symbol, rather than a run that dies at an
+    // arbitrary later instruction.
+    //
+    // The *last* `movz x16` before the `svc` is the operative one:
+    // `__fork` carries its `svc` at +16 and `unlinkat` at +48, with
+    // setup instructions in between.
+    let carried = words[..offset]
+        .iter()
+        .rev()
+        .find_map(|word| {
+            let instruction = u32::from_le_bytes(*word);
+            // `movz x16, #imm16, lsl #0`: sf=1 opc=10 100101 hw=00, Rd=16.
+            (instruction & 0xffe0_001f == 0xd280_0010)
+                .then(|| u64::from((instruction >> 5) & 0xffff))
+        })
+        .ok_or_else(|| error("symbol", format!("no syscall number in {name}")))?;
+    if carried != number {
+        return Err(error(
+            "symbol",
+            format!("{name} issues syscall {carried}, not the {number} umbra traces it as"),
+        ));
+    }
+    Ok(start + offset as u64 * 4)
+}
+
 /// Load address of the tracee's main executable (`MH_EXECUTE`).
 fn main_image_base(images: &[serde_json::Value]) -> Result<u64> {
     images
@@ -1832,7 +1878,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.done && self.live.is_some() {
-            self.task.kill();
+            let _ = self.task.kill();
         }
         // Every backend path tears its sessions down in order first, children
         // before parents (`MacosTraceBackend::tear_down_sessions`). This only
@@ -1878,6 +1924,10 @@ pub struct MacosTraceBackend {
     /// the tree, so a descendant execing the same image breakpoints the same trap
     /// sites. See `Session::interposer`.
     interposer: Option<(PathBuf, PathBuf, u32)>,
+    /// Test-only (#205): a session whose stops are not polled until the
+    /// instant, so a fork it opened stays in its window across a teardown.
+    #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+    fork_window_hold: Option<(usize, Instant)>,
     _affine: PhantomData<Rc<()>>,
 }
 impl Default for MacosTraceBackend {
@@ -1909,6 +1959,8 @@ impl MacosTraceBackend {
             owner: None,
             generation: 0,
             interposer: None,
+            #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+            fork_window_hold: None,
             _affine: PhantomData,
         }
     }
@@ -2303,7 +2355,7 @@ impl MacosTraceBackend {
         if self.deadline.is_some_and(|d| crate::clock::now() >= d) {
             for s in &self.sessions {
                 if let Some(live) = &s.live {
-                    live.task.kill();
+                    let _ = live.task.kill();
                 }
             }
             return Err(error("watchdog", "session timed out"));
@@ -2701,7 +2753,7 @@ impl MacosTraceBackend {
                 // boundary: the caller would have no handle to terminate it with.
                 for session in &self.sessions {
                     if let Some(live) = &session.live {
-                        live.task.kill();
+                        let _ = live.task.kill();
                     }
                 }
                 self.tear_down_sessions();
@@ -3208,6 +3260,18 @@ impl MacosTraceBackend {
                 s.task.read(pc + 4, &mut original)?;
                 restore.insert(pc + 4, original);
                 s.return_stop(thread, ReturnKind::Fork { restore })?;
+                // Test-only (#205): hold a fork opened while another session
+                // exists in its window, so a sibling's refusal tears the run
+                // down while this fork's child is still unenrolled.
+                #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                if self.sessions.len() > 1
+                    && std::env::var_os("UMBRA_FIX_205_FORK_WINDOW_HOLD").is_some()
+                {
+                    let pid = self.sessions[index].id.0.native_id;
+                    eprintln!("fork-window-hold parent={pid}");
+                    self.fork_window_hold =
+                        Some((index, crate::clock::now() + Duration::from_secs(10)));
+                }
             }
             Some(abi::Delivery::Wait) => {
                 let wanted = get(&regs, 0)? as i32;
@@ -3727,18 +3791,30 @@ fn reap_launched_child(pid: i32) -> bool {
 
 // ---- Ordered teardown (#186; cause-gate ruling F1-revised, R2, R3) ----
 //
-// **Why the order matters.** A debugger-held tracee cannot finish exiting while
-// its debugserver holds it: `task_terminate` only aborts its threads
-// (xnu-12377.121.6 `osfmk/kern/task.c:3063-3094`, `thread_act.c:285-320`). So
-// killing debugserver both releases the tracee's exit and runs debugserver's
-// own exit concurrently. If debugserver's child loop reaches the tracee after
-// the tracee's `proc_prepareexit` cleared `P_LTRACED` (`kern_exit.c:2278`), the
-// tracee goes to launchd through the untraced branch, which does no job-control
-// accounting (`kern_exit.c:2610-2614`, `proc_reparentlocked` `:3549-3594`). The
-// tracee's own `fixjobc` (`kern_exit.c:2505`) then counts launchd as a
-// qualifying parent whenever the run's process group is in launchd's session,
-// takes `pg_jobc` from 1 to 0 and `orphanpg` sends SIGHUP+SIGCONT to the whole
-// group, supervisor included (`kern_proc.c:3203-3211`, `:3321-3383`).
+// **Why the order matters.** A debugger-held tracee does not start exiting while
+// its debugserver holds it: a SIGKILL, another thread's `_exit` and
+// `task_terminate` all wait, and on macOS 27.2.1 `task_terminate` returns
+// KERN_FAILURE for it (#205, measured natively). Killing debugserver releases
+// the hold before debugserver's own child loop runs. If the tracee then starts
+// exiting (an exit was pending, or it was held at a breakpoint and traps again)
+// before that loop reaches it, its `proc_prepareexit` has cleared `P_LTRACED`
+// (`kern_exit.c:2278`) and the loop takes the untraced branch: launchd becomes
+// its parent with `p_oppid` still set (`kern_exit.c:2610-2614`). Two things
+// follow:
+// - **#205:** the tracee's exit takes the notify-the-parent branch because of
+//   `p_oppid` (`kern_exit.c:2748`, SZOMB `:2773`, SIGCHLD to launchd `:2779`),
+//   not the kernel's system reap (`:2784-2817`). launchd never waits for it and
+//   its original parent's `waitpid` gets ECHILD, so it stays a zombie until a
+//   reboot. `barrier_decision` therefore never counts a zombie under launchd.
+// - **#186:** the untraced branch does no job-control accounting
+//   (`proc_reparentlocked` `:3549-3594`). The tracee's own `fixjobc`
+//   (`kern_exit.c:2505`) then counts launchd as a qualifying parent whenever the
+//   run's process group is in launchd's session, takes `pg_jobc` from 1 to 0,
+//   and `orphanpg` sends SIGHUP+SIGCONT to the whole group, supervisor included
+//   (`kern_proc.c:3203-3211`, `:3321-3383`).
+//
+// The teardown therefore opens by continuing its debugserver (a stopped one
+// never answers `k`), and only debugserver ends the held tracee.
 //
 // **The order, per session.** RSP `k` over the existing connection (re-sent
 // once after a stale stop reply), then a state barrier that proves the tracee
@@ -3748,11 +3824,22 @@ fn reap_launched_child(pid: i32) -> bool {
 // **The timeout path (ruling R3 option (i), review ruling 1 V3).** If the
 // barrier does not confirm within the bound, the warning goes to stderr, the
 // tracer is killed anyway, and one post-kill barrier decides: confirmed means
-// `terminate` succeeds, still unconfirmed means it fails. In launchd's session
-// the #186 race can recur on that path. That is a residual, tracked in #193
-// together with what this code never reaches: the provider dying first, the
-// supervisor or a provider being `SIGKILL`ed, any cancellation that bypasses
+// `terminate` succeeds, still unconfirmed means it fails, and a tracee handed
+// to launchd is never confirmed. The tracer kill on this path is the last
+// resort for a hung debugserver (#205 R3): it can hand the tracee to launchd,
+// and `terminate` then fails and names it. What this code never reaches stays
+// residual (#205 R1, R2): debugserver ended by SIGKILL while its tracee is held,
+// the provider ended by a fatal signal, any cancellation that bypasses
 // `terminate`/`Drop`, and `Rsp`'s attach/connect failure fallback.
+
+/// Record a teardown's `task_terminate` result in the teardown log
+/// (`UMBRA_TEARDOWN_LOG`). Anything but success is expected for a tracee its
+/// debugger holds; the ordered teardown that follows is what ends it.
+fn record_task_terminate(pid: i32, result: i32) {
+    if result != 0 && std::env::var_os("UMBRA_TEARDOWN_LOG").is_some() {
+        eprintln!("umbra-platform-macos: task_terminate(pid={pid}) returned {result}");
+    }
+}
 
 /// Bound on the RSP `k` send and reply plus the barrier, per session. Measured
 /// replies took 16-91 ms (#186 arc, E4 K arm). With the two reap bounds, one
@@ -3764,12 +3851,20 @@ const TEARDOWN_BOUND: Duration = Duration::from_millis(1500);
 const TRACEE_REAP_BOUND: Duration = Duration::from_millis(250);
 /// `p_stat` value of a process awaiting collection (`bsd/sys/proc.h:159`).
 const SZOMB: u32 = 5;
+/// How long a zombie under launchd is given before it counts as handed to
+/// launchd uncollected (#205 A1(a)): a kernel-reaped orphan passes through
+/// SZOMB with ppid 1 on its way to the system reap.
+const LAUNCHD_ZOMBIE_SETTLE: Duration = Duration::from_millis(50);
 
 /// One barrier lookup of a pid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Lookup {
-    /// The process, with its `p_stat` and start identity.
-    Found { status: u32, start: (u64, u64) },
+    /// The process, with its `p_stat`, start identity and parent pid.
+    Found {
+        status: u32,
+        start: (u64, u64),
+        ppid: i32,
+    },
     /// `ESRCH`: no process holds this pid.
     Absent,
     /// Any other failure, or a short or unreadable record.
@@ -3844,6 +3939,7 @@ fn lookup(pid: i32) -> Lookup {
         return Lookup::Found {
             status: info.pbi_status,
             start: (info.pbi_start_tvsec, info.pbi_start_tvusec),
+            ppid: info.pbi_ppid as i32,
         };
     }
     let error = std::io::Error::last_os_error();
@@ -3854,6 +3950,257 @@ fn lookup(pid: i32) -> Lookup {
     } else {
         Lookup::Error(format!("short record: {got} of {size} bytes"))
     }
+}
+
+/// The barrier's lookup after the launchd-zombie settle (#205 A1(a)): a
+/// zombie under launchd is read once more, after `reread` waits
+/// [`LAUNCHD_ZOMBIE_SETTLE`]. A kernel-reaped orphan passes through SZOMB with
+/// ppid 1 on its way to the system reap (`kern_exit.c:2803` before `:2815`) and
+/// is then gone; one still there was handed to launchd uncollected. The
+/// settle is defensive: the system reap holds `proc_list_lock` across that
+/// window, so the transient should be all but invisible to a lookup.
+fn settled_lookup(first: Lookup, reread: impl FnOnce() -> Lookup) -> Lookup {
+    match first {
+        Lookup::Found {
+            status: SZOMB,
+            ppid: 1,
+            ..
+        } => reread(),
+        other => other,
+    }
+}
+
+/// How long the unenrolled-fork sweep waits for a fork still in the kernel to
+/// produce its child, and for a killed child to be gone or a zombie (#205).
+const UNENROLLED_FORK_SETTLE: Duration = Duration::from_millis(100);
+const UNENROLLED_FORK_BOUND: Duration = Duration::from_secs(1);
+
+/// The frozen shutdown allowance: the retirement windows already running,
+/// plus one teardown per live session, and the unenrolled fork-child sweep
+/// for `fork_windows` open fork windows (#205). No reservation is admitted
+/// after the freeze, so no window can open later.
+fn shutdown_allowance(
+    retirement: Duration,
+    live_sessions: usize,
+    fork_windows: usize,
+) -> Result<Duration> {
+    let overflow = || error("shutdown", "cleanup schedule overflow");
+    let mut remaining = retirement;
+    for _ in 0..live_sessions {
+        remaining = remaining
+            .checked_add(TEARDOWN_BOUND + rsp::TRACER_REAP_BOUND + TRACEE_REAP_BOUND)
+            .ok_or_else(overflow)?;
+    }
+    if fork_windows > 0 {
+        // One shared settle and one shared wait, whatever the count.
+        remaining = remaining
+            .checked_add(UNENROLLED_FORK_SETTLE + UNENROLLED_FORK_BOUND)
+            .ok_or_else(overflow)?;
+    }
+    Ok(remaining)
+}
+
+/// The fork windows of one live session that are still open: a fork return
+/// not yet processed, whose child's slot is reserved (#205).
+fn open_fork_windows(live: &LiveSession) -> Vec<ThreadId> {
+    live.pending
+        .iter()
+        .filter(|(_, p)| matches!(p.kind, ReturnKind::Fork { .. }) && p.creation.is_some())
+        .map(|(thread, _)| *thread)
+        .collect()
+}
+
+/// `PROC_FLAG_TRACED` in `proc_bsdinfo::pbi_flags` (`sys/proc_info.h`).
+const PROC_FLAG_TRACED: u32 = 0x2;
+
+/// The live (not zombie) children of `parent`, read-only.
+fn live_children(parent: i32) -> Vec<i32> {
+    let mut pids = [0i32; 256];
+    // SAFETY: `pids` is writable for its size in bytes.
+    let count = unsafe {
+        libc::proc_listchildpids(
+            parent,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as i32,
+        )
+    };
+    if count <= 0 {
+        return Vec::new();
+    }
+    pids[..(count as usize).min(pids.len())]
+        .iter()
+        .copied()
+        .filter(|&pid| pid > 0 && bsd_info(pid).is_some_and(|info| info.pbi_status != SZOMB))
+        .collect()
+}
+
+/// Settle an unenrolled fork child's slot as unconfirmed, naming why, and say
+/// so on stderr beside the other teardown lines (#205). Returns the
+/// diagnostic, which `terminate` also reports.
+fn unenrolled_unconfirmed(
+    tracee: &umbra_platform::shutdown::Reservation,
+    diagnostic: String,
+) -> String {
+    eprintln!("umbra-platform-macos: unconfirmed {diagnostic}");
+    let _ = tracee.unconfirmed(diagnostic.clone());
+    diagnostic
+}
+
+/// Begin ending one fork child the platform never enrolled (#205): record its
+/// identity on its ledger reservation and SIGKILL it. The parent cannot reap
+/// it meanwhile: a fork needs a single-threaded parent (`single_thread`), and
+/// that one thread is in the fork or held at its return gate while the window
+/// is open; the child itself spins at that gate. So the pid can name another
+/// process only if something else ended the child, the parent died and
+/// launchd reaped the child, and the pid was reused. The read that takes its
+/// birth right before the signal therefore must still show `parent`'s child
+/// with the birth the census read ([`unenrolled_identity`]), or nothing is
+/// signalled and the slot is unconfirmed. It is untraced unless a debugger is
+/// attaching to it; then it is
+/// left to that debugger (debugger-last: a debugger's program is ended only
+/// through it) and its slot names why it stays unconfirmed. Returns the
+/// child's birth when it was signalled; its end is awaited by
+/// [`await_unenrolled_ends`], shared with every other signalled child.
+/// Otherwise returns the diagnostic of the unconfirmed slot.
+fn signal_unenrolled_child(
+    parent: i32,
+    pid: i32,
+    census_birth: Option<(u64, u64)>,
+    tracee: &umbra_platform::shutdown::Reservation,
+) -> std::result::Result<(u64, u64), String> {
+    let Some(info) = bsd_info(pid) else {
+        return Err(unenrolled_unconfirmed(
+            tracee,
+            format!("unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"),
+        ));
+    };
+    let seen = (info.pbi_ppid, (info.pbi_start_tvsec, info.pbi_start_tvusec));
+    let birth = match unenrolled_identity(parent, census_birth, seen) {
+        Ok(birth) => birth,
+        Err(why) => {
+            return Err(unenrolled_unconfirmed(
+                tracee,
+                format!("unenrolled fork child pid={pid} of pid={parent}: {why}; not signalled"),
+            ))
+        }
+    };
+    if let Err(refused) = tracee.acquired(umbra_core::shutdown::Identity {
+        pid: Some(pid),
+        birth: Some(birth),
+    }) {
+        return Err(unenrolled_unconfirmed(
+            tracee,
+            format!(
+                "unenrolled fork child pid={pid} of pid={parent}: its identity was not recorded ({refused}); not signalled"
+            ),
+        ));
+    }
+    if info.pbi_flags & PROC_FLAG_TRACED != 0 {
+        return Err(unenrolled_unconfirmed(
+            tracee,
+            format!(
+                "unenrolled fork child pid={pid} of pid={parent}: traced but not enrolled; left to its debugger"
+            ),
+        ));
+    }
+    // SAFETY: plain libSystem call on an untraced, unreaped child of a live
+    // session; see above for why the pid names this child.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    Ok(birth)
+}
+
+/// Whether one read of a census-found fork child, `(ppid, birth)`, still names
+/// that child (#205), and its birth if so; otherwise why not.
+fn unenrolled_identity(
+    parent: i32,
+    census_birth: Option<(u64, u64)>,
+    seen: (u32, (u64, u64)),
+) -> std::result::Result<(u64, u64), String> {
+    let (ppid, birth) = seen;
+    if i64::from(ppid) != i64::from(parent) {
+        return Err(format!(
+            "no longer a child of pid={parent} (parent pid={ppid})"
+        ));
+    }
+    if census_birth.is_some_and(|census| census != birth) {
+        return Err(format!(
+            "another birth at its pid ({}.{:06}) than the census read",
+            birth.0, birth.1
+        ));
+    }
+    Ok(birth)
+}
+
+/// The fork-child sweep's one wait (#205): re-read every signalled child
+/// `(pid, birth)` until each has ended or `limit` passes, whatever the number
+/// of children, so the sweep's worst case is one bound, not one per child.
+/// Returns, per child, its ending state ([`unenrolled_child_state`]) or the
+/// last lookup taken by the limit.
+fn await_unenrolled_ends(
+    children: &[(i32, (u64, u64))],
+    limit: Instant,
+    mut lookup: impl FnMut(i32) -> Lookup,
+    now: impl Fn() -> Instant,
+    mut pause: impl FnMut(),
+) -> Vec<std::result::Result<&'static str, Lookup>> {
+    let mut ended: Vec<Option<&'static str>> = vec![None; children.len()];
+    let mut last: Vec<Lookup> = vec![Lookup::Absent; children.len()];
+    loop {
+        for (index, (pid, birth)) in children.iter().enumerate() {
+            if ended[index].is_none() {
+                let found = lookup(*pid);
+                ended[index] = unenrolled_child_state(&found, *birth);
+                last[index] = found;
+            }
+        }
+        if ended.iter().all(Option::is_some) || now() >= limit {
+            break;
+        }
+        pause();
+    }
+    ended
+        .into_iter()
+        .zip(last)
+        .map(|(state, last)| state.ok_or(last))
+        .collect()
+}
+
+/// Whether one lookup proves a SIGKILLed unenrolled fork child ended (#205):
+/// no process at its pid, a different process there (its birth replaced), or
+/// a zombie of the same birth. A failed lookup proves nothing: it is never
+/// read as disappearance.
+fn unenrolled_child_state(found: &Lookup, birth: (u64, u64)) -> Option<&'static str> {
+    match found {
+        Lookup::Absent => Some("gone"),
+        Lookup::Found { start, .. } if *start != birth => Some("gone"),
+        Lookup::Found { status, .. } if *status == SZOMB => Some("a zombie under its parent"),
+        Lookup::Found { .. } | Lookup::Error(_) => None,
+    }
+}
+
+/// A candidate unenrolled fork child: its pid and the birth the census read
+/// (`None` when unread).
+type ForkCandidate = (i32, Option<(u64, u64)>);
+
+/// A session's identity for the fork-child sweep: pid, recorded birth, and
+/// whether it still has live resources.
+type SessionIdentity = (i32, Option<(u64, u64)>, bool);
+
+/// Whether a live child of a session, with pid `pid` and birth `birth`, is an
+/// enrolled session (#205): a session with the same pid and the same birth,
+/// or, when a session recorded no birth, one that still has live resources.
+/// A retired session's pid alone never excludes a child, since that pid can
+/// have been reused by a new, unenrolled fork child.
+fn enrolled_identity(sessions: &[SessionIdentity], pid: i32, birth: Option<(u64, u64)>) -> bool {
+    sessions.iter().any(|(session, recorded, live)| {
+        *session == pid
+            && match recorded {
+                Some(recorded) => birth == Some(*recorded),
+                None => *live,
+            }
+    })
 }
 
 fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
@@ -3913,6 +4260,21 @@ fn barrier_decision(
                 lookup: ReportedExitLookup::PidReused { start: *start },
                 admitted_by: ADMITTED_REUSED,
             })
+        }
+        // #205: a zombie under launchd is never exit evidence. The kernel hands
+        // a traced program to launchd, uncollected and with its original
+        // parent left set, when its debugger finishes exiting after the
+        // program started exiting (kern_exit.c:2610-2614, `:2748`); launchd
+        // never waits for it and the original parent's `waitpid` gets ECHILD.
+        // `settled_lookup` has already re-read it once, so a kernel-reaped
+        // orphan passing through SZOMB on its way to the system reap is not
+        // judged here.
+        (Lookup::Found { status, ppid, .. }, _) if *status == SZOMB && *ppid == 1 => {
+            BarrierReading::Unconfirmed(
+                "handed to launchd uncollected: a zombie under launchd with the attach-time \
+                 identity"
+                    .into(),
+            )
         }
         (Lookup::Found { status, .. }, _) if *status == SZOMB => {
             BarrierReading::Confirmed(BarrierEvidence::Zombie)
@@ -3991,6 +4353,10 @@ pub enum BarrierReading {
 /// One step of a session's ordered teardown, in the order it happened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TeardownStep {
+    /// The tracer was stopped when its teardown began, and was continued
+    /// before `k` (#205 A1(b)). The continue is sent whether or not it was
+    /// stopped; this step records only that it was.
+    TracerContinued,
     /// RSP `k` was written.
     KillSent,
     /// No `k`: the tracer already reported the tracee's exit.
@@ -4071,6 +4437,51 @@ fn log_teardown(report: &TeardownReport) {
     }
 }
 
+/// Whether a teardown ends unconfirmed once the tracer is gone: the one
+/// post-kill reading, and for a root (the platform's own child) whether it was
+/// collected (#205 A1(a)).
+///
+/// A root not collected once its tracer is gone was not handed back: that is
+/// the shape in which the kernel gives it to launchd, and the post-kill
+/// barrier's `Zombie` reading of it was the false `Ok` #205 found.
+fn post_kill_unconfirmed(after_kill: Option<&BarrierReading>, root: bool, reaped: bool) -> bool {
+    matches!(after_kill, Some(BarrierReading::Unconfirmed(_))) || (root && !reaped)
+}
+
+/// Continue a tracer before its teardown (#205 A1(b)). `true` when it was
+/// stopped, for the record only: the continue itself is unconditional while
+/// the tracer is unreaped.
+trait ContinueTracer {
+    fn continue_tracer(&mut self) -> bool;
+}
+
+/// The teardown's first step: continue the tracer, unconditionally (harmless
+/// when it runs; no check-then-act gap), and report `TracerContinued` when it
+/// was stopped. A stopped debugserver never answers `k`, and killing it while
+/// its tracee is held at a breakpoint hands the tracee to launchd (#205).
+fn teardown_prologue(tracer: &mut impl ContinueTracer) -> Option<TeardownStep> {
+    tracer
+        .continue_tracer()
+        .then_some(TeardownStep::TracerContinued)
+}
+
+impl ContinueTracer for Rsp {
+    fn continue_tracer(&mut self) -> bool {
+        // Once reaped, the tracer's pid may already belong to another process;
+        // while unreaped, its zombie keeps the pid from being reused.
+        if crate::retirement::Tracer::already_reaped(self) {
+            return false;
+        }
+        let pid = self.tracer_pid();
+        let stopped = bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SSTOP);
+        // SAFETY: plain libSystem call on our own child; SIGCONT ends nothing.
+        unsafe {
+            libc::kill(pid, libc::SIGCONT);
+        }
+        stopped
+    }
+}
+
 impl Session {
     /// Keep the original failure and append one explicit bounded emergency attempt.
     fn finalize_failed_retirement(&mut self) {
@@ -4122,7 +4533,11 @@ impl Session {
             self.reaped = true;
             return BarrierReading::Confirmed(BarrierEvidence::ReapedByPlatform);
         }
-        barrier_decision(self.exit_report.as_deref(), self.birth, &lookup(pid))
+        let found = settled_lookup(lookup(pid), || {
+            std::thread::sleep(LAUNCHD_ZOMBIE_SETTLE);
+            lookup(pid)
+        });
+        barrier_decision(self.exit_report.as_deref(), self.birth, &found)
     }
 
     /// Tear this session down in the #186 order: RSP `k`, the barrier, and only
@@ -4139,6 +4554,9 @@ impl Session {
         let pid = self.id.0.native_id as i32;
         let tracer = self.rsp.tracer_pid();
         let mut steps = Vec::new();
+        // #205 A1(b): before `k`, and before the emergency-retirement path,
+        // which comes through here too.
+        steps.extend(teardown_prologue(&mut self.rsp));
         // R3.4: an unsendable `k`, or a connection that closes before any
         // reply, goes to the timeout path without waiting for the barrier.
         let mut abandoned: Option<String> = None;
@@ -4263,7 +4681,7 @@ impl Session {
         }
         steps.push(TeardownStep::TracerReaped(tracer_reaped));
         self.rsp.mark_torn_down();
-        let mut unconfirmed = false;
+        let post_kill = after_kill.clone();
         match after_kill {
             Some(BarrierReading::Confirmed(evidence)) => {
                 eprintln!(
@@ -4275,7 +4693,6 @@ impl Session {
             }
             Some(BarrierReading::Unconfirmed(why)) => {
                 steps.push(TeardownStep::UnconfirmedAfterTracerKill(why));
-                unconfirmed = true;
             }
             None => {}
         }
@@ -4293,6 +4710,8 @@ impl Session {
             }
             steps.push(TeardownStep::TraceeReaped(self.reaped));
         }
+        let unconfirmed =
+            post_kill_unconfirmed(post_kill.as_ref(), self.parent.is_none(), self.reaped);
         TeardownReport {
             pid,
             identity: self.birth,
@@ -4413,11 +4832,156 @@ impl MacosTraceBackend {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+    /// End every fork child the platform has not enrolled yet (#205), before
+    /// any root is ended. A fork entry opens a return window: it writes a
+    /// branch-to-self at the return gate, reserves the child's ledger slot and
+    /// resumes the parent. The child spins at that gate, running and untraced,
+    /// until the parent's fork return is processed and enrolls it. A teardown
+    /// that comes first, such as another session's refused spawn, would leave
+    /// it running after umbra and its slot reserved. Each open window's child
+    /// is found by parentage while its parent still lives (after one short
+    /// settle shared by every parent, for a fork still in the kernel), then
+    /// every child is signalled ([`signal_unenrolled_child`]) and all of them
+    /// are awaited by one shared wait ([`await_unenrolled_ends`]), so the
+    /// sweep's worst case is one settle plus one wait, which
+    /// [`shutdown_allowance`] budgets. A window whose child cannot be found
+    /// names itself as unconfirmed, never as nothing.
+    #[must_use = "an unconfirmed fork child is a cleanup failure the caller must report"]
+    fn end_unenrolled_fork_children(&mut self) -> Vec<String> {
+        let enrolled: Vec<SessionIdentity> = self
+            .sessions
+            .iter()
+            .map(|s| (s.id.0.native_id as i32, s.birth, s.live.is_some()))
+            .collect();
+        // Every session with an open window. A retired session has no live
+        // resources, so no open window.
+        let windows: Vec<(usize, i32, Vec<ThreadId>)> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, s)| {
+                let open = open_fork_windows(s.live.as_deref()?);
+                (!open.is_empty()).then_some((index, s.id.0.native_id as i32, open))
+            })
+            .collect();
+        let mut unconfirmed = Vec::new();
+        if windows.is_empty() {
+            return unconfirmed;
+        }
+        // One settle, shared by every parent, for forks still in the kernel.
+        // Each candidate with the birth the census read (`None` if unread).
+        let unenrolled = |parent: i32| -> Vec<ForkCandidate> {
+            live_children(parent)
+                .into_iter()
+                .map(|pid| {
+                    let birth =
+                        bsd_info(pid).map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec));
+                    (pid, birth)
+                })
+                .filter(|&(pid, birth)| !enrolled_identity(&enrolled, pid, birth))
+                .collect()
+        };
+        let settle = crate::clock::now() + UNENROLLED_FORK_SETTLE;
+        let found = loop {
+            let found: Vec<Vec<ForkCandidate>> = windows
+                .iter()
+                .map(|(_, parent, _)| unenrolled(*parent))
+                .collect();
+            let complete = found
+                .iter()
+                .zip(&windows)
+                .all(|(children, (_, _, open))| children.len() >= open.len());
+            if complete || crate::clock::now() >= settle {
+                break found;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        // Signal every child, keeping each reservation until it is settled.
+        let mut signalled = Vec::new();
+        for ((index, parent, open), children) in windows.into_iter().zip(found) {
+            let mut children = children.into_iter();
+            for thread in open {
+                let Some(owner) = self.sessions[index]
+                    .live
+                    .as_deref_mut()
+                    .and_then(|live| live.pending.get_mut(&thread))
+                    .and_then(|pending| pending.creation.take())
+                else {
+                    continue;
+                };
+                match children.next() {
+                    Some((pid, census_birth)) => {
+                        match signal_unenrolled_child(parent, pid, census_birth, &owner.tracee) {
+                            Ok(birth) => signalled.push((parent, pid, birth, owner)),
+                            Err(diagnostic) => unconfirmed.push(diagnostic),
+                        }
+                    }
+                    None => unconfirmed.push(unenrolled_unconfirmed(
+                        &owner.tracee,
+                        format!(
+                            "fork child of pid={parent}: none found while its fork window was open \
+                             (reserved, no identity)"
+                        ),
+                    )),
+                }
+            }
+        }
+        if signalled.is_empty() {
+            return unconfirmed;
+        }
+        // One wait, shared by every signalled child.
+        let identities: Vec<(i32, (u64, u64))> = signalled
+            .iter()
+            .map(|(_, pid, birth, _)| (*pid, *birth))
+            .collect();
+        let ends = await_unenrolled_ends(
+            &identities,
+            crate::clock::now() + UNENROLLED_FORK_BOUND,
+            lookup,
+            crate::clock::now,
+            || std::thread::sleep(Duration::from_millis(2)),
+        );
+        for ((parent, pid, birth, owner), end) in signalled.into_iter().zip(ends) {
+            match end {
+                Ok(state) => {
+                    eprintln!(
+                        "umbra-platform-macos: unenrolled fork child ended: pid={pid} of pid={parent} birth={}.{:06} ({state})",
+                        birth.0, birth.1
+                    );
+                    let _ = owner
+                        .tracee
+                        .confirm(umbra_core::shutdown::Proof::Accounted {
+                            evidence: format!("unenrolled fork child SIGKILLed: {state}"),
+                            root_owned: false,
+                            root_collected: false,
+                        });
+                }
+                Err(last) => {
+                    let state = match &last {
+                        Lookup::Error(error) => format!("unreadable ({error})"),
+                        _ => "still live".into(),
+                    };
+                    unconfirmed.push(unenrolled_unconfirmed(
+                        &owner.tracee,
+                        format!(
+                            "unenrolled fork child pid={pid} of pid={parent}: {state} {} ms after SIGKILL",
+                            UNENROLLED_FORK_BOUND.as_millis()
+                        ),
+                    ));
+                }
+            }
+        }
+        unconfirmed
+    }
     /// Run [`Session::ordered_teardown`] for every session not yet torn down,
     /// children before parents (the reverse of creation order), so a child's
     /// zombie still has its original parent to be handed back to. It does not
     /// remove the sessions; callers clear them afterwards.
     fn tear_down_sessions(&mut self) -> Vec<TeardownReport> {
+        // Paths without a result of their own settle an unconfirmed fork
+        // child through its reservation; `terminate` runs the sweep first and
+        // reports it.
+        let _ = self.end_unenrolled_fork_children();
         self.drain_retirements();
         #[cfg(feature = "mutation-probe-spawn-lifecycle")]
         if std::env::var_os("UMBRA_FIX_243_OWNER_TRACE").is_some() {
@@ -4499,12 +5063,16 @@ impl Drop for MacosTraceBackend {
     fn drop(&mut self) {
         #[cfg(feature = "shutdown-witness")]
         umbra_platform::shutdown::witness(serde_json::json!({"event": "owner-drop"}));
+        // #205: an unenrolled fork child is found by parentage, so before any
+        // root is ended. A drop has no result: an unconfirmed child is settled
+        // through its reservation (and named on stderr).
+        let _ = self.end_unenrolled_fork_children();
         if let Some(watchdog) = &self.watchdog {
             watchdog.terminate_registered();
         }
         for s in self.sessions.iter().rev() {
             if !s.done {
-                s.task.kill();
+                record_task_terminate(s.id.0.native_id as i32, s.task.kill());
             }
         }
         self.tear_down_sessions();
@@ -4608,6 +5176,13 @@ impl TraceBackend for MacosTraceBackend {
                     continue;
                 }
                 if self.sessions[i].stopped {
+                    continue;
+                }
+                #[cfg(feature = "mutation-probe-spawn-lifecycle")]
+                if self
+                    .fork_window_hold
+                    .is_some_and(|(held, until)| held == i && crate::clock::now() < until)
+                {
                     continue;
                 }
                 if let Some(reply) = self.sessions[i].rsp.poll(
@@ -4812,14 +5387,19 @@ impl TraceControl for MacosTraceBackend {
             .max()
             .unwrap_or_default()
             .max(rsp::TRACER_REAP_BOUND);
-        let mut remaining = retirement;
-        for session in self.sessions.iter().chain(self.failed_retirements.iter()) {
-            if session.live.is_some() && !session.torn_down {
-                remaining = remaining
-                    .checked_add(TEARDOWN_BOUND + rsp::TRACER_REAP_BOUND + TRACEE_REAP_BOUND)
-                    .ok_or_else(|| error("shutdown", "cleanup schedule overflow"))?;
-            }
-        }
+        let live_sessions = self
+            .sessions
+            .iter()
+            .chain(self.failed_retirements.iter())
+            .filter(|session| session.live.is_some() && !session.torn_down)
+            .count();
+        let fork_windows = self
+            .sessions
+            .iter()
+            .filter_map(|session| session.live.as_deref())
+            .map(|live| open_fork_windows(live).len())
+            .sum();
+        let remaining = shutdown_allowance(retirement, live_sessions, fork_windows)?;
         let accepted = self.ledger.freeze(nonce, remaining)?;
         Ok(umbra_platform::shutdown::Start::Local {
             accepted,
@@ -4923,7 +5503,7 @@ impl TraceControl for MacosTraceBackend {
                 // A failed interrupt/ack must not leave part of the tree running.
                 for s in &self.sessions {
                     if let Some(live) = &s.live {
-                        live.task.kill();
+                        let _ = live.task.kill();
                     }
                 }
                 return Err(e);
@@ -4958,12 +5538,15 @@ impl TraceControl for MacosTraceBackend {
         if !matches!(policy, TerminationPolicy::Immediate) {
             return Err(unsupported("graceful tree termination"));
         }
+        // #205: an unenrolled fork child is found by parentage, so before any
+        // root is ended. One it cannot confirm ended fails the termination.
+        let unenrolled = self.end_unenrolled_fork_children();
         if let Some(watchdog) = &self.watchdog {
             watchdog.terminate_registered();
         }
         for s in self.sessions.iter().rev() {
             if !s.done {
-                s.task.kill();
+                record_task_terminate(s.id.0.native_id as i32, s.task.kill());
             }
         }
         let reports = self.tear_down_sessions();
@@ -4986,21 +5569,396 @@ impl TraceControl for MacosTraceBackend {
             .filter(|r| r.unconfirmed || r.steps.iter().any(|step| matches!(step, TeardownStep::Retirement(outcome) if !outcome.success())))
             .map(TeardownReport::summary)
             .collect();
-        if !unconfirmed.is_empty() {
-            return Err(error(
-                "terminate",
-                format!(
-                    "tree cleanup failed (tracee or retired tracer): {}",
-                    unconfirmed.join("; ")
-                ),
-            ));
-        }
-        Ok(())
+        termination_result(unconfirmed, unenrolled)
     }
+}
+
+/// `terminate`'s result (#205): `Ok` only when nothing is left unconfirmed:
+/// no session report (tracee or retired tracer), and no unenrolled fork child
+/// the sweep could not confirm ended. Callers treat `Ok` as confirmed
+/// termination (the provider forgets the root; `terminate_tree` reports it).
+fn termination_result(sessions: Vec<String>, unenrolled: Vec<String>) -> Result<()> {
+    if sessions.is_empty() && unenrolled.is_empty() {
+        return Ok(());
+    }
+    let failures: Vec<String> = sessions.into_iter().chain(unenrolled).collect();
+    Err(error(
+        "terminate",
+        format!(
+            "tree cleanup failed (tracee, retired tracer or unenrolled fork child): {}",
+            failures.join("; ")
+        ),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    /// F2 (#205): every `TRACED_STUBS` row resolves to at least one verified
+    /// `svc` site in this process's own libsystem_kernel. This reads local
+    /// memory only and traces nothing, so it runs on hosted runners too.
+    ///
+    /// Failing before the macOS 27 fix: on macOS 27.2.1 `fchmodat` is a C
+    /// wrapper that calls `__fchmodat`, with no `svc` in its first 96 bytes,
+    /// so the row fails with `no svc in fchmodat` and every traced launch
+    /// fails with it.
+    #[test]
+    fn every_traced_stub_resolves_on_this_host() {
+        use super::*;
+        let mut failures = Vec::new();
+        for (name, number, _) in abi::TRACED_STUBS {
+            match traced_stub_sites(name, *number) {
+                Ok(sites) if !sites.is_empty() => {}
+                Ok(_) => failures.push(format!("{name}({number}): no site")),
+                Err(e) => failures.push(format!("{name}({number}): {e}")),
+            }
+        }
+        assert!(failures.is_empty(), "unresolved stubs: {failures:?}");
+    }
+
+    /// F1 (#205 A1(a)): a tracee found as a zombie whose parent is launchd is
+    /// never exit evidence, whatever the tracer reported. The kernel leaves
+    /// such a zombie to launchd, which never collects it, and its original
+    /// parent's `waitpid` gets ECHILD (measured natively during the design).
+    /// A zombie still under its debugger stays `Zombie` evidence.
+    ///
+    /// The settle re-reads a zombie under launchd once: a kernel-reaped orphan
+    /// passes through SZOMB with ppid 1 on its way to the system reap, and is
+    /// then `Absent`, which is the existing reaped-proven evidence.
+    ///
+    /// After the tracer kill, a root the platform did not collect is
+    /// unconfirmed, whatever the post-kill reading said (the false `Ok` the
+    /// base returned with `ConfirmedAfterTracerKill(Zombie)` then
+    /// `TraceeReaped(false)`). A child session is not the platform's to collect.
+    #[test]
+    fn a_tracee_handed_to_launchd_is_never_confirmed() {
+        use super::*;
+        let birth = Some((1_000, 7));
+        let at = |status: u32, ppid: i32| Lookup::Found {
+            status,
+            start: (1_000, 7),
+            ppid,
+        };
+        assert_eq!(
+            barrier_decision(None, birth, &at(SZOMB, 4242)),
+            BarrierReading::Confirmed(BarrierEvidence::Zombie)
+        );
+        for report in [None, Some("X09")] {
+            let reading = barrier_decision(report, birth, &at(SZOMB, 1));
+            assert!(
+                matches!(&reading, BarrierReading::Unconfirmed(why) if why.contains("handed to launchd")),
+                "report {report:?}: {reading:?}"
+            );
+        }
+        // A pid reused by another process is still proof of the reap.
+        assert!(matches!(
+            barrier_decision(
+                None,
+                birth,
+                &Lookup::Found {
+                    status: SZOMB,
+                    start: (2_000, 1),
+                    ppid: 1,
+                }
+            ),
+            BarrierReading::Confirmed(BarrierEvidence::ReapedProven { .. })
+        ));
+        // The settle: a zombie under launchd is read again; one that is gone
+        // by then was a kernel-reaped orphan.
+        assert_eq!(
+            settled_lookup(at(SZOMB, 1), || Lookup::Absent),
+            Lookup::Absent
+        );
+        assert_eq!(
+            settled_lookup(at(SZOMB, 1), || at(SZOMB, 1)),
+            at(SZOMB, 1),
+            "a zombie still under launchd after the settle stays one"
+        );
+        assert_eq!(
+            settled_lookup(at(SZOMB, 4242), || panic!(
+                "only a zombie under launchd is re-read"
+            )),
+            at(SZOMB, 4242)
+        );
+        assert_eq!(
+            settled_lookup(at(2, 1), || panic!("only a zombie is re-read")),
+            at(2, 1)
+        );
+        // After the tracer kill.
+        let zombie = BarrierReading::Confirmed(BarrierEvidence::Zombie);
+        let unconfirmed = BarrierReading::Unconfirmed("p_stat 2".into());
+        assert!(post_kill_unconfirmed(Some(&zombie), true, false));
+        assert!(post_kill_unconfirmed(None, true, false));
+        assert!(!post_kill_unconfirmed(Some(&zombie), true, true));
+        assert!(!post_kill_unconfirmed(None, true, true));
+        assert!(!post_kill_unconfirmed(Some(&zombie), false, false));
+        assert!(post_kill_unconfirmed(Some(&unconfirmed), false, false));
+        assert!(post_kill_unconfirmed(Some(&unconfirmed), true, true));
+    }
+
+    /// The mutation discriminator for #205 A1(b): the teardown opens by
+    /// continuing its tracer, unconditionally, and records `TracerContinued`
+    /// only when it was stopped. A stopped debugserver never answers `k`; a
+    /// teardown that then kills it while its tracee is held at a breakpoint
+    /// hands the tracee to launchd.
+    #[test]
+    fn the_teardown_opens_by_continuing_its_tracer() {
+        use super::*;
+        struct Fake {
+            stopped: bool,
+            continued: u32,
+        }
+        impl ContinueTracer for Fake {
+            fn continue_tracer(&mut self) -> bool {
+                self.continued += 1;
+                std::mem::replace(&mut self.stopped, false)
+            }
+        }
+        let mut stopped = Fake {
+            stopped: true,
+            continued: 0,
+        };
+        assert_eq!(
+            teardown_prologue(&mut stopped),
+            Some(TeardownStep::TracerContinued)
+        );
+        assert_eq!(stopped.continued, 1);
+        let mut running = Fake {
+            stopped: false,
+            continued: 0,
+        };
+        assert_eq!(teardown_prologue(&mut running), None);
+        assert_eq!(running.continued, 1, "the continue is unconditional");
+    }
+
+    /// #205: the prologue never signals a reaped tracer's pid, which may
+    /// already name another process; an unreaped stopped tracer is continued.
+    #[test]
+    fn a_reaped_tracer_is_never_continued() {
+        use super::*;
+        fn stop(pid: i32) {
+            // SAFETY: plain libSystem call on this test's own child.
+            unsafe { libc::kill(pid, libc::SIGSTOP) };
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while bsd_info(pid).map(|i| i.pbi_status) != Some(libc::SSTOP) {
+                assert!(std::time::Instant::now() < end, "{pid} never stopped");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let other = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        stop(other.id() as i32);
+        let mut reaped = Rsp::retirement_test();
+        reaped.retirement_reused_pid(other);
+        let pid = reaped.tracer_pid();
+        assert_eq!(teardown_prologue(&mut reaped), None);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            bsd_info(pid).map(|i| i.pbi_status),
+            Some(libc::SSTOP),
+            "the prologue signalled a reaped tracer's pid"
+        );
+        let mut live = Rsp::retirement_test();
+        live.retirement_live_child();
+        let pid = live.tracer_pid();
+        stop(pid);
+        assert_eq!(
+            teardown_prologue(&mut live),
+            Some(TeardownStep::TracerContinued)
+        );
+        let end = std::time::Instant::now() + Duration::from_secs(1);
+        while bsd_info(pid).map(|i| i.pbi_status) == Some(libc::SSTOP) {
+            assert!(
+                std::time::Instant::now() < end,
+                "a live stopped tracer was not continued"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_fork_child_is_signalled_only_while_it_is_still_the_census_child() {
+        use super::*;
+        // #205 (U-2): the read that takes the child's birth right before
+        // SIGKILL must still show the census child: `parent`'s child, with the
+        // birth the census read. Anything else is not signalled.
+        let birth = (100, 7);
+        assert_eq!(unenrolled_identity(42, Some(birth), (42, birth)), Ok(birth));
+        assert_eq!(unenrolled_identity(42, None, (42, birth)), Ok(birth));
+        let reparented = unenrolled_identity(42, Some(birth), (1, birth));
+        assert!(
+            reparented
+                .as_ref()
+                .is_err_and(|why| why.contains("no longer a child of pid=42")),
+            "{reparented:?}"
+        );
+        let replaced = unenrolled_identity(42, Some(birth), (42, (101, 0)));
+        assert!(
+            replaced
+                .as_ref()
+                .is_err_and(|why| why.contains("another birth")),
+            "{replaced:?}"
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_fork_child_fails_termination() {
+        use super::*;
+        // #205 (CR-21): an unenrolled fork child the sweep could not confirm
+        // ended is a cleanup failure, even when every session tore down: the
+        // provider and `terminate_tree` treat `Ok` as confirmed termination.
+        let child = "unenrolled fork child pid=77 of pid=42: still live 1000 ms after SIGKILL";
+        let failed = termination_result(Vec::new(), vec![child.to_owned()])
+            .expect_err("an unconfirmed fork child is not a confirmed termination");
+        assert!(failed.to_string().contains(child), "{failed}");
+        let session = "Tracee pid=42: unconfirmed";
+        let both = termination_result(vec![session.to_owned()], vec![child.to_owned()])
+            .expect_err("both kinds fail");
+        assert!(
+            both.to_string().contains(session) && both.to_string().contains(child),
+            "{both}"
+        );
+        assert!(termination_result(Vec::new(), Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn an_open_fork_window_is_budgeted_in_the_shutdown_allowance() {
+        use super::*;
+        // #205 (CR-11): the fork-child sweep runs inside the frozen shutdown
+        // envelope. Its worst case is one settle and one shared wait, once,
+        // whatever the number of open windows; with none open it adds nothing.
+        let retirement = Duration::from_millis(1500);
+        let per_session = TEARDOWN_BOUND + rsp::TRACER_REAP_BOUND + TRACEE_REAP_BOUND;
+        let none = shutdown_allowance(retirement, 3, 0).unwrap();
+        assert_eq!(
+            none,
+            retirement + per_session * 3,
+            "no window: nothing added"
+        );
+        let sweep = UNENROLLED_FORK_SETTLE + UNENROLLED_FORK_BOUND;
+        for windows in [1, 2, 17] {
+            assert_eq!(
+                shutdown_allowance(retirement, 3, windows).unwrap(),
+                none + sweep,
+                "{windows} open fork window(s): the sweep's worst case, once"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fork_sweep_waits_once_for_every_child() {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+        // #205 (CR-11): 17 signalled children (the fix-243-cap shape's parent
+        // count) share one wait. Three end along the way, the rest never do:
+        // the wait still ends at one UNENROLLED_FORK_BOUND, not one per child.
+        let birth = (100, 7);
+        let children: Vec<(i32, (u64, u64))> = (1000..1017).map(|pid| (pid, birth)).collect();
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let reads = RefCell::new(std::collections::HashMap::<i32, u32>::new());
+        let lookup = |pid: i32| {
+            let mut reads = reads.borrow_mut();
+            let n = reads.entry(pid).or_default();
+            *n += 1;
+            match (pid, *n) {
+                (1000, _) => Lookup::Absent,
+                (1001, n) if n > 5 => Lookup::Found {
+                    status: SZOMB,
+                    start: birth,
+                    ppid: 42,
+                },
+                (1002, n) if n > 50 => Lookup::Error("transient".into()),
+                _ => Lookup::Found {
+                    status: 2,
+                    start: birth,
+                    ppid: 42,
+                },
+            }
+        };
+        let ends = await_unenrolled_ends(
+            &children,
+            start + UNENROLLED_FORK_BOUND,
+            lookup,
+            || clock.get(),
+            || clock.set(clock.get() + Duration::from_millis(2)),
+        );
+        let waited = clock.get() - start;
+        assert!(
+            waited >= UNENROLLED_FORK_BOUND
+                && waited < UNENROLLED_FORK_BOUND + Duration::from_millis(5),
+            "one shared wait: {waited:?}"
+        );
+        assert_eq!(ends[0], Ok("gone"));
+        assert_eq!(ends[1], Ok("a zombie under its parent"));
+        assert_eq!(ends[2], Err(Lookup::Error("transient".into())));
+        assert!(ends[3..]
+            .iter()
+            .all(|end| matches!(end, Err(Lookup::Found { .. }))));
+        // Every child ends early: the wait returns at once.
+        let clock = Cell::new(start);
+        let ends = await_unenrolled_ends(
+            &children,
+            start + UNENROLLED_FORK_BOUND,
+            |_| Lookup::Absent,
+            || clock.get(),
+            || clock.set(clock.get() + Duration::from_millis(2)),
+        );
+        assert_eq!(clock.get(), start, "nothing left to wait for");
+        assert!(ends.iter().all(|end| *end == Ok("gone")));
+    }
+
+    /// #205: a SIGKILLed unenrolled fork child is confirmed ended only by an
+    /// absent pid, a replaced birth, or a zombie of its birth; a failed lookup
+    /// is never read as disappearance.
+    #[test]
+    fn an_unreadable_fork_child_is_never_confirmed_gone() {
+        use super::*;
+        let birth = (100, 7);
+        let at = |status: u32, start: (u64, u64)| Lookup::Found {
+            status,
+            start,
+            ppid: 42,
+        };
+        assert_eq!(unenrolled_child_state(&Lookup::Absent, birth), Some("gone"));
+        assert_eq!(
+            unenrolled_child_state(&at(2, (101, 0)), birth),
+            Some("gone")
+        );
+        assert_eq!(
+            unenrolled_child_state(&at(SZOMB, birth), birth),
+            Some("a zombie under its parent")
+        );
+        assert_eq!(unenrolled_child_state(&at(2, birth), birth), None);
+        assert_eq!(
+            unenrolled_child_state(&Lookup::Error("EPERM".into()), birth),
+            None,
+            "a failed lookup is not disappearance"
+        );
+    }
+
+    /// #205: the fork-child sweep excludes a child only when an enrolled
+    /// session has its pid and birth (or, with no recorded birth, still has
+    /// live resources). A retired session's reused pid never hides a child.
+    #[test]
+    fn a_retired_sessions_pid_never_hides_a_fork_child() {
+        use super::*;
+        let child = Some((200, 3));
+        // A retired session (no live resources) whose pid a new child reused.
+        assert!(!enrolled_identity(
+            &[(77, Some((150, 1)), false)],
+            77,
+            child
+        ));
+        assert!(!enrolled_identity(&[(77, None, false)], 77, child));
+        // The same process, enrolled.
+        assert!(enrolled_identity(&[(77, Some((200, 3)), true)], 77, child));
+        assert!(enrolled_identity(&[(77, None, true)], 77, child));
+        // Another pid.
+        assert!(!enrolled_identity(&[(78, None, true)], 77, child));
+    }
+
     #[test]
     fn retirement_failure_does_not_end_the_session() {
         use super::*;
@@ -5538,7 +6496,13 @@ mod tests {
     #[test]
     fn the_teardown_barrier_decides_from_report_identity_and_lookup() {
         let birth = Some((1_000, 7));
-        let found = |status: u32, start: (u64, u64)| Lookup::Found { status, start };
+        // Under its debugger (any parent but launchd), as the barrier sees a
+        // tracee before the hand-back.
+        let found = |status: u32, start: (u64, u64)| Lookup::Found {
+            status,
+            start,
+            ppid: 4242,
+        };
         let reported = Some("X09");
         let unconfirmed = |r: &BarrierReading| matches!(r, BarrierReading::Unconfirmed(_));
         // A done session (the tracer reported W/X).

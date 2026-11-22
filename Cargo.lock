@@ -610,6 +610,7 @@ name = "umbra-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "serde_json",
  "tempfile",
  "umbra-agent",
@@ -765,6 +766,7 @@ dependencies = [
  "umbra-journal",
  "umbra-journal-file",
  "umbra-platform",
+ "umbra-platform-macos",
  "umbra-storage",
  "uuid",
 ]

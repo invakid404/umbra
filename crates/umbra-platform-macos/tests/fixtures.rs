@@ -1,5 +1,6 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod support;
+mod zombies;
 use std::{
     collections::BTreeMap,
     os::unix::ffi::OsStrExt,
@@ -1744,6 +1745,15 @@ fn in_fresh_session(test: &str, body: impl FnOnce()) {
 /// Launch the fixture and stop at the attached, held root: the same state a
 /// refusal leaves the tracee in. `None` (skip) without the fixture variables.
 fn teardown_launch(case: &str) -> Option<(MacosTraceBackend, ProcessHandle, i32, i32)> {
+    teardown_launch_with(case, |host| vec![b"open_libc".to_vec(), bytes(host)])
+}
+
+/// [`teardown_launch`] with the fixture arguments after argv[0] chosen by the
+/// caller (given the case's host directory).
+fn teardown_launch_with(
+    case: &str,
+    arguments: impl FnOnce(&Path) -> Vec<Vec<u8>>,
+) -> Option<(MacosTraceBackend, ProcessHandle, i32, i32)> {
     let Some(fixture) = std::env::var_os("UMBRA_TEST_FIXTURE_PATH") else {
         assert!(
             std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
@@ -1761,7 +1771,9 @@ fn teardown_launch(case: &str) -> Option<(MacosTraceBackend, ProcessHandle, i32,
     let process = tracer
         .launch_experimental(LaunchSpec {
             executable: byte_path(&fixture),
-            argv: vec![bytes(&fixture), b"open_libc".to_vec(), bytes(&host)],
+            argv: std::iter::once(bytes(&fixture))
+                .chain(arguments(&host))
+                .collect(),
             environment: vec![],
             cwd: byte_path(&std::env::current_dir().unwrap()),
             policy: LaunchPolicy {
@@ -1887,6 +1899,7 @@ fn step_index(report: &TeardownReport, wanted: impl Fn(&TeardownStep) -> bool) -
 #[test]
 fn teardown_confirms_exit_before_killing_tracer() {
     in_fresh_session("teardown_confirms_exit_before_killing_tracer", || {
+        let since = zombies::now();
         let _serial = fixture_launch_lock();
         let Some((mut tracer, process, tracee, debugserver)) = teardown_launch("confirm") else {
             return;
@@ -1915,16 +1928,24 @@ fn teardown_confirms_exit_before_killing_tracer() {
         assert!(report.steps.contains(&TeardownStep::TraceeReaped(true)));
         assert!(gone(tracee) && gone(debugserver));
         assert!(no_children_left());
+        assert_no_launchd_zombie(since, &[(tracee, report.identity)]);
     });
 }
 
-/// A tracer that never answers `k` (stopped): the barrier cannot be confirmed,
-/// so after the bound the warning goes out, then the tracer is killed and
-/// reaped. `terminate`'s result follows the post-kill barrier, which must match
-/// the tracee's end state. Nothing this process owns leaks.
+/// A tracer that is stopped when the teardown begins (#205 OD4 re-pin).
+///
+/// Before #205 this was the timeout path: the stopped debugserver never answered
+/// `k`, the warning went out after the bound, and the tracer was killed while its
+/// tracee was held at a breakpoint. The kernel then handed the tracee to launchd
+/// as a zombie nobody collects (step 1 of #205 found two such zombies from this
+/// test's crate-wide runs). The platform now continues its own debugserver before
+/// `k`, so the stopped tracer answers, the barrier confirms before the tracer
+/// kill, and nothing is left. The timeout path's own coverage is the dead-tracer
+/// test below.
 #[test]
 fn teardown_times_out_on_unresponsive_tracer() {
     in_fresh_session("teardown_times_out_on_unresponsive_tracer", || {
+        let since = zombies::now();
         let _serial = fixture_launch_lock();
         let Some((mut tracer, process, tracee, debugserver)) = teardown_launch("unresponsive")
         else {
@@ -1944,48 +1965,61 @@ fn teardown_times_out_on_unresponsive_tracer() {
         let result = tracer.terminate(process, TerminationPolicy::Immediate);
         let elapsed = started.elapsed();
         let report = tracer.teardown_reports().last().unwrap().clone();
-        let end = end_state(tracee, report.identity);
         eprintln!("teardown report ({elapsed:?}): {report:?}");
-        assert!(report.timed_out);
-        let outcome = post_kill_outcome(&report, &result);
-        eprintln!("post-kill outcome: {outcome}; tracee end state: {end:?}");
-        assert_outcome_matches_end_state(outcome, &end);
-        // The bound is 1.5 s for `k` and the barrier, plus 0.25 s for each reap.
-        assert!(
-            elapsed >= std::time::Duration::from_millis(1500)
-                && elapsed <= std::time::Duration::from_millis(2500),
-            "teardown took {elapsed:?}"
-        );
-        let warning =
-            step_index(&report, |s| matches!(s, TeardownStep::Warning(_))).expect("warning");
+        eprintln!("tracee {tracee}: now {}", where_now(tracee));
+        result.expect("a stopped tracer is continued, and its teardown confirms");
+        assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
+        let continued = step_index(&report, |s| *s == TeardownStep::TracerContinued)
+            .expect("the stopped tracer was continued");
+        let confirmed = step_index(&report, |s| {
+            matches!(s, TeardownStep::Barrier(BarrierReading::Confirmed(_)))
+        })
+        .expect("confirmed barrier");
         let killed = step_index(&report, |s| *s == TeardownStep::TracerKilled).unwrap();
-        assert!(warning < killed, "the warning must precede the tracer kill");
-        assert!(matches!(
-            report.steps[warning - 1],
-            TeardownStep::Barrier(BarrierReading::Unconfirmed(_))
-        ));
-        assert!(report.steps.contains(&TeardownStep::TracerReaped(true)));
-        assert!(gone(debugserver), "tracer left behind");
-        // The tracee is ours to reap only if the kernel handed it back to us;
-        // if it went to launchd instead (the residual), it is launchd's.
-        eprintln!(
-            "tracee {tracee}: reaped by platform = {}; now {}",
-            report.steps.contains(&TeardownStep::TraceeReaped(true)),
-            where_now(tracee)
+        assert!(
+            continued < confirmed && confirmed < killed,
+            "continue, then the confirmed barrier, then the tracer kill"
         );
+        assert!(step_index(&report, |s| matches!(s, TeardownStep::Warning(_))).is_none());
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "teardown took {elapsed:?}: the bound was reached"
+        );
+        assert!(report.steps.contains(&TeardownStep::TracerReaped(true)));
+        assert!(report.steps.contains(&TeardownStep::TraceeReaped(true)));
+        assert!(gone(debugserver), "tracer left behind");
+        assert!(gone(tracee), "tracee left behind");
         assert!(no_children_left(), "a child of this process leaked");
+        assert_no_launchd_zombie(since, &[(tracee, report.identity)]);
     });
 }
 
 /// A tracer that is already dead: the closed connection is seen at once, so the
 /// timeout path is taken without waiting for the bound (ruling R3.4).
+///
+/// **Reshaped for #205 (OD1).** The tracer used to be killed while the root was
+/// held at its attached breakpoint. The kernel releases a held tracee when its
+/// debugger dies, before the debugger's child walk; a breakpoint hold then traps
+/// again and starts the tracee's exit, and the walk hands the half-exited tracee
+/// to launchd as a zombie nobody collects. That is a kernel-determined leak with
+/// no software fix, so every run of the old shape left a zombie. Now the root is
+/// first run into a loop with no system calls (`--spin`) and **proved running**
+/// (its CPU time advances) before its debugserver is killed. The kernel then
+/// hands the live, traced root back to its original parent, this process, with a
+/// SIGKILL, so the platform collects it. The dead-tracer reporting is unchanged,
+/// and this test now carries the timeout path's coverage.
 #[test]
 fn teardown_reports_dead_tracer_without_waiting() {
     in_fresh_session("teardown_reports_dead_tracer_without_waiting", || {
+        let since = zombies::now();
         let _serial = fixture_launch_lock();
-        let Some((mut tracer, process, tracee, debugserver)) = teardown_launch("dead") else {
+        let Some((mut tracer, process, tracee, debugserver)) =
+            teardown_launch_with("dead", |_| vec![b"--spin".to_vec(), b"unused".to_vec()])
+        else {
             return;
         };
+        run_until_spinning(&mut tracer, tracee);
+        assert_running(tracee);
         // SAFETY: plain libSystem call on our own child.
         unsafe {
             assert_eq!(libc::kill(debugserver, libc::SIGKILL), 0);
@@ -2035,13 +2069,98 @@ fn teardown_reports_dead_tracer_without_waiting() {
         assert!(warning < killed, "the warning must precede the tracer kill");
         assert!(report.steps.contains(&TeardownStep::TracerReaped(true)));
         assert!(gone(debugserver), "tracer left behind");
-        eprintln!(
-            "tracee {tracee}: reaped by platform = {}; now {}",
+        eprintln!("tracee {tracee}: now {}", where_now(tracee));
+        assert!(
             report.steps.contains(&TeardownStep::TraceeReaped(true)),
-            where_now(tracee)
+            "the running root was not handed back to the platform: {report:?}"
         );
+        assert!(gone(tracee), "tracee left behind");
         assert!(no_children_left(), "a child of this process leaked");
+        assert_no_launchd_zombie(since, &[(tracee, report.identity)]);
     });
+}
+
+/// Resume every event without rewrites until no event arrives for 300 ms: the
+/// `--spin` root is then past every intercepted call, in its loop.
+fn run_until_spinning(tracer: &mut MacosTraceBackend, tracee: i32) {
+    let bound = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut quiet = 0;
+    while quiet < 3 {
+        assert!(
+            std::time::Instant::now() < bound,
+            "tracee {tracee} never settled into its loop"
+        );
+        match tracer
+            .poll_event(std::time::Duration::from_millis(100))
+            .unwrap()
+        {
+            umbra_platform::EventPoll::Idle => quiet += 1,
+            umbra_platform::EventPoll::Event(event) => {
+                quiet = 0;
+                let thread = match event {
+                    TraceEvent::ThreadStarted { thread, .. }
+                    | TraceEvent::SyscallEntry { thread, .. }
+                    | TraceEvent::SyscallExit { thread, .. }
+                    | TraceEvent::Exec { thread, .. } => thread,
+                    other => panic!("unexpected event before the loop: {other:?}"),
+                };
+                tracer
+                    .resume(ResumeCommand {
+                        thread,
+                        mode: ResumeMode::Syscall,
+                        signal: None,
+                    })
+                    .unwrap();
+            }
+        }
+    }
+}
+
+/// The tracee is running, not held at a debugger stop: `p_stat` is SRUN and its
+/// CPU time advances across two readings.
+fn assert_running(pid: i32) {
+    let cpu = || {
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+        // SAFETY: `info` is a writable buffer of exactly `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTASKINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        assert_eq!(got, size, "task info of {pid}");
+        info.pti_total_user + info.pti_total_system
+    };
+    let mut bsd: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `bsd` is a writable buffer of exactly `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut bsd as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    assert_eq!(got, size, "bsd info of {pid}");
+    assert_eq!(bsd.pbi_status, libc::SRUN, "tracee {pid} is not running");
+    let first = cpu();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let second = cpu();
+    eprintln!("tracee {pid}: running, CPU time {first} -> {second} ns");
+    assert!(second > first, "tracee {pid} is not making progress");
+}
+
+/// #205 per-test guard: no launchd-parented zombie of this fixture started in
+/// this test's window, and none at a recorded (pid, start identity).
+fn assert_no_launchd_zombie(since: (u64, u64), recorded: &[(i32, Option<(u64, u64)>)]) {
+    let left = zombies::launchd_zombies(&["umbra-test-child"], since, recorded);
+    assert!(left.is_empty(), "launchd-parented zombies left: {left:?}");
 }
 
 /// Review ruling 1 V3: after a timeout (warning, then the tracer kill), the
@@ -2165,6 +2284,7 @@ fn teardown_confirms_a_live_orphaned_child_without_warning() {
     in_fresh_session(
         "teardown_confirms_a_live_orphaned_child_without_warning",
         || {
+            let since = zombies::now();
             let _serial = fixture_launch_lock();
             let Some((mut tracer, process, child)) = mt_spawn_until(
                 "orphan",
@@ -2214,6 +2334,10 @@ fn teardown_confirms_a_live_orphaned_child_without_warning() {
             );
             assert!(gone(child), "the orphaned child was left behind");
             assert!(no_children_left(), "a child of this process leaked");
+            assert_no_launchd_zombie(
+                since,
+                &[(child, None), (process.0 .0.native_id as i32, None)],
+            );
         },
     );
 }
@@ -2226,6 +2350,7 @@ fn teardown_confirms_a_live_child_while_its_root_is_alive() {
     in_fresh_session(
         "teardown_confirms_a_live_child_while_its_root_is_alive",
         || {
+            let since = zombies::now();
             let _serial = fixture_launch_lock();
             let Some((mut tracer, process, child)) = mt_spawn_until("rooted", |event, _| {
                 matches!(event, TraceEvent::Child { .. })
@@ -2243,6 +2368,160 @@ fn teardown_confirms_a_live_child_while_its_root_is_alive() {
             }
             assert!(gone(child) && gone(process.0 .0.native_id as i32));
             assert!(no_children_left(), "a child of this process leaked");
+            assert_no_launchd_zombie(
+                since,
+                &[(child, None), (process.0 .0.native_id as i32, None)],
+            );
         },
     );
+}
+
+/// F7 (#205): the native control for the ordering the fix relies on, with no
+/// umbra code. A debugger process holds a test program at an exception, as
+/// debugserver does, and is ended only after it has answered (or with the
+/// program at a plain stop and nothing pending). In every such ordering the
+/// kernel hands the program back to its original parent, which collects it.
+/// The orderings that leak (a pending exit or a breakpoint hold when the
+/// debugger ends) were measured once during the design and are deliberately
+/// not built into the fixture.
+#[test]
+fn native_debugger_last_hands_the_program_back() {
+    let Some(probe) = std::env::var_os("UMBRA_FIX205_EXITWIN") else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_FIX205_EXITWIN"
+        );
+        eprintln!("SKIP native_debugger_last_hands_the_program_back: set UMBRA_FIX205_EXITWIN");
+        return;
+    };
+    let since = zombies::now();
+    for mode in [
+        "exit-held-release",
+        "kill-held-release",
+        "term-held-release",
+        "held-end",
+    ] {
+        let out = std::process::Command::new(&probe)
+            .arg(mode)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        eprintln!(
+            "===== {mode} ({}):\n{text}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{mode}: {}", out.status);
+        assert!(
+            text.lines()
+                .any(|l| l.contains(&format!("RESULT mode={mode} "))
+                    && l.contains("collected by original parent M")),
+            "{mode}: the program did not come back to its original parent"
+        );
+    }
+    let left = zombies::launchd_zombies(&["umbra-fix-205-exitwin"], since, &[]);
+    assert!(left.is_empty(), "launchd-parented zombies left: {left:?}");
+}
+
+/// F9 (#205 N3): `fchmodat` routed through the traced stub behaves as it does
+/// natively. On macOS 27.2.1 the public `fchmodat` is a wrapper that calls the
+/// raw `__fchmodat` stub, retrying with masked flags when the first call fails,
+/// so the breakpoint sits under the wrapper and each retry is its own traced
+/// call. The fixture records each case's result and the target's mode; the
+/// traced run passes every call through unmodified, and must record exactly what
+/// the native run recorded. Every case must also reach the traced stub
+/// (syscall 467), whatever the decoder makes of it: today it refuses
+/// `AT_SYMLINK_NOFOLLOW_ANY` as an unmodelled `*at` flag (fail closed), and a
+/// routed run would refuse that call rather than give the host's answer.
+#[test]
+fn fchmodat_traced_matches_native() {
+    let Some(fixture) = std::env::var_os("UMBRA_TEST_FIXTURE_PATH") else {
+        assert!(
+            std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none(),
+            "required integration needs UMBRA_TEST_FIXTURE_PATH"
+        );
+        eprintln!("SKIP fchmodat_traced_matches_native: set UMBRA_TEST_FIXTURE_PATH");
+        return;
+    };
+    let _serial = fixture_launch_lock();
+    let since = zombies::now();
+    let fixture = PathBuf::from(fixture);
+    let base = std::env::temp_dir().join(format!("umbra-fchmodat-{}", std::process::id()));
+    let native = base.join("native");
+    let traced = base.join("traced");
+    std::fs::create_dir_all(&native).unwrap();
+    std::fs::create_dir_all(&traced).unwrap();
+    let status = std::process::Command::new(&fixture)
+        .arg("--fchmodat")
+        .arg(&native)
+        .status()
+        .unwrap();
+    assert!(status.success(), "native run: {status}");
+    let expected = std::fs::read_to_string(native.join("fchmodat.txt")).unwrap();
+    let mut tracer = MacosTraceBackend::new(Options {
+        timeout_ms: Some(25_000),
+        ..Options::default()
+    });
+    let process = tracer
+        .launch_experimental(LaunchSpec {
+            executable: byte_path(&fixture),
+            argv: vec![bytes(&fixture), b"--fchmodat".to_vec(), bytes(&traced)],
+            environment: vec![],
+            cwd: byte_path(&std::env::current_dir().unwrap()),
+            policy: LaunchPolicy {
+                persistence: PersistencePolicy::LocalDevelopment,
+                inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                interpose: false,
+                descriptor_limit: None,
+            },
+            sandbox: SandboxRequirement::UnsandboxedExperiment,
+        })
+        .unwrap();
+    let mut chmods = Vec::new();
+    loop {
+        let event = tracer.next_event().unwrap();
+        let thread = match event {
+            TraceEvent::Exit { task, .. } if task == process.0 => break,
+            TraceEvent::SyscallEntry {
+                task,
+                thread,
+                ref registers,
+            } => {
+                if umbra_platform_macos::abi::get(registers, 16).unwrap() == 467 {
+                    let decoded =
+                        DarwinArm64Abi.decode_entry(registers, &mut Memory(&mut tracer, task));
+                    chmods.push(match decoded {
+                        Ok(Some(FsOp::Chmod { mode, follow, .. })) => {
+                            format!("decoded mode={mode:o} follow={follow}")
+                        }
+                        other => format!("refused by the decoder: {other:?}"),
+                    });
+                }
+                thread
+            }
+            TraceEvent::ThreadStarted { thread, .. }
+            | TraceEvent::SyscallExit { thread, .. }
+            | TraceEvent::Exec { thread, .. } => thread,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        tracer
+            .resume(ResumeCommand {
+                thread,
+                mode: ResumeMode::Syscall,
+                signal: None,
+            })
+            .unwrap();
+    }
+    tracer
+        .terminate(process, TerminationPolicy::Immediate)
+        .unwrap();
+    let recorded = std::fs::read_to_string(traced.join("fchmodat.txt")).unwrap();
+    eprintln!("native:\n{expected}traced:\n{recorded}traced chmod calls: {chmods:#?}");
+    assert_eq!(recorded, expected, "the traced run diverged from native");
+    assert!(
+        chmods.len() >= 4,
+        "every fchmodat case must reach the traced stub (467): {chmods:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+    assert_no_launchd_zombie(since, &[(process.0 .0.native_id as i32, None)]);
 }

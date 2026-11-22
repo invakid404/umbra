@@ -188,15 +188,39 @@ impl Rsp {
         let address = listener
             .local_addr()
             .map_err(|e| error("debugserver listen", e))?;
-        let child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .args(["--reverse-connect", &address.to_string()])
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| error("debugserver spawn", e))?;
+            .stderr(Stdio::inherit());
+        // #205 A2b: debugserver is a member of the terminal job's process
+        // group, so ^C, ^\ and `kill -INT/-QUIT/-TERM -pgid` reach it, and it
+        // ends on all three (it handles only SIGPIPE and SIGHUP). Ended while
+        // its program is held at an intercepted call, it would leave the
+        // program to the kernel, which hands it to launchd as a zombie nobody
+        // collects. It starts with those three ignored: an ignored disposition
+        // survives its `execve`, and nothing in debugserver re-enables the
+        // default. The program is spawned by this provider, not by
+        // debugserver, so it never inherits this. The platform still ends
+        // debugserver with SIGKILL.
+        //
+        // `pre_exec` makes `std` fork and exec rather than `posix_spawn`. The
+        // closure runs only `signal`, which is async-signal-safe.
+        // SAFETY: only async-signal-safe libc between fork and exec.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+                for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                    if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().map_err(|e| error("debugserver spawn", e))?;
         let mut child = SetupChild {
             child: Some(child),
             ownership: ownership.clone(),
@@ -218,7 +242,11 @@ impl Rsp {
         let stream = loop {
             match listener.accept() {
                 Ok((s, _)) => break s,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
                 Err(e) => {
                     return Err(error("debugserver accept", e));
                 }
@@ -538,6 +566,8 @@ impl Rsp {
                     return true;
                 }
                 Ok(None) => {}
+                // A caught signal can interrupt the wait (#205 A2a): try again.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => return false,
             }
             if crate::clock::now() >= limit {
@@ -596,6 +626,12 @@ impl Rsp {
         self.child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         self.reaped = false;
     }
+    /// A tracer recorded as reaped whose pid now names another live process:
+    /// the pid-reuse case the teardown prologue must never signal (#205).
+    pub(crate) fn retirement_reused_pid(&mut self, other: Child) {
+        assert!(self.reaped);
+        self.child = other;
+    }
     /// Delay visibility, never fabricate a successful owned wait status.
     pub(crate) fn retirement_wait_gate(&mut self, observations: usize) {
         self.reaped = false;
@@ -649,10 +685,12 @@ impl Drop for Rsp {
     ///
     /// **Not shown safe.** Measured in the #186 arc: when a tracer dies while
     /// holding an attached, not-yet-terminated inferior, the inferior has been
-    /// seen as a PPID-1 zombie within 5 ms. It was not handed back to its
-    /// original parent, and the reason is not established. So in launchd's
-    /// session this fallback may take the #186 route. It is a residual tracked
-    /// in #193.
+    /// seen as a PPID-1 zombie within 5 ms. #205 established why: the tracer's
+    /// death releases its hold before the tracer's child loop runs, the held
+    /// inferior (at a breakpoint, or with an exit pending) starts exiting
+    /// first, and the loop hands it to launchd with its original parent still
+    /// recorded, so it is never collected. This fallback can therefore leave
+    /// such a zombie (#205 R1) and, in launchd's session, take the #186 route.
     fn drop(&mut self) {
         if self.torn_down {
             return;
@@ -695,6 +733,102 @@ mod tests {
         // Exercise a reply after negotiation, when debugserver sends #00.
         let host = rsp.request("qHostInfo").unwrap();
         assert_eq!(fields(&host).get("ostype"), Some(&"macosx"));
+    }
+
+    /// `kp_proc.p_sigignore` of `pid`, from `sysctl(KERN_PROC_PID)`.
+    /// `struct kinfo_proc` is 648 bytes on arm64 Darwin with `p_sigignore` at
+    /// offset 232 (measured with `offsetof` against the SDK headers; the
+    /// `libc` crate does not define `kinfo_proc` for Apple targets). The test
+    /// validates the read on a known case before relying on it.
+    fn sigignore_of(pid: i32) -> Option<u32> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        let mut buf = [0u8; 648];
+        let mut len = buf.len();
+        // SAFETY: `buf` is writable for `len` bytes; the name has 4 components.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                4,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && len == buf.len()).then(|| u32::from_ne_bytes(buf[232..236].try_into().unwrap()))
+    }
+
+    fn sig_bit(signal: i32) -> u32 {
+        1 << (signal - 1)
+    }
+
+    /// F11 (#205 A2b): debugserver is a member of the terminal job's group,
+    /// so ^C, ^\ and `kill -INT/-QUIT/-TERM -pgid` reach it, and the shipped
+    /// debugserver ends on all three (it handles only SIGPIPE and SIGHUP). If
+    /// it ends while its program is held at an intercepted call, the kernel
+    /// hands the program to launchd as a zombie nobody collects. umbra
+    /// therefore spawns it with those three ignored. Nothing is traced here.
+    #[test]
+    fn debugserver_ignores_terminal_signals() {
+        use std::os::unix::process::CommandExt;
+        let path = discover_debugserver();
+        if !path.as_ref().is_some_and(|p| p.is_file()) {
+            eprintln!("SKIP debugserver_ignores_terminal_signals: debugserver missing at {path:?}");
+            return;
+        }
+        // The instrument on a known case first: a child with SIGUSR1 ignored.
+        let mut known = Command::new("/bin/sleep");
+        known.arg("30");
+        // SAFETY: only async-signal-safe libc between fork and exec.
+        unsafe {
+            known.pre_exec(|| {
+                libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut known = known.spawn().unwrap();
+        let read = sigignore_of(known.id() as i32);
+        let _ = known.kill();
+        let _ = known.wait();
+        let read = read.expect("p_sigignore of a known child");
+        assert!(
+            read & sig_bit(libc::SIGUSR1) != 0 && read & sig_bit(libc::SIGUSR2) == 0,
+            "p_sigignore read {read:#x} does not show the known SIGUSR1 ignore"
+        );
+        let mut rsp = Rsp::connect(
+            &Options::default(),
+            Some(crate::clock::now() + Duration::from_secs(10)),
+        )
+        .unwrap();
+        let pid = rsp.tracer_pid();
+        let mask = sigignore_of(pid);
+        let mut failures = Vec::new();
+        for (name, signal) in [
+            ("SIGINT", libc::SIGINT),
+            ("SIGQUIT", libc::SIGQUIT),
+            ("SIGTERM", libc::SIGTERM),
+        ] {
+            if mask.is_none_or(|m| m & sig_bit(signal) == 0) {
+                failures.push(format!("{name} not ignored (p_sigignore {mask:x?})"));
+            }
+        }
+        // Behaviourally too, so the test still holds if the field ever reads
+        // empty: send each, and debugserver must still be running 1 s later.
+        if failures.is_empty() {
+            for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                // SAFETY: our own child, with no program attached.
+                unsafe { libc::kill(pid, signal) };
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            if let Ok(Some(status)) = rsp.child.try_wait() {
+                rsp.reaped = true;
+                failures.push(format!("debugserver ended: {status}"));
+            }
+        }
+        rsp.kill_tracer();
+        let reaped = rsp.reaped || rsp.reap_tracer(Duration::from_secs(2));
+        assert!(reaped, "debugserver {pid} not reaped");
+        assert!(failures.is_empty(), "debugserver {pid}: {failures:?}");
     }
 }
 

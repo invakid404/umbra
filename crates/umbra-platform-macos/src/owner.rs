@@ -16,6 +16,55 @@ struct Unique {
     original: i32,
     reserved: [u64; 2],
 }
+/// The terminating signals a terminal or a process-group kill delivers to the
+/// provider as a member of the run's job (#205).
+const LIFETIME_SIGNALS: [libc::c_int; 4] =
+    [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
+
+extern "C" fn ignore_lifetime_signal(_: libc::c_int) {}
+
+/// Make the provider's lifetime its owner's, not a terminal's (#205 A2a).
+///
+/// In a terminal the provider shares the job's process group, so a hangup,
+/// ^C, ^\ or `kill -pgid` reaches it. Dying there, without the backend's
+/// drop, leaves its debugserver holding the program; ending that debugserver
+/// later hands the program to launchd as a zombie nobody collects (#198,
+/// #205). With these handled, the provider ends when its owner, the
+/// supervisor, does: the IPC connection closes, the drop runs the ordered
+/// teardown, and the process exits.
+///
+/// Each handler is installed only where the inherited disposition is the
+/// default. An inherited ignore (`nohup`, or a background command of a
+/// non-interactive shell) is kept, so the program, which this process spawns,
+/// inherits exactly what it would natively. A caught handler resets to the
+/// default at `execve`, so neither debugserver nor the program inherits it.
+/// `SA_RESTART`, and every blocking call the provider makes retries on EINTR.
+pub fn keep_lifetime_with_owner() -> Result<()> {
+    for signal in LIFETIME_SIGNALS {
+        // SAFETY: plain old data, filled by sigaction below.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null new action only reads the current one.
+        if unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) } != 0 {
+            return Err(error("lifetime-signals", std::io::Error::last_os_error()));
+        }
+        if current.sa_sigaction != libc::SIG_DFL {
+            continue;
+        }
+        // SAFETY: plain old data, filled in below.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = ignore_lifetime_signal as *const () as usize;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: `action.sa_mask` is a valid sigset_t.
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        // SAFETY: a valid action; the handler is async-signal-safe (it does
+        // nothing).
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+            return Err(error("lifetime-signals", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
 /// Identity captured from the provider's actual parent before accepting requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnerIdentity {

@@ -132,7 +132,7 @@ fn t1_c_anchor_forced_off_never_signals_then_anchor_held_completes() {
     assert_eq!(sid(member), leader);
 
     let off = sweep(
-        &mut MacHost { anchor: || false },
+        &mut MacHost::new(|| false),
         leader,
         Duration::from_millis(500),
     );
@@ -151,11 +151,7 @@ fn t1_c_anchor_forced_off_never_signals_then_anchor_held_completes() {
         "claimants were harmed"
     );
 
-    let on = sweep(
-        &mut MacHost { anchor: || true },
-        leader,
-        Duration::from_secs(3),
-    );
+    let on = sweep(&mut MacHost::new(|| true), leader, Duration::from_secs(3));
     assert_eq!(on.kind, Kind::Complete, "{on:?}");
     assert!(on.sent >= 2);
     let st = reap(leader);
@@ -185,7 +181,7 @@ fn a_stale_token_is_refused_and_a_live_one_kills() {
     // SAFETY: our own child.
     unsafe { libc::kill(gone, libc::SIGKILL) };
     reap(gone);
-    let mut host = MacHost { anchor: || true };
+    let mut host = MacHost::new(|| true);
     assert_eq!(host.kill(&token), Signalled::Stale);
 
     let live = spawn(
@@ -229,7 +225,7 @@ fn a_zombie_leader_is_not_a_claimant() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(stat(s).starts_with('Z'), "not a zombie: {:?}", stat(s));
-    let mut host = MacHost { anchor: || true };
+    let mut host = MacHost::new(|| true);
     let census = host
         .census(s, std::time::Instant::now() + Duration::from_secs(2))
         .unwrap();
@@ -238,4 +234,34 @@ fn a_zombie_leader_is_not_a_claimant() {
     assert_eq!(o.kind, Kind::Complete, "{o:?}");
     assert_eq!(o.sent, 0);
     reap(s);
+}
+
+/// #205: the supervisor is ended only under the anchor rule. With the anchor
+/// forced off (ownership of the session id not proved, as after identity
+/// reuse) `end_supervisor` signals nothing; with it held, the same process is
+/// ended by its verified token.
+#[test]
+fn the_supervisor_is_never_ended_without_the_anchor() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id() as i32;
+    let session = sid(pid);
+    let refused = MacHost::new(|| false).end_supervisor(pid, session);
+    assert_eq!(refused, Signalled::Stale);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "a supervisor was signalled without the anchor"
+    );
+    assert_eq!(
+        MacHost::new(|| true).end_supervisor(pid, session),
+        Signalled::Sent
+    );
+    let status = child.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
 }

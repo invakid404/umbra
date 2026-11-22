@@ -3,6 +3,8 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run() -> umbra_core::Result<()> {
     use umbra_platform::TraceControl;
+    // #205: end with the owner, not with the terminal's signals.
+    umbra_platform_macos::keep_lifetime_with_owner()?;
     let owner = umbra_platform_macos::OwnerIdentity::parent()?;
     let (connection, mut backend) = umbra_core::provider::accept("macos", "platform", |options| {
         let options = if options.is_empty() {

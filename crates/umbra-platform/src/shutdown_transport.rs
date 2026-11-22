@@ -309,6 +309,15 @@ fn serve_polls(
     outcome
 }
 
+/// `close_client`'s error text for a Final that does not confirm (#205): the
+/// named unconfirmed obligations and diagnostics, then the exit result.
+fn unconfirmed_final(final_state: &Final, exit: &impl std::fmt::Debug) -> String {
+    format!(
+        "{}; exit: {exit:?}",
+        crate::shutdown::unconfirmed_obligations(final_state)
+    )
+}
+
 pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
     if !client.owns_provider() {
         client.connection.invalidate();
@@ -361,10 +370,7 @@ pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
                         "proof": proof, "accepted": accepted, "final": final_state,
                     }));
                     if !proof {
-                        return Err(protocol_error(format!(
-                            "shutdown ledger has unconfirmed obligations: {:?}; exit: {exit:?}",
-                            final_state.diagnostics,
-                        )));
+                        return Err(protocol_error(unconfirmed_final(&final_state, &exit)));
                     }
                     return exit;
                 }

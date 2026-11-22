@@ -36,6 +36,10 @@ umbra-journal-file = { path = "../umbra-journal-file" }
 # formula test-side where it could drift from the encoder it is modelling. A
 # dev-dependency, so no product binary gains an edge.
 umbra-platform = { path = "../umbra-platform" }
+# The packed-spawn cases branch on the platform's own spawn-profile predicate
+# (`spawn_profile_qualified`), never on an OS version chosen by the test:
+# unqualified, they assert the exact fail-closed refusal (#205, #247).
+umbra-platform-macos = { path = "../umbra-platform-macos" }
 tempfile.workspace = true
 # `userspace_run.rs` asserts, executably, that no NFS mount covers the run --
 # the addendum's guard against the whole end-to-end proof being an illusion.

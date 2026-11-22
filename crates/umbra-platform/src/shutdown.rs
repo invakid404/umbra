@@ -49,7 +49,7 @@ impl Closure {
                 error: None,
                 final_to_exit: None,
             },
-            Ok(false) => Self::failed(invalid("shutdown ledger has unconfirmed obligations")),
+            Ok(false) => Self::failed(invalid(&unconfirmed_obligations(final_state))),
             Err(error) => Self::failed(error),
         }
     }
@@ -96,6 +96,35 @@ impl crate::PlatformSession {
             }
         }
     }
+}
+
+/// The unconfirmed-obligation message (#205): every entry that is neither
+/// confirmed nor never-created, as kind, pid (or `?`) and disposition, then
+/// the ledger's own diagnostics. Text only; it decides nothing.
+pub(crate) fn unconfirmed_obligations(final_state: &Final) -> String {
+    let unconfirmed: Vec<String> = final_state
+        .entries
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                entry.disposition,
+                Disposition::Confirmed(_) | Disposition::NeverCreated
+            )
+        })
+        .map(|entry| {
+            let pid = entry
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.pid)
+                .map_or_else(|| "?".to_string(), |pid| pid.to_string());
+            format!("{:?} pid={pid} {:?}", entry.slot.kind, entry.disposition)
+        })
+        .collect();
+    format!(
+        "shutdown ledger has unconfirmed obligations: [{}]; diagnostics: {:?}",
+        unconfirmed.join(", "),
+        final_state.diagnostics
+    )
 }
 
 fn invalid(message: &str) -> UmbraError {
@@ -480,8 +509,63 @@ pub(crate) fn collected_model_root(ledger: &Ledger) -> SlotId {
 }
 
 #[cfg(test)]
+pub(crate) fn scripted_unconfirmed_final() -> (Accepted, Final) {
+    let ledger = Ledger::new();
+    let tracee = ledger.reserve(ResourceKind::Tracee, None, 1, 0).unwrap();
+    tracee
+        .acquired(Identity {
+            pid: Some(4242),
+            birth: None,
+        })
+        .unwrap();
+    let _right = ledger
+        .reserve(ResourceKind::TaskRight, Some(tracee.id()), 1, 0)
+        .unwrap();
+    let tracer = ledger
+        .reserve(ResourceKind::Tracer, Some(tracee.id()), 1, 0)
+        .unwrap();
+    tracer
+        .acquired(Identity {
+            pid: Some(5151),
+            birth: None,
+        })
+        .unwrap();
+    tracer
+        .confirm(Proof::Collected {
+            status: "exit 0".into(),
+        })
+        .unwrap();
+    let accepted = ledger
+        .freeze(Nonce::new_v4(), Duration::from_secs(1))
+        .unwrap();
+    let mut final_state = ledger.final_snapshot().unwrap();
+    final_state
+        .diagnostics
+        .push("poisoned: scripted ownership failure".into());
+    (accepted, final_state)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    /// #205: the unconfirmed-obligation message names each unconfirmed entry
+    /// (kind, pid or `?`, disposition) and keeps the diagnostics; a confirmed
+    /// entry is not listed.
+    #[test]
+    fn the_unconfirmed_message_names_its_obligations() {
+        let (accepted, final_state) = scripted_unconfirmed_final();
+        let closure = Closure::from_final(&accepted, &final_state);
+        assert!(!closure.tree_terminated);
+        let message = closure.error.expect("unconfirmed").to_string();
+        for named in [
+            "Tracee pid=4242 Unconfirmed(\"owner destroyed without terminal proof\")",
+            "TaskRight pid=? Unconfirmed(\"owner destroyed without terminal proof\")",
+            "poisoned: scripted ownership failure",
+        ] {
+            assert!(message.contains(named), "{named} missing from: {message}");
+        }
+        assert!(!message.contains("Tracer pid=5151"), "{message}");
+    }
     #[test]
     fn shutdown_late_result_and_retired_history_survive_freeze() {
         let ledger = Ledger::new();
