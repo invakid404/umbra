@@ -323,12 +323,10 @@ pub fn end_run(
             ZombieCheck::Clear => {}
         }
     }
-    // A member seen only without a token has no identity to check: its pid is
-    // checked instead, unless a seen token already covers that pid.
+    // A member seen without a token has no identity to check: its pid is
+    // checked instead, always. A seen token at the same pid may name another
+    // instance (the pid reused), so it never vouches for the tokenless one.
     for pid in tokenless {
-        if seen.iter().any(|t| token_pid(t) == pid) {
-            continue;
-        }
         match host.launchd_zombie_pid(pid) {
             ZombieCheck::Clear => {}
             ZombieCheck::Zombie | ZombieCheck::Unreadable => unreadable.push(pid),
