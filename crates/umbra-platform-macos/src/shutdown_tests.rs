@@ -8,11 +8,13 @@ fn shared_reason(reason: TerminalCause) -> UmbraError {
     tasks.lock().unwrap().latch(reason);
     let mut backend = MacosTraceBackend::default();
     backend.owner = Some(Watchdog {
+        wakeups: Arc::new(rsp::Wakeups::default()),
         tasks: tasks.clone(),
         cancel: None,
         worker: None,
     });
     backend.watchdog = Some(Watchdog {
+        wakeups: Arc::new(rsp::Wakeups::default()),
         tasks,
         cancel: None,
         worker: None,
@@ -83,6 +85,7 @@ fn drop_during_latch_joins_after_release() {
         release_tx.send(()).unwrap();
     });
     let watchdog = Watchdog {
+        wakeups: Arc::new(rsp::Wakeups::default()),
         tasks: Arc::new(Mutex::new(WatchedTasks::default())),
         cancel: Some(cancel_writer),
         worker: Some(worker),

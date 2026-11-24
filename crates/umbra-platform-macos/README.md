@@ -297,8 +297,11 @@ The M1 mechanisms named in the tracker spec are all present:
     their recorded retirement evidence. Failed retirement owners remain held
     through termination and receive explicit bounded emergency finalization
     on drop, with its results merged into their original failure reports.
-    - It sends RSP `k`, and sends it once more after a stop reply: a session
-      left at a breakpoint answers the first `k` with its stale stop.
+    - It consumes buffered replies without blocking. A stop of any signal
+      answers the outstanding resume; an already stopped session sends `k`
+      without an interrupt. Only an unanswered resume requires one interrupt
+      and its stop reply before `k`. Unsolicited or duplicate stops fail loudly;
+      one extra interrupt-race stop after authorization is ignored.
     - It waits on a fail-closed barrier until the tracee has passed its exit
       accounting.
     - Only then does it kill and reap debugserver (`Rsp::kill_tracer`,
@@ -352,8 +355,8 @@ The M1 mechanisms named in the tracker spec are all present:
     ([umbra-isolation](../umbra-isolation/README.md)); if instead its tracer
     dies, the kernel kills it. debugserver's own `--kill-on-error` flag would
     only set the same value at startup, before any inferior exists, so umbra
-    does not pass it. No test injects a rejected reply (there is no scripted
-    debugserver); every real connection exercises the `OK` path. Other detach
+    does not pass it. No test injects a rejected handshake reply;
+    every real connection exercises the `OK` path. Other detach
     routes inside debugserver are unaudited (#200).
 <!-- /memoria:section -->
 
@@ -849,13 +852,34 @@ run's job, so a hangup, ^C, ^\ or `kill -pgid` reaches both.
   the provider, not by debugserver, and never inherits them. SIGTSTP stops
   debugserver with the job, and the teardown's SIGCONT continues it.
 
-The `k` plus the barrier is bounded at 1.5 s per session, and each reap at
-250 ms (at most 2 s per session). On a timeout the provider writes
+Ordered teardown first interrupts a running program and consumes its stop
+reply, then sends `k`. The stop phase has 250 ms; termination and native
+identity/reap confirmation have at most 1250 ms, within the original absolute
+1.5 s deadline. Each of the two reaps retains its 250 ms limit (at most 2 s per
+session). A buffered stop answering the outstanding resume, of any signal,
+or an already consumed stop with no subsequent resume, skips the interrupt.
+A resume becomes outstanding before its packet is sent: a transport error can
+still mean the debugger received the full packet. Teardown accepts the one
+answering stop in that case. Signal delivery remains closed after an ambiguous
+send, so it cannot be retried. The scripted-peer test
+`completed_resume_error_accepts_answering_stop` checks full packet receipt,
+an injected send error, and confirmation after the answering T05.
+Unsolicited and duplicate stops fail closed, except for one ignored interrupt
+race reply after kill authorization. At most one interrupt and two `k` packets
+are permitted. Ordinary-work
+cancellation wakes a separate fd and hands the same RSP stream and incremental
+decoder to teardown; an incomplete outgoing frame fails closed.
+
+The provider drain remains `3 + 4D` seconds, with its existing fork-sweep
+allowance unchanged; the whole-run worst case at D=1 remains 11.1 s. These are teardown
+bounds, not session age or inactivity limits.
+
+On a missing stop, missing confirmation, or protocol failure the provider writes
 `tracee termination unconfirmed; tracer killed` to stderr, kills debugserver,
 and runs one post-kill barrier inside the 250 ms tracer reap:
 - **Confirmed:** a second line, `tracee exit confirmed after tracer kill`,
-  follows the warning. `Terminate` succeeds if no other session remains
-  unconfirmed and no retirement failure is retained.
+  follows the warning. The failed ordered attempt remains unconfirmed and
+  `Terminate` fails even if this fallback collected the program.
 - **Still unconfirmed:** `Terminate` returns the warning as its error. If final
   shutdown cannot confirm every obligation, the run is left recovery-required.
 - **Handed to launchd:** a root the provider did not collect once its
@@ -877,7 +901,7 @@ stopped, which the SIGCONT handles) or already dead. The tests pin these cases:
 - a stopped debugserver is continued and confirms before the tracer kill;
 - a dead debugserver takes the timeout path, and the post-kill result must
   match the tracee's end state: past its exit means `ConfirmedAfterTracerKill`
-  and `Ok`, a tracee still live means `Err`, and an end state the test cannot
+  with the original failure retained, a tracee still live means `Err`, and an end state the test cannot
   read (a lookup error other than ESRCH) fails the test.
 
 **Residuals (#205), each tracked in #205.** These can still leave a tracee to
@@ -899,17 +923,27 @@ launchd as a zombie nobody collects:
   while anything is held: it waits for the provider's `Final`. A shutdown
   error before `Final` (the envelope deadline, a transport error) or a panic
   while a session is live does, and is R2.
-- **R3:** a hung or slow debugserver on the timeout path; the kill can hand
-  its tracee to launchd, and `Terminate` fails and names it. Slow includes a
-  debugserver still inside its own kill of a running tracee: it first stops
-  the tracee with SIGSTOP and waits up to 2 s for that stop, then sends
-  `PT_KILL` and waits up to 1 s more (LLVM `MachProcess::Kill`,
-  `MachProcess::DoSIGSTOP`), longer than the 1.5 s per-session bound.
-  On CI, `sid1_p1`'s child, a running tracee whose debugserver was not the
-  stopped one, timed out on this path: its `k` was still unconfirmed after
-  1.5 s with the child running, and it was confirmed after the kill.
-  Debugserver's own kill path fits that reading from source; the cause in
-  that run is not established.
+- **R3 (#300):** stop-before-`k` repairs the observed running-program dispatch
+  path without increasing the bound. The local watchdog case confirmed before
+  tracer disposal in 20.57 ms. The SID-1 stopped-tracer case still requires CI
+  qualification; its earlier timeout was not proved to have the same cause.
+  The earlier predicate discarded answering buffered stops and left two
+  launchd-parented zombies. Resume-accounted stops repair that path: the local
+  live-child reading now passes, with its root confirming in 13.66 ms. The
+  earlier orphan reading confirmed termination in 18.94 ms, but failed an
+  obsolete test assertion expecting a repeated kill. After that assertion was
+  corrected, the authorized fresh reading passed the full orphan test and
+  confirmed termination in 22.67 ms. These readings reported no new zombie.
+  A hung peer, or a stop/exit not observed within its phase, still takes the
+  loud timeout path and can leave a zombie.
+
+The mechanism evidence uses host debugserver lldb-2100.0.17.108
+(SHA-256 prefix `162db59f`, suffix `1a0a`) and its arm64 dispatch table,
+corroborated against LLVM revision `37d519eb`. This is not exact-build source.
+The repair does not depend on `k` being dropped while running: stopping first
+also avoids the running-program SIGSTOP wait before `PT_KILL` and its reap
+of up to 1 s. R2 (#299), externally killed providers/helpers, and R1 remain
+outside this repair.
 
 `SIGKILL` or other cancellation that bypasses `Terminate` and drop reaches R1 or
 R2. In launchd's session none of these reaches a group there: #193 runs the
@@ -1047,8 +1081,8 @@ tracer was reaped and that no child of the test process remains.
 |---|---|
 | `teardown_confirms_exit_before_killing_tracer` | `terminate` returns `Ok`; steps `KillSent`, a confirmed barrier, then `TracerKilled`; no warning; tracer and tracee both reaped |
 | `teardown_times_out_on_unresponsive_tracer` | debugserver stopped with `SIGSTOP` (#205 re-pin): `TracerContinued`, then a confirmed barrier, then `TracerKilled`; no warning, no timeout, under 1.5 s; `terminate` returns `Ok`; tracer and tracee both reaped; no launchd-parented zombie |
-| `teardown_reports_dead_tracer_without_waiting` | the root first proved running (`--spin`: `p_stat` SRUN and CPU time advancing), then debugserver killed (#205 reshape: a held root would be handed to launchd, R1); the timeout path runs in under 1 s, after a `KillSendFailed` or `ConnectionClosed` step; the warning precedes `TracerKilled`; exactly one post-kill step, `ConfirmedAfterTracerKill` with `Ok` or `UnconfirmedAfterTracerKill` with `Err`, matching the tracee's end state as `terminate` returns; the root handed back and reaped (`TraceeReaped(true)`); no launchd-parented zombie |
-| `teardown_confirms_a_live_orphaned_child_without_warning` | `--mt-spawn` stopped at the root's `Exit`, with the traced child live; `terminate` returns `Ok`; no report timed out; the child's barrier is confirmed before `TracerKilled` (`ReapedProven`, or `Zombie`); a stop reply is followed directly by `KillResent` |
+| `teardown_reports_dead_tracer_without_waiting` | the root first proved running (`--spin`: `p_stat` SRUN and CPU time advancing), then debugserver killed (#205 reshape: a held root would be handed to launchd, R1); the timeout path runs in under 1 s, after a `KillSendFailed` or `ConnectionClosed` step; the warning precedes `TracerKilled`; exactly one post-kill step, `ConfirmedAfterTracerKill` or `UnconfirmedAfterTracerKill`, with `Err` in both cases, matching the tracee's end state as `terminate` returns; the root handed back and reaped (`TraceeReaped(true)`); no launchd-parented zombie |
+| `teardown_confirms_a_live_orphaned_child_without_warning` | `--mt-spawn` stopped at the root's `Exit`, with the traced child live; `terminate` returns `Ok`; no report timed out or remained unconfirmed; the child's barrier is confirmed before `TracerKilled` (`ReapedProven`, or `Zombie`); any recorded stop reply is followed directly by `KillSent` |
 | `teardown_confirms_a_live_child_while_its_root_is_alive` | `--mt-spawn` stopped at the `Child` event; `terminate` returns `Ok`; both reports confirm with no warning |
 
 Each of the five also counts launchd-parented zombies of `umbra-test-child`
@@ -1082,7 +1116,15 @@ Further #205 coverage:
   SIGINT explicitly, ignored or default, so neither inherits the test's own).
 - `native_debugger_last_hands_the_program_back` is the native control
   (`experiments/fixtures/umbra-fix-205-exitwin.c`, the orderings that leave
-  nothing behind only).
+  nothing behind only). It requires `UMBRA_FIX205_EXITWIN` to name the signed
+  native-control executable; without it the test skips, or fails when
+  `UMBRA_INTEGRATION_REQUIRED` is set. From the repository root, build with
+  `clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-205-exitwin.c -o target/debug/umbra-fix-205-exitwin`,
+  then sign with `codesign --force --sign - --entitlements experiments/fixtures/umbra-fix-205-exitwin.entitlements target/debug/umbra-fix-205-exitwin`.
+  Set `UMBRA_FIX205_EXITWIN` to that executable's absolute path and run
+  `cargo test -p umbra-platform-macos --test fixtures native_debugger_last_hands_the_program_back -- --nocapture`.
+  Each selected mode must exit successfully and report collection by the
+  original parent; the test also requires no attributable launchd zombie.
 - `fchmodat_traced_matches_native` runs `fchmodat` traced and natively.
 
 `native::tests::the_teardown_barrier_decides_from_report_identity_and_lookup`
@@ -1401,9 +1443,10 @@ and the host destination remains absent.
 Set `UMBRA_INTEGRATION_REQUIRED=1` to make missing fixture inputs fail the sandbox,
 IPC and direct tracer suites. CI's `native-qualification` job runs these and the
 CLI's local matrix on a runner labelled `umbra-integration`; that runner
-requires debugger permission. CI sets `UMBRA_TEST_SKIP_NFS_MATRIX=1`; the separate
-mounted-NFS matrix requires `UMBRA_TEST_NFS_ROOT` when run locally. No test
-provisions a mount or prompts.
+requires debugger permission. The separate mounted-NFS matrix uses
+`UMBRA_TEST_NFS_ROOT` and is qualified by name on CI. Agent sessions must not
+set that variable or mount NFS; they leave those cases for CI qualification.
+No test provisions a mount or prompts.
 
 Sandbox handoff compares canonical target paths with `proc_pidpath`. The twin
 cache root is also canonicalized so a symlinked cache recognizes already-resigned

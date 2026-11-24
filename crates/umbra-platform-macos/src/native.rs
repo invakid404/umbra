@@ -206,12 +206,14 @@ impl TerminalCause {
     }
 }
 struct WatchedTasks<T = Arc<Task>> {
+    wakeups: Arc<rsp::Wakeups>,
     tasks: Vec<T>,
     reason: Option<TerminalCause>,
 }
 impl<T> Default for WatchedTasks<T> {
     fn default() -> Self {
         Self {
+            wakeups: Arc::new(rsp::Wakeups::default()),
             tasks: Vec::new(),
             reason: None,
         }
@@ -251,10 +253,12 @@ where
     }
 }
 struct Watchdog {
+    wakeups: Arc<rsp::Wakeups>,
     tasks: Arc<Mutex<WatchedTasks>>,
     cancel: Option<std::os::unix::net::UnixStream>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
+
 impl Watchdog {
     fn new(
         deadline: Option<Instant>,
@@ -262,6 +266,13 @@ impl Watchdog {
         tasks: Arc<Mutex<WatchedTasks>>,
     ) -> Result<Self> {
         let owned = tasks.clone();
+        // Owner and deadline monitors share cancellation with their task latch.
+        let wakeups = tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wakeups
+            .clone();
+        let wake_worker = wakeups.clone();
         let (waiter, cancel) = crate::owner::Waiter::new(owner)?;
         let worker = std::thread::Builder::new()
             .name("umbra-owner".into())
@@ -272,6 +283,7 @@ impl Watchdog {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .latch(reason);
+                        wake_worker.signal();
                         if reason != TerminalCause::Deadline {
                             waiter.disconnect();
                         }
@@ -282,11 +294,13 @@ impl Watchdog {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .latch(TerminalCause::MonitorPanicked);
+                    wake_worker.signal();
                     waiter.disconnect();
                 }
             })
             .map_err(|e| error("owner-observation", e))?;
         Ok(Self {
+            wakeups,
             tasks,
             cancel: Some(cancel),
             worker: Some(worker),
@@ -661,6 +675,7 @@ impl Session {
             0,
         )?;
         let mut rsp = Rsp::connect_owned(options, deadline, tracer)?;
+        watchdog.wakeups.add(rsp.wakeup());
         let actions = rsp.request("vCont?")?;
         if !actions.split(';').any(|action| action == "C") {
             return Err(unsupported(
@@ -920,8 +935,9 @@ impl Session {
     }
     /// Resume every thread when no return window is open.
     fn continue_run(&mut self) -> Result<()> {
-        self.rsp.send("c")?;
+        // A failed write may still have resumed the peer; its stop is outstanding.
         self.stopped = false;
+        self.rsp.send("c")?;
         Ok(())
     }
     /// Resume exactly one thread and leave every sibling stopped.
@@ -951,9 +967,9 @@ impl Session {
     /// the known residual tracked in #242. A bare `c` is still unsafe: it would
     /// release siblings into the unmediated window described above.
     fn continue_thread(&mut self, thread: ThreadId) -> Result<()> {
+        self.stopped = false;
         self.rsp
             .send(&format!("vCont;c:{:x}", thread.0.native_id))?;
-        self.stopped = false;
         Ok(())
     }
     /// Resume from a stop this backend absorbed without opening a transaction,
@@ -1376,10 +1392,12 @@ impl Session {
         #[cfg(feature = "signal-witness")]
         self.signal_probe("internal")?;
         loop {
+            self.stopped = false;
             let stop = self.rsp.request("c")?;
             if !stop.starts_with('T') {
                 return Err(error("run_to", stop));
             }
+            self.stopped = true;
             let fields = rsp::fields(&stop[3..]);
             self.thread = tid(
                 rsp::number(
@@ -1464,10 +1482,12 @@ impl Session {
         // breakpoint below then catches the next call to it.
         self.temporary_breakpoint(notify)?;
         loop {
+            self.stopped = false;
             let stop = self.rsp.request("c")?;
             if !stop.starts_with('T') {
                 return Err(error("dyld startup", stop));
             }
+            self.stopped = true;
             let fields = rsp::fields(&stop[3..]);
             self.thread = tid(
                 rsp::number(
@@ -4324,6 +4344,69 @@ pub enum BarrierEvidence {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TeardownReply {
+    Stop(u8),
+    Exit,
+    Other,
+}
+fn teardown_reply(packet: &str, pid: i32) -> std::result::Result<TeardownReply, &'static str> {
+    let bytes = packet.as_bytes();
+    if !matches!(bytes.first(), Some(b'T' | b'S' | b'W' | b'X')) {
+        return Ok(TeardownReply::Other);
+    }
+    if bytes.len() < 3 || !bytes[1..3].iter().all(u8::is_ascii_hexdigit) {
+        return Err("malformed teardown stop/exit signal");
+    }
+    let signal = u8::from_str_radix(&packet[1..3], 16).map_err(|_| "invalid signal")?;
+    if bytes[0] == b'S' && bytes.len() != 3 {
+        return Err("malformed S reply");
+    }
+    if bytes.len() > 3 {
+        let fields = packet[3..].trim_start_matches(';');
+        if !fields.ends_with(';')
+            || fields[..fields.len() - 1].split(';').any(|field| {
+                field
+                    .split_once(':')
+                    .is_none_or(|(key, value)| key.is_empty() || value.is_empty())
+            })
+        {
+            return Err("malformed teardown reply fields");
+        }
+        for (key, value) in rsp::fields(fields) {
+            if key == "process" {
+                if u64::from_str_radix(value, 16).ok() != Some(pid as u64) {
+                    return Err("wrong teardown process identity");
+                }
+            } else if key == "thread" {
+                let thread = if let Some(identity) = value.strip_prefix('p') {
+                    let (process, thread) = identity
+                        .split_once('.')
+                        .ok_or("malformed teardown thread identity")?;
+                    if u64::from_str_radix(process, 16).ok() != Some(pid as u64) {
+                        return Err("wrong teardown thread process");
+                    }
+                    thread
+                } else {
+                    value
+                };
+                if u64::from_str_radix(thread, 16)
+                    .ok()
+                    .filter(|n| *n != 0)
+                    .is_none()
+                {
+                    return Err("malformed teardown thread");
+                }
+            }
+        }
+    }
+    Ok(if matches!(bytes[0], b'T' | b'S') {
+        TeardownReply::Stop(signal)
+    } else {
+        TeardownReply::Exit
+    })
+}
+
 /// Ruling-1 branch (b): absence after the report.
 const ADMITTED_ABSENT: &str =
     "xnu proof (b): pid leaves the hash only at reap (kern_exit.c:2983), after fixjobc (:2505)";
@@ -4357,6 +4440,8 @@ pub enum TeardownStep {
     /// before `k` (#205 A1(b)). The continue is sent whether or not it was
     /// stopped; this step records only that it was.
     TracerContinued,
+    /// The teardown-only interrupt was written on the existing stream.
+    InterruptSent,
     /// RSP `k` was written.
     KillSent,
     /// No `k`: the tracer already reported the tracee's exit.
@@ -4401,8 +4486,9 @@ pub struct TeardownReport {
     /// The barrier did not confirm before the bound, so the timeout path ran:
     /// the warning, then the tracer kill.
     pub timed_out: bool,
-    /// Still not confirmed after the post-kill barrier. Cleanup makes terminate
-    /// fail for this condition or any retained failed retirement outcome.
+    /// The ordered attempt failed, or disposal still lacks collection proof.
+    /// Post-kill collection cannot clear an earlier ordered failure. Cleanup
+    /// makes terminate fail for this or any retained failed retirement outcome.
     /// Invalid root handles and unsupported termination policies also return Err.
     pub unconfirmed: bool,
     pub elapsed: Duration,
@@ -4557,71 +4643,152 @@ impl Session {
         // #205 A1(b): before `k`, and before the emergency-retirement path,
         // which comes through here too.
         steps.extend(teardown_prologue(&mut self.rsp));
-        // R3.4: an unsendable `k`, or a connection that closes before any
-        // reply, goes to the timeout path without waiting for the barrier.
-        let mut abandoned: Option<String> = None;
-        let mut replied = false;
+        // A running peer must observe an interrupt before k is dispatched.
+        // 250ms stop + 1250ms kill/confirmation share the original 1500ms cap.
+        let stop_deadline = started + Duration::from_millis(250);
+        let mut failure = (!self.rsp.begin_teardown())
+            .then(|| "ordinary RSP frame incomplete at teardown handover".to_string());
         let mut closed = false;
-        // Review ruling 1 V2, measured: a session left stopped at a breakpoint
-        // has its stop reply (`T05…`) queued, and debugserver answers the first
-        // `k` with that stale stop and does not act on it; a second `k` sent
-        // after it took effect within 20 ms (fix-r1 probe). So `k` is re-sent
-        // exactly once after the first stop reply, inside the same bound.
-        let mut resent = false;
-        if self.done {
+        let mut exit_seen = self.done;
+        let mut interrupt_sent = false;
+        let mut extra_stop_drained = false;
+        if failure.is_none() && !self.done {
+            // A buffered stop answers the outstanding resume, regardless of signal.
+            // Keep the incremental decoder and the same socket throughout.
+            while crate::clock::now() < stop_deadline {
+                match self.rsp.teardown_read_buffered() {
+                    rsp::TeardownRead::Quiet => break,
+                    rsp::TeardownRead::Closed(why) => {
+                        steps.push(TeardownStep::ConnectionClosed(why.clone()));
+                        failure = Some(format!("RSP closed before interrupt: {why}"));
+                        closed = true;
+                        break;
+                    }
+                    rsp::TeardownRead::Packet(packet) => {
+                        let kind = teardown_reply(&packet, pid);
+                        steps.push(TeardownStep::Reply(packet));
+                        match kind {
+                            Ok(TeardownReply::Exit) => {
+                                exit_seen = true;
+                                break;
+                            }
+                            Ok(TeardownReply::Stop(_)) if !self.stopped => {
+                                self.stopped = true;
+                            }
+                            Ok(TeardownReply::Stop(_)) => {
+                                failure = Some("unsolicited or duplicate stop".into());
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(why) => {
+                                failure = Some(why.into());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if failure.is_none() && !exit_seen && !self.stopped {
+                match self.rsp.teardown_interrupt(stop_deadline) {
+                    Ok(()) => {
+                        interrupt_sent = true;
+                        steps.push(TeardownStep::InterruptSent);
+                    }
+                    Err(e) => failure = Some(format!("RSP interrupt failed: {e}")),
+                }
+                let mut stopped = false;
+                while failure.is_none() && crate::clock::now() < stop_deadline {
+                    let wait = stop_deadline
+                        .saturating_duration_since(crate::clock::now())
+                        .min(Duration::from_millis(5));
+                    match self.rsp.teardown_read(wait) {
+                        rsp::TeardownRead::Quiet => {}
+                        rsp::TeardownRead::Closed(why) => {
+                            steps.push(TeardownStep::ConnectionClosed(why.clone()));
+                            closed = true;
+                            failure = Some(format!("RSP closed waiting for stop: {why}"));
+                        }
+                        rsp::TeardownRead::Packet(packet) => {
+                            let kind = teardown_reply(&packet, pid);
+                            steps.push(TeardownStep::Reply(packet));
+                            match kind {
+                                Ok(TeardownReply::Stop(_)) => {
+                                    self.stopped = true;
+                                    stopped = true;
+                                    break;
+                                }
+                                Ok(TeardownReply::Exit) => {
+                                    exit_seen = true;
+                                    break;
+                                }
+                                Ok(_) => {}
+                                Err(why) => failure = Some(why.into()),
+                            }
+                        }
+                    }
+                }
+                if !stopped && !exit_seen && failure.is_none() {
+                    failure = Some("interrupt stop phase expired".into());
+                }
+            }
+        }
+        // A fast stop must not lend its unused allocation to termination.
+        let deadline = deadline.min(crate::clock::now() + Duration::from_millis(1250));
+        if exit_seen {
             steps.push(TeardownStep::KillSkipped);
-        } else {
-            match self.rsp.send_kill(Duration::from_millis(250)) {
+        } else if failure.is_none() {
+            let bound = deadline
+                .saturating_duration_since(crate::clock::now())
+                .min(Duration::from_millis(250));
+            match self.rsp.send_kill(bound) {
                 Ok(()) => steps.push(TeardownStep::KillSent),
                 Err(e) => {
                     steps.push(TeardownStep::KillSendFailed(e.to_string()));
-                    abandoned = Some(format!("not evaluated: RSP k not sent: {e}"));
+                    failure = Some(format!("RSP k failed: {e}"));
                 }
             }
         }
         let reading = loop {
-            if let Some(why) = abandoned.take() {
-                break BarrierReading::Unconfirmed(why);
+            if let Some(why) = &failure {
+                break BarrierReading::Unconfirmed(why.clone());
             }
-            // Read first, so a dead tracer's closed connection is seen before
-            // any barrier evaluation.
-            if self.done || closed {
-                std::thread::sleep(Duration::from_millis(1));
-            } else {
+            if !exit_seen && !closed {
                 let wait = deadline
                     .saturating_duration_since(crate::clock::now())
                     .min(Duration::from_millis(5));
                 match self.rsp.teardown_read(wait) {
-                    rsp::TeardownRead::Packet(packet) => {
-                        let stop = packet.starts_with('T') || packet.starts_with('S');
-                        steps.push(TeardownStep::Reply(packet));
-                        replied = true;
-                        if stop && !resent {
-                            resent = true;
-                            let bound = deadline
-                                .saturating_duration_since(crate::clock::now())
-                                .min(Duration::from_millis(250));
-                            match self.rsp.send_kill(bound) {
-                                Ok(()) => steps.push(TeardownStep::KillResent),
-                                Err(e) => steps.push(TeardownStep::KillSendFailed(e.to_string())),
-                            }
-                        }
-                    }
                     rsp::TeardownRead::Quiet => {}
                     rsp::TeardownRead::Closed(why) => {
                         steps.push(TeardownStep::ConnectionClosed(why.clone()));
-                        closed = true;
-                        if !replied {
-                            break BarrierReading::Unconfirmed(format!(
-                                "not evaluated: connection closed before any reply: {why}"
-                            ));
+                        failure = Some(format!("RSP closed during kill: {why}"));
+                    }
+                    rsp::TeardownRead::Packet(packet) => {
+                        let kind = teardown_reply(&packet, pid);
+                        steps.push(TeardownStep::Reply(packet));
+                        match kind {
+                            Ok(TeardownReply::Stop(_)) if interrupt_sent && !extra_stop_drained => {
+                                // One interrupt race reply is ignored, never a new authorization.
+                                extra_stop_drained = true;
+                            }
+                            Ok(TeardownReply::Stop(_)) => {
+                                failure = Some("unsolicited or duplicate stop during kill".into());
+                            }
+                            Ok(TeardownReply::Exit) => exit_seen = true,
+                            Ok(_) => {}
+                            Err(why) => failure = Some(why.into()),
                         }
                     }
                 }
             }
+            if failure.is_some() {
+                continue;
+            }
             let reading = self.barrier();
             if matches!(reading, BarrierReading::Confirmed(_)) || crate::clock::now() >= deadline {
                 break reading;
+            }
+            if exit_seen {
+                std::thread::sleep(Duration::from_millis(1));
             }
         };
         if let BarrierReading::Confirmed(evidence) = &reading {
@@ -4710,8 +4877,8 @@ impl Session {
             }
             steps.push(TeardownStep::TraceeReaped(self.reaped));
         }
-        let unconfirmed =
-            post_kill_unconfirmed(post_kill.as_ref(), self.parent.is_none(), self.reaped);
+        let unconfirmed = timed_out
+            || post_kill_unconfirmed(post_kill.as_ref(), self.parent.is_none(), self.reaped);
         TeardownReport {
             pid,
             identity: self.birth,
@@ -5302,13 +5469,13 @@ impl TraceBackend for MacosTraceBackend {
             ));
         }
         let s = &mut self.sessions[i];
-        if !s.stopped || !s.waiting.is_empty() {
-            return Err(error("resume", "not externally stopped"));
-        }
         if s.signals.closed() {
             return Err(unsupported(
                 "signal-delivery-closed: no resume after ambiguous send or teardown",
             ));
+        }
+        if !s.stopped || !s.waiting.is_empty() {
+            return Err(error("resume", "not externally stopped"));
         }
         if let ResumeMode::Signal(token) = command.mode {
             if s.torn_down
@@ -5330,9 +5497,12 @@ impl TraceBackend for MacosTraceBackend {
                 command.thread,
                 s.exec_generation,
                 command.signal,
-                |packet| live.rsp.send(packet),
+                |packet| {
+                    // Validation has succeeded; even an error can mean delivery.
+                    s.stopped = false;
+                    live.rsp.send(packet)
+                },
             )?;
-            s.stopped = false;
             return Ok(());
         }
         if command.signal.is_some() || s.signals.pending() {
@@ -5593,6 +5763,50 @@ fn termination_result(sessions: Vec<String>, unenrolled: Vec<String>) -> Result<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_loss_wakes_a_pending_rsp_request() {
+        use std::io::Read;
+        let tasks = Arc::new(Mutex::new(WatchedTasks::default()));
+        let (stream, owner_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let owner = Watchdog::new(
+            None,
+            Some(crate::owner::OwnerWatch::test_stream(stream).unwrap()),
+            tasks.clone(),
+        )
+        .unwrap();
+        let deadline = Watchdog::new(None, None, tasks).unwrap();
+        let (mut rsp, mut peer) = Rsp::retirement_test_pair();
+        deadline.wakeups.add(rsp.wakeup());
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = rsp.request("qC");
+            completed.send((result, rsp)).unwrap();
+        });
+        let mut request = [0; 6];
+        peer.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"$qC#b4");
+        drop(owner_peer);
+        let limit = Instant::now() + Duration::from_secs(2);
+        while owner.reason().is_none() && Instant::now() < limit {
+            std::thread::yield_now();
+        }
+        assert_eq!(owner.reason(), Some(TerminalCause::OwnerGone));
+        // Synchronize with the monitor itself before checking delivery; no race
+        // between latching the reason and signalling its wakeup registry.
+        drop(owner);
+        let response = completion.recv_timeout(Duration::from_secs(1));
+        // Always release the worker even when the wiring is broken.
+        deadline.wakeups.signal();
+        worker.join().unwrap();
+        let (result, mut rsp) = response.expect("owner loss must wake the pending request");
+        assert!(result.is_err());
+        assert!(
+            rsp.begin_teardown(),
+            "cancellation must preserve the RSP stream"
+        );
+    }
+
     /// F2 (#205): every `TRACED_STUBS` row resolves to at least one verified
     /// `svc` site in this process's own libsystem_kernel. This reads local
     /// memory only and traces nothing, so it runs on hosted runners too.
@@ -6804,3 +7018,7 @@ mod retirement_controls;
 #[cfg(test)]
 #[path = "shutdown_tests.rs"]
 mod shutdown_tests;
+
+#[cfg(test)]
+#[path = "teardown_tests.rs"]
+mod teardown_tests;
