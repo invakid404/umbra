@@ -9917,13 +9917,13 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for #300 uncertain resume accounting: single_thread and its Fork/WaitPlan::Park
+    // Re-characterized for #300 internal resume/stop accounting: single_thread and its Fork/WaitPlan::Park
     // call sites are unchanged from #298 (55c6c248), including six preceding
     // and fifteen following lines. The structural guard and native/routed
     // refusal retain the same classification and runtime-witness limitation.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("d71d46f6e92aa45b3f935c0d3cdcbd9c228a491db4d47d9d21ad289db49aa0bd"),
+        Some("94a1c688e1ebc64f099893f8533e8b4c517a7bd13bdedd869f86e961bd1fb073"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
