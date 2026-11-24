@@ -57,6 +57,11 @@ cases, 29 lifecycle-feature cases, and the #205 fork-window SETSID refusal.
 Qualification covers 51 of these 54 arms. The three guardian provider-loss
 arms are blocked by [#303](https://github.com/invakid404/umbra/issues/303)
 and kept, with unchanged bodies and oracles, out of CI until that defect is fixed.
+The separate `fix_243_provider_loss_no_spawn_reading` and
+`fix_243_provider_loss_null_reading` comparisons are also blocked by #303:
+their own classifications were `NOT QUALIFIED` despite Cargo reporting success,
+and the serial census found new zombies. Exclude both comparisons and the three
+guardian provider-loss cases by name from local group runs until #303 is fixed.
 There is no conditional profile-refusal arm that can make these tests pass
 without reaching the requested semantics. Unknown-profile refusal is checked
 independently by synthetic profile/witness tests.

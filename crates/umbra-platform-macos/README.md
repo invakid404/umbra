@@ -143,7 +143,7 @@ checks the running kernel's prefix; installed-image disassembly alone is
 not a live-kernel observation.
 
 The legacy row deliberately keeps its original single-library admission rule;
-missing C-library evidence is not a wildcard in the current row. Both decoders
+missing C-library evidence is not a wildcard in the current row. The shared decoder
 reject nondefault conclave memory limits. Current-profile alignment gaps remain
 zero-required; only source-established legacy padding is normalized. CLOSE,
 DUP2 and INHERIT remain the only admitted actions.
@@ -176,6 +176,13 @@ Mach handle to the owner monitor; see
 the in-process watchdog. Terminal/library runs have no outer guardian sweep;
 the local no-spawn, null-spawn and packed-spawn comparison left root/debugger
 survivors requiring test recovery. A live-process census does not prove reap.
+The current qualification restores 51 of the 54 packed-spawn arms. The three
+guardian provider-loss arms remain unchanged and out of CI pending
+[#303](https://github.com/invakid404/umbra/issues/303). The no-spawn and null-spawn
+provider-loss comparison readings also exposed that defect: Cargo reported
+success while their own evidence said `NOT QUALIFIED` and the serial census
+found a new zombie. These readings do not qualify provider-loss cleanup and
+must not be repeated before #303 is fixed.
 Guardian-isolated entry retains its existing session sweep and zombie caveat.
 Later child-initiated group/session changes remain outside this guarantee.
 
