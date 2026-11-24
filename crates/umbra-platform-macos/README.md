@@ -1116,7 +1116,15 @@ Further #205 coverage:
   SIGINT explicitly, ignored or default, so neither inherits the test's own).
 - `native_debugger_last_hands_the_program_back` is the native control
   (`experiments/fixtures/umbra-fix-205-exitwin.c`, the orderings that leave
-  nothing behind only).
+  nothing behind only). It requires `UMBRA_FIX205_EXITWIN` to name the signed
+  native-control executable; without it the test skips, or fails when
+  `UMBRA_INTEGRATION_REQUIRED` is set. From the repository root, build with
+  `clang -arch arm64 -O1 -Wall -Wextra -Werror experiments/fixtures/umbra-fix-205-exitwin.c -o target/debug/umbra-fix-205-exitwin`,
+  then sign with `codesign --force --sign - --entitlements experiments/fixtures/umbra-fix-205-exitwin.entitlements target/debug/umbra-fix-205-exitwin`.
+  Set `UMBRA_FIX205_EXITWIN` to that executable's absolute path and run
+  `cargo test -p umbra-platform-macos --test fixtures native_debugger_last_hands_the_program_back -- --nocapture`.
+  Each selected mode must exit successfully and report collection by the
+  original parent; the test also requires no attributable launchd zombie.
 - `fchmodat_traced_matches_native` runs `fchmodat` traced and natively.
 
 `native::tests::the_teardown_barrier_decides_from_report_identity_and_lookup`
