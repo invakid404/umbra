@@ -307,9 +307,9 @@ impl Rsp {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        // Darwin inherits O_NONBLOCK from the listener. poll() uses blocking
-        // reads with a timeout; an inherited nonblocking socket would return
-        // WouldBlock immediately, before debugserver can answer the handshake.
+        // Normalize Darwin's inherited O_NONBLOCK while configuring the socket.
+        // Reads below are nonblocking; poll() waits on the socket and wakeup fd
+        // before retrying, within the request deadline.
         stream.set_nonblocking(false).map_err(|e| error("rsp", e))?;
         stream.set_nodelay(true).map_err(|e| error("rsp", e))?;
         stream

@@ -206,12 +206,14 @@ impl TerminalCause {
     }
 }
 struct WatchedTasks<T = Arc<Task>> {
+    wakeups: Arc<rsp::Wakeups>,
     tasks: Vec<T>,
     reason: Option<TerminalCause>,
 }
 impl<T> Default for WatchedTasks<T> {
     fn default() -> Self {
         Self {
+            wakeups: Arc::new(rsp::Wakeups::default()),
             tasks: Vec::new(),
             reason: None,
         }
@@ -264,7 +266,12 @@ impl Watchdog {
         tasks: Arc<Mutex<WatchedTasks>>,
     ) -> Result<Self> {
         let owned = tasks.clone();
-        let wakeups = Arc::new(rsp::Wakeups::default());
+        // Owner and deadline monitors share cancellation with their task latch.
+        let wakeups = tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wakeups
+            .clone();
         let wake_worker = wakeups.clone();
         let (waiter, cancel) = crate::owner::Waiter::new(owner)?;
         let worker = std::thread::Builder::new()
