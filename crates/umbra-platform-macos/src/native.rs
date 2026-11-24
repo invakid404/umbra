@@ -1944,6 +1944,21 @@ impl Drop for Session {
     }
 }
 
+/// Each provider retains both successful and failed host observations. Tracee
+/// lifecycle transitions never invalidate this process-local library witness.
+#[derive(Default)]
+struct SpawnQualification {
+    observed: Option<Option<&'static spawn::Layout>>,
+}
+impl SpawnQualification {
+    fn get(
+        &mut self,
+        observe: impl FnOnce() -> Option<&'static spawn::Layout>,
+    ) -> Option<&'static spawn::Layout> {
+        *self.observed.get_or_insert_with(observe)
+    }
+}
+
 /// Native prototype control, deliberately !Send/!Sync. Construct on the provider thread.
 pub struct MacosTraceBackend {
     launch_stdio: Option<umbra_core::launch_stdio::LaunchStdio>,
@@ -1952,7 +1967,7 @@ pub struct MacosTraceBackend {
     ledger: umbra_platform::shutdown::Ledger,
     poll_cursor: usize,
     spawn_sequence: u64,
-    spawn_profile: Option<Option<&'static spawn::Layout>>,
+    spawn_profile: SpawnQualification,
     options: Options,
     sessions: Vec<Session>,
     failed_retirements: Vec<Session>,
@@ -1996,7 +2011,7 @@ impl MacosTraceBackend {
             ledger: umbra_platform::shutdown::Ledger::new(),
             poll_cursor: 0,
             spawn_sequence: 0,
-            spawn_profile: None,
+            spawn_profile: SpawnQualification::default(),
             options,
             sessions: vec![],
             failed_retirements: vec![],
@@ -2029,14 +2044,7 @@ impl MacosTraceBackend {
         regs: RegisterSet,
         twin: PathBuf,
     ) -> Result<()> {
-        let layout = match self.spawn_profile {
-            Some(value) => value,
-            None => {
-                let value = spawn_host::qualify().ok();
-                self.spawn_profile = Some(value);
-                value
-            }
-        };
+        let layout = self.spawn_profile.get(|| spawn_host::qualify().ok());
         let layout = layout.ok_or_else(|| unsupported("spawn ABI profile mismatch"))?;
         if std::env::var_os("UMBRA_SPAWN_LOG").is_some() {
             eprintln!("spawn-capture descriptor=non-null profile={}", layout.id);
@@ -5651,6 +5659,47 @@ fn termination_result(sessions: Vec<String>, unenrolled: Vec<String>) -> Result<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f247_qualification_cache_is_provider_scoped() {
+        use super::*;
+        use std::cell::Cell;
+        let observations = Cell::new(0);
+        for outcome in [Some(&spawn::CURRENT), None] {
+            let mut provider = SpawnQualification::default();
+            let before = observations.get();
+            for _tracee_exec_generation in 0..3 {
+                let actual = provider.get(|| {
+                    observations.set(observations.get() + 1);
+                    outcome
+                });
+                assert_eq!(
+                    actual.map(|layout| layout.id),
+                    outcome.map(|layout| layout.id)
+                );
+            }
+            assert_eq!(observations.get(), before + 1);
+            // A later available observation cannot upgrade a refused provider.
+            assert_eq!(
+                provider
+                    .get(|| Some(&spawn::LEGACY))
+                    .map(|layout| layout.id),
+                outcome.map(|layout| layout.id)
+            );
+        }
+        let mut restarted = SpawnQualification::default();
+        assert_eq!(
+            restarted
+                .get(|| {
+                    observations.set(observations.get() + 1);
+                    Some(&spawn::CURRENT)
+                })
+                .unwrap()
+                .id,
+            spawn::CURRENT.id
+        );
+        assert_eq!(observations.get(), 3);
+    }
+
     fn spawn_barrier_fixture() -> (super::SpawnBarrier, umbra_core::SpawnAuthorization) {
         use super::*;
         let parent = TaskId(TaskIdentity {
