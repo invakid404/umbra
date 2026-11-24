@@ -511,6 +511,9 @@ impl Rsp {
     /// own bound, because the session deadline may already have expired (the
     /// watchdog path) and a teardown still has to read the tracer's reply.
     fn poll_until(&mut self, limit: Instant) -> Result<Option<String>> {
+        self.poll_packets(limit, false)
+    }
+    fn poll_packets(&mut self, limit: Instant, nonblocking: bool) -> Result<Option<String>> {
         loop {
             if let Some(start) = self.buffer.iter().position(|b| *b == b'$') {
                 if let Some(end) = self.buffer[start + 1..]
@@ -568,7 +571,7 @@ impl Rsp {
             } else {
                 self.buffer.clear();
             }
-            if crate::clock::now() >= limit {
+            if !nonblocking && crate::clock::now() >= limit {
                 return Ok(None);
             }
             self.stream
@@ -576,7 +579,7 @@ impl Rsp {
                     limit.saturating_duration_since(crate::clock::now()),
                 )))
                 .map_err(|e| error("rsp timeout", e))?;
-            if !self.ready(libc::POLLIN, limit, false)? {
+            if !nonblocking && !self.ready(libc::POLLIN, limit, false)? {
                 return Ok(None);
             }
             let mut bytes = [0; 8192];
@@ -600,6 +603,9 @@ impl Rsp {
                             | std::io::ErrorKind::Interrupted
                     ) =>
                 {
+                    if nonblocking {
+                        return Ok(None);
+                    }
                     continue;
                 }
                 Err(e) => return Err(error("rsp receive", e)),
@@ -671,6 +677,14 @@ impl Rsp {
             .map_err(std::io::Error::other)
     }
 
+    /// Consume only bytes already available, retaining incomplete packets.
+    pub(crate) fn teardown_read_buffered(&mut self) -> TeardownRead {
+        match self.poll_packets(crate::clock::now() + Duration::from_millis(1), true) {
+            Ok(Some(packet)) => TeardownRead::Packet(packet),
+            Ok(None) => TeardownRead::Quiet,
+            Err(e) => TeardownRead::Closed(e.to_string()),
+        }
+    }
     /// One bounded read of whatever the tracer sends during teardown.
     pub fn teardown_read(&mut self, wait: Duration) -> TeardownRead {
         match self.poll_until(crate::clock::now() + wait) {
@@ -716,6 +730,19 @@ impl Rsp {
 }
 #[cfg(test)]
 impl Rsp {
+    pub(crate) fn buffer_test_packets(&mut self, count: usize) {
+        let limit = crate::clock::now() + Duration::from_secs(1);
+        while self.buffer.iter().filter(|b| **b == b'#').count() < count
+            || self.buffer.len() < 3
+            || self.buffer[self.buffer.len() - 3] != b'#'
+        {
+            assert!(self.ready(libc::POLLIN, limit, false).unwrap());
+            let mut bytes = [0; 8192];
+            let n = self.read_progress(&mut bytes).unwrap();
+            assert!(n > 0);
+            self.buffer.extend_from_slice(&bytes[..n]);
+        }
+    }
     pub(crate) fn set_test_ownership(&mut self, slot: umbra_platform::shutdown::Reservation) {
         self.ownership = Some(slot);
     }

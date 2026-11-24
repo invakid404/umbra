@@ -73,13 +73,14 @@ fn run_peer(
         .spawn()
         .unwrap();
     let pid = child.id() as i32;
-    let (rsp, mut peer) = Rsp::retirement_test_pair();
+    let (mut rsp, mut peer) = Rsp::retirement_test_pair();
     peer.set_read_timeout(Some(Duration::from_millis(25)))
         .unwrap();
     if let Some(queued) = queued {
         for reply in queued.split('|') {
             packet(&mut peer, reply);
         }
+        rsp.buffer_test_packets(queued.split('|').count());
     }
     let done = Arc::new(AtomicBool::new(false));
     let peer_done = done.clone();
@@ -219,12 +220,7 @@ fn unsolicited_stop_is_loud() {
 
 #[test]
 fn duplicate_buffered_stop_is_loud() {
-    let (report, bytes) = run_peer(
-        false,
-        Some("T14thread:1;|T14thread:1;"),
-        None,
-        true,
-    );
+    let (report, bytes) = run_peer(false, Some("T14thread:1;|T14thread:1;"), None, true);
     assert!(report.timed_out && report.unconfirmed, "{report:?}");
     assert!(bytes.is_empty(), "{bytes:?}");
 }

@@ -4637,12 +4637,13 @@ impl Session {
             .then(|| "ordinary RSP frame incomplete at teardown handover".to_string());
         let mut closed = false;
         let mut exit_seen = self.done;
-        let mut resent = false;
-        if failure.is_none() && !self.done && !self.stopped {
-            // Discard already queued stop packets: they may precede a resume.
+        let mut interrupt_sent = false;
+        let mut extra_stop_drained = false;
+        if failure.is_none() && !self.done {
+            // A buffered stop answers the outstanding resume, regardless of signal.
             // Keep the incremental decoder and the same socket throughout.
             while crate::clock::now() < stop_deadline {
-                match self.rsp.teardown_read(Duration::from_millis(1)) {
+                match self.rsp.teardown_read_buffered() {
                     rsp::TeardownRead::Quiet => break,
                     rsp::TeardownRead::Closed(why) => {
                         steps.push(TeardownStep::ConnectionClosed(why.clone()));
@@ -4658,6 +4659,13 @@ impl Session {
                                 exit_seen = true;
                                 break;
                             }
+                            Ok(TeardownReply::Stop(_)) if !self.stopped => {
+                                self.stopped = true;
+                            }
+                            Ok(TeardownReply::Stop(_)) => {
+                                failure = Some("unsolicited or duplicate stop".into());
+                                break;
+                            }
                             Ok(_) => {}
                             Err(why) => {
                                 failure = Some(why.into());
@@ -4667,9 +4675,12 @@ impl Session {
                     }
                 }
             }
-            if failure.is_none() && !exit_seen {
+            if failure.is_none() && !exit_seen && !self.stopped {
                 match self.rsp.teardown_interrupt(stop_deadline) {
-                    Ok(()) => steps.push(TeardownStep::InterruptSent),
+                    Ok(()) => {
+                        interrupt_sent = true;
+                        steps.push(TeardownStep::InterruptSent);
+                    }
                     Err(e) => failure = Some(format!("RSP interrupt failed: {e}")),
                 }
                 let mut stopped = false;
@@ -4688,10 +4699,8 @@ impl Session {
                             let kind = teardown_reply(&packet, pid);
                             steps.push(TeardownStep::Reply(packet));
                             match kind {
-                                // debugserver reports Darwin SIGSTOP (0x11) for
-                                // an interrupt; peers may also report SIGINT.
-                                // A stale breakpoint cannot replace that reply.
-                                Ok(TeardownReply::Stop(2 | 17)) => {
+                                Ok(TeardownReply::Stop(_)) => {
+                                    self.stopped = true;
                                     stopped = true;
                                     break;
                                 }
@@ -4744,15 +4753,12 @@ impl Session {
                         let kind = teardown_reply(&packet, pid);
                         steps.push(TeardownStep::Reply(packet));
                         match kind {
-                            Ok(TeardownReply::Stop(_)) if !resent => {
-                                resent = true;
-                                let bound = deadline
-                                    .saturating_duration_since(crate::clock::now())
-                                    .min(Duration::from_millis(250));
-                                match self.rsp.send_kill(bound) {
-                                    Ok(()) => steps.push(TeardownStep::KillResent),
-                                    Err(e) => failure = Some(format!("RSP resend failed: {e}")),
-                                }
+                            Ok(TeardownReply::Stop(_)) if interrupt_sent && !extra_stop_drained => {
+                                // One interrupt race reply is ignored, never a new authorization.
+                                extra_stop_drained = true;
+                            }
+                            Ok(TeardownReply::Stop(_)) => {
+                                failure = Some("unsolicited or duplicate stop during kill".into());
                             }
                             Ok(TeardownReply::Exit) => exit_seen = true,
                             Ok(_) => {}
