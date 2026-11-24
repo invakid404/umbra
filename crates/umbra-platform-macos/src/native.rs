@@ -6804,3 +6804,7 @@ mod retirement_controls;
 #[cfg(test)]
 #[path = "shutdown_tests.rs"]
 mod shutdown_tests;
+
+#[cfg(test)]
+#[path = "teardown_tests.rs"]
+mod teardown_tests;
