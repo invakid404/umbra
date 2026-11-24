@@ -849,13 +849,26 @@ run's job, so a hangup, ^C, ^\ or `kill -pgid` reaches both.
   the provider, not by debugserver, and never inherits them. SIGTSTP stops
   debugserver with the job, and the teardown's SIGCONT continues it.
 
-The `k` plus the barrier is bounded at 1.5 s per session, and each reap at
-250 ms (at most 2 s per session). On a timeout the provider writes
+Ordered teardown first interrupts a running program and consumes its stop
+reply, then sends `k`. The stop phase has 250 ms; termination and native
+identity/reap confirmation have at most 1250 ms, within the original absolute
+1.5 s deadline. Each of the two reaps retains its 250 ms limit (at most 2 s per
+session). An already stopped program skips the interrupt. Queued stops are
+drained before the interrupt; a breakpoint reply cannot replace the interrupt
+stop. At most one interrupt and two `k` packets are sent. Ordinary-work
+cancellation wakes a separate fd and hands the same RSP stream and incremental
+decoder to teardown; an incomplete outgoing frame fails closed.
+
+The provider drain remains `3 + 4D` seconds, with its existing fork-sweep
+allowance unchanged; the whole-run worst case at D=1 remains 11.1 s. These are teardown
+bounds, not session age or inactivity limits.
+
+On a missing stop, missing confirmation, or protocol failure the provider writes
 `tracee termination unconfirmed; tracer killed` to stderr, kills debugserver,
 and runs one post-kill barrier inside the 250 ms tracer reap:
 - **Confirmed:** a second line, `tracee exit confirmed after tracer kill`,
-  follows the warning. `Terminate` succeeds if no other session remains
-  unconfirmed and no retirement failure is retained.
+  follows the warning. The failed ordered attempt remains unconfirmed and
+  `Terminate` fails even if this fallback collected the program.
 - **Still unconfirmed:** `Terminate` returns the warning as its error. If final
   shutdown cannot confirm every obligation, the run is left recovery-required.
 - **Handed to launchd:** a root the provider did not collect once its
@@ -877,7 +890,7 @@ stopped, which the SIGCONT handles) or already dead. The tests pin these cases:
 - a stopped debugserver is continued and confirms before the tracer kill;
 - a dead debugserver takes the timeout path, and the post-kill result must
   match the tracee's end state: past its exit means `ConfirmedAfterTracerKill`
-  and `Ok`, a tracee still live means `Err`, and an end state the test cannot
+  with the original failure retained, a tracee still live means `Err`, and an end state the test cannot
   read (a lookup error other than ESRCH) fails the test.
 
 **Residuals (#205), each tracked in #205.** These can still leave a tracee to
@@ -899,17 +912,20 @@ launchd as a zombie nobody collects:
   while anything is held: it waits for the provider's `Final`. A shutdown
   error before `Final` (the envelope deadline, a transport error) or a panic
   while a session is live does, and is R2.
-- **R3:** a hung or slow debugserver on the timeout path; the kill can hand
-  its tracee to launchd, and `Terminate` fails and names it. Slow includes a
-  debugserver still inside its own kill of a running tracee: it first stops
-  the tracee with SIGSTOP and waits up to 2 s for that stop, then sends
-  `PT_KILL` and waits up to 1 s more (LLVM `MachProcess::Kill`,
-  `MachProcess::DoSIGSTOP`), longer than the 1.5 s per-session bound.
-  On CI, `sid1_p1`'s child, a running tracee whose debugserver was not the
-  stopped one, timed out on this path: its `k` was still unconfirmed after
-  1.5 s with the child running, and it was confirmed after the kill.
-  Debugserver's own kill path fits that reading from source; the cause in
-  that run is not established.
+- **R3 (#300):** stop-before-`k` repairs the observed running-program dispatch
+  path without increasing the bound. The local watchdog case confirmed before
+  tracer disposal in 20.57 ms. The SID-1 stopped-tracer case still requires CI
+  qualification; its earlier timeout was not proved to have the same cause.
+  A hung peer, or a stop/exit not observed within its phase, still takes the
+  loud timeout path and can leave a zombie.
+
+The mechanism evidence uses host debugserver lldb-2100.0.17.108
+(SHA-256 prefix `162db59f`, suffix `1a0a`) and its arm64 dispatch table,
+corroborated against LLVM revision `37d519eb`. This is not exact-build source.
+The repair does not depend on `k` being dropped while running: stopping first
+also avoids the running-program SIGSTOP wait before `PT_KILL` and its reap
+of up to 1 s. R2 (#299), externally killed providers/helpers, and R1 remain
+outside this repair.
 
 `SIGKILL` or other cancellation that bypasses `Terminate` and drop reaches R1 or
 R2. In launchd's session none of these reaches a group there: #193 runs the

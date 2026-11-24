@@ -2164,8 +2164,8 @@ fn assert_no_launchd_zombie(since: (u64, u64), recorded: &[(i32, Option<(u64, u6
 }
 
 /// Review ruling 1 V3: after a timeout (warning, then the tracer kill), the
-/// result follows the one post-kill barrier. Confirmed after the kill means
-/// `terminate` succeeds; still unconfirmed means it fails. Either step comes
+/// result records the one post-kill barrier. The failed ordered attempt
+/// remains loud even if collection follows the kill. Either step comes
 /// after `TracerKilled`. Returns which one the end state proved.
 fn post_kill_outcome(report: &TeardownReport, result: &Result<()>) -> &'static str {
     let killed = step_index(report, |s| *s == TeardownStep::TracerKilled).unwrap();
@@ -2178,8 +2178,8 @@ fn post_kill_outcome(report: &TeardownReport, result: &Result<()>) -> &'static s
     match (confirmed, unconfirmed) {
         (Some(at), None) => {
             assert!(at > killed, "post-kill confirmation before the kill");
-            assert!(!report.unconfirmed);
-            assert!(result.is_ok(), "confirmed after the kill, yet {result:?}");
+            assert!(report.unconfirmed);
+            assert!(result.is_err(), "fallback must retain ordered failure");
             "confirmed after tracer kill"
         }
         (None, Some(at)) => {
