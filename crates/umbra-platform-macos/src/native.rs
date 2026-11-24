@@ -1,10 +1,11 @@
 //! Thread-affine debugger controller. Unsafe code is limited to owned Mach rights,
 //! local libSystem calls and bounded remote memory copies.
 use crate::{
-    abi::{self, get, set, CPSR, PC},
+    Options,
+    abi::{self, CPSR, PC, get, set},
     cache, error, interpose,
     rsp::{self, Rsp},
-    spawn, spawn_host, unsupported, Options,
+    spawn, spawn_host, unsupported,
 };
 use mach2::{
     traps::{mach_task_self, task_for_pid},
@@ -65,7 +66,7 @@ impl Task {
         Ok(task)
     }
     fn writable_pid_slot(&self, pointer: u64) -> bool {
-        use mach2::vm_region::{vm_region_basic_info_64, VM_REGION_BASIC_INFO_64};
+        use mach2::vm_region::{VM_REGION_BASIC_INFO_64, vm_region_basic_info_64};
         let Some(end) = pointer.checked_add(4) else {
             return false;
         };
@@ -668,6 +669,32 @@ impl std::ops::DerefMut for Session {
     }
 }
 
+impl LiveSession {
+    fn attached(
+        pid: i32,
+        task: Arc<Task>,
+        rsp: Rsp,
+        twin: PathBuf,
+        registers: Vec<(usize, usize)>,
+        interposer: Option<(PathBuf, PathBuf, u32)>,
+    ) -> Self {
+        Self {
+            _witness: crate::ownership::Witness::new(pid as u64, "body"),
+            spawn: None,
+            task,
+            rsp,
+            twin,
+            breaks: crate::ownership::Owned::new(BTreeMap::new(), pid as u64, "breaks"),
+            pending: crate::ownership::Owned::new(BTreeMap::new(), pid as u64, "pending"),
+            waiting: crate::ownership::Owned::new(vec![], pid as u64, "waiting"),
+            entry: crate::ownership::Owned::new(BTreeMap::new(), pid as u64, "entry"),
+            registers: crate::ownership::Owned::new(registers, pid as u64, "registers"),
+            scratch: crate::ownership::Owned::new(vec![], pid as u64, "scratch"),
+            interposer,
+        }
+    }
+}
+
 impl Session {
     #[allow(clippy::too_many_arguments)]
     fn attach(
@@ -784,20 +811,9 @@ impl Session {
             initial: true,
             retirement: None,
             retirement_report: None,
-            live: Some(Box::new(LiveSession {
-                _witness: crate::ownership::Witness::new(pid as u64, "body"),
-                spawn: None,
-                task,
-                rsp,
-                twin,
-                breaks: crate::ownership::Owned::new(BTreeMap::new(), pid as u64, "breaks"),
-                pending: crate::ownership::Owned::new(BTreeMap::new(), pid as u64, "pending"),
-                waiting: crate::ownership::Owned::new(vec![], pid as u64, "waiting"),
-                entry: crate::ownership::Owned::new(BTreeMap::new(), pid as u64, "entry"),
-                registers: crate::ownership::Owned::new(registers, pid as u64, "registers"),
-                scratch: crate::ownership::Owned::new(vec![], pid as u64, "scratch"),
-                interposer,
-            })),
+            live: Some(Box::new(LiveSession::attached(
+                pid, task, rsp, twin, registers, interposer,
+            ))),
         })
     }
     /// Read one thread's registers.
@@ -5729,6 +5745,54 @@ mod tests {
         )
     }
     #[test]
+    fn f247_child_has_no_inherited_pending_snapshot() {
+        use super::*;
+        let pid = std::process::id() as i32;
+        let task = Arc::new(Task::acquire(pid).unwrap());
+        let make = || {
+            LiveSession::attached(
+                pid,
+                task.clone(),
+                Rsp::retirement_test(),
+                PathBuf::new(),
+                vec![],
+                None,
+            )
+        };
+        let (barrier, auth) = spawn_barrier_fixture();
+        let snapshot = spawn::decode(
+            &spawn::CURRENT,
+            &[0; spawn::DESCRIPTOR_BYTES],
+            |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut parent = make();
+        parent.spawn = Some(SpawnInFlight {
+            token: barrier.token,
+            snapshot,
+            plan: SpawnPlan {
+                digest: auth.digest,
+                actions: vec![],
+                close_on_exec_default: false,
+            },
+            authorization: Some(auth),
+            original: RegisterSet::new(Architecture::Aarch64, vec![0; 272]).unwrap(),
+            returned: None,
+            caller_pid: pid as u64,
+            region: None,
+            twin: PathBuf::new(),
+            child: None,
+        });
+        let before = parent.spawn.as_ref().unwrap() as *const SpawnInFlight;
+        let child = make();
+        assert!(child.spawn.is_none());
+        let retained = parent.spawn.as_ref().unwrap();
+        assert_eq!(before, retained as *const SpawnInFlight);
+        assert_eq!(retained.authorization, Some(auth));
+        assert!(std::ptr::eq(retained.snapshot.layout(), &spawn::CURRENT));
+    }
+
+    #[test]
     fn f247_stale_and_repeated_authorization() {
         let (mut barrier, auth) = spawn_barrier_fixture();
         let parent = auth.token.parent;
@@ -6091,9 +6155,11 @@ mod tests {
         assert_eq!(ends[0], Ok("gone"));
         assert_eq!(ends[1], Ok("a zombie under its parent"));
         assert_eq!(ends[2], Err(Lookup::Error("transient".into())));
-        assert!(ends[3..]
-            .iter()
-            .all(|end| matches!(end, Err(Lookup::Found { .. }))));
+        assert!(
+            ends[3..]
+                .iter()
+                .all(|end| matches!(end, Err(Lookup::Found { .. })))
+        );
         // Every child ends early: the wait returns at once.
         let clock = Cell::new(start);
         let ends = await_unenrolled_ends(
@@ -6804,21 +6870,25 @@ mod bounded_poll_tests {
         ));
         backend.events.push_back(exit_event());
         backend.deadline = Some(crate::clock::now());
-        assert!(backend
-            .poll_event(Duration::from_millis(1))
-            .unwrap_err()
-            .to_string()
-            .contains("session timed out"));
+        assert!(
+            backend
+                .poll_event(Duration::from_millis(1))
+                .unwrap_err()
+                .to_string()
+                .contains("session timed out")
+        );
         assert_eq!(backend.events.len(), 1);
     }
     #[test]
     fn no_live_process_and_invalid_budget_are_not_idle() {
         let mut backend = MacosTraceBackend::default();
-        assert!(backend
-            .poll_event(Duration::from_nanos(1))
-            .unwrap_err()
-            .to_string()
-            .contains("no live processes"));
+        assert!(
+            backend
+                .poll_event(Duration::from_nanos(1))
+                .unwrap_err()
+                .to_string()
+                .contains("no live processes")
+        );
         for wait in [Duration::ZERO, Duration::MAX] {
             assert!(backend.poll_event(wait).is_err());
         }
@@ -6950,10 +7020,12 @@ mod monitor_sleep_tests {
         registry.add(existing.clone());
         assert!(registry.replace(&absent, new.clone()).is_none());
         assert_eq!(registry.tasks.len(), 2);
-        assert!(registry
-            .tasks
-            .iter()
-            .any(|entry| Arc::ptr_eq(entry, &existing)));
+        assert!(
+            registry
+                .tasks
+                .iter()
+                .any(|entry| Arc::ptr_eq(entry, &existing))
+        );
         assert!(registry.tasks.iter().any(|entry| Arc::ptr_eq(entry, &new)));
         registry.latch(TerminalCause::OwnerGone);
         assert_eq!(existing.load(std::sync::atomic::Ordering::SeqCst), 1);
