@@ -1,11 +1,10 @@
 //! Thread-affine debugger controller. Unsafe code is limited to owned Mach rights,
 //! local libSystem calls and bounded remote memory copies.
 use crate::{
-    Options,
-    abi::{self, CPSR, PC, get, set},
+    abi::{self, get, set, CPSR, PC},
     cache, error, interpose,
     rsp::{self, Rsp},
-    spawn, spawn_host, unsupported,
+    spawn, spawn_host, unsupported, Options,
 };
 use mach2::{
     traps::{mach_task_self, task_for_pid},
@@ -66,7 +65,7 @@ impl Task {
         Ok(task)
     }
     fn writable_pid_slot(&self, pointer: u64) -> bool {
-        use mach2::vm_region::{VM_REGION_BASIC_INFO_64, vm_region_basic_info_64};
+        use mach2::vm_region::{vm_region_basic_info_64, VM_REGION_BASIC_INFO_64};
         let Some(end) = pointer.checked_add(4) else {
             return false;
         };
@@ -6155,11 +6154,9 @@ mod tests {
         assert_eq!(ends[0], Ok("gone"));
         assert_eq!(ends[1], Ok("a zombie under its parent"));
         assert_eq!(ends[2], Err(Lookup::Error("transient".into())));
-        assert!(
-            ends[3..]
-                .iter()
-                .all(|end| matches!(end, Err(Lookup::Found { .. })))
-        );
+        assert!(ends[3..]
+            .iter()
+            .all(|end| matches!(end, Err(Lookup::Found { .. }))));
         // Every child ends early: the wait returns at once.
         let clock = Cell::new(start);
         let ends = await_unenrolled_ends(
@@ -6870,25 +6867,21 @@ mod bounded_poll_tests {
         ));
         backend.events.push_back(exit_event());
         backend.deadline = Some(crate::clock::now());
-        assert!(
-            backend
-                .poll_event(Duration::from_millis(1))
-                .unwrap_err()
-                .to_string()
-                .contains("session timed out")
-        );
+        assert!(backend
+            .poll_event(Duration::from_millis(1))
+            .unwrap_err()
+            .to_string()
+            .contains("session timed out"));
         assert_eq!(backend.events.len(), 1);
     }
     #[test]
     fn no_live_process_and_invalid_budget_are_not_idle() {
         let mut backend = MacosTraceBackend::default();
-        assert!(
-            backend
-                .poll_event(Duration::from_nanos(1))
-                .unwrap_err()
-                .to_string()
-                .contains("no live processes")
-        );
+        assert!(backend
+            .poll_event(Duration::from_nanos(1))
+            .unwrap_err()
+            .to_string()
+            .contains("no live processes"));
         for wait in [Duration::ZERO, Duration::MAX] {
             assert!(backend.poll_event(wait).is_err());
         }
@@ -7020,12 +7013,10 @@ mod monitor_sleep_tests {
         registry.add(existing.clone());
         assert!(registry.replace(&absent, new.clone()).is_none());
         assert_eq!(registry.tasks.len(), 2);
-        assert!(
-            registry
-                .tasks
-                .iter()
-                .any(|entry| Arc::ptr_eq(entry, &existing))
-        );
+        assert!(registry
+            .tasks
+            .iter()
+            .any(|entry| Arc::ptr_eq(entry, &existing)));
         assert!(registry.tasks.iter().any(|entry| Arc::ptr_eq(entry, &new)));
         registry.latch(TerminalCause::OwnerGone);
         assert_eq!(existing.load(std::sync::atomic::Ordering::SeqCst), 1);
