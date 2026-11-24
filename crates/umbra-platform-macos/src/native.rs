@@ -141,8 +141,7 @@ impl Task {
 }
 impl Drop for Task {
     fn drop(&mut self) {
-        #[cfg(test)]
-        if self.0 == 0 && self.1.is_none() {
+        if cfg!(test) && self.0 == 0 && self.1.is_none() {
             return; // Synthetic task fixture owns no Mach send right.
         }
         let result = unsafe { mach2::mach_port::mach_port_deallocate(mach_task_self(), self.0) };
