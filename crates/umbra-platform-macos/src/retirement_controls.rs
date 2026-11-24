@@ -148,16 +148,14 @@ fn f284_backend_rejects_duplicate_and_cross_exec_tokens() {
     // Deliberately leave authority present: this isolates the generation
     // comparison from the separate invalidation at an exec notification.
     owned.0.sessions[0].exec_generation = 1;
-    assert!(
-        owned
-            .0
-            .resume(ResumeCommand {
-                thread,
-                mode: ResumeMode::Signal(stale),
-                signal: Some(30),
-            })
-            .is_err()
-    );
+    assert!(owned
+        .0
+        .resume(ResumeCommand {
+            thread,
+            mode: ResumeMode::Signal(stale),
+            signal: Some(30),
+        })
+        .is_err());
     drop(owned);
     peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut bytes = Vec::new();
@@ -209,18 +207,16 @@ fn signal_transport_failure(accepted: usize, reason: &'static str) {
         1
     );
     assert!(owned.0.sessions[0].stopped);
-    assert!(
-        owned
-            .0
-            .resume(ResumeCommand {
-                thread,
-                mode: ResumeMode::Continue,
-                signal: None,
-            })
-            .unwrap_err()
-            .to_string()
-            .contains("signal-delivery-closed")
-    );
+    assert!(owned
+        .0
+        .resume(ResumeCommand {
+            thread,
+            mode: ResumeMode::Continue,
+            signal: None,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("signal-delivery-closed"));
     drop(owned);
     peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut bytes = Vec::new();
@@ -321,17 +317,15 @@ fn retirement_release_owns_all_resources() {
     assert!(backend.sessions[0].live.is_none());
     assert_eq!(crate::ownership::remaining(pid), Vec::<&str>::new());
     assert!(task.upgrade().is_none(), "both Task owners must release");
-    assert!(
-        backend
-            .watchdog
-            .as_ref()
-            .unwrap()
-            .tasks
-            .lock()
-            .unwrap()
-            .tasks
-            .is_empty()
-    );
+    assert!(backend
+        .watchdog
+        .as_ref()
+        .unwrap()
+        .tasks
+        .lock()
+        .unwrap()
+        .tasks
+        .is_empty());
     peer.set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
     assert_eq!(peer.read(&mut [0]).unwrap(), 0, "RSP socket must close");
@@ -455,11 +449,9 @@ fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
         4,
         "retired child history survives quiesce/resume/terminate"
     );
-    assert!(
-        accepted
-            .confirms(&ledger.final_snapshot().unwrap())
-            .unwrap()
-    );
+    assert!(accepted
+        .confirms(&ledger.final_snapshot().unwrap())
+        .unwrap());
 }
 
 #[test]
@@ -510,12 +502,10 @@ fn retirement_backend_late_reap_terminates_ok() {
         .unwrap();
     assert!(owner.upgrade().is_none());
     assert!(backend.failed_retirements.is_empty());
-    assert!(
-        backend.teardown_reports[0]
-            .steps
-            .iter()
-            .any(|step| matches!(step, TeardownStep::RetirementOverrun { .. }))
-    );
+    assert!(backend.teardown_reports[0]
+        .steps
+        .iter()
+        .any(|step| matches!(step, TeardownStep::RetirementOverrun { .. })));
     assert!(backend.teardown_reports[0].steps.iter().any(|step| matches!(step,
         TeardownStep::Retirement(crate::FinishOutcome::KilledThenReaped(status)) if status.signal() == Some(libc::SIGKILL))));
 }
@@ -528,11 +518,9 @@ fn retirement_backend_exhausted_drain_retains_child_and_failure() {
     let owner = Arc::downgrade(&session.task);
     backend.sessions.push(session);
     backend.service_retirements();
-    assert!(
-        backend
-            .terminate(root, TerminationPolicy::Immediate)
-            .is_err()
-    );
+    assert!(backend
+        .terminate(root, TerminationPolicy::Immediate)
+        .is_err());
     assert!(owner.upgrade().is_some());
     assert_eq!(backend.failed_retirements.len(), 1);
     assert_eq!(backend.failed_retirements[0].rsp.tracer_pid(), tracer);
@@ -541,11 +529,9 @@ fn retirement_backend_exhausted_drain_retains_child_and_failure() {
         step,
         TeardownStep::Retirement(crate::FinishOutcome::BoundExhausted(_))
     )));
-    assert!(
-        original
-            .iter()
-            .any(|step| matches!(step, TeardownStep::RetirementOverrun { .. }))
-    );
+    assert!(original
+        .iter()
+        .any(|step| matches!(step, TeardownStep::RetirementOverrun { .. })));
     backend.failed_retirements[0].rsp.retirement_wait_gate(0);
     backend.finalize_failed_retirements();
     assert!(backend.teardown_reports[0].steps.starts_with(&original));
@@ -576,11 +562,9 @@ fn retirement_drop_unconfirmed_resource_owner_records_emergency() {
     let owner = Arc::downgrade(&session.task);
     backend.sessions.push(session);
     backend.service_retirements();
-    assert!(
-        backend
-            .terminate(root, TerminationPolicy::Immediate)
-            .is_err()
-    );
+    assert!(backend
+        .terminate(root, TerminationPolicy::Immediate)
+        .is_err());
     assert!(owner.upgrade().is_some());
     let original = backend.teardown_reports[0].steps.clone();
     backend.finalize_failed_retirements();

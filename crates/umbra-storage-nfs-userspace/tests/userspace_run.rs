@@ -9161,13 +9161,12 @@ impl SlateWatchState {
         .unwrap();
         std::fs::write(
             evidence.with_extension("ledger.json"),
-            serde_json::to_vec_pretty(&serde_json::json!(
-                self.ledger
-                    .iter()
-                    .map(|b| serde_json::json!({"pid": b.pid, "start_sec": b.start.0,
+            serde_json::to_vec_pretty(&serde_json::json!(self
+                .ledger
+                .iter()
+                .map(|b| serde_json::json!({"pid": b.pid, "start_sec": b.start.0,
                     "start_usec": b.start.1}))
-                    .collect::<Vec<_>>()
-            ))
+                .collect::<Vec<_>>()))
             .unwrap(),
         )
         .unwrap();
@@ -10064,10 +10063,9 @@ fn slate_c10_10_fork_helper_refusal() {
     let no_done = read_through_client(&host, port, &path).is_none();
     let completed = journal_records_completion(&run);
     std::fs::write(evidence.join("oracles.txt"),format!("supervisor={:?} tracee_status_line={:?}\nchild_shadow_absent={child_absent} child_host_absent={} post_fork_absent={no_done} journal_completed={completed} run_id={}\n",run.status,run.stderr.lines().find(|l|l.contains("finished:")),!run.destination.exists(),run.run_id.0)).unwrap();
-    assert!(
-        run.stderr
-            .contains("fork/deferred wait requires one thread")
-    );
+    assert!(run
+        .stderr
+        .contains("fork/deferred wait requires one thread"));
     assert_ne!(run.status, Some(0));
     assert!(!run.stderr.contains("finished:"));
     assert!(child_absent && !run.destination.exists() && no_done);
@@ -10179,10 +10177,8 @@ fn slate_tokio_records(bytes: &[u8], case: &str) {
         assert!(rows[0].starts_with("dispatch task=roundtrip operation=write path="));
         assert!(rows[0].contains("out.txt"));
         assert!(rows[1].starts_with("result task=roundtrip operation=write value=Ok(())"));
-        assert!(
-            rows[2]
-                .starts_with("result task=roundtrip operation=read value=Ok([65, 83, 89, 78, 67])")
-        );
+        assert!(rows[2]
+            .starts_with("result task=roundtrip operation=read value=Ok([65, 83, 89, 78, 67])"));
         for row in &rows {
             assert!(row.ends_with(&format!("poll_tid={}", field("tid"))));
         }
@@ -10351,9 +10347,10 @@ fn slate_spawn_routed(spawn: &SlateSpawn, mode: &str, names: &[&str]) -> SlateRo
     if let Some(timeout_ms) = spawn.platform_timeout_ms {
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
-        config["providers"]["platform"]["options"] = serde_json::json!(
-            serde_json::to_vec(&serde_json::json!({"timeout_ms": timeout_ms})).unwrap()
-        );
+        config["providers"]["platform"]["options"] = serde_json::json!(serde_json::to_vec(
+            &serde_json::json!({"timeout_ms": timeout_ms})
+        )
+        .unwrap());
         std::fs::write(&registry, serde_json::to_vec(&config).unwrap()).unwrap();
     }
     assert_no_nfs_mount(&host, port, &[&workspace], "rank-11 before");
@@ -10779,16 +10776,12 @@ fn fix_243_signal(mode: &str, child_record: &str, flags: &str) {
     assert!(native.status.success(), "native control: {}", native.status);
     assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
     assert_eq!(std::fs::read(root.join("parent.txt")).unwrap(), b"PARENT");
-    assert!(
-        std::fs::read_to_string(root.join("records.child"))
-            .unwrap()
-            .contains(child_record)
-    );
-    assert!(
-        std::fs::read_to_string(root.join("records.done"))
-            .unwrap()
-            .contains("parent-signal ignored=1 blocked=1")
-    );
+    assert!(std::fs::read_to_string(root.join("records.child"))
+        .unwrap()
+        .contains(child_record));
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("parent-signal ignored=1 blocked=1"));
     let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "parent.txt"]);
     let correct = slate_two_exit_completion(&routed)
         && routed.object("child.txt") == Some(b"CHILD".as_slice())
@@ -10805,17 +10798,13 @@ fn fix_243_signal(mode: &str, child_record: &str, flags: &str) {
     );
     assert!(correct, "{}", routed.run.stderr);
     assert!(routed.text("records.child").contains(child_record));
-    assert!(
-        routed
-            .text("records.done")
-            .contains("parent-signal ignored=1 blocked=1")
-    );
-    assert!(
-        routed
-            .run
-            .stderr
-            .contains(&format!("spawn-policy flags={flags} actions=0"))
-    );
+    assert!(routed
+        .text("records.done")
+        .contains("parent-signal ignored=1 blocked=1"));
+    assert!(routed
+        .run
+        .stderr
+        .contains(&format!("spawn-policy flags={flags} actions=0")));
     assert!(journal_records_completion(&routed.run));
     slate_spawn_finish(&spawn, &routed);
     slate_finish_cleanup();
@@ -10848,16 +10837,12 @@ fn fix_243_signal_oracle_rejects_ignored_child() {
     };
     let (root, native) = slate_spawn_native(&spawn, "fix-243-sigdefault-mutant");
     assert!(!native.status.success());
-    assert!(
-        std::fs::read_to_string(root.join("records.child"))
-            .unwrap()
-            .contains("child-signal default=0 ignored=1 blocked=1")
-    );
-    assert!(
-        std::fs::read_to_string(root.join("records.done"))
-            .unwrap()
-            .contains("exited=1 code=81")
-    );
+    assert!(std::fs::read_to_string(root.join("records.child"))
+        .unwrap()
+        .contains("child-signal default=0 ignored=1 blocked=1"));
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("exited=1 code=81"));
     slate_finish_cleanup();
 }
 
@@ -10888,11 +10873,9 @@ fn fix_243_pipe(mode: &str) {
         serde_json::json!({"run_id": routed.run.run_id.0.to_string()}),
     );
     assert!(correct, "{}", routed.run.stderr);
-    assert!(
-        routed
-            .text("records.done")
-            .contains("pipe-result bytes=13 payload=FIX-243-NONCE eof=1")
-    );
+    assert!(routed
+        .text("records.done")
+        .contains("pipe-result bytes=13 payload=FIX-243-NONCE eof=1"));
     if matches!(
         mode,
         "fix-243-cloexec"
@@ -10902,11 +10885,9 @@ fn fix_243_pipe(mode: &str) {
             | "fix-243-dup-before-close"
     ) {
         let expected = "pruned-victim result=-1 errno=9";
-        assert!(
-            std::fs::read_to_string(root.join("records.child"))
-                .unwrap()
-                .contains(expected)
-        );
+        assert!(std::fs::read_to_string(root.join("records.child"))
+            .unwrap()
+            .contains(expected));
         assert!(routed.text("records.child").contains(expected));
     }
     if mode == "fix-243-inherit-cloexec" || mode == "fix-243-close-before-dup" {
@@ -10920,11 +10901,9 @@ fn fix_243_pipe(mode: &str) {
     }
     if mode == "fix-243-error-recovery" {
         assert!(native_done.contains("kernel-error result=9 expected=9"));
-        assert!(
-            routed
-                .text("records.done")
-                .contains("kernel-error result=9 expected=9")
-        );
+        assert!(routed
+            .text("records.done")
+            .contains("kernel-error result=9 expected=9"));
     }
     assert!(journal_records_completion(&routed.run));
     slate_spawn_finish(&spawn, &routed);
@@ -10957,11 +10936,9 @@ fn fix_243_second_thread_null_spawn() {
     let (root, native) = slate_spawn_native(&spawn, "fix-243-thread-null");
     assert!(native.status.success(), "native: {}", native.status);
     assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
-    assert!(
-        std::fs::read_to_string(root.join("records.done"))
-            .unwrap()
-            .contains("null-thread result=0")
-    );
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("null-thread result=0"));
     let routed = slate_spawn_routed(&spawn, "fix-243-thread-null", &["child.txt"]);
     assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
     assert_eq!(routed.text("child.txt"), "CHILD");
@@ -10979,11 +10956,9 @@ fn fix_243_distinct_parent_backing_overlap() {
     };
     let (root, native) = slate_spawn_native(&spawn, "fix-243-overlap");
     assert!(native.status.success(), "native: {}", native.status);
-    assert!(
-        std::fs::read_to_string(root.join("records.done"))
-            .unwrap()
-            .contains("completed=2")
-    );
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("completed=2"));
     spawn.provider_environment.extend([
         ("UMBRA_FIX_243_REGION_TRACE".into(), "1".into()),
         ("UMBRA_FIX_243_OVERLAP_PARENTS".into(), "2".into()),
@@ -11037,11 +11012,9 @@ fn fix_243_provider_region_cap() {
     };
     let (root, native) = slate_spawn_native(&spawn, "fix-243-cap");
     assert!(native.status.success(), "native: {}", native.status);
-    assert!(
-        std::fs::read_to_string(root.join("records.done"))
-            .unwrap()
-            .contains("completed=17")
-    );
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("completed=17"));
     spawn.provider_environment.extend([
         ("UMBRA_FIX_243_REGION_TRACE".into(), "1".into()),
         ("UMBRA_FIX_243_OVERLAP_PARENTS".into(), "17".into()),
@@ -11158,11 +11131,9 @@ fn fix_205_refusal_with_an_unenrolled_fork_child() {
     let (root, native) = slate_spawn_native(&spawn, "fix-205-fork-window");
     assert!(native.status.success(), "native control: {}", native.status);
     assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
-    assert!(
-        std::fs::read_to_string(root.join("records.done"))
-            .unwrap()
-            .contains("fork-window spawn result=0 completed=2")
-    );
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("fork-window spawn result=0 completed=2"));
     spawn
         .provider_environment
         .push(("UMBRA_FIX_205_FORK_WINDOW_HOLD".into(), "1".into()));
@@ -11332,11 +11303,9 @@ fn fix_243_refusal(mode: &str, diagnostic: &str) {
     let (root, native) = slate_spawn_native(&spawn, mode);
     assert!(native.status.success(), "native control: {}", native.status);
     assert_eq!(std::fs::read(root.join("child.txt")).unwrap(), b"CHILD");
-    assert!(
-        std::fs::read_to_string(root.join("records.done"))
-            .unwrap()
-            .contains("spawn result=0")
-    );
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("spawn result=0"));
     let routed = slate_spawn_routed(&spawn, mode, &["child.txt", "opened.txt", "victim.txt"]);
     let exact = routed.run.status != Some(0)
         && routed.run.stderr.contains(diagnostic)
@@ -11957,11 +11926,9 @@ fn slate_c11_05_collision_premise_apparatus() {
         slate_field(&pre, "dup2-live-victim", "result"),
         slate_field(&pre, "dup2-live-victim", "victim")
     );
-    assert!(
-        std::fs::read_to_string(root.join("records.done"))
-            .unwrap()
-            .contains("pipe-read result=16 bytes=COLLISION-c11-05")
-    );
+    assert!(std::fs::read_to_string(root.join("records.done"))
+        .unwrap()
+        .contains("pipe-read result=16 bytes=COLLISION-c11-05"));
     let routed = slate_spawn_routed(&spawn, "c11-05-premise", &["victim.txt"]);
     let pre = routed.text("records.pre");
     let victim: u64 = slate_field(&pre, "dup2-live-victim", "victim")
@@ -12866,10 +12833,9 @@ fn c12_case(mode: u8) {
         assert_eq!(src.as_deref(), Some(C12_SRC));
         assert_eq!(run.status, Some(1), "{}", run.stderr);
         assert_eq!(run.child_exit(), 69);
-        assert!(
-            run.stderr
-                .contains(&format!("C12 mode={mode} result=-1 errno=45"))
-        );
+        assert!(run
+            .stderr
+            .contains(&format!("C12 mode={mode} result=-1 errno=45")));
         assert!(complete, "ordinary refusal must allow run finalization");
         assert!(
             !records
@@ -12964,12 +12930,10 @@ fn c12_case(mode: u8) {
             umbra_storage_nfs_userspace::authority::marker::AdmissionPhase::Held
         );
         assert!(records.iter().any(|r| r["stage"] == "probe-complete"));
-        assert!(
-            !records
-                .iter()
-                .any(|r| matches!(r["stage"].as_str(), Some("release" | "close"))
-                    && r["value"].get("Ok").is_some())
-        );
+        assert!(!records
+            .iter()
+            .any(|r| matches!(r["stage"].as_str(), Some("release" | "close"))
+                && r["value"].get("Ok").is_some()));
     }
 }
 #[test]
@@ -13392,7 +13356,7 @@ struct C13Pipe {
 }
 /// Check the complete native or routed primitive report against its pinned disposition.
 fn c13_report(bytes: &[u8], case: usize, mode: &str, nonce: &str, evidence: &Path) {
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     assert_eq!(bytes.last(), Some(&b'\n'));
     // Typed deserialization rejects duplicate fields, including nested pipe keys.
     let report: C13Report = serde_json::from_slice(bytes).expect("complete C13 report");
@@ -13765,8 +13729,8 @@ impl R14Observer {
     fn start(
         evidence: PathBuf,
         inspect: impl FnMut(&serde_json::Value, std::time::Instant) -> Result<serde_json::Value, String>
-        + Send
-        + 'static,
+            + Send
+            + 'static,
     ) -> Self {
         Self::start_with_nonce(evidence, uuid::Uuid::new_v4().to_string(), inspect)
     }
@@ -13774,12 +13738,9 @@ impl R14Observer {
     fn start_with_nonce(
         evidence: PathBuf,
         nonce: String,
-        mut inspect: impl FnMut(
-            &serde_json::Value,
-            std::time::Instant,
-        ) -> Result<serde_json::Value, String>
-        + Send
-        + 'static,
+        mut inspect: impl FnMut(&serde_json::Value, std::time::Instant) -> Result<serde_json::Value, String>
+            + Send
+            + 'static,
     ) -> Self {
         use std::{
             io::Write,
@@ -14020,11 +13981,9 @@ fn slate_r14_observer_native_qualification() {
         let (output, records) = r14_native(mode, scratch.path(), &evidence.join(mode));
         assert!(output.status.success());
         if mode == "qualify-disconnect" {
-            assert!(
-                records
-                    .unwrap_err()
-                    .contains("EOF before terminal exchange")
-            );
+            assert!(records
+                .unwrap_err()
+                .contains("EOF before terminal exchange"));
             let persisted =
                 std::fs::read_to_string(evidence.join(mode).join("observer/phases.jsonl")).unwrap();
             assert!(persisted.lines().last().unwrap().contains("BEFORE"));
@@ -14286,11 +14245,9 @@ fn slate_r14_observer_routed_qualification() {
         assert_eq!(run.status, Some(0), "{}", run.stderr);
         assert_eq!(run.child_exit(), 0);
         if mode == "qualify-disconnect" {
-            assert!(
-                records
-                    .unwrap_err()
-                    .contains("EOF before terminal exchange")
-            );
+            assert!(records
+                .unwrap_err()
+                .contains("EOF before terminal exchange"));
         } else {
             let records = records.unwrap();
             assert_eq!(records.last().unwrap()["kind"], "TERMINAL");
@@ -15130,10 +15087,8 @@ fn r17_defect(
         assert_eq!(r17_phase(records, "mutation")["ack_us"], start);
         assert!(r17_phase(records, "observation-end").as_u64().unwrap() >= start + 5_000_000);
         assert!(stderr.contains("panicked at src/main.rs:112:24:"));
-        assert!(
-            stderr
-                .contains("Os { code: 9, kind: Uncategorized, message: \"Bad file descriptor\" }")
-        );
+        assert!(stderr
+            .contains("Os { code: 9, kind: Uncategorized, message: \"Bad file descriptor\" }"));
         assert!(stderr.contains("finished: Some(Code(101)) after 1 process exits"));
         assert!(stderr.contains("ProcessFailed during run.child:"));
         assert!(!stderr.contains("fatal signal/exception"));
@@ -15240,9 +15195,10 @@ fn r17_case(case: usize) {
             serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
         // Keep the 12-second IPC deadline below half the writer lease.
         // The platform's whole-session watchdog is a separate budget.
-        config["providers"]["platform"]["options"] = serde_json::json!(
-            serde_json::to_vec(&serde_json::json!({"timeout_ms": 45000})).unwrap()
-        );
+        config["providers"]["platform"]["options"] = serde_json::json!(serde_json::to_vec(
+            &serde_json::json!({"timeout_ms": 45000})
+        )
+        .unwrap());
         std::fs::write(&registry, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
         let mut command = if native {
             Command::new(&program)
@@ -15429,49 +15385,47 @@ fn slate_r17_retained_readings_validate_exact_defects() {
                     let stale =
                         std::fs::read_to_string(root.join("unidentified-C17-02.stderr")).unwrap();
                     assert!(stale.contains("src/main.rs:101:23:"));
-                    assert!(
-                        std::panic::catch_unwind(|| r17_defect(
-                            &records,
-                            case,
-                            &nonce,
-                            Some(1),
-                            &stale
-                        ))
-                        .is_err()
-                    );
+                    assert!(std::panic::catch_unwind(|| r17_defect(
+                        &records,
+                        case,
+                        &nonce,
+                        Some(1),
+                        &stale
+                    ))
+                    .is_err());
                 }
                 // The original prediction still rejects the same bytes. This
                 // is offline classification, never a retake of a failed run.
                 assert!(std::panic::catch_unwind(|| r17_records(&bytes, &nonce, true)).is_err());
-                assert!(
-                    std::panic::catch_unwind(|| r17_defect(
-                        &records,
-                        case,
-                        &nonce,
-                        Some(0),
-                        &stderr
-                    ))
-                    .is_err()
-                );
+                assert!(std::panic::catch_unwind(|| r17_defect(
+                    &records,
+                    case,
+                    &nonce,
+                    Some(0),
+                    &stderr
+                ))
+                .is_err());
                 let mut wrong = records.clone();
                 wrong
                     .iter_mut()
                     .find(|r| r["phase"] == "registration")
                     .unwrap()["data"] = serde_json::json!({"ok":false,"data":0});
-                assert!(
-                    std::panic::catch_unwind(|| r17_defect(&wrong, case, &nonce, Some(1), &stderr))
-                        .is_err()
-                );
-                assert!(
-                    std::panic::catch_unwind(|| r17_defect(
-                        &records,
-                        case,
-                        &nonce,
-                        Some(1),
-                        "unrelated failure"
-                    ))
-                    .is_err()
-                );
+                assert!(std::panic::catch_unwind(|| r17_defect(
+                    &wrong,
+                    case,
+                    &nonce,
+                    Some(1),
+                    &stderr
+                ))
+                .is_err());
+                assert!(std::panic::catch_unwind(|| r17_defect(
+                    &records,
+                    case,
+                    &nonce,
+                    Some(1),
+                    "unrelated failure"
+                ))
+                .is_err());
             }
         }
     }
@@ -16210,14 +16164,12 @@ fn r10_deferred_records(case: u8, bytes: &[u8]) {
             );
             assert_eq!(slate_field(opens[0], "open", "tid"), main);
             assert_eq!(slate_field(opens[1], "open", "tid"), helper);
-            assert!(
-                text.lines()
-                    .any(|s| s.starts_with("write ") && s.contains(&format!("tid={main} ")))
-            );
-            assert!(
-                text.lines()
-                    .any(|s| s.starts_with("write ") && s.contains(&format!("tid={helper} ")))
-            );
+            assert!(text
+                .lines()
+                .any(|s| s.starts_with("write ") && s.contains(&format!("tid={main} "))));
+            assert!(text
+                .lines()
+                .any(|s| s.starts_with("write ") && s.contains(&format!("tid={helper} "))));
         }
         if case == 8 {
             assert_eq!(slate_field(text, "close ", "tid"), helper);
@@ -16680,20 +16632,16 @@ fn fix_227_rewrite_registry(registry_path: &Path, store: &Path) {
         &std::fs::read(repository().join("crates/umbra-storage-local/provider.json")).unwrap(),
     )
     .unwrap();
-    local["executable"] = serde_json::json!(
-        binaries()
-            .join("umbra-storage-local")
-            .as_os_str()
-            .as_bytes()
-    );
+    local["executable"] = serde_json::json!(binaries()
+        .join("umbra-storage-local")
+        .as_os_str()
+        .as_bytes());
     local["capabilities"] =
         serde_json::json!(["local-development-v1", "experimental-open-rewrite-v1"]);
-    local["options"] = serde_json::json!(
-        umbra_core::provider::encode(
-            &umbra_core::BytePath::new(store.as_os_str().as_bytes().to_vec()).unwrap()
-        )
-        .unwrap()
-    );
+    local["options"] = serde_json::json!(umbra_core::provider::encode(
+        &umbra_core::BytePath::new(store.as_os_str().as_bytes().to_vec()).unwrap()
+    )
+    .unwrap());
     r["providers"]["storage"] = local;
     std::fs::write(registry_path, serde_json::to_vec(&r).unwrap()).unwrap();
 }
@@ -17297,16 +17245,14 @@ fn fix_274_descendant_exit_status_controls() {
             // terminal exit packet. It must never be accepted as completion.
             assert_eq!(routed.run.status, Some(1), "{}", routed.run.stderr);
             assert!(routed.run.stderr.contains("fatal signal/exception: T09"));
-            assert!(
-                fix_274_descendant_packets(
-                    &routed.run.stderr,
-                    routed
-                        .object("descendant.pid")
-                        .expect("descendant identity object")
-                )
-                .iter()
-                .any(|s| s.starts_with("T09"))
-            );
+            assert!(fix_274_descendant_packets(
+                &routed.run.stderr,
+                routed
+                    .object("descendant.pid")
+                    .expect("descendant identity object")
+            )
+            .iter()
+            .any(|s| s.starts_with("T09")));
             assert!(!journal_records_completion(&routed.run));
         } else {
             assert_eq!(routed.run.status, Some(0), "{}", routed.run.stderr);
@@ -17372,10 +17318,10 @@ fn fix_274_identity_and_status_controls() {
         log.replace("$W07#00", "$W00#00"),
         log.replace("$W07#00", "$X09#00"),
     ] {
-        assert!(
-            std::panic::catch_unwind(|| fix_274_descendant_status(&invalid, b"80749\n", "W07"))
-                .is_err()
-        );
+        assert!(std::panic::catch_unwind(|| fix_274_descendant_status(
+            &invalid, b"80749\n", "W07"
+        ))
+        .is_err());
     }
     fix_274_descendant_status(log, b"80749\n", "W07");
     assert!(

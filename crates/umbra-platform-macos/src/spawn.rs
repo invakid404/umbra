@@ -375,15 +375,16 @@ mod tests {
             } else {
                 format!("spawn unsupported attribute field {offset}")
             };
-            assert!(error.to_string().contains(&expected), "byte {offset}: {error}");
+            assert!(
+                error.to_string().contains(&expected),
+                "byte {offset}: {error}"
+            );
         }
         for pair in 2..9 {
             let mut descriptor = [0u8; 144];
             descriptor[pair * 16..pair * 16 + 8].copy_from_slice(&16u64.to_le_bytes());
-            descriptor[pair * 16 + 8..pair * 16 + 16]
-                .copy_from_slice(&0x5000u64.to_le_bytes());
-            let error = decode(&CURRENT, &descriptor, |_, _| panic!("extension read"))
-                .unwrap_err();
+            descriptor[pair * 16 + 8..pair * 16 + 16].copy_from_slice(&0x5000u64.to_le_bytes());
+            let error = decode(&CURRENT, &descriptor, |_, _| panic!("extension read")).unwrap_err();
             assert!(error.to_string().contains("spawn unsupported extension"));
         }
     }
@@ -529,21 +530,17 @@ mod tests {
     fn setsid_wins_over_setpgroup_and_malformed_wins_over_flags() {
         let mut bytes = baseline();
         bytes[..2].copy_from_slice(&0x0402u16.to_le_bytes());
-        assert!(
-            attributes(&bytes)
-                .unwrap_err()
-                .to_string()
-                .contains("attribute SETSID")
-        );
+        assert!(attributes(&bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("attribute SETSID"));
         let mut descriptor = [0; DESCRIPTOR_BYTES];
         descriptor[..8].copy_from_slice(&247u64.to_le_bytes());
         descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
-        assert!(
-            decode(&LEGACY, &descriptor, |_, _| panic!("must not read"))
-                .unwrap_err()
-                .to_string()
-                .contains("malformed packed descriptor")
-        );
+        assert!(decode(&LEGACY, &descriptor, |_, _| panic!("must not read"))
+            .unwrap_err()
+            .to_string()
+            .contains("malformed packed descriptor"));
     }
 
     #[test]
@@ -636,12 +633,10 @@ mod tests {
         for (offset, value) in [(0, 0i32), (4, 0), (4, -1), (4, 65), (4, 2)] {
             let mut bytes = valid.clone();
             bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-            assert!(
-                actions(&bytes)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("malformed packed descriptor")
-            );
+            assert!(actions(&bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("malformed packed descriptor"));
         }
         let mut truncated = valid.clone();
         truncated.pop();
@@ -663,14 +658,12 @@ mod tests {
             (99, "99"),
         ] {
             let bytes = action_plan(&[(2, 4, 1), (tag, 3, 0)]);
-            assert!(
-                actions(&bytes)
-                    .unwrap()
-                    .require_supported()
-                    .unwrap_err()
-                    .to_string()
-                    .contains(&format!("spawn unsupported action {diagnostic}"))
-            );
+            assert!(actions(&bytes)
+                .unwrap()
+                .require_supported()
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("spawn unsupported action {diagnostic}")));
         }
     }
 
@@ -690,14 +683,12 @@ mod tests {
         let mut descriptor = [0; DESCRIPTOR_BYTES];
         descriptor[..8].copy_from_slice(&248u64.to_le_bytes());
         descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
-        assert!(
-            decode(&LEGACY, &descriptor, |_, _| Err(crate::error(
-                "read", "short"
-            )))
-            .unwrap_err()
-            .to_string()
-            .contains("malformed packed descriptor")
-        );
+        assert!(decode(&LEGACY, &descriptor, |_, _| Err(crate::error(
+            "read", "short"
+        )))
+        .unwrap_err()
+        .to_string()
+        .contains("malformed packed descriptor"));
     }
 
     #[test]
@@ -706,14 +697,12 @@ mod tests {
             let mut descriptor = [0; DESCRIPTOR_BYTES];
             descriptor[pair * 16..pair * 16 + 8].copy_from_slice(&16u64.to_le_bytes());
             descriptor[pair * 16 + 8..pair * 16 + 16].copy_from_slice(&0x5000u64.to_le_bytes());
-            assert!(
-                decode(&LEGACY, &descriptor, |_, _| panic!(
-                    "extension must not be read"
-                ))
-                .unwrap_err()
-                .to_string()
-                .contains("spawn unsupported extension")
-            );
+            assert!(decode(&LEGACY, &descriptor, |_, _| panic!(
+                "extension must not be read"
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("spawn unsupported extension"));
         }
     }
 
@@ -729,10 +718,8 @@ mod tests {
         assert_eq!(&backing[144..392], &snapshot.attributes);
         assert!(backing[32..144].iter().all(|byte| *byte == 0));
         assert!(backing[392..416].iter().all(|byte| *byte == 0));
-        assert!(
-            snapshot
-                .backing(u64::MAX - REGION_BYTES as u64 + 1)
-                .is_err()
-        );
+        assert!(snapshot
+            .backing(u64::MAX - REGION_BYTES as u64 + 1)
+            .is_err());
     }
 }

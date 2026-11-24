@@ -1,6 +1,6 @@
 //! Read-only qualification of this provider's installed spawn ABI.
 use crate::{
-    spawn::{ATTRIBUTE_BYTES, Profile, baseline},
+    spawn::{baseline, Profile, ATTRIBUTE_BYTES},
     unsupported,
 };
 use std::ffi::{CStr, CString};
@@ -388,7 +388,11 @@ fn allocation(address: usize, length: usize) -> Result<Vec<u8>> {
     read_self(address, length)
 }
 fn success(code: i32) -> Result<()> {
-    if code == 0 { Ok(()) } else { Err(mismatch()) }
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(mismatch())
+    }
 }
 
 // Return the original callable pointer after checking ownership, not XPACI's
