@@ -921,9 +921,13 @@ launchd as a zombie nobody collects:
   path without increasing the bound. The local watchdog case confirmed before
   tracer disposal in 20.57 ms. The SID-1 stopped-tracer case still requires CI
   qualification; its earlier timeout was not proved to have the same cause.
-  Local live-child and orphaned-child qualification still fails when teardown
-  drains a queued stop and receives no fresh interrupt stop. Both cases left
-  a launchd-parented zombie; this repair is not yet qualified for those shapes.
+  The earlier predicate discarded answering buffered stops and left two
+  launchd-parented zombies. Resume-accounted stops repair that path: the local
+  live-child reading now passes, with its root confirming in 13.66 ms. The
+  orphan reading confirmed termination in 18.94 ms, but failed an obsolete
+  test assertion expecting a repeated kill; that assertion is corrected and
+  the full orphan test remains unqualified. Neither new reading reported a
+  new zombie.
   A hung peer, or a stop/exit not observed within its phase, still takes the
   loud timeout path and can leave a zombie.
 
