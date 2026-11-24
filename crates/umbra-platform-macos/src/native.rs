@@ -5776,6 +5776,13 @@ mod tests {
         barrier.child = true;
         assert!(barrier.complete(auth.token.parent, 3, auth, false).is_err());
         assert!(barrier.complete(auth.token.parent, 3, auth, true).is_ok());
+        barrier.authorization = None;
+        assert!(barrier.complete(auth.token.parent, 3, auth, true).is_err());
+        let mut other = auth;
+        other.table_generation += 1;
+        barrier.authorization = Some(other);
+        assert!(barrier.complete(auth.token.parent, 3, auth, true).is_err());
+        barrier.authorization = Some(auth);
         // Completion removes the pending plan; a new capture never accepts the
         // old sequence. No replay reconstructs a plan from its digest.
         barrier.token.sequence += 1;
