@@ -164,6 +164,13 @@ fn stopped_peer_native_control_confirms_before_tracer_kill() {
 }
 
 #[test]
+fn darwin_sigstop_interrupt_reply_confirms() {
+    let (report, bytes) = run_peer(false, None, Some("T11thread:1;"), true);
+    assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
+    assert_eq!(bytes, b"\x03$k#6b");
+}
+
+#[test]
 fn missing_stop_never_sends_k() {
     let (report, bytes) = run_peer(false, None, None, true);
     assert!(report.timed_out && report.unconfirmed, "{report:?}");

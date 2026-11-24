@@ -4685,9 +4685,10 @@ impl Session {
                             let kind = teardown_reply(&packet, pid);
                             steps.push(TeardownStep::Reply(packet));
                             match kind {
-                                // Ctrl-C reports SIGINT. A stale breakpoint stop
-                                // cannot stand in for this interrupt response.
-                                Ok(TeardownReply::Stop(2)) => {
+                                // debugserver reports Darwin SIGSTOP (0x11) for
+                                // an interrupt; peers may also report SIGINT.
+                                // A stale breakpoint cannot replace that reply.
+                                Ok(TeardownReply::Stop(2 | 17)) => {
                                     stopped = true;
                                     break;
                                 }
