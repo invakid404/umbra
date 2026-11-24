@@ -935,8 +935,9 @@ impl Session {
     }
     /// Resume every thread when no return window is open.
     fn continue_run(&mut self) -> Result<()> {
-        self.rsp.send("c")?;
+        // A failed write may still have resumed the peer; its stop is outstanding.
         self.stopped = false;
+        self.rsp.send("c")?;
         Ok(())
     }
     /// Resume exactly one thread and leave every sibling stopped.
@@ -966,9 +967,9 @@ impl Session {
     /// the known residual tracked in #242. A bare `c` is still unsafe: it would
     /// release siblings into the unmediated window described above.
     fn continue_thread(&mut self, thread: ThreadId) -> Result<()> {
+        self.stopped = false;
         self.rsp
             .send(&format!("vCont;c:{:x}", thread.0.native_id))?;
-        self.stopped = false;
         Ok(())
     }
     /// Resume from a stop this backend absorbed without opening a transaction,
@@ -5492,9 +5493,12 @@ impl TraceBackend for MacosTraceBackend {
                 command.thread,
                 s.exec_generation,
                 command.signal,
-                |packet| live.rsp.send(packet),
+                |packet| {
+                    // Validation has succeeded; even an error can mean delivery.
+                    s.stopped = false;
+                    live.rsp.send(packet)
+                },
             )?;
-            s.stopped = false;
             return Ok(());
         }
         if command.signal.is_some() || s.signals.pending() {
