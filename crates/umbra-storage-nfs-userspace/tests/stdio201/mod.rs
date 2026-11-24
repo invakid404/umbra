@@ -39,10 +39,9 @@ pub(super) fn command_fixture(
         let registry = registry(root, &target.0, target.1);
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
-        config["providers"]["platform"]["options"] = serde_json::json!(serde_json::to_vec(
-            &serde_json::json!({"timeout_ms": 20_000})
-        )
-        .unwrap());
+        config["providers"]["platform"]["options"] = serde_json::json!(
+            serde_json::to_vec(&serde_json::json!({"timeout_ms": 20_000})).unwrap()
+        );
         std::fs::write(&registry, serde_json::to_vec(&config).unwrap()).unwrap();
         let mut c = Command::new(binaries().join("umbra"));
         c.args(["run", "--registry"])

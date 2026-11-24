@@ -1,10 +1,11 @@
 //! Thread-affine debugger controller. Unsafe code is limited to owned Mach rights,
 //! local libSystem calls and bounded remote memory copies.
 use crate::{
-    abi::{self, get, set, CPSR, PC},
+    Options,
+    abi::{self, CPSR, PC, get, set},
     cache, error, interpose,
     rsp::{self, Rsp},
-    spawn, spawn_host, unsupported, Options,
+    spawn, spawn_host, unsupported,
 };
 use mach2::{
     traps::{mach_task_self, task_for_pid},
@@ -65,7 +66,7 @@ impl Task {
         Ok(task)
     }
     fn writable_pid_slot(&self, pointer: u64) -> bool {
-        use mach2::vm_region::{vm_region_basic_info_64, VM_REGION_BASIC_INFO_64};
+        use mach2::vm_region::{VM_REGION_BASIC_INFO_64, vm_region_basic_info_64};
         let Some(end) = pointer.checked_add(4) else {
             return false;
         };
@@ -330,7 +331,7 @@ fn monitor_reason(
             Ok(crate::owner::Wake::Timeout)
                 if !deadline.is_some_and(|d| crate::clock::now() >= d) =>
             {
-                continue
+                continue;
             }
             Ok(crate::owner::Wake::Timeout) => return Some(TerminalCause::Deadline),
             Ok(crate::owner::Wake::OwnerGone) => return Some(TerminalCause::OwnerGone),
@@ -477,6 +478,56 @@ struct SpawnInFlight {
     region: Option<u64>,
     twin: PathBuf,
     child: Option<usize>,
+}
+
+/// Pure view of the production barrier; contains no task rights or ownership.
+struct SpawnBarrier {
+    token: SpawnToken,
+    digest: [u8; 32],
+    authorization: Option<SpawnAuthorization>,
+    returned: bool,
+    child: bool,
+}
+impl SpawnInFlight {
+    fn barrier(&self) -> SpawnBarrier {
+        SpawnBarrier {
+            token: self.token,
+            digest: self.plan.digest,
+            authorization: self.authorization,
+            returned: self.returned.is_some(),
+            child: self.child.is_some(),
+        }
+    }
+}
+impl SpawnBarrier {
+    fn current(&self, parent: TaskId, generation: u64, auth: SpawnAuthorization) -> bool {
+        self.token == auth.token
+            && self.digest == auth.digest
+            && auth.token.parent == parent
+            && auth.token.exec_generation == generation
+    }
+    fn authorize(&self, parent: TaskId, generation: u64, auth: SpawnAuthorization) -> Result<()> {
+        if !self.current(parent, generation, auth) || self.authorization.is_some() {
+            return Err(error("spawn", "stale authorization"));
+        }
+        Ok(())
+    }
+    fn complete(
+        &self,
+        parent: TaskId,
+        generation: u64,
+        auth: SpawnAuthorization,
+        success: bool,
+    ) -> Result<()> {
+        if !self.current(parent, generation, auth)
+            || self.authorization != Some(auth)
+            || !self.returned
+            || self.child != success
+        {
+            return Err(error("spawn", "stale or premature Ready"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1902,7 +1953,7 @@ pub struct MacosTraceBackend {
     ledger: umbra_platform::shutdown::Ledger,
     poll_cursor: usize,
     spawn_sequence: u64,
-    spawn_profile: Option<bool>,
+    spawn_profile: Option<Option<&'static spawn::Layout>>,
     options: Options,
     sessions: Vec<Session>,
     failed_retirements: Vec<Session>,
@@ -1979,19 +2030,17 @@ impl MacosTraceBackend {
         regs: RegisterSet,
         twin: PathBuf,
     ) -> Result<()> {
-        let qualified = match self.spawn_profile {
+        let layout = match self.spawn_profile {
             Some(value) => value,
             None => {
-                let value = spawn_host::qualify().is_ok();
+                let value = spawn_host::qualify().ok();
                 self.spawn_profile = Some(value);
                 value
             }
         };
-        if !qualified {
-            return Err(unsupported("spawn ABI profile mismatch"));
-        }
+        let layout = layout.ok_or_else(|| unsupported("spawn ABI profile mismatch"))?;
         if std::env::var_os("UMBRA_SPAWN_LOG").is_some() {
-            eprintln!("spawn-capture descriptor=non-null profile=25F80");
+            eprintln!("spawn-capture descriptor=non-null profile={}", layout.id);
         }
         if self.sessions[index].spawn.is_some()
             || self
@@ -2008,7 +2057,9 @@ impl MacosTraceBackend {
         s.task
             .read(get(&regs, 2)?, &mut descriptor)
             .map_err(|_| unsupported("spawn malformed packed descriptor"))?;
-        let snapshot = spawn::decode(&descriptor, |address, output| s.task.read(address, output))?;
+        let snapshot = spawn::decode(layout, &descriptor, |address, output| {
+            s.task.read(address, output)
+        })?;
         if std::env::var_os("UMBRA_SPAWN_LOG").is_some() {
             eprintln!(
                 "spawn-policy flags={:#06x} actions={}",
@@ -2017,7 +2068,7 @@ impl MacosTraceBackend {
             );
         }
         let plan = SpawnPlan {
-            digest: spawn_host::digest(&snapshot.backing(0)?)?,
+            digest: spawn_host::digest(&snapshot.canonical_plan()?)?,
             actions: snapshot.actions.clone(),
             close_on_exec_default: snapshot.attributes[1] & 0x40 != 0,
         };
@@ -2066,16 +2117,15 @@ impl MacosTraceBackend {
     fn arm_spawn(&mut self, index: usize, authorization: SpawnAuthorization) -> Result<()> {
         let s = &mut self.sessions[index];
         let allocation_task = s.task.0;
+        let parent = s.id;
+        let exec_generation = s.policy_exec_generation;
         let pending = s
             .spawn
             .as_mut()
             .ok_or_else(|| error("spawn", "no captured plan"))?;
-        if pending.token != authorization.token
-            || pending.plan.digest != authorization.digest
-            || pending.authorization.is_some()
-        {
-            return Err(error("spawn", "stale authorization"));
-        }
+        pending
+            .barrier()
+            .authorize(parent, exec_generation, authorization)?;
         pending.snapshot.require_supported()?;
         pending.authorization = Some(authorization);
         let mut address = 0;
@@ -2092,7 +2142,7 @@ impl MacosTraceBackend {
                 mach2::vm::mach_vm_allocate(
                     allocation_task,
                     &mut address,
-                    spawn::REGION_BYTES as u64,
+                    pending.snapshot.backing_plan()?.allocation_bytes as u64,
                     mach2::vm_statistics::VM_FLAGS_ANYWHERE,
                 ),
                 "spawn snapshot allocation",
@@ -2103,6 +2153,7 @@ impl MacosTraceBackend {
         crate::spawn_probe::region("allocated", pending.token, address, 0);
         // Store ownership before any write can fail.
         let backing = pending.snapshot.backing(address)?;
+        let pid_offset = pending.snapshot.layout().pid_offset;
         let mut regs = pending.original.clone();
         let mut path = pending.twin.as_os_str().as_bytes().to_vec();
         path.push(0);
@@ -2121,7 +2172,7 @@ impl MacosTraceBackend {
         }
         s.write(address, &backing)?;
         set(&mut regs, 1, s.allocate(&path)?)?;
-        set(&mut regs, 0, address + 400)?;
+        set(&mut regs, 0, address + pid_offset as u64)?;
         set(&mut regs, 2, address)?;
         s.set_regs(authorization.token.thread, &regs)?;
         #[cfg(feature = "mutation-probe-spawn-lifecycle")]
@@ -2222,12 +2273,12 @@ impl MacosTraceBackend {
             .spawn
             .as_ref()
             .ok_or_else(|| error("spawn", "no pending completion"))?;
-        if pending.authorization != Some(authorization)
-            || pending.returned.is_none()
-            || pending.child.is_some() != success
-        {
-            return Err(error("spawn", "stale or premature Ready"));
-        }
+        pending.barrier().complete(
+            self.sessions[index].id,
+            self.sessions[index].policy_exec_generation,
+            authorization,
+            success,
+        )?;
         let child = pending.child;
         let caller = pending.caller_pid;
         let region = pending.region.expect("completion owns region");
@@ -2819,7 +2870,7 @@ impl MacosTraceBackend {
                             "sandbox installer exited with {status:?} before applying the \
                              policy and starting the target"
                         ),
-                    ))
+                    ));
                 }
                 TraceEvent::Child { .. }
                 | TraceEvent::SpawnPrepare { .. }
@@ -2828,7 +2879,7 @@ impl MacosTraceBackend {
                     return Err(error(
                         "sandbox.launch",
                         "sandbox installer created a child before installing the policy",
-                    ))
+                    ));
                 }
                 TraceEvent::ThreadExited { .. } => continue,
                 TraceEvent::ThreadStarted { thread, .. }
@@ -3293,7 +3344,7 @@ impl MacosTraceBackend {
                     WaitPlan::Unsupported => {
                         return Err(unsupported(
                             "wait process-group/stopped/continued selection",
-                        ))
+                        ));
                     }
                     // Success zero with the carry flag cleared, past the svc,
                     // leaving status/rusage and every child's reaped state
@@ -4071,7 +4122,9 @@ fn signal_unenrolled_child(
     let Some(info) = bsd_info(pid) else {
         return Err(unenrolled_unconfirmed(
             tracee,
-            format!("unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"),
+            format!(
+                "unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"
+            ),
         ));
     };
     let seen = (info.pbi_ppid, (info.pbi_start_tvsec, info.pbi_start_tvusec));
@@ -4081,7 +4134,7 @@ fn signal_unenrolled_child(
             return Err(unenrolled_unconfirmed(
                 tracee,
                 format!("unenrolled fork child pid={pid} of pid={parent}: {why}; not signalled"),
-            ))
+            ));
         }
     };
     if let Err(refused) = tracee.acquired(umbra_core::shutdown::Identity {
@@ -4625,7 +4678,10 @@ impl Session {
             }
         };
         if let BarrierReading::Confirmed(evidence) = &reading {
-            eprintln!("umbra-platform-macos: tracee exit confirmed: pid={pid} identity={:?} evidence={evidence:?}", self.birth);
+            eprintln!(
+                "umbra-platform-macos: tracee exit confirmed: pid={pid} identity={:?} evidence={evidence:?}",
+                self.birth
+            );
         }
         let timed_out = !matches!(reading, BarrierReading::Confirmed(_));
         steps.push(TeardownStep::Barrier(reading.clone()));
@@ -4791,7 +4847,10 @@ impl MacosTraceBackend {
                     crate::ownership::remaining(s.id.0.native_id)
                 );
             } else {
-                eprintln!("umbra-platform-macos: child retirement failed: pid={} tracer={} outcome={outcome:?}", report.pid, report.tracer);
+                eprintln!(
+                    "umbra-platform-macos: child retirement failed: pid={} tracer={} outcome={outcome:?}",
+                    report.pid, report.tracer
+                );
             }
             log_teardown(&report);
             self.teardown_reports.push(report.clone());
@@ -5265,7 +5324,7 @@ impl TraceBackend for MacosTraceBackend {
         if command.signal.is_none() && self.sessions[i].stopped {
             match command.mode {
                 ResumeMode::SpawnAuthorize(auth) if auth.token.thread == command.thread => {
-                    return self.arm_spawn(i, auth)
+                    return self.arm_spawn(i, auth);
                 }
                 ResumeMode::SpawnChildReady(auth) if auth.token.thread == command.thread => {
                     #[cfg(feature = "mutation-probe-spawn-lifecycle")]
@@ -5280,7 +5339,7 @@ impl TraceBackend for MacosTraceBackend {
                     return self.complete_spawn(i, auth, true);
                 }
                 ResumeMode::SpawnAbortReady(auth) if auth.token.thread == command.thread => {
-                    return self.complete_spawn(i, auth, false)
+                    return self.complete_spawn(i, auth, false);
                 }
                 _ => {}
             }
@@ -5593,6 +5652,90 @@ fn termination_result(sessions: Vec<String>, unenrolled: Vec<String>) -> Result<
 
 #[cfg(test)]
 mod tests {
+    fn spawn_barrier_fixture() -> (super::SpawnBarrier, umbra_core::SpawnAuthorization) {
+        use super::*;
+        let parent = TaskId(TaskIdentity {
+            native_id: 10,
+            generation: 2,
+        });
+        let token = SpawnToken {
+            run_generation: 2,
+            parent,
+            exec_generation: 3,
+            thread: tid(11, 2),
+            sequence: 4,
+        };
+        (
+            SpawnBarrier {
+                token,
+                digest: [5; 32],
+                authorization: None,
+                returned: false,
+                child: false,
+            },
+            SpawnAuthorization {
+                token,
+                digest: [5; 32],
+                table_generation: 6,
+            },
+        )
+    }
+    #[test]
+    fn f247_stale_and_repeated_authorization() {
+        let (mut barrier, auth) = spawn_barrier_fixture();
+        let parent = auth.token.parent;
+        assert!(barrier.authorize(parent, 3, auth).is_ok());
+        for field in 0..7 {
+            let mut bad = auth;
+            match field {
+                0 => bad.digest[0] ^= 1,
+                1 => bad.token.run_generation += 1,
+                2 => bad.token.parent.0.native_id += 1,
+                3 => bad.token.exec_generation += 1,
+                4 => bad.token.thread = super::tid(99, 2),
+                5 => bad.token.sequence += 1,
+                _ => bad.token.parent.0.generation += 1,
+            }
+            assert!(barrier.authorize(parent, 3, bad).is_err());
+        }
+        barrier.authorization = Some(auth);
+        assert!(barrier.authorize(parent, 3, auth).is_err());
+    }
+    #[test]
+    fn f247_exec_generation_invalidates_authorization() {
+        let (mut barrier, auth) = spawn_barrier_fixture();
+        assert!(barrier.authorize(auth.token.parent, 4, auth).is_err());
+        barrier.authorization = Some(auth);
+        barrier.returned = true;
+        barrier.child = true;
+        assert!(barrier.complete(auth.token.parent, 4, auth, true).is_err());
+        let mut next = auth;
+        next.token.exec_generation = 4;
+        next.token.sequence += 1;
+        barrier.token = next.token;
+        barrier.authorization = None;
+        assert!(barrier.authorize(next.token.parent, 4, next).is_ok());
+    }
+    #[test]
+    fn f247_resume_and_replay_preserve_snapshot() {
+        let (mut barrier, auth) = spawn_barrier_fixture();
+        assert!(barrier.complete(auth.token.parent, 3, auth, false).is_err());
+        barrier.authorization = Some(auth);
+        assert!(barrier.complete(auth.token.parent, 3, auth, false).is_err());
+        barrier.returned = true;
+        assert!(barrier.complete(auth.token.parent, 3, auth, true).is_err());
+        assert!(barrier.complete(auth.token.parent, 3, auth, false).is_ok());
+        barrier.child = true;
+        assert!(barrier.complete(auth.token.parent, 3, auth, false).is_err());
+        assert!(barrier.complete(auth.token.parent, 3, auth, true).is_ok());
+        // Completion removes the pending plan; a new capture never accepts the
+        // old sequence. No replay reconstructs a plan from its digest.
+        barrier.token.sequence += 1;
+        barrier.authorization = None;
+        assert!(barrier.authorize(auth.token.parent, 3, auth).is_err());
+        assert!(barrier.complete(auth.token.parent, 3, auth, true).is_err());
+    }
+
     /// F2 (#205): every `TRACED_STUBS` row resolves to at least one verified
     /// `svc` site in this process's own libsystem_kernel. This reads local
     /// memory only and traces nothing, so it runs on hosted runners too.
@@ -5893,9 +6036,11 @@ mod tests {
         assert_eq!(ends[0], Ok("gone"));
         assert_eq!(ends[1], Ok("a zombie under its parent"));
         assert_eq!(ends[2], Err(Lookup::Error("transient".into())));
-        assert!(ends[3..]
-            .iter()
-            .all(|end| matches!(end, Err(Lookup::Found { .. }))));
+        assert!(
+            ends[3..]
+                .iter()
+                .all(|end| matches!(end, Err(Lookup::Found { .. })))
+        );
         // Every child ends early: the wait returns at once.
         let clock = Cell::new(start);
         let ends = await_unenrolled_ends(
@@ -6606,21 +6751,25 @@ mod bounded_poll_tests {
         ));
         backend.events.push_back(exit_event());
         backend.deadline = Some(crate::clock::now());
-        assert!(backend
-            .poll_event(Duration::from_millis(1))
-            .unwrap_err()
-            .to_string()
-            .contains("session timed out"));
+        assert!(
+            backend
+                .poll_event(Duration::from_millis(1))
+                .unwrap_err()
+                .to_string()
+                .contains("session timed out")
+        );
         assert_eq!(backend.events.len(), 1);
     }
     #[test]
     fn no_live_process_and_invalid_budget_are_not_idle() {
         let mut backend = MacosTraceBackend::default();
-        assert!(backend
-            .poll_event(Duration::from_nanos(1))
-            .unwrap_err()
-            .to_string()
-            .contains("no live processes"));
+        assert!(
+            backend
+                .poll_event(Duration::from_nanos(1))
+                .unwrap_err()
+                .to_string()
+                .contains("no live processes")
+        );
         for wait in [Duration::ZERO, Duration::MAX] {
             assert!(backend.poll_event(wait).is_err());
         }
@@ -6752,10 +6901,12 @@ mod monitor_sleep_tests {
         registry.add(existing.clone());
         assert!(registry.replace(&absent, new.clone()).is_none());
         assert_eq!(registry.tasks.len(), 2);
-        assert!(registry
-            .tasks
-            .iter()
-            .any(|entry| Arc::ptr_eq(entry, &existing)));
+        assert!(
+            registry
+                .tasks
+                .iter()
+                .any(|entry| Arc::ptr_eq(entry, &existing))
+        );
         assert!(registry.tasks.iter().any(|entry| Arc::ptr_eq(entry, &new)));
         registry.latch(TerminalCause::OwnerGone);
         assert_eq!(existing.load(std::sync::atomic::Ordering::SeqCst), 1);

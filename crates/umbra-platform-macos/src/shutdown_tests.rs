@@ -116,17 +116,23 @@ fn freeze_late_result() {
     let accepted = ledger
         .freeze(Nonce::new_v4(), Duration::from_secs(1))
         .unwrap();
-    assert!(!accepted
-        .confirms(&ledger.final_snapshot().unwrap())
-        .unwrap());
-    assert!(ledger
-        .reserve(ResourceKind::Tracer, Some(root), 1, 1)
-        .is_err());
+    assert!(
+        !accepted
+            .confirms(&ledger.final_snapshot().unwrap())
+            .unwrap()
+    );
+    assert!(
+        ledger
+            .reserve(ResourceKind::Tracer, Some(root), 1, 1)
+            .is_err()
+    );
     release_tx.send(()).unwrap();
     worker.join().unwrap();
-    assert!(accepted
-        .confirms(&ledger.final_snapshot().unwrap())
-        .unwrap());
+    assert!(
+        accepted
+            .confirms(&ledger.final_snapshot().unwrap())
+            .unwrap()
+    );
 }
 
 #[test]
@@ -159,9 +165,11 @@ fn replacement_keeps_old_tracer_collection_obligation() {
         "replacement must not erase old tracer receipt"
     );
     assert!(old.reap_tracer(Duration::ZERO));
-    assert!(accepted
-        .confirms(&ledger.final_snapshot().unwrap())
-        .unwrap());
+    assert!(
+        accepted
+            .confirms(&ledger.final_snapshot().unwrap())
+            .unwrap()
+    );
 }
 
 fn collected_model_root(ledger: &umbra_platform::shutdown::Ledger) -> umbra_core::shutdown::SlotId {
@@ -203,7 +211,9 @@ fn backend_drop_probe_retains_provider_ledger() {
         vec![root],
         "backend disposal must retain the provider's resource history"
     );
-    assert!(accepted
-        .confirms(&backend.ledger.final_snapshot().unwrap())
-        .unwrap());
+    assert!(
+        accepted
+            .confirms(&backend.ledger.final_snapshot().unwrap())
+            .unwrap()
+    );
 }
