@@ -9917,19 +9917,13 @@ fn slate_c10_10_fork_helper_refusal() {
         digest.status.success(),
         "native.rs SHA-256 prerequisite failed"
     );
-    // Re-characterized for #205 (launchd-zombie teardown, traced-stub
-    // aliases, no SIGCONT to a reaped tracer, the unenrolled-fork-child
-    // sweep, its shared wait inside the shutdown envelope, its report from
-    // terminate and its census-child check before the signal): single_thread
-    // and its Fork and WaitPlan::Park call sites are byte-identical to the
-    // #284 base (compared with six lines of context);
-    // the Fork arm only gains a cfg-gated test probe after its return stop.
-    // The refusal oracle and runtime-witness limitation remain unchanged.
-    // The structural unit ran in the affected-crate suite; this case repeats it
-    // and the native/routed fork refusal below. The witness limitation remains.
+    // Re-characterized for #300: single_thread and its Fork/WaitPlan::Park
+    // call sites are unchanged from #298 (55c6c248), including six preceding
+    // and fifteen following lines. The structural guard and native/routed
+    // refusal retain the same classification and runtime-witness limitation.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("8bab4559527e4e56399f7f452ed07eb53908999610cc06b8f4efa84f284dba5b"),
+        Some("d629f042da48d50bb5dd8a94e40234b43c10af1d6040b86b4bca37185632d1e6"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
