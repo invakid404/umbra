@@ -273,6 +273,9 @@ into two groups:
     debugserver usually ends by itself after its tracee's death; P2 records
     whether it did or the test ended it, and proves by pid and start time
     that the process it did not kill is gone;
+    P1 additionally enables teardown diagnostics and requires a confirmed
+    barrier with no timeout or unconfirmed report. That strengthened #300
+    assertion awaits a SID-1 CI reading;
   - the run's topology, the mirrored status, the isolation record, and
     debugserver's arguments left as on master (no `--kill-on-error`);
   - a descendant refused entry to the caller's group, and the tracee's own
