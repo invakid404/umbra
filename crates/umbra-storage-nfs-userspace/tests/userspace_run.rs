@@ -10973,11 +10973,6 @@ fn slate_c11_02_empty_actions() {
 /// C11-02, attributes only: an initialized, empty attribute object.
 #[test]
 fn slate_c11_02_empty_attributes() {
-    // Re-characterized for macOS 27.2.1 (26B131): packed spawn is unqualified and refuses (fail closed); restore positive coverage under #247.
-    if !spawn_profile_qualified() {
-        slate_spawn_profile_refusal("c11-02-attributes");
-        return;
-    }
     slate_spawn_shape("c11-02-attributes", true);
 }
 
