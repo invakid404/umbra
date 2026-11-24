@@ -571,7 +571,7 @@ impl Rsp {
             } else {
                 self.buffer.clear();
             }
-            if !nonblocking && crate::clock::now() >= limit {
+            if crate::clock::now() >= limit {
                 return Ok(None);
             }
             self.stream

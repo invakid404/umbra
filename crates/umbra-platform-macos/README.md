@@ -297,8 +297,11 @@ The M1 mechanisms named in the tracker spec are all present:
     their recorded retirement evidence. Failed retirement owners remain held
     through termination and receive explicit bounded emergency finalization
     on drop, with its results merged into their original failure reports.
-    - It sends RSP `k`, and sends it once more after a stop reply: a session
-      left at a breakpoint answers the first `k` with its stale stop.
+    - It consumes buffered replies without blocking. A stop of any signal
+      answers the outstanding resume; an already stopped session sends `k`
+      without an interrupt. Only an unanswered resume requires one interrupt
+      and its stop reply before `k`. Unsolicited or duplicate stops fail loudly;
+      one extra interrupt-race stop after authorization is ignored.
     - It waits on a fail-closed barrier until the tracee has passed its exit
       accounting.
     - Only then does it kill and reap debugserver (`Rsp::kill_tracer`,
@@ -853,9 +856,11 @@ Ordered teardown first interrupts a running program and consumes its stop
 reply, then sends `k`. The stop phase has 250 ms; termination and native
 identity/reap confirmation have at most 1250 ms, within the original absolute
 1.5 s deadline. Each of the two reaps retains its 250 ms limit (at most 2 s per
-session). An already stopped program skips the interrupt. Queued stops are
-drained before the interrupt; a breakpoint reply cannot replace the interrupt
-stop. At most one interrupt and two `k` packets are sent. Ordinary-work
+session). A buffered stop answering the outstanding resume, of any signal,
+or an already consumed stop with no subsequent resume, skips the interrupt.
+Unsolicited and duplicate stops fail closed, except for one ignored interrupt
+race reply after kill authorization. At most one interrupt and two `k` packets
+are permitted. Ordinary-work
 cancellation wakes a separate fd and hands the same RSP stream and incremental
 decoder to teardown; an incomplete outgoing frame fails closed.
 
