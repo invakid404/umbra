@@ -3489,6 +3489,13 @@ mod tests {
             eprintln!("SKIP: installed witness requires the provisioned current host");
             return;
         }
+        let started = std::time::Instant::now();
+        let layout = qualify().expect("ordinary production qualification");
+        eprintln!(
+            "f247 one-time production qualification wall_ns={}",
+            started.elapsed().as_nanos()
+        );
+        assert!(std::ptr::eq(layout, &crate::spawn::CURRENT));
         let kernel = image(KERNEL_IMAGE).expect("kernel image");
         let c = image(C_IMAGE).expect("C image");
         let profile = Profile {
