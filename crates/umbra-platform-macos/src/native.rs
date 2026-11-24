@@ -334,7 +334,7 @@ fn monitor_reason(
             Ok(crate::owner::Wake::Timeout)
                 if !deadline.is_some_and(|d| crate::clock::now() >= d) =>
             {
-                continue;
+                continue
             }
             Ok(crate::owner::Wake::Timeout) => return Some(TerminalCause::Deadline),
             Ok(crate::owner::Wake::OwnerGone) => return Some(TerminalCause::OwnerGone),
@@ -4148,9 +4148,7 @@ fn signal_unenrolled_child(
     let Some(info) = bsd_info(pid) else {
         return Err(unenrolled_unconfirmed(
             tracee,
-            format!(
-                "unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"
-            ),
+            format!("unenrolled fork child pid={pid} of pid={parent}: gone before its identity was read"),
         ));
     };
     let seen = (info.pbi_ppid, (info.pbi_start_tvsec, info.pbi_start_tvusec));
@@ -4160,7 +4158,7 @@ fn signal_unenrolled_child(
             return Err(unenrolled_unconfirmed(
                 tracee,
                 format!("unenrolled fork child pid={pid} of pid={parent}: {why}; not signalled"),
-            ));
+            ))
         }
     };
     if let Err(refused) = tracee.acquired(umbra_core::shutdown::Identity {
@@ -4704,10 +4702,7 @@ impl Session {
             }
         };
         if let BarrierReading::Confirmed(evidence) = &reading {
-            eprintln!(
-                "umbra-platform-macos: tracee exit confirmed: pid={pid} identity={:?} evidence={evidence:?}",
-                self.birth
-            );
+            eprintln!("umbra-platform-macos: tracee exit confirmed: pid={pid} identity={:?} evidence={evidence:?}", self.birth);
         }
         let timed_out = !matches!(reading, BarrierReading::Confirmed(_));
         steps.push(TeardownStep::Barrier(reading.clone()));
@@ -4873,10 +4868,7 @@ impl MacosTraceBackend {
                     crate::ownership::remaining(s.id.0.native_id)
                 );
             } else {
-                eprintln!(
-                    "umbra-platform-macos: child retirement failed: pid={} tracer={} outcome={outcome:?}",
-                    report.pid, report.tracer
-                );
+                eprintln!("umbra-platform-macos: child retirement failed: pid={} tracer={} outcome={outcome:?}", report.pid, report.tracer);
             }
             log_teardown(&report);
             self.teardown_reports.push(report.clone());

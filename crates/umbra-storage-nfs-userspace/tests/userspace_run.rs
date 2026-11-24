@@ -3504,10 +3504,8 @@ fn every_mutation_probe_is_wired_into_the_userspace_job() {
         .1;
     for package in ["umbra-cli", "umbra-platform-macos"] {
         assert!(
-            restore.contains(&format!(
-                "cargo build -p {package}
-"
-            )),
+            restore.contains(&format!("cargo build -p {package}
+")),
             "the restore step does not rebuild an unmutated {package}, leaving a              probe in target/debug for whatever runs on this runner next"
         );
     }
@@ -8193,7 +8191,7 @@ fn slate_group_members(group: u32, deadline: std::time::Instant) -> Result<Strin
                             .is_some_and(|v| v == group.to_string())
                     })
                     .collect::<Vec<_>>()
-                    .join("\n"));
+                    .join("\n"))
             }
             Err(reason) => error = reason,
         }
@@ -8897,10 +8895,7 @@ fn slate_launch(
             break;
         }
         if grace.saturating_duration_since(Instant::now()) <= Duration::from_millis(400) {
-            cleanup_failure = Some(format!(
-                "cleanup FAILED: grace exhausted with live={live:?}, escaped={escaped:?}, direct_status={status:?}, pipes_complete={}",
-                pipes.iter().all(Option::is_some)
-            ));
+            cleanup_failure=Some(format!("cleanup FAILED: grace exhausted with live={live:?}, escaped={escaped:?}, direct_status={status:?}, pipes_complete={}",pipes.iter().all(Option::is_some)));
             break;
         }
         // #205 (D-A): a run that exited on its own but left members is ended
@@ -8986,10 +8981,7 @@ fn slate_launch(
             },
             &error,
         );
-        retain(&format!(
-            "{error}; supervisor_status={:?} timed_out={timed_out} group={group} zombies={zombies:?}\n{census}",
-            output.status
-        ));
+        retain(&format!("{error}; supervisor_status={:?} timed_out={timed_out} group={group} zombies={zombies:?}\n{census}",output.status));
         slate_cleanup_failure(format!("{}: {error}", evidence.display()));
     } else {
         let disposition = if zombies.is_empty() {
@@ -9930,10 +9922,7 @@ fn slate_c10_10_fork_helper_refusal() {
     // are byte-identical to base 55c6c248. The structural unit and native/routed
     // refusal run below retain the existing runtime-witness limitation.
     assert_eq!(
-        String::from_utf8(digest.stdout)
-            .unwrap()
-            .split_whitespace()
-            .next(),
+        String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
         Some("3373659a4cf8ce4ccb53e5a526bf39ffa7088ff93b1798b96d306dd6747071ce"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
