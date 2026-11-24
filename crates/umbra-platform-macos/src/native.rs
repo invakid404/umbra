@@ -141,6 +141,10 @@ impl Task {
 }
 impl Drop for Task {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.0 == 0 && self.1.is_none() {
+            return; // Synthetic task fixture owns no Mach send right.
+        }
         let result = unsafe { mach2::mach_port::mach_port_deallocate(mach_task_self(), self.0) };
         if let Some(slot) = self.1.take() {
             if result == 0 {
@@ -5746,8 +5750,8 @@ mod tests {
     #[test]
     fn f247_child_has_no_inherited_pending_snapshot() {
         use super::*;
-        let pid = std::process::id() as i32;
-        let task = Arc::new(Task::acquire(pid).unwrap());
+        let pid = 247;
+        let task = Arc::new(Task(0, None));
         let make = || {
             LiveSession::attached(
                 pid,
