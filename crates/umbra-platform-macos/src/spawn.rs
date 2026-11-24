@@ -232,6 +232,42 @@ pub(crate) fn decode(
 mod tests {
     use super::*;
 
+    /// Published xnu-12377.121.6 spawn_internal.h:262 places the
+    /// conclave memory limit here. It must never be discarded as padding.
+    #[test]
+    fn f247_legacy_conclave_limit_is_semantic() {
+        let mut bytes = baseline();
+        bytes[188..192].copy_from_slice(&11u32.to_le_bytes());
+        let result = attributes(&bytes);
+        assert!(
+            result.is_err(),
+            "nondefault conclave memory limit was silently erased"
+        );
+    }
+
+    /// Synthetic initialized 26B131 attributes: no installed-library reads
+    /// and no traced task are required to exercise the packed decoder.
+    #[test]
+    fn f247_current_attribute_allocation_decodes() {
+        let mut bytes = [0u8; 256];
+        bytes[56] = 1;
+        bytes[68..80].fill(0xff);
+        bytes[112..128].fill(0xff);
+        let mut descriptor = [0u8; 144];
+        descriptor[..8].copy_from_slice(&256u64.to_le_bytes());
+        descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
+        let result = decode(&descriptor, |address, output| {
+            assert_eq!(address, 4096);
+            assert_eq!(output.len(), bytes.len());
+            output.copy_from_slice(&bytes);
+            Ok(())
+        });
+        assert!(
+            result.is_ok(),
+            "initialized current-profile bytes must decode: {result:?}"
+        );
+    }
+
     fn attributes(bytes: &[u8; ATTRIBUTE_BYTES]) -> Result<Snapshot> {
         let mut descriptor = [0; DESCRIPTOR_BYTES];
         descriptor[..8].copy_from_slice(&(ATTRIBUTE_BYTES as u64).to_le_bytes());
