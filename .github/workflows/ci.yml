@@ -322,6 +322,21 @@ jobs:
           export UMBRA_STDIO_FIXTURE="$GITHUB_WORKSPACE/target/debug/umbra-fix-201-stdio"
           cargo test -p umbra-platform-macos --test launch_stdio -- --nocapture --test-threads=1
           cargo test -p umbra-core ambiguous_stdio_ack_closes_transport_and_all_writer_copies -- --nocapture
+      - name: Qualify packed spawn layouts and kernel-readable backing
+        env:
+          UMBRA_F247_EVIDENCE: /tmp/spawn-abi-247-${{ github.run_id }}-${{ github.run_attempt }}.json
+        run: |
+          cargo test -p umbra-platform-macos --lib f247_ -- --nocapture --test-threads=1
+          cargo test -p umbra-platform-macos --test spawn_abi_247 f247_native_attribute_prefix_boundary -- --exact --nocapture --test-threads=1
+
+      - name: Preserve packed spawn boundary observations
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packed-spawn-boundary
+          path: /tmp/spawn-abi-247-${{ github.run_id }}-${{ github.run_attempt }}.json
+          if-no-files-found: warn
+
       - name: Qualify completed-child resource retirement
         env:
           UMBRA_RETIREMENT_WITNESS: "1"
@@ -380,7 +395,7 @@ jobs:
       # with proc_pidpath, is under ~/Library/Caches/umbra/twins, so a twin that
       # keeps a vendor argv[0] is found too), or umbra's debugserver (its argv
       # carries `--reverse-connect 127.0.0.1:`). A process whose executable path
-      # cannot be read is listed as a leftover; only one proven gone (ESRCH) is
+      # cannot be read is listed as a leftover; only one proven gone or a zombie (ESRCH) is
       # skipped. Zombies are counted above, not again as leftovers. Both checks
       # read ONE process table, so a process cannot be live in the zombie check
       # and a zombie in the leftover check; a failed `ps` fails the step. The
@@ -860,6 +875,9 @@ jobs:
             fix_243_policy_session_drop fix_243_policy_terminate fix_243_policy_watchdog \
             --exact --nocapture --test-threads=1
 
+      # The provider-loss guardian cases return when #303 is fixed:
+      # fix_243_guardian_provider_loss, fix_243_guardian_copyout_failure_loss,
+      # and fix_243_guardian_free_failure_loss leave launchd-parented zombies.
       - name: Packed spawn -- guardian and region qualification
         env:
           UMBRA_SLATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/spawn-guardian-regions-${{ github.run_attempt }}
@@ -867,8 +885,7 @@ jobs:
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
           cargo build -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle --example umbra243relay
           cargo test -p umbra-storage-nfs-userspace --features transport-raw,mutation-probe-spawn-lifecycle \
-            --test userspace_run -- fix_243_guardian_provider_loss fix_243_guardian_unregistered \
-            fix_243_guardian_copyout_failure_loss fix_243_guardian_free_failure_loss \
+            --test userspace_run -- fix_243_guardian_unregistered \
             fix_243_distinct_parent_backing_overlap fix_243_provider_region_cap \
             fix_243_region_success_error_cycles fix_243_region_allocation_failure \
             fix_243_region_write_failure fix_205_refusal_with_an_unenrolled_fork_child \
@@ -1103,7 +1120,7 @@ jobs:
       # with proc_pidpath, is under ~/Library/Caches/umbra/twins, so a twin that
       # keeps a vendor argv[0] is found too), or umbra's debugserver (its argv
       # carries `--reverse-connect 127.0.0.1:`). A process whose executable path
-      # cannot be read is listed as a leftover; only one proven gone (ESRCH) is
+      # cannot be read is listed as a leftover; only one proven gone or a zombie (ESRCH) is
       # skipped. Zombies are counted above, not again as leftovers. Both checks
       # read ONE process table, so a process cannot be live in the zombie check
       # and a zombie in the leftover check; a failed `ps` fails the step. The

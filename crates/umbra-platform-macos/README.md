@@ -116,13 +116,55 @@ positions in the captured plan. The supervisor selects the first unsupported
 opcode or virtual operand in caller order; the platform independently rejects
 unsupported actions before allocation or kernel execution.
 
-Admission is restricted to the exact ABI profile checked in `src/spawn.rs`
-and `src/spawn_host.rs`; it is not a portability claim. Broader admission is
-tracked in [#247](https://github.com/invakid404/umbra/issues/247). After a macOS
-update, retain the named profile refusal, inspect the packed descriptor layout
-and libsystem kernel identity, and re-run native controls, decoder/profile
-checks, positive leaves, exact refusals and lifecycle qualification before
-changing the allowlist. Do not widen it from a version string alone.
+Admission is an exact layout contract, not a version range. The current row
+is macOS 27.2.1 / 26B131 / Darwin 27.2.0 / xnu-13432.41.4~25,
+RELEASE_ARM64_T8132. Both libsystem_kernel and libsystem_c UUIDs, 67 bounded
+instruction windows, ten fresh attribute observations, file-action fields and
+counts, and port-action fields must match. Unreadable observations and unknown
+identities refuse with `spawn ABI profile mismatch`. Runtime selection is cached
+per provider; each snapshot retains its immutable layout through digest,
+backing construction and completion. Advertised attribute length never substitutes
+for readable kernel-prefix backing.
+
+| Row | Attribute allocation / kernel prefix | Qualification |
+|---|---|---|
+| 26B131 | 256 / 200 bytes | Full two-library structural witness and current-host qualification |
+| 25F80 (macOS 26.5.1) | 248 / 192 bytes | legacy: live-qualified in #243; layout re-derived from the exact published source; not live re-certified since; admitted by the pre-#247 witness, weaker than the current two-library contract |
+
+The current layout is derived from the nearest published XNU tag,
+`xnu-12377.121.6`, and installed-image disassembly; source for
+`xnu-13432` was unavailable. In the matching installed kernel image, the
+descriptor copy is at `0xfffffe000790d680..0xfffffe000790d684` and the
+200-byte attribute copy is at `0xfffffe000790d6a0..0xfffffe000790d6b8`.
+The installed `posix_spawn` wrapper sets allocation length 256 at offset
+`+0x98` and packs extension pointers at `+0xa0`, `+0xe4`, `+0x120`,
+`+0x130`, `+0x140`, `+0x150` and `+0x160`. The raw boundary test independently
+checks the running kernel's prefix; installed-image disassembly alone is
+not a live-kernel observation.
+
+The legacy row deliberately keeps its original single-library admission rule;
+missing C-library evidence is not a wildcard in the current row. Both decoders
+reject nondefault conclave memory limits. Current-profile alignment gaps remain
+zero-required; only source-established legacy padding is normalized. CLOSE,
+DUP2 and INHERIT remain the only admitted actions.
+
+Requalification after an update starts with refusal. Record the full host tuple,
+both library UUIDs, named published XNU tag (or explicitly state its absence),
+installed wrapper and setter instructions, all defaults, semantic fields,
+extensions, action operands/counts and kernel-selected prefix. Update reviewed
+layout and witness fixtures, then run hosted synthetic decoder/profile and
+backing tests. On each provisioned profile, require the raw-syscall boundary
+control, native/routed success and exact-refusal leaves, inheritance/lifecycle
+cases, and wrong-offset, ignored-extension and short-backing mutations. The
+boundary control compares valid 256-readable and 200-readable attributes with
+199-readable EFAULT, independently of the advertised nonzero length. Commit the
+supported matrix and this procedure with the evidence. Never widen by version
+string, zero defaults or a harmless-looking byte difference alone. Fresh legacy
+live qualification and broader evidence remain
+[#247](https://github.com/invakid404/umbra/issues/247); this change does not close it.
+When a 25F80 host becomes available, run this full procedure and either upgrade
+that row to the two-library witness or propose retirement to the owner.
+Retirement requires the owner's decision.
 
 Parent and child remain stopped through supervisor Ready, caller PID delivery,
 release of the dedicated remote region and final register commit. New fallible
@@ -178,7 +220,8 @@ Probe controls are listed under [Provider binary](#provider-binary).
 - `spawn_profile_qualified()` answers whether this host's packed-spawn ABI is
   the qualified profile, by the exact predicate packed-spawn capture refuses
   on. It is a read-only, `#[doc(hidden)]` seam for the userspace suite's
-  profile-conditional cases (#247); the backend never calls it.
+  diagnostics. The positive userspace cases no longer turn profile refusal into
+  a passing alternate arm; the backend never calls this public seam.
 <!-- /memoria:section -->
 
 <!-- memoria:section id="shipped-mechanisms" files="src/interpose.rs src/rsp.rs src/native.rs src/abi.rs src/cache.rs" guidance="../../docs/guides/reviewing-syscall-coverage.md" -->

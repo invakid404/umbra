@@ -49,34 +49,25 @@ remains ([#135](https://github.com/invakid404/umbra/issues/135)). The secondary-
 null-descriptor case bypasses `SpawnPrepare` and is a comparison control, not
 proof of lazy registration.
 
-Packed spawn is admitted only on the measured macOS 26.5.1 (25F80) profile. On
-any other spawn profile the platform refuses every packed spawn, failing
-closed. On macOS 27.2.1 (26B131) the private `posix_spawn` attribute block grew
-from 248 to 256 bytes, so packed spawn is refused there; requalifying it is
-[#247](https://github.com/invakid404/umbra/issues/247). Every case measured to
-route a packed spawn branches on the platform's own predicate, the one
-`capture_spawn` refuses on (`umbra_platform_macos::spawn_profile_qualified`),
-never on an OS version chosen by the test. That is 24 cases in the main suite
-(21 `fix_243_*`, both `slate_c11_02_empty_*` and
-`slate_c11_10_e8_pipe_refusal`) and 29 under `mutation-probe-spawn-lifecycle`
-(the registered-attach, completion, inserted, acquired, policy and guardian
-probe cases, and the backing-overlap, region-cap and region-fault cases):
+Packed spawn uses the platform's exact reviewed layout contract: current
+26B131 plus the explicitly historical 25F80 exception, with all other profiles
+refused. See the [platform matrix and requalification procedure](../umbra-platform-macos/README.md#packed-spawn-descriptors-experimental).
+The 54 cases exercise their qualified bodies directly: 24 ordinary
+cases, 29 lifecycle-feature cases, and the #205 fork-window SETSID refusal.
+Qualification covers 51 of these 54 arms. The three guardian provider-loss
+arms are blocked by [#303](https://github.com/invakid404/umbra/issues/303)
+and kept, with unchanged bodies and oracles, out of CI until that defect is fixed.
+There is no conditional profile-refusal arm that can make these tests pass
+without reaching the requested semantics. Unknown-profile refusal is checked
+independently by synthetic profile/witness tests.
 
-- **On the qualified profile,** they make their positive assertions as above.
-- **On any other profile,** each asserts the exact refusal. The native control
-  spawns and writes the mode's own bytes (`child.txt`, `spawn result=0`, and a
-  `virtual-*` victim's `SEED`). The routed run fails with `UnsupportedCapability
-  during macos: spawn ABI profile mismatch (errno: None)` and reports no tracee
-  completion; the program reached its spawn, and nothing was spawned (neither
-  `child.txt` nor the refused open's `opened.txt` exists afterwards). A
-  `virtual-*` victim keeps its `SEED` through the client. A probe case also
-  arms its probe as usual and asserts that nothing ever reached it. Each also
-  keeps its qualified body's cleanup oracle: a `CLEAN` cleanup record, with
-  no group kill and no zombie wherever the qualified body asserts that (every
-  probe case, the region-cap and both region-fault cases), a `COMPLETE`
-  guardian sweep for a guardian case, and a reopen that regains writer
-  authority. That is no
-  positive coverage of packed spawn, only of its fail-closed refusal.
+Each body retains its native control, outputs, journal and action-specific
+oracles. The shared finish path checks no host effect or mount, writer-authority
+reopen (or the explicitly required recovery refusal), no observed SIGHUP,
+no orphaned tracee, CLEAN cleanup, zero group kills and no zombies, including
+deferred cleanup checks for the reopen. Guardian cases additionally require their
+COMPLETE sweep. These are concrete checks of the qualified bodies; a historical
+profile-refusal reading is not positive coverage.
 
 The optional `mutation-probe-spawn-lifecycle` feature enables lifecycle fault
 tests. CI builds both the CLI and platform provider with that feature and

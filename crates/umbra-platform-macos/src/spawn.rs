@@ -357,6 +357,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn f247_current_semantic_bytes_and_extension_fences() {
+        for offset in 16..256 {
+            let mut bytes = CURRENT.baseline();
+            bytes[offset] ^= 1;
+            let mut descriptor = [0u8; 144];
+            descriptor[..8].copy_from_slice(&256u64.to_le_bytes());
+            descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
+            let error = decode(&CURRENT, &descriptor, |address, output| {
+                assert_eq!(address, 4096);
+                output.copy_from_slice(&bytes);
+                Ok(())
+            })
+            .expect_err("every current semantic or zero-required byte must refuse");
+            let expected = if offset >= 200 {
+                "spawn unsupported extension".to_owned()
+            } else {
+                format!("spawn unsupported attribute field {offset}")
+            };
+            assert!(error.to_string().contains(&expected), "byte {offset}: {error}");
+        }
+        for pair in 2..9 {
+            let mut descriptor = [0u8; 144];
+            descriptor[pair * 16..pair * 16 + 8].copy_from_slice(&16u64.to_le_bytes());
+            descriptor[pair * 16 + 8..pair * 16 + 16]
+                .copy_from_slice(&0x5000u64.to_le_bytes());
+            let error = decode(&CURRENT, &descriptor, |_, _| panic!("extension read"))
+                .unwrap_err();
+            assert!(error.to_string().contains("spawn unsupported extension"));
+        }
+    }
+
+    #[test]
     fn f247_production_backing_rejects_short_prefix() {
         for layout in [&LEGACY, &CURRENT] {
             let mut plan = BackingPlan {
