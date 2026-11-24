@@ -250,6 +250,7 @@ fn retirement_self_task_registry_is_cleared_on_unwind() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut owned = SelfTaskBackend(MacosTraceBackend::default());
         owned.0.watchdog = Some(Watchdog {
+            wakeups: Arc::new(rsp::Wakeups::default()),
             tasks: watched.clone(),
             cancel: None,
             worker: None,
@@ -267,6 +268,7 @@ fn retirement_release_owns_all_resources() {
     let mut owned = SelfTaskBackend(MacosTraceBackend::default());
     let backend = &mut owned.0;
     backend.watchdog = Some(Watchdog {
+        wakeups: Arc::new(rsp::Wakeups::default()),
         tasks: Arc::new(Mutex::new(WatchedTasks::default())),
         cancel: None,
         worker: None,
@@ -365,6 +367,7 @@ fn retirement_quiesce_resume_preserves_tombstones_and_live_sibling() {
     let mut owned = SelfTaskBackend(MacosTraceBackend::default());
     let backend = &mut owned.0;
     backend.watchdog = Some(Watchdog {
+        wakeups: Arc::new(rsp::Wakeups::default()),
         tasks: Arc::new(Mutex::new(WatchedTasks::default())),
         cancel: None,
         worker: None,

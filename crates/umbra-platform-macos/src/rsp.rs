@@ -31,7 +31,53 @@ pub fn number(s: &str) -> Result<u64> {
 pub fn fields(s: &str) -> BTreeMap<&str, &str> {
     s.split(';').filter_map(|f| f.split_once(':')).collect()
 }
+pub(crate) struct Wakeup {
+    reader: std::os::unix::net::UnixStream,
+    writer: std::os::unix::net::UnixStream,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+impl Wakeup {
+    fn new() -> std::io::Result<std::sync::Arc<Self>> {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        writer.set_nonblocking(true)?;
+        Ok(std::sync::Arc::new(Self {
+            reader,
+            writer,
+            cancelled: false.into(),
+        }))
+    }
+    pub(crate) fn signal(&self) {
+        use std::sync::atomic::Ordering;
+        self.cancelled.store(true, Ordering::Release);
+        let _ = (&self.writer).write(&[1]);
+    }
+}
+#[derive(Default)]
+pub(crate) struct Wakeups(std::sync::Mutex<(bool, Vec<std::sync::Weak<Wakeup>>)>);
+impl Wakeups {
+    pub(crate) fn add(&self, wakeup: std::sync::Weak<Wakeup>) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.1.retain(|w| w.strong_count() != 0);
+        if state.0 {
+            if let Some(w) = wakeup.upgrade() {
+                w.signal();
+            }
+        }
+        state.1.push(wakeup);
+    }
+    pub(crate) fn signal(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 = true;
+        for wake in state.1.iter().filter_map(std::sync::Weak::upgrade) {
+            wake.signal();
+        }
+    }
+}
 pub struct Rsp {
+    wakeup: std::sync::Arc<Wakeup>,
+    teardown: bool,
+    aligned: bool,
     ownership: Option<umbra_platform::shutdown::Reservation>,
     /// Debug aid: distinguishes concurrent connections in UMBRA_RSP_LOG output.
     pub id: u32,
@@ -270,7 +316,13 @@ impl Rsp {
             .set_write_timeout(Some(Duration::from_secs(2)))
             .map_err(|e| error("rsp", e))?;
         static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        stream
+            .set_nonblocking(true)
+            .map_err(|e| error("rsp nonblocking", e))?;
         let mut r = Self {
+            wakeup: Wakeup::new().map_err(|e| error("rsp wakeup", e))?,
+            teardown: false,
+            aligned: true,
             ownership,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             stream,
@@ -301,6 +353,66 @@ impl Rsp {
         r.ok("QSetDetachOnError:0")?;
         Ok(r)
     }
+    pub(crate) fn wakeup(&self) -> std::sync::Weak<Wakeup> {
+        std::sync::Arc::downgrade(&self.wakeup)
+    }
+    pub(crate) fn begin_teardown(&mut self) -> bool {
+        self.teardown = true;
+        self.aligned
+    }
+    fn ready(&self, event: i16, limit: Instant, finish_frame: bool) -> Result<bool> {
+        use std::os::fd::AsRawFd;
+        loop {
+            if !self.teardown
+                && !finish_frame
+                && self
+                    .wakeup
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(error(
+                    "rsp",
+                    "ordinary work cancelled; stream retained for teardown",
+                ));
+            }
+            let remaining = limit.saturating_duration_since(crate::clock::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.stream.as_raw_fd(),
+                    events: event,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: if self.teardown || finish_frame {
+                        -1
+                    } else {
+                        self.wakeup.reader.as_raw_fd()
+                    },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+            // SAFETY: poll receives the valid stack array for this call only.
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
+            if rc < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error("rsp poll", e));
+            }
+            if fds[1].revents != 0 {
+                continue;
+            }
+            if fds[0].revents != 0 {
+                return Ok(true);
+            }
+        }
+    }
     fn write_packet(&mut self, bytes: &[u8], limit: Instant) -> Result<()> {
         #[cfg(feature = "signal-witness")]
         if !self.signal_fault_fired
@@ -326,6 +438,9 @@ impl Rsp {
                 return Err(error("rsp write", reason));
             }
         }
+        if !self.aligned {
+            return Err(error("rsp write", "previous outgoing frame incomplete"));
+        }
         let mut offset = 0;
         while offset < bytes.len() {
             let remaining = limit
@@ -335,9 +450,16 @@ impl Rsp {
             self.stream
                 .set_write_timeout(Some(read_timeout(remaining)))
                 .map_err(|e| error("rsp write", e))?;
+            if !self.ready(libc::POLLOUT, limit, offset > 0)? {
+                self.aligned = offset == 0;
+                return Err(error("rsp write", "deadline expired during frame"));
+            }
             match self.stream.write(&bytes[offset..]) {
                 Ok(0) => return Err(error("rsp write", "debugserver disconnected")),
-                Ok(n) => offset += n,
+                Ok(n) => {
+                    offset += n;
+                    self.aligned = offset == bytes.len();
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -454,6 +576,9 @@ impl Rsp {
                     limit.saturating_duration_since(crate::clock::now()),
                 )))
                 .map_err(|e| error("rsp timeout", e))?;
+            if !self.ready(libc::POLLIN, limit, false)? {
+                return Ok(None);
+            }
             let mut bytes = [0; 8192];
             match self.read_progress(&mut bytes) {
                 Ok(0) => return Err(error("rsp", "debugserver disconnected")),
@@ -535,10 +660,17 @@ impl Rsp {
     /// handshake). It bypasses the session deadline, because teardown also runs
     /// after a watchdog expiry, and it is bounded by its own write timeout.
     pub fn send_kill(&mut self, bound: Duration) -> std::io::Result<()> {
-        self.stream
-            .set_write_timeout(Some(bound.max(Duration::from_millis(1))))?;
-        self.stream.write_all(b"$k#6b")
+        self.teardown_write(b"$k#6b", crate::clock::now() + bound)
     }
+    pub(crate) fn teardown_interrupt(&mut self, deadline: Instant) -> std::io::Result<()> {
+        self.teardown_write(&[3], deadline)
+    }
+    fn teardown_write(&mut self, bytes: &[u8], deadline: Instant) -> std::io::Result<()> {
+        // Deliberately independent of expired ordinary session/setup deadlines.
+        self.write_packet(bytes, deadline)
+            .map_err(std::io::Error::other)
+    }
+
     /// One bounded read of whatever the tracer sends during teardown.
     pub fn teardown_read(&mut self, wait: Duration) -> TeardownRead {
         match self.poll_until(crate::clock::now() + wait) {
@@ -594,10 +726,14 @@ impl Rsp {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
         let mut child = Command::new("/usr/bin/true").spawn().unwrap();
         child.wait().unwrap();
         (
             Self {
+                wakeup: Wakeup::new().unwrap(),
+                teardown: false,
+                aligned: true,
                 ownership: None,
                 id: 0,
                 stream,
@@ -702,6 +838,45 @@ impl Drop for Rsp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancellation_preserves_partial_reply_and_same_stream_for_teardown() {
+        use std::io::{Read, Write};
+        let (mut rsp, mut peer) = Rsp::retirement_test_pair();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        rsp.send("qC").unwrap();
+        let mut request = [0; 6];
+        peer.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"$qC#b4");
+        peer.write_all(b"$O").unwrap();
+        assert!(rsp
+            .poll(std::time::Duration::from_millis(10))
+            .unwrap()
+            .is_none());
+        assert_eq!(&rsp.buffer, b"$O");
+        rsp.wakeup.signal();
+        assert!(rsp.poll(std::time::Duration::from_secs(1)).is_err());
+        assert_eq!(&rsp.buffer, b"$O");
+        assert!(rsp.begin_teardown());
+        peer.write_all(b"K#00").unwrap();
+        assert!(
+            matches!(rsp.teardown_read(std::time::Duration::from_millis(20)), TeardownRead::Packet(p) if p == "OK")
+        );
+        rsp.teardown_interrupt(crate::clock::now() + std::time::Duration::from_millis(20))
+            .unwrap();
+        let mut interrupt = [0];
+        peer.read_exact(&mut interrupt).unwrap();
+        assert_eq!(interrupt, [3]);
+        peer.write_all(b"$T02thread:1;#00").unwrap();
+        assert!(
+            matches!(rsp.teardown_read(std::time::Duration::from_millis(20)), TeardownRead::Packet(p) if p == "T02thread:1;")
+        );
+        rsp.send_kill(std::time::Duration::from_millis(20)).unwrap();
+        let mut kill = [0; 5];
+        peer.read_exact(&mut kill).unwrap();
+        assert_eq!(&kill, b"$k#6b");
+    }
+
     use super::*;
 
     #[test]
@@ -849,6 +1024,9 @@ mod poll_bound_tests {
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         child.wait().unwrap();
         let mut rsp = Rsp {
+            wakeup: Wakeup::new().unwrap(),
+            teardown: false,
+            aligned: true,
             ownership: None,
             id: 0,
             stream,
@@ -903,6 +1081,9 @@ mod early_packet_test {
         let mut child = Command::new("/usr/bin/true").spawn().unwrap();
         child.wait().unwrap();
         let mut rsp = Rsp {
+            wakeup: Wakeup::new().unwrap(),
+            teardown: false,
+            aligned: true,
             ownership: None,
             id: 0,
             stream,

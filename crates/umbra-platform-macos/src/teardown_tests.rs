@@ -52,6 +52,15 @@ fn packet(peer: &mut std::net::TcpStream, body: &str) {
 }
 
 fn run(stopped: bool) -> (TeardownReport, Vec<u8>) {
+    run_peer(stopped, None, Some("T02thread:1;"), true)
+}
+
+fn run_peer(
+    stopped: bool,
+    queued: Option<&str>,
+    stop_reply: Option<&'static str>,
+    collect: bool,
+) -> (TeardownReport, Vec<u8>) {
     // The native control proves this ordinary child is collectable without RSP.
     let mut control = std::process::Command::new("/bin/sleep")
         .arg("30")
@@ -67,6 +76,9 @@ fn run(stopped: bool) -> (TeardownReport, Vec<u8>) {
     let (rsp, mut peer) = Rsp::retirement_test_pair();
     peer.set_read_timeout(Some(Duration::from_millis(25)))
         .unwrap();
+    if let Some(queued) = queued {
+        packet(&mut peer, queued);
+    }
     let done = Arc::new(AtomicBool::new(false));
     let peer_done = done.clone();
     let worker = std::thread::spawn(move || {
@@ -80,12 +92,14 @@ fn run(stopped: bool) -> (TeardownReport, Vec<u8>) {
                 Ok(_) => {
                     bytes.push(byte[0]);
                     if byte[0] == 3 {
-                        stopped = true;
-                        packet(&mut peer, "T02thread:1;");
+                        stopped = stop_reply.is_some();
+                        if let Some(reply) = stop_reply {
+                            packet(&mut peer, reply);
+                        }
                     } else {
                         pending.push(byte[0]);
                         if pending.ends_with(b"$k#6b") {
-                            if stopped {
+                            if stopped && collect {
                                 // SAFETY: the test still owns this live ordinary child.
                                 assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
                                 packet(&mut peer, "X09");
@@ -147,4 +161,58 @@ fn running_peer_requires_interrupt_before_k() {
 fn stopped_peer_native_control_confirms_before_tracer_kill() {
     let (report, _) = run(true);
     assert!(!report.timed_out, "{report:?}");
+}
+
+#[test]
+fn missing_stop_never_sends_k() {
+    let (report, bytes) = run_peer(false, None, None, true);
+    assert!(report.timed_out && report.unconfirmed, "{report:?}");
+    assert_eq!(bytes, [3]);
+}
+
+#[test]
+fn queued_stop_cannot_replace_interrupt_reply() {
+    let (report, bytes) = run_peer(false, Some("T02thread:1;"), None, true);
+    assert!(report.timed_out && report.unconfirmed, "{report:?}");
+    assert_eq!(bytes, [3]);
+}
+
+#[test]
+fn stale_breakpoint_cannot_replace_interrupt_reply() {
+    let (report, bytes) = run_peer(false, None, Some("T05thread:1;"), true);
+    assert!(report.timed_out && report.unconfirmed, "{report:?}");
+    assert_eq!(bytes, [3]);
+}
+
+#[test]
+fn wrong_process_stop_is_loud() {
+    let (report, bytes) = run_peer(false, None, Some("T02thread:pffffffff.1;"), true);
+    assert!(report.timed_out && report.unconfirmed, "{report:?}");
+    assert_eq!(bytes, [3]);
+}
+
+#[test]
+fn stop_and_k_do_not_prove_collection() {
+    let (report, bytes) = run_peer(false, None, Some("T02thread:1;"), false);
+    assert!(report.timed_out && report.unconfirmed, "{report:?}");
+    assert_eq!(bytes, b"\x03$k#6b");
+    assert!(!report
+        .steps
+        .iter()
+        .any(|step| matches!(step, TeardownStep::Barrier(BarrierReading::Confirmed(_)))));
+}
+
+#[test]
+fn malformed_teardown_reply_is_rejected() {
+    for packet in [
+        "T",
+        "S02extra",
+        "Tzz",
+        "T02thread:;",
+        "T02thread:xyz;",
+        "T02process:ffff;",
+        "W00broken",
+    ] {
+        assert!(teardown_reply(packet, 123).is_err(), "{packet}");
+    }
 }
