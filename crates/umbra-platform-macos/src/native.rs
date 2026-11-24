@@ -1392,10 +1392,12 @@ impl Session {
         #[cfg(feature = "signal-witness")]
         self.signal_probe("internal")?;
         loop {
+            self.stopped = false;
             let stop = self.rsp.request("c")?;
             if !stop.starts_with('T') {
                 return Err(error("run_to", stop));
             }
+            self.stopped = true;
             let fields = rsp::fields(&stop[3..]);
             self.thread = tid(
                 rsp::number(
@@ -1480,10 +1482,12 @@ impl Session {
         // breakpoint below then catches the next call to it.
         self.temporary_breakpoint(notify)?;
         loop {
+            self.stopped = false;
             let stop = self.rsp.request("c")?;
             if !stop.starts_with('T') {
                 return Err(error("dyld startup", stop));
             }
+            self.stopped = true;
             let fields = rsp::fields(&stop[3..]);
             self.thread = tid(
                 rsp::number(
