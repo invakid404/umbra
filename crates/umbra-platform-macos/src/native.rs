@@ -4473,8 +4473,9 @@ pub struct TeardownReport {
     /// The barrier did not confirm before the bound, so the timeout path ran:
     /// the warning, then the tracer kill.
     pub timed_out: bool,
-    /// Still not confirmed after the post-kill barrier. Cleanup makes terminate
-    /// fail for this condition or any retained failed retirement outcome.
+    /// The ordered attempt failed, or disposal still lacks collection proof.
+    /// Post-kill collection cannot clear an earlier ordered failure. Cleanup
+    /// makes terminate fail for this or any retained failed retirement outcome.
     /// Invalid root handles and unsupported termination policies also return Err.
     pub unconfirmed: bool,
     pub elapsed: Duration,
