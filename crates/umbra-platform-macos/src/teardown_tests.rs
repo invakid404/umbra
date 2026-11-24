@@ -337,8 +337,7 @@ fn completed_resume_error_accepts_answering_stop() {
 
 #[test]
 fn internal_resume_error_accepts_answering_stop() {
-    let (report, bytes) =
-        run_peer_internal(true, Some("T05thread:1;"), None, true, false, true);
+    let (report, bytes) = run_peer_internal(true, Some("T05thread:1;"), None, true, false, true);
     assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
     assert_eq!(bytes, b"$k#6b");
 }
