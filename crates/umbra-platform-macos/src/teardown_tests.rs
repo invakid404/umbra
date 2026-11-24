@@ -77,12 +77,15 @@ fn run_peer(
     peer.set_read_timeout(Some(Duration::from_millis(25)))
         .unwrap();
     if let Some(queued) = queued {
-        packet(&mut peer, queued);
+        for reply in queued.split('|') {
+            packet(&mut peer, reply);
+        }
     }
     let done = Arc::new(AtomicBool::new(false));
     let peer_done = done.clone();
+    let peer_stopped = stopped || queued.is_some();
     let worker = std::thread::spawn(move || {
-        let mut stopped = stopped;
+        let mut stopped = peer_stopped;
         let mut bytes = Vec::new();
         let mut pending = Vec::new();
         while !peer_done.load(Ordering::Acquire) {
@@ -201,17 +204,36 @@ fn eof_before_interrupt_records_connection_failure() {
 }
 
 #[test]
-fn queued_stop_cannot_replace_interrupt_reply() {
-    let (report, bytes) = run_peer(false, Some("T02thread:1;"), None, true);
-    assert!(report.timed_out && report.unconfirmed, "{report:?}");
-    assert_eq!(bytes, [3]);
+fn buffered_sigchld_answers_outstanding_resume_without_interrupt() {
+    let (report, bytes) = run_peer(false, Some("T14thread:1;"), None, true);
+    assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
+    assert_eq!(bytes, b"$k#6b");
 }
 
 #[test]
-fn stale_breakpoint_cannot_replace_interrupt_reply() {
-    let (report, bytes) = run_peer(false, None, Some("T05thread:1;"), true);
+fn unsolicited_stop_is_loud() {
+    let (report, bytes) = run_peer(true, Some("T14thread:1;"), None, true);
     assert!(report.timed_out && report.unconfirmed, "{report:?}");
-    assert_eq!(bytes, [3]);
+    assert!(bytes.is_empty(), "{bytes:?}");
+}
+
+#[test]
+fn duplicate_buffered_stop_is_loud() {
+    let (report, bytes) = run_peer(
+        false,
+        Some("T14thread:1;|T14thread:1;"),
+        None,
+        true,
+    );
+    assert!(report.timed_out && report.unconfirmed, "{report:?}");
+    assert!(bytes.is_empty(), "{bytes:?}");
+}
+
+#[test]
+fn breakpoint_answers_outstanding_resume() {
+    let (report, bytes) = run_peer(false, None, Some("T05thread:1;"), true);
+    assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
+    assert_eq!(bytes, b"\x03$k#6b");
 }
 
 #[test]
