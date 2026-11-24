@@ -390,6 +390,27 @@ mod tests {
     }
 
     #[test]
+    fn f247_extension_fence_independent_of_semantic_padding() {
+        // A synthetic descriptor puts a legacy padding byte in the extension
+        // range. The semantic loop permits it; the extension fence must refuse.
+        static SYNTHETIC: Layout = Layout {
+            kernel_prefix: 169,
+            ..LEGACY
+        };
+        let mut bytes = SYNTHETIC.baseline();
+        bytes[169] = 1;
+        let mut descriptor = [0u8; 144];
+        descriptor[..8].copy_from_slice(&248u64.to_le_bytes());
+        descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
+        let error = decode(&SYNTHETIC, &descriptor, |_, output| {
+            output.copy_from_slice(&bytes);
+            Ok(())
+        })
+        .expect_err("extension must refuse independently of semantic padding");
+        assert!(error.to_string().contains("spawn unsupported extension"));
+    }
+
+    #[test]
     fn f247_production_backing_rejects_short_prefix() {
         for layout in [&LEGACY, &CURRENT] {
             let mut plan = BackingPlan {
@@ -428,12 +449,19 @@ mod tests {
         }
     }
 
+    thread_local! {
+        static SYNTHETIC_SELECTION: std::cell::Cell<&'static Layout> =
+            const { std::cell::Cell::new(&LEGACY) };
+    }
+
     #[test]
     fn f247_concurrent_snapshots_retain_layout() {
         let old = decode(&LEGACY, &[0; 144], |_, _| panic!("null")).unwrap();
         let current = decode(&CURRENT, &[0; 144], |_, _| panic!("null")).unwrap();
         for address in [0, 0x1000, 0x2000] {
+            SYNTHETIC_SELECTION.set(&CURRENT);
             assert_eq!(u64_at(&old.backing(address).unwrap(), 0), 248);
+            SYNTHETIC_SELECTION.set(&LEGACY);
             assert_eq!(u64_at(&current.backing(address).unwrap(), 0), 256);
             assert_eq!(old.layout().id, LEGACY.id);
             assert_eq!(current.layout().id, CURRENT.id);
