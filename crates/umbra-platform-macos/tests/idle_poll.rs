@@ -175,7 +175,32 @@ fn absolute_watchdog_expires_across_idle_replies() {
             Err(error) => break error,
         }
     };
-    let _ = backend.terminate(root, TerminationPolicy::Immediate);
+    backend
+        .terminate(root, TerminationPolicy::Immediate)
+        .unwrap();
+    let reports = backend.teardown_reports();
+    assert!(!reports.is_empty(), "watchdog must record ordered teardown");
+    for report in reports {
+        assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
+        let barrier = report
+            .steps
+            .iter()
+            .position(|step| {
+                matches!(
+                    step,
+                    umbra_platform_macos::TeardownStep::Barrier(
+                        umbra_platform_macos::BarrierReading::Confirmed(_)
+                    )
+                )
+            })
+            .expect("confirmed barrier");
+        let tracer = report
+            .steps
+            .iter()
+            .position(|step| matches!(step, umbra_platform_macos::TeardownStep::TracerKilled))
+            .expect("tracer disposal");
+        assert!(barrier < tracer, "{report:?}");
+    }
     assert!(idle > 0);
     assert!(failure.to_string().contains("watchdog"), "{failure}");
 }

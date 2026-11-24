@@ -146,6 +146,24 @@ pub(crate) struct OwnerWatch {
     _stream: UnixStream,
 }
 impl OwnerWatch {
+    #[cfg(test)]
+    pub(crate) fn test_stream(stream: UnixStream) -> Result<Self> {
+        let queue = queue()?;
+        register(
+            &queue,
+            event(
+                stream.as_raw_fd() as usize,
+                libc::EVFILT_READ,
+                libc::EV_ADD | libc::EV_CLEAR,
+                0,
+            ),
+        )?;
+        Ok(Self {
+            queue,
+            _stream: stream,
+        })
+    }
+
     pub fn new(identity: OwnerIdentity, stream: UnixStream) -> Result<Self> {
         let mut peer = 0i32;
         let mut len = std::mem::size_of::<i32>() as libc::socklen_t;

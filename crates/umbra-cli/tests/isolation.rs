@@ -426,6 +426,9 @@ impl Run {
         if !fresh {
             command.process_group(0);
         }
+        if case == "P1" {
+            command.env("UMBRA_TEARDOWN_LOG", "1");
+        }
         if observe {
             std::fs::create_dir(dir.join("signals")).unwrap();
             command
@@ -1019,6 +1022,14 @@ fn sid1_p1_stopped_tracer_at_the_deadline() {
     let tree = run.discover();
     signal(tree.root_tracer, "STOP");
     let o = run.finish(Duration::from_secs(45));
+    assert!(
+        o.stderr.contains("Barrier(Confirmed(")
+            && !o.stderr.contains("Barrier(Unconfirmed(")
+            && !o.stderr.contains("timed_out: true")
+            && !o.stderr.contains("unconfirmed: true"),
+        "SID-1 stopped-tracer teardown must confirm before fallback: {}",
+        o.stderr
+    );
     assert_no_sighup_to_umbra(o);
     assert_caller_group_untouched(o);
     assert!(

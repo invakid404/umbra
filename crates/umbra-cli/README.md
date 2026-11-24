@@ -223,7 +223,9 @@ and an existing NFSv4 mount. Build providers with `cargo build --workspace --bin
 and compile `experiments/fixtures/umbra-test-child.c` first. Set
 `UMBRA_TEST_FIXTURE_PATH` and `UMBRA_TEST_NFS_ROOT`, then run
 `UMBRA_INTEGRATION_REQUIRED=1 cargo test -p umbra-cli --test run_fixtures -- --nocapture`.
-Required mode fails on missing inputs; ordinary developer tests may skip. Failed
+Mounted-NFS cases are qualified on CI by name; agent sessions must not mount
+NFS or set `UMBRA_TEST_NFS_ROOT`. Required mode fails on missing inputs;
+ordinary developer tests may skip. Failed
 commands report their captured stderr before any required run-ID parse. Cleanup
 uses an emitted prepared ID even when that status assertion fails; without one,
 it touches no directory in the shared NFS mount.
@@ -253,8 +255,9 @@ Two `jobc_` cases run anywhere: they check, without a run, how the sampler below
 selects its readings and how the harness judges its log. The other cases fall
 into two groups:
 
-- **`sid1_` cases.** They need launchd's session: CI's self-hosted runner, or
-  locally a `launchctl submit` of the test binary. Anywhere else they skip,
+- **`sid1_` cases.** They need launchd's session and are qualified by name on
+  CI's self-hosted runner. Worker terminal sessions cannot qualify them and
+  must not submit launchd jobs to obtain that prerequisite. Elsewhere they skip,
   unless `UMBRA_REQUIRE_SID1` is set, which makes another session a failure.
   Each drives `umbra run` from a launcher in its own process group. That group
   also holds a passive sentinel, and a sampler outside it records the group's
@@ -273,6 +276,9 @@ into two groups:
     debugserver usually ends by itself after its tracee's death; P2 records
     whether it did or the test ended it, and proves by pid and start time
     that the process it did not kill is gone;
+    P1 additionally enables teardown diagnostics and requires a confirmed
+    barrier with no timeout or unconfirmed report. That strengthened #300
+    assertion awaits a SID-1 CI reading;
   - the run's topology, the mirrored status, the isolation record, and
     debugserver's arguments left as on master (no `--kill-on-error`);
   - a descendant refused entry to the caller's group, and the tracee's own
