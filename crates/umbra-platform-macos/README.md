@@ -916,6 +916,9 @@ launchd as a zombie nobody collects:
   path without increasing the bound. The local watchdog case confirmed before
   tracer disposal in 20.57 ms. The SID-1 stopped-tracer case still requires CI
   qualification; its earlier timeout was not proved to have the same cause.
+  Local live-child and orphaned-child qualification still fails when teardown
+  drains a queued stop and receives no fresh interrupt stop. Both cases left
+  a launchd-parented zombie; this repair is not yet qualified for those shapes.
   A hung peer, or a stop/exit not observed within its phase, still takes the
   loud timeout path and can leave a zombie.
 
