@@ -256,6 +256,7 @@ struct Watchdog {
     cancel: Option<std::os::unix::net::UnixStream>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
+
 impl Watchdog {
     fn new(
         deadline: Option<Instant>,
@@ -5747,6 +5748,50 @@ fn termination_result(sessions: Vec<String>, unenrolled: Vec<String>) -> Result<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_loss_wakes_a_pending_rsp_request() {
+        use std::io::Read;
+        let tasks = Arc::new(Mutex::new(WatchedTasks::default()));
+        let (stream, owner_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let owner = Watchdog::new(
+            None,
+            Some(crate::owner::OwnerWatch::test_stream(stream).unwrap()),
+            tasks.clone(),
+        )
+        .unwrap();
+        let deadline = Watchdog::new(None, None, tasks).unwrap();
+        let (mut rsp, mut peer) = Rsp::retirement_test_pair();
+        deadline.wakeups.add(rsp.wakeup());
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = rsp.request("qC");
+            completed.send((result, rsp)).unwrap();
+        });
+        let mut request = [0; 6];
+        peer.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"$qC#b4");
+        drop(owner_peer);
+        let limit = Instant::now() + Duration::from_secs(2);
+        while owner.reason().is_none() && Instant::now() < limit {
+            std::thread::yield_now();
+        }
+        assert_eq!(owner.reason(), Some(TerminalCause::OwnerGone));
+        // Synchronize with the monitor itself before checking delivery; no race
+        // between latching the reason and signalling its wakeup registry.
+        drop(owner);
+        let response = completion.recv_timeout(Duration::from_secs(1));
+        // Always release the worker even when the wiring is broken.
+        deadline.wakeups.signal();
+        worker.join().unwrap();
+        let (result, mut rsp) = response.expect("owner loss must wake the pending request");
+        assert!(result.is_err());
+        assert!(
+            rsp.begin_teardown(),
+            "cancellation must preserve the RSP stream"
+        );
+    }
+
     /// F2 (#205): every `TRACED_STUBS` row resolves to at least one verified
     /// `svc` site in this process's own libsystem_kernel. This reads local
     /// memory only and traces nothing, so it runs on hosted runners too.
