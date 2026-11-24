@@ -5779,6 +5779,18 @@ mod tests {
         });
         let before = parent.spawn.as_ref().unwrap() as *const SpawnInFlight;
         let child = make();
+        for fixture in [&parent, &child] {
+            let pid = fixture.rsp.tracer_pid();
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            let wait_error = std::io::Error::last_os_error().raw_os_error();
+            assert_eq!(waited, -1, "fixture child {pid} was not already waited for");
+            assert_eq!(wait_error, Some(libc::ECHILD));
+            let exists = unsafe { libc::kill(pid, 0) };
+            let existence_error = std::io::Error::last_os_error().raw_os_error();
+            assert_eq!(exists, -1, "fixture child {pid} survives");
+            assert_eq!(existence_error, Some(libc::ESRCH));
+        }
         assert!(child.spawn.is_none());
         let retained = parent.spawn.as_ref().unwrap();
         assert_eq!(before, retained as *const SpawnInFlight);
