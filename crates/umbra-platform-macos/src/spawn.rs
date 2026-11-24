@@ -1,4 +1,4 @@
-//! Packed spawn layout for the qualified 25F80 arm64 profile.
+//! Reviewed packed-spawn layouts and owned kernel backing.
 //! Decoding owns every byte; no caller pointer is forwarded to the kernel.
 use crate::unsupported;
 use umbra_core::Result;
@@ -8,7 +8,97 @@ pub(crate) const ATTRIBUTE_BYTES: usize = 248;
 pub(crate) const ACTION_STRIDE: usize = 1040;
 pub(crate) const MAX_ACTIONS: usize = 64;
 pub(crate) const REGION_BYTES: usize = 81920;
+#[cfg(test)]
 pub(crate) const ACTION_OFFSET: usize = 416;
+
+/// Immutable byte contract, selected only by host qualification.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Layout {
+    pub id: &'static str,
+    pub attribute_bytes: usize,
+    pub kernel_prefix: usize,
+    pub attribute_offset: usize,
+    pub action_offset: usize,
+    pub pid_offset: usize,
+    pub region_bytes: usize,
+}
+
+pub(crate) static LEGACY: Layout = Layout {
+    id: "25F80-v2",
+    attribute_bytes: 248,
+    kernel_prefix: 192,
+    attribute_offset: 144,
+    action_offset: 416,
+    pid_offset: 400,
+    region_bytes: 81920,
+};
+pub(crate) static CURRENT: Layout = Layout {
+    id: "26B131-v1",
+    attribute_bytes: 256,
+    kernel_prefix: 200,
+    attribute_offset: 144,
+    action_offset: 416,
+    pid_offset: 400,
+    region_bytes: 81920,
+};
+
+impl Layout {
+    pub fn baseline(&self) -> Vec<u8> {
+        let mut bytes = vec![0; self.attribute_bytes];
+        bytes[56] = 1;
+        bytes[68..80].fill(0xff);
+        bytes[112..128].fill(0xff);
+        bytes
+    }
+
+    fn padding(&self, offset: usize) -> bool {
+        // Only the published legacy padding is normalized. Current gaps
+        // remain zero-required until the running kernel proves them unused.
+        self.id == LEGACY.id && matches!(offset, 2..=3 | 66..=67 | 107 | 169)
+    }
+}
+
+/// The allocator and writer must both cover the kernel-selected prefix,
+/// independently of the descriptor's advertised attribute allocation.
+#[derive(Debug)]
+pub(crate) struct BackingPlan {
+    pub allocation_bytes: usize,
+    pub written_bytes: usize,
+    attribute_storage: usize,
+}
+
+impl BackingPlan {
+    pub fn validate(&self, layout: &Layout, action_bytes: usize) -> Result<()> {
+        let fits = |offset: usize, len: usize, limit: usize| {
+            offset.checked_add(len).is_some_and(|end| end <= limit)
+        };
+        if self.attribute_storage < layout.kernel_prefix
+            || !fits(
+                layout.attribute_offset,
+                layout.kernel_prefix,
+                self.allocation_bytes,
+            )
+            || !fits(
+                layout.attribute_offset,
+                layout.kernel_prefix,
+                self.written_bytes,
+            )
+            || !fits(
+                layout.attribute_offset,
+                self.attribute_storage,
+                layout.pid_offset,
+            )
+            || !fits(layout.pid_offset, 4, self.allocation_bytes)
+            || !fits(layout.pid_offset, 4, self.written_bytes)
+            || !fits(layout.action_offset, action_bytes, self.allocation_bytes)
+            || !fits(layout.action_offset, action_bytes, self.written_bytes)
+            || self.written_bytes > self.allocation_bytes
+        {
+            return Err(malformed());
+        }
+        Ok(())
+    }
+}
 
 /// Every component must be queried successfully. A missing observation cannot
 /// become a wildcard, including on hosted CI (which tests synthetic profiles).
@@ -49,7 +139,8 @@ use umbra_core::SpawnAction as Action;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
-    pub attributes: [u8; ATTRIBUTE_BYTES],
+    layout: &'static Layout,
+    pub attributes: Vec<u8>,
     pub actions: Vec<Action>,
     pub action_bytes: Vec<u8>,
 }
@@ -64,20 +155,44 @@ impl Snapshot {
         Ok(())
     }
 
-    /// Build zero-filled, self-contained remote backing after allocation.
-    /// Even the unused attribute tail is readable by the qualified kernel.
-    pub(crate) fn backing(&self, address: u64) -> Result<Vec<u8>> {
-        if address.checked_add(REGION_BYTES as u64).is_none() {
+    pub fn layout(&self) -> &'static Layout {
+        self.layout
+    }
+
+    pub fn backing_plan(&self) -> Result<BackingPlan> {
+        let plan = BackingPlan {
+            allocation_bytes: self.layout.region_bytes,
+            written_bytes: self.layout.region_bytes,
+            attribute_storage: self.attributes.len(),
+        };
+        plan.validate(self.layout, self.action_bytes.len())?;
+        Ok(plan)
+    }
+
+    /// Bind the immutable layout as well as canonical owned bytes.
+    pub fn canonical_plan(&self) -> Result<Vec<u8>> {
+        let mut result = b"umbra-spawn-layout-v1".to_vec();
+        result.extend_from_slice(&(self.layout.id.len() as u64).to_le_bytes());
+        result.extend_from_slice(self.layout.id.as_bytes());
+        result.extend_from_slice(&self.backing(0)?);
+        Ok(result)
+    }
+
+    pub fn backing(&self, address: u64) -> Result<Vec<u8>> {
+        let plan = self.backing_plan()?;
+        if address.checked_add(plan.allocation_bytes as u64).is_none() {
             return Err(malformed());
         }
-        let mut bytes = vec![0; REGION_BYTES];
-        bytes[..8].copy_from_slice(&(ATTRIBUTE_BYTES as u64).to_le_bytes());
-        bytes[8..16].copy_from_slice(&(address + 144).to_le_bytes());
-        bytes[144..144 + ATTRIBUTE_BYTES].copy_from_slice(&self.attributes);
+        let layout = self.layout;
+        let mut bytes = vec![0; plan.written_bytes];
+        bytes[..8].copy_from_slice(&(layout.attribute_bytes as u64).to_le_bytes());
+        bytes[8..16].copy_from_slice(&(address + layout.attribute_offset as u64).to_le_bytes());
+        bytes[layout.attribute_offset..layout.attribute_offset + self.attributes.len()]
+            .copy_from_slice(&self.attributes);
         if !self.action_bytes.is_empty() {
             bytes[16..24].copy_from_slice(&(self.action_bytes.len() as u64).to_le_bytes());
-            bytes[24..32].copy_from_slice(&(address + ACTION_OFFSET as u64).to_le_bytes());
-            bytes[ACTION_OFFSET..ACTION_OFFSET + self.action_bytes.len()]
+            bytes[24..32].copy_from_slice(&(address + layout.action_offset as u64).to_le_bytes());
+            bytes[layout.action_offset..layout.action_offset + self.action_bytes.len()]
                 .copy_from_slice(&self.action_bytes);
         }
         Ok(bytes)
@@ -104,13 +219,15 @@ pub(crate) fn baseline() -> [u8; ATTRIBUTE_BYTES] {
     bytes
 }
 
+#[cfg(test)]
 fn padding(offset: usize) -> bool {
-    matches!(offset, 2..=3 | 66..=67 | 107 | 169 | 188..=191)
+    LEGACY.padding(offset)
 }
 
 /// `read` must either fill the entire requested buffer or return an error.
 /// Structural checks precede semantic refusal, regardless of flag order.
 pub(crate) fn decode(
+    layout: &'static Layout,
     descriptor: &[u8],
     mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
 ) -> Result<Snapshot> {
@@ -127,9 +244,9 @@ pub(crate) fn decode(
             return Err(malformed());
         }
     }
-    let mut attributes = baseline();
+    let mut attributes = layout.baseline();
     if pairs[0].0 != 0 {
-        if pairs[0].0 != ATTRIBUTE_BYTES as u64 {
+        if pairs[0].0 != layout.attribute_bytes as u64 {
             return Err(malformed());
         }
         read(pairs[0].1, &mut attributes).map_err(|_| malformed())?;
@@ -163,9 +280,15 @@ pub(crate) fn decode(
             }
         }
     }
-    if pairs[2..].iter().any(|pair| pair.0 != 0) || attributes[192..].iter().any(|byte| *byte != 0)
+    if pairs[2..].iter().any(|pair| pair.0 != 0)
+        || attributes[layout.kernel_prefix..]
+            .iter()
+            .any(|byte| *byte != 0)
     {
         return Err(unsupported("spawn unsupported extension"));
+    }
+    if layout.id == CURRENT.id && attributes[2..4] != [0, 0] {
+        return Err(unsupported("spawn unsupported attribute field 2"));
     }
     let flags = u16::from_le_bytes(attributes[..2].try_into().unwrap());
     for (bit, name) in [
@@ -186,16 +309,16 @@ pub(crate) fn decode(
             1u16 << unknown.trailing_zeros()
         )));
     }
-    let defaults = baseline();
-    for offset in 16..ATTRIBUTE_BYTES {
-        if !padding(offset) && attributes[offset] != defaults[offset] {
+    let defaults = layout.baseline();
+    for offset in 16..layout.attribute_bytes {
+        if !layout.padding(offset) && attributes[offset] != defaults[offset] {
             return Err(unsupported(format!(
                 "spawn unsupported attribute field {offset}"
             )));
         }
     }
     for (offset, byte) in attributes.iter_mut().enumerate() {
-        if padding(offset) {
+        if layout.padding(offset) {
             *byte = 0;
         }
     }
@@ -222,6 +345,7 @@ pub(crate) fn decode(
         action_bytes[..4].copy_from_slice(&count.to_le_bytes());
     }
     Ok(Snapshot {
+        layout,
         attributes,
         actions,
         action_bytes,
@@ -232,11 +356,174 @@ pub(crate) fn decode(
 mod tests {
     use super::*;
 
+    #[test]
+    fn f247_current_semantic_bytes_and_extension_fences() {
+        for offset in 16..256 {
+            let mut bytes = CURRENT.baseline();
+            bytes[offset] ^= 1;
+            let mut descriptor = [0u8; 144];
+            descriptor[..8].copy_from_slice(&256u64.to_le_bytes());
+            descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
+            let error = decode(&CURRENT, &descriptor, |address, output| {
+                assert_eq!(address, 4096);
+                output.copy_from_slice(&bytes);
+                Ok(())
+            })
+            .expect_err("every current semantic or zero-required byte must refuse");
+            let expected = if offset >= 200 {
+                "spawn unsupported extension".to_owned()
+            } else {
+                format!("spawn unsupported attribute field {offset}")
+            };
+            assert!(
+                error.to_string().contains(&expected),
+                "byte {offset}: {error}"
+            );
+        }
+        for pair in 2..9 {
+            let mut descriptor = [0u8; 144];
+            descriptor[pair * 16..pair * 16 + 8].copy_from_slice(&16u64.to_le_bytes());
+            descriptor[pair * 16 + 8..pair * 16 + 16].copy_from_slice(&0x5000u64.to_le_bytes());
+            let error = decode(&CURRENT, &descriptor, |_, _| panic!("extension read")).unwrap_err();
+            assert!(error.to_string().contains("spawn unsupported extension"));
+        }
+    }
+
+    #[test]
+    fn f247_extension_fence_independent_of_semantic_padding() {
+        // A synthetic descriptor puts a legacy padding byte in the extension
+        // range. The semantic loop permits it; the extension fence must refuse.
+        static SYNTHETIC: Layout = Layout {
+            kernel_prefix: 169,
+            ..LEGACY
+        };
+        let mut bytes = SYNTHETIC.baseline();
+        bytes[169] = 1;
+        let mut descriptor = [0u8; 144];
+        descriptor[..8].copy_from_slice(&248u64.to_le_bytes());
+        descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
+        let error = decode(&SYNTHETIC, &descriptor, |_, output| {
+            output.copy_from_slice(&bytes);
+            Ok(())
+        })
+        .expect_err("extension must refuse independently of semantic padding");
+        assert!(error.to_string().contains("spawn unsupported extension"));
+    }
+
+    #[test]
+    fn f247_production_backing_rejects_short_prefix() {
+        for layout in [&LEGACY, &CURRENT] {
+            let mut plan = BackingPlan {
+                allocation_bytes: layout.region_bytes,
+                written_bytes: layout.region_bytes,
+                attribute_storage: layout.kernel_prefix - 1,
+            };
+            assert!(plan.validate(layout, 0).is_err());
+            plan.attribute_storage = layout.kernel_prefix;
+            assert!(plan.validate(layout, 0).is_ok());
+            plan.written_bytes = layout.attribute_offset + layout.kernel_prefix - 1;
+            assert!(plan.validate(layout, 0).is_err());
+            plan.written_bytes = layout.region_bytes;
+            plan.allocation_bytes = layout.attribute_offset + layout.kernel_prefix - 1;
+            assert!(plan.validate(layout, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn f247_production_backing_preserves_required_prefix() {
+        for (layout, expected_prefix, expected_length) in
+            [(&LEGACY, 192, 248), (&CURRENT, 200, 256)]
+        {
+            let snapshot = decode(layout, &[0; 144], |_, _| panic!("null pointers")).unwrap();
+            let plan = snapshot.backing_plan().unwrap();
+            let bytes = snapshot.backing(0x1000).unwrap();
+            assert_eq!(layout.kernel_prefix, expected_prefix);
+            assert_eq!(plan.attribute_storage, expected_length);
+            assert_eq!(bytes.len(), 81920);
+            assert_eq!(u64_at(&bytes, 0), expected_length as u64);
+            assert_eq!(u64_at(&bytes, 8), 0x1000 + 144);
+            let mut expected = layout.baseline();
+            expected[0] = 0x80; // Existing internal START_SUSPENDED normalization.
+            assert_eq!(&bytes[144..144 + expected_length], expected);
+            assert!(snapshot.backing(u64::MAX - 100).is_err());
+        }
+    }
+
+    thread_local! {
+        static SYNTHETIC_SELECTION: std::cell::Cell<&'static Layout> =
+            const { std::cell::Cell::new(&LEGACY) };
+    }
+
+    #[test]
+    fn f247_concurrent_snapshots_retain_layout() {
+        let old = decode(&LEGACY, &[0; 144], |_, _| panic!("null")).unwrap();
+        let current = decode(&CURRENT, &[0; 144], |_, _| panic!("null")).unwrap();
+        for address in [0, 0x1000, 0x2000] {
+            SYNTHETIC_SELECTION.set(&CURRENT);
+            assert_eq!(u64_at(&old.backing(address).unwrap(), 0), 248);
+            SYNTHETIC_SELECTION.set(&LEGACY);
+            assert_eq!(u64_at(&current.backing(address).unwrap(), 0), 256);
+            assert_eq!(old.layout().id, LEGACY.id);
+            assert_eq!(current.layout().id, CURRENT.id);
+        }
+    }
+
+    #[test]
+    fn f247_different_layouts_bind_distinct_plans() {
+        static ALTERNATE: Layout = Layout {
+            id: "synthetic-distinct-revision",
+            ..LEGACY
+        };
+        let old = decode(&LEGACY, &[0; 144], |_, _| panic!("null")).unwrap();
+        let other = decode(&ALTERNATE, &[0; 144], |_, _| panic!("null")).unwrap();
+        assert_eq!(old.backing(0).unwrap(), other.backing(0).unwrap());
+        assert_ne!(
+            old.canonical_plan().unwrap(),
+            other.canonical_plan().unwrap()
+        );
+    }
+
+    /// Published xnu-12377.121.6 spawn_internal.h:262 places the
+    /// conclave memory limit here. It must never be discarded as padding.
+    #[test]
+    fn f247_legacy_conclave_limit_is_semantic() {
+        let mut bytes = baseline();
+        bytes[188..192].copy_from_slice(&11u32.to_le_bytes());
+        let result = attributes(&bytes);
+        assert!(
+            result.is_err(),
+            "nondefault conclave memory limit was silently erased"
+        );
+    }
+
+    /// Synthetic initialized 26B131 attributes: no installed-library reads
+    /// and no traced task are required to exercise the packed decoder.
+    #[test]
+    fn f247_current_attribute_allocation_decodes() {
+        let mut bytes = [0u8; 256];
+        bytes[56] = 1;
+        bytes[68..80].fill(0xff);
+        bytes[112..128].fill(0xff);
+        let mut descriptor = [0u8; 144];
+        descriptor[..8].copy_from_slice(&256u64.to_le_bytes());
+        descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
+        let result = decode(&CURRENT, &descriptor, |address, output| {
+            assert_eq!(address, 4096);
+            assert_eq!(output.len(), bytes.len());
+            output.copy_from_slice(&bytes);
+            Ok(())
+        });
+        assert!(
+            result.is_ok(),
+            "initialized current-profile bytes must decode: {result:?}"
+        );
+    }
+
     fn attributes(bytes: &[u8; ATTRIBUTE_BYTES]) -> Result<Snapshot> {
         let mut descriptor = [0; DESCRIPTOR_BYTES];
         descriptor[..8].copy_from_slice(&(ATTRIBUTE_BYTES as u64).to_le_bytes());
         descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
-        decode(&descriptor, |address, output| {
+        decode(&LEGACY, &descriptor, |address, output| {
             assert_eq!(address, 4096);
             output.copy_from_slice(bytes);
             Ok(())
@@ -278,7 +565,7 @@ mod tests {
         let mut descriptor = [0; DESCRIPTOR_BYTES];
         descriptor[..8].copy_from_slice(&247u64.to_le_bytes());
         descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
-        assert!(decode(&descriptor, |_, _| panic!("must not read"))
+        assert!(decode(&LEGACY, &descriptor, |_, _| panic!("must not read"))
             .unwrap_err()
             .to_string()
             .contains("malformed packed descriptor"));
@@ -331,7 +618,7 @@ mod tests {
         let mut descriptor = [0; DESCRIPTOR_BYTES];
         descriptor[16..24].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
         descriptor[24..32].copy_from_slice(&8192u64.to_le_bytes());
-        decode(&descriptor, |address, output| {
+        decode(&LEGACY, &descriptor, |address, output| {
             assert_eq!(address, 8192);
             output.copy_from_slice(bytes);
             Ok(())
@@ -414,20 +701,22 @@ mod tests {
             let mut descriptor = [0; DESCRIPTOR_BYTES];
             descriptor[..8].copy_from_slice(&size.to_le_bytes());
             descriptor[8..16].copy_from_slice(&pointer.to_le_bytes());
-            assert!(decode(&descriptor, |_, _| panic!("invalid pair read"))
-                .unwrap_err()
-                .to_string()
-                .contains("malformed packed descriptor"));
+            assert!(
+                decode(&LEGACY, &descriptor, |_, _| panic!("invalid pair read"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("malformed packed descriptor")
+            );
         }
         let mut descriptor = [0; DESCRIPTOR_BYTES];
         descriptor[..8].copy_from_slice(&248u64.to_le_bytes());
         descriptor[8..16].copy_from_slice(&4096u64.to_le_bytes());
-        assert!(
-            decode(&descriptor, |_, _| Err(crate::error("read", "short")))
-                .unwrap_err()
-                .to_string()
-                .contains("malformed packed descriptor")
-        );
+        assert!(decode(&LEGACY, &descriptor, |_, _| Err(crate::error(
+            "read", "short"
+        )))
+        .unwrap_err()
+        .to_string()
+        .contains("malformed packed descriptor"));
     }
 
     #[test]
@@ -436,12 +725,12 @@ mod tests {
             let mut descriptor = [0; DESCRIPTOR_BYTES];
             descriptor[pair * 16..pair * 16 + 8].copy_from_slice(&16u64.to_le_bytes());
             descriptor[pair * 16 + 8..pair * 16 + 16].copy_from_slice(&0x5000u64.to_le_bytes());
-            assert!(
-                decode(&descriptor, |_, _| panic!("extension must not be read"))
-                    .unwrap_err()
-                    .to_string()
-                    .contains("spawn unsupported extension")
-            );
+            assert!(decode(&LEGACY, &descriptor, |_, _| panic!(
+                "extension must not be read"
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("spawn unsupported extension"));
         }
     }
 

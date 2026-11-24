@@ -63,7 +63,12 @@ the reopen suites spawn them for real. The additional native qualification job
 runs the sandbox, IPC, tracer fixture, local-storage CLI matrix and reopen suites
 on an `umbra-integration` macOS ARM64 runner, with
 `UMBRA_INTEGRATION_REQUIRED=1` so a missing prerequisite fails there instead of
-skipping. It requires debugger permission. Its jobs run in launchd's session,
+skipping. It requires debugger permission and also checks packed-spawn layout
+admission and the kernel-readable
+attribute boundary. The [macOS provider documentation](crates/umbra-platform-macos/README.md)
+records the exact supported profiles, the weaker legacy admission contract,
+and the requalification procedure; unknown profiles fail closed.
+Its jobs run in launchd's session,
 where `umbra run` moves the run into a session of its own
 ([umbra-isolation](crates/umbra-isolation/README.md), #193), so the same job also
 runs the isolation suites with `UMBRA_REQUIRE_SID1=1`: a session other than
