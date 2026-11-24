@@ -429,7 +429,7 @@ impl Rsp {
             return Err(error("rsp write", "f284 possibly completed signal send"));
         }
         #[cfg(test)]
-        if bytes.starts_with(b"$vCont;C") {
+        if bytes.starts_with(b"$vCont;") || bytes.starts_with(b"$c#") {
             SIGNAL_WRITE_ATTEMPTS.with(|count| count.set(count.get() + 1));
             if let Some((accepted, reason)) = SIGNAL_WRITE_FAULT.with(|fault| fault.take()) {
                 self.stream

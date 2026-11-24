@@ -77,6 +77,16 @@ fn run_peer(
     stop_reply: Option<&'static str>,
     collect: bool,
 ) -> (TeardownReport, Vec<u8>) {
+    run_peer_resume(stopped, queued, stop_reply, collect, false)
+}
+
+fn run_peer_resume(
+    stopped: bool,
+    queued: Option<&str>,
+    stop_reply: Option<&'static str>,
+    collect: bool,
+    failed_resume: bool,
+) -> (TeardownReport, Vec<u8>) {
     // The native control proves this ordinary child is collectable without RSP.
     let mut control = TestChild {
         child: std::process::Command::new("/bin/sleep")
@@ -150,6 +160,10 @@ fn run_peer(
     });
     let mut session = session(pid, rsp);
     session.stopped = stopped;
+    if failed_resume {
+        rsp::SIGNAL_WRITE_FAULT.with(|fault| fault.set(Some((usize::MAX, "completed resume"))));
+        assert!(session.continue_run().is_err());
+    }
     let report = session.ordered_teardown();
     child.reaped = session.reaped;
     done.store(true, Ordering::Release);
@@ -285,4 +299,11 @@ fn malformed_teardown_reply_is_rejected() {
     ] {
         assert!(teardown_reply(packet, 123).is_err(), "{packet}");
     }
+}
+
+#[test]
+fn completed_resume_error_accepts_answering_stop() {
+    let (report, bytes) = run_peer_resume(true, Some("T05thread:1;"), None, true, true);
+    assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
+    assert_eq!(bytes, b"$c#63$k#6b");
 }
