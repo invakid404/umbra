@@ -342,3 +342,18 @@ fn internal_resume_error_accepts_answering_stop() {
     assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
     assert_eq!(bytes, b"$k#6b");
 }
+
+#[test]
+fn internal_stop_is_recorded_before_thread_validation() {
+    let (rsp, mut peer) = Rsp::retirement_test_pair();
+    let mut session = session(std::process::id() as i32, rsp);
+    session.stopped = true;
+    let instruction = [0u8; 4];
+    packet(&mut peer, "OK");
+    // A consumed stop still answers the resume if later parsing fails.
+    packet(&mut peer, "T05");
+    assert!(session.run_to(instruction.as_ptr() as u64).is_err());
+    assert!(session.stopped);
+    // This session borrows the test process; never tear that process down.
+    session.torn_down = true;
+}
