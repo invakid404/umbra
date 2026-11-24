@@ -355,8 +355,8 @@ The M1 mechanisms named in the tracker spec are all present:
     ([umbra-isolation](../umbra-isolation/README.md)); if instead its tracer
     dies, the kernel kills it. debugserver's own `--kill-on-error` flag would
     only set the same value at startup, before any inferior exists, so umbra
-    does not pass it. No test injects a rejected reply (there is no scripted
-    debugserver); every real connection exercises the `OK` path. Other detach
+    does not pass it. No test injects a rejected handshake reply;
+    every real connection exercises the `OK` path. Other detach
     routes inside debugserver are unaudited (#200).
 <!-- /memoria:section -->
 
@@ -1076,7 +1076,7 @@ tracer was reaped and that no child of the test process remains.
 | `teardown_confirms_exit_before_killing_tracer` | `terminate` returns `Ok`; steps `KillSent`, a confirmed barrier, then `TracerKilled`; no warning; tracer and tracee both reaped |
 | `teardown_times_out_on_unresponsive_tracer` | debugserver stopped with `SIGSTOP` (#205 re-pin): `TracerContinued`, then a confirmed barrier, then `TracerKilled`; no warning, no timeout, under 1.5 s; `terminate` returns `Ok`; tracer and tracee both reaped; no launchd-parented zombie |
 | `teardown_reports_dead_tracer_without_waiting` | the root first proved running (`--spin`: `p_stat` SRUN and CPU time advancing), then debugserver killed (#205 reshape: a held root would be handed to launchd, R1); the timeout path runs in under 1 s, after a `KillSendFailed` or `ConnectionClosed` step; the warning precedes `TracerKilled`; exactly one post-kill step, `ConfirmedAfterTracerKill` or `UnconfirmedAfterTracerKill`, with `Err` in both cases, matching the tracee's end state as `terminate` returns; the root handed back and reaped (`TraceeReaped(true)`); no launchd-parented zombie |
-| `teardown_confirms_a_live_orphaned_child_without_warning` | `--mt-spawn` stopped at the root's `Exit`, with the traced child live; `terminate` returns `Ok`; no report timed out; the child's barrier is confirmed before `TracerKilled` (`ReapedProven`, or `Zombie`); a stop reply is followed directly by `KillResent` |
+| `teardown_confirms_a_live_orphaned_child_without_warning` | `--mt-spawn` stopped at the root's `Exit`, with the traced child live; `terminate` returns `Ok`; no report timed out or remained unconfirmed; the child's barrier is confirmed before `TracerKilled` (`ReapedProven`, or `Zombie`); any recorded stop reply is followed directly by `KillSent` |
 | `teardown_confirms_a_live_child_while_its_root_is_alive` | `--mt-spawn` stopped at the `Child` event; `terminate` returns `Ok`; both reports confirm with no warning |
 
 Each of the five also counts launchd-parented zombies of `umbra-test-child`
@@ -1429,9 +1429,10 @@ and the host destination remains absent.
 Set `UMBRA_INTEGRATION_REQUIRED=1` to make missing fixture inputs fail the sandbox,
 IPC and direct tracer suites. CI's `native-qualification` job runs these and the
 CLI's local matrix on a runner labelled `umbra-integration`; that runner
-requires debugger permission. CI sets `UMBRA_TEST_SKIP_NFS_MATRIX=1`; the separate
-mounted-NFS matrix requires `UMBRA_TEST_NFS_ROOT` when run locally. No test
-provisions a mount or prompts.
+requires debugger permission. The separate mounted-NFS matrix uses
+`UMBRA_TEST_NFS_ROOT` and is qualified by name on CI. Agent sessions must not
+set that variable or mount NFS; they leave those cases for CI qualification.
+No test provisions a mount or prompts.
 
 Sandbox handoff compares canonical target paths with `proc_pidpath`. The twin
 cache root is also canonicalized so a symlinked cache recognizes already-resigned
