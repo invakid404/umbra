@@ -107,14 +107,23 @@ fn run_peer_resume(
         reaped: false,
     };
     let pid = child.child.id() as i32;
-    let (mut rsp, mut peer) = Rsp::retirement_test_pair();
+    let (rsp, mut peer) = Rsp::retirement_test_pair();
     peer.set_read_timeout(Some(Duration::from_millis(25)))
         .unwrap();
+    let mut session = session(pid, rsp);
+    session.stopped = stopped;
+    if failed_resume {
+        rsp::SIGNAL_WRITE_FAULT.with(|fault| fault.set(Some((usize::MAX, "completed resume"))));
+        assert!(session.continue_run().is_err());
+        let mut resume = [0; 5];
+        peer.read_exact(&mut resume).unwrap();
+        assert_eq!(&resume, b"$c#63");
+    }
     if let Some(queued) = queued {
         for reply in queued.split('|') {
             packet(&mut peer, reply);
         }
-        rsp.buffer_test_packets(queued.split('|').count());
+        session.rsp.buffer_test_packets(queued.split('|').count());
     }
     let done = Arc::new(AtomicBool::new(false));
     let peer_done = done.clone();
@@ -158,12 +167,6 @@ fn run_peer_resume(
         }
         bytes
     });
-    let mut session = session(pid, rsp);
-    session.stopped = stopped;
-    if failed_resume {
-        rsp::SIGNAL_WRITE_FAULT.with(|fault| fault.set(Some((usize::MAX, "completed resume"))));
-        assert!(session.continue_run().is_err());
-    }
     let report = session.ordered_teardown();
     child.reaped = session.reaped;
     done.store(true, Ordering::Release);
@@ -305,5 +308,5 @@ fn malformed_teardown_reply_is_rejected() {
 fn completed_resume_error_accepts_answering_stop() {
     let (report, bytes) = run_peer_resume(true, Some("T05thread:1;"), None, true, true);
     assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
-    assert_eq!(bytes, b"$c#63$k#6b");
+    assert_eq!(bytes, b"$k#6b");
 }

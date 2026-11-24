@@ -5465,13 +5465,13 @@ impl TraceBackend for MacosTraceBackend {
             ));
         }
         let s = &mut self.sessions[i];
-        if !s.stopped || !s.waiting.is_empty() {
-            return Err(error("resume", "not externally stopped"));
-        }
         if s.signals.closed() {
             return Err(unsupported(
                 "signal-delivery-closed: no resume after ambiguous send or teardown",
             ));
+        }
+        if !s.stopped || !s.waiting.is_empty() {
+            return Err(error("resume", "not externally stopped"));
         }
         if let ResumeMode::Signal(token) = command.mode {
             if s.torn_down
