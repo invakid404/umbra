@@ -12575,7 +12575,7 @@ fn c12_read(host: &str, port: u16, path: &[Vec<u8>]) -> Option<Vec<u8>> {
                 size = attr.size;
             }
             Err(e) if e.status() == Some(umbra_storage_nfs_userspace::error::Nfs4Status::NOENT) => {
-                return None;
+                return None
             }
             Err(e) => panic!("C12 independent lookup unavailable: {e:?}"),
         }

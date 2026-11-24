@@ -2895,7 +2895,7 @@ impl MacosTraceBackend {
                             "sandbox installer exited with {status:?} before applying the \
                              policy and starting the target"
                         ),
-                    ));
+                    ))
                 }
                 TraceEvent::Child { .. }
                 | TraceEvent::SpawnPrepare { .. }
@@ -2904,7 +2904,7 @@ impl MacosTraceBackend {
                     return Err(error(
                         "sandbox.launch",
                         "sandbox installer created a child before installing the policy",
-                    ));
+                    ))
                 }
                 TraceEvent::ThreadExited { .. } => continue,
                 TraceEvent::ThreadStarted { thread, .. }
@@ -3369,7 +3369,7 @@ impl MacosTraceBackend {
                     WaitPlan::Unsupported => {
                         return Err(unsupported(
                             "wait process-group/stopped/continued selection",
-                        ));
+                        ))
                     }
                     // Success zero with the carry flag cleared, past the svc,
                     // leaving status/rusage and every child's reaped state
