@@ -2310,12 +2310,12 @@ fn teardown_confirms_a_live_orphaned_child_without_warning() {
             let killed = step_index(report, |s| *s == TeardownStep::TracerKilled).unwrap();
             assert!(confirmed < killed, "the tracer died before the barrier");
             assert!(step_index(report, |s| matches!(s, TeardownStep::Warning(_))).is_none());
-            // V2: if the first reply was a stop, `k` was re-sent right after it.
+            // The answering stop authorizes the first terminate request.
             if let Some(stop) = step_index(
                 report,
                 |s| matches!(s, TeardownStep::Reply(r) if r.starts_with('T') || r.starts_with('S')),
             ) {
-                assert_eq!(report.steps.get(stop + 1), Some(&TeardownStep::KillResent));
+                assert_eq!(report.steps.get(stop + 1), Some(&TeardownStep::KillSent));
             }
             // The measured outcome is the V1 proof, `ReapedProven { Absent }`: the
             // child's own tracer reaps it with no handback. A barrier poll can also
