@@ -924,10 +924,10 @@ launchd as a zombie nobody collects:
   The earlier predicate discarded answering buffered stops and left two
   launchd-parented zombies. Resume-accounted stops repair that path: the local
   live-child reading now passes, with its root confirming in 13.66 ms. The
-  orphan reading confirmed termination in 18.94 ms, but failed an obsolete
-  test assertion expecting a repeated kill; that assertion is corrected and
-  the full orphan test remains unqualified. Neither new reading reported a
-  new zombie.
+  earlier orphan reading confirmed termination in 18.94 ms, but failed an
+  obsolete test assertion expecting a repeated kill. After that assertion was
+  corrected, the authorized fresh reading passed the full orphan test and
+  confirmed termination in 22.67 ms. These readings reported no new zombie.
   A hung peer, or a stop/exit not observed within its phase, still takes the
   loud timeout path and can leave a zombie.
 
