@@ -858,6 +858,12 @@ identity/reap confirmation have at most 1250 ms, within the original absolute
 1.5 s deadline. Each of the two reaps retains its 250 ms limit (at most 2 s per
 session). A buffered stop answering the outstanding resume, of any signal,
 or an already consumed stop with no subsequent resume, skips the interrupt.
+A resume becomes outstanding before its packet is sent: a transport error can
+still mean the debugger received the full packet. Teardown accepts the one
+answering stop in that case. Signal delivery remains closed after an ambiguous
+send, so it cannot be retried. The scripted-peer test
+`completed_resume_error_accepts_answering_stop` checks full packet receipt,
+an injected send error, and confirmation after the answering T05.
 Unsolicited and duplicate stops fail closed, except for one ignored interrupt
 race reply after kill authorization. At most one interrupt and two `k` packets
 are permitted. Ordinary-work

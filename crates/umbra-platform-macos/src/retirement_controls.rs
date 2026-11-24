@@ -206,7 +206,10 @@ fn signal_transport_failure(accepted: usize, reason: &'static str) {
         crate::rsp::SIGNAL_WRITE_ATTEMPTS.with(|count| count.get()),
         1
     );
-    assert!(!owned.0.sessions[0].stopped, "failed send leaves an outstanding resume");
+    assert!(
+        !owned.0.sessions[0].stopped,
+        "failed send leaves an outstanding resume"
+    );
     assert!(owned
         .0
         .resume(ResumeCommand {
