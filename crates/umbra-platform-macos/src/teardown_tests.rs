@@ -3,6 +3,22 @@ use super::*;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+struct TestChild {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+        }
+        // ordered_teardown may already have reaped it with waitpid; still wait
+        // on every path, including unwinding from a failed peer assertion.
+        let _ = self.child.wait();
+    }
+}
+
 fn session(pid: i32, rsp: Rsp) -> Session {
     let later_id = TaskId(TaskIdentity {
         native_id: pid as u64,
@@ -62,17 +78,25 @@ fn run_peer(
     collect: bool,
 ) -> (TeardownReport, Vec<u8>) {
     // The native control proves this ordinary child is collectable without RSP.
-    let mut control = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    control.kill().unwrap();
-    assert!(control.wait().unwrap().code().is_none());
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let pid = child.id() as i32;
+    let mut control = TestChild {
+        child: std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+        reaped: false,
+    };
+    control.child.kill().unwrap();
+    let status = control.child.wait().unwrap();
+    control.reaped = true;
+    assert!(status.code().is_none());
+    let mut child = TestChild {
+        child: std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+        reaped: false,
+    };
+    let pid = child.child.id() as i32;
     let (mut rsp, mut peer) = Rsp::retirement_test_pair();
     peer.set_read_timeout(Some(Duration::from_millis(25)))
         .unwrap();
@@ -127,13 +151,11 @@ fn run_peer(
     let mut session = session(pid, rsp);
     session.stopped = stopped;
     let report = session.ordered_teardown();
+    child.reaped = session.reaped;
     done.store(true, Ordering::Release);
     let bytes = worker.join().unwrap();
     // The production root fallback normally reaps it. Clean up even on oracle failure.
-    if !session.reaped {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    drop(child);
     eprintln!("scripted teardown: {report:?}; wire={bytes:?}");
     (report, bytes)
 }
