@@ -178,6 +178,29 @@ fn missing_stop_never_sends_k() {
 }
 
 #[test]
+fn eof_before_interrupt_records_connection_failure() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (rsp, peer) = Rsp::retirement_test_pair();
+    drop(peer);
+    let mut session = session(child.id() as i32, rsp);
+    let report = session.ordered_teardown();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(report.timed_out && report.unconfirmed, "{report:?}");
+    assert!(report
+        .steps
+        .iter()
+        .any(|s| matches!(s, TeardownStep::ConnectionClosed(_))));
+    assert!(!report
+        .steps
+        .iter()
+        .any(|s| matches!(s, TeardownStep::KillSent)));
+}
+
+#[test]
 fn queued_stop_cannot_replace_interrupt_reply() {
     let (report, bytes) = run_peer(false, Some("T02thread:1;"), None, true);
     assert!(report.timed_out && report.unconfirmed, "{report:?}");

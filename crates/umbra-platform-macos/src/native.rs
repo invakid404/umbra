@@ -4645,6 +4645,7 @@ impl Session {
                 match self.rsp.teardown_read(Duration::from_millis(1)) {
                     rsp::TeardownRead::Quiet => break,
                     rsp::TeardownRead::Closed(why) => {
+                        steps.push(TeardownStep::ConnectionClosed(why.clone()));
                         failure = Some(format!("RSP closed before interrupt: {why}"));
                         closed = true;
                         break;
@@ -4679,6 +4680,7 @@ impl Session {
                     match self.rsp.teardown_read(wait) {
                         rsp::TeardownRead::Quiet => {}
                         rsp::TeardownRead::Closed(why) => {
+                            steps.push(TeardownStep::ConnectionClosed(why.clone()));
                             closed = true;
                             failure = Some(format!("RSP closed waiting for stop: {why}"));
                         }
