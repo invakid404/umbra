@@ -87,6 +87,17 @@ fn run_peer_resume(
     collect: bool,
     failed_resume: bool,
 ) -> (TeardownReport, Vec<u8>) {
+    run_peer_internal(stopped, queued, stop_reply, collect, failed_resume, false)
+}
+
+fn run_peer_internal(
+    stopped: bool,
+    queued: Option<&str>,
+    stop_reply: Option<&'static str>,
+    collect: bool,
+    failed_resume: bool,
+    internal_resume: bool,
+) -> (TeardownReport, Vec<u8>) {
     // The native control proves this ordinary child is collectable without RSP.
     let mut control = TestChild {
         child: std::process::Command::new("/bin/sleep")
@@ -112,6 +123,19 @@ fn run_peer_resume(
         .unwrap();
     let mut session = session(pid, rsp);
     session.stopped = stopped;
+    if internal_resume {
+        // Breakpoint installation succeeds, then the resume receives an error
+        // instead of its stop. The actual answering stop arrives at handover.
+        let instruction = [0u8; 4];
+        let address = instruction.as_ptr() as u64;
+        packet(&mut peer, "OK");
+        packet(&mut peer, "E01");
+        assert!(session.run_to(address).is_err());
+        let body = format!("Z0,{address:x},4");
+        let mut sent = vec![0; body.len() + 4 + 5];
+        peer.read_exact(&mut sent).unwrap();
+        assert!(sent.ends_with(b"$c#63"), "{sent:?}");
+    }
     if failed_resume {
         rsp::SIGNAL_WRITE_FAULT.with(|fault| fault.set(Some((usize::MAX, "completed resume"))));
         assert!(session.continue_run().is_err());
@@ -307,6 +331,14 @@ fn malformed_teardown_reply_is_rejected() {
 #[test]
 fn completed_resume_error_accepts_answering_stop() {
     let (report, bytes) = run_peer_resume(true, Some("T05thread:1;"), None, true, true);
+    assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
+    assert_eq!(bytes, b"$k#6b");
+}
+
+#[test]
+fn internal_resume_error_accepts_answering_stop() {
+    let (report, bytes) =
+        run_peer_internal(true, Some("T05thread:1;"), None, true, false, true);
     assert!(!report.timed_out && !report.unconfirmed, "{report:?}");
     assert_eq!(bytes, b"$k#6b");
 }
