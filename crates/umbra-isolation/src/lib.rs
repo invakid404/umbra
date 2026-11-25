@@ -19,6 +19,8 @@
 #![deny(missing_docs)]
 
 pub mod frame;
+#[cfg(target_os = "macos")]
+pub mod managed;
 pub mod record;
 pub mod sweep;
 

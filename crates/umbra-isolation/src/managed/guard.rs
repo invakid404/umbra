@@ -1,0 +1,696 @@
+//! Parent-role event polling, independent of the worker's main RPC connection.
+use super::{
+    boot_nanos, invalid,
+    process::{ProcessWatch, SpawnedChild},
+    publication::{Publication, Route},
+};
+use std::io;
+use umbra_core::managed::{Participant, RunIdentity, Start, TicketState};
+
+/// Notification and collection are different facts.
+pub enum Event {
+    /// Complete Start accepted and committed before its ACK was queued.
+    Start(Start),
+    /// Kernel exit notification; does not prove parent collection.
+    Exited(Participant),
+    /// Actual parent's waitpid receipt, including the raw kernel status.
+    Collected(Participant, i32),
+    /// Attributable channel, watch, wait or ticket error.
+    Failed(String),
+    /// An original-ticket stage has expired; the callback chooses its role action.
+    OpportunityExpired(u64),
+}
+
+/// Explicit parent-role actions, executed against this guard's retained state.
+#[derive(Clone)]
+pub enum Action {
+    /// Forward the original Start without changing origin or deadline.
+    Publish(Start),
+    /// Signal an actual child only after its original-ticket cutoff.
+    Force {
+        /// Pre-GO identity.
+        participant: Participant,
+        /// Absolute opportunity cutoff.
+        not_before: u64,
+    },
+}
+/// Whole parent-role outcome; unresolved handles remain explicit at expiry.
+pub struct Outcome {
+    /// Every accepted notification, wait receipt and attributed failure.
+    pub events: Vec<Event>,
+    /// Sticky failure independent of eventual collection.
+    pub failed: bool,
+    /// Still-owned children retained for the remaining original-ticket fallback.
+    pub unresolved: Vec<SpawnedChild>,
+}
+
+struct Peer {
+    route: Route,
+    identity: Participant,
+    ack: Option<Start>,
+    failed: bool,
+    received: bool,
+}
+
+struct Owned {
+    child: SpawnedChild,
+    identity: Participant,
+    collected: bool,
+    lost: bool,
+}
+
+/// One guardian, relay or external caller's independent monitoring state.
+pub struct Guard {
+    local: Participant,
+    run: RunIdentity,
+    tickets: TicketState,
+    watch: ProcessWatch,
+    peers: Vec<Peer>,
+    children: Vec<Owned>,
+    expired: bool,
+    inventory: Vec<Participant>,
+    watch_failed: bool,
+    clock_failed: bool,
+    capacity: u64,
+    publication: Option<Publication>,
+    published: Vec<Start>,
+    stage_events: std::collections::BTreeSet<u64>,
+}
+
+impl Guard {
+    /// Compose a guardian/relay runtime from its executable assignment and
+    /// already installed startup queue. Prepare this before releasing GO.
+    pub fn from_entry(
+        entry: &mut super::executable::Entry,
+        watch: ProcessWatch,
+    ) -> io::Result<Self> {
+        use umbra_core::managed::Role;
+        if !matches!(entry.role, Role::Guardian | Role::Relay) {
+            return Err(invalid("entry is not a parent runtime role"));
+        }
+        let inventory = entry
+            .inventory()
+            .ok_or_else(|| invalid("parent runtime before inventory"))?
+            .clone();
+        let local = super::process::identity(std::process::id(), entry.role)?;
+        let channels = super::channels::RuntimeChannels::from_entry(entry)?.finish()?;
+        let mut guard = Self::from_startup(local, &inventory, entry.launch.capacity, watch)?;
+        for route in channels {
+            guard.route(route.peer(), route);
+        }
+        Ok(guard)
+    }
+
+    /// Transfer bootstrap child handles after GO forwarding. Validation happens
+    /// before consuming any handle, preserving all custody on an error.
+    pub fn adopt_ready_children(
+        &mut self,
+        children: &mut Vec<super::executable::PendingRole>,
+    ) -> io::Result<()> {
+        let mut identities = Vec::new();
+        for child in children.iter() {
+            let (participant, parent) = child.guard_identity()?;
+            if parent != self.local
+                || participant.pid != child.child.pid()
+                || !self.inventory.contains(&participant)
+                || identities.contains(&participant)
+                || self
+                    .children
+                    .iter()
+                    .any(|owned| owned.identity.pid == participant.pid)
+            {
+                return Err(invalid("runtime child custody differs from startup"));
+            }
+            identities.push(participant);
+        }
+        for (child, identity) in children.drain(..).zip(identities) {
+            self.children.push(Owned {
+                child: child.into_child(),
+                identity,
+                collected: false,
+                lost: false,
+            });
+        }
+        Ok(())
+    }
+
+    /// Run the parent fallback schedule inside the original helper allocation.
+    /// No original ticket means no timer and no invented caller-return bound.
+    /// Only actual children are signalled; unresolved custody stays in Outcome.
+    pub fn run_parent(self) -> Outcome {
+        let local = self.local.role;
+        let capacity = self.capacity;
+        let children: Vec<_> = self.children.iter().map(|child| child.identity).collect();
+        let mut forced = std::collections::BTreeSet::new();
+        self.run(move |event, ticket| {
+            let Event::OpportunityExpired(now) = event else {
+                return Ok(Vec::new());
+            };
+            let Some(ticket) = ticket else {
+                return Ok(Vec::new());
+            };
+            let mut actions = Vec::new();
+            for participant in &children {
+                let cutoff = parent_cutoff(local, participant.role, ticket, capacity)?;
+                if *now >= cutoff && forced.insert(participant.pid) {
+                    actions.push(Action::Force {
+                        participant: *participant,
+                        not_before: cutoff,
+                    });
+                }
+            }
+            Ok(actions)
+        })
+    }
+
+    /// Drive this parent's independent observation and collection loop.
+    /// Original Starts are forwarded automatically. The hook schedules fallback;
+    /// it receives the original ticket and cannot replace this guard's deadline.
+    pub fn run(
+        mut self,
+        mut on_event: impl FnMut(&Event, Option<umbra_core::managed::Ticket>) -> io::Result<Vec<Action>>,
+    ) -> Outcome {
+        let mut events = Vec::new();
+        let mut pending = std::collections::VecDeque::new();
+        loop {
+            for event in self.poll() {
+                if let Event::Start(start) = &event {
+                    if pending.len() < 16 {
+                        pending.push_back(Action::Publish(start.clone()));
+                    } else {
+                        self.tickets.fail();
+                        events.push(Event::Failed(
+                            "Start forwarding queue exceeded bound".into(),
+                        ));
+                    }
+                }
+                let result = on_event(&event, self.tickets.ticket()).and_then(|actions| {
+                    if pending.len() + actions.len() > 16 {
+                        return Err(invalid("parent action queue exceeded bound"));
+                    }
+                    pending.extend(actions);
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    self.tickets.fail();
+                    events.push(Event::Failed(format!("parent role action: {error}")));
+                }
+                events.push(event);
+            }
+            while let Some(action) = pending.pop_front() {
+                match self.act(action.clone()) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        pending.push_front(action);
+                        break;
+                    }
+                    Err(error) => {
+                        self.tickets.fail();
+                        events.push(Event::Failed(format!("parent action: {error}")));
+                    }
+                    Ok(()) => {}
+                }
+            }
+            if (self.collected()
+                && pending.is_empty()
+                && self.publication.is_none()
+                && self
+                    .peers
+                    .iter()
+                    .all(|peer| peer.failed || peer.ack.is_none()))
+                || self.expired
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Outcome {
+            failed: self.failed() || self.tickets.ticket().is_none(),
+            events,
+            unresolved: self
+                .children
+                .into_iter()
+                .filter(|owned| !owned.collected)
+                .map(|owned| owned.child)
+                .collect(),
+        }
+    }
+
+    /// Create the private queue after exec, without starting an inactivity timer.
+    pub fn new(local: Participant, run: RunIdentity, capacity: u64) -> io::Result<Self> {
+        Self::with_watch(local, run, capacity, ProcessWatch::new()?)
+    }
+
+    /// Preserve the startup queue and validated full inventory in the parent
+    /// runtime without allocating a second event queue.
+    pub fn from_startup(
+        local: Participant,
+        inventory: &super::inventory::Inventory,
+        capacity: u64,
+        watch: ProcessWatch,
+    ) -> io::Result<Self> {
+        inventory.validate(inventory.run, inventory.external_caller)?;
+        if !watch.covers(&inventory.watches(local)?) {
+            return Err(invalid("parent queue lacks required startup watches"));
+        }
+        let mut guard = Self::with_watch(local, inventory.run, capacity, watch)?;
+        guard.inventory = inventory
+            .members
+            .iter()
+            .map(|member| member.participant)
+            .collect();
+        Ok(guard)
+    }
+
+    fn with_watch(
+        local: Participant,
+        run: RunIdentity,
+        capacity: u64,
+        watch: ProcessWatch,
+    ) -> io::Result<Self> {
+        local.validate().map_err(invalid)?;
+        Ok(Self {
+            local,
+            run,
+            tickets: TicketState::new(run, capacity).map_err(invalid)?,
+            watch,
+            peers: Vec::new(),
+            children: Vec::new(),
+            expired: false,
+            inventory: vec![local],
+            watch_failed: false,
+            clock_failed: false,
+            capacity,
+            publication: None,
+            published: Vec::new(),
+            stage_events: std::collections::BTreeSet::new(),
+        })
+    }
+
+    fn act(&mut self, action: Action) -> io::Result<()> {
+        match action {
+            Action::Publish(start) => {
+                if !self.inventory.contains(&start.origin) {
+                    return Err(invalid("forwarded Start origin absent from inventory"));
+                }
+                if self.published.iter().any(|prior| {
+                    prior.origin == start.origin && prior.ticket.deadline <= start.ticket.deadline
+                }) {
+                    return Ok(());
+                }
+                if self.publication.is_some() || self.peers.iter().any(|peer| peer.ack.is_some()) {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                let (retained, forwarding): (Vec<_>, Vec<_>) = std::mem::take(&mut self.peers)
+                    .into_iter()
+                    .partition(|peer| peer.received);
+                self.peers = retained;
+                let routes = forwarding.into_iter().map(|peer| peer.route).collect();
+                let mut publication = Publication::begin(
+                    start.clone(),
+                    start.origin,
+                    self.local,
+                    &mut self.tickets,
+                    routes,
+                )?;
+                publication.inventory(&self.inventory);
+                self.publication = Some(publication);
+                self.published.retain(|prior| prior.origin != start.origin);
+                self.published.push(start);
+                Ok(())
+            }
+            Action::Force {
+                participant,
+                not_before,
+            } => {
+                let ticket = self
+                    .tickets
+                    .ticket()
+                    .ok_or_else(|| invalid("force without original Start"))?;
+                let child = self
+                    .children
+                    .iter_mut()
+                    .find(|owned| owned.identity == participant)
+                    .ok_or_else(|| invalid("force targets a non-child"))?;
+                if child.child.force_after(participant, ticket, not_before)? {
+                    self.tickets.fail();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Install a birth-validated watch even if another role holds a channel copy.
+    pub fn watch(&mut self, participant: Participant) -> io::Result<()> {
+        self.watch.install(participant)?;
+        self.inventory.push(participant);
+        Ok(())
+    }
+
+    /// Validate the full topology and install required observations before Ready.
+    /// Failure retains any already-installed watches and permanently fails the run.
+    pub fn install_inventory(
+        &mut self,
+        inventory: &super::inventory::Inventory,
+        external_caller: bool,
+    ) -> io::Result<Vec<Participant>> {
+        let result = (|| {
+            inventory.validate(self.run, external_caller)?;
+            let watched = inventory.watches(self.local)?;
+            for participant in &watched {
+                self.watch.install(*participant)?;
+            }
+            self.inventory = inventory.members.iter().map(|m| m.participant).collect();
+            Ok(watched)
+        })();
+        if result.is_err() {
+            self.tickets.fail();
+        }
+        result
+    }
+
+    /// Attach a direct Start route from the pre-GO participant inventory.
+    pub fn route(&mut self, identity: Participant, route: Route) {
+        self.peers.push(Peer {
+            identity,
+            route,
+            ack: None,
+            failed: false,
+            received: false,
+        });
+    }
+
+    /// Adopt only an actual child; return the handle on identity mismatch.
+    pub fn child(
+        &mut self,
+        identity: Participant,
+        child: SpawnedChild,
+    ) -> Result<(), SpawnedChild> {
+        if child.pid() != identity.pid
+            || self.children.iter().any(|c| c.identity.pid == identity.pid)
+        {
+            return Err(child);
+        }
+        self.children.push(Owned {
+            child,
+            identity,
+            collected: false,
+            lost: false,
+        });
+        Ok(())
+    }
+
+    /// Poll every independent source once without blocking on a silent peer.
+    pub fn poll(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        if let Some(publication) = self.publication.as_mut() {
+            match publication.progress(&mut self.tickets) {
+                Ok(true) => {
+                    events.extend(publication.failures().iter().cloned().map(Event::Failed));
+                    events.extend(
+                        publication
+                            .received()
+                            .iter()
+                            .map(|(_, start)| Event::Start(start.clone())),
+                    );
+                    for route in self.publication.take().unwrap().into_routes() {
+                        self.peers.push(Peer {
+                            identity: route.peer(),
+                            route,
+                            ack: None,
+                            failed: false,
+                            received: false,
+                        });
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.tickets.fail();
+                    events.push(Event::Failed(format!("Start forwarding: {error}")));
+                    events.extend(
+                        publication
+                            .received()
+                            .iter()
+                            .map(|(_, start)| Event::Start(start.clone())),
+                    );
+                    for route in self.publication.take().unwrap().into_routes() {
+                        self.peers.push(Peer {
+                            identity: route.peer(),
+                            route,
+                            ack: None,
+                            failed: true,
+                            received: false,
+                        });
+                    }
+                }
+            }
+        }
+        // No ticket means no session-age timeout. Even a lost route cannot
+        // manufacture a caller-return bound before an original Start arrives.
+        let deadline = self.tickets.ticket().map_or(u64::MAX, |t| t.deadline);
+        for peer in &mut self.peers {
+            if peer.failed {
+                continue;
+            }
+            let result = (|| {
+                if let Some(start) = peer.ack.as_ref() {
+                    if !peer.route.flush_ack(start, &mut self.tickets)? {
+                        return Ok(());
+                    }
+                    peer.ack = None;
+                }
+                if let Some(start) = peer.route.receive_start_from(
+                    &mut self.tickets,
+                    self.local,
+                    &self.inventory,
+                    deadline,
+                )? {
+                    peer.ack = Some(start.clone());
+                    peer.received = true;
+                    events.push(Event::Start(start));
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let error: io::Error = error;
+                peer.failed = true;
+                self.tickets.fail();
+                events.push(Event::Failed(format!(
+                    "{:?} control: {error}",
+                    peer.identity.role
+                )));
+            }
+        }
+        if !self.watch_failed {
+            match self.watch.exited() {
+                Ok(Some(participant)) => events.push(Event::Exited(participant)),
+                Ok(None) => {}
+                Err(error) => {
+                    self.watch_failed = true;
+                    self.tickets.fail();
+                    events.push(Event::Failed(format!("process watch: {error}")));
+                }
+            }
+        }
+        for owned in &mut self.children {
+            if owned.collected || owned.lost {
+                continue;
+            }
+            match owned.child.collect() {
+                Ok(Some(status)) => {
+                    owned.collected = true;
+                    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+                        self.tickets.fail();
+                        events.push(Event::Failed(format!(
+                            "{:?} exited with status {status}",
+                            owned.identity.role
+                        )));
+                    }
+                    events.push(Event::Collected(owned.identity, status));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    owned.lost = true;
+                    self.tickets.fail();
+                    events.push(Event::Failed(format!(
+                        "{:?} parent wait: {error}",
+                        owned.identity.role
+                    )));
+                }
+            }
+        }
+        if !self.expired && !self.clock_failed {
+            match boot_nanos() {
+                Ok(now) if self.tickets.ticket().is_some_and(|t| now >= t.deadline) => {
+                    self.expired = true;
+                    self.tickets.fail();
+                    events.push(Event::Failed("original cleanup ticket expired".into()));
+                }
+                Err(error) => {
+                    self.clock_failed = true;
+                    self.tickets.fail();
+                    events.push(Event::Failed(format!("boot clock: {error}")));
+                }
+                Ok(now) => {
+                    if let Some(ticket) = self.tickets.ticket() {
+                        match ticket.cutoffs(self.capacity) {
+                            Ok(cutoffs) => {
+                                let mut stages =
+                                    vec![cutoffs.cooperative, cutoffs.fallback, cutoffs.helpers];
+                                for child in &self.children {
+                                    if let Ok(cutoff) = parent_cutoff(
+                                        self.local.role,
+                                        child.identity.role,
+                                        ticket,
+                                        self.capacity,
+                                    ) {
+                                        stages.push(cutoff);
+                                    }
+                                }
+                                for cutoff in stages {
+                                    if now >= cutoff && self.stage_events.insert(cutoff) {
+                                        events.push(Event::OpportunityExpired(cutoff));
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                self.tickets.fail();
+                                events.push(Event::Failed(error.into()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        events
+    }
+
+    /// Parent collection never clears notification or protocol failure.
+    pub fn failed(&self) -> bool {
+        self.tickets.failed()
+    }
+
+    /// True only after every owned child produced an actual parent wait receipt.
+    pub fn collected(&self) -> bool {
+        self.children.iter().all(|child| child.collected)
+    }
+}
+
+fn parent_cutoff(
+    parent: umbra_core::managed::Role,
+    child: umbra_core::managed::Role,
+    ticket: umbra_core::managed::Ticket,
+    capacity: u64,
+) -> io::Result<u64> {
+    use umbra_core::managed::Role;
+    let slot = match (parent, child) {
+        (Role::Guardian, Role::Worker) => 0,
+        (Role::Guardian, Role::CleanupOwner) => 1,
+        (Role::Relay, Role::Guardian) => 2,
+        (Role::Caller, Role::Relay) => 3,
+        _ => return Err(invalid("unsupported parent fallback edge")),
+    };
+    let cutoffs = ticket.cutoffs(capacity).map_err(invalid)?;
+    let cutoff = cutoffs
+        .fallback
+        .checked_add(slot * 1_000_000_000)
+        .ok_or_else(|| invalid("parent fallback clock overflow"))?;
+    if cutoff >= cutoffs.helpers {
+        return Err(invalid("parent fallback exceeds helper allocation"));
+    }
+    Ok(cutoff)
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use umbra_core::managed::{CleanupPath, Role, Ticket};
+
+    #[test]
+    fn parent_waits_for_original_cutoff_then_collects_stalled_child() {
+        use super::super::process::identity;
+        let local = identity(std::process::id(), Role::Guardian).unwrap();
+        let run: RunIdentity = serde_json::from_str(
+            r#"{"nonce":"00000000-0000-0000-0000-000000000001","generation":1}"#,
+        )
+        .unwrap();
+        let mut guard = Guard::new(local, run, 1).unwrap();
+        let child = SpawnedChild::spawn(
+            std::path::Path::new("/bin/sleep"),
+            &["sleep".into(), "30".into()],
+            &[],
+            false,
+            &[],
+        )
+        .unwrap();
+        let participant = identity(child.pid(), Role::Worker).unwrap();
+        assert!(guard.child(participant, child).is_ok());
+        let allocation = Ticket::new(0, CleanupPath::Failed, 1)
+            .unwrap()
+            .cutoffs(1)
+            .unwrap();
+        let cutoff = boot_nanos().unwrap() + 100_000_000;
+        let ticket = Ticket::new(cutoff - allocation.fallback, CleanupPath::Failed, 1).unwrap();
+        guard
+            .tickets
+            .accept(
+                Start {
+                    run,
+                    origin: local,
+                    ticket,
+                },
+                local,
+                local,
+            )
+            .unwrap();
+        let events = guard.poll();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::Collected(..))));
+        assert!(
+            !guard.collected(),
+            "live child must remain owned before cutoff"
+        );
+        let outcome = guard.run_parent();
+        let finished = boot_nanos().unwrap();
+        let collected = outcome.events.iter().any(|event| {
+            matches!(
+                event, Event::Collected(found, status)
+                    if *found == participant && libc::WIFSIGNALED(*status)
+                        && libc::WTERMSIG(*status) == libc::SIGKILL
+            )
+        });
+        let unresolved = outcome.unresolved.len();
+        // Retain actual-parent cleanup even when the policy assertion fails.
+        for mut child in outcome.unresolved {
+            let _ = child.force_after(participant, ticket, ticket.started);
+            while child.collect().unwrap().is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        assert_eq!(unresolved, 0);
+        assert!(collected && outcome.failed);
+        assert!(finished >= cutoff && finished < ticket.cutoffs(1).unwrap().helpers);
+    }
+
+    #[test]
+    fn fallback_edges_share_one_helper_window() {
+        for path in [CleanupPath::Trusted, CleanupPath::Failed] {
+            let ticket = Ticket::new(1_000, path, 64).unwrap();
+            let stages = ticket.cutoffs(64).unwrap();
+            let edges = [
+                (Role::Guardian, Role::Worker),
+                (Role::Guardian, Role::CleanupOwner),
+                (Role::Relay, Role::Guardian),
+                (Role::Caller, Role::Relay),
+            ];
+            let mut prior = None;
+            for (parent, child) in edges {
+                let cutoff = parent_cutoff(parent, child, ticket, 64).unwrap();
+                assert!(cutoff >= stages.fallback && cutoff < stages.helpers);
+                assert!(prior.is_none_or(|before| cutoff > before));
+                prior = Some(cutoff);
+            }
+            assert!(parent_cutoff(Role::Relay, Role::Provider, ticket, 64).is_err());
+        }
+    }
+}

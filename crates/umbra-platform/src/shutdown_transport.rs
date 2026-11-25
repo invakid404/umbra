@@ -319,12 +319,38 @@ fn unconfirmed_final(final_state: &Final, exit: &impl std::fmt::Debug) -> String
 }
 
 pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
-    if !client.owns_provider() {
+    close_with_owner(client, nonce, None)
+}
+
+pub(super) fn close_managed_client(
+    client: &mut Client,
+    nonce: Nonce,
+    owner: &mut dyn ManagedCleanup,
+) -> Closure {
+    close_with_owner(client, nonce, Some(owner))
+}
+
+fn close_with_owner(
+    client: &mut Client,
+    nonce: Nonce,
+    mut owner: Option<&mut dyn ManagedCleanup>,
+) -> Closure {
+    if let Some(owner) = owner.as_deref_mut() {
+        match owner.start() {
+            Ok(deadline) => client.connection.cap_cleanup_deadline(deadline),
+            Err(error) => {
+                owner.failed(&error);
+                return Closure::failed(error);
+            }
+        }
+    }
+    if owner.is_none() && !client.owns_provider() {
         client.connection.invalidate();
         return Closure::failed(protocol_error("platform provider has no owned exit waiter"));
     }
     let mut proof = false;
     let mut final_to_exit = None;
+    let mut collection_attempted = false;
     let result = (|| {
         let Response::ShutdownAccepted(accepted) =
             client.call(&Request::BeginShutdown { nonce })?
@@ -359,7 +385,13 @@ pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
                     // Measure from decoded-Final receipt, including validation.
                     let started = now();
                     proof = accepted.confirms(&final_state)?;
-                    let exit = client.confirm_provider_exit();
+                    let exit = if let Some(owner) = owner.as_deref_mut() {
+                        client.connection.invalidate();
+                        collection_attempted = true;
+                        owner.collect_provider()
+                    } else {
+                        client.confirm_provider_exit()
+                    };
                     let elapsed = now().saturating_duration_since(started);
                     final_to_exit = Some(elapsed);
                     #[cfg(feature = "shutdown-witness")]
@@ -384,8 +416,20 @@ pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
             error: None,
             final_to_exit,
         },
-        Err(error) => {
+        Err(mut error) => {
             client.connection.invalidate();
+            if let Some(owner) = owner {
+                owner.failed(&error);
+                if let Err(collection) = if collection_attempted {
+                    Ok(Duration::ZERO)
+                } else {
+                    owner.collect_provider()
+                } {
+                    error
+                        .context
+                        .push_str(&format!("; managed provider collection: {collection}"));
+                }
+            }
             Closure {
                 tree_terminated: proof,
                 error: Some(error),

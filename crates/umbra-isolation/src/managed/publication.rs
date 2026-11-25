@@ -1,0 +1,405 @@
+//! Parallel Start/ACK publication independent of the main provider client.
+use super::{boot_nanos, invalid, Channel};
+use std::io;
+use umbra_core::managed::{ControlMessage, Participant, Start, TicketState, ACK_NANOS};
+
+/// An independently owned direct notification route.
+pub struct Route {
+    peer: Participant,
+    channel: Channel,
+}
+
+impl Route {
+    /// Bind a channel to the participant recorded in the pre-GO inventory.
+    pub fn new(peer: Participant, channel: Channel) -> io::Result<Self> {
+        peer.validate().map_err(invalid)?;
+        Ok(Self { peer, channel })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Writing,
+    AwaitingAck,
+    Acknowledged,
+    Failed,
+}
+
+/// One combined publication attempt. No route receives a fresh timeout.
+pub struct Publication {
+    local: Participant,
+    inventory: Vec<Participant>,
+    start: Start,
+    deadline: u64,
+    routes: Vec<(Route, State)>,
+    failures: Vec<String>,
+    received: Vec<(Participant, Start)>,
+}
+
+impl Publication {
+    /// Commit locally before publishing; attempt every route even on partial failure.
+    pub fn begin(
+        start: Start,
+        expected_origin: Participant,
+        local: Participant,
+        tickets: &mut TicketState,
+        routes: Vec<Route>,
+    ) -> io::Result<Self> {
+        let deadline = start
+            .ticket
+            .started
+            .checked_add(ACK_NANOS)
+            .ok_or_else(|| invalid("publication deadline overflow"))?
+            .min(start.ticket.deadline);
+        tickets
+            .accept(start.clone(), expected_origin, local)
+            .map_err(invalid)?;
+        let mut publication = Self {
+            local,
+            inventory: routes
+                .iter()
+                .map(|route| route.peer)
+                .chain([local, start.origin])
+                .collect(),
+            start,
+            deadline,
+            routes: Vec::new(),
+            failures: Vec::new(),
+            received: Vec::new(),
+        };
+        for mut route in routes {
+            let state = match route
+                .channel
+                .queue(&ControlMessage::Start(publication.start.clone()))
+            {
+                Ok(()) => State::Writing,
+                Err(error) => {
+                    tickets.fail();
+                    publication
+                        .failures
+                        .push(format!("{:?}: {error}", route.peer.role));
+                    State::Failed
+                }
+            };
+            publication.routes.push((route, state));
+        }
+        Ok(publication)
+    }
+
+    /// Supply the full pre-GO inventory for notifications forwarded by peers.
+    pub fn inventory(&mut self, inventory: &[Participant]) {
+        self.inventory = inventory.to_vec();
+    }
+
+    /// Advance every route once. True means all attempts terminated, not success.
+    pub fn progress(&mut self, tickets: &mut TicketState) -> io::Result<bool> {
+        let expired = boot_nanos()? >= self.deadline;
+        for (route, state) in &mut self.routes {
+            if matches!(state, State::Acknowledged | State::Failed) {
+                continue;
+            }
+            let result: io::Result<()> = if expired {
+                Err(io::ErrorKind::TimedOut.into())
+            } else {
+                (|| {
+                    if !route.channel.flush(self.deadline)? {
+                        return Ok(());
+                    }
+                    if *state == State::Writing {
+                        *state = State::AwaitingAck;
+                    }
+                    if let Some(message) = route.channel.receive::<ControlMessage>(self.deadline)? {
+                        match message {
+                            ControlMessage::Ack(ack) => {
+                                ack.validate(&self.start, route.peer).map_err(invalid)?;
+                                if !self.inventory.contains(&ack.committed.origin) {
+                                    return Err(invalid("ACK committed an unknown origin"));
+                                }
+                                tickets
+                                    .accept(ack.committed.clone(), ack.committed.origin, self.local)
+                                    .map_err(invalid)?;
+                                *state = State::Acknowledged;
+                            }
+                            ControlMessage::Start(start) => {
+                                if !self.inventory.contains(&start.origin) {
+                                    return Err(invalid("concurrent Start has unknown origin"));
+                                }
+                                let ack_deadline = start
+                                    .ticket
+                                    .started
+                                    .checked_add(ACK_NANOS)
+                                    .ok_or_else(|| invalid("ACK clock overflow"))?;
+                                self.deadline = self.deadline.min(ack_deadline);
+                                let ack = tickets
+                                    .accept(start.clone(), start.origin, self.local)
+                                    .map_err(invalid)?;
+                                if !self.received.iter().any(|(_, prior)| prior == &start) {
+                                    if self.received.len() >= 16 {
+                                        return Err(invalid(
+                                            "publication notification bound exceeded",
+                                        ));
+                                    }
+                                    self.received.push((route.peer, start));
+                                }
+                                route.channel.queue(&ControlMessage::Ack(ack))?;
+                            }
+                            _ => return Err(invalid("expected Start or acknowledgement")),
+                        }
+                    }
+                    Ok(())
+                })()
+            };
+            if let Err(error) = result {
+                tickets.fail();
+                self.failures
+                    .push(format!("{:?}: {error}", route.peer.role));
+                *state = State::Failed;
+            }
+        }
+        Ok(self
+            .routes
+            .iter()
+            .all(|(_, state)| matches!(state, State::Acknowledged | State::Failed)))
+    }
+
+    /// Sticky attributable errors; later child collection never erases these.
+    pub fn failures(&self) -> &[String] {
+        &self.failures
+    }
+
+    /// Original notifications committed during this exchange, paired with the
+    /// delivering peer. The role loop must retain them for forwarding.
+    pub fn received(&self) -> &[(Participant, Start)] {
+        &self.received
+    }
+
+    /// Recover the independent routes after publication for role-loop ownership.
+    pub fn into_routes(self) -> Vec<Route> {
+        self.routes.into_iter().map(|(route, _)| route).collect()
+    }
+}
+
+impl Route {
+    /// Bound peer identity used by owner RPC selection.
+    pub fn peer(&self) -> Participant {
+        self.peer
+    }
+
+    /// Borrow the exclusively owned channel after Start publication has completed.
+    pub fn channel(&mut self) -> &mut Channel {
+        &mut self.channel
+    }
+
+    /// Receive an original Start and commit it before queueing its ACK.
+    /// `expected_origin` comes from the complete pre-GO participant inventory,
+    /// so a forwarding peer cannot replace the origin with its own identity.
+    pub fn receive_start(
+        &mut self,
+        tickets: &mut TicketState,
+        local: Participant,
+        expected_origin: Participant,
+        deadline: u64,
+    ) -> io::Result<Option<Start>> {
+        self.receive_start_from(tickets, local, &[expected_origin], deadline)
+    }
+
+    /// Accept a forwarded original only when its origin is in the pre-GO inventory.
+    pub fn receive_start_from(
+        &mut self,
+        tickets: &mut TicketState,
+        local: Participant,
+        inventory: &[Participant],
+        deadline: u64,
+    ) -> io::Result<Option<Start>> {
+        let Some(message) = self.channel.receive::<ControlMessage>(deadline)? else {
+            return Ok(None);
+        };
+        let ControlMessage::Start(start) = message else {
+            return Err(invalid("expected cleanup Start"));
+        };
+        if !inventory.contains(&start.origin) {
+            tickets.fail();
+            return Err(invalid("Start origin absent from pre-GO inventory"));
+        }
+        let expected_origin = start.origin;
+        let ack = tickets
+            .accept(start.clone(), expected_origin, local)
+            .map_err(invalid)?;
+        if let Err(error) = self.channel.queue(&ControlMessage::Ack(ack)) {
+            tickets.fail();
+            return Err(error);
+        }
+        Ok(Some(start))
+    }
+
+    /// Advance a queued ACK under the original publication deadline.
+    pub fn flush_ack(&mut self, start: &Start, tickets: &mut TicketState) -> io::Result<bool> {
+        let deadline = start
+            .ticket
+            .started
+            .checked_add(ACK_NANOS)
+            .ok_or_else(|| invalid("ACK deadline overflow"))?
+            .min(start.ticket.deadline);
+        self.channel.flush(deadline).inspect_err(|_| tickets.fail())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use umbra_core::managed::{CleanupPath, Role, RunIdentity, Ticket};
+
+    #[test]
+    fn simultaneous_start_commits_earliest_before_acknowledging_both() {
+        simultaneous(false);
+    }
+
+    #[test]
+    fn forwarded_origin_from_full_inventory_keeps_original_ticket() {
+        simultaneous(true);
+    }
+
+    fn simultaneous(forwarded: bool) {
+        let run: RunIdentity = serde_json::from_str(
+            r#"{"nonce":"00000000-0000-0000-0000-000000000001","generation":1}"#,
+        )
+        .unwrap();
+        let a = Participant {
+            role: Role::Worker,
+            pid: 42,
+            birth: (1, 0),
+        };
+        let b = Participant {
+            role: Role::CleanupOwner,
+            pid: 43,
+            birth: (1, 0),
+        };
+        let origin = if forwarded {
+            Participant {
+                role: Role::Guardian,
+                pid: 44,
+                birth: (1, 0),
+            }
+        } else {
+            a
+        };
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut sa = TicketState::new(run, 1).unwrap();
+        let mut sb = TicketState::new(run, 1).unwrap();
+        let first = Ticket::new(boot_nanos().unwrap(), CleanupPath::Trusted, 1).unwrap();
+        let later = Ticket::new(first.started + 1, CleanupPath::Trusted, 1).unwrap();
+        let mut pa = Publication::begin(
+            Start {
+                run,
+                origin,
+                ticket: first,
+            },
+            origin,
+            a,
+            &mut sa,
+            vec![Route::new(b, Channel::new(left).unwrap()).unwrap()],
+        )
+        .unwrap();
+        let mut pb = Publication::begin(
+            Start {
+                run,
+                origin: b,
+                ticket: later,
+            },
+            b,
+            b,
+            &mut sb,
+            vec![Route::new(a, Channel::new(right).unwrap()).unwrap()],
+        )
+        .unwrap();
+        pa.inventory(&[a, b, origin]);
+        pb.inventory(&[a, b, origin]);
+        let mut done = false;
+        for _ in 0..20 {
+            let da = pa.progress(&mut sa).unwrap();
+            let db = pb.progress(&mut sb).unwrap();
+            if da && db {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert!(
+            pb.received().iter().any(|(peer, start)| {
+                *peer == a && start.origin == origin && start.ticket == first
+            }),
+            "forwarded original must remain available to the role loop"
+        );
+        assert!(
+            pa.received()
+                .iter()
+                .any(|(peer, start)| { *peer == b && start.origin == b && start.ticket == later }),
+            "simultaneous notification must remain available to the role loop"
+        );
+        assert!(pa.failures().is_empty() && pb.failures().is_empty());
+        assert_eq!(sa.ticket(), Some(first));
+        assert_eq!(sb.ticket(), Some(first));
+    }
+
+    #[test]
+    fn failed_direct_route_does_not_prevent_alternate_ack() {
+        let run: RunIdentity = serde_json::from_str(
+            r#"{"nonce":"00000000-0000-0000-0000-000000000001","generation":1}"#,
+        )
+        .unwrap();
+        let origin = Participant {
+            role: Role::Worker,
+            pid: 42,
+            birth: (1, 0),
+        };
+        let relay = Participant {
+            role: Role::Relay,
+            pid: 43,
+            birth: (1, 0),
+        };
+        let caller = Participant {
+            role: Role::Caller,
+            pid: 44,
+            birth: (1, 0),
+        };
+        let (dead, gone) = UnixStream::pair().unwrap();
+        drop(gone);
+        let (out, incoming) = UnixStream::pair().unwrap();
+        let mut receiver = Route::new(origin, Channel::new(incoming).unwrap()).unwrap();
+        let mut sender_tickets = TicketState::new(run, 64).unwrap();
+        let mut receiver_tickets = TicketState::new(run, 64).unwrap();
+        let start = Start {
+            run,
+            origin,
+            ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Trusted, 64).unwrap(),
+        };
+        let mut publication = Publication::begin(
+            start.clone(),
+            origin,
+            origin,
+            &mut sender_tickets,
+            vec![
+                Route::new(caller, Channel::new(dead).unwrap()).unwrap(),
+                Route::new(relay, Channel::new(out).unwrap()).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(!publication.progress(&mut sender_tickets).unwrap());
+        assert!(sender_tickets.failed());
+        let received = receiver
+            .receive_start(&mut receiver_tickets, relay, origin, publication.deadline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receiver_tickets.ticket(), Some(start.ticket));
+        assert!(receiver
+            .flush_ack(&received, &mut receiver_tickets)
+            .unwrap());
+        assert!(publication.progress(&mut sender_tickets).unwrap());
+        assert_eq!(publication.failures().len(), 1);
+        assert!(
+            sender_tickets.failed(),
+            "alternate success cannot erase direct-route failure"
+        );
+    }
+}

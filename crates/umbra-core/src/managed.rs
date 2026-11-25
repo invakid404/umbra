@@ -105,7 +105,54 @@ pub struct Ticket {
     /// Path whose allocation produced this ticket.
     pub path: CleanupPath,
 }
+
+/// Original-ticket cutoffs; every stage is capped by the committed deadline.
+#[derive(Clone, Copy, Debug)]
+pub struct Cutoffs {
+    /// End of cooperative provider cleanup and its parent collection slot.
+    pub cooperative: u64,
+    /// End of the one owner fallback opportunity.
+    pub fallback: u64,
+    /// End of helper collection.
+    pub helpers: u64,
+    /// Whole invocation deadline, including durable finalization.
+    pub complete: u64,
+}
+
 impl Ticket {
+    /// D4 stage algebra. A later failure may consume remaining time but cannot
+    /// turn a trusted ticket into a larger failure allocation.
+    pub fn cutoffs(&self, capacity: u64) -> Result<Cutoffs, &'static str> {
+        self.validate(capacity)?;
+        let variable = capacity
+            .checked_mul(4_000_000_000)
+            .ok_or("stage budget overflow")?;
+        let g = 8_100_000_000u64
+            .checked_add(variable)
+            .ok_or("stage budget overflow")?;
+        let o = 7_000_000_000u64
+            .checked_add(variable)
+            .ok_or("stage budget overflow")?;
+        let (notification, fallback, collection) = match self.path {
+            CleanupPath::Trusted => (ACK_NANOS, 4_000_000_000, 4_000_000_000),
+            CleanupPath::Failed => (500_000_000, o, 5_000_000_000),
+        };
+        let add = |base: u64, amount: u64| base.checked_add(amount).ok_or("stage clock overflow");
+        let cooperative = add(add(self.started, notification)?, g)?;
+        let fallback = add(cooperative, fallback)?;
+        let helpers = add(fallback, collection)?;
+        let complete = add(helpers, 10_000_000_000)?;
+        if complete != self.deadline {
+            return Err("stage allocation mismatch");
+        }
+        Ok(Cutoffs {
+            cooperative,
+            fallback,
+            helpers,
+            complete,
+        })
+    }
+
     /// Calculate the absolute ticket before any stop operation or ACK.
     pub fn new(started: u64, path: CleanupPath, capacity: u64) -> Result<Self, &'static str> {
         let deadline = started
@@ -162,12 +209,52 @@ pub struct Start {
 /// ACK proves the recipient committed a ticket no later than the original one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ack {
+    /// Complete earliest notification retained by this recipient.
+    pub committed: Start,
     /// Original complete Start, preventing cross-origin acknowledgement.
     pub start: Start,
     /// Participant that committed before replying.
     pub recipient: Participant,
     /// Committed minimum deadline.
     pub deadline: u64,
+}
+
+/// Method-tagged messages on independent managed control routes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ControlMessage {
+    /// Original nonrenewable cleanup notification.
+    Start(Start),
+    /// Recipient committed its deadline before replying.
+    Ack(Ack),
+    /// Worker protocol failed; retain the reason and close its provider transport.
+    Cancel {
+        /// Exact run and generation.
+        run: RunIdentity,
+        /// Sticky diagnostic.
+        reason: String,
+    },
+    /// Ask the actual provider parent for its wait receipt.
+    Collect {
+        /// Exact run and generation.
+        run: RunIdentity,
+    },
+    /// Actual parent's completed wait, never an exit observation.
+    Collected(ProviderReceipt),
+}
+
+/// Collection proof passed from cleanup owner to worker.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderReceipt {
+    /// Exact managed run.
+    pub run: RunIdentity,
+    /// Validated cleanup-owner identity.
+    pub owner: Participant,
+    /// Provider identity bound before GO.
+    pub provider: Participant,
+    /// Raw status returned by the owner's actual wait.
+    pub status: i32,
+    /// Owner retains prior failures even after a successful wait.
+    pub failed: bool,
 }
 
 impl Ack {
@@ -177,6 +264,8 @@ impl Ack {
         if &self.start != start
             || self.recipient != recipient
             || self.deadline > start.ticket.deadline
+            || self.committed.run != start.run
+            || self.committed.ticket.deadline != self.deadline
         {
             return Err("ACK identity or deadline mismatch");
         }
@@ -190,6 +279,7 @@ pub struct TicketState {
     run: RunIdentity,
     capacity: u64,
     ticket: Option<Ticket>,
+    source: Option<Start>,
     failed: bool,
 }
 impl TicketState {
@@ -201,6 +291,7 @@ impl TicketState {
             run,
             capacity,
             ticket: None,
+            source: None,
             failed: false,
         })
     }
@@ -244,8 +335,10 @@ impl TicketState {
             .is_none_or(|current| start.ticket.deadline < current.deadline)
         {
             self.ticket = Some(start.ticket);
+            self.source = Some(start.clone());
         }
         Ok(Ack {
+            committed: self.source.clone().unwrap(),
             deadline: self.ticket.unwrap().deadline,
             start,
             recipient,
@@ -373,6 +466,16 @@ mod tests {
             CleanupPath::Failed.allocation_nanos(64).unwrap(),
             542_600_000_000
         );
+        for capacity in [1, 4, 64] {
+            for path in [CleanupPath::Trusted, CleanupPath::Failed] {
+                let ticket = Ticket::new(100, path, capacity).unwrap();
+                let cutoffs = ticket.cutoffs(capacity).unwrap();
+                assert!(cutoffs.cooperative < cutoffs.fallback);
+                assert!(cutoffs.fallback < cutoffs.helpers);
+                assert_eq!(cutoffs.complete - cutoffs.helpers, 10_000_000_000);
+                assert_eq!(cutoffs.complete, ticket.deadline);
+            }
+        }
     }
 
     #[test]

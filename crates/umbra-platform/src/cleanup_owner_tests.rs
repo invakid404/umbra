@@ -233,6 +233,7 @@ fn endpoint(mode: &str) {
             let shared = Rc::new(std::cell::RefCell::new(client));
             let session = PlatformSession {
                 control: Box::new(super::super::super::Control {
+                    managed: None,
                     client: shared.clone(),
                     capabilities: Default::default(),
                     timeout_ms: 100,

@@ -177,6 +177,71 @@ struct Control {
     client: Rc<RefCell<Client>>,
     capabilities: PlatformCapabilities,
     timeout_ms: u64,
+    managed: Option<Box<dyn ManagedCleanup>>,
+}
+
+/// Independent cleanup-owner control; implementations retain the original
+/// cross-process ticket and validate actual provider-parent collection receipts.
+pub trait ManagedCleanup {
+    /// Publish Start on every required route before any cleanup operation.
+    /// Return the local representation of the committed absolute deadline.
+    fn start(&mut self) -> Result<std::time::Instant>;
+    /// Record a sticky protocol failure without renewing the original ticket.
+    fn failed(&mut self, error: &umbra_core::UmbraError);
+    /// Obtain the cleanup owner's actual parent wait receipt under that ticket.
+    fn collect_provider(&mut self) -> Result<std::time::Duration>;
+    /// Publish failed Start on drop or unwind using only independent routes.
+    fn abandon(&mut self);
+}
+
+impl Drop for Control {
+    fn drop(&mut self) {
+        if let Some(owner) = self.managed.as_mut() {
+            owner.abandon();
+        }
+    }
+}
+
+/// Attach the worker to a handshaken provider whose child belongs to the
+/// cleanup-owner process. Registration and capability agreement are validated
+/// before this function; unsupported ownership is refused before launch.
+pub fn attach_managed(
+    mut client: Client,
+    timeout_ms: u64,
+    mut managed: Box<dyn ManagedCleanup>,
+) -> Result<PlatformSession> {
+    let negotiation = (|| {
+        if client.owns_provider()
+            || client.welcome.role != "platform"
+            || !client
+                .welcome
+                .capabilities
+                .contains(umbra_core::shutdown::CAPABILITY)
+        {
+            return Err(protocol_error("invalid managed platform handoff"));
+        }
+        match client.call(&Request::Capabilities)? {
+            Response::Capabilities(value) => Ok(value),
+            _ => Err(protocol_error("platform.capabilities response")),
+        }
+    })();
+    let capabilities = match negotiation {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            managed.failed(&error);
+            return Err(error);
+        }
+    };
+    let client = Rc::new(RefCell::new(client));
+    Ok(PlatformSession {
+        control: Box::new(Control {
+            client: client.clone(),
+            capabilities,
+            timeout_ms,
+            managed: Some(managed),
+        }),
+        abi: Box::new(Abi { client }),
+    })
 }
 struct Abi {
     client: Rc<RefCell<Client>>,
@@ -225,6 +290,7 @@ fn connect_inner(
             client: client.clone(),
             capabilities,
             timeout_ms,
+            managed: None,
         }),
         abi: Box::new(Abi { client }),
     })
@@ -351,10 +417,13 @@ impl TraceControl for Control {
                 "shutdown requires exclusive platform ownership",
             ));
         }
-        Ok(shutdown::Start::Remote(closing::close_client(
-            &mut self.client.borrow_mut(),
-            nonce,
-        )))
+        let mut client = self.client.borrow_mut();
+        let closure = match self.managed.as_mut() {
+            Some(owner) => closing::close_managed_client(&mut client, nonce, owner.as_mut()),
+            None => closing::close_client(&mut client, nonce),
+        };
+        self.managed.take();
+        Ok(shutdown::Start::Remote(closure))
     }
     fn capabilities(&self) -> PlatformCapabilities {
         self.capabilities.clone()
@@ -839,6 +908,7 @@ mod tests {
                 },
             )));
             let mut control = Control {
+                managed: None,
                 timeout_ms: 5000,
                 client,
                 capabilities: Default::default(),
@@ -955,6 +1025,7 @@ mod tests {
             },
         )));
         let mut control = Control {
+            managed: None,
             timeout_ms: 5000,
             client: client.clone(),
             capabilities: PlatformCapabilities {
@@ -1100,6 +1171,7 @@ mod poll_tests {
             Default::default()
         };
         Control {
+            managed: None,
             client: Rc::new(RefCell::new(Client::from_connection(
                 Connection::new(stream, Duration::from_millis(timeout_ms)),
                 wire::Welcome {
@@ -1263,5 +1335,55 @@ mod poll_tests {
             worker.join().unwrap();
             assert!(control.poll_event(Duration::from_millis(5)).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod managed_drop_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct Notify(Arc<AtomicBool>);
+    impl ManagedCleanup for Notify {
+        fn start(&mut self) -> Result<std::time::Instant> {
+            unreachable!()
+        }
+        fn failed(&mut self, _: &umbra_core::UmbraError) {
+            unreachable!()
+        }
+        fn collect_provider(&mut self) -> Result<std::time::Duration> {
+            unreachable!()
+        }
+        fn abandon(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn managed_drop_notifies_while_main_client_is_borrowed() {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = Rc::new(RefCell::new(Client::from_connection(
+            Connection::new(socket, std::time::Duration::from_secs(1)),
+            wire::Welcome {
+                id: "managed".into(),
+                role: "platform".into(),
+                version: wire::PROTOCOL_VERSION,
+                capabilities: Default::default(),
+            },
+        )));
+        let notified = Arc::new(AtomicBool::new(false));
+        let control = Control {
+            client: client.clone(),
+            capabilities: PlatformCapabilities::default(),
+            timeout_ms: 100,
+            managed: Some(Box::new(Notify(notified.clone()))),
+        };
+        let borrowed = client.borrow_mut();
+        drop(control);
+        assert!(notified.load(Ordering::SeqCst));
+        drop(borrowed);
     }
 }

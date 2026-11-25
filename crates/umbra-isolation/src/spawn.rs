@@ -46,6 +46,29 @@ pub fn spawn(
     new_session: bool,
     keep: &[RawFd],
 ) -> Result<i32, i32> {
+    spawn_impl(exe, args, env, new_session, keep, false)
+}
+
+/// Spawn a managed role with only stdio and its explicitly assigned endpoints.
+/// Every other descriptor closes in the atomic exec file-action boundary.
+pub fn spawn_managed(
+    exe: &Path,
+    args: &[OsString],
+    env: &[(OsString, OsString)],
+    new_session: bool,
+    keep: &[RawFd],
+) -> Result<i32, i32> {
+    spawn_impl(exe, args, env, new_session, keep, true)
+}
+
+fn spawn_impl(
+    exe: &Path,
+    args: &[OsString],
+    env: &[(OsString, OsString)],
+    new_session: bool,
+    keep: &[RawFd],
+    managed: bool,
+) -> Result<i32, i32> {
     let path = cstring(exe.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
     let argv: Vec<CString> = args
         .iter()
@@ -90,6 +113,17 @@ pub fn spawn(
                 return Err(r);
             }
             let mut flags = libc::POSIX_SPAWN_SETSIGDEF as libc::c_short;
+            if managed {
+                // Darwin sys/spawn.h: close every descriptor unless explicitly
+                // inherited, including descriptors lacking FD_CLOEXEC.
+                flags |= 0x4000;
+                for fd in 0..=2 {
+                    let result = posix_spawn_file_actions_addinherit_np(&mut actions, fd);
+                    if result != 0 {
+                        return Err(result);
+                    }
+                }
+            }
             if new_session {
                 flags |= POSIX_SPAWN_SETSID;
             }

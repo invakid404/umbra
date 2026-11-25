@@ -16,6 +16,9 @@ publish = false
 shutdown-witness = []
 
 [dependencies]
+umbra-core = { path = "../umbra-core" }
+umbra-platform = { path = "../umbra-platform" }
+serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -24,3 +27,13 @@ mach2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+umbra-journal-file = { path = "../umbra-journal-file" }
+umbra-journal = { path = "../umbra-journal" }
+
+[[test]]
+name = "managed_topology"
+harness = false
+
+[[test]]
+name = "managed_startup"
+harness = false

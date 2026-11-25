@@ -645,8 +645,13 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "mach2",
+ "serde",
  "serde_json",
  "tempfile",
+ "umbra-core",
+ "umbra-journal",
+ "umbra-journal-file",
+ "umbra-platform",
 ]
 
 [[package]]

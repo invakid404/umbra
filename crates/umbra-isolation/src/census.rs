@@ -239,7 +239,7 @@ impl<A: FnMut() -> bool> MacHost<A> {
     }
 }
 
-fn signal_token(token: &Token, signal: libc::c_int) -> Signalled {
+pub(crate) fn signal_token(token: &Token, signal: libc::c_int) -> Signalled {
     let mut t = *token;
     // SAFETY: `t` is a valid audit_token_t for the duration of the call.
     match unsafe { proc_signal_with_audittoken(&mut t, signal) } {
