@@ -716,6 +716,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "umbra-core",
+ "umbra-isolation",
  "umbra-journal",
  "umbra-overlay",
  "umbra-platform",

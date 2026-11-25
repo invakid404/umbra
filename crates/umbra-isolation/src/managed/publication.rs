@@ -385,7 +385,18 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(!publication.progress(&mut sender_tickets).unwrap());
+        while !sender_tickets.failed() {
+            assert!(
+                boot_nanos().unwrap() < publication.deadline,
+                "closed direct route must be observed before the publication timeout"
+            );
+            assert!(!publication.progress(&mut sender_tickets).unwrap());
+            std::thread::yield_now();
+        }
+        assert!(
+            boot_nanos().unwrap() < publication.deadline,
+            "timeout is not evidence of the closed direct route"
+        );
         assert!(sender_tickets.failed());
         let received = receiver
             .receive_start(&mut receiver_tickets, relay, origin, publication.deadline)

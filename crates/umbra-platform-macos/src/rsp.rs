@@ -139,7 +139,13 @@ impl Drop for SetupChild {
                 Err(_) => break,
                 Ok(None) => {}
             }
-            if crate::clock::now() >= deadline {
+            let bounded = self
+                .ownership
+                .as_ref()
+                .map(|slot| slot.ledger().admission_cutoff())
+                .transpose()
+                .and_then(|cutoff| crate::clock::clamp_deadline(deadline, cutoff.flatten()));
+            if bounded.is_err() || crate::clock::now() >= bounded.unwrap_or(deadline) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -168,21 +174,37 @@ pub enum TeardownRead {
 ///
 /// `connect` and its handshake test share this so the test cannot silently skip
 /// on a host where only the override names a usable binary.
+#[cfg(test)]
 pub fn discover_debugserver() -> Option<std::path::PathBuf> {
+    discover_debugserver_owned(crate::clock::now() + Duration::from_secs(10), None).ok()
+}
+
+fn discover_debugserver_owned(
+    deadline: Instant,
+    ledger: Option<&umbra_platform::shutdown::Ledger>,
+) -> Result<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("UMBRA_DEBUGSERVER") {
-        return Some(std::path::PathBuf::from(path));
+        return Ok(std::path::PathBuf::from(path));
     }
-    Command::new("/usr/bin/xcode-select")
-        .arg("-p")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| {
-            std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
-                .join("Library/PrivateFrameworks/LLDB.framework/Resources/debugserver")
-        })
+    let out = crate::cache::command_with_ledger(
+        Command::new("/usr/bin/xcode-select").arg("-p"),
+        deadline,
+        ledger,
+    )?;
+    Ok(
+        std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+            .join("Library/PrivateFrameworks/LLDB.framework/Resources/debugserver"),
+    )
 }
 impl Rsp {
+    fn managed_cutoff(&self) -> Result<Option<u64>> {
+        self.ownership
+            .as_ref()
+            .map(|slot| slot.ledger().admission_cutoff())
+            .transpose()
+            .map(Option::flatten)
+    }
+
     pub fn deadline(&self) -> Instant {
         self.limit(Duration::from_secs(10))
     }
@@ -223,8 +245,14 @@ impl Rsp {
     ) -> Result<Self> {
         let executable = match &options.debugserver {
             Some(p) => p.clone(),
-            None => discover_debugserver()
-                .ok_or_else(|| error("xcode-select", "developer tools unavailable"))?,
+            None => {
+                let ledger = ownership.as_ref().map(|slot| slot.ledger());
+                let cutoff = crate::clock::now() + Duration::from_secs(10);
+                discover_debugserver_owned(
+                    deadline.map_or(cutoff, |deadline| deadline.min(cutoff)),
+                    ledger.as_ref(),
+                )?
+            }
         };
         let listener =
             TcpListener::bind("127.0.0.1:0").map_err(|e| error("debugserver listen", e))?;
@@ -297,7 +325,13 @@ impl Rsp {
                     return Err(error("debugserver accept", e));
                 }
             }
-            if crate::clock::now() >= limit
+            let cutoff = ownership
+                .as_ref()
+                .map(|slot| slot.ledger().admission_cutoff())
+                .transpose()?
+                .flatten();
+            let bounded = crate::clock::clamp_deadline(limit, cutoff)?;
+            if crate::clock::now() >= bounded
                 || child
                     .try_wait()
                     .map_err(|e| error("debugserver wait", e))?
@@ -375,7 +409,9 @@ impl Rsp {
                     "ordinary work cancelled; stream retained for teardown",
                 ));
             }
-            let remaining = limit.saturating_duration_since(crate::clock::now());
+            let cutoff = self.managed_cutoff()?;
+            let bounded = crate::clock::clamp_deadline(limit, cutoff)?;
+            let remaining = bounded.saturating_duration_since(crate::clock::now());
             if remaining.is_zero() {
                 return Ok(false);
             }
@@ -395,7 +431,14 @@ impl Rsp {
                     revents: 0,
                 },
             ];
-            let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+            // Re-read a managed cutoff while blocked: an independent Start
+            // can shorten it without making the debugger socket readable.
+            let poll_bound = if cutoff.is_some() {
+                10
+            } else {
+                i32::MAX as u128
+            };
+            let millis = remaining.as_millis().min(poll_bound) as i32;
             // SAFETY: poll receives the valid stack array for this call only.
             let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
             if rc < 0 {
@@ -716,7 +759,10 @@ impl Rsp {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => return false,
             }
-            if crate::clock::now() >= limit {
+            let bounded = self
+                .managed_cutoff()
+                .and_then(|cutoff| crate::clock::clamp_deadline(limit, cutoff));
+            if bounded.is_err() || crate::clock::now() >= bounded.unwrap_or(limit) {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -1042,6 +1088,51 @@ fn read_timeout(remaining: Duration) -> Duration {
 #[cfg(test)]
 mod poll_bound_tests {
     use super::*;
+    #[test]
+    fn blocked_rsp_observes_shortened_managed_cutoff() {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+        struct Authority;
+        impl umbra_core::AdmissionTransport for Authority {
+            fn exchange(
+                &mut self,
+                _: umbra_core::AdmissionOperation,
+                _: u64,
+            ) -> std::io::Result<std::result::Result<u64, umbra_core::AdmissionError>> {
+                Ok(Ok(1))
+            }
+        }
+        let cutoff = Arc::new(AtomicU64::new(u64::MAX));
+        let observed = cutoff.clone();
+        let ledger = umbra_platform::shutdown::Ledger::new();
+        ledger
+            .install_admission(
+                umbra_platform::admission::Admission::new(Box::new(Authority)),
+                Box::new(move || Ok(observed.load(Ordering::Acquire))),
+            )
+            .unwrap();
+        let slot = ledger
+            .reserve(umbra_core::shutdown::ResourceKind::Tracee, None, 1, 0)
+            .unwrap();
+        let (mut rsp, _peer) = Rsp::retirement_test_pair();
+        rsp.set_test_ownership(slot);
+        rsp.torn_down = true; // Synthetic accounting; fixture child is already waited.
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cutoff.store(crate::clock::boot_nanos().unwrap(), Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = rsp.ready(libc::POLLIN, started + Duration::from_secs(2), false);
+        setter.join().unwrap();
+        assert!(!result.unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "blocked socket must observe a shortened shared cutoff"
+        );
+    }
+
     #[test]
     fn partial_packet_survives_idle() {
         use std::io::Write;

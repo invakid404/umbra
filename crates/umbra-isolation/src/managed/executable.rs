@@ -598,6 +598,57 @@ impl Entry {
             .ok_or_else(|| invalid("bootstrap already closed"))?
             .queue(&descendants)
     }
+    /// Adopt the provider's unique admission endpoint after durable GO.
+    /// Taking it removes the descriptor from startup ownership before native
+    /// acquisition can begin.
+    pub fn take_admission(&mut self) -> io::Result<super::admission::AdmissionClient> {
+        if self.role != Role::Provider || self.authorization.is_none() {
+            return Err(invalid("provider admission before GO"));
+        }
+        let matches: Vec<_> = self
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, endpoint)| endpoint.purpose == Purpose::Admission)
+            .map(|(index, endpoint)| (index, endpoint.peer))
+            .collect();
+        let [(index, Role::CleanupOwner)] = matches.as_slice() else {
+            return Err(invalid("invalid provider admission endpoint assignment"));
+        };
+        let endpoint = self.endpoints.remove(*index);
+        super::admission::AdmissionClient::new(
+            self.launch.run,
+            super::Channel::new(endpoint.stream)?,
+        )
+    }
+
+    /// Adopt the dedicated provider cancellation route after durable GO.
+    pub fn take_cancellation(
+        &mut self,
+        cutoff: super::admission::AdmissionCutoff,
+    ) -> io::Result<super::cancellation::Receiver> {
+        if self.role != Role::Provider || self.authorization.is_none() {
+            return Err(invalid("provider cancellation before GO"));
+        }
+        let matches: Vec<_> = self
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, endpoint)| endpoint.purpose == Purpose::Cancellation)
+            .map(|(index, endpoint)| (index, endpoint.peer))
+            .collect();
+        let [(index, Role::CleanupOwner)] = matches.as_slice() else {
+            return Err(invalid("invalid provider cancellation endpoint assignment"));
+        };
+        let endpoint = self.endpoints.remove(*index);
+        super::cancellation::Receiver::new(
+            self.launch.run,
+            self.launch.capacity,
+            super::Channel::new(endpoint.stream)?,
+            cutoff,
+        )
+    }
+
     /// Advance readiness and accept matching GO under the original deadline.
     pub fn await_go(&mut self, deadline: u64) -> io::Result<bool> {
         let bootstrap = self
@@ -618,5 +669,78 @@ impl Entry {
         self.authorization = Some(run);
         self.bootstrap.take();
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn provider_cannot_take_admission_before_durable_go() {
+        let launch: LaunchConfiguration = serde_json::from_str(
+            r#"{"run":{"nonce":"00000000-0000-0000-0000-000000000001","generation":1},"capacity":64,"dispatch":"admission","payload":[]}"#,
+        ).unwrap();
+        let (stream, _owner) = UnixStream::pair().unwrap();
+        let mut entry = Entry {
+            role: Role::Provider,
+            parent: Participant {
+                role: Role::CleanupOwner,
+                pid: 42,
+                birth: (1, 0),
+            },
+            launch,
+            readiness_deadline: u64::MAX,
+            endpoints: vec![Endpoint {
+                peer: Role::CleanupOwner,
+                purpose: Purpose::Admission,
+                stream,
+            }],
+            descendants: BTreeMap::new(),
+            bootstrap: None,
+            authorization: None,
+            announced: None,
+            inventory: None,
+        };
+        assert!(entry.take_admission().is_err());
+        assert_eq!(
+            entry.endpoints.len(),
+            1,
+            "refusal must retain endpoint custody"
+        );
+        let (child, parent) = UnixStream::pair().unwrap();
+        entry.bootstrap = Some(super::super::Channel::new(child).unwrap());
+        let mut parent = super::super::Channel::new(parent).unwrap();
+        let local = identity(std::process::id(), Role::Provider).unwrap();
+        let deadline = super::super::boot_nanos().unwrap() + 1_000_000_000;
+        let go = super::super::startup::Go {
+            run: entry.launch.run,
+            record: umbra_core::CustodyRecord {
+                run_id: serde_json::from_value(serde_json::json!(entry.launch.run.nonce)).unwrap(),
+                generation: entry.launch.run.nonce,
+                sequence: 1,
+                state: umbra_core::CustodyPhase::Armed {
+                    capacity: entry.launch.capacity,
+                    startup_nonce: entry.launch.run.nonce,
+                    participants: vec![umbra_core::CustodyParticipant {
+                        pid: local.pid,
+                        birth: local.birth.0 * 1_000_000 + local.birth.1,
+                    }],
+                },
+            },
+            durable_sequence: umbra_core::Sequence(1),
+            deadline,
+        };
+        parent.queue(&go).unwrap();
+        assert!(parent.flush(deadline).unwrap());
+        while !entry.await_go(deadline).unwrap() {
+            std::thread::yield_now();
+        }
+        let _client = entry.take_admission().unwrap();
+        assert!(entry.endpoints.is_empty());
+        assert!(
+            entry.take_admission().is_err(),
+            "admission may be adopted only once"
+        );
     }
 }

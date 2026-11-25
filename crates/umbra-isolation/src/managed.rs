@@ -2,8 +2,10 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use umbra_core::managed::{decode_frame, encode_frame, MAX_FRAME};
+pub mod admission;
 pub mod arming;
 pub mod bootstrap;
+pub mod cancellation;
 pub mod channels;
 pub mod executable;
 pub mod fail_stop;

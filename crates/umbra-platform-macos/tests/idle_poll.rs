@@ -7,6 +7,9 @@ fn path(p: &Path) -> BytePath {
     BytePath::new(p.as_os_str().as_bytes().to_vec()).unwrap()
 }
 
+#[path = "support/managed_admission.rs"]
+mod managed_admission;
+
 fn qualified() -> bool {
     if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_some() {
         return true;
@@ -40,6 +43,7 @@ fn idle_across_fork_park_and_exec() {
         timeout_ms: Some(15000),
         ..Options::default()
     });
+    let (_count, admission_service) = managed_admission::install(&mut backend);
     let root = backend
         .launch_experimental(LaunchSpec {
             executable: path(&program),
@@ -109,6 +113,22 @@ fn idle_across_fork_park_and_exec() {
     backend
         .terminate(root, TerminationPolicy::Immediate)
         .unwrap();
+    let closure = backend
+        .begin_shutdown(umbra_core::shutdown::Nonce::new_v4())
+        .unwrap();
+    drop(backend);
+    let umbra_platform::shutdown::Start::Local { accepted, ledger } = closure else {
+        panic!("native custody required")
+    };
+    assert!(accepted
+        .confirms(&ledger.final_snapshot().unwrap())
+        .unwrap());
+    drop(ledger);
+    assert_eq!(
+        admission_service.join().unwrap(),
+        0,
+        "fork/exec charges must retire after native collection"
+    );
     assert_eq!(children, 4);
     // A quiet scan of four live children must share the 1ms budget. With
     // independent 2ms allowances it takes at least 8ms. Use the fastest

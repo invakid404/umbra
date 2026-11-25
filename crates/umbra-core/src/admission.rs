@@ -12,6 +12,14 @@ pub const DEFAULT_CLEANUP_CAPACITY: u64 = 64;
 pub enum TerminalCertificate {
     /// An acquisition was never entered and cannot subsequently start.
     CancelledBeforeEntry,
+    /// An entered creator returned a definitive failure without producing a
+    /// resource, and no creation-capable operation remains in flight.
+    NoResource {
+        /// Identity committed by Entering, even though creation failed.
+        resource: Uuid,
+        /// The creator reached its terminal checkpoint.
+        creator_terminal: bool,
+    },
     /// The creator stopped and the identified resource was actually collected.
     Collected {
         /// Stable resource identity assigned when entering.
@@ -68,6 +76,30 @@ pub struct AdmissionRequest {
     pub operation: AdmissionOperation,
 }
 
+/// Owner acknowledgement of one exact admission transaction. The provider must
+/// match the full request before treating the transition as committed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionResponse {
+    /// Exact operation and identity applied by the owner.
+    pub request: AdmissionRequest,
+    /// Committed outstanding count or an attributable refusal.
+    pub result: Result<u64, AdmissionError>,
+    /// Owner's retained absolute cleanup cutoff, or MAX before cleanup starts.
+    pub cutoff: u64,
+}
+
+/// Provider-side transport to the authoritative per-run owner ledger.
+/// The absolute boot-clock cutoff belongs to the operation, never to inactivity.
+pub trait AdmissionTransport: Send {
+    /// Return only an acknowledgement of the exact operation. Transport errors
+    /// leave the operation ambiguous and must never authorize acquisition.
+    fn exchange(
+        &mut self,
+        operation: AdmissionOperation,
+        deadline: u64,
+    ) -> std::io::Result<Result<u64, AdmissionError>>;
+}
+
 /// Attributable refusal or invalid protocol state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdmissionError {
@@ -104,6 +136,13 @@ pub struct AdmissionLedger {
 }
 
 impl AdmissionLedger {
+    /// Freeze directly in the owner's serialized event loop before cancellation.
+    /// Already charged and entered resources remain outstanding.
+    pub fn freeze(&mut self) -> u64 {
+        self.frozen = true;
+        self.current()
+    }
+
     /// Negotiate a nonzero capacity and fresh run identity without side effects.
     pub fn new(nonce: Uuid, generation: u64, capacity: u64) -> Result<Self, AdmissionError> {
         if nonce.is_nil() || generation == 0 || capacity == 0 {
@@ -218,6 +257,10 @@ impl AdmissionLedger {
                     .ok_or(AdmissionError::Invalid)?;
                 let proven = match certificate {
                     TerminalCertificate::CancelledBeforeEntry => slot.resource.is_none(),
+                    TerminalCertificate::NoResource {
+                        resource,
+                        creator_terminal,
+                    } => slot.resource == Some(*resource) && *creator_terminal,
                     TerminalCertificate::Collected {
                         resource,
                         creator_terminal,
@@ -238,6 +281,53 @@ impl AdmissionLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entered_creation_failure_requires_terminal_creator_and_exact_resource() {
+        let nonce = Uuid::from_u128(1);
+        let obligation = Uuid::from_u128(2);
+        let resource = Uuid::from_u128(3);
+        for (proof_resource, creator_terminal, expected) in [
+            (resource, true, Ok(0)),
+            (resource, false, Err(AdmissionError::Invalid)),
+            (Uuid::from_u128(4), true, Err(AdmissionError::Invalid)),
+        ] {
+            let mut ledger = AdmissionLedger::new(nonce, 1, 1).unwrap();
+            let operations = [
+                AdmissionOperation::Reserve { obligation },
+                AdmissionOperation::Entering {
+                    obligation,
+                    resource,
+                },
+                AdmissionOperation::Retiring { obligation },
+            ];
+            for (index, operation) in operations.into_iter().enumerate() {
+                assert_eq!(
+                    ledger.apply(AdmissionRequest {
+                        nonce,
+                        generation: 1,
+                        sequence: index as u64 + 1,
+                        operation,
+                    }),
+                    Ok(1)
+                );
+            }
+            let result = ledger.apply(AdmissionRequest {
+                nonce,
+                generation: 1,
+                sequence: 4,
+                operation: AdmissionOperation::Release {
+                    obligation,
+                    certificate: TerminalCertificate::NoResource {
+                        resource: proof_resource,
+                        creator_terminal,
+                    },
+                },
+            });
+            assert_eq!(result, expected);
+            assert_eq!(ledger.current(), u64::from(expected.is_err()));
+        }
+    }
 
     #[test]
     fn r2_budget_overflow_and_writer_death() {

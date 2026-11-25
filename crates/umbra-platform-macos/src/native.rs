@@ -262,6 +262,55 @@ struct Watchdog {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
+struct ManagedCancellation {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    requested: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl ManagedCancellation {
+    fn new(
+        mut receiver: umbra_isolation::managed::cancellation::Receiver,
+        wakeups: Arc<rsp::Wakeups>,
+    ) -> Result<Self> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let requested = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let observed = requested.clone();
+        let worker = std::thread::Builder::new()
+            .name("umbra-cancel".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while !stopped.load(Ordering::Acquire) {
+                        match receiver.poll(u64::MAX) {
+                            Ok(false) => std::thread::sleep(Duration::from_millis(1)),
+                            Ok(true) | Err(_) => return true,
+                        }
+                    }
+                    false
+                }));
+                if result.unwrap_or(true) {
+                    observed.store(true, Ordering::Release);
+                    wakeups.signal();
+                }
+            })
+            .map_err(|e| error("managed cancellation", e))?;
+        Ok(Self {
+            stop,
+            requested,
+            worker: Some(worker),
+        })
+    }
+}
+impl Drop for ManagedCancellation {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl Watchdog {
     fn new(
         deadline: Option<Instant>,
@@ -484,6 +533,7 @@ struct Pending {
 /// Owned until explicit deallocation succeeds or this task dies. Never dropped
 /// as a side effect of taking the pending return out of the thread map.
 struct SpawnInFlight {
+    creation: Option<TraceOwnership>,
     token: SpawnToken,
     snapshot: spawn::Snapshot,
     plan: SpawnPlan,
@@ -494,6 +544,15 @@ struct SpawnInFlight {
     region: Option<u64>,
     twin: PathBuf,
     child: Option<usize>,
+}
+impl Drop for SpawnInFlight {
+    fn drop(&mut self) {
+        // Ownership is transferred to the return window before any creation
+        // resume. If still here, no child creation was submitted.
+        if let Some(owner) = &self.creation {
+            owner.tracee.creation_failed();
+        }
+    }
 }
 
 /// Pure view of the production barrier; contains no task rights or ownership.
@@ -550,6 +609,19 @@ impl SpawnBarrier {
 struct TraceOwnership {
     ledger: umbra_platform::shutdown::Ledger,
     tracee: umbra_platform::shutdown::Reservation,
+}
+/// Before root spawn, no creation-capable call remains after preparation
+/// returns. Once spawn succeeds, only explicit native collection may settle it.
+struct RootPreparation {
+    slot: umbra_platform::shutdown::Reservation,
+    spawned: bool,
+}
+impl Drop for RootPreparation {
+    fn drop(&mut self) {
+        if !self.spawned {
+            self.slot.creation_failed();
+        }
+    }
 }
 struct Session {
     ownership: Option<TraceOwnership>,
@@ -712,6 +784,12 @@ impl LiveSession {
 }
 
 impl Session {
+    fn cleanup_limit(&self, deadline: Instant) -> Instant {
+        self.ownership.as_ref().map_or(deadline, |owner| {
+            crate::clock::cleanup_limit(deadline, &owner.ledger)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attach(
         pid: i32,
@@ -1177,17 +1255,16 @@ impl Session {
         let pc = get(&regs, PC)?;
         let gate = pc + 4;
         let hardware = matches!(kind, ReturnKind::Fork { .. });
-        let entry_breakpoint = self.remove_breakpoint(pc)?;
-        if hardware {
-            self.write(gate, &[0, 0, 0, 0x14])?;
-            self.rsp.ok(&format!("Z1,{gate:x},4"))?;
-        } else {
-            self.temporary_breakpoint(gate)?;
-        }
-        let creation = if matches!(
-            kind,
-            ReturnKind::Fork { .. } | ReturnKind::Spawn { .. } | ReturnKind::PackedSpawn
-        ) {
+        // Reserve the child before any breakpoint or tracee edit. Admission
+        // refusal must leave the stopped creator's instruction state intact.
+        let creation = if matches!(kind, ReturnKind::PackedSpawn) {
+            Some(
+                self.spawn
+                    .as_mut()
+                    .and_then(|pending| pending.creation.take())
+                    .ok_or_else(|| error("spawn", "missing admitted child preparation"))?,
+            )
+        } else if matches!(kind, ReturnKind::Fork { .. } | ReturnKind::Spawn { .. }) {
             let owner = self
                 .ownership
                 .as_ref()
@@ -1204,6 +1281,23 @@ impl Session {
         } else {
             None
         };
+        let entry_breakpoint = (|| {
+            let entry = self.remove_breakpoint(pc)?;
+            if hardware {
+                self.write(gate, &[0, 0, 0, 0x14])?;
+                self.rsp.ok(&format!("Z1,{gate:x},4"))?;
+            } else {
+                self.temporary_breakpoint(gate)?;
+            }
+            Ok(entry)
+        })()
+        .inspect_err(|_: &UmbraError| {
+            // This thread has not resumed the creation syscall. Partial
+            // breakpoint edits remain owned by the existing parent session.
+            if let Some(owner) = &creation {
+                owner.tracee.creation_failed();
+            }
+        })?;
         self.pending.insert(
             thread,
             Pending {
@@ -1518,7 +1612,7 @@ impl Session {
         // notification before installing syscall sites, rather than reading
         // shared-cache addresses that are not mapped yet. Initial dyld pointers
         // contain unapplied chained fixups, so resolve exported file symbols.
-        let symbols = cache::command(
+        let symbols = cache::command_with_ledger(
             std::process::Command::new("/usr/bin/xcrun").args([
                 "nm",
                 "-arch",
@@ -1527,6 +1621,7 @@ impl Session {
                 "/usr/lib/dyld",
             ]),
             self.rsp.deadline(),
+            self.ownership.as_ref().map(|owner| &owner.ledger),
         )?;
         let symbols = String::from_utf8_lossy(&symbols.stdout);
         let symbol = |name: &str| -> Result<u64> {
@@ -1999,6 +2094,7 @@ impl SpawnQualification {
 
 /// Native prototype control, deliberately !Send/!Sync. Construct on the provider thread.
 pub struct MacosTraceBackend {
+    cancellation: Option<ManagedCancellation>,
     launch_stdio: Option<umbra_core::launch_stdio::LaunchStdio>,
     stdio_adopted: bool,
     stdio_consumed: bool,
@@ -2039,10 +2135,57 @@ impl Default for MacosTraceBackend {
     }
 }
 impl MacosTraceBackend {
+    /// Adopt the provider's startup admission endpoint after durable GO.
+    /// The caller supplies the original operation/phase deadline. The returned
+    /// handle lets independent cancellation retain validated cleanup tickets.
+    pub fn install_managed_admission(
+        &mut self,
+        entry: &mut umbra_isolation::managed::executable::Entry,
+        operation_deadline: Box<dyn Fn() -> Result<u64> + Send>,
+    ) -> Result<umbra_isolation::managed::admission::AdmissionCutoff> {
+        if self.cancellation.is_some() || self.launched {
+            return Err(error("admission", "late or duplicate managed installation"));
+        }
+        let wakeups = self
+            .owner
+            .as_ref()
+            .ok_or_else(|| {
+                error(
+                    "admission",
+                    "managed owner observation must be installed first",
+                )
+            })?
+            .wakeups
+            .clone();
+        let client = entry.take_admission().map_err(|e| error("admission", e))?;
+        let cutoff = client.cutoff();
+        let receiver = entry
+            .take_cancellation(cutoff.clone())
+            .map_err(|e| error("admission", e))?;
+        let observed = cutoff.clone();
+        self.install_admission(
+            umbra_platform::admission::Admission::new(Box::new(client)),
+            Box::new(move || operation_deadline().map(|deadline| observed.clamp(deadline))),
+        )?;
+        self.cancellation = Some(ManagedCancellation::new(receiver, wakeups)?);
+        Ok(cutoff)
+    }
+
+    /// Install the enrolled owner admission endpoint before native acquisition.
+    /// The supplied cutoff follows the run's original cleanup ticket.
+    pub fn install_admission(
+        &mut self,
+        admission: umbra_platform::admission::Admission,
+        deadline: Box<dyn Fn() -> Result<u64> + Send>,
+    ) -> Result<()> {
+        self.ledger.install_admission(admission, deadline)
+    }
+
     pub fn new(options: Options) -> Self {
         #[cfg(feature = "shutdown-witness")]
         umbra_platform::shutdown::witness(serde_json::json!({"event": "owner-constructed"}));
         Self {
+            cancellation: None,
             launch_stdio: None,
             stdio_adopted: false,
             stdio_consumed: false,
@@ -2123,6 +2266,23 @@ impl MacosTraceBackend {
         }
         // Reserve queue and child-session capacity before the kernel can
         // create a child; attach adds no allocation for new token bookkeeping.
+        let owner = s
+            .ownership
+            .as_ref()
+            .ok_or_else(|| error("spawn", "missing creator ownership"))?;
+        let creation = TraceOwnership {
+            ledger: owner.ledger.clone(),
+            tracee: owner.ledger.reserve(
+                umbra_core::shutdown::ResourceKind::Tracee,
+                Some(owner.tracee.id()),
+                s.id.0.generation,
+                s.exec_generation,
+            )?,
+        };
+        let mut preparation = RootPreparation {
+            slot: creation.tracee.clone(),
+            spawned: false,
+        };
         self.sessions
             .try_reserve(1)
             .map_err(|e| error("spawn reserve", e))?;
@@ -2143,6 +2303,7 @@ impl MacosTraceBackend {
             sequence: self.spawn_sequence,
         };
         s.spawn = Some(SpawnInFlight {
+            creation: Some(creation),
             token,
             snapshot,
             plan: plan.clone(),
@@ -2154,6 +2315,7 @@ impl MacosTraceBackend {
             twin,
             child: None,
         });
+        preparation.spawned = true;
         self.events
             .push_back(TraceEvent::SpawnPrepare { token, plan });
         Ok(())
@@ -2442,13 +2604,29 @@ impl MacosTraceBackend {
         Ok(())
     }
     fn check_deadline(&mut self) -> Result<()> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|monitor| monitor.requested.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(error(
+                "managed cancellation",
+                "owner requested cleanup or cancellation route failed",
+            ));
+        }
         if let Some(reason) = self.owner.as_ref().and_then(Watchdog::reason) {
             return Err(error(reason.operation(), reason.message()));
         }
         if let Some(reason) = self.watchdog.as_ref().and_then(Watchdog::reason) {
             return Err(error(reason.operation(), reason.message()));
         }
-        if self.deadline.is_some_and(|d| crate::clock::now() >= d) {
+        let managed_expired = self
+            .ledger
+            .admission_cutoff()?
+            .map(|cutoff| crate::clock::boot_nanos().map(|now| now >= cutoff))
+            .transpose()?
+            .unwrap_or(false);
+        if managed_expired || self.deadline.is_some_and(|d| crate::clock::now() >= d) {
             for s in &self.sessions {
                 if let Some(live) = &s.live {
                     let _ = live.task.kill();
@@ -2524,6 +2702,18 @@ impl MacosTraceBackend {
     fn launch_traced(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
         #[cfg(feature = "shutdown-witness")]
         crate::performance_observation::record("acquisition_entry", None);
+        let root_slot = self.ledger.reserve(
+            umbra_core::shutdown::ResourceKind::Tracee,
+            None,
+            self.generation
+                .checked_add(1)
+                .ok_or_else(|| error("launch", "generation exhausted"))?,
+            0,
+        )?;
+        let mut preparation = RootPreparation {
+            slot: root_slot.clone(),
+            spawned: false,
+        };
         let launch_stdio = self.consume_launch_stdio()?;
         Self::check_sandbox_shape(&spec)?;
         if self.launched {
@@ -2607,6 +2797,7 @@ impl MacosTraceBackend {
             Path::new(OsStr::from_bytes(spec.executable.as_bytes())),
             &self.options,
             operation_deadline(deadline, Duration::from_secs(10)),
+            Some(&self.ledger),
         )?;
         // Enforcement is installed before the target's first instruction and the
         // interposer is loaded into that same image, so both are arranged here,
@@ -2624,6 +2815,7 @@ impl MacosTraceBackend {
             let published = interpose::publish(
                 &self.options,
                 operation_deadline(deadline, Duration::from_secs(10)),
+                Some(&self.ledger),
             )?;
             // The target runs as its resigned twin, so this is the image umbra
             // will arm -- not the caller's `spec.executable`. Getting it wrong
@@ -2675,6 +2867,7 @@ impl MacosTraceBackend {
                     Path::new(SANDBOX_BOOTSTRAP),
                     &self.options,
                     operation_deadline(deadline, Duration::from_secs(10)),
+                    Some(&self.ledger),
                 )?;
                 // The target runs as its resigned twin, exactly as on the
                 // unenforced path, so image identity and `_NSGetExecutablePath`
@@ -2702,12 +2895,6 @@ impl MacosTraceBackend {
             .map(|v| v.as_ptr() as *mut libc::c_char)
             .collect::<Vec<_>>();
         envp.push(std::ptr::null_mut());
-        let root_slot = self.ledger.reserve(
-            umbra_core::shutdown::ResourceKind::Tracee,
-            None,
-            self.generation + 1,
-            0,
-        )?;
         let mut pid = 0;
         // SAFETY: initialized spawn objects, owned NUL-terminated arrays and valid out pointers.
         unsafe {
@@ -2791,6 +2978,7 @@ impl MacosTraceBackend {
                 root_slot.creation_failed();
                 return Err(error);
             }
+            preparation.spawned = true;
         }
         drop(launch_stdio);
         #[cfg(feature = "shutdown-witness")]
@@ -3429,6 +3617,7 @@ impl MacosTraceBackend {
                     Path::new(OsStr::from_bytes(old.as_bytes())),
                     &self.options,
                     operation_deadline(self.deadline, Duration::from_secs(10)),
+                    Some(&self.ledger),
                 )?;
                 if number == 244 && get(&regs, 2)? != 0 {
                     return self.capture_spawn(index, thread, regs, twin);
@@ -4248,9 +4437,20 @@ fn unenrolled_identity(
 /// of children, so the sweep's worst case is one bound, not one per child.
 /// Returns, per child, its ending state ([`unenrolled_child_state`]) or the
 /// last lookup taken by the limit.
+#[cfg(test)]
 fn await_unenrolled_ends(
     children: &[(i32, (u64, u64))],
     limit: Instant,
+    lookup: impl FnMut(i32) -> Lookup,
+    now: impl Fn() -> Instant,
+    pause: impl FnMut(),
+) -> Vec<std::result::Result<&'static str, Lookup>> {
+    await_unenrolled_ends_with_limit(children, || limit, lookup, now, pause)
+}
+
+fn await_unenrolled_ends_with_limit(
+    children: &[(i32, (u64, u64))],
+    limit: impl Fn() -> Instant,
     mut lookup: impl FnMut(i32) -> Lookup,
     now: impl Fn() -> Instant,
     mut pause: impl FnMut(),
@@ -4265,7 +4465,7 @@ fn await_unenrolled_ends(
                 last[index] = found;
             }
         }
-        if ended.iter().all(Option::is_some) || now() >= limit {
+        if ended.iter().all(Option::is_some) || now() >= limit() {
             break;
         }
         pause();
@@ -4726,7 +4926,12 @@ impl Session {
     fn ordered_teardown_inner(&mut self, emergency_retirement: bool) -> TeardownReport {
         self.torn_down = true;
         let started = crate::clock::now();
-        let deadline = started + TEARDOWN_BOUND;
+        let deadline = self
+            .ownership
+            .as_ref()
+            .map_or(started + TEARDOWN_BOUND, |owner| {
+                crate::clock::cleanup_limit(started + TEARDOWN_BOUND, &owner.ledger)
+            });
         let pid = self.id.0.native_id as i32;
         let tracer = self.rsp.tracer_pid();
         let mut steps = Vec::new();
@@ -4735,7 +4940,7 @@ impl Session {
         steps.extend(teardown_prologue(&mut self.rsp));
         // A running peer must observe an interrupt before k is dispatched.
         // 250ms stop + 1250ms kill/confirmation share the original 1500ms cap.
-        let stop_deadline = started + Duration::from_millis(250);
+        let stop_deadline = deadline.min(started + Duration::from_millis(250));
         let mut failure = (!self.rsp.begin_teardown())
             .then(|| "ordinary RSP frame incomplete at teardown handover".to_string());
         let mut closed = false;
@@ -4745,7 +4950,7 @@ impl Session {
         if failure.is_none() && !self.done {
             // A buffered stop answers the outstanding resume, regardless of signal.
             // Keep the incremental decoder and the same socket throughout.
-            while crate::clock::now() < stop_deadline {
+            while crate::clock::now() < self.cleanup_limit(stop_deadline) {
                 match self.rsp.teardown_read_buffered() {
                     rsp::TeardownRead::Quiet => break,
                     rsp::TeardownRead::Closed(why) => {
@@ -4787,7 +4992,7 @@ impl Session {
                     Err(e) => failure = Some(format!("RSP interrupt failed: {e}")),
                 }
                 let mut stopped = false;
-                while failure.is_none() && crate::clock::now() < stop_deadline {
+                while failure.is_none() && crate::clock::now() < self.cleanup_limit(stop_deadline) {
                     let wait = stop_deadline
                         .saturating_duration_since(crate::clock::now())
                         .min(Duration::from_millis(5));
@@ -4874,7 +5079,9 @@ impl Session {
                 continue;
             }
             let reading = self.barrier();
-            if matches!(reading, BarrierReading::Confirmed(_)) || crate::clock::now() >= deadline {
+            if matches!(reading, BarrierReading::Confirmed(_))
+                || crate::clock::now() >= self.cleanup_limit(deadline)
+            {
                 break reading;
             }
             if exit_seen {
@@ -5077,7 +5284,7 @@ impl MacosTraceBackend {
             {
                 break;
             }
-            if crate::clock::now() >= limit {
+            if crate::clock::now() >= crate::clock::cleanup_limit(limit, &self.ledger) {
                 for s in &mut self.sessions {
                     if let Some(r) = &mut s.retirement {
                         r.finish_drain(crate::clock::now());
@@ -5138,7 +5345,8 @@ impl MacosTraceBackend {
                 .filter(|&(pid, birth)| !enrolled_identity(&enrolled, pid, birth))
                 .collect()
         };
-        let settle = crate::clock::now() + UNENROLLED_FORK_SETTLE;
+        let settle =
+            crate::clock::cleanup_limit(crate::clock::now() + UNENROLLED_FORK_SETTLE, &self.ledger);
         let found = loop {
             let found: Vec<Vec<ForkCandidate>> = windows
                 .iter()
@@ -5148,7 +5356,8 @@ impl MacosTraceBackend {
                 .iter()
                 .zip(&windows)
                 .all(|(children, (_, _, open))| children.len() >= open.len());
-            if complete || crate::clock::now() >= settle {
+            if complete || crate::clock::now() >= crate::clock::cleanup_limit(settle, &self.ledger)
+            {
                 break found;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -5191,9 +5400,10 @@ impl MacosTraceBackend {
             .iter()
             .map(|(_, pid, birth, _)| (*pid, *birth))
             .collect();
-        let ends = await_unenrolled_ends(
+        let wait_limit = crate::clock::now() + UNENROLLED_FORK_BOUND;
+        let ends = await_unenrolled_ends_with_limit(
             &identities,
-            crate::clock::now() + UNENROLLED_FORK_BOUND,
+            || crate::clock::cleanup_limit(wait_limit, &self.ledger),
             lookup,
             crate::clock::now,
             || std::thread::sleep(Duration::from_millis(2)),
@@ -5632,6 +5842,7 @@ impl TraceControl for MacosTraceBackend {
     ) -> Result<umbra_platform::shutdown::Start> {
         #[cfg(feature = "shutdown-witness")]
         umbra_platform::shutdown::witness(serde_json::json!({"event": "owner-begin"}));
+        self.ledger.freeze_admission()?;
         for session in &mut self.sessions {
             session.signals.close();
         }
@@ -5660,6 +5871,9 @@ impl TraceControl for MacosTraceBackend {
             .map(|live| open_fork_windows(live).len())
             .sum();
         let remaining = shutdown_allowance(retirement, live_sessions, fork_windows)?;
+        let remaining =
+            crate::clock::clamp_deadline(now + remaining, self.ledger.admission_cutoff()?)?
+                .saturating_duration_since(now);
         let accepted = self.ledger.freeze(nonce, remaining)?;
         Ok(umbra_platform::shutdown::Start::Local {
             accepted,
@@ -5712,7 +5926,10 @@ impl TraceControl for MacosTraceBackend {
                 ));
             }
             self.check_deadline()?;
-            let quiesce_limit = operation_deadline(self.deadline, Duration::from_secs(5));
+            let quiesce_limit = crate::clock::clamp_deadline(
+                operation_deadline(self.deadline, Duration::from_secs(5)),
+                self.ledger.admission_cutoff()?,
+            )?;
             let result = (|| {
                 // Interrupt all live connections before waiting on any one of them.
                 for s in &mut self.sessions {
@@ -5946,6 +6163,7 @@ mod tests {
         .unwrap();
         let mut parent = make();
         parent.spawn = Some(SpawnInFlight {
+            creation: None,
             token: barrier.token,
             snapshot,
             plan: SpawnPlan {
@@ -7304,3 +7522,7 @@ mod shutdown_tests;
 #[cfg(test)]
 #[path = "teardown_tests.rs"]
 mod teardown_tests;
+
+#[cfg(test)]
+#[path = "cancellation_tests.rs"]
+mod cancellation_tests;

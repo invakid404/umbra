@@ -1,0 +1,225 @@
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+//! Native managed-admission qualification; requires debugger permission.
+use std::{os::unix::ffi::OsStrExt, path::Path, sync::atomic::Ordering};
+use umbra_core::shutdown::Nonce;
+use umbra_core::*;
+use umbra_platform::{TraceBackend, TraceControl};
+use umbra_platform_macos::{MacosTraceBackend, Options};
+#[path = "support/managed_admission.rs"]
+mod managed_admission;
+
+fn path(value: &Path) -> BytePath {
+    BytePath::new(value.as_os_str().as_bytes().to_vec()).unwrap()
+}
+fn qualified() -> bool {
+    if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_some() {
+        return true;
+    }
+    eprintln!("SKIP: managed_cleanup requires UMBRA_INTEGRATION_REQUIRED and debugger permission");
+    false
+}
+#[test]
+fn r2_native_capacity_refusal_before_preparation() {
+    if !qualified() {
+        return;
+    }
+    let cache = tempfile::tempdir().unwrap();
+    let root = cache.path().canonicalize().unwrap();
+    let profile = include_str!("../../../experiments/seatbelt/umbra.sb")
+        .replace("{{UMBRA_RUN_ROOT}}", &format!("\"{}\"", root.display()));
+    let mut backend = MacosTraceBackend::new(Options {
+        twin_cache: Some(cache.path().to_owned()),
+        timeout_ms: Some(30_000),
+        ..Options::default()
+    });
+    let (_count, service) = managed_admission::install_with_capacity(&mut backend, 1, true);
+    let launch = backend.launch(LaunchSpec {
+        executable: path(Path::new("/usr/bin/true")),
+        argv: vec![b"/usr/bin/true".to_vec()],
+        environment: vec![],
+        cwd: path(&std::env::current_dir().unwrap()),
+        policy: LaunchPolicy {
+            persistence: PersistencePolicy::NfsClientFsync,
+            inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+            interpose: false,
+            descriptor_limit: None,
+        },
+        sandbox: SandboxRequirement::Required(
+            SandboxProfile::new(SEATBELT_PROFILE_FORMAT, profile.into_bytes(), path(&root))
+                .unwrap(),
+        ),
+    });
+    let error = launch.unwrap_err();
+    assert_eq!(error.operation, "admission");
+    assert!(error.to_string().contains("capacity"));
+    assert_eq!(
+        std::fs::read_dir(cache.path()).unwrap().count(),
+        0,
+        "capacity refusal must precede cache/signing preparation"
+    );
+    drop(backend);
+    assert_eq!(
+        service.join().unwrap(),
+        1,
+        "preexisting charge must remain retained"
+    );
+}
+
+#[test]
+fn r2_native_admission_root_parent_collection() {
+    if !qualified() {
+        return;
+    }
+    let cache = tempfile::tempdir().unwrap();
+    let root = cache.path().canonicalize().unwrap();
+    let profile = include_str!("../../../experiments/seatbelt/umbra.sb")
+        .replace("{{UMBRA_RUN_ROOT}}", &format!("\"{}\"", root.display()));
+    let mut backend = MacosTraceBackend::new(Options {
+        twin_cache: Some(cache.path().to_owned()),
+        timeout_ms: Some(30_000),
+        ..Options::default()
+    });
+    let (count, service) = managed_admission::install(&mut backend);
+    let launch = backend.launch(LaunchSpec {
+        executable: path(Path::new("/usr/bin/true")),
+        argv: vec![b"/usr/bin/true".to_vec()],
+        environment: vec![],
+        cwd: path(&std::env::current_dir().unwrap()),
+        policy: LaunchPolicy {
+            persistence: PersistencePolicy::NfsClientFsync,
+            inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+            interpose: false,
+            descriptor_limit: None,
+        },
+        sandbox: SandboxRequirement::Required(
+            SandboxProfile::new(SEATBELT_PROFILE_FORMAT, profile.into_bytes(), path(&root))
+                .unwrap(),
+        ),
+    });
+    if let Err(error) = launch {
+        drop(backend);
+        panic!("native launch failed: {error}");
+    }
+    assert!(
+        count.load(Ordering::Acquire) > 0,
+        "live native resources must remain charged"
+    );
+    let start = backend.begin_shutdown(Nonce::new_v4()).unwrap();
+    drop(backend);
+    let umbra_platform::shutdown::Start::Local { accepted, ledger } = start else {
+        panic!("native local custody required")
+    };
+    assert!(accepted
+        .confirms(&ledger.final_snapshot().unwrap())
+        .unwrap());
+    drop(ledger);
+    assert_eq!(
+        service.join().unwrap(),
+        0,
+        "all native obligations must be collected before capacity release"
+    );
+}
+
+#[test]
+fn r2_native_admission_packed_spawn_collection() {
+    if !qualified() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("spawn.c");
+    let program = dir.path().join("spawn");
+    std::fs::write(&source, "#include <spawn.h>\n#include <sys/wait.h>\nextern char **environ;\nint main(void){posix_spawnattr_t attr; if(posix_spawnattr_init(&attr))return 4; pid_t p; char *a[]={\"true\",0}; int s; if(posix_spawn(&p,\"/usr/bin/true\",0,&attr,a,environ))return 2; if(waitpid(p,&s,0)!=p)return 3; return !WIFEXITED(s)||WEXITSTATUS(s);}").unwrap();
+    assert!(std::process::Command::new("cc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&program)
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new(&program)
+        .status()
+        .unwrap()
+        .success());
+    let mut backend = MacosTraceBackend::new(Options {
+        twin_cache: Some(dir.path().join("twins")),
+        timeout_ms: Some(30_000),
+        ..Options::default()
+    });
+    let (_count, service) = managed_admission::install(&mut backend);
+    backend
+        .launch_experimental(LaunchSpec {
+            executable: path(&program),
+            argv: vec![program.as_os_str().as_bytes().to_vec()],
+            environment: vec![],
+            cwd: path(dir.path()),
+            policy: LaunchPolicy {
+                persistence: PersistencePolicy::LocalDevelopment,
+                inherited_fds: vec![TracedFd(0), TracedFd(1), TracedFd(2)],
+                interpose: false,
+                descriptor_limit: None,
+            },
+            sandbox: SandboxRequirement::UnsandboxedExperiment,
+        })
+        .unwrap();
+    let (mut live, mut prepared, mut children) = (1, 0, 0);
+    while live > 0 {
+        let event = match backend
+            .poll_event(std::time::Duration::from_millis(10))
+            .unwrap()
+        {
+            umbra_platform::EventPoll::Idle => continue,
+            umbra_platform::EventPoll::Event(event) => event,
+        };
+        let resume = match event {
+            TraceEvent::SpawnPrepare { token, plan } => {
+                prepared += 1;
+                Some((
+                    token.thread,
+                    ResumeMode::SpawnAuthorize(SpawnAuthorization {
+                        token,
+                        digest: plan.digest,
+                        table_generation: 1,
+                    }),
+                ))
+            }
+            TraceEvent::SpawnChild { authorization, .. } => {
+                children += 1;
+                live += 1;
+                Some((
+                    authorization.token.thread,
+                    ResumeMode::SpawnChildReady(authorization),
+                ))
+            }
+            TraceEvent::ThreadStarted { thread, .. }
+            | TraceEvent::SyscallEntry { thread, .. }
+            | TraceEvent::SyscallExit { thread, .. }
+            | TraceEvent::Exec { thread, .. } => Some((thread, ResumeMode::Syscall)),
+            TraceEvent::Exit { status, .. } => {
+                assert_eq!(status, ExitStatus::Code(0));
+                live -= 1;
+                None
+            }
+            other => panic!("unexpected packed-spawn event: {other:?}"),
+        };
+        if let Some((thread, mode)) = resume {
+            backend
+                .resume(ResumeCommand {
+                    thread,
+                    mode,
+                    signal: None,
+                })
+                .unwrap();
+        }
+    }
+    assert_eq!((prepared, children), (1, 1));
+    let start = backend.begin_shutdown(Nonce::new_v4()).unwrap();
+    drop(backend);
+    let umbra_platform::shutdown::Start::Local { accepted, ledger } = start else {
+        panic!("native custody required")
+    };
+    assert!(accepted
+        .confirms(&ledger.final_snapshot().unwrap())
+        .unwrap());
+    drop(ledger);
+    assert_eq!(service.join().unwrap(), 0);
+}

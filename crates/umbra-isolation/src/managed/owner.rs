@@ -193,9 +193,45 @@ pub struct Owner {
     collected: Option<ExitStatus>,
     failures: Vec<String>,
     watch: Option<super::process::ProcessWatch>,
+    admission: Option<super::admission::AdmissionService>,
+    admission_closed: bool,
+    independent_cancellation: Option<super::Channel>,
+    cancellation_queued: bool,
 }
 
 impl Owner {
+    /// Install the dedicated provider route before any Start.
+    pub fn install_cancellation(&mut self, channel: super::Channel) -> io::Result<()> {
+        if self.independent_cancellation.is_some() || self.tickets.ticket().is_some() {
+            return Err(invalid("late or duplicate cancellation installation"));
+        }
+        self.independent_cancellation = Some(channel);
+        Ok(())
+    }
+    /// Adopt the independently assigned admission route before cleanup starts.
+    pub fn install_admission(&mut self, channel: super::Channel) -> io::Result<()> {
+        if self.admission.is_some() || self.tickets.ticket().is_some() {
+            return Err(invalid("late or duplicate admission installation"));
+        }
+        self.admission = Some(super::admission::AdmissionService::new(
+            self.run,
+            self.capacity,
+            channel,
+        )?);
+        Ok(())
+    }
+
+    /// Conservative count includes entries whose responses or proofs were lost.
+    pub fn outstanding_admissions(&self) -> Option<u64> {
+        self.admission.as_ref().map(|service| service.outstanding())
+    }
+
+    fn freeze_admission(&mut self) {
+        if let Some(service) = &mut self.admission {
+            service.freeze();
+        }
+    }
+
     /// Adopt the already installed startup queue, preserving the descriptor
     /// budget and observations even when a peer's socket remains duplicated.
     pub fn install_watch(
@@ -353,6 +389,9 @@ impl Owner {
                     .tickets
                     .accept(start.clone(), start.origin, self.participant)
                     .map_err(invalid)?;
+                if let Some(service) = &mut self.admission {
+                    service.freeze();
+                }
                 let cutoff = start
                     .ticket
                     .started
@@ -463,6 +502,10 @@ impl Owner {
                 collected: None,
                 failures: Vec::new(),
                 watch: None,
+                admission: None,
+                admission_closed: false,
+                independent_cancellation: None,
+                cancellation_queued: false,
             }),
             Err(error) => Err((invalid(error), provider, cancellation, routes)),
         }
@@ -475,6 +518,7 @@ impl Owner {
             self.tickets
                 .accept(start.clone(), expected_origin, self.participant)
                 .map_err(invalid)?;
+            self.freeze_admission();
             return self.forward(start, None);
         }
         self.forwarded.push(start.clone());
@@ -489,6 +533,7 @@ impl Owner {
             publication.inventory(inventory);
         }
         self.publication = Some(publication);
+        self.freeze_admission();
         Ok(())
     }
 
@@ -501,6 +546,7 @@ impl Owner {
             ));
         }
         self.tickets.fail();
+        self.freeze_admission();
         self.failures.push(reason);
         self.cancellation_requested = true;
         Ok(())
@@ -526,19 +572,91 @@ impl Owner {
             }
         }
         self.poll_notifications()?;
-        if self.cancellation_requested && !self.transport_closed {
-            // shutdown reaches the worker's duplicate too, but leaves the provider
-            // process alive to complete EOF-triggered resource cleanup.
-            if let Err(error) = self.cancellation.shutdown(Shutdown::Both) {
-                self.tickets.fail();
-                self.failures
-                    .push(format!("provider transport closure: {error}"));
+        if self.tickets.ticket().is_some() {
+            self.freeze_admission();
+        }
+        let deadline = self.tickets.ticket().map_or(u64::MAX, |t| t.deadline);
+        let admission_error = self
+            .admission
+            .as_mut()
+            .filter(|_| !self.admission_closed)
+            .and_then(|service| service.poll(deadline).err());
+        if let Some(error) = admission_error {
+            self.admission_closed = true;
+            let orderly_eof = error.kind() == io::ErrorKind::UnexpectedEof
+                && self.tickets.ticket().is_some()
+                && self.outstanding_admissions() == Some(0);
+            // The failed endpoint retains its charges. Initiate cleanup once;
+            // later polls still have to collect the actual provider child.
+            if !orderly_eof && !self.cancellation_requested {
+                if self.tickets.ticket().is_none() {
+                    let start = Start {
+                        run: self.run,
+                        origin: self.participant,
+                        ticket: umbra_core::managed::Ticket::new(
+                            boot_nanos()?,
+                            umbra_core::managed::CleanupPath::Failed,
+                            self.capacity,
+                        )
+                        .map_err(invalid)?,
+                    };
+                    self.start(start, self.participant)?;
+                }
+                self.cancel(format!("owner admission channel: {error}"))?;
+                if self.publication.is_some() {
+                    return Ok(None);
+                }
             }
-            self.transport_closed = true;
+        }
+        if self.cancellation_requested && !self.transport_closed {
+            if let Some(channel) = &mut self.independent_cancellation {
+                let ticket = self
+                    .tickets
+                    .ticket()
+                    .ok_or_else(|| invalid("cancellation without ticket"))?;
+                let result = (|| {
+                    if !self.cancellation_queued {
+                        channel.queue(&super::cancellation::Notification {
+                            run: self.run,
+                            ticket,
+                        })?;
+                        self.cancellation_queued = true;
+                    }
+                    let cutoff = ticket.cutoffs(self.capacity).map_err(invalid)?.fallback;
+                    channel.flush(cutoff)
+                })();
+                match result {
+                    Ok(false) => return Ok(None),
+                    Ok(true) => {}
+                    Err(error) => {
+                        self.tickets.fail();
+                        self.failures
+                            .push(format!("independent cancellation: {error}"));
+                    }
+                }
+                self.transport_closed = true;
+            } else {
+                // shutdown reaches the worker's duplicate too, but leaves the provider
+                // process alive to complete EOF-triggered resource cleanup.
+                if let Err(error) = self.cancellation.shutdown(Shutdown::Both) {
+                    self.tickets.fail();
+                    self.failures
+                        .push(format!("provider transport closure: {error}"));
+                }
+                self.transport_closed = true;
+            }
         }
         if self.collected.is_none() {
             match self.provider.try_wait() {
                 Ok(Some(status)) => {
+                    if self
+                        .outstanding_admissions()
+                        .is_some_and(|count| count != 0)
+                    {
+                        self.tickets.fail();
+                        self.failures
+                            .push("provider exited with admission obligations".into());
+                    }
                     if !status.success() {
                         self.tickets.fail();
                         self.failures.push(format!("provider exited: {status}"));
@@ -786,6 +904,80 @@ mod tests {
     use umbra_core::managed::{CleanupPath, Role, Ticket};
 
     #[test]
+    fn dedicated_cancellation_preserves_rpc_and_collects_actual_child() {
+        use std::io::Read;
+        let run = RunIdentity {
+            nonce: umbra_core::shutdown::Nonce::from_u128(1),
+            generation: 1,
+        };
+        let participant =
+            super::super::process::identity(std::process::id(), Role::CleanupOwner).unwrap();
+        let (control, mut rpc) = UnixStream::pair().unwrap();
+        rpc.set_nonblocking(true).unwrap();
+        let child = Command::new("/usr/bin/true").spawn().unwrap();
+        let mut owner = match Owner::new(participant, run, 1, child, control, Vec::new()) {
+            Ok(owner) => owner,
+            Err((error, mut child, _, _)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{error}");
+            }
+        };
+        let result = (|| -> io::Result<()> {
+            let (sender, receiver) = UnixStream::pair()?;
+            owner.install_cancellation(super::super::Channel::new(sender)?)?;
+            let ticket = Ticket::new(boot_nanos()?, CleanupPath::Failed, 1).map_err(invalid)?;
+            owner.start(
+                Start {
+                    run,
+                    origin: participant,
+                    ticket,
+                },
+                participant,
+            )?;
+            owner.cancel("fixture requested cleanup".into())?;
+            let deadline = boot_nanos()? + 1_000_000_000;
+            loop {
+                if let Some(status) = owner.progress()? {
+                    assert!(status.success());
+                    break;
+                }
+                if boot_nanos()? >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                std::thread::yield_now();
+            }
+            let mut receiver = super::super::Channel::new(receiver)?;
+            let message = loop {
+                if let Some(message) =
+                    receiver.receive::<super::super::cancellation::Notification>(deadline)?
+                {
+                    break message;
+                }
+                std::thread::yield_now();
+            };
+            assert_eq!(message.run, run);
+            assert_eq!(message.ticket, ticket);
+            assert_eq!(
+                rpc.read(&mut [0u8; 1]).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "dedicated cancellation must leave main RPC open"
+            );
+            assert!(
+                owner.failed(),
+                "actual child success cannot erase cancellation failure"
+            );
+            Ok(())
+        })();
+        let mut child = owner.into_child();
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        assert!(child.wait().unwrap().success());
+        result.unwrap();
+    }
+
+    #[test]
     fn owner_closes_transport_then_collects_provider_after_cleanup() {
         owner_collection(false);
     }
@@ -793,6 +985,61 @@ mod tests {
     #[test]
     fn idle_owner_acknowledges_start_then_collects_provider_after_cleanup() {
         owner_collection(true);
+    }
+
+    #[test]
+    fn admission_eof_after_zero_obligations_still_requires_provider_wait() {
+        let run = RunIdentity {
+            nonce: umbra_core::shutdown::Nonce::from_u128(1),
+            generation: 1,
+        };
+        let participant =
+            super::super::process::identity(std::process::id(), Role::CleanupOwner).unwrap();
+        let (control, input) = UnixStream::pair().unwrap();
+        let child = Command::new("/usr/bin/true")
+            .stdin(Stdio::from(OwnedFd::from(input)))
+            .spawn()
+            .unwrap();
+        let mut owner = match Owner::new(participant, run, 1, child, control, Vec::new()) {
+            Ok(owner) => owner,
+            Err((error, mut child, _, _)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{error}");
+            }
+        };
+        let result = (|| -> io::Result<ExitStatus> {
+            let (provider, owner_channel) = UnixStream::pair()?;
+            owner.install_admission(super::super::Channel::new(owner_channel)?)?;
+            owner.start(
+                Start {
+                    run,
+                    origin: participant,
+                    ticket: Ticket::new(boot_nanos()?, CleanupPath::Trusted, 1).map_err(invalid)?,
+                },
+                participant,
+            )?;
+            drop(provider);
+            let deadline = boot_nanos()? + 1_000_000_000;
+            loop {
+                if let Some(status) = owner.progress()? {
+                    return Ok(status);
+                }
+                if boot_nanos()? >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                std::thread::yield_now();
+            }
+        })();
+        let failed = owner.failed();
+        let mut child = owner.into_child();
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let collected = child.wait().unwrap();
+        assert!(result.unwrap().success());
+        assert!(collected.success());
+        assert!(!failed, "orderly empty admission EOF must preserve success");
     }
 
     fn owner_collection(independent_start: bool) {
@@ -843,6 +1090,23 @@ mod tests {
             }
         };
         let result = (|| -> io::Result<ExitStatus> {
+            use super::super::{admission::AdmissionClient, Channel};
+            use umbra_core::{AdmissionError, AdmissionOperation};
+            let (provider_admission, owner_admission) = UnixStream::pair()?;
+            owner.install_admission(Channel::new(owner_admission)?)?;
+            let mut admission = AdmissionClient::new(run, Channel::new(provider_admission)?)?;
+            let obligation = umbra_core::shutdown::Nonce::from_u128(2);
+            admission.begin(AdmissionOperation::Reserve { obligation })?;
+            let admission_deadline = boot_nanos()? + 1_000_000_000;
+            loop {
+                owner.progress()?;
+                if let Some(result) = admission.poll(admission_deadline)? {
+                    if result != Ok(1) {
+                        return Err(invalid("initial admission was not granted"));
+                    }
+                    break;
+                }
+            }
             if owner.progress()?.is_some() {
                 return Err(invalid("provider exited before EOF"));
             }
@@ -919,6 +1183,25 @@ mod tests {
                 return Err(invalid(
                     "trusted Start prematurely closed provider transport",
                 ));
+            }
+            admission.begin(AdmissionOperation::Entering {
+                obligation,
+                resource: umbra_core::shutdown::Nonce::from_u128(3),
+            })?;
+            let admission_deadline = boot_nanos()? + 1_000_000_000;
+            loop {
+                owner.progress()?;
+                if let Some(result) = admission.poll(admission_deadline)? {
+                    if result != Err(AdmissionError::Frozen)
+                        || owner.outstanding_admissions() != Some(1)
+                        || owner.transport_closed
+                    {
+                        return Err(invalid(
+                            "Start did not freeze admission before cancellation",
+                        ));
+                    }
+                    break;
+                }
             }
             owner.cancel("test worker transport failure".into())?;
             let deadline = boot_nanos()? + 2_000_000_000;

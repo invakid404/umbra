@@ -85,14 +85,19 @@ pub const INSERT_VARIABLE: &str = "DYLD_INSERT_LIBRARIES";
 /// derived from the bytes, the write goes to a unique staging name first, and a
 /// published file that already matches byte for byte is reused.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub fn publish(options: &Options, deadline: Instant) -> Result<PathBuf> {
+pub fn publish(
+    options: &Options,
+    deadline: Instant,
+    ledger: Option<&umbra_platform::shutdown::Ledger>,
+) -> Result<PathBuf> {
     let root = cache_root(options)?.join("interpose");
     make_directory(&root)?;
     let folder = root.join(digest(DYLIB));
     make_directory(&folder)?;
     let published = folder.join("libumbra_interpose.dylib");
 
-    if matches(&published, DYLIB) && verify(&published, deadline).is_ok() {
+    if matches(&published, DYLIB) && cache::cached(verify(&published, deadline, ledger))?.is_some()
+    {
         return Ok(published);
     }
 
@@ -115,7 +120,7 @@ pub fn publish(options: &Options, deadline: Instant) -> Result<PathBuf> {
         // Verify the staged copy, not the published one: a signature that does
         // not validate means dyld will refuse to map it, and refusing here names
         // the cause instead of leaving a tracee that dies during image loading.
-        verify(&staging, deadline)?;
+        verify(&staging, deadline, ledger)?;
         fs::rename(&staging, &published).map_err(|e| error("interposer publish", e))?;
         Ok(published.clone())
     })();
@@ -127,7 +132,11 @@ pub fn publish(options: &Options, deadline: Instant) -> Result<PathBuf> {
 
 /// A host this backend cannot trace loads nothing.
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub fn publish(_options: &Options, _deadline: Instant) -> Result<PathBuf> {
+pub fn publish(
+    _options: &Options,
+    _deadline: Instant,
+    ledger: Option<&umbra_platform::shutdown::Ledger>,
+) -> Result<PathBuf> {
     Err(crate::unsupported(
         "the userspace-routing interposer requires macOS on arm64",
     ))
@@ -177,12 +186,17 @@ fn matches(path: &Path, expected: &[u8]) -> bool {
 }
 
 /// Refuse a copy dyld would not map.
-fn verify(path: &Path, deadline: Instant) -> Result<()> {
-    cache::command(
+fn verify(
+    path: &Path,
+    deadline: Instant,
+    ledger: Option<&umbra_platform::shutdown::Ledger>,
+) -> Result<()> {
+    cache::command_with_ledger(
         Command::new("/usr/bin/codesign")
             .args(["--verify", "--strict"])
             .arg(path),
         deadline,
+        ledger,
     )
     .map(|_| ())
 }
@@ -294,10 +308,10 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(60);
 
         // First publish: nothing is there, so this takes the staging path.
-        let first = publish(&options, deadline).expect("first publish");
+        let first = publish(&options, deadline, None).expect("first publish");
         // Second: the published copy already matches, so this takes the
         // content-addressed early return and writes nothing.
-        let second = publish(&options, deadline).expect("second publish");
+        let second = publish(&options, deadline, None).expect("second publish");
         assert_eq!(first, second, "the published path is content-addressed");
         assert!(
             matches(&first, DYLIB),
@@ -310,7 +324,7 @@ mod tests {
         // half the two calls above do not reach, and the half that can leave a
         // `.stage-*` file behind or hand back the wrong bytes.
         fs::remove_file(&first).unwrap();
-        let third = publish(&options, deadline).expect("republish after removal");
+        let third = publish(&options, deadline, None).expect("republish after removal");
         assert_eq!(
             third, first,
             "the path is derived from the bytes, not the run"

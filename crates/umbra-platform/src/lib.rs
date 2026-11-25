@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod admission;
 pub mod dirents;
 pub mod shutdown;
 
