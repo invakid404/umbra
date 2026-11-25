@@ -769,6 +769,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn r2_missing_custody_field_refuses_to_decode() {
+        let run_id = RunId(Uuid::from_u128(0x5150));
+        let full = RecoveryState {
+            custody: None,
+            run_id,
+            checkpoint: None,
+            last_valid_sequence: Sequence(4),
+            durable: None,
+            pending: vec![],
+            tail: JournalTailRecovery::Intact,
+            recovery_required: false,
+            clean: true,
+        };
+        let encoded = encode(&full).unwrap();
+        assert_eq!(&decode::<RecoveryState>(&encoded).unwrap(), &full);
+
+        // The same payload as an older peer would send it: every other field
+        // present, this one absent.
+        let older: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        let mut older = older.as_object().unwrap().clone();
+        assert!(
+            older.remove("custody").is_some(),
+            "the field must be on the wire in the first place"
+        );
+        let older = serde_json::to_vec(&older).unwrap();
+        let refused = decode::<RecoveryState>(&older).unwrap_err();
+        assert_eq!(
+            refused.kind,
+            ErrorKind::ProtocolMismatch,
+            "a missing verdict must fail closed, never default to 'recoverable'"
+        );
+    }
+
     /// The exhaustiveness `Overlay::replay_must_poison` relies on, asserted from
     /// this side too.
     ///
