@@ -549,5 +549,13 @@ fn r2_prepare_finish_requires_entire_run_receipt() {
         reopen(&request).custody.unwrap().record.state,
         CustodyPhase::Armed { .. }
     ));
-    assert!(f.control.join("writer.json").exists());
+    assert!(f
+        .overlay
+        .storage
+        .acquire_writer(&AcquireWriterRequest {
+            run_id: request.control.run_id,
+            writer_id: WriterId("receipt-contender".into()),
+            takeover: TakeoverPolicy::Refuse,
+        })
+        .is_err());
 }
