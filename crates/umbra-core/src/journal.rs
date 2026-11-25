@@ -406,6 +406,7 @@ pub enum JournalTailRecovery {
 pub struct RecoveryState {
     /// Replayed managed custody, absent for journals from unarmed runs.
     /// A missing wire field is rejected rather than interpreted as safe absence.
+    #[serde(deserialize_with = "required_custody")]
     pub custody: Option<crate::CustodyState>,
     /// Stable run identity; independent of the physical mount root.
     pub run_id: RunId,
@@ -444,6 +445,13 @@ pub struct RecoveryState {
     pub recovery_required: bool,
     /// False until unfinished effects and an unclean prior session are reconciled.
     pub clean: bool,
+}
+
+fn required_custody<'de, D>(deserializer: D) -> std::result::Result<Option<crate::CustodyState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<crate::CustodyState>::deserialize(deserializer)
 }
 
 #[cfg(test)]
