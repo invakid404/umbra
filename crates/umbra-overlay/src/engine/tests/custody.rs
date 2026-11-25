@@ -80,3 +80,94 @@ fn r2_finish_commit_ack_lost() {
     assert_eq!(state.last_valid_sequence, receipt.completed_through);
     assert!(matches!(state.custody.unwrap().record.state, CustodyPhase::Complete { .. }));
 }
+
+#[test]
+fn r2_recovery_cannot_erase_unknown_creator() {
+    let (mut f, request, _) = setup();
+    let state = reopen(&request);
+    let mut config = f.overlay.config.take().unwrap();
+    config.recovery = state;
+    let base = f.overlay.base.take().unwrap();
+    f.overlay.bind(config, base).unwrap();
+    assert!(f.overlay.requires_recovery().unwrap());
+    assert!(f.overlay.idle().is_err());
+    let mut candidate = FileJournal::new();
+    let recovered = candidate.open(&request).unwrap();
+    assert!(!recovered.clean);
+    assert!(candidate.append(&JournalRecord {
+        format_version: 1, sequence: Sequence(0), operation_id: OperationId(Uuid::new_v4()),
+        writer_epoch: f.overlay.config().unwrap().lease.epoch,
+        payload: JournalPayload::Lifecycle(JournalLifecycle::RunCompleted { through: Sequence(1) }),
+    }).is_err(), "a candidate lease cannot authorize mutation of unresolved custody");
+}
+
+#[test]
+fn r2_stale_owner_failure_generation() {
+    let (mut f, request, proof) = setup();
+    let mut stale = f.overlay.custody.as_ref().unwrap().record.clone();
+    stale.generation = Uuid::new_v4();
+    stale.sequence = 2;
+    stale.state = CustodyPhase::Failed { reason: "delayed owner receipt".into() };
+    assert!(f.overlay.persist_custody(stale).is_err());
+    // A rejected stale message cannot change the current generation's outcome.
+    f.overlay.prepare_finish(proof.clone()).unwrap();
+    f.overlay.commit_custody(&proof).unwrap();
+    assert!(reopen(&request).clean);
+}
+
+#[test]
+fn r2_concurrent_resume_single_writer() {
+    let (f, request, _) = setup();
+    let run_id = request.control.run_id;
+    std::thread::scope(|scope| {
+        let path = f._dirs[1].path();
+        let handles: Vec<_> = ["resume-a", "resume-b"].into_iter().map(|writer| {
+            scope.spawn(move || {
+                let mut contender = LocalStorage::new(path).unwrap();
+                contender.open_run(&OpenRunRequest {
+                    run_id, intent: OpenRunIntent::OpenExisting,
+                    immutable_base: ImmutableBaseContract {
+                        identity: "test-base".into(), fingerprint: vec![1],
+                    },
+                    policy: StoragePolicy {
+                        read_only: false, require_strict_remote_persistence: false,
+                        require_kernel_shadow: false, format_version: 1,
+                    },
+                }).unwrap();
+                contender.acquire_writer(&AcquireWriterRequest {
+                    run_id, writer_id: WriterId(writer.into()), takeover: TakeoverPolicy::Refuse,
+                }).is_err()
+            })
+        }).collect();
+        for handle in handles { assert!(handle.join().unwrap()); }
+    });
+    assert!(!reopen(&request).clean);
+}
+
+#[test]
+fn r2_reopen_after_admission_timeout() {
+    let (mut f, request, proof) = setup();
+    let mut failed = f.overlay.custody.as_ref().unwrap().record.clone();
+    failed.sequence = 2;
+    failed.state = CustodyPhase::Failed { reason: "admission acknowledgement timed out".into() };
+    f.overlay.fail_custody(failed).unwrap();
+    assert!(f.overlay.prepare_finish(proof).is_err());
+    let recovered = reopen(&request);
+    assert!(!recovered.clean);
+    assert!(matches!(recovered.custody.unwrap().record.state, CustodyPhase::Failed { .. }));
+}
+
+#[test]
+fn r2_warning_unwind_retains_custody() {
+    let (mut f, request, _) = setup();
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        panic!("injected warning observer unwind");
+    }));
+    assert!(unwind.is_err());
+    assert!(f.overlay.fail_run(&FailedRunRequest {
+        run_id: request.control.run_id, tree_terminated: true,
+        reason: "warning observer unwind".into(),
+    }).is_err());
+    assert!(!reopen(&request).clean);
+    assert!(f.overlay.config.is_some(), "failed custody retains writer authority");
+}

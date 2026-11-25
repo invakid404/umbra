@@ -63,3 +63,26 @@ fn r2_release_requires_terminal_proof() {
     })), Ok(0));
     assert!(ledger.failed(), "eventual collection cannot clear failure");
 }
+
+#[test]
+fn r2_absent_stale_partial_inventory() {
+    for (nonce, generation, sequence) in [
+        (Uuid::nil(), 1, 1),
+        (Uuid::from_u128(1), 2, 1),
+        (Uuid::from_u128(1), 1, u64::MAX),
+    ] {
+        let mut ledger = ledger();
+        let mut malformed = request(1, AdmissionOperation::Reserve {
+            obligation: Uuid::from_u128(2),
+        });
+        malformed.nonce = nonce;
+        malformed.generation = generation;
+        malformed.sequence = sequence;
+        assert_eq!(ledger.apply(malformed), Err(AdmissionError::Invalid));
+        assert!(ledger.failed());
+        assert_eq!(ledger.current(), 0);
+        assert_eq!(ledger.apply(request(1, AdmissionOperation::Reserve {
+            obligation: Uuid::from_u128(2),
+        })), Err(AdmissionError::Frozen));
+    }
+}
