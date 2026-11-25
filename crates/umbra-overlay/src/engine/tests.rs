@@ -11,6 +11,7 @@ use std::{
 use tempfile::TempDir;
 use umbra_storage_local::LocalStorage;
 use uuid::Uuid;
+mod custody;
 
 #[derive(Default)]
 struct Log {
@@ -101,6 +102,7 @@ impl Journal for MemoryJournal {
 }
 fn recovery(run_id: RunId) -> RecoveryState {
     RecoveryState {
+        custody: None,
         run_id,
         checkpoint: None,
         last_valid_sequence: Sequence(0),
@@ -6771,7 +6773,7 @@ fn inventory(records: &[JournalRecord]) -> Vec<JournalPendingOperation> {
             JournalPayload::Commit | JournalPayload::Abort { .. } => {
                 pending.retain(|e| e.operation_id != record.operation_id)
             }
-            JournalPayload::Lifecycle(_) => {}
+            JournalPayload::Lifecycle(_) | JournalPayload::Custody(_) => {}
         }
     }
     pending
