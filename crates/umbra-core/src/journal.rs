@@ -265,6 +265,8 @@ pub enum JournalLifecycle {
 /// recovery needs durable intent; abort does not assert that kernel writes vanished.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalPayload {
+    /// Dormant managed-run custody transition in the authoritative stream.
+    Custody(crate::CustodyRecord),
     /// Prepare.
     Prepare {
         /// Intent.
@@ -402,6 +404,9 @@ pub enum JournalTailRecovery {
 /// Validated recovery inventory; readable frames do not imply a prior flush receipt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryState {
+    /// Replayed managed custody, absent for journals from unarmed runs.
+    /// A missing wire field is rejected rather than interpreted as safe absence.
+    pub custody: Option<crate::CustodyState>,
     /// Stable run identity; independent of the physical mount root.
     pub run_id: RunId,
     /// Request a logical checkpoint after the caller establishes quiescence.
@@ -734,6 +739,7 @@ mod tests {
     fn a_recovery_state_without_the_declared_verdict_refuses_to_decode() {
         let run_id = RunId(Uuid::from_u128(0x5150));
         let full = RecoveryState {
+            custody: None,
             run_id,
             checkpoint: None,
             last_valid_sequence: Sequence(4),

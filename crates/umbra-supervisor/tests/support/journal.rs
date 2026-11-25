@@ -38,6 +38,7 @@ use umbra_journal::Journal;
 /// `reopen` helper for the shape.
 pub fn recovery(run_id: RunId) -> RecoveryState {
     RecoveryState {
+        custody: None,
         run_id,
         checkpoint: None,
         last_valid_sequence: Sequence(0),

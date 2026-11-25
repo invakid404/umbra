@@ -90,6 +90,8 @@ pub struct FileJournal {
 
 #[derive(Debug)]
 struct SessionState {
+    custody: Option<umbra_core::CustodyState>,
+    custody_sequence: Option<Sequence>,
     directory: PathBuf,
     log: PathBuf,
     file: Option<File>,
@@ -323,6 +325,8 @@ impl Journal for FileJournal {
             BTreeMap::new();
         // Latched by the replay below, never cleared. See `apply_recovery`.
         let mut recovery_required = false;
+        let mut custody = None;
+        let mut custody_sequence = None;
         let mut tail = JournalTailRecovery::Intact;
 
         if let Some(file) = existing.as_mut() {
@@ -370,12 +374,31 @@ impl Journal for FileJournal {
                         }
                         last_sequence = frame.record.sequence;
                         valid_bytes += frame.bytes;
+                        if let JournalPayload::Custody(record) = &frame.record.payload {
+                            custody = Some(umbra_core::CustodyState::transition(
+                                custody.as_ref(),
+                                request.control.run_id,
+                                frame.record.writer_epoch,
+                                record,
+                            )?);
+                            custody_sequence = Some(frame.record.sequence);
+                        }
                         apply_recovery(&mut pending, &mut recovery_required, &frame.record);
                     }
                 }
             }
         }
 
+        // A candidate writer claim permits inspection, not mutation of an
+        // unresolved managed run. In particular, do not repair its final tail.
+        let recovery_only = custody.as_ref().is_some_and(|state| state.recovery_only());
+        let writable = writable && !recovery_only;
+        let epoch = if recovery_only { None } else { epoch };
+        if recovery_only {
+            if let JournalTailRecovery::IncompleteFinalFrame { repaired, .. } = &mut tail {
+                *repaired = false;
+            }
+        }
         let session_file = if writable {
             let mut file = OpenOptions::new()
                 .create(true)
@@ -412,6 +435,8 @@ impl Journal for FileJournal {
         }
 
         self.session = Some(Box::new(SessionState {
+            custody: custody.clone(),
+            custody_sequence,
             directory,
             log,
             file: session_file,
@@ -423,8 +448,10 @@ impl Journal for FileJournal {
             closed: false,
         }));
 
-        let clean = recovery_is_clean(&pending, recovery_required, &tail);
+        let clean = recovery_is_clean(&pending, recovery_required, &tail)
+            && !custody.as_ref().is_some_and(|state| state.recovery_only());
         Ok(RecoveryState {
+            custody,
             run_id: request.control.run_id,
             checkpoint,
             last_valid_sequence: last_sequence,
@@ -452,7 +479,31 @@ impl Journal for FileJournal {
                 "record epoch does not match this session's writer authority",
             ));
         }
-        let sequence = Sequence(state.last_sequence.0 + 1);
+        let custody = match &record.payload {
+            JournalPayload::Custody(next) => Some(umbra_core::CustodyState::transition(
+                state.custody.as_ref(),
+                state.run_id,
+                epoch,
+                next,
+            )?),
+            _ => state.custody.clone(),
+        };
+        if matches!(record.payload, JournalPayload::Custody(_)) && custody == state.custody {
+            return state.custody_sequence.ok_or_else(|| {
+                error(
+                    ErrorKind::InvalidState,
+                    "journal_file.append",
+                    "missing custody sequence",
+                )
+            });
+        }
+        let sequence = Sequence(state.last_sequence.0.checked_add(1).ok_or_else(|| {
+            error(
+                ErrorKind::InvalidState,
+                "journal_file.append",
+                "sequence exhausted",
+            )
+        })?);
         let stored = JournalRecord {
             format_version: FORMAT_VERSION,
             // The caller's sequence is not authority to place a frame; the log
@@ -477,6 +528,10 @@ impl Journal for FileJournal {
             .map_err(|e| io_error("journal_file.append", &state.log, e))?;
         state.valid_bytes += frame.len() as u64;
         state.last_sequence = sequence;
+        state.custody = custody;
+        if matches!(record.payload, JournalPayload::Custody(_)) {
+            state.custody_sequence = Some(sequence);
+        }
         Ok(sequence)
     }
 
@@ -492,6 +547,14 @@ impl Journal for FileJournal {
         let file = state.file.as_ref().expect("writer has a log handle");
         file.sync_all()
             .map_err(|e| io_error("journal_file.flush", &state.log, e))?;
+        if state.custody.is_some() {
+            // Make the directory entry containing the authoritative log durable
+            // before acknowledging Armed. Unarmed flush ordering is unchanged.
+            fsync_directory(&state.directory)?;
+            if let Some(parent) = state.directory.parent() {
+                fsync_directory(parent)?;
+            }
+        }
         // The receipt covers everything accepted so far, which is at least the
         // requested sequence; a partial fsync is not a thing this backend claims.
         let receipt = DurableSequence {
@@ -731,7 +794,7 @@ fn apply_recovery(
         JournalPayload::Lifecycle(JournalLifecycle::RecoveryRequired) => {
             *recovery_required = true;
         }
-        JournalPayload::Lifecycle(_) => {}
+        JournalPayload::Lifecycle(_) | JournalPayload::Custody(_) => {}
     }
 }
 
@@ -846,8 +909,14 @@ mod tests {
         let mut reopened = FileJournal::new();
         let recovered = reopened.open(&request(scratch.path(), run_id, 2)).unwrap();
         assert!(recovered.pending.is_empty());
-        assert!(!recovered.recovery_required, "custody is distinct from the irreversible failure latch");
-        assert!(!recovered.clean, "an epoch advance cannot erase Armed custody");
+        assert!(
+            !recovered.recovery_required,
+            "custody is distinct from the irreversible failure latch"
+        );
+        assert!(
+            !recovered.clean,
+            "an epoch advance cannot erase Armed custody"
+        );
     }
 
     #[test]
@@ -857,13 +926,15 @@ mod tests {
         {
             let mut journal = FileJournal::new();
             journal.open(&request(scratch.path(), run_id, 1)).unwrap();
-            let sequence = journal.append(&record(
-                1,
-                OperationId(uuid_v4()),
-                JournalPayload::Lifecycle(JournalLifecycle::RunCompleted {
-                    through: Sequence(0),
-                }),
-            )).unwrap();
+            let sequence = journal
+                .append(&record(
+                    1,
+                    OperationId(uuid_v4()),
+                    JournalPayload::Lifecycle(JournalLifecycle::RunCompleted {
+                        through: Sequence(0),
+                    }),
+                ))
+                .unwrap();
             journal.flush(sequence).unwrap();
             journal.close().unwrap();
         }
