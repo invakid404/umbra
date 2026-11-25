@@ -386,3 +386,119 @@ fn r2_warning_unwind_retains_custody() {
         "failed custody retains writer authority"
     );
 }
+
+#[test]
+fn r2_complete_reopen_unarmed_finish() {
+    complete_reopen_finish(false);
+}
+
+#[test]
+fn r2_complete_reopen_new_generation() {
+    complete_reopen_finish(true);
+}
+
+fn complete_reopen_finish(arm_again: bool) {
+    let (mut f, mut request, mut proof) = setup();
+    let base = f.overlay.base.take().unwrap();
+    let old_epoch = f.overlay.config().unwrap().lease.epoch;
+    let old_generation = proof.generation;
+    f.overlay.prepare_finish(proof.clone()).unwrap();
+    f.overlay.commit_custody(&proof).unwrap();
+    let run_id = request.control.run_id;
+    let mut storage = LocalStorage::new(f._dirs[1].path()).unwrap();
+    let binding = storage
+        .open_run(&OpenRunRequest {
+            run_id,
+            intent: OpenRunIntent::OpenExisting,
+            immutable_base: ImmutableBaseContract {
+                identity: "test-base".into(),
+                fingerprint: vec![1],
+            },
+            policy: StoragePolicy {
+                read_only: false,
+                require_strict_remote_persistence: false,
+                require_kernel_shadow: false,
+                format_version: 1,
+            },
+        })
+        .unwrap();
+    let lease = storage
+        .acquire_writer(&AcquireWriterRequest {
+            run_id,
+            writer_id: WriterId("next-invocation".into()),
+            takeover: TakeoverPolicy::Refuse,
+        })
+        .unwrap();
+    assert!(lease.epoch.0 > old_epoch.0);
+    let JournalAccess::Writer(authority) = &mut request.access else {
+        unreachable!()
+    };
+    authority.lease_epoch = lease.epoch;
+    authority.writer_instance_id = "next-invocation".into();
+    let mut journal = FileJournal::new();
+    let recovered = journal.open(&request).unwrap();
+    assert!(recovered.clean);
+    let prior = recovered.custody.clone().unwrap();
+    let mut overlay = Overlay::new(Box::new(storage), Box::new(journal));
+    overlay
+        .bind(
+            SessionConfig {
+                context: context(run_id, Some(lease.epoch)),
+                binding,
+                lease: lease.clone(),
+                recovery: recovered,
+            },
+            base,
+        )
+        .unwrap();
+    if arm_again {
+        let mut armed = CustodyRecord {
+            run_id,
+            generation: Uuid::new_v4(),
+            sequence: 1,
+            state: CustodyPhase::Armed {
+                capacity: 64,
+                startup_nonce: Uuid::new_v4(),
+                participants: vec![CustodyParticipant {
+                    pid: std::process::id(),
+                    birth: 1,
+                }],
+            },
+        };
+        assert!(CustodyState::transition(Some(&prior), run_id, old_epoch, &armed).is_err());
+        armed.generation = old_generation;
+        assert!(CustodyState::transition(Some(&prior), run_id, lease.epoch, &armed).is_err());
+        armed.generation = Uuid::new_v4();
+        proof.generation = armed.generation;
+        overlay.arm_custody(armed).unwrap();
+    }
+    f.overlay = overlay;
+    f.run(&FsOp::Mkdir {
+        dir: DirRef::Cwd,
+        path: bytes(b"continued"),
+        mode: 0o750,
+    });
+    assert!(f.shadow_root.join("continued").is_dir());
+    if arm_again {
+        f.overlay.prepare_finish(proof.clone()).unwrap();
+        f.overlay.commit_custody(&proof).unwrap();
+    } else {
+        f.overlay
+            .finish_run(&FinishRunRequest {
+                run_id,
+                root_status: Some(ExitStatus::Code(0)),
+                processes_exited: 1,
+            })
+            .unwrap();
+    }
+    let recovered = reopen(&request);
+    assert!(recovered.clean);
+    assert_eq!(
+        recovered.custody.unwrap().record.generation,
+        if arm_again {
+            proof.generation
+        } else {
+            old_generation
+        }
+    );
+}
