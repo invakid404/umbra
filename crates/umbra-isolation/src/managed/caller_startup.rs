@@ -33,6 +33,19 @@ pub struct CallerStartup {
 }
 
 impl CallerStartup {
+    /// Continue failed cleanup after readiness when GO may have reached a child.
+    /// Pending child handles stay here if runtime adoption cannot be validated.
+    pub fn fail_runtime(&mut self) -> io::Result<super::guard::Outcome> {
+        self.failed = true;
+        let guard = self
+            .guard
+            .as_mut()
+            .ok_or_else(|| invalid("runtime guard not prepared"))?;
+        guard.adopt_ready_children(&mut self.children)?;
+        guard.notify_failure()?;
+        Ok(self.guard.take().unwrap().run_parent())
+    }
+
     /// Roll back only before publishing caller readiness can authorize arming.
     pub fn rollback(&mut self) -> io::Result<bool> {
         self.failed = true;

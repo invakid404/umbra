@@ -76,9 +76,35 @@ pub struct Guard {
     published: Vec<Start>,
     stage_events: std::collections::BTreeSet<u64>,
     exchanges: std::collections::BTreeMap<umbra_core::managed::Role, super::Channel>,
+    pending_failure: Option<Start>,
 }
 
 impl Guard {
+    /// Commit a failed cleanup trigger before returning to publication polling.
+    /// An existing cleanup allocation is preserved without renewal.
+    pub fn notify_failure(&mut self) -> io::Result<()> {
+        let ticket = match self.tickets.ticket() {
+            Some(ticket) => ticket,
+            None => umbra_core::managed::Ticket::new(
+                boot_nanos()?,
+                umbra_core::managed::CleanupPath::Failed,
+                self.capacity,
+            )
+            .map_err(invalid)?,
+        };
+        let start = Start {
+            run: self.run,
+            origin: self.local,
+            ticket,
+        };
+        self.tickets
+            .accept(start.clone(), self.local, self.local)
+            .map_err(invalid)?;
+        self.tickets.fail();
+        self.pending_failure = Some(start);
+        Ok(())
+    }
+
     /// Compose a guardian/relay runtime from its executable assignment and
     /// already installed startup queue. Prepare this before releasing GO.
     pub fn from_entry(
@@ -223,11 +249,19 @@ impl Guard {
         let mut events = Vec::new();
         let mut pending = std::collections::VecDeque::new();
         loop {
+            if let Some(start) = self.pending_failure.take() {
+                pending.push_front(Action::Publish(start));
+            }
             if !progress_failed {
                 if let Err(error) = progress(self.tickets.ticket()) {
                     progress_failed = true;
                     self.tickets.fail();
                     events.push(Event::Failed(format!("parent forwarding: {error}")));
+                    if let Err(error) = self.notify_failure() {
+                        events.push(Event::Failed(format!(
+                            "parent failure notification: {error}"
+                        )));
+                    }
                 }
             }
             for event in self.poll() {
@@ -269,6 +303,7 @@ impl Guard {
             }
             if (self.collected()
                 && pending.is_empty()
+                && self.pending_failure.is_none()
                 && self.publication.is_none()
                 && self
                     .peers
@@ -341,6 +376,7 @@ impl Guard {
             published: Vec::new(),
             stage_events: std::collections::BTreeSet::new(),
             exchanges: std::collections::BTreeMap::new(),
+            pending_failure: None,
         })
     }
 
