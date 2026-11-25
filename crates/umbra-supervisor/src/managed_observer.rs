@@ -64,7 +64,22 @@ impl CallerObserver {
 
     /// Deliver only a fresh, ordered request for this run.
     pub fn dispatch(&mut self, request: Request) -> Result<Response> {
-        let result = self.deliver(&request);
+        let result = if matches!(request.event, Event::StdioAdopted | Event::Prepared) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.deliver(&request)))
+            {
+                Ok(result) => result,
+                Err(payload) => {
+                    std::mem::forget(payload);
+                    Err(UmbraError::new(
+                        ErrorKind::InvalidState,
+                        "run.observer",
+                        "managed preparation observer panicked",
+                    ))
+                }
+            }
+        } else {
+            self.deliver(&request)
+        };
         if result.is_err() {
             self.failed = true;
         }
@@ -132,5 +147,129 @@ impl CallerObserver {
         }
         self.failed = false;
         Ok(())
+    }
+}
+
+/// Worker adapter. The exchange must drive transport and cleanup notifications
+/// together; it must not create an independent run or inactivity deadline.
+pub struct WorkerObserver<F> {
+    run_id: RunId,
+    next: u64,
+    exchange: F,
+    failed: bool,
+}
+
+impl<F: FnMut(Request) -> Result<Response>> WorkerObserver<F> {
+    /// Bind an exclusive request/response exchange to one storage run.
+    pub fn new(run_id: RunId, exchange: F) -> Self {
+        Self {
+            run_id,
+            next: 1,
+            exchange,
+            failed: false,
+        }
+    }
+
+    fn call(&mut self, event: Event) -> Result<()> {
+        let invalid = || {
+            UmbraError::new(
+                ErrorKind::ProtocolMismatch,
+                "run.observer",
+                "managed observer exchange failed or acknowledgment mismatched",
+            )
+        };
+        if self.failed {
+            return Err(invalid());
+        }
+        self.failed = true;
+        let sequence = self.next;
+        self.next = self.next.checked_add(1).ok_or_else(invalid)?;
+        let response = (self.exchange)(Request {
+            run_id: self.run_id,
+            sequence,
+            event,
+        })?;
+        if response.run_id != self.run_id || response.sequence != sequence {
+            return Err(invalid());
+        }
+        response.result?;
+        self.failed = false;
+        Ok(())
+    }
+}
+
+impl<F: FnMut(Request) -> Result<Response>> RunObserver for WorkerObserver<F> {
+    fn stdio_adopted(&mut self) -> Result<()> {
+        self.call(Event::StdioAdopted)
+    }
+    fn prepared(&mut self, run_id: RunId) -> Result<()> {
+        if run_id != self.run_id {
+            self.failed = true;
+            return Err(UmbraError::new(
+                ErrorKind::ProtocolMismatch,
+                "run.observer",
+                "prepared run mismatch",
+            ));
+        }
+        self.call(Event::Prepared)
+    }
+    fn finished(&mut self, outcome: &RunOutcome) {
+        if let Err(error) = self.call(Event::Finished(outcome.clone())) {
+            // These callbacks have no Result return. Preserve the existing
+            // unwind behavior so managed ownership cannot report success.
+            std::panic::panic_any(error);
+        }
+    }
+    fn teardown_warning(&mut self, error: &UmbraError) {
+        if let Err(error) = self.call(Event::TeardownWarning(error.clone())) {
+            std::panic::panic_any(error);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mismatched_acknowledgment_stops_further_callbacks() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let mut calls = 0;
+        let mut worker = WorkerObserver::new(run, |request: Request| {
+            calls += 1;
+            Ok(Response {
+                run_id: request.run_id,
+                sequence: request.sequence + 1,
+                result: Ok(()),
+            })
+        });
+        assert!(worker.stdio_adopted().is_err());
+        assert!(worker.prepared(run).is_err());
+        assert_eq!(calls, 1);
+    }
+
+    struct Panics;
+    impl RunObserver for Panics {
+        fn prepared(&mut self, _: RunId) -> Result<()> {
+            panic!("observer failure")
+        }
+        fn finished(&mut self, _: &RunOutcome) {
+            panic!("unexpected finished")
+        }
+        fn teardown_warning(&mut self, _: &UmbraError) {
+            panic!("unexpected warning")
+        }
+    }
+
+    #[test]
+    fn preparation_panic_is_reported_and_cannot_be_replayed() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let mut caller = CallerObserver::new(run, Some(Box::new(Panics)));
+        let mut worker = WorkerObserver::new(run, |request| caller.dispatch(request));
+        worker.stdio_adopted().unwrap();
+        let error = worker.prepared(run).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidState);
+        assert_eq!(error.operation, "run.observer");
+        assert!(worker.prepared(run).is_err());
     }
 }
