@@ -76,15 +76,92 @@ impl RelayStartup {
         self.step(|state| state.prepare_arming(request))
     }
 
+    /// Bind the caller's storage identity to the actual startup receipts.
+    /// A library caller supplies its installed-watch receipt separately.
+    pub fn arm_storage(
+        &mut self,
+        run_id: umbra_core::RunId,
+        caller: Option<super::startup::Ready>,
+    ) -> io::Result<()> {
+        self.step(|state| {
+            if run_id.0.is_nil() {
+                return Err(invalid("missing storage run identity"));
+            }
+            let mut readiness = state
+                .entry
+                .readiness()
+                .ok_or_else(|| invalid("relay readiness missing"))?
+                .to_vec();
+            if let Some(caller) = caller {
+                if caller.participant.role != Role::Caller {
+                    return Err(invalid("external readiness is not caller"));
+                }
+                readiness.push(caller);
+            }
+            readiness.sort_by_key(|receipt| receipt.participant.role);
+            let participants = readiness
+                .iter()
+                .map(|receipt| {
+                    let identity = receipt.participant;
+                    Ok(umbra_core::CustodyParticipant {
+                        pid: identity.pid,
+                        birth: identity
+                            .birth
+                            .0
+                            .checked_mul(1_000_000)
+                            .and_then(|value| value.checked_add(identity.birth.1))
+                            .ok_or_else(|| invalid("custody birth overflow"))?,
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let record = umbra_core::CustodyRecord {
+                run_id,
+                generation: uuid::Uuid::new_v4(),
+                sequence: 1,
+                state: umbra_core::CustodyPhase::Armed {
+                    capacity: state.entry.launch.capacity,
+                    startup_nonce: state.entry.launch.run.nonce,
+                    participants,
+                },
+            };
+            state.prepare_arming(Request {
+                run: state.entry.launch.run,
+                readiness,
+                record,
+            })
+        })
+    }
+
     fn prepare_arming(&mut self, request: Request) -> io::Result<()> {
         if !self.ready || self.arming.is_some() || request.run != self.entry.launch.run {
             return Err(invalid("relay arming out of order or wrong run"));
+        }
+        if !matches!(&request.record.state,
+            umbra_core::CustodyPhase::Armed { capacity, .. } if *capacity == self.entry.launch.capacity)
+        {
+            return Err(invalid("Armed request changed launch capacity"));
         }
         let external = self
             .entry
             .inventory()
             .ok_or_else(|| invalid("relay inventory missing"))?
             .external_caller;
+        let retained = self
+            .entry
+            .readiness()
+            .ok_or_else(|| invalid("relay receipts missing"))?;
+        let mut proposed: Vec<_> = request
+            .readiness
+            .iter()
+            .filter(|receipt| receipt.participant.role != Role::Caller)
+            .cloned()
+            .collect();
+        let mut retained = retained.to_vec();
+        proposed.sort_by_key(|receipt| receipt.participant.role);
+        retained.sort_by_key(|receipt| receipt.participant.role);
+        if proposed != retained {
+            return Err(invalid("Armed request changed subtree readiness"));
+        }
         let matches: Vec<_> = self
             .entry
             .endpoints

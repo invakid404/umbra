@@ -63,7 +63,12 @@ impl Entry {
         let mut topology = super::topology::Topology::new(false)?;
         let endpoints = topology.take(Role::Relay)?;
         let mut descendants = BTreeMap::new();
-        for role in [Role::Guardian, Role::Worker, Role::CleanupOwner, Role::Provider] {
+        for role in [
+            Role::Guardian,
+            Role::Worker,
+            Role::CleanupOwner,
+            Role::Provider,
+        ] {
             descendants.insert(role, topology.take(role)?);
         }
         Ok(Self {
@@ -648,7 +653,11 @@ impl Entry {
                 members: announcement.members.clone(),
             };
             inventory.validate(self.launch.run, false)?;
-            if self.announced.as_ref().is_some_and(|prior| prior != &announcement) {
+            if self
+                .announced
+                .as_ref()
+                .is_some_and(|prior| prior != &announcement)
+            {
                 return Err(invalid("root announcement changed"));
             }
             self.announced = Some(announcement);
@@ -706,7 +715,12 @@ impl Entry {
             let inventory = super::inventory::Inventory {
                 run: self.launch.run,
                 external_caller: false,
-                members: self.announced.as_ref().ok_or_else(|| invalid("root not announced"))?.members.clone(),
+                members: self
+                    .announced
+                    .as_ref()
+                    .ok_or_else(|| invalid("root not announced"))?
+                    .members
+                    .clone(),
             };
             inventory.validate(self.launch.run, false)?;
             self.inventory = Some(inventory);
@@ -818,7 +832,12 @@ impl Entry {
         descendants.insert(0, ready);
         if let Some(inventory) = &self.inventory {
             if self.root {
-                super::startup::Startup::from_readiness(self.launch.run, false, self.readiness_deadline, descendants.clone())?;
+                super::startup::Startup::from_readiness(
+                    self.launch.run,
+                    false,
+                    self.readiness_deadline,
+                    descendants.clone(),
+                )?;
             } else {
                 inventory.validate_readiness(local, &descendants)?;
             }
@@ -956,7 +975,7 @@ mod admission_tests {
             announced: None,
             inventory: None,
             readiness: None,
-        root: false,
+            root: false,
         };
         assert!(entry.take_admission().is_err());
         assert_eq!(

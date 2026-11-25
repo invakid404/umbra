@@ -717,6 +717,7 @@ dependencies = [
  "umbra-journal",
  "umbra-journal-file",
  "umbra-platform",
+ "uuid",
 ]
 
 [[package]]
