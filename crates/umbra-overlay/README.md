@@ -992,11 +992,14 @@ crate's `standard_namespace` and never opens a namespace descriptor.
 The concrete `Overlay` also exposes dormant `arm_custody`, `prepare_finish`,
 `commit_custody` and `fail_custody` methods for the later managed owner. They are
 not wired into `NamespaceSession`, its provider protocol or the supervisor yet.
-The caller must hold the bound writer claim. Arming appends and flushes Armed;
+The caller must hold the bound writer claim. Arming accepts only an Armed-phase
+record, then appends and flushes it;
 an uncertain append/flush retains custody conservatively. Preparation requires
 validated ledger Final, provider parent collection, terminal creators and
 confirmed cleanup, then flushes run data and FinishPrepared while retaining
-authority. It prevents further ordinary namespace operations. Commit accepts
+authority. The storage receipt must match the run and writer epoch, report
+nonzero durability, and cover `FlushScope::EntireRun`; a partial-scope receipt
+cannot authorize preparation. It prevents further ordinary namespace operations. Commit accepts
 only the exact prepared generation and certificate, flushes Complete, then
 closes the journal, releases the writer and closes storage. Accepted Failed
 custody prevents completion. A missing completion acknowledgement is resolved
