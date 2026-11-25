@@ -37,6 +37,124 @@ pub struct Response {
     pub result: Result<()>,
 }
 
+/// Nonblocking transport on an exclusively transferred managed channel.
+#[cfg(target_os = "macos")]
+pub struct WorkerTransport {
+    channel: umbra_isolation::managed::Channel,
+    failed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl WorkerTransport {
+    /// Adopt an existing channel; never create or duplicate a descriptor.
+    pub fn new(channel: umbra_isolation::managed::Channel) -> Self {
+        Self {
+            channel,
+            failed: false,
+        }
+    }
+
+    /// Keep notification processing active during observer delivery. `progress`
+    /// returns the original cleanup cutoff when one exists; it cannot renew it.
+    pub fn exchange(
+        &mut self,
+        request: Request,
+        mut progress: impl FnMut() -> Result<Option<u64>>,
+    ) -> Result<Response> {
+        if self.failed {
+            return Err(transport_error("observer transport already failed"));
+        }
+        self.failed = true;
+        self.channel.queue(&request).map_err(transport_error)?;
+        let mut deadline = u64::MAX;
+        let mut flushed = false;
+        loop {
+            if let Some(cutoff) = progress()? {
+                deadline = deadline.min(cutoff);
+            }
+            if !flushed {
+                flushed = self.channel.flush(deadline).map_err(transport_error)?;
+            }
+            if flushed {
+                if let Some(response) = self
+                    .channel
+                    .receive::<Response>(deadline)
+                    .map_err(transport_error)?
+                {
+                    if response.run_id != request.run_id || response.sequence != request.sequence {
+                        return Err(transport_error("observer acknowledgment mismatch"));
+                    }
+                    self.failed = response.result.is_err();
+                    return Ok(response);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn transport_error(error: impl std::fmt::Display) -> UmbraError {
+    UmbraError::new(
+        ErrorKind::ProtocolMismatch,
+        "run.observer",
+        error.to_string(),
+    )
+}
+
+/// Caller polling side. It owns callbacks and one bounded pending response.
+#[cfg(target_os = "macos")]
+pub struct CallerTransport {
+    channel: umbra_isolation::managed::Channel,
+    observer: CallerObserver,
+    pending: bool,
+    failed: bool,
+    deadline: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl CallerTransport {
+    /// Adopt a routed observer channel without additional descriptors.
+    pub fn new(channel: umbra_isolation::managed::Channel, observer: CallerObserver) -> Self {
+        Self {
+            channel,
+            observer,
+            pending: false,
+            failed: false,
+            deadline: u64::MAX,
+        }
+    }
+
+    /// One nonblocking step, sharing the caller runtime's original cutoff.
+    pub fn poll(&mut self, cutoff: Option<u64>) -> Result<()> {
+        if self.failed {
+            return Err(transport_error("caller observer transport already failed"));
+        }
+        self.failed = true;
+        if let Some(cutoff) = cutoff {
+            self.deadline = self.deadline.min(cutoff);
+        }
+        if self.pending {
+            if !self.channel.flush(self.deadline).map_err(transport_error)? {
+                self.failed = false;
+                return Ok(());
+            }
+            self.pending = false;
+        }
+        if let Some(request) = self
+            .channel
+            .receive::<Request>(self.deadline)
+            .map_err(transport_error)?
+        {
+            let response = self.observer.dispatch(request)?;
+            self.channel.queue(&response).map_err(transport_error)?;
+            self.pending = !self.channel.flush(self.deadline).map_err(transport_error)?;
+        }
+        self.failed = false;
+        Ok(())
+    }
+}
+
 /// Caller-owned callbacks. Protocol or callback failure permanently stops delivery.
 pub struct CallerObserver {
     run_id: RunId,
