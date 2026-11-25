@@ -127,6 +127,14 @@ impl CustodyState {
                 }
             }
             Some(prior) => {
+                if !prior.recovery_only()
+                    && epoch.0 > prior.writer_epoch.0
+                    && record.generation != prior.record.generation
+                {
+                    // A completed invocation remains history; a later writer may
+                    // start a distinct generation with the initial Armed contract.
+                    return Self::transition(None, run_id, epoch, record);
+                }
                 if prior.writer_epoch != epoch || prior.record.generation != record.generation {
                     return Err(invalid());
                 }

@@ -706,7 +706,12 @@ impl Overlay {
     /// There are no production callers in the foundation slice.
     pub fn arm_custody(&mut self, record: CustodyRecord) -> Result<Sequence> {
         self.idle()?;
-        if self.custody.is_some() || self.planned.is_some() {
+        if self
+            .custody
+            .as_ref()
+            .is_some_and(CustodyState::recovery_only)
+            || self.planned.is_some()
+        {
             return Err(error(
                 ErrorKind::InvalidState,
                 "custody already armed or operation planned",
@@ -732,7 +737,11 @@ impl Overlay {
             Err(e) => {
                 // An append or flush error may have persisted the transition.
                 // Retain its custody obligation even without an acknowledgement.
-                if self.custody.is_none() {
+                if !self
+                    .custody
+                    .as_ref()
+                    .is_some_and(CustodyState::recovery_only)
+                {
                     self.custody = Some(next);
                 }
                 self.poisoned = true;
@@ -4803,7 +4812,11 @@ impl NamespaceSession for Overlay {
     }
     fn finish_run(&mut self, request: &FinishRunRequest) -> Result<FinishRunReceipt> {
         self.idle()?;
-        if self.custody.is_some() {
+        if self
+            .custody
+            .as_ref()
+            .is_some_and(CustodyState::recovery_only)
+        {
             return Err(error(
                 ErrorKind::InvalidState,
                 "armed custody requires prepare/commit",
