@@ -661,6 +661,7 @@ dependencies = [
 name = "umbra-journal-file"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "tempfile",
  "umbra-core",
  "umbra-journal",
@@ -676,6 +677,7 @@ dependencies = [
  "tracing",
  "umbra-core",
  "umbra-journal",
+ "umbra-journal-file",
  "umbra-storage",
  "umbra-storage-local",
  "uuid",

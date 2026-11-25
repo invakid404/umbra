@@ -1,10 +1,56 @@
 # umbra-core
 
 Shared byte paths, stable IDs, filesystem IR, storage/journal/namespace/agent DTOs,
-and structured errors. All DTO families support serde; BytePath, RegisterSet and
+and structured errors. Persisted and wire DTO families support serde; BytePath, RegisterSet and
 StoragePath validate during deserialization, and write payloads have an explicit bound.
 Storage types are available both at the root and through `storage` for compatibility.
 Core has no Umbra dependencies and forbids unsafe code.
+
+## Dormant cleanup-owner foundation
+
+`AdmissionLedger` is a pure per-run state machine with no production callers.
+The exported default simultaneous capacity is 64; callers negotiate the limit. Reserve commits a charge
+before returning a grant; Entering commits the resource identity before a future
+caller may acquire it. Retiring keeps the charge. Release requires a terminal
+creator checkpoint and actual parent collection, or proof that entry never
+occurred. EOF and disappearance are not collection certificates.
+
+Exclusive mutable access serializes Freeze with grants and entries. Freeze
+forbids both. Capacity refusal reports the configured capacity and current count;
+it performs no resource side effect. A lost reply retains its charge. Exact
+retransmission of the latest request returns the committed result, while older
+or conflicting requests fail and freeze admission. Nonce, generation, sequence
+and checked arithmetic guard transitions. The replay cache holds one response,
+so unlimited session duration does not accumulate a transaction history in
+memory. Capacity counts current obligations, never session age or inactivity.
+
+`CustodyRecord` adds Armed, FinishPrepared, Complete and Failed phases to the
+authoritative journal, under its writer epoch and a separate run generation.
+`RecoveryState::custody` carries replayed custody independently of the permanent
+`RecoveryRequired` latch. The wire field is required even when its value is null;
+an older reply that omits it fails decoding. Existing unarmed journal records
+remain readable. Nonterminal or Failed custody permits recovery inspection only,
+and a new writer epoch cannot erase it. Complete remains durable history and
+permits normal work and finalization after reopen. A later writer may start a
+distinct Armed generation at custody sequence one only with a strictly newer
+writer epoch; same-epoch or reused-generation restart is refused.
+
+These APIs do not activate the managed topology or repair the provider-drop
+endpoints yet (Refs #299, Refs #205). PR 2 supplies the cleanup-owner process,
+all acquisition fences, runtime deadlines, CLI activation and managed executable
+library entrypoint. PR 3 addresses trusted-inventory waits and admission overhead;
+PR 4 supplies library adapters and migration examples.
+
+The accepted activation residuals remain explicit: total loss of all caller
+notification routes before any Start has no proven finite caller-return bound.
+Custody is retained and the outcome remains failed or unconfirmed; there is no
+session-age or inactivity timeout. Cleanup-owner, guardian or relay loss can
+leave orphaned helpers; a stalled owner requiring forced fallback and late
+kernel creation after Entering can also leave collection unconfirmed. The kernel
+case where the tracer itself ends while holding a program remains outside this
+work. These conditions never establish clean completion. This dormant slice adds
+no runtime waits, processes or descriptors; its state-machine calls perform no
+I/O. The later activation must enforce its separately accepted timing bounds.
 
 On Unix, `launch_stdio::LaunchStdio` owns validated copies of the caller's
 standard streams. It accepts tty, pipe/FIFO, Unix stream, regular-file and

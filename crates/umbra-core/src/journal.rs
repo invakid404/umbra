@@ -265,6 +265,8 @@ pub enum JournalLifecycle {
 /// recovery needs durable intent; abort does not assert that kernel writes vanished.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalPayload {
+    /// Dormant managed-run custody transition in the authoritative stream.
+    Custody(crate::CustodyRecord),
     /// Prepare.
     Prepare {
         /// Intent.
@@ -402,6 +404,10 @@ pub enum JournalTailRecovery {
 /// Validated recovery inventory; readable frames do not imply a prior flush receipt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryState {
+    /// Replayed managed custody, absent for journals from unarmed runs.
+    /// A missing wire field is rejected rather than interpreted as safe absence.
+    #[serde(deserialize_with = "required_custody")]
+    pub custody: Option<crate::CustodyState>,
     /// Stable run identity; independent of the physical mount root.
     pub run_id: RunId,
     /// Request a logical checkpoint after the caller establishes quiescence.
@@ -439,6 +445,15 @@ pub struct RecoveryState {
     pub recovery_required: bool,
     /// False until unfinished effects and an unclean prior session are reconciled.
     pub clean: bool,
+}
+
+fn required_custody<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<crate::CustodyState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<crate::CustodyState>::deserialize(deserializer)
 }
 
 #[cfg(test)]
@@ -734,6 +749,7 @@ mod tests {
     fn a_recovery_state_without_the_declared_verdict_refuses_to_decode() {
         let run_id = RunId(Uuid::from_u128(0x5150));
         let full = RecoveryState {
+            custody: None,
             run_id,
             checkpoint: None,
             last_valid_sequence: Sequence(4),
@@ -752,6 +768,40 @@ mod tests {
         let mut older = older.as_object().unwrap().clone();
         assert!(
             older.remove("recovery_required").is_some(),
+            "the field must be on the wire in the first place"
+        );
+        let older = serde_json::to_vec(&older).unwrap();
+        let refused = decode::<RecoveryState>(&older).unwrap_err();
+        assert_eq!(
+            refused.kind,
+            ErrorKind::ProtocolMismatch,
+            "a missing verdict must fail closed, never default to 'recoverable'"
+        );
+    }
+
+    #[test]
+    fn r2_missing_custody_field_refuses_to_decode() {
+        let run_id = RunId(Uuid::from_u128(0x5150));
+        let full = RecoveryState {
+            custody: None,
+            run_id,
+            checkpoint: None,
+            last_valid_sequence: Sequence(4),
+            durable: None,
+            pending: vec![],
+            tail: JournalTailRecovery::Intact,
+            recovery_required: false,
+            clean: true,
+        };
+        let encoded = encode(&full).unwrap();
+        assert_eq!(&decode::<RecoveryState>(&encoded).unwrap(), &full);
+
+        // The same payload as an older peer would send it: every other field
+        // present, this one absent.
+        let older: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        let mut older = older.as_object().unwrap().clone();
+        assert!(
+            older.remove("custody").is_some(),
             "the field must be on the wire in the first place"
         );
         let older = serde_json::to_vec(&older).unwrap();

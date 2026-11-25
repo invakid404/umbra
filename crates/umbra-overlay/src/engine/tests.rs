@@ -11,10 +11,13 @@ use std::{
 use tempfile::TempDir;
 use umbra_storage_local::LocalStorage;
 use uuid::Uuid;
+mod custody;
 
 #[derive(Default)]
 struct Log {
     records: Vec<JournalRecord>,
+    fail_custody: bool,
+    fail_flush: bool,
     fail_prepare: bool,
     fail_commit: bool,
     /// Injects a failure on the `Abort` record's append.
@@ -42,6 +45,7 @@ impl Journal for MemoryJournal {
     fn append(&mut self, record: &JournalRecord) -> Result<Sequence> {
         let mut log = self.log.lock().unwrap();
         if (log.fail_prepare && matches!(record.payload, JournalPayload::Prepare { .. }))
+            || (log.fail_custody && matches!(record.payload, JournalPayload::Custody(_)))
             || (log.fail_commit && matches!(record.payload, JournalPayload::Commit))
             || (log.fail_abort && matches!(record.payload, JournalPayload::Abort { .. }))
         {
@@ -54,6 +58,9 @@ impl Journal for MemoryJournal {
         Ok(sequence)
     }
     fn flush(&mut self, through: Sequence) -> Result<DurableSequence> {
+        if self.log.lock().unwrap().fail_flush {
+            return Err(error(ErrorKind::Io, "injected journal durability failure"));
+        }
         // A landmine for reopen tests, and cheaper to name than to hit. Since
         // #65 `bind` seeds `last_committed` from `recovery.last_valid_sequence`,
         // so a session reopened over a journal that reports N records starts
@@ -101,6 +108,7 @@ impl Journal for MemoryJournal {
 }
 fn recovery(run_id: RunId) -> RecoveryState {
     RecoveryState {
+        custody: None,
         run_id,
         checkpoint: None,
         last_valid_sequence: Sequence(0),
@@ -202,6 +210,7 @@ impl Storage for BadReceipt {
             // reach the engine's `ProtocolMismatch` -- and only this one models
             // a store that could not make the undo durable in the first place.
             3 => return Err(error(ErrorKind::Io, "injected flush failure")),
+            4 => receipt.scope = FlushScope::Data { objects: vec![] },
             _ => unreachable!(),
         }
         Ok(receipt)
@@ -6771,7 +6780,7 @@ fn inventory(records: &[JournalRecord]) -> Vec<JournalPendingOperation> {
             JournalPayload::Commit | JournalPayload::Abort { .. } => {
                 pending.retain(|e| e.operation_id != record.operation_id)
             }
-            JournalPayload::Lifecycle(_) => {}
+            JournalPayload::Lifecycle(_) | JournalPayload::Custody(_) => {}
         }
     }
     pending

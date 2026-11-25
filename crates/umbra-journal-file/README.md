@@ -19,7 +19,7 @@ Boundaries the implementation keeps:
   authority before opening anything for mutation, then replays to establish the
   last valid sequence and the prepared-but-uncommitted operations for the
   namespace owner to reconcile. Recovery is clean only with no pending operations,
-  an intact tail, and no `RecoveryRequired` verdict from a prior session -- the
+  an intact tail, no unresolved managed custody, and no `RecoveryRequired` verdict from a prior session -- the
   third is not implied by the first, because the session that declares itself
   unrecoverable also writes the terminal record that empties `pending` of the
   operation it is about. Readable frames are never treated as evidence of a
@@ -28,7 +28,10 @@ Boundaries the implementation keeps:
   remains corruption.
 - A demonstrably incomplete final frame is the only recoverable log damage, reported as
   `IncompleteFinalFrame`; truncating it requires writer authority, so a read-only
-  open reports it without repairing. A complete frame with a bad checksum, or any
+  open reports it without repairing. Reopening Armed, FinishPrepared or Failed
+  custody also permits inspection only, even with a candidate writer claim:
+  append, checkpoint publication and tail repair remain forbidden.
+  A complete frame with a bad checksum, or any
   interior corruption or sequence gap, is `CorruptJournal`.
 - `append` assigns and persists the sequence itself; a caller's sequence is not
   authority to place a frame. A record whose epoch does not match the session's
@@ -45,6 +48,20 @@ Boundaries the implementation keeps:
   by an older writer falls back to full log replay without selecting a snapshot.
 - `close` surfaces the error from its final flush rather than reporting a clean
   shutdown over a failed write.
+
+Managed custody is dormant groundwork for the later cleanup-owner activation.
+No production path currently writes these records. The authoritative stream
+validates run, writer epoch, generation, sequence and phase transitions:
+Armed -> FinishPrepared -> Complete, or Armed/FinishPrepared -> Failed.
+Failed is terminal; advancing a writer epoch does not resolve custody.
+Exact retransmission of the latest custody record returns its original journal
+sequence without appending another record. A lost Complete acknowledgement can
+therefore be resolved by inspecting the committed generation.
+
+Custody flush includes the journal directory and its parent before returning a
+durability receipt. Ordinary unarmed journals retain their existing record
+format, replay and flush ordering. Custody is separate from the irreversible
+`RecoveryRequired` latch: completing custody cannot clear that prior failure.
 
 Resumable checkpoint recovery is out of scope here: this backend publishes and
 reads checkpoints, but reconciling a nonempty recovery into a running namespace is

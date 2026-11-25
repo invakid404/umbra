@@ -41,6 +41,10 @@ use uuid::Uuid;
 
 mod journal;
 pub use journal::*;
+mod custody;
+pub use custody::*;
+mod admission;
+pub use admission::*;
 
 mod platform;
 pub use platform::{PlatformCapabilities, QuiescedTree, TerminationPolicy};

@@ -64,6 +64,7 @@ workspace = true
 workspace = true
 
 [dev-dependencies]
+umbra-journal-file = { path = "../umbra-journal-file" }
 umbra-storage-local = { path = "../umbra-storage-local" }
 tempfile.workspace = true
 uuid.workspace = true

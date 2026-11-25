@@ -631,6 +631,8 @@ pub struct Overlay {
     pending: Option<Pending>,
     poisoned: bool,
     completed_run: Option<RunId>,
+    custody: Option<CustodyState>,
+    prepared_custody: Option<(CustodyFinishProof, DurabilityReceipt)>,
     serial: u64,
     last_committed: Sequence,
     pages: BTreeMap<Vec<u8>, (StoragePath, Vec<DirectoryEntry>)>,
@@ -686,6 +688,188 @@ pub struct Overlay {
 }
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 impl Overlay {
+    /// Persist a sequenced failure for the current managed generation. Stale
+    /// evidence is rejected before append; accepted failure blocks completion.
+    pub fn fail_custody(&mut self, record: CustodyRecord) -> Result<Sequence> {
+        if !matches!(&record.state, CustodyPhase::Failed { reason } if !reason.is_empty()) {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                "expected attributable custody failure",
+            ));
+        }
+        let sequence = self.persist_custody(record)?;
+        self.poisoned = true;
+        Ok(sequence)
+    }
+
+    /// Persist a dormant managed generation before a future caller may send GO.
+    /// There are no production callers in the foundation slice.
+    pub fn arm_custody(&mut self, record: CustodyRecord) -> Result<Sequence> {
+        self.idle()?;
+        if !matches!(record.state, CustodyPhase::Armed { .. }) {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "arming requires Armed phase",
+            ));
+        }
+        if self
+            .custody
+            .as_ref()
+            .is_some_and(CustodyState::recovery_only)
+            || self.planned.is_some()
+        {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "custody already armed or operation planned",
+            ));
+        }
+        self.persist_custody(record)
+    }
+
+    fn persist_custody(&mut self, record: CustodyRecord) -> Result<Sequence> {
+        let config = self.config()?;
+        let next = CustodyState::transition(
+            self.custody.as_ref(),
+            config.context.run_id,
+            config.lease.epoch,
+            &record,
+        )?;
+        let operation = config.context.operation_id;
+        match self.record(operation, JournalPayload::Custody(record), true) {
+            Ok(sequence) => {
+                self.custody = Some(next);
+                Ok(sequence)
+            }
+            Err(e) => {
+                // An append or flush error may have persisted the transition.
+                // Retain its custody obligation even without an acknowledgement.
+                if !self
+                    .custody
+                    .as_ref()
+                    .is_some_and(CustodyState::recovery_only)
+                {
+                    self.custody = Some(next);
+                }
+                self.poisoned = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Flush data and prepare an exact terminal decision while retaining the
+    /// writer claim. Ordinary namespace operations stop after preparation.
+    pub fn prepare_finish(&mut self, proof: CustodyFinishProof) -> Result<Sequence> {
+        self.idle()?;
+        if self.planned.is_some()
+            || !proof.ledger_final
+            || !proof.provider_collected
+            || !proof.creators_terminal
+            || !proof.cleanup_confirmed
+        {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "incomplete custody certificate",
+            ));
+        }
+        let prior = self
+            .custody
+            .as_ref()
+            .ok_or_else(|| error(ErrorKind::InvalidState, "custody is not armed"))?;
+        if prior.record.generation != proof.generation
+            || !matches!(prior.record.state, CustodyPhase::Armed { .. })
+        {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "wrong custody generation or phase",
+            ));
+        }
+        let mut next = prior.record.clone();
+        next.sequence = next
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| error(ErrorKind::InvalidState, "custody sequence exhausted"))?;
+        next.state = CustodyPhase::FinishPrepared {
+            certificate: proof.certificate,
+            root_result: proof.root_result,
+        };
+        let context = self.context()?;
+        let durability = self.storage.flush(&FlushRequest {
+            context,
+            scope: FlushScope::EntireRun,
+        })?;
+        let config = self.config()?;
+        if durability.run_id != config.context.run_id
+            || durability.writer_epoch != config.lease.epoch
+            || durability.durability == Durability::None
+            || durability.scope != FlushScope::EntireRun
+        {
+            return Err(error(
+                ErrorKind::ProtocolMismatch,
+                "invalid storage durability receipt",
+            ));
+        }
+        let sequence = self.persist_custody(next)?;
+        self.prepared_custody = Some((proof, durability));
+        Ok(sequence)
+    }
+
+    /// Commit the prepared decision durably before releasing writer authority.
+    /// A lost acknowledgement is resolved by replaying this exact generation.
+    pub fn commit_custody(&mut self, proof: &CustodyFinishProof) -> Result<FinishRunReceipt> {
+        if self.poisoned {
+            return Err(error(ErrorKind::InvalidState, "custody requires recovery"));
+        }
+        let (prepared, durability) = self
+            .prepared_custody
+            .as_ref()
+            .ok_or_else(|| error(ErrorKind::InvalidState, "custody finish is not prepared"))?;
+        if prepared != proof {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "custody certificate changed",
+            ));
+        }
+        let durability = durability.clone();
+        let mut next = self
+            .custody
+            .as_ref()
+            .expect("prepared custody")
+            .record
+            .clone();
+        next.sequence = next
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| error(ErrorKind::InvalidState, "custody sequence exhausted"))?;
+        next.state = CustodyPhase::Complete {
+            certificate: proof.certificate,
+        };
+        let lease = self.config()?.lease.clone();
+        let completed_through = self.persist_custody(next)?;
+        self.poisoned = true;
+        self.completed_run = Some(lease.run_id);
+        let mut cleanup: Result<()> = Ok(());
+        for result in [
+            self.journal.close(),
+            self.storage.release_writer(&lease),
+            self.storage.close_run(),
+        ] {
+            if let Err(e) = result {
+                match &mut cleanup {
+                    Ok(()) => cleanup = Err(e),
+                    Err(primary) => primary.context.push_str(&format!("; {e}")),
+                }
+            }
+        }
+        self.config = None;
+        self.base = None;
+        cleanup?;
+        Ok(FinishRunReceipt {
+            run_id: lease.run_id,
+            durability,
+            completed_through,
+        })
+    }
+
     /// Inject contracts without selecting, opening, or acquiring a backend.
     pub fn new(storage: Box<dyn Storage>, journal: Box<dyn Journal>) -> Self {
         Self {
@@ -697,6 +881,8 @@ impl Overlay {
             pending: None,
             poisoned: false,
             completed_run: None,
+            custody: None,
+            prepared_custody: None,
             serial: 0,
             last_committed: Sequence(0),
             pages: BTreeMap::new(),
@@ -729,7 +915,7 @@ impl Overlay {
     }
     fn idle(&self) -> Result<()> {
         self.config()?;
-        if self.poisoned || self.pending.is_some() {
+        if self.poisoned || self.pending.is_some() || self.prepared_custody.is_some() {
             return Err(error(
                 ErrorKind::InvalidState,
                 "transaction pending or recovery required",
@@ -3522,6 +3708,11 @@ impl NamespaceSession for Overlay {
         // `all`, so an inventory with nothing in it is vacuously reconcilable --
         // which is right, and is the E6 case.
         let poisoned = config.recovery.recovery_required
+            || config
+                .recovery
+                .custody
+                .as_ref()
+                .is_some_and(|state| state.recovery_only())
             || !config.recovery.pending.iter().all(reconcilable_on_reopen);
         // Seed the session from the inventory it just accepted. On master the two
         // predicates dropped above made a non-pristine state unbindable, so both
@@ -3576,6 +3767,7 @@ impl NamespaceSession for Overlay {
         // a follow-up rather than guessed at here.
         self.used_operations
             .extend(config.recovery.pending.iter().map(|p| p.operation_id));
+        self.custody = config.recovery.custody.clone();
         self.config = Some(config);
         self.base = Some(base);
         self.poisoned = poisoned;
@@ -4627,6 +4819,16 @@ impl NamespaceSession for Overlay {
     }
     fn finish_run(&mut self, request: &FinishRunRequest) -> Result<FinishRunReceipt> {
         self.idle()?;
+        if self
+            .custody
+            .as_ref()
+            .is_some_and(CustodyState::recovery_only)
+        {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "armed custody requires prepare/commit",
+            ));
+        }
         let config = self.config()?;
         if config.context.run_id != request.run_id {
             return Err(error(ErrorKind::InvalidInput, "finish targets another run"));
@@ -4712,7 +4914,7 @@ impl NamespaceSession for Overlay {
         // Close the journal so its accepted records are not silently discarded,
         // but keep its error rather than reporting a tidy shutdown.
         let closed = self.journal.close();
-        if !request.tree_terminated {
+        if !request.tree_terminated || self.custody.as_ref().is_some_and(|c| c.recovery_only()) {
             // Something may still hold a writable descriptor into this run.
             // Retaining the writer marker blocks takeover; storage stays open
             // because closing it would invalidate that evidence for this session.
