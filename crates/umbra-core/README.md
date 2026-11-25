@@ -30,7 +30,10 @@ authoritative journal, under its writer epoch and a separate run generation.
 `RecoveryRequired` latch. The wire field is required even when its value is null;
 an older reply that omits it fails decoding. Existing unarmed journal records
 remain readable. Nonterminal or Failed custody permits recovery inspection only,
-and a new writer epoch cannot erase it.
+and a new writer epoch cannot erase it. Complete remains durable history and
+permits normal work and finalization after reopen. A later writer may start a
+distinct Armed generation at custody sequence one only with a strictly newer
+writer epoch; same-epoch or reused-generation restart is refused.
 
 These APIs do not activate the managed topology or repair the provider-drop
 endpoints yet (Refs #299, Refs #205). PR 2 supplies the cleanup-owner process,

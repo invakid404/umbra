@@ -1001,6 +1001,12 @@ only the exact prepared generation and certificate, flushes Complete, then
 closes the journal, releases the writer and closes storage. Accepted Failed
 custody prevents completion. A missing completion acknowledgement is resolved
 by replaying the exact generation, never by starting another transaction.
+After replay confirms Complete, a newly bound invocation can mutate and use
+ordinary `finish_run` while retaining that completion as history. It may instead
+arm a distinct generation at sequence one under a strictly newer writer epoch.
+An uncertain append or flush of that new Armed record retains its obligation,
+even though the preceding generation was Complete. Nonterminal and Failed
+custody still refuse normal continuation.
 
 Unarmed finalization keeps its existing records, ordering and release timing.
 These methods add no active managed cleanup guarantee or new runtime wait.
