@@ -804,6 +804,75 @@ mod tests {
         }
     }
 
+    // Decode the proposed wire record so these tests compile on the pre-custody
+    // implementation. Once supported, the same tests exercise append, flush,
+    // close and disk replay rather than a separate replay model.
+    fn custody_record(run_id: RunId, generation: &str, state: serde_json::Value) -> JournalRecord {
+        let payload: JournalPayload = serde_json::from_value(serde_json::json!({
+            "Custody": {
+                "run_id": run_id,
+                "generation": generation,
+                "sequence": 1,
+                "state": state
+            }
+        }))
+        .expect("the authoritative journal must support custody records");
+        record(1, OperationId(uuid_v4()), payload)
+    }
+
+    #[test]
+    fn r2_reopen_armed_before_go() {
+        let scratch = scratch("custody-armed");
+        let run_id = RunId(uuid_v4());
+        let generation = uuid_v4().to_string();
+        {
+            let mut journal = FileJournal::new();
+            journal.open(&request(scratch.path(), run_id, 1)).unwrap();
+            let armed = custody_record(
+                run_id,
+                &generation,
+                serde_json::json!({
+                    "Armed": {
+                        "capacity": 64,
+                        "startup_nonce": uuid_v4().to_string(),
+                        "participants": [{"pid": 123, "birth": 456}]
+                    }
+                }),
+            );
+            let sequence = journal.append(&armed).unwrap();
+            journal.flush(sequence).unwrap();
+            journal.close().unwrap();
+        }
+        let mut reopened = FileJournal::new();
+        let recovered = reopened.open(&request(scratch.path(), run_id, 2)).unwrap();
+        assert!(recovered.pending.is_empty());
+        assert!(!recovered.recovery_required, "custody is distinct from the irreversible failure latch");
+        assert!(!recovered.clean, "an epoch advance cannot erase Armed custody");
+    }
+
+    #[test]
+    fn r2_unarmed_reopen_control() {
+        let scratch = scratch("custody-unarmed");
+        let run_id = RunId(uuid_v4());
+        {
+            let mut journal = FileJournal::new();
+            journal.open(&request(scratch.path(), run_id, 1)).unwrap();
+            let sequence = journal.append(&record(
+                1,
+                OperationId(uuid_v4()),
+                JournalPayload::Lifecycle(JournalLifecycle::RunCompleted {
+                    through: Sequence(0),
+                }),
+            )).unwrap();
+            journal.flush(sequence).unwrap();
+            journal.close().unwrap();
+        }
+        let mut reopened = FileJournal::new();
+        let recovered = reopened.open(&request(scratch.path(), run_id, 2)).unwrap();
+        assert!(recovered.clean);
+        assert!(!recovered.recovery_required);
+    }
+
     #[test]
     fn append_assigns_sequences_and_replay_returns_them_in_order() {
         let scratch = scratch("append");
