@@ -2,7 +2,7 @@
 
 Storage-independent MVP overlay. **Runtime dependencies remain `umbra-core`,
 `umbra-storage`, `umbra-journal`, and `serde` only.** `umbra-storage-local`,
-`tempfile`, and `uuid` are dev-dependencies for real-filesystem unit tests. There
+`umbra-journal-file`, `tempfile`, and `uuid` are dev-dependencies for real-filesystem unit tests. There
 is no NFS dependency and no host filesystem I/O in the library.
 
 `standard_namespace(storage, journal)` returns `Box<dyn NamespaceSession + Send>`;
@@ -29,7 +29,10 @@ its kernel outcome was an observed failure — together, proof that `prepare`
 finished and `commit` never ran. Every other entry *poisons* the session, as does
 a previous session having *declared* the run unrecoverable by journaling
 `JournalLifecycle::RecoveryRequired`, which is carried out of the log as
-`RecoveryState.recovery_required`. It returns `Ok` either way,
+`RecoveryState.recovery_required`. Replayed Armed, FinishPrepared or Failed
+custody independently poisons the session; a candidate writer claim cannot
+authorize ordinary mutation or resume while that custody remains unresolved.
+It returns `Ok` either way,
 so a run that cannot serve can still be opened and inspected. A checkpoint or a torn tail is still
 refused outright, with `UnsupportedCapability`. Reconciling a nonempty recovery —
 repairing the tree rather than detecting that it cannot be trusted — remains
@@ -970,7 +973,7 @@ crate's `standard_namespace` and never opens a namespace descriptor.
   and the caller must stop resuming tracees rather than retry into a mutation.
   Renewal is permitted while a transaction is pending. A failed renewal latches
   the session poisoned, and an already-poisoned session refuses renewal.
-- `finish_run` durably completes a fresh command run: flush run data, append and
+- `finish_run` durably completes an unarmed fresh command run: flush run data, append and
   flush a `RunCompleted` record, close the journal, release the writer, close
   storage. The storage flush receipt must match the run and writer epoch and
   report non-None durability before completion is recorded. Once completion is
@@ -981,9 +984,30 @@ crate's `standard_namespace` and never opens a namespace descriptor.
   returned only when every step succeeded; it authorizes no takeover.
 - `fail_run` leaves the run explicitly failed. It writes no completion record and
   publishes no checkpoint, and it releases the writer lease only when the request
-  carries evidence that the supervised tree is gone. Without that evidence the
+  carries evidence that the supervised tree is gone and no unresolved managed
+  custody remains. Without that evidence the
   writer marker is retained and the session is poisoned, so a later writer cannot
   take over a run whose effects are uncertain.
+
+The concrete `Overlay` also exposes dormant `arm_custody`, `prepare_finish`,
+`commit_custody` and `fail_custody` methods for the later managed owner. They are
+not wired into `NamespaceSession`, its provider protocol or the supervisor yet.
+The caller must hold the bound writer claim. Arming appends and flushes Armed;
+an uncertain append/flush retains custody conservatively. Preparation requires
+validated ledger Final, provider parent collection, terminal creators and
+confirmed cleanup, then flushes run data and FinishPrepared while retaining
+authority. It prevents further ordinary namespace operations. Commit accepts
+only the exact prepared generation and certificate, flushes Complete, then
+closes the journal, releases the writer and closes storage. Accepted Failed
+custody prevents completion. A missing completion acknowledgement is resolved
+by replaying the exact generation, never by starting another transaction.
+
+Unarmed finalization keeps its existing records, ordering and release timing.
+These methods add no active managed cleanup guarantee or new runtime wait.
+Activation and its bounded outer supervision arrive in PR 2; the
+[core contract](../umbra-core/README.md) describes its accepted notification-loss,
+custody-loss and late-creation residuals. Such outcomes remain failed or
+unconfirmed and never authorize a clean resume.
 
 Each storage request derives its own `OperationId` from the pending transaction's
 identity (or the session's) plus a serial. One logical transaction issues several

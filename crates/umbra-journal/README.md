@@ -4,7 +4,7 @@ Pure synchronous journal contract, depending only on `umbra-core`. Shared reques
 record, recovery and checkpoint types are owned by core. This crate contains no
 journal-file I/O, CRC implementation, storage backend or lease service.
 Its `provider` module implements the journal server harness and IPC proxy.
-The workspace uses edition 2021 and pins Rust 1.99.1 for build validation.
+The workspace uses edition 2021 and pins Rust 1.100.0 for build validation.
 
 <!-- memoria:section id="public-contract" files="src/lib.rs" -->
 ## Public contract
@@ -36,10 +36,19 @@ its resources. Worker queues and replay buffers must be bounded.
 injected writer authority before writes. It returns recovery state, including
 unfinished operations. `append` assigns increasing sequences but does not promise
 persistence. Records carry version, sequence, operation ID, epoch and typed prepare,
-observed-result, commit, abort or lifecycle payloads. File backends add bounded
+observed-result, commit, abort, lifecycle or custody payloads. File backends add bounded
 length framing and CRC32 checksums. `flush(through)` returns a durability receipt
 only after that sequence reaches the backing store's promised persistence boundary.
 It does not flush tracee-owned files. `close` surfaces pending flush failures.
+
+Managed custody is dormant: no production caller writes it in this foundation
+slice. Implementations validate Armed, FinishPrepared, Complete and Failed under
+the run, writer epoch, generation and custody sequence. Armed and FinishPrepared
+retain authority; only a durable Complete receipt permits normal final release.
+Failed and nonterminal custody reopen for inspection only. Acquiring a candidate
+writer claim or advancing its epoch does not authorize mutation, tail repair or
+resume until custody is resolved. Custody never clears the independent
+`RecoveryRequired` latch. Exact duplicate custody receipts remain idempotent.
 
 `replay(after)` yields only validated records strictly after the cursor, in sequence
 order, with errors delivered either at iterator creation or during iteration. It
