@@ -480,6 +480,16 @@ pub struct PendingRole {
     readiness_deadline: u64,
 }
 impl PendingRole {
+    /// Publish the external caller's installed-watch receipt once, then flush.
+    pub(super) fn publish_caller(
+        &mut self,
+        receipt: Option<&super::startup::Ready>,
+    ) -> io::Result<bool> {
+        if let Some(receipt) = receipt {
+            self.bootstrap.queue(receipt)?;
+        }
+        self.bootstrap.flush(self.readiness_deadline)
+    }
     pub(super) fn permits_rollback(&self, deadline: u64) -> bool {
         self.go_queued.is_none()
             && self
@@ -802,6 +812,35 @@ impl Entry {
     /// same receipts when constructing its immutable Armed request.
     pub fn readiness(&self) -> Option<&[super::startup::Ready]> {
         self.readiness.as_deref()
+    }
+
+    /// Receive the external caller's receipt on the existing bootstrap channel.
+    pub fn receive_caller_readiness(&mut self) -> io::Result<Option<super::startup::Ready>> {
+        if self.role != Role::Relay
+            || !self.inventory.as_ref().is_some_and(|i| i.external_caller)
+            || self.readiness.is_none()
+        {
+            return Err(invalid("caller receipt outside library relay startup"));
+        }
+        let bootstrap = self
+            .bootstrap
+            .as_mut()
+            .ok_or_else(|| invalid("caller bootstrap missing"))?;
+        if !bootstrap.flush(self.readiness_deadline)? {
+            return Ok(None);
+        }
+        let Some(receipt) = bootstrap.receive::<super::startup::Ready>(self.readiness_deadline)?
+        else {
+            return Ok(None);
+        };
+        if receipt.participant != self.parent
+            || receipt.run != self.launch.run
+            || receipt.parent.is_some()
+            || receipt.watched != self.inventory.as_ref().unwrap().watches(self.parent)?
+        {
+            return Err(invalid("caller readiness mismatch"));
+        }
+        Ok(Some(receipt))
     }
 
     /// Report this role and its validated descendant readiness receipts together.

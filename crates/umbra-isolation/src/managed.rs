@@ -5,6 +5,7 @@ use umbra_core::managed::{decode_frame, encode_frame, MAX_FRAME};
 pub mod admission;
 pub mod arming;
 pub mod bootstrap;
+pub mod caller_startup;
 pub mod cancellation;
 pub mod channels;
 pub mod executable;
