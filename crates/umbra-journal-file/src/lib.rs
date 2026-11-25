@@ -945,6 +945,52 @@ mod tests {
     }
 
     #[test]
+    fn r2_finish_commit_ack_lost() {
+        let scratch = scratch("custody-duplicate-complete");
+        let run_id = RunId(uuid_v4());
+        let mut journal = FileJournal::new();
+        journal.open(&request(scratch.path(), run_id, 1)).unwrap();
+        let mut transition = umbra_core::CustodyRecord {
+            run_id,
+            generation: uuid_v4(),
+            sequence: 1,
+            state: umbra_core::CustodyPhase::Armed {
+                capacity: 1,
+                startup_nonce: uuid_v4(),
+                participants: vec![umbra_core::CustodyParticipant { pid: 1, birth: 1 }],
+            },
+        };
+        let id = OperationId(uuid_v4());
+        for phase in [
+            transition.state.clone(),
+            umbra_core::CustodyPhase::FinishPrepared {
+                certificate: [7; 32],
+                root_result: 0,
+            },
+            umbra_core::CustodyPhase::Complete {
+                certificate: [7; 32],
+            },
+        ] {
+            transition.state = phase;
+            let assigned = journal
+                .append(&record(1, id, JournalPayload::Custody(transition.clone())))
+                .unwrap();
+            journal.flush(assigned).unwrap();
+            transition.sequence += 1;
+        }
+        transition.sequence -= 1;
+        let duplicate = record(1, id, JournalPayload::Custody(transition));
+        assert_eq!(journal.append(&duplicate).unwrap(), Sequence(3));
+        assert_eq!(journal.replay(Sequence(0)).unwrap().count(), 3);
+        journal.close().unwrap();
+        let recovered = FileJournal::new()
+            .open(&request(scratch.path(), run_id, 2))
+            .unwrap();
+        assert!(recovered.clean);
+        assert_eq!(recovered.last_valid_sequence, Sequence(3));
+    }
+
+    #[test]
     fn append_assigns_sequences_and_replay_returns_them_in_order() {
         let scratch = scratch("append");
         let dir = scratch.path();
