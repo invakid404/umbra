@@ -210,6 +210,7 @@ impl Storage for BadReceipt {
             // reach the engine's `ProtocolMismatch` -- and only this one models
             // a store that could not make the undo durable in the first place.
             3 => return Err(error(ErrorKind::Io, "injected flush failure")),
+            4 => receipt.scope = FlushScope::Data { objects: vec![] },
             _ => unreachable!(),
         }
         Ok(receipt)

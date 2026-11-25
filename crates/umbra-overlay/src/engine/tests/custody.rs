@@ -6,7 +6,10 @@ fn setup() -> (Fixture, JournalOpenRequest, CustodyFinishProof) {
 }
 
 fn setup_with_arm(arm: bool) -> (Fixture, JournalOpenRequest, CustodyFinishProof) {
-    let mut f = Fixture::new(&[]);
+    setup_fixture(Fixture::new(&[]), arm)
+}
+
+fn setup_fixture(mut f: Fixture, arm: bool) -> (Fixture, JournalOpenRequest, CustodyFinishProof) {
     let config = f.overlay.config().unwrap();
     let run_id = config.context.run_id;
     let request = JournalOpenRequest {
@@ -501,4 +504,50 @@ fn complete_reopen_finish(arm_again: bool) {
             old_generation
         }
     );
+}
+
+#[test]
+fn r2_arm_rejects_duplicate_complete_phase() {
+    let (mut f, request, proof) = setup();
+    f.overlay.prepare_finish(proof).unwrap();
+    let mut complete = f.overlay.custody.as_ref().unwrap().record.clone();
+    complete.sequence += 1;
+    complete.state = CustodyPhase::Complete {
+        certificate: [7; 32],
+    };
+    // Keep the session bound while exercising the actual journal transition.
+    f.overlay.persist_custody(complete.clone()).unwrap();
+    f.overlay.prepared_custody = None;
+    assert_eq!(
+        f.overlay.arm_custody(complete).unwrap_err().kind,
+        ErrorKind::InvalidState
+    );
+    assert!(matches!(
+        f.overlay.custody.as_ref().unwrap().record.state,
+        CustodyPhase::Complete { .. }
+    ));
+    assert_eq!(reopen(&request).custody.unwrap().record.sequence, 3);
+}
+
+#[test]
+fn r2_prepare_finish_requires_entire_run_receipt() {
+    let fixture = Fixture::build(
+        &[],
+        Setup {
+            mismatch: Some(4),
+            ..Setup::default()
+        },
+    );
+    let (mut f, request, proof) = setup_fixture(fixture, true);
+    assert_eq!(
+        f.overlay.prepare_finish(proof.clone()).unwrap_err().kind,
+        ErrorKind::ProtocolMismatch
+    );
+    assert!(f.overlay.prepared_custody.is_none());
+    assert!(f.overlay.commit_custody(&proof).is_err());
+    assert!(matches!(
+        reopen(&request).custody.unwrap().record.state,
+        CustodyPhase::Armed { .. }
+    ));
+    assert!(f.control.join("writer.json").exists());
 }
