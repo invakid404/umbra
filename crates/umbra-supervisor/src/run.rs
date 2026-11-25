@@ -232,7 +232,7 @@ pub struct ResumeOutcome {
 }
 
 /// What the supervised tree actually did.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunOutcome {
     /// Stable run identity; independent of the physical mount root.
     pub run_id: RunId,
