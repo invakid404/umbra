@@ -447,7 +447,9 @@ pub struct RecoveryState {
     pub clean: bool,
 }
 
-fn required_custody<'de, D>(deserializer: D) -> std::result::Result<Option<crate::CustodyState>, D::Error>
+fn required_custody<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<crate::CustodyState>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

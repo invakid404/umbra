@@ -120,43 +120,40 @@ fn uncertain_arm(fail_flush: bool) {
         log.fail_custody = !fail_flush;
         log.fail_flush = fail_flush;
     }
-    assert!(
-        f.overlay
-            .arm_custody(CustodyRecord {
-                run_id,
-                generation: Uuid::new_v4(),
-                sequence: 1,
-                state: CustodyPhase::Armed {
-                    capacity: 64,
-                    startup_nonce: Uuid::new_v4(),
-                    participants: vec![CustodyParticipant {
-                        pid: std::process::id(),
-                        birth: 1
-                    }],
-                },
-            })
-            .is_err()
-    );
-    assert!(
-        f.overlay
-            .fail_run(&FailedRunRequest {
-                run_id,
-                reason: "uncertain append".into(),
-                tree_terminated: true,
-            })
-            .is_err()
-    );
+    assert!(f
+        .overlay
+        .arm_custody(CustodyRecord {
+            run_id,
+            generation: Uuid::new_v4(),
+            sequence: 1,
+            state: CustodyPhase::Armed {
+                capacity: 64,
+                startup_nonce: Uuid::new_v4(),
+                participants: vec![CustodyParticipant {
+                    pid: std::process::id(),
+                    birth: 1
+                }],
+            },
+        })
+        .is_err());
+    assert!(f
+        .overlay
+        .fail_run(&FailedRunRequest {
+            run_id,
+            reason: "uncertain append".into(),
+            tree_terminated: true,
+        })
+        .is_err());
     assert!(f.overlay.config.is_some());
-    assert!(
-        f.overlay
-            .storage
-            .acquire_writer(&AcquireWriterRequest {
-                run_id,
-                writer_id: WriterId("contender".into()),
-                takeover: TakeoverPolicy::Refuse,
-            })
-            .is_err()
-    );
+    assert!(f
+        .overlay
+        .storage
+        .acquire_writer(&AcquireWriterRequest {
+            run_id,
+            writer_id: WriterId("contender".into()),
+            takeover: TakeoverPolicy::Refuse,
+        })
+        .is_err());
 }
 
 #[test]
@@ -375,15 +372,14 @@ fn r2_warning_unwind_retains_custody() {
         panic!("injected warning observer unwind");
     }));
     assert!(unwind.is_err());
-    assert!(
-        f.overlay
-            .fail_run(&FailedRunRequest {
-                run_id: request.control.run_id,
-                tree_terminated: true,
-                reason: "warning observer unwind".into(),
-            })
-            .is_err()
-    );
+    assert!(f
+        .overlay
+        .fail_run(&FailedRunRequest {
+            run_id: request.control.run_id,
+            tree_terminated: true,
+            reason: "warning observer unwind".into(),
+        })
+        .is_err());
     assert!(!reopen(&request).clean);
     assert!(
         f.overlay.config.is_some(),
