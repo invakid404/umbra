@@ -16,6 +16,41 @@ fn tick() {
     std::thread::sleep(std::time::Duration::from_millis(1));
 }
 
+/// Serve the cleanup owner while keeping its service in caller-owned custody
+/// on every polling error, including after the provider has been launched.
+pub fn owner(
+    startup: &mut umbra_isolation::managed::owner_startup::OwnerStartup,
+    service: &mut Option<umbra_isolation::managed::owner::Service>,
+    input: &crate::managed_input::ManagedRunInput,
+    external_caller: bool,
+) -> io::Result<()> {
+    if service.is_none() {
+        let descriptor = input.platform().map_err(io::Error::other)?;
+        while !startup.poll(descriptor, external_caller)? {
+            tick();
+        }
+        *service = Some(startup.take_service()?);
+    }
+    while !service.as_mut().unwrap().poll()? {
+        tick();
+    }
+    Ok(())
+}
+
+/// Complete worker readiness before entering staged storage setup.
+/// Failed readiness leaves the worker startup in the dispatcher's custody.
+pub fn worker_ready(
+    startup: &mut umbra_isolation::managed::worker_startup::WorkerStartup,
+    input: &crate::managed_input::ManagedRunInput,
+    external_caller: bool,
+) -> io::Result<()> {
+    let descriptor = input.platform().map_err(io::Error::other)?;
+    while !startup.poll(descriptor, 5_000, external_caller)? {
+        tick();
+    }
+    Ok(())
+}
+
 /// Run a guardian with its startup owner retained by the executable dispatcher.
 /// On startup error, the caller still owns every child through `startup`.
 pub fn guardian(
@@ -88,7 +123,9 @@ fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
                 Some(Err(error)) => error.to_string(),
                 _ => "worker exited without a final result".to_owned(),
             };
-            outcome.events.push(umbra_isolation::managed::guard::Event::Failed(message));
+            outcome
+                .events
+                .push(umbra_isolation::managed::guard::Event::Failed(message));
         }
     }
     outcome

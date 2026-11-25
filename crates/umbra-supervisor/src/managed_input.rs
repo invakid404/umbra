@@ -65,6 +65,11 @@ impl ManagedRunInput {
         self.run_id
     }
 
+    /// Resolve the same platform descriptor in cleanup-owner and worker roles.
+    pub fn platform(&self) -> Result<&umbra_core::provider::ProviderDescriptor> {
+        self.registry.get("platform")
+    }
+
     /// Reconstruct worker inputs with an explicit observer-protocol adapter.
     pub fn into_spec(self, observer: Option<Box<dyn RunObserver>>) -> RunSpec {
         RunSpec {

@@ -508,6 +508,76 @@ impl<F: FnMut(Request) -> Result<Response>> RunObserver for WorkerObserver<F> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn channel_exchange_delivers_final_result_before_clean_eof() {
+        use std::os::unix::net::UnixStream;
+        use umbra_isolation::managed::{boot_nanos, Channel};
+        let run = RunId(uuid::Uuid::new_v4());
+        let (worker, caller) = UnixStream::pair().unwrap();
+        let deadline = boot_nanos().unwrap() + 5_000_000_000;
+        let parent = std::thread::spawn(move || {
+            let observer = CallerObserver::new(run, None);
+            let result = observer.result_handle();
+            let mut caller = CallerTransport::new(Channel::new(caller).unwrap(), observer);
+            while !caller.complete || caller.pending {
+                caller.poll(Some(deadline)).unwrap();
+                std::thread::yield_now();
+            }
+            assert!(matches!(result.borrow().as_ref(), Some(Ok(()))));
+            // Completed exchange must not turn EOF into a protocol failure.
+            caller.poll(Some(deadline)).unwrap();
+        });
+        let mut transport = WorkerTransport::new(Channel::new(worker).unwrap());
+        let mut worker = WorkerObserver::new(run, |request| {
+            transport.exchange(request, || Ok(Some(deadline)))
+        });
+        worker.stdio_adopted().unwrap();
+        worker.prepared(run).unwrap();
+        worker.finished(&RunOutcome {
+            run_id: run,
+            root_status: Some(umbra_core::ExitStatus::Code(0)),
+            processes_exited: 1,
+        });
+        worker.complete(Ok(())).unwrap();
+        drop(transport);
+        parent.join().unwrap();
+    }
+
+    #[test]
+    fn success_result_requires_finished_callback_and_is_not_replayable() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let mut caller = CallerObserver::new(run, None);
+        let response = caller
+            .dispatch(Request {
+                run_id: run,
+                sequence: 1,
+                event: Event::RunResult(Ok(())),
+            })
+            .unwrap();
+        assert!(response.result.is_err());
+        assert!(caller.result_handle().borrow().is_none());
+        let failure = UmbraError::new(ErrorKind::InvalidState, "test", "failed run");
+        caller
+            .dispatch(Request {
+                run_id: run,
+                sequence: 2,
+                event: Event::RunResult(Err(failure)),
+            })
+            .unwrap()
+            .result
+            .unwrap();
+        assert!(caller
+            .dispatch(Request {
+                run_id: run,
+                sequence: 3,
+                event: Event::RunResult(Ok(()))
+            })
+            .unwrap()
+            .result
+            .is_err());
+    }
+
     #[test]
     fn mismatched_acknowledgment_stops_further_callbacks() {
         let run = RunId(uuid::Uuid::new_v4());
