@@ -235,6 +235,59 @@ pub trait NamespaceSession: NamespaceResolver {
     fn abort(&mut self, operation: OperationId, reason: &AbortReason) -> Result<()>;
     /// Request a logical checkpoint after the caller establishes quiescence.
     fn checkpoint(&mut self, request: &CheckpointRequest) -> Result<Checkpoint>;
+    /// Inspect the exact durable generation after a lost acknowledgement.
+    fn query_custody(
+        &mut self,
+        _run: umbra_core::RunId,
+        _generation: uuid::Uuid,
+    ) -> Result<umbra_core::CustodyState> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "namespace.query_custody",
+            "provider does not support managed custody",
+        ))
+    }
+    /// Persist Armed before GO.
+    fn arm_custody(&mut self, _record: &umbra_core::CustodyRecord) -> Result<umbra_core::Sequence> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "namespace.arm_custody",
+            "provider does not support managed custody",
+        ))
+    }
+    /// Persist an attributable managed failure.
+    fn fail_custody(
+        &mut self,
+        _record: &umbra_core::CustodyRecord,
+    ) -> Result<umbra_core::Sequence> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "namespace.fail_custody",
+            "provider does not support managed custody",
+        ))
+    }
+    /// Prepare an exact terminal certificate while retaining authority.
+    fn prepare_finish(
+        &mut self,
+        _proof: &umbra_core::CustodyFinishProof,
+    ) -> Result<umbra_core::Sequence> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "namespace.prepare_finish",
+            "provider does not support managed custody",
+        ))
+    }
+    /// Commit the prepared certificate before releasing authority.
+    fn commit_custody(
+        &mut self,
+        _proof: &umbra_core::CustodyFinishProof,
+    ) -> Result<umbra_core::FinishRunReceipt> {
+        Err(umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::UnsupportedCapability,
+            "namespace.commit_custody",
+            "provider does not support managed custody",
+        ))
+    }
     /// Renew the injected writer lease through this session's own storage.
     ///
     /// The namespace owns its storage session, so renewal must go through it

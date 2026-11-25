@@ -53,6 +53,7 @@ mutation-probe-fstat = []
 mutation-probe-dircache = []
 
 [dependencies]
+uuid.workspace = true
 umbra-core = { path = "../umbra-core" }
 umbra-storage = { path = "../umbra-storage" }
 umbra-journal = { path = "../umbra-journal" }
@@ -67,4 +68,3 @@ workspace = true
 umbra-journal-file = { path = "../umbra-journal-file" }
 umbra-storage-local = { path = "../umbra-storage-local" }
 tempfile.workspace = true
-uuid.workspace = true

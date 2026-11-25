@@ -251,6 +251,19 @@ fn r2_finish_commit_ack_lost() {
     let (mut f, request, proof) = setup();
     f.overlay.prepare_finish(proof.clone()).unwrap();
     let receipt = f.overlay.commit_custody(&proof).unwrap();
+    let queried =
+        NamespaceSession::query_custody(&mut f.overlay, request.control.run_id, proof.generation)
+            .unwrap();
+    assert!(matches!(
+        queried.record.state,
+        CustodyPhase::Complete { .. }
+    ));
+    assert!(NamespaceSession::query_custody(
+        &mut f.overlay,
+        request.control.run_id,
+        Uuid::new_v4(),
+    )
+    .is_err());
     // Discarding the response cannot undo the durable decision.
     let state = reopen(&request);
     assert!(state.clean);

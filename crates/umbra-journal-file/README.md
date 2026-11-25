@@ -20,7 +20,7 @@ Boundaries the implementation keeps:
   last valid sequence and the prepared-but-uncommitted operations for the
   namespace owner to reconcile. Recovery is clean only with no pending operations,
   an intact tail, no unresolved managed custody, and no `RecoveryRequired` verdict from a prior session -- the
-  third is not implied by the first, because the session that declares itself
+  `RecoveryRequired` condition is not implied by an empty pending set, because the session that declares itself
   unrecoverable also writes the terminal record that empties `pending` of the
   operation it is about. Readable frames are never treated as evidence of a
   previous flush receipt. A zero-length log left by interrupted creation is
