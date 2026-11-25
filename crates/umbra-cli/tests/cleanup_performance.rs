@@ -305,3 +305,37 @@ fn d6_tree_receipts_require_every_actual_parent_wait() {
     records[0]["collected"][2]["waited"] = json!(-1);
     assert!(tree::validate(&records).is_err());
 }
+
+/// One diagnostic invocation, not a D6 series or a successful-product assertion.
+#[cfg(target_os = "macos")]
+#[test]
+fn baseline_tree_diagnosis() {
+    let c = config::read(|key| std::env::var(key).ok(), false).unwrap();
+    assert_eq!(c.workload, config::Workload::NativeTree5);
+    assert_eq!(c.session, config::Session::OwnSession);
+    let selected = manifest::load(&c.base, true).unwrap();
+    std::fs::create_dir(&c.evidence).unwrap();
+    let args = workload::prepare(&c, &selected, &c.evidence.join("setup")).unwrap();
+    let result = invocation::measure(
+        &selected,
+        &c.evidence.join("invocation"),
+        &args,
+        "native_tree5",
+        true,
+        schedule::Member {
+            warmup: false,
+            index: 0,
+            order: 0,
+            build: schedule::Build::Base,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(900),
+        },
+    );
+    eprintln!("DIAGNOSIS (not qualification): {result:?}");
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(c.evidence.join("invocation/parent-receipt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["cancelled"], false);
+    assert_eq!(receipt["forced"], false);
+    eprintln!("actual CLI parent receipt: {receipt}");
+}
