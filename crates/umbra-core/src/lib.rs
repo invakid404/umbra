@@ -8,6 +8,7 @@
 pub mod capabilities;
 #[cfg(unix)]
 pub mod launch_stdio;
+pub mod managed;
 pub mod shutdown;
 pub mod storage;
 

@@ -1,5 +1,6 @@
 //! Dormant per-run admission ledger. Callers must commit the returned grant
 //! before performing an acquisition; this module performs no resource I/O.
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -7,7 +8,7 @@ use uuid::Uuid;
 pub const DEFAULT_CLEANUP_CAPACITY: u64 = 64;
 
 /// Terminal evidence supplied by the collector of an obligation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalCertificate {
     /// An acquisition was never entered and cannot subsequently start.
     CancelledBeforeEntry,
@@ -23,7 +24,7 @@ pub enum TerminalCertificate {
 }
 
 /// Serialized ledger operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdmissionOperation {
     /// Charge one obligation and return its grant.
     Reserve {
@@ -55,7 +56,7 @@ pub enum AdmissionOperation {
 
 /// Request identity makes the latest exact retransmission idempotent.
 /// Older requests fail as stale, so replay storage is bounded for unlimited runs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionRequest {
     /// Negotiated run nonce.
     pub nonce: Uuid,
@@ -68,7 +69,7 @@ pub struct AdmissionRequest {
 }
 
 /// Attributable refusal or invalid protocol state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdmissionError {
     /// No acquisition is permitted when capacity is exhausted.
     Capacity {
