@@ -21,7 +21,7 @@ fn response(c: &mut Connection, id: u64, r: Response) {
     });
 }
 fn child(dir: &str, mode: &str) {
-    let mut stream = UnixStream::connect(format!("{dir}/{mode}.sock")).unwrap();
+    let mut stream = UnixStream::connect(format!("{dir}/s")).unwrap();
     stream.write_all(b"R").unwrap();
     let mut c = Connection::new(stream, Duration::from_secs(3));
     if !matches!(
@@ -157,7 +157,7 @@ fn endpoint(mode: &str) {
     let dir = std::env::temp_dir().join(format!("umbra-fix-299b-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let dir = dir.to_str().unwrap().to_owned();
-    let socket = format!("{dir}/{mode}.sock");
+    let socket = format!("{dir}/s");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut process = std::process::Command::new(std::env::current_exe().unwrap())
