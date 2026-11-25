@@ -97,3 +97,11 @@ mod option_tests {
         );
     }
 }
+
+#[cfg(all(
+    feature = "shutdown-witness",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+#[path = "../../../experiments/fixtures/umbra-fix-299b-performance/observation.rs"]
+mod performance_observation;

@@ -2522,6 +2522,8 @@ impl MacosTraceBackend {
         Ok(self.launch_stdio.take())
     }
     fn launch_traced(&mut self, spec: LaunchSpec) -> Result<ProcessHandle> {
+        #[cfg(feature = "shutdown-witness")]
+        crate::performance_observation::record("acquisition_entry", None);
         let launch_stdio = self.consume_launch_stdio()?;
         Self::check_sandbox_shape(&spec)?;
         if self.launched {
@@ -2867,6 +2869,11 @@ impl MacosTraceBackend {
                 return Err(e);
             }
         }
+        #[cfg(feature = "shutdown-witness")]
+        crate::performance_observation::record(
+            "process_handle_returned",
+            Some(handle.0 .0.native_id),
+        );
         Ok(handle)
     }
 
@@ -3482,6 +3489,13 @@ impl MacosTraceBackend {
             s.done = true;
             s.stopped = false;
             s.exit_report = Some(reply.clone());
+            #[cfg(feature = "shutdown-witness")]
+            if s.parent.is_none() {
+                crate::performance_observation::record(
+                    "first_root_exit_observed",
+                    Some(s.id.0.native_id),
+                );
+            }
             self.events.push_back(TraceEvent::Exit {
                 task: s.id,
                 status: if reply.starts_with('W') {

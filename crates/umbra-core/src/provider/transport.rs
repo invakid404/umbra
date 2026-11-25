@@ -184,7 +184,7 @@ impl Connection {
                         if is_deadline_timeout(e)
                             || e.kind() == std::io::ErrorKind::Interrupted =>
                     {
-                        continue
+                        continue;
                     }
                     Err(e) => return Err(unavailable(e)),
                 },
@@ -234,7 +234,7 @@ impl Connection {
                 Err(ref e)
                     if is_deadline_timeout(e) || e.kind() == std::io::ErrorKind::Interrupted =>
                 {
-                    continue
+                    continue;
                 }
                 Err(e) => return Err(unavailable(e)),
             };
@@ -295,10 +295,41 @@ impl Reap for Child {
         Child::kill(self)
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        Child::try_wait(self)
+        let result = Child::try_wait(self);
+        #[cfg(feature = "test-owned-exit")]
+        if let Ok(Some(status)) = &result {
+            observed_exit(self.id(), *status);
+        }
+        result
     }
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        Child::wait(self)
+        let result = Child::wait(self);
+        #[cfg(feature = "test-owned-exit")]
+        if let Ok(status) = &result {
+            observed_exit(self.id(), *status);
+        }
+        result
+    }
+}
+
+#[cfg(feature = "test-owned-exit")]
+type ExitObservation = std::sync::Arc<std::sync::Mutex<Option<std::process::ExitStatus>>>;
+#[cfg(feature = "test-owned-exit")]
+static EXIT_OBSERVATIONS: std::sync::Mutex<
+    std::collections::BTreeMap<
+        u32,
+        std::sync::Weak<std::sync::Mutex<Option<std::process::ExitStatus>>>,
+    >,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(feature = "test-owned-exit")]
+fn observed_exit(pid: u32, status: std::process::ExitStatus) {
+    if let Some(observer) = EXIT_OBSERVATIONS
+        .lock()
+        .unwrap()
+        .remove(&pid)
+        .and_then(|value| value.upgrade())
+    {
+        *observer.lock().unwrap() = Some(status);
     }
 }
 
@@ -379,6 +410,17 @@ impl Drop for Client {
     }
 }
 impl Client {
+    /// Qualification receipt populated only by this transport's actual parent wait.
+    #[cfg(feature = "test-owned-exit")]
+    pub fn observe_owned_exit(pid: u32) -> ExitObservation {
+        let observation = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut registry = EXIT_OBSERVATIONS.lock().unwrap();
+        registry.retain(|_, value| value.strong_count() > 0);
+        assert!(registry
+            .insert(pid, std::sync::Arc::downgrade(&observation))
+            .is_none());
+        observation
+    }
     /// Whether this client can independently confirm its provider's exit.
     /// Attached storage/journal clients remain valid for their own protocols.
     pub fn owns_provider(&self) -> bool {
@@ -399,6 +441,8 @@ impl Client {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    #[cfg(feature = "test-owned-exit")]
+                    observed_exit(child.id(), status);
                     self.child.take();
                     if !status.success() {
                         return Err(protocol_error(format!("provider exited with {status}")));

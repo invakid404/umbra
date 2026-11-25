@@ -86,6 +86,12 @@ pub fn run(spec: &std::ffi::OsStr) -> ! {
         "supervisor-started",
         serde_json::json!({ "sid": me, "supervisor": supervisor }),
     );
+    #[cfg(feature = "shutdown-witness")]
+    crate::performance_observation::record_as(
+        "guardian",
+        "helpers_ready_go",
+        Some(supervisor as u64),
+    );
     let relay_alive = send(up, &Msg::Started(supervisor)).is_ok();
 
     let finish_relay_dead = |mut rec: Record<record::FdSink>, why: &str| -> ! {

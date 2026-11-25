@@ -80,3 +80,8 @@ pub fn isolate_run() {
         relay::run();
     }
 }
+
+#[cfg(all(feature = "shutdown-witness", target_os = "macos"))]
+#[path = "../../../experiments/fixtures/umbra-fix-299b-performance/observation.rs"]
+#[allow(dead_code)] // This role uses record_as; provider uses record.
+mod performance_observation;

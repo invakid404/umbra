@@ -669,3 +669,6 @@ fn close_client_names_its_unconfirmed_obligations() {
     }
     assert!(!message.contains("Tracee pid=123"), "{message}");
 }
+
+#[path = "cleanup_owner_tests.rs"]
+mod cleanup_owner_tests;

@@ -11,6 +11,10 @@ publish = false
 # `#![forbid(unsafe_code)]` and calls the safe API in `src/lib.rs`. On every
 # other target the API is a no-op.
 
+[features]
+# Observational D6 instrumentation; no lifecycle behavior change.
+shutdown-witness = []
+
 [dependencies]
 serde_json.workspace = true
 

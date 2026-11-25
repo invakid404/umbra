@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 # Test-only closure measurements, also usable by external CLI-library fixtures.
-shutdown-witness = ["umbra-platform/shutdown-witness"]
+shutdown-witness = ["umbra-platform/shutdown-witness", "umbra-isolation/shutdown-witness"]
 probe-idle-renewal = ["umbra-supervisor/probe-idle-renewal"]
 # Forwarded to `umbra-overlay` through `umbra-supervisor`; see that manifest.
 # Building the `umbra` binary with one of these is how
