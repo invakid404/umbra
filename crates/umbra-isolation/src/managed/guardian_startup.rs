@@ -20,9 +20,26 @@ pub struct GuardianStartup {
     phase: u8,
     forwarded: usize,
     failed: bool,
+    rollback: Option<super::rollback::Rollback>,
 }
 
 impl GuardianStartup {
+    /// Progress pre-GO rollback under the original readiness plus helper cutoff.
+    /// Timeout keeps the rollback slot and every uncollected child owned here.
+    pub fn rollback(&mut self) -> io::Result<bool> {
+        self.failed = true;
+        let deadline = self
+            .entry
+            .readiness_deadline
+            .checked_add(9_000_000_000)
+            .ok_or_else(|| invalid("rollback clock overflow"))?;
+        super::rollback::Rollback::retain(&mut self.children, &mut self.rollback, deadline)?;
+        self.entry.close_before_go()?;
+        self.guard.take();
+        self.bootstrap.take();
+        self.rollback.as_mut().unwrap().poll()
+    }
+
     /// Validate the role before spawning either child.
     pub fn new(entry: Entry) -> io::Result<Self> {
         if entry.role != Role::Guardian {
@@ -36,6 +53,7 @@ impl GuardianStartup {
             phase: 0,
             forwarded: 0,
             failed: false,
+            rollback: None,
         })
     }
 

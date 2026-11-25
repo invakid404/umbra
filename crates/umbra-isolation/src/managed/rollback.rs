@@ -11,6 +11,28 @@ pub struct Rollback {
 }
 
 impl Rollback {
+    /// Move custody into a retained rollback slot, restoring the original
+    /// handles when any child has already entered the GO phase.
+    pub fn retain(
+        children: &mut Vec<PendingRole>,
+        slot: &mut Option<Self>,
+        deadline: u64,
+    ) -> io::Result<()> {
+        if slot.is_some() {
+            return Ok(());
+        }
+        match Self::begin(std::mem::take(children), deadline) {
+            Ok(rollback) => {
+                *slot = Some(rollback);
+                Ok(())
+            }
+            Err((error, retained)) => {
+                *children = retained;
+                Err(error)
+            }
+        }
+    }
+
     /// Close all bootstrap channels together, sharing the supplied original
     /// cutoff. A GO already queued makes pre-GO rollback invalid.
     pub fn begin(

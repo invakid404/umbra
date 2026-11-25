@@ -26,9 +26,26 @@ pub struct RelayStartup {
     ready: bool,
     released: bool,
     failed: bool,
+    rollback: Option<super::rollback::Rollback>,
 }
 
 impl RelayStartup {
+    /// Progress pre-GO rollback under the original readiness plus helper cutoff.
+    /// Timeout keeps the rollback slot and every uncollected child owned here.
+    pub fn rollback(&mut self) -> io::Result<bool> {
+        self.failed = true;
+        let deadline = self
+            .entry
+            .readiness_deadline
+            .checked_add(9_000_000_000)
+            .ok_or_else(|| invalid("rollback clock overflow"))?;
+        super::rollback::Rollback::retain(&mut self.children, &mut self.rollback, deadline)?;
+        self.entry.close_before_go()?;
+        self.guard.take();
+        self.bootstrap.take();
+        self.rollback.as_mut().unwrap().poll()
+    }
+
     /// Validate relay role before spawning its separate guardian session.
     pub fn new(entry: Entry) -> io::Result<Self> {
         if entry.role != Role::Relay {
@@ -44,6 +61,7 @@ impl RelayStartup {
             ready: false,
             released: false,
             failed: false,
+            rollback: None,
         })
     }
 

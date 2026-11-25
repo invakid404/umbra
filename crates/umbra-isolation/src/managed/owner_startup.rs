@@ -29,6 +29,35 @@ pub struct OwnerStartup {
 }
 
 impl OwnerStartup {
+    /// Collect a provider that never received GO; preserve the actual Child
+    /// in Launch on errors or expiry. No acquisition is authorized in this phase.
+    pub fn rollback(&mut self) -> io::Result<bool> {
+        self.failed = true;
+        if self.owner.is_some() {
+            return Err(invalid("owner rollback after runtime adoption"));
+        }
+        self.entry.close_before_go()?;
+        self.bootstrap.take();
+        self.handoff.take();
+        self.control.take();
+        let Some(child) = self.launch.child.as_mut() else {
+            return Ok(true);
+        };
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        let deadline = self
+            .entry
+            .readiness_deadline
+            .checked_add(9_000_000_000)
+            .ok_or_else(|| invalid("rollback clock overflow"))?;
+        if super::boot_nanos()? >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        child.kill()?;
+        Ok(child.try_wait()?.is_some())
+    }
+
     /// Retain the entry before any provider acquisition.
     pub fn new(entry: Entry) -> Self {
         Self {

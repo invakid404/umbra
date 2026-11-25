@@ -54,6 +54,18 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Close startup routes only before this role has accepted durable GO.
+    /// Child custody is separately retained by the startup coordinator.
+    pub fn close_before_go(&mut self) -> io::Result<()> {
+        if self.authorization.is_some() {
+            return Err(invalid("pre-GO closure after authorization"));
+        }
+        self.bootstrap.take();
+        self.endpoints.clear();
+        self.descendants.clear();
+        Ok(())
+    }
+
     /// Create the CLI relay before any descendants or run resources exist.
     pub fn root_relay(launch: LaunchConfiguration, readiness_deadline: u64) -> io::Result<Self> {
         launch.validate().map_err(invalid)?;

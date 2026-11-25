@@ -29,9 +29,26 @@ pub struct CallerStartup {
     queued: bool,
     complete: bool,
     failed: bool,
+    rollback: Option<super::rollback::Rollback>,
 }
 
 impl CallerStartup {
+    /// Roll back only before publishing caller readiness can authorize arming.
+    pub fn rollback(&mut self) -> io::Result<bool> {
+        self.failed = true;
+        if self.queued || self.complete {
+            return Err(invalid("caller rollback after arming authorization"));
+        }
+        let deadline = self
+            .deadline
+            .checked_add(9_000_000_000)
+            .ok_or_else(|| invalid("caller rollback clock overflow"))?;
+        super::rollback::Rollback::retain(&mut self.children, &mut self.rollback, deadline)?;
+        self.endpoints.clear();
+        self.guard.take();
+        self.rollback.as_mut().unwrap().poll()
+    }
+
     /// Spawn only the registered executable, retaining the original cutoff.
     pub fn spawn(launch: LaunchConfiguration, deadline: u64) -> io::Result<Self> {
         let mut topology = Topology::new(true)?;
@@ -68,6 +85,7 @@ impl CallerStartup {
             queued: false,
             complete: false,
             failed: false,
+            rollback: None,
         })
     }
 
