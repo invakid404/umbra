@@ -263,6 +263,7 @@ mod tests {
         assert_eq!(
             ledger.apply(AdmissionRequest {
                 sequence: 0,
+                operation: AdmissionOperation::Freeze,
                 ..reserve
             }),
             Err(AdmissionError::Invalid)

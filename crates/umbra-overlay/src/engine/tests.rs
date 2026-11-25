@@ -17,6 +17,7 @@ mod custody;
 struct Log {
     records: Vec<JournalRecord>,
     fail_custody: bool,
+    fail_flush: bool,
     fail_prepare: bool,
     fail_commit: bool,
     /// Injects a failure on the `Abort` record's append.
@@ -57,6 +58,9 @@ impl Journal for MemoryJournal {
         Ok(sequence)
     }
     fn flush(&mut self, through: Sequence) -> Result<DurableSequence> {
+        if self.log.lock().unwrap().fail_flush {
+            return Err(error(ErrorKind::Io, "injected journal durability failure"));
+        }
         // A landmine for reopen tests, and cheaper to name than to hit. Since
         // #65 `bind` seeds `last_committed` from `recovery.last_valid_sequence`,
         // so a session reopened over a journal that reports N records starts

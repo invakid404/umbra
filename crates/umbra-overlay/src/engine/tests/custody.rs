@@ -104,9 +104,22 @@ fn r2_child_checkpoint_writer() {
 
 #[test]
 fn r2_uncertain_armed_append_retains_authority() {
+    uncertain_arm(false);
+}
+
+#[test]
+fn r2_armed_requires_durable_receipt() {
+    uncertain_arm(true);
+}
+
+fn uncertain_arm(fail_flush: bool) {
     let mut f = Fixture::new(&[]);
     let run_id = f.overlay.config().unwrap().context.run_id;
-    f.log.lock().unwrap().fail_custody = true;
+    {
+        let mut log = f.log.lock().unwrap();
+        log.fail_custody = !fail_flush;
+        log.fail_flush = fail_flush;
+    }
     assert!(
         f.overlay
             .arm_custody(CustodyRecord {
