@@ -73,6 +73,32 @@ fn r2_freeze_races_grant() {
 }
 
 #[test]
+fn r2_grant_before_entry_freeze() {
+    let mut ledger = ledger();
+    let obligation = Uuid::from_u128(2);
+    assert_eq!(
+        ledger.apply(request(1, AdmissionOperation::Reserve { obligation })),
+        Ok(1)
+    );
+    assert_eq!(ledger.apply(request(2, AdmissionOperation::Freeze)), Ok(1));
+    assert_eq!(
+        ledger.apply(request(
+            3,
+            AdmissionOperation::Entering {
+                obligation,
+                resource: Uuid::from_u128(3),
+            }
+        )),
+        Err(AdmissionError::Frozen)
+    );
+    assert_eq!(
+        ledger.current(),
+        1,
+        "freeze must retain the outstanding grant"
+    );
+}
+
+#[test]
 fn r2_release_requires_terminal_proof() {
     let mut ledger = ledger();
     let obligation = Uuid::from_u128(2);
