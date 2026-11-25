@@ -5,7 +5,7 @@ use std::io;
 use umbra_core::managed::{Participant, Role, RunIdentity};
 
 /// A ready participant names its real parent and installed watch inventory.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Ready {
     /// Exact startup identity.
     pub run: RunIdentity,

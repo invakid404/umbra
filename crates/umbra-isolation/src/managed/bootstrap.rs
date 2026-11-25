@@ -28,6 +28,7 @@ pub struct Bootstrap {
     receipts: Vec<Ready>,
     watched: Vec<umbra_core::managed::Participant>,
     watch: Option<ProcessWatch>,
+    provider: Option<super::provider_startup::ProviderStartup>,
 }
 
 impl Bootstrap {
@@ -41,7 +42,24 @@ impl Bootstrap {
             receipts,
             watched: Vec::new(),
             watch: None,
+            provider: None,
         })
+    }
+
+    /// Include the cleanup owner's provider in the same startup barrier.
+    pub fn with_provider(provider: super::provider_startup::ProviderStartup) -> io::Result<Self> {
+        let mut bootstrap = Self::new(Vec::new(), Vec::new())?;
+        bootstrap.provider = Some(provider);
+        Ok(bootstrap)
+    }
+
+    /// Forward only the GO already accepted by the owning entry.
+    pub fn forward_provider_go(&mut self, entry: &Entry) -> io::Result<bool> {
+        entry.forward_provider_go(
+            self.provider
+                .as_mut()
+                .ok_or_else(|| invalid("bootstrap has no provider"))?,
+        )
     }
 
     /// One bounded startup step. True means readiness has been queued, never
@@ -76,6 +94,18 @@ impl Bootstrap {
         }
         match self.phase {
             Phase::Members => {
+                if let Some(provider) = &mut self.provider {
+                    if !self
+                        .members
+                        .iter()
+                        .any(|m| m.participant.role == umbra_core::managed::Role::Provider)
+                    {
+                        let Some(member) = provider.member()? else {
+                            return Ok(false);
+                        };
+                        self.members.push(member);
+                    }
+                }
                 while let Some(child) = children.get_mut(self.index) {
                     let Some(members) = child.receive_members()? else {
                         return Ok(false);
@@ -114,10 +144,27 @@ impl Bootstrap {
                     }
                     self.index += 1;
                 }
+                if let Some(provider) = &mut self.provider {
+                    if !provider.distribute(inventory)? {
+                        return Ok(false);
+                    }
+                }
                 self.index = 0;
                 self.phase = Phase::Readiness;
             }
             Phase::Readiness => {
+                if let Some(provider) = &mut self.provider {
+                    if !self
+                        .receipts
+                        .iter()
+                        .any(|r| r.participant.role == umbra_core::managed::Role::Provider)
+                    {
+                        let Some(receipt) = provider.readiness()? else {
+                            return Ok(false);
+                        };
+                        self.receipts.push(receipt);
+                    }
+                }
                 while let Some(child) = children.get_mut(self.index) {
                     let Some(receipts) = child.receive_readiness(entry.readiness_deadline)? else {
                         return Ok(false);

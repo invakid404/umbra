@@ -633,7 +633,8 @@ pub struct Overlay {
     completed_run: Option<RunId>,
     custody: Option<CustodyState>,
     custody_durable: bool,
-    prepared_custody: Option<(CustodyFinishProof, DurabilityReceipt)>,
+    prepared_custody: Option<(CustodyFinishProof, DurabilityReceipt, Sequence)>,
+    completed_custody: Option<(CustodyFinishProof, FinishRunReceipt)>,
     serial: u64,
     last_committed: Sequence,
     pages: BTreeMap<Vec<u8>, (StoragePath, Vec<DirectoryEntry>)>,
@@ -762,6 +763,18 @@ impl Overlay {
     /// Flush data and prepare an exact terminal decision while retaining the
     /// writer claim. Ordinary namespace operations stop after preparation.
     pub fn prepare_finish(&mut self, proof: CustodyFinishProof) -> Result<Sequence> {
+        if !self.poisoned || self.completed_custody.is_some() {
+            if let Some((prepared, _, sequence)) = &self.prepared_custody {
+                return if prepared == &proof {
+                    Ok(*sequence)
+                } else {
+                    Err(error(
+                        ErrorKind::InvalidState,
+                        "custody certificate changed",
+                    ))
+                };
+            }
+        }
         self.idle()?;
         if self.planned.is_some()
             || !proof.ledger_final
@@ -812,17 +825,27 @@ impl Overlay {
             ));
         }
         let sequence = self.persist_custody(next)?;
-        self.prepared_custody = Some((proof, durability));
+        self.prepared_custody = Some((proof, durability, sequence));
         Ok(sequence)
     }
 
     /// Commit the prepared decision durably before releasing writer authority.
     /// A lost acknowledgement is resolved by replaying this exact generation.
     pub fn commit_custody(&mut self, proof: &CustodyFinishProof) -> Result<FinishRunReceipt> {
+        if let Some((completed, receipt)) = &self.completed_custody {
+            return if completed == proof {
+                Ok(receipt.clone())
+            } else {
+                Err(error(
+                    ErrorKind::InvalidState,
+                    "custody certificate changed",
+                ))
+            };
+        }
         if self.poisoned {
             return Err(error(ErrorKind::InvalidState, "custody requires recovery"));
         }
-        let (prepared, durability) = self
+        let (prepared, durability, _) = self
             .prepared_custody
             .as_ref()
             .ok_or_else(|| error(ErrorKind::InvalidState, "custody finish is not prepared"))?;
@@ -866,11 +889,13 @@ impl Overlay {
         self.config = None;
         self.base = None;
         cleanup?;
-        Ok(FinishRunReceipt {
+        let receipt = FinishRunReceipt {
             run_id: lease.run_id,
             durability,
             completed_through,
-        })
+        };
+        self.completed_custody = Some((proof.clone(), receipt.clone()));
+        Ok(receipt)
     }
 
     /// Inject contracts without selecting, opening, or acquiring a backend.
@@ -887,6 +912,7 @@ impl Overlay {
             custody: None,
             custody_durable: false,
             prepared_custody: None,
+            completed_custody: None,
             serial: 0,
             last_committed: Sequence(0),
             pages: BTreeMap::new(),

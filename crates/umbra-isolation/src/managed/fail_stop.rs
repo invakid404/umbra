@@ -12,6 +12,34 @@ pub struct WorkerBoundary {
 }
 
 impl WorkerBoundary {
+    /// Enrolled run identity carried by this worker-only capability.
+    pub fn run_identity(&self) -> RunIdentity {
+        self.run
+    }
+    /// Validate shared ownership without borrowing notification state.
+    pub fn validates(&self, cleanup: &super::worker::SharedWorkerCleanup) -> bool {
+        self.local.role == Role::Worker
+            && identity(std::process::id(), Role::Worker).ok() == Some(self.local)
+            && cleanup.belongs_to(self.run, self.local)
+    }
+
+    /// Fail-stop remains terminal when notification state is borrowed or panics.
+    pub fn fail_stop_shared(
+        self,
+        cleanup: &super::worker::SharedWorkerCleanup,
+        failure: &umbra_core::UmbraError,
+    ) -> io::Result<Infallible> {
+        if !self.validates(cleanup) {
+            return Err(invalid("fail-stop outside enrolled worker"));
+        }
+        let mut cleanup = cleanup.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cleanup.failed(failure);
+        }));
+        // SAFETY: identity and registered role were checked before borrowing.
+        unsafe { libc::_exit(1) }
+    }
+
     pub(super) fn new(local: Participant, run: RunIdentity) -> Self {
         Self { local, run }
     }

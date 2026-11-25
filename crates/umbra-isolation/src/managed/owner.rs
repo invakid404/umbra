@@ -14,7 +14,7 @@ use umbra_core::managed::{Participant, RunIdentity, Start, TicketState};
 #[derive(Default)]
 pub struct Launch {
     attempted: bool,
-    child: Option<Child>,
+    pub(super) child: Option<Child>,
 }
 
 /// Run-bound metadata preceding the single provider descriptor.
@@ -73,6 +73,18 @@ impl Launch {
         descriptor: &umbra_core::provider::ProviderDescriptor,
         readiness_deadline: u64,
     ) -> io::Result<Handoff> {
+        self.connect_configured(descriptor, readiness_deadline, |_| Ok(()))
+    }
+
+    /// Attach the provider's private startup endpoints before spawning it.
+    /// The original readiness cutoff and this owner's child custody apply
+    /// equally to configuration failures and handshake failures.
+    pub fn connect_configured(
+        &mut self,
+        descriptor: &umbra_core::provider::ProviderDescriptor,
+        readiness_deadline: u64,
+        configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
+    ) -> io::Result<Handoff> {
         if self.attempted {
             return Err(invalid("provider launch already attempted"));
         }
@@ -82,10 +94,11 @@ impl Launch {
         if timeout_ms == 0 {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        let client = umbra_core::provider::Client::connect_managed(
+        let client = umbra_core::provider::Client::connect_managed_configured(
             descriptor,
             timeout_ms.min(60_000),
             &mut self.child,
+            configure,
         )
         .map_err(io::Error::other)?;
         let child = self

@@ -10,14 +10,19 @@ pub mod channels;
 pub mod executable;
 pub mod fail_stop;
 pub mod guard;
+pub mod guardian_startup;
 pub mod inventory;
 pub mod owner;
+pub mod owner_startup;
 pub mod process;
+pub mod provider_startup;
 pub mod publication;
+pub mod relay_startup;
 pub mod rollback;
 pub mod startup;
 pub mod topology;
 pub mod worker;
+pub mod worker_startup;
 
 /// Checked boot-clock timestamp shared by every participant on this machine.
 pub fn boot_nanos() -> io::Result<u64> {

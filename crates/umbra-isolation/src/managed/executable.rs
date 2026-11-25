@@ -49,6 +49,38 @@ pub struct Entry {
     authorization: Option<super::startup::Go>,
     announced: Option<super::inventory::Announcement>,
     inventory: Option<super::inventory::Inventory>,
+    readiness: Option<Vec<super::startup::Ready>>,
+    root: bool,
+}
+
+impl Entry {
+    /// Create the CLI relay before any descendants or run resources exist.
+    pub fn root_relay(launch: LaunchConfiguration, readiness_deadline: u64) -> io::Result<Self> {
+        launch.validate().map_err(invalid)?;
+        if super::boot_nanos()? >= readiness_deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let mut topology = super::topology::Topology::new(false)?;
+        let endpoints = topology.take(Role::Relay)?;
+        let mut descendants = BTreeMap::new();
+        for role in [Role::Guardian, Role::Worker, Role::CleanupOwner, Role::Provider] {
+            descendants.insert(role, topology.take(role)?);
+        }
+        Ok(Self {
+            role: Role::Relay,
+            parent: identity(std::process::id(), Role::Relay)?,
+            launch,
+            readiness_deadline,
+            endpoints,
+            descendants,
+            bootstrap: None,
+            authorization: None,
+            announced: None,
+            inventory: None,
+            readiness: None,
+            root: true,
+        })
+    }
 }
 
 /// Spawn a helper from this executable; no caller-supplied executable fallback.
@@ -218,6 +250,8 @@ pub fn entry() -> io::Result<Option<Entry>> {
         authorization: None,
         announced: None,
         inventory: None,
+        readiness: None,
+        root: false,
     }))
 }
 
@@ -263,6 +297,25 @@ fn in_subtree(root: Role, candidate: Role) -> bool {
 }
 
 impl Entry {
+    /// End an enrolled worker after ambiguous Armed persistence without running
+    /// namespace or process-exit destructors. Installed parent watches retain
+    /// failure detection and collection authority before GO.
+    pub fn fail_stop_worker_startup(&self) -> io::Result<std::convert::Infallible> {
+        let local = identity(std::process::id(), Role::Worker)?;
+        if self.role != Role::Worker
+            || !self.inventory.as_ref().is_some_and(|inventory| {
+                inventory
+                    .members
+                    .iter()
+                    .any(|member| member.participant == local)
+            })
+        {
+            return Err(invalid("startup fail-stop outside enrolled worker"));
+        }
+        // SAFETY: verified enrolled worker only; other roles retain custody.
+        unsafe { libc::_exit(1) }
+    }
+
     /// Obtain fail-stop authority only for this registered, GO-authorized worker.
     pub fn worker_boundary(&self) -> io::Result<super::fail_stop::WorkerBoundary> {
         let local = identity(std::process::id(), self.role)?;
@@ -306,6 +359,103 @@ impl Entry {
             new_session,
             self.readiness_deadline,
         )
+    }
+}
+
+impl Entry {
+    /// Launch the registered provider with its assigned private endpoints.
+    /// Actual child custody stays in `launch`, including handshake failures.
+    /// Bootstrap remains independent of the worker RPC handoff.
+    pub fn connect_provider(
+        &mut self,
+        launch: &mut super::owner::Launch,
+        descriptor: &umbra_core::provider::ProviderDescriptor,
+    ) -> io::Result<(
+        super::owner::Handoff,
+        super::provider_startup::ProviderStartup,
+    )> {
+        use std::os::unix::process::CommandExt;
+        if self.role != Role::CleanupOwner || super::boot_nanos()? >= self.readiness_deadline {
+            return Err(invalid("provider launch outside owner startup"));
+        }
+        let endpoints = self
+            .descendants
+            .remove(&Role::Provider)
+            .ok_or_else(|| invalid("provider endpoint assignment missing"))?;
+        if endpoints
+            .iter()
+            .any(|endpoint| endpoint.peer != Role::CleanupOwner)
+            || endpoints
+                .iter()
+                .filter(|endpoint| endpoint.purpose == Purpose::Admission)
+                .count()
+                != 1
+            || endpoints
+                .iter()
+                .filter(|endpoint| endpoint.purpose == Purpose::Cancellation)
+                .count()
+                != 1
+            || endpoints.len() != 2
+        {
+            return Err(invalid("invalid provider endpoint inventory"));
+        }
+        let (parent_bootstrap, child_bootstrap) = UnixStream::pair()?;
+        let bootstrap = super::Channel::new(parent_bootstrap)?;
+        let spec = Spec {
+            role: Role::Provider,
+            parent: identity(std::process::id(), Role::CleanupOwner)?,
+            launch: self.launch.clone(),
+            endpoints: endpoints
+                .iter()
+                .map(|endpoint| Descriptor {
+                    owner: Role::Provider,
+                    peer: endpoint.peer,
+                    purpose: endpoint.purpose,
+                    fd: endpoint.stream.as_raw_fd(),
+                })
+                .collect(),
+            bootstrap: child_bootstrap.as_raw_fd(),
+            readiness_deadline: self.readiness_deadline,
+        };
+        let encoded = serde_json::to_string(&spec).map_err(io::Error::other)?;
+        if encoded.len() > umbra_core::managed::MAX_FRAME {
+            return Err(invalid("provider re-entry configuration too large"));
+        }
+        let mut fds: Vec<_> = spec.endpoints.iter().map(|endpoint| endpoint.fd).collect();
+        fds.push(spec.bootstrap);
+        let handoff =
+            launch.connect_configured(descriptor, self.readiness_deadline, |command| {
+                command
+                    .env_remove(crate::ENV_GUARDIAN)
+                    .env(ENV_ROLE, encoded);
+                // SAFETY: only fcntl runs after fork; owned descriptors remain
+                // live on this stack until connect returns. Parent flags stay intact.
+                unsafe {
+                    command.pre_exec(move || {
+                        for fd in &fds {
+                            let flags = libc::fcntl(*fd, libc::F_GETFD);
+                            if flags < 0
+                                || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                            {
+                                return Err(io::Error::last_os_error());
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+                Ok(())
+            })?;
+        drop(endpoints);
+        drop(child_bootstrap);
+        let startup = super::provider_startup::ProviderStartup::new(
+            bootstrap,
+            self.launch.run,
+            handoff.provider,
+            spec.parent,
+            self.launch.capacity,
+            self.readiness_deadline,
+        );
+        Ok((handoff, startup))
     }
 }
 
@@ -489,6 +639,21 @@ impl Entry {
             run: self.launch.run,
             members,
         };
+        if self.root {
+            let mut announcement = announcement;
+            announcement.members[0].parent = None;
+            let inventory = super::inventory::Inventory {
+                run: self.launch.run,
+                external_caller: false,
+                members: announcement.members.clone(),
+            };
+            inventory.validate(self.launch.run, false)?;
+            if self.announced.as_ref().is_some_and(|prior| prior != &announcement) {
+                return Err(invalid("root announcement changed"));
+            }
+            self.announced = Some(announcement);
+            return Ok(true);
+        }
         announcement.validate(self.launch.run, local, self.parent)?;
         if self
             .announced
@@ -510,6 +675,43 @@ impl Entry {
 
     /// Accept the parent's complete topology under the original readiness cutoff.
     pub fn receive_inventory(&mut self, external_caller: bool) -> io::Result<bool> {
+        self.receive_inventory_mode(Some(external_caller))
+    }
+
+    /// Complete the provider leaf's barrier after its RPC handshake.
+    /// The owner's validated topology determines whether an external caller
+    /// exists; providers do not launch descendants or install role watches.
+    pub fn complete_provider_startup(&mut self) -> io::Result<()> {
+        if self.role != Role::Provider || !self.descendants.is_empty() {
+            return Err(invalid("provider startup used by another role"));
+        }
+        while !self.announce_members(&[])? {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        while !self.receive_inventory_mode(None)? {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.ready(Vec::new())?;
+        while !self.await_go(self.readiness_deadline)? {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    fn receive_inventory_mode(&mut self, external_caller: Option<bool>) -> io::Result<bool> {
+        if self.root {
+            if external_caller == Some(true) || self.inventory.is_some() {
+                return Err(invalid("root inventory mode or phase mismatch"));
+            }
+            let inventory = super::inventory::Inventory {
+                run: self.launch.run,
+                external_caller: false,
+                members: self.announced.as_ref().ok_or_else(|| invalid("root not announced"))?.members.clone(),
+            };
+            inventory.validate(self.launch.run, false)?;
+            self.inventory = Some(inventory);
+            return Ok(true);
+        }
         if self.announced.is_none() || self.inventory.is_some() {
             return Err(invalid("inventory in wrong startup phase"));
         }
@@ -525,7 +727,10 @@ impl Entry {
         else {
             return Ok(false);
         };
-        inventory.validate(self.launch.run, external_caller)?;
+        inventory.validate(
+            self.launch.run,
+            external_caller.unwrap_or(inventory.external_caller),
+        )?;
         let member = super::inventory::Member {
             participant: identity(std::process::id(), self.role)?,
             parent: Some(self.parent),
@@ -559,9 +764,30 @@ impl Entry {
         child.send_authorization(authorization, deadline)
     }
 
+    /// Forward accepted durable authorization to this owner's provider.
+    pub fn forward_provider_go(
+        &self,
+        provider: &mut super::provider_startup::ProviderStartup,
+    ) -> io::Result<bool> {
+        if self.role != Role::CleanupOwner {
+            return Err(invalid("provider GO outside cleanup owner"));
+        }
+        provider.authorize(
+            self.authorization
+                .as_ref()
+                .ok_or_else(|| invalid("provider GO before owner acceptance"))?,
+        )
+    }
+
     /// Queue this role's identity and installed watch inventory.
     pub fn ready(&mut self, watched: Vec<Participant>) -> io::Result<()> {
         self.ready_subtree(watched, Vec::new())
+    }
+
+    /// Exact validated receipts queued for the parent. The relay uses these
+    /// same receipts when constructing its immutable Armed request.
+    pub fn readiness(&self) -> Option<&[super::startup::Ready]> {
+        self.readiness.as_deref()
     }
 
     /// Report this role and its validated descendant readiness receipts together.
@@ -585,18 +811,32 @@ impl Entry {
         let ready = super::startup::Ready {
             run: self.launch.run,
             participant: identity(std::process::id(), self.role)?,
-            parent: Some(self.parent),
+            parent: (!self.root).then_some(self.parent),
             watched,
         };
         let local = ready.participant;
         descendants.insert(0, ready);
         if let Some(inventory) = &self.inventory {
-            inventory.validate_readiness(local, &descendants)?;
+            if self.root {
+                super::startup::Startup::from_readiness(self.launch.run, false, self.readiness_deadline, descendants.clone())?;
+            } else {
+                inventory.validate_readiness(local, &descendants)?;
+            }
         }
-        self.bootstrap
-            .as_mut()
-            .ok_or_else(|| invalid("bootstrap already closed"))?
-            .queue(&descendants)
+        if let Some(prior) = &self.readiness {
+            if prior != &descendants {
+                return Err(invalid("startup readiness changed"));
+            }
+            return Ok(());
+        }
+        if !self.root {
+            self.bootstrap
+                .as_mut()
+                .ok_or_else(|| invalid("bootstrap already closed"))?
+                .queue(&descendants)?;
+        }
+        self.readiness = Some(descendants);
+        Ok(())
     }
     /// Adopt the provider's unique admission endpoint after durable GO.
     /// Taking it removes the descriptor from startup ownership before native
@@ -647,6 +887,20 @@ impl Entry {
             super::Channel::new(endpoint.stream)?,
             cutoff,
         )
+    }
+
+    /// Advance readiness and accept matching GO under the original deadline.
+    pub fn flush_readiness(&mut self) -> io::Result<bool> {
+        if self.root {
+            if super::boot_nanos()? >= self.readiness_deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            return Ok(self.readiness.is_some());
+        }
+        self.bootstrap
+            .as_mut()
+            .ok_or_else(|| invalid("startup already closed"))?
+            .flush(self.readiness_deadline)
     }
 
     /// Advance readiness and accept matching GO under the original deadline.
@@ -701,6 +955,8 @@ mod admission_tests {
             authorization: None,
             announced: None,
             inventory: None,
+            readiness: None,
+        root: false,
         };
         assert!(entry.take_admission().is_err());
         assert_eq!(

@@ -31,6 +31,60 @@ pub struct WorkerCleanup {
     receipt: Option<ProviderReceipt>,
 }
 
+/// Thread-affine shared cleanup state for the worker run owner and platform proxy.
+/// Every user of this handle retains the same ticket and parent-wait receipt.
+#[derive(Clone)]
+pub struct SharedWorkerCleanup {
+    inner: std::rc::Rc<std::cell::RefCell<WorkerCleanup>>,
+    run: RunIdentity,
+    local: Participant,
+}
+
+impl SharedWorkerCleanup {
+    /// Share an enrolled worker's independent notification routes.
+    pub fn new(cleanup: WorkerCleanup) -> Self {
+        Self {
+            run: cleanup.run,
+            local: cleanup.local,
+            inner: std::rc::Rc::new(std::cell::RefCell::new(cleanup)),
+        }
+    }
+
+    /// Publish failure and end the registered worker without unwinding owners.
+    pub fn fail_stop(
+        &self,
+        boundary: super::fail_stop::WorkerBoundary,
+        failure: &UmbraError,
+    ) -> std::io::Result<std::convert::Infallible> {
+        boundary.fail_stop_shared(self, failure)
+    }
+
+    pub(super) fn belongs_to(&self, run: RunIdentity, local: Participant) -> bool {
+        self.run == run && self.local == local
+    }
+}
+
+impl ManagedCleanup for SharedWorkerCleanup {
+    fn provider_receipt(&self) -> Option<umbra_core::managed::ProviderReceipt> {
+        self.inner.try_borrow().ok()?.provider_receipt()
+    }
+    fn start(&mut self) -> umbra_core::Result<Instant> {
+        self.inner.try_borrow_mut().map_err(error)?.start()
+    }
+    fn failed(&mut self, failure: &UmbraError) {
+        self.inner.borrow_mut().failed(failure);
+    }
+    fn collect_provider(&mut self) -> umbra_core::Result<Duration> {
+        self.inner
+            .try_borrow_mut()
+            .map_err(error)?
+            .collect_provider()
+    }
+    fn abandon(&mut self) {
+        self.inner.borrow_mut().abandon();
+    }
+}
+
 fn error(error: impl std::fmt::Display) -> UmbraError {
     UmbraError::new(
         ErrorKind::ProtocolMismatch,
@@ -251,6 +305,33 @@ impl WorkerCleanup {
         timeout_ms: u64,
         readiness_deadline: u64,
     ) -> io::Result<Option<umbra_core::provider::Client>> {
+        Self::receive_offer(
+            &super::owner::ProviderOffer {
+                run: self.run,
+                owner: self.owner,
+                provider: self.provider,
+                welcome: welcome.clone(),
+            },
+            self.run,
+            route,
+            descriptor,
+            timeout_ms,
+            readiness_deadline,
+        )
+    }
+
+    /// Receive the owner handoff before building runtime cleanup routes.
+    /// Validate the offered run and kernel parent edge before consuming its fd.
+    pub fn receive_offer(
+        offer: &super::owner::ProviderOffer,
+        run: RunIdentity,
+        route: &std::os::unix::net::UnixStream,
+        descriptor: &umbra_core::provider::ProviderDescriptor,
+        timeout_ms: u64,
+        readiness_deadline: u64,
+    ) -> io::Result<Option<umbra_core::provider::Client>> {
+        offer.validate(run)?;
+        let welcome = &offer.welcome;
         if boot_nanos()? >= readiness_deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
@@ -271,10 +352,10 @@ impl WorkerCleanup {
             return Ok(None);
         };
         let (provider, parent) =
-            super::process::identity_with_parent(self.provider.pid, self.provider.role)?;
-        if provider != self.provider
-            || parent != self.owner.pid
-            || super::process::identity(self.owner.pid, self.owner.role)? != self.owner
+            super::process::identity_with_parent(offer.provider.pid, offer.provider.role)?;
+        if provider != offer.provider
+            || parent != offer.owner.pid
+            || super::process::identity(offer.owner.pid, offer.owner.role)? != offer.owner
         {
             return Err(invalid("provider handoff parent or birth mismatch"));
         }
@@ -392,6 +473,12 @@ impl WorkerCleanup {
 }
 
 impl ManagedCleanup for WorkerCleanup {
+    fn provider_receipt(&self) -> Option<ProviderReceipt> {
+        self.receipt
+            .as_ref()
+            .filter(|receipt| !receipt.failed && receipt.status == 0 && !self.tickets.failed())
+            .cloned()
+    }
     fn start(&mut self) -> umbra_core::Result<Instant> {
         self.publish(CleanupPath::Trusted).map_err(error)?;
         let cutoff = self

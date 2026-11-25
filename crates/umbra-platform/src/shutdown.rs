@@ -23,6 +23,8 @@ pub enum Start {
 
 /// Run-end evidence, keeping ledger proof separate from exit-wait success.
 pub struct Closure {
+    /// Ordered managed evidence, present only after validated Final and parent wait.
+    pub managed: Option<Box<ManagedTerminal>>,
     /// All resource obligations independently confirmed.
     pub tree_terminated: bool,
     /// Closure error; never overwrites a preexisting event-loop primary error.
@@ -31,10 +33,42 @@ pub struct Closure {
     pub final_to_exit: Option<Duration>,
 }
 
+/// Resource evidence retained only after successful managed provider collection.
+pub struct ManagedTerminal {
+    accepted: Accepted,
+    final_state: Final,
+    receipt: umbra_core::managed::ProviderReceipt,
+}
+
+impl ManagedTerminal {
+    pub(crate) fn collected(
+        accepted: Accepted,
+        final_state: Final,
+        receipt: umbra_core::managed::ProviderReceipt,
+    ) -> Self {
+        Self {
+            accepted,
+            final_state,
+            receipt,
+        }
+    }
+
+    /// Encode the exact ordered resource evidence for a durable certificate.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        umbra_core::provider::encode(&(&self.accepted, &self.final_state, &self.receipt))
+    }
+
+    /// Identity of the run whose provider was collected by its actual parent.
+    pub fn run(&self) -> umbra_core::managed::RunIdentity {
+        self.receipt.run
+    }
+}
+
 impl Closure {
     /// Missing proof, including failure before acceptance.
     pub fn failed(error: UmbraError) -> Self {
         Self {
+            managed: None,
             tree_terminated: false,
             error: Some(error),
             final_to_exit: None,
@@ -45,6 +79,7 @@ impl Closure {
     pub fn from_final(accepted: &Accepted, final_state: &Final) -> Self {
         match accepted.confirms(final_state) {
             Ok(true) => Self {
+                managed: None,
                 tree_terminated: true,
                 error: None,
                 final_to_exit: None,

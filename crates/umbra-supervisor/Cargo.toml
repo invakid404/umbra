@@ -25,6 +25,8 @@ mutation-probe-readdir = []
 mutation-probe-spawn-lifecycle = []
 
 [dependencies]
+serde.workspace = true
+sha2 = "=0.10.9"
 tracing.workspace = true
 # Run and operation identities are allocated here, so the generator is a direct
 # dependency rather than something borrowed from a backend crate.
@@ -35,6 +37,9 @@ umbra-storage = { path = "../umbra-storage" }
 umbra-overlay = { path = "../umbra-overlay" }
 umbra-journal = { path = "../umbra-journal" }
 umbra-agent = { path = "../umbra-agent" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+umbra-isolation = { path = "../umbra-isolation" }
 
 [dev-dependencies]
 libc = "=0.2.191"

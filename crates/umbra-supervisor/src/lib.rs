@@ -35,10 +35,15 @@ pub mod base;
 /// The production directory encoder and its per-syscall buffer binding.
 pub mod directory;
 mod events;
+pub mod managed_finish;
+pub mod managed_input;
+pub mod namespace_owner;
 /// Open file descriptions routed descriptors share across fork and spawn.
 mod ofd;
 /// Staged composition of one command run.
 pub mod run;
+#[cfg(target_os = "macos")]
+pub mod run_owner;
 /// Runtime rendering of the single Seatbelt policy template.
 pub mod sandbox;
 mod spawn;
@@ -333,7 +338,7 @@ mod filesystem;
 pub struct Supervisor {
     terminal_journal: Option<crate::shutdown_journal::TerminalJournal>,
     platform: PlatformSession,
-    namespace: Box<dyn NamespaceSession + Send>,
+    namespace: namespace_owner::NamespaceOwner,
     agent: Option<Box<dyn Agent>>,
     state: SupervisorState,
     budget: Option<RunBudget>,
@@ -418,7 +423,7 @@ pub struct SupervisorParts {
     /// Platform.
     pub platform: PlatformSession,
     /// Namespace.
-    pub namespace: Box<dyn NamespaceSession + Send>,
+    pub namespace: namespace_owner::NamespaceOwner,
     /// Agent, absent for a raw command run.
     pub agent: Option<Box<dyn Agent>>,
     /// State.
@@ -448,6 +453,31 @@ impl Supervisor {
         run_id: RunId,
         platform: PlatformSession,
         namespace: Box<dyn NamespaceSession + Send>,
+        agent: Option<Box<dyn Agent>>,
+    ) -> Self {
+        Self::assemble(run_id, platform, namespace.into(), agent)
+    }
+
+    /// Assemble a registered worker using retained namespace custody.
+    #[cfg(target_os = "macos")]
+    pub fn with_run_owner(
+        run_id: RunId,
+        platform: PlatformSession,
+        owner: run_owner::RunOwner,
+        agent: Option<Box<dyn Agent>>,
+    ) -> Self {
+        Self::assemble(
+            run_id,
+            platform,
+            namespace_owner::NamespaceOwner::Managed(Box::new(owner)),
+            agent,
+        )
+    }
+
+    fn assemble(
+        run_id: RunId,
+        platform: PlatformSession,
+        namespace: namespace_owner::NamespaceOwner,
         agent: Option<Box<dyn Agent>>,
     ) -> Self {
         Self {

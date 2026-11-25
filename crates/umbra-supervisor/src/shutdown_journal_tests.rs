@@ -64,6 +64,7 @@ mod shutdown_journal {
     }
     pub(super) fn confirmed() -> umbra_platform::shutdown::Closure {
         umbra_platform::shutdown::Closure {
+            managed: None,
             tree_terminated: true,
             error: None,
             final_to_exit: None,
@@ -333,10 +334,10 @@ mod shutdown_journal {
             )
             .unwrap();
         let failed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        supervisor.namespace = Box::new(Spy {
+        supervisor.namespace = crate::namespace_owner::NamespaceOwner::Unmanaged(Box::new(Spy {
             inner: Box::new(namespace),
             failed: failed.clone(),
-        });
+        }));
         supervisor
             .handle_event(TraceEvent::Exit {
                 task: task(1),

@@ -84,6 +84,15 @@ impl Guard {
         entry: &mut super::executable::Entry,
         watch: ProcessWatch,
     ) -> io::Result<Self> {
+        Self::from_entry_restoring(entry, watch, Vec::new())
+    }
+
+    /// Restore assigned startup channels before validating runtime coverage.
+    pub fn from_entry_restoring(
+        entry: &mut super::executable::Entry,
+        watch: ProcessWatch,
+        restored: Vec<(umbra_core::managed::Role, super::Channel)>,
+    ) -> io::Result<Self> {
         use umbra_core::managed::Role;
         if !matches!(entry.role, Role::Guardian | Role::Relay) {
             return Err(invalid("entry is not a parent runtime role"));
@@ -93,7 +102,11 @@ impl Guard {
             .ok_or_else(|| invalid("parent runtime before inventory"))?
             .clone();
         let local = super::process::identity(std::process::id(), entry.role)?;
-        let channels = super::channels::RuntimeChannels::from_entry(entry)?.finish()?;
+        let mut channels = super::channels::RuntimeChannels::from_entry(entry)?;
+        for (peer, channel) in restored {
+            channels.insert(peer, channel)?;
+        }
+        let channels = channels.finish()?;
         let mut guard = Self::from_startup(local, &inventory, entry.launch.capacity, watch)?;
         for route in channels {
             guard.route(route.peer(), route);

@@ -516,7 +516,7 @@ impl Client {
 
     /// Validate provider registration and establish a private protocol session.
     pub fn connect(descriptor: &ProviderDescriptor, timeout_ms: u64) -> Result<Self> {
-        Self::connect_with_custody(descriptor, timeout_ms, None)
+        Self::connect_with_custody(descriptor, timeout_ms, None, |_| Ok(()))
     }
 
     /// Connect from the cleanup-owner process, retaining its child on every error.
@@ -528,16 +528,30 @@ impl Client {
         timeout_ms: u64,
         custody: &mut Option<Child>,
     ) -> Result<Self> {
+        Self::connect_managed_configured(descriptor, timeout_ms, custody, |_| Ok(()))
+    }
+
+    /// Install private managed startup descriptors and environment before spawn.
+    /// Configuration spends the same readiness allowance as the handshake.
+    /// A configuration failure cannot leave a spawned child; after spawn the
+    /// supplied custody slot retains the child even if the handshake fails.
+    pub fn connect_managed_configured(
+        descriptor: &ProviderDescriptor,
+        timeout_ms: u64,
+        custody: &mut Option<Child>,
+        configure: impl FnOnce(&mut Command) -> std::io::Result<()>,
+    ) -> Result<Self> {
         if custody.is_some() {
             return Err(protocol_error("provider custody slot already occupied"));
         }
-        Self::connect_with_custody(descriptor, timeout_ms, Some(custody))
+        Self::connect_with_custody(descriptor, timeout_ms, Some(custody), configure)
     }
 
     fn connect_with_custody(
         descriptor: &ProviderDescriptor,
         timeout_ms: u64,
         custody: Option<&mut Option<Child>>,
+        configure: impl FnOnce(&mut Command) -> std::io::Result<()>,
     ) -> Result<Self> {
         descriptor.validate(&descriptor.role)?;
         if timeout_ms == 0 || timeout_ms > 60_000 {
@@ -558,18 +572,22 @@ impl Client {
         let socket = directory.path().join("ipc");
         let listener = UnixListener::bind(&socket).map_err(unavailable)?;
         listener.set_nonblocking(true).map_err(unavailable)?;
-        let child = Command::new(std::ffi::OsStr::from_bytes(
+        let mut command = Command::new(std::ffi::OsStr::from_bytes(
             descriptor.executable.as_bytes(),
-        ))
-        .arg("--umbra-socket")
-        .arg(&socket)
-        .arg("--umbra-timeout-ms")
-        .arg(timeout_ms.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(unavailable)?;
+        ));
+        command
+            .arg("--umbra-socket")
+            .arg(&socket)
+            .arg("--umbra-timeout-ms")
+            .arg(timeout_ms.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        configure(&mut command).map_err(unavailable)?;
+        if managed_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(unavailable("provider readiness expired before spawn"));
+        }
+        let child = command.spawn().map_err(unavailable)?;
         let mut local_child = None;
         let child_slot = custody.unwrap_or(&mut local_child);
         *child_slot = Some(child);
@@ -1265,6 +1283,50 @@ mod tests {
         connection.cap_cleanup_deadline(earlier);
         connection.begin();
         assert_eq!(connection.deadline(), earlier);
+    }
+
+    #[test]
+    fn managed_configuration_failure_never_spawns_provider() {
+        let descriptor = managed_stall_descriptor();
+        let mut custody = None;
+        let result = Client::connect_managed_configured(&descriptor, 1000, &mut custody, |_| {
+            Err(std::io::Error::other("startup endpoint setup failed"))
+        });
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("startup endpoint setup failed"));
+        assert!(custody.is_none(), "configuration failure spawned a child");
+    }
+
+    #[test]
+    fn managed_configuration_cannot_renew_readiness_before_spawn() {
+        let descriptor = managed_stall_descriptor();
+        let mut custody = None;
+        let result = Client::connect_managed_configured(&descriptor, 1, &mut custody, |_| {
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(())
+        });
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("readiness expired before spawn"));
+        assert!(custody.is_none(), "expired startup spawned a child");
+    }
+
+    fn managed_stall_descriptor() -> ProviderDescriptor {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stall-provider.sh");
+        ProviderDescriptor {
+            id: "fake".into(),
+            role: "test".into(),
+            protocol_version: PROTOCOL_VERSION,
+            executable: crate::BytePath::new(script.as_os_str().as_bytes().to_vec()).unwrap(),
+            capabilities: Default::default(),
+            options: Default::default(),
+        }
     }
 
     #[test]

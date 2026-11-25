@@ -183,6 +183,10 @@ struct Control {
 /// Independent cleanup-owner control; implementations retain the original
 /// cross-process ticket and validate actual provider-parent collection receipts.
 pub trait ManagedCleanup {
+    /// Exact successful parent-wait receipt, absent until collection is proven.
+    fn provider_receipt(&self) -> Option<umbra_core::managed::ProviderReceipt> {
+        None
+    }
     /// Publish Start on every required route before any cleanup operation.
     /// Return the local representation of the committed absolute deadline.
     fn start(&mut self) -> Result<std::time::Instant>;
@@ -242,6 +246,38 @@ pub fn attach_managed(
         }),
         abi: Box::new(Abi { client }),
     })
+}
+
+/// Adopt worker stdio on the already handed-off managed provider connection.
+pub fn attach_managed_with_stdio(
+    mut client: Client,
+    timeout_ms: u64,
+    mut managed: Box<dyn ManagedCleanup>,
+    stdio: umbra_core::launch_stdio::LaunchStdio,
+) -> Result<PlatformSession> {
+    if client.owns_provider()
+        || client.welcome.role != "platform"
+        || !client
+            .welcome
+            .capabilities
+            .contains(umbra_core::launch_stdio::CAPABILITY)
+        || !client
+            .welcome
+            .capabilities
+            .contains(umbra_core::shutdown::CAPABILITY)
+    {
+        let error = protocol_error("managed stdio handoff lacks ownership or capabilities");
+        managed.failed(&error);
+        return Err(error);
+    }
+    let result = client
+        .call_with_stdio(&Request::AdoptStdio, stdio)
+        .and_then(unit);
+    if let Err(error) = result {
+        managed.failed(&error);
+        return Err(error);
+    }
+    attach_managed(client, timeout_ms, managed)
 }
 struct Abi {
     client: Rc<RefCell<Client>>,

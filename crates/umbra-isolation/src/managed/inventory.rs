@@ -38,6 +38,7 @@ impl Announcement {
             Guardian => &[Guardian, Worker, CleanupOwner, Provider],
             CleanupOwner => &[CleanupOwner, Provider],
             Worker => &[Worker],
+            Provider => &[Provider],
             _ => return Err(invalid("invalid announcing role")),
         };
         if self.run != run || self.members.len() != expected.len() {

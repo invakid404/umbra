@@ -574,5 +574,11 @@ pub fn idle_namespace(
         "Idle must not resume"
     );
     assert!(!supervisor.is_poisoned());
-    supervisor.into_parts().namespace
+    match supervisor.into_parts().namespace {
+        umbra_supervisor::namespace_owner::NamespaceOwner::Unmanaged(namespace) => namespace,
+        #[cfg(target_os = "macos")]
+        umbra_supervisor::namespace_owner::NamespaceOwner::Managed(_) => {
+            panic!("raw fixture unexpectedly acquired managed custody")
+        }
+    }
 }

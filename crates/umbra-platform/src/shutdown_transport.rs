@@ -349,6 +349,8 @@ fn close_with_owner(
         return Closure::failed(protocol_error("platform provider has no owned exit waiter"));
     }
     let mut proof = false;
+    let managed_run = owner.is_some();
+    let mut managed = None;
     let mut final_to_exit = None;
     let mut collection_attempted = false;
     let result = (|| {
@@ -404,6 +406,20 @@ fn close_with_owner(
                     if !proof {
                         return Err(protocol_error(unconfirmed_final(&final_state, &exit)));
                     }
+                    if managed_run && proof && exit.is_ok() {
+                        if let Some(receipt) =
+                            owner.as_deref().and_then(ManagedCleanup::provider_receipt)
+                        {
+                            if receipt.failed || receipt.status != 0 {
+                                return Err(protocol_error("failed managed collection receipt"));
+                            }
+                            managed = Some(Box::new(crate::shutdown::ManagedTerminal::collected(
+                                accepted.clone(),
+                                final_state,
+                                receipt,
+                            )));
+                        }
+                    }
                     return exit;
                 }
                 _ => return Err(protocol_error("invalid shutdown response phase")),
@@ -412,6 +428,7 @@ fn close_with_owner(
     })();
     match result {
         Ok(_) => Closure {
+            managed,
             tree_terminated: proof,
             error: None,
             final_to_exit,
@@ -431,6 +448,7 @@ fn close_with_owner(
                 }
             }
             Closure {
+                managed: None,
                 tree_terminated: proof,
                 error: Some(error),
                 final_to_exit,
