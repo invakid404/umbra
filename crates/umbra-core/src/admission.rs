@@ -233,3 +233,45 @@ impl AdmissionLedger {
         Ok(self.current())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r2_budget_overflow_and_writer_death() {
+        let nonce = Uuid::from_u128(1);
+        let mut ledger = AdmissionLedger::new(nonce, 1, u64::MAX).unwrap();
+        let reserve = AdmissionRequest {
+            nonce,
+            generation: 1,
+            sequence: 1,
+            operation: AdmissionOperation::Reserve {
+                obligation: Uuid::from_u128(2),
+            },
+        };
+        ledger.apply(reserve.clone()).unwrap();
+        // Place the protocol at its final representable transaction without
+        // performing a lifetime-sized workload. No wrapping restart is allowed.
+        ledger.last = Some((
+            AdmissionRequest {
+                sequence: u64::MAX,
+                ..reserve.clone()
+            },
+            Ok(1),
+        ));
+        assert_eq!(
+            ledger.apply(AdmissionRequest {
+                sequence: 0,
+                ..reserve
+            }),
+            Err(AdmissionError::Invalid)
+        );
+        assert!(ledger.failed());
+        assert_eq!(
+            ledger.current(),
+            1,
+            "loss of protocol authority cannot clear obligations"
+        );
+    }
+}

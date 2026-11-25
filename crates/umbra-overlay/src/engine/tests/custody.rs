@@ -2,6 +2,10 @@ use super::*;
 use umbra_journal_file::FileJournal;
 
 fn setup() -> (Fixture, JournalOpenRequest, CustodyFinishProof) {
+    setup_with_arm(true)
+}
+
+fn setup_with_arm(arm: bool) -> (Fixture, JournalOpenRequest, CustodyFinishProof) {
     let mut f = Fixture::new(&[]);
     let config = f.overlay.config().unwrap();
     let run_id = config.context.run_id;
@@ -32,21 +36,23 @@ fn setup() -> (Fixture, JournalOpenRequest, CustodyFinishProof) {
     assert!(journal.open(&request).unwrap().clean);
     f.overlay.journal = Box::new(journal);
     let generation = Uuid::new_v4();
-    f.overlay
-        .arm_custody(CustodyRecord {
-            run_id,
-            generation,
-            sequence: 1,
-            state: CustodyPhase::Armed {
-                capacity: 64,
-                startup_nonce: Uuid::new_v4(),
-                participants: vec![CustodyParticipant {
-                    pid: std::process::id(),
-                    birth: 1,
-                }],
-            },
-        })
-        .unwrap();
+    if arm {
+        f.overlay
+            .arm_custody(CustodyRecord {
+                run_id,
+                generation,
+                sequence: 1,
+                state: CustodyPhase::Armed {
+                    capacity: 64,
+                    startup_nonce: Uuid::new_v4(),
+                    participants: vec![CustodyParticipant {
+                        pid: std::process::id(),
+                        birth: 1,
+                    }],
+                },
+            })
+            .unwrap();
+    }
     let proof = CustodyFinishProof {
         generation,
         certificate: [7; 32],
@@ -57,6 +63,127 @@ fn setup() -> (Fixture, JournalOpenRequest, CustodyFinishProof) {
         root_result: 0,
     };
     (f, request, proof)
+}
+
+#[test]
+fn r2_child_checkpoint_writer() {
+    let Ok(encoded) = std::env::var("UMBRA_FIX_299_JOURNAL_REQUEST") else {
+        return;
+    };
+    let request: JournalOpenRequest = umbra_core::provider::decode(encoded.as_bytes()).unwrap();
+    let JournalAccess::Writer(authority) = &request.access else {
+        panic!("writer required")
+    };
+    let mut journal = FileJournal::new();
+    journal.open(&request).unwrap();
+    let sequence = journal
+        .append(&JournalRecord {
+            format_version: 1,
+            sequence: Sequence(0),
+            operation_id: OperationId(Uuid::new_v4()),
+            writer_epoch: authority.lease_epoch,
+            payload: JournalPayload::Custody(CustodyRecord {
+                run_id: request.control.run_id,
+                generation: Uuid::new_v4(),
+                sequence: 1,
+                state: CustodyPhase::Armed {
+                    capacity: 64,
+                    startup_nonce: Uuid::new_v4(),
+                    participants: vec![CustodyParticipant {
+                        pid: std::process::id(),
+                        birth: 1,
+                    }],
+                },
+            }),
+        })
+        .unwrap();
+    journal.flush(sequence).unwrap();
+    // Simulate abrupt worker completion: no journal close or Rust destructors.
+    std::process::exit(0);
+}
+
+#[test]
+fn r2_uncertain_armed_append_retains_authority() {
+    let mut f = Fixture::new(&[]);
+    let run_id = f.overlay.config().unwrap().context.run_id;
+    f.log.lock().unwrap().fail_custody = true;
+    assert!(
+        f.overlay
+            .arm_custody(CustodyRecord {
+                run_id,
+                generation: Uuid::new_v4(),
+                sequence: 1,
+                state: CustodyPhase::Armed {
+                    capacity: 64,
+                    startup_nonce: Uuid::new_v4(),
+                    participants: vec![CustodyParticipant {
+                        pid: std::process::id(),
+                        birth: 1
+                    }],
+                },
+            })
+            .is_err()
+    );
+    assert!(
+        f.overlay
+            .fail_run(&FailedRunRequest {
+                run_id,
+                reason: "uncertain append".into(),
+                tree_terminated: true,
+            })
+            .is_err()
+    );
+    assert!(f.overlay.config.is_some());
+    assert!(
+        f.overlay
+            .storage
+            .acquire_writer(&AcquireWriterRequest {
+                run_id,
+                writer_id: WriterId("contender".into()),
+                takeover: TakeoverPolicy::Refuse,
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn r2_reopen_armed_before_go() {
+    let (mut f, request, _) = setup_with_arm(false);
+    f.overlay.journal.close().unwrap();
+    let encoded = String::from_utf8(umbra_core::provider::encode(&request).unwrap()).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "engine::tests::custody::r2_child_checkpoint_writer",
+            "--nocapture",
+        ])
+        .env("UMBRA_FIX_299_JOURNAL_REQUEST", encoded)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("checkpoint child exceeded five seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let recovered = reopen(&request);
+    assert!(!recovered.clean);
+    let mut journal = FileJournal::new();
+    journal.open(&request).unwrap();
+    f.overlay.journal = Box::new(journal);
+    let mut config = f.overlay.config.take().unwrap();
+    config.recovery = recovered;
+    let base = f.overlay.base.take().unwrap();
+    f.overlay.bind(config, base).unwrap();
+    assert!(f.overlay.requires_recovery().unwrap());
+    assert!(f.overlay.idle().is_err());
 }
 
 fn reopen(request: &JournalOpenRequest) -> RecoveryState {

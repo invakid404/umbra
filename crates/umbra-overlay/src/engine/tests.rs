@@ -16,6 +16,7 @@ mod custody;
 #[derive(Default)]
 struct Log {
     records: Vec<JournalRecord>,
+    fail_custody: bool,
     fail_prepare: bool,
     fail_commit: bool,
     /// Injects a failure on the `Abort` record's append.
@@ -43,6 +44,7 @@ impl Journal for MemoryJournal {
     fn append(&mut self, record: &JournalRecord) -> Result<Sequence> {
         let mut log = self.log.lock().unwrap();
         if (log.fail_prepare && matches!(record.payload, JournalPayload::Prepare { .. }))
+            || (log.fail_custody && matches!(record.payload, JournalPayload::Custody(_)))
             || (log.fail_commit && matches!(record.payload, JournalPayload::Commit))
             || (log.fail_abort && matches!(record.payload, JournalPayload::Abort { .. }))
         {
