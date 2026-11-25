@@ -275,6 +275,25 @@ fn r2_finish_commit_ack_lost() {
 }
 
 #[test]
+fn r2_finish_retries_keep_exact_proof_and_durable_sequence() {
+    let (mut f, request, proof) = setup();
+    let prepared = f.overlay.prepare_finish(proof.clone()).unwrap();
+    assert_eq!(f.overlay.prepare_finish(proof.clone()).unwrap(), prepared);
+    let mut changed = proof.clone();
+    changed.root_result += 1;
+    assert!(f.overlay.prepare_finish(changed.clone()).is_err());
+    assert!(f.overlay.commit_custody(&changed).is_err());
+    let committed = f.overlay.commit_custody(&proof).unwrap();
+    let repeated = f.overlay.commit_custody(&proof).unwrap();
+    assert_eq!(committed.run_id, repeated.run_id);
+    assert_eq!(committed.completed_through, repeated.completed_through);
+    assert_eq!(committed.durability, repeated.durability);
+    assert_eq!(f.overlay.prepare_finish(proof).unwrap(), prepared);
+    assert!(f.overlay.commit_custody(&changed).is_err());
+    assert_eq!(reopen(&request).custody.unwrap().record.sequence, 3);
+}
+
+#[test]
 fn r2_recovery_cannot_erase_unknown_creator() {
     let (mut f, request, _) = setup();
     let state = reopen(&request);
