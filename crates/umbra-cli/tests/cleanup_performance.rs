@@ -339,3 +339,118 @@ fn baseline_tree_diagnosis() {
     assert_eq!(receipt["forced"], false);
     eprintln!("actual CLI parent receipt: {receipt}");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn r2_tree_native_control_and_recorded_registry_receipts() {
+    use std::process::{Command, Stdio};
+    let manifest_path = std::env::var("UMBRA_F299_PERF_BASE_MANIFEST").unwrap();
+    let frozen = manifest::load(std::path::Path::new(&manifest_path), true).unwrap();
+    let output = std::env::var("UMBRA_F299_PARENT_EVIDENCE").unwrap();
+    let directory = std::path::Path::new(&output);
+    std::fs::create_dir(directory).unwrap();
+    let mut child = child::OwnedChild::new(
+        Command::new(&frozen.artifacts["tree5"])
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(directory.join("native.jsonl")).unwrap())
+            .stderr(std::fs::File::create(directory.join("native.stderr")).unwrap())
+            .spawn()
+            .unwrap(),
+        std::time::Instant::now() + std::time::Duration::from_secs(65),
+    );
+    let status = child
+        .collect_until(std::time::Instant::now() + std::time::Duration::from_secs(64))
+        .unwrap()
+        .expect("native fixture collection");
+    assert!(status.success());
+    let parse = |text: &str| {
+        let mut rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows.sort_by_key(|row| row["root"] != true);
+        rows
+    };
+    let native = parse(&std::fs::read_to_string(directory.join("native.jsonl")).unwrap());
+    tree::validate(&native).unwrap();
+    assert!(native[1..]
+        .iter()
+        .all(|row| row["parent"] == native[0]["pid"]));
+    let retained = std::env::var("UMBRA_F299_PARENT_REPLAY").unwrap();
+    let routed = parse(&std::fs::read_to_string(retained).unwrap());
+    assert!(routed[1..]
+        .iter()
+        .any(|row| row["parent"] != routed[0]["pid"]));
+    tree::validate(&routed).unwrap();
+    std::fs::write(directory.join("replay-result.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "native_direct_edges": true, "old_registry_parent_check": false, "registry_wait_receipts": true
+    })).unwrap()).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn r2_parent_edge_middle() {
+    let Ok(path) = std::env::var("UMBRA_F299_GRANDCHILD_RECORD") else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut child = child::OwnedChild::new(
+        std::process::Command::new("/bin/sleep")
+            .arg("2")
+            .spawn()
+            .unwrap(),
+        deadline,
+    );
+    std::fs::write(path, child.id().to_string()).unwrap();
+    assert!(child.collect_until(deadline).unwrap().unwrap().success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn r2_parent_edge_rejects_actual_nonchild() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("grandchild");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut middle = child::OwnedChild::new(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["r2_parent_edge_middle", "--exact", "--nocapture"])
+            .env("UMBRA_F299_GRANDCHILD_RECORD", &path)
+            .spawn()
+            .unwrap(),
+        deadline,
+    );
+    while !path.exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let grandchild: i32 = std::fs::read_to_string(path).unwrap().parse().unwrap();
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(grandchild, &mut status, libc::WNOHANG) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(waited, -1);
+    assert_eq!(errno, Some(libc::ECHILD));
+    let root = std::process::id();
+    let mut receipts = Vec::new();
+    let mut records = vec![json!({"pid":root,"birth":[1,0]})];
+    for _ in 0..3 {
+        let mut direct = child::OwnedChild::new(
+            std::process::Command::new("/usr/bin/true").spawn().unwrap(),
+            deadline,
+        );
+        assert!(direct.collect_until(deadline).unwrap().unwrap().success());
+        records.push(json!({"pid":direct.id(),"parent":root,"birth":[1,0]}));
+        receipts.push(json!({"pid":direct.id(),"waited":direct.id(),"status":0}));
+    }
+    records.push(json!({"pid":grandchild,"parent":middle.id(),"birth":[1,0]}));
+    receipts.push(json!({"pid":grandchild,"waited":waited,"status":status}));
+    records[0]["collected"] = json!(receipts);
+    assert_eq!(
+        tree::validate(&records).unwrap_err(),
+        "invalid parent wait receipt"
+    );
+    assert!(middle.collect_until(deadline).unwrap().unwrap().success());
+    eprintln!(
+        "NONCHILD DISCRIMINATION: waitpid={waited}, errno={errno:?}; corrected oracle rejected"
+    );
+}

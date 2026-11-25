@@ -36,11 +36,8 @@ pub fn validate(records: &[Value]) -> Result<(), String> {
             return Err("invalid parent wait receipt".into());
         }
     }
-    if records[1..]
-        .iter()
-        .any(|record| record["parent"].as_u64() != Some(root))
-    {
-        return Err("unexpected workload parent edge".into());
-    }
+    // getppid() is retained as an observation, not collection authority:
+    // debugger attachment can change the observed parent. Only the root's
+    // actual waitpid return proves its ability to collect each recorded PID.
     Ok(())
 }
