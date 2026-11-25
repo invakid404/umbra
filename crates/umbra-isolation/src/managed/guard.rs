@@ -75,6 +75,7 @@ pub struct Guard {
     publication: Option<Publication>,
     published: Vec<Start>,
     stage_events: std::collections::BTreeSet<u64>,
+    exchanges: std::collections::BTreeMap<umbra_core::managed::Role, super::Channel>,
 }
 
 impl Guard {
@@ -137,14 +138,30 @@ impl Guard {
             identities.push(participant);
         }
         for (child, identity) in children.drain(..).zip(identities) {
+            let (child, exchange) = child.into_runtime_parts();
+            if matches!(
+                identity.role,
+                umbra_core::managed::Role::Worker
+                    | umbra_core::managed::Role::Guardian
+                    | umbra_core::managed::Role::Relay
+            ) {
+                self.exchanges.insert(identity.role, exchange);
+            }
             self.children.push(Owned {
-                child: child.into_child(),
+                child,
                 identity,
                 collected: false,
                 lost: false,
             });
         }
         Ok(())
+    }
+
+    /// Move the child's observer/result channel without releasing child custody.
+    pub fn take_exchange(&mut self, role: umbra_core::managed::Role) -> io::Result<super::Channel> {
+        self.exchanges
+            .remove(&role)
+            .ok_or_else(|| invalid("child exchange unavailable"))
     }
 
     /// Run the parent fallback schedule inside the original helper allocation.
@@ -296,6 +313,7 @@ impl Guard {
             publication: None,
             published: Vec::new(),
             stage_events: std::collections::BTreeSet::new(),
+            exchanges: std::collections::BTreeMap::new(),
         })
     }
 

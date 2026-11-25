@@ -102,6 +102,95 @@ fn transport_error(error: impl std::fmt::Display) -> UmbraError {
     )
 }
 
+/// Parent forwarding on the existing child and parent bootstrap channels.
+/// Each poll leaves time for the parent's independent cleanup guard.
+#[cfg(target_os = "macos")]
+pub struct Forwarder {
+    child: umbra_isolation::managed::Channel,
+    parent: umbra_isolation::managed::Channel,
+    run_id: RunId,
+    sequence: u64,
+    phase: u8,
+    deadline: u64,
+    failed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Forwarder {
+    /// Adopt only the channels for the observer's worker-to-caller path.
+    pub fn new(
+        run_id: RunId,
+        child: umbra_isolation::managed::Channel,
+        parent: umbra_isolation::managed::Channel,
+    ) -> Self {
+        Self {
+            child,
+            parent,
+            run_id,
+            sequence: 1,
+            phase: 0,
+            deadline: u64::MAX,
+            failed: false,
+        }
+    }
+
+    /// Advance at most one request/response phase under the original cutoff.
+    pub fn poll(&mut self, cutoff: Option<u64>) -> Result<()> {
+        if self.failed {
+            return Err(transport_error("observer forwarder already failed"));
+        }
+        self.failed = true;
+        if let Some(cutoff) = cutoff {
+            self.deadline = self.deadline.min(cutoff);
+        }
+        match self.phase {
+            0 => {
+                if let Some(request) = self
+                    .child
+                    .receive::<Request>(self.deadline)
+                    .map_err(transport_error)?
+                {
+                    if request.run_id != self.run_id || request.sequence != self.sequence {
+                        return Err(transport_error("forwarded observer request mismatch"));
+                    }
+                    self.parent.queue(&request).map_err(transport_error)?;
+                    self.phase = 1;
+                }
+            }
+            1 => {
+                if self.parent.flush(self.deadline).map_err(transport_error)? {
+                    self.phase = 2;
+                }
+            }
+            2 => {
+                if let Some(response) = self
+                    .parent
+                    .receive::<Response>(self.deadline)
+                    .map_err(transport_error)?
+                {
+                    if response.run_id != self.run_id || response.sequence != self.sequence {
+                        return Err(transport_error("forwarded observer response mismatch"));
+                    }
+                    self.child.queue(&response).map_err(transport_error)?;
+                    self.phase = 3;
+                }
+            }
+            3 => {
+                if self.child.flush(self.deadline).map_err(transport_error)? {
+                    self.sequence = self
+                        .sequence
+                        .checked_add(1)
+                        .ok_or_else(|| transport_error("observer sequence overflow"))?;
+                    self.phase = 0;
+                }
+            }
+            _ => unreachable!(),
+        }
+        self.failed = false;
+        Ok(())
+    }
+}
+
 /// Caller polling side. It owns callbacks and one bounded pending response.
 #[cfg(target_os = "macos")]
 pub struct CallerTransport {

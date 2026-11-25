@@ -637,6 +637,10 @@ impl PendingRole {
     pub fn into_child(self) -> SpawnedChild {
         self.child
     }
+
+    pub(super) fn into_runtime_parts(self) -> (SpawnedChild, super::Channel) {
+        (self.child, self.bootstrap)
+    }
 }
 impl Entry {
     /// Announce this role before any installed-watch readiness assertion.
@@ -979,8 +983,24 @@ impl Entry {
             self.launch.capacity,
         )?;
         self.authorization = Some(run);
-        self.bootstrap.take();
+        if !matches!(self.role, Role::Worker | Role::Guardian | Role::Relay) {
+            self.bootstrap.take();
+        }
         Ok(true)
+    }
+
+    /// Transfer the completed parent channel for observer/result forwarding.
+    /// Cleanup notification channels remain separately owned by the runtime.
+    pub fn take_exchange(&mut self) -> io::Result<super::Channel> {
+        if !matches!(self.role, Role::Worker | Role::Guardian | Role::Relay)
+            || (self.authorization.is_none() && self.role != Role::Relay)
+            || self.readiness.is_none()
+        {
+            return Err(invalid("exchange transfer before authorized startup"));
+        }
+        self.bootstrap
+            .take()
+            .ok_or_else(|| invalid("exchange already transferred or root relay"))
     }
 }
 
