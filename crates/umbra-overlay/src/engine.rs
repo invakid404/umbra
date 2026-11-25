@@ -706,6 +706,12 @@ impl Overlay {
     /// There are no production callers in the foundation slice.
     pub fn arm_custody(&mut self, record: CustodyRecord) -> Result<Sequence> {
         self.idle()?;
+        if !matches!(record.state, CustodyPhase::Armed { .. }) {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "arming requires Armed phase",
+            ));
+        }
         if self
             .custody
             .as_ref()
@@ -795,6 +801,7 @@ impl Overlay {
         if durability.run_id != config.context.run_id
             || durability.writer_epoch != config.lease.epoch
             || durability.durability == Durability::None
+            || durability.scope != FlushScope::EntireRun
         {
             return Err(error(
                 ErrorKind::ProtocolMismatch,
