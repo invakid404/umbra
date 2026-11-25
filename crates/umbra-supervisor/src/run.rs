@@ -874,7 +874,12 @@ pub fn run_worker(
     run_id: RunId,
     startup: umbra_isolation::managed::worker_startup::WorkerStartup,
 ) -> Result<()> {
-    unix::run_inner(spec, run_id, Some(startup))
+    let mut completion = None;
+    let result = unix::run_inner(spec, run_id, Some(startup), &mut completion);
+    if let Some(complete) = completion {
+        complete(result.clone())?;
+    }
+    result
 }
 
 /// Unsupported hosts fail explicitly rather than importing a backend.
@@ -935,6 +940,8 @@ mod unix {
             RunId(Uuid::new_v4()),
             #[cfg(target_os = "macos")]
             None,
+            #[cfg(target_os = "macos")]
+            &mut None,
         )
     }
 
@@ -944,6 +951,7 @@ mod unix {
         #[cfg(target_os = "macos")] startup: Option<
             umbra_isolation::managed::worker_startup::WorkerStartup,
         >,
+        #[cfg(target_os = "macos")] completion: &mut Option<crate::managed_observer::Completion>,
     ) -> Result<()> {
         validate(&spec)?;
         let launch_stdio = umbra_core::launch_stdio::LaunchStdio::capture()?;
@@ -1326,9 +1334,17 @@ mod unix {
             })?;
             let mut transport = crate::managed_observer::WorkerTransport::new(exchange);
             let observer_cleanup = cleanup.clone();
-            observer = Some(Box::new(crate::managed_observer::WorkerObserver::new(
-                run_id,
-                move |request| transport.exchange(request, || observer_cleanup.observer_progress()),
+            let shared_observer = std::rc::Rc::new(std::cell::RefCell::new(
+                crate::managed_observer::WorkerObserver::new(run_id, move |request| {
+                    transport.exchange(request, || observer_cleanup.observer_progress())
+                }),
+            ));
+            let final_observer = shared_observer.clone();
+            *completion = Some(Box::new(move |result| {
+                final_observer.borrow_mut().complete(result)
+            }));
+            observer = Some(Box::new(crate::managed_observer::SharedObserver(
+                shared_observer,
             )));
             let platform = umbra_platform::provider::attach_managed_with_stdio(
                 client,

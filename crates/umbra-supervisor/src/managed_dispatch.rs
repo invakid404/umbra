@@ -57,8 +57,9 @@ fn forward(guard: Guard, forwarder: Forwarder) -> Outcome {
 }
 
 fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
+    let result = transport.result_handle();
     let mut transport = Some(transport);
-    guard.run_parent_with_progress(move |ticket| {
+    let mut outcome = guard.run_parent_with_progress(move |ticket| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             transport
                 .as_mut()
@@ -78,7 +79,19 @@ fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
                 Err(io::Error::other("managed terminal observer panicked"))
             }
         }
-    })
+    });
+    match result.borrow().as_ref() {
+        Some(Ok(())) => {}
+        result => {
+            outcome.failed = true;
+            let message = match result {
+                Some(Err(error)) => error.to_string(),
+                _ => "worker exited without a final result".to_owned(),
+            };
+            outcome.events.push(umbra_isolation::managed::guard::Event::Failed(message));
+        }
+    }
+    outcome
 }
 
 /// Execute the relay barrier, exact storage arming and guardian collection.

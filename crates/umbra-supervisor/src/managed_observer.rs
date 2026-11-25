@@ -13,6 +13,8 @@ pub enum Event {
     Finished(RunOutcome),
     /// Cleanup diagnostic.
     TeardownWarning(UmbraError),
+    /// Final worker return value, distinct from successful-finish callbacks.
+    RunResult(Result<()>),
 }
 
 /// Identity and sequence prevent cross-run or repeated callback delivery.
@@ -84,7 +86,7 @@ impl WorkerTransport {
                     if response.run_id != request.run_id || response.sequence != request.sequence {
                         return Err(transport_error("observer acknowledgment mismatch"));
                     }
-                    self.failed = response.result.is_err();
+                    self.failed = false;
                     return Ok(response);
                 }
             }
@@ -113,6 +115,7 @@ pub struct Forwarder {
     phase: u8,
     deadline: u64,
     failed: bool,
+    terminal: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -131,6 +134,7 @@ impl Forwarder {
             phase: 0,
             deadline: u64::MAX,
             failed: false,
+            terminal: false,
         }
     }
 
@@ -138,6 +142,9 @@ impl Forwarder {
     pub fn poll(&mut self, cutoff: Option<u64>) -> Result<()> {
         if self.failed {
             return Err(transport_error("observer forwarder already failed"));
+        }
+        if self.phase == 4 {
+            return Ok(());
         }
         self.failed = true;
         if let Some(cutoff) = cutoff {
@@ -153,6 +160,7 @@ impl Forwarder {
                     if request.run_id != self.run_id || request.sequence != self.sequence {
                         return Err(transport_error("forwarded observer request mismatch"));
                     }
+                    self.terminal = matches!(request.event, Event::RunResult(_));
                     self.parent.queue(&request).map_err(transport_error)?;
                     self.phase = 1;
                 }
@@ -181,7 +189,7 @@ impl Forwarder {
                         .sequence
                         .checked_add(1)
                         .ok_or_else(|| transport_error("observer sequence overflow"))?;
-                    self.phase = 0;
+                    self.phase = if self.terminal { 4 } else { 0 };
                 }
             }
             _ => unreachable!(),
@@ -199,10 +207,16 @@ pub struct CallerTransport {
     pending: bool,
     failed: bool,
     deadline: u64,
+    complete: bool,
 }
 
 #[cfg(target_os = "macos")]
 impl CallerTransport {
+    /// Observe the final return without moving callback ownership.
+    pub fn result_handle(&self) -> std::rc::Rc<std::cell::RefCell<Option<Result<()>>>> {
+        self.observer.result_handle()
+    }
+
     /// Adopt a routed observer channel without additional descriptors.
     pub fn new(channel: umbra_isolation::managed::Channel, observer: CallerObserver) -> Self {
         Self {
@@ -211,6 +225,7 @@ impl CallerTransport {
             pending: false,
             failed: false,
             deadline: u64::MAX,
+            complete: false,
         }
     }
 
@@ -230,12 +245,18 @@ impl CallerTransport {
             }
             self.pending = false;
         }
+        if self.complete {
+            self.failed = false;
+            return Ok(());
+        }
         if let Some(request) = self
             .channel
             .receive::<Request>(self.deadline)
             .map_err(transport_error)?
         {
+            let terminal = matches!(request.event, Event::RunResult(_));
             let response = self.observer.dispatch(request)?;
+            self.complete = terminal && response.result.is_ok();
             self.channel.queue(&response).map_err(transport_error)?;
             self.pending = !self.channel.flush(self.deadline).map_err(transport_error)?;
         }
@@ -253,6 +274,7 @@ pub struct CallerObserver {
     adopted: bool,
     prepared: bool,
     finished: bool,
+    result: std::rc::Rc<std::cell::RefCell<Option<Result<()>>>>,
 }
 
 impl CallerObserver {
@@ -266,7 +288,13 @@ impl CallerObserver {
             adopted: false,
             prepared: false,
             finished: false,
+            result: Default::default(),
         }
+    }
+
+    /// Final worker result; it is evidence only alongside successful parent waits.
+    pub fn result_handle(&self) -> std::rc::Rc<std::cell::RefCell<Option<Result<()>>>> {
+        self.result.clone()
     }
 
     /// Deliver only a fresh, ordered request for this run.
@@ -305,14 +333,22 @@ impl CallerObserver {
                 "invalid managed callback identity, sequence or phase",
             )
         };
-        if self.failed
-            || self.finished
+        let terminal = matches!(request.event, Event::RunResult(_));
+        if ((self.failed || self.finished) && !terminal)
+            || self.result.borrow().is_some()
             || request.run_id != self.run_id
             || request.sequence != self.next
         {
             return Err(invalid());
         }
         self.next = self.next.checked_add(1).ok_or_else(invalid)?;
+        if let Event::RunResult(result) = &request.event {
+            if result.is_ok() && (self.failed || !self.finished) {
+                return Err(invalid());
+            }
+            *self.result.borrow_mut() = Some(result.clone());
+            return Ok(());
+        }
         // Mark failed before calling user code so an unwind cannot permit replay.
         self.failed = true;
         match &request.event {
@@ -351,6 +387,7 @@ impl CallerObserver {
                     observer.teardown_warning(error);
                 }
             }
+            Event::RunResult(_) => unreachable!(),
         }
         self.failed = false;
         Ok(())
@@ -366,6 +403,26 @@ pub struct WorkerObserver<F> {
     failed: bool,
 }
 
+/// Shared adapter retains the same sequence through the worker's final return.
+pub struct SharedObserver<F>(pub std::rc::Rc<std::cell::RefCell<WorkerObserver<F>>>);
+impl<F: FnMut(Request) -> Result<Response>> RunObserver for SharedObserver<F> {
+    fn stdio_adopted(&mut self) -> Result<()> {
+        self.0.borrow_mut().stdio_adopted()
+    }
+    fn prepared(&mut self, run_id: RunId) -> Result<()> {
+        self.0.borrow_mut().prepared(run_id)
+    }
+    fn finished(&mut self, outcome: &RunOutcome) {
+        self.0.borrow_mut().finished(outcome);
+    }
+    fn teardown_warning(&mut self, error: &UmbraError) {
+        self.0.borrow_mut().teardown_warning(error);
+    }
+}
+
+/// One final send after staged worker execution returns.
+pub type Completion = Box<dyn FnOnce(Result<()>) -> Result<()>>;
+
 impl<F: FnMut(Request) -> Result<Response>> WorkerObserver<F> {
     /// Bind an exclusive request/response exchange to one storage run.
     pub fn new(run_id: RunId, exchange: F) -> Self {
@@ -375,6 +432,19 @@ impl<F: FnMut(Request) -> Result<Response>> WorkerObserver<F> {
             exchange,
             failed: false,
         }
+    }
+
+    /// A failed callback still permits reporting the failed run, never success.
+    pub fn complete(&mut self, result: Result<()>) -> Result<()> {
+        if self.failed && result.is_ok() {
+            return Err(UmbraError::new(
+                ErrorKind::InvalidState,
+                "run.observer",
+                "success after observer failure",
+            ));
+        }
+        self.failed = false;
+        self.call(Event::RunResult(result))
     }
 
     fn call(&mut self, event: Event) -> Result<()> {
