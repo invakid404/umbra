@@ -41,6 +41,13 @@ pub struct SharedWorkerCleanup {
 }
 
 impl SharedWorkerCleanup {
+    /// Progress independent notifications while an observer response is pending.
+    pub fn observer_progress(&self) -> umbra_core::Result<Option<u64>> {
+        let mut cleanup = self.inner.try_borrow_mut().map_err(error)?;
+        cleanup.poll_notifications().map_err(error)?;
+        Ok(cleanup.tickets.ticket().map(|ticket| ticket.deadline))
+    }
+
     /// Share an enrolled worker's independent notification routes.
     pub fn new(cleanup: WorkerCleanup) -> Self {
         Self {

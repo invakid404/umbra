@@ -1317,6 +1317,19 @@ mod unix {
             let (owner, client, cleanup) =
                 crate::run_owner::RunOwner::arm_worker(run_id, raw, &mut startup)?;
             let namespace = crate::namespace_owner::NamespaceOwner::Managed(Box::new(owner));
+            let exchange = startup.entry.take_exchange().map_err(|failure| {
+                error(
+                    ErrorKind::ProtocolMismatch,
+                    "run.observer",
+                    failure.to_string(),
+                )
+            })?;
+            let mut transport = crate::managed_observer::WorkerTransport::new(exchange);
+            let observer_cleanup = cleanup.clone();
+            observer = Some(Box::new(crate::managed_observer::WorkerObserver::new(
+                run_id,
+                move |request| transport.exchange(request, || observer_cleanup.observer_progress()),
+            )));
             let platform = umbra_platform::provider::attach_managed_with_stdio(
                 client,
                 timeout,

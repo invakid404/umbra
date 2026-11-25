@@ -168,41 +168,68 @@ impl Guard {
     /// No original ticket means no timer and no invented caller-return bound.
     /// Only actual children are signalled; unresolved custody stays in Outcome.
     pub fn run_parent(self) -> Outcome {
+        self.run_parent_with_progress(|_| Ok(()))
+    }
+
+    /// Poll application forwarding alongside independent cleanup and collection.
+    pub fn run_parent_with_progress(
+        self,
+        progress: impl FnMut(Option<umbra_core::managed::Ticket>) -> io::Result<()>,
+    ) -> Outcome {
         let local = self.local.role;
         let capacity = self.capacity;
         let children: Vec<_> = self.children.iter().map(|child| child.identity).collect();
         let mut forced = std::collections::BTreeSet::new();
-        self.run(move |event, ticket| {
-            let Event::OpportunityExpired(now) = event else {
-                return Ok(Vec::new());
-            };
-            let Some(ticket) = ticket else {
-                return Ok(Vec::new());
-            };
-            let mut actions = Vec::new();
-            for participant in &children {
-                let cutoff = parent_cutoff(local, participant.role, ticket, capacity)?;
-                if *now >= cutoff && forced.insert(participant.pid) {
-                    actions.push(Action::Force {
-                        participant: *participant,
-                        not_before: cutoff,
-                    });
+        self.run_with_progress(
+            move |event, ticket| {
+                let Event::OpportunityExpired(now) = event else {
+                    return Ok(Vec::new());
+                };
+                let Some(ticket) = ticket else {
+                    return Ok(Vec::new());
+                };
+                let mut actions = Vec::new();
+                for participant in &children {
+                    let cutoff = parent_cutoff(local, participant.role, ticket, capacity)?;
+                    if *now >= cutoff && forced.insert(participant.pid) {
+                        actions.push(Action::Force {
+                            participant: *participant,
+                            not_before: cutoff,
+                        });
+                    }
                 }
-            }
-            Ok(actions)
-        })
+                Ok(actions)
+            },
+            progress,
+        )
     }
 
     /// Drive this parent's independent observation and collection loop.
     /// Original Starts are forwarded automatically. The hook schedules fallback;
     /// it receives the original ticket and cannot replace this guard's deadline.
     pub fn run(
+        self,
+        on_event: impl FnMut(&Event, Option<umbra_core::managed::Ticket>) -> io::Result<Vec<Action>>,
+    ) -> Outcome {
+        self.run_with_progress(on_event, |_| Ok(()))
+    }
+
+    fn run_with_progress(
         mut self,
         mut on_event: impl FnMut(&Event, Option<umbra_core::managed::Ticket>) -> io::Result<Vec<Action>>,
+        mut progress: impl FnMut(Option<umbra_core::managed::Ticket>) -> io::Result<()>,
     ) -> Outcome {
+        let mut progress_failed = false;
         let mut events = Vec::new();
         let mut pending = std::collections::VecDeque::new();
         loop {
+            if !progress_failed {
+                if let Err(error) = progress(self.tickets.ticket()) {
+                    progress_failed = true;
+                    self.tickets.fail();
+                    events.push(Event::Failed(format!("parent forwarding: {error}")));
+                }
+            }
             for event in self.poll() {
                 if let Event::Start(start) = &event {
                     if pending.len() < 16 {
