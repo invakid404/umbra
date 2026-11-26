@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn independent_cancellation_retains_ticket_before_waking_rsp() {
+fn r2_preaccepted_work_cancel() {
     use std::io::Read;
     use std::os::unix::net::UnixStream;
     use umbra_core::managed::{CleanupPath, RunIdentity, Ticket};
@@ -28,9 +28,11 @@ fn independent_cancellation_retains_ticket_before_waking_rsp() {
         debugger
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let mut request = [0; 1];
+        // Accept the complete ordinary request before publishing on the
+        // independent owner route. The main RPC remains waiting for its reply.
+        let mut request = [0; b"qCurrentThread".len() + 4];
         debugger.read_exact(&mut request).unwrap();
-        assert_eq!(request[0], b'$');
+        assert!(request.starts_with(b"$qCurrentThread#"));
         let ticket = Ticket::new(boot_nanos().unwrap(), CleanupPath::Failed, 64).unwrap();
         let mut owner = Channel::new(owner).unwrap();
         owner.queue(&Notification { run, ticket }).unwrap();

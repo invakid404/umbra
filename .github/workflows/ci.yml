@@ -91,6 +91,10 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test -p umbra-isolation --test managed_startup r2_ticket_publication_all_writes_fail -- --exact --nocapture
 
+      - name: Independent cancellation of accepted ordinary work
+        if: runner.os == 'macOS'
+        run: cargo test -p umbra-platform-macos --lib native::cancellation_tests::r2_preaccepted_work_cancel -- --exact --nocapture
+
       - name: RSP cancellation preserves the stream
         if: runner.os == 'macOS'
         run: |
