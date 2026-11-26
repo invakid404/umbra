@@ -41,7 +41,8 @@ fn main() {
             "owner_death",
             "armed_reply_loss",
             "startup_abort",
-            "missing_provider"
+            "missing_provider",
+            "readiness_timeout"
         ]
         .contains(&mode.as_str())
     );
@@ -116,6 +117,15 @@ fn main() {
                 .to_vec(),
         )
         .unwrap();
+    }
+    if mode == "readiness_timeout" {
+        use std::os::unix::fs::PermissionsExt;
+        let silent = workspace.join("silent-provider");
+        // exec leaves exactly one provider process for its actual owner to wait.
+        std::fs::write(&silent, b"#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        providers.get_mut("platform").unwrap().executable =
+            BytePath::new(silent.as_os_str().as_bytes().to_vec()).unwrap();
     }
     struct Observer {
         caller: u32,
@@ -223,11 +233,17 @@ fn main() {
         let run_id =
             RunId(uuid::Uuid::parse_str(entries[0].file_name().to_str().unwrap()).unwrap());
         inspect_custody(&store, run_id, false);
-    } else if mode == "startup_abort" || mode == "missing_provider" {
+    } else if ["startup_abort", "missing_provider", "readiness_timeout"].contains(&mode.as_str()) {
         if mode == "startup_abort" {
             result.unwrap();
         } else {
-            assert!(result.is_err(), "missing provider startup succeeded");
+            assert!(result.is_err(), "invalid provider startup succeeded");
+        }
+        if mode == "readiness_timeout" {
+            assert!(
+                elapsed >= std::time::Duration::from_secs(2),
+                "silent provider failed before the shared readiness cutoff"
+            );
         }
         assert!(
             events.borrow().is_empty(),
