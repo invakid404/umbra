@@ -5867,7 +5867,10 @@ impl TraceControl for MacosTraceBackend {
             .sessions
             .iter()
             .chain(self.failed_retirements.iter())
-            .filter(|session| session.live.is_some() && !session.torn_down)
+            // Ordered teardown can finish before the task rights, transport
+            // and admission charge are dropped. Budget those retained owners;
+            // only a resource-free tombstone has no remaining obligation.
+            .filter(|session| session.live.is_some())
             .count();
         let fork_windows = self
             .sessions
