@@ -442,14 +442,23 @@ fn shutdown_stale_phase_and_id() {
 
 #[test]
 fn shutdown_affinity_failure_paths() {
-    for failure in [
-        Failure::Spawn,
-        Failure::Handoff,
+    affinity_failure_paths(&[
         Failure::TransportPanic,
         Failure::Acceptance,
         Failure::OwnerPanic,
         Failure::Eof,
-    ] {
+    ]);
+}
+
+#[test]
+fn r2_reaper_creation_failure() {
+    // The helper only serves the cleanup protocol. Native destruction remains
+    // on its creating thread when helper creation or the ready handoff fails.
+    affinity_failure_paths(&[Failure::Spawn, Failure::Handoff]);
+}
+
+fn affinity_failure_paths(failures: &[Failure]) {
+    for &failure in failures {
         let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
         let owner_log = log.clone();

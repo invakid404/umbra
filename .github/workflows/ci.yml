@@ -88,6 +88,9 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test -p umbra-isolation --test managed_runtime r2_owner_exit_with_inherited_fd -- --exact --nocapture
 
+      - name: Cleanup helper creation and handoff failure
+        run: cargo test -p umbra-platform --lib provider::closing::tests::r2_reaper_creation_failure -- --exact --nocapture
+
       - name: Managed watch registration failure and exit ordering
         if: runner.os == 'macOS'
         run: cargo test -p umbra-isolation --lib managed::process::tests::custody_watch_registration_race -- --exact --nocapture
