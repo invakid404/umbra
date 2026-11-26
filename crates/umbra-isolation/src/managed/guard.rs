@@ -567,6 +567,16 @@ impl Guard {
             if let Err(error) = result {
                 let error: io::Error = error;
                 peer.failed = true;
+                if error.kind() == io::ErrorKind::UnexpectedEof
+                    && self.tickets.ticket().is_some()
+                    && peer.ack.is_none()
+                    && peer.route.channel().at_frame_boundary()
+                {
+                    // A closed notification route is not collection evidence.
+                    // Actual child waits and the outer worker-result exchange
+                    // remain required. Partial frames and pending ACKs fail.
+                    continue;
+                }
                 self.tickets.fail();
                 events.push(Event::Failed(format!(
                     "{:?} control: {error}",
@@ -698,6 +708,53 @@ fn parent_cutoff(
 mod policy_tests {
     use super::*;
     use umbra_core::managed::{CleanupPath, Role, Ticket};
+
+    #[test]
+    fn notification_eof_requires_start_and_complete_frames() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        for (started, partial, expected_failed) in [
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            let local =
+                super::super::process::identity(std::process::id(), Role::Guardian).unwrap();
+            let peer = super::super::process::identity(std::process::id(), Role::Worker).unwrap();
+            let run = RunIdentity {
+                nonce: uuid::Uuid::new_v4(),
+                generation: 1,
+            };
+            let mut guard = Guard::new(local, run, 1).unwrap();
+            if started {
+                let start = Start {
+                    run,
+                    origin: local,
+                    ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Trusted, 1).unwrap(),
+                };
+                guard.tickets.accept(start, local, local).unwrap();
+            }
+            let (mut writer, reader) = UnixStream::pair().unwrap();
+            guard.route(
+                peer,
+                Route::new(peer, super::super::Channel::new(reader).unwrap()).unwrap(),
+            );
+            if partial {
+                writer.write_all(&[0]).unwrap();
+            }
+            drop(writer);
+            let events = guard.poll();
+            assert_eq!(
+                guard.failed(),
+                expected_failed,
+                "started={started} partial={partial}"
+            );
+            assert_eq!(
+                events.iter().any(|event| matches!(event, Event::Failed(_))),
+                expected_failed
+            );
+        }
+    }
 
     #[test]
     fn parent_waits_for_original_cutoff_then_collects_stalled_child() {

@@ -59,6 +59,11 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// No incomplete incoming frame or pending outgoing bytes remain.
+    pub fn at_frame_boundary(&self) -> bool {
+        self.input.is_empty() && self.written == self.output.len()
+    }
+
     /// Borrow the stream only at a complete frame boundary for the one-shot
     /// startup descriptor transfer. Partial framed I/O forbids changing modes.
     pub fn handoff_stream(&self) -> io::Result<&UnixStream> {
