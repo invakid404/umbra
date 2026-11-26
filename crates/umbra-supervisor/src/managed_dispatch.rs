@@ -34,7 +34,11 @@ pub fn owner(
     while !service.as_mut().unwrap().poll()? {
         tick();
     }
-    Ok(())
+    if service.as_ref().unwrap().failed() {
+        Err(io::Error::other("cleanup owner collected after failed cleanup"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Complete worker readiness before entering staged storage setup.

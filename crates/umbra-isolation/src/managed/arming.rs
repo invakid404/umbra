@@ -37,34 +37,52 @@ pub struct RelayArming {
 impl RelayArming {
     /// Queue one immutable request after validating complete role readiness.
     pub fn new(
-        mut channel: Channel,
+        channel: Channel,
         request: Request,
         readiness_deadline: u64,
         external_caller: bool,
     ) -> io::Result<Self> {
-        let local = identity(std::process::id(), Role::Relay)?;
-        if !request
-            .readiness
-            .iter()
-            .any(|ready| ready.participant == local)
-        {
-            return Err(invalid("relay absent from arming readiness"));
-        }
-        let mut startup = Startup::from_readiness(
-            request.run,
-            external_caller,
-            readiness_deadline,
-            request.readiness.clone(),
-        )?;
-        startup.begin_arming(request.record.clone())?;
-        let umbra_core::CustodyPhase::Armed { capacity, .. } = &request.record.state else {
-            return Err(invalid("relay arming requires Armed record"));
+        Self::new_retaining(channel, request, readiness_deadline, external_caller)
+            .map_err(|(error, _)| error)
+    }
+
+    /// Keep the assigned route available for failed startup notification.
+    pub fn new_retaining(
+        mut channel: Channel,
+        request: Request,
+        readiness_deadline: u64,
+        external_caller: bool,
+    ) -> Result<Self, (io::Error, Channel)> {
+        let prepared = (|| -> io::Result<_> {
+            let local = identity(std::process::id(), Role::Relay)?;
+            if !request
+                .readiness
+                .iter()
+                .any(|ready| ready.participant == local)
+            {
+                return Err(invalid("relay absent from arming readiness"));
+            }
+            let mut startup = Startup::from_readiness(
+                request.run,
+                external_caller,
+                readiness_deadline,
+                request.readiness.clone(),
+            )?;
+            startup.begin_arming(request.record.clone())?;
+            let umbra_core::CustodyPhase::Armed { capacity, .. } = &request.record.state else {
+                return Err(invalid("relay arming requires Armed record"));
+            };
+            let capacity = *capacity;
+            let response_deadline = readiness_deadline
+                .checked_add(5_000_000_000)
+                .ok_or_else(|| invalid("relay arming clock overflow"))?;
+            channel.queue(&request)?;
+            Ok((local, capacity, response_deadline))
+        })();
+        let (local, capacity, response_deadline) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Err((error, channel)),
         };
-        let capacity = *capacity;
-        let response_deadline = readiness_deadline
-            .checked_add(5_000_000_000)
-            .ok_or_else(|| invalid("relay arming clock overflow"))?;
-        channel.queue(&request)?;
         Ok(Self {
             channel,
             request,

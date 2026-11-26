@@ -22,6 +22,7 @@ pub struct RelayStartup {
     pub guard: Option<Guard>,
     bootstrap: Option<Bootstrap>,
     arming: Option<RelayArming>,
+    failed_route: Option<Channel>,
     authorization: Option<Go>,
     ready: bool,
     released: bool,
@@ -34,6 +35,7 @@ impl RelayStartup {
     /// Pending child handles stay here if runtime adoption cannot be validated.
     pub fn fail_runtime(&mut self) -> io::Result<super::guard::Outcome> {
         self.failed = true;
+        self.prepare_guard()?;
         let guard = self
             .guard
             .as_mut()
@@ -70,6 +72,7 @@ impl RelayStartup {
             guard: None,
             bootstrap: Some(Bootstrap::new(Vec::new(), Vec::new())?),
             arming: None,
+            failed_route: None,
             authorization: None,
             ready: false,
             released: false,
@@ -205,12 +208,20 @@ impl RelayStartup {
             return Err(invalid("relay worker route missing"));
         };
         let endpoint = self.entry.endpoints.remove(*index);
-        self.arming = Some(RelayArming::new(
-            Channel::new(endpoint.stream)?,
-            request,
-            self.entry.readiness_deadline,
-            external,
-        )?);
+        self.arming = Some(
+            match RelayArming::new_retaining(
+                Channel::new(endpoint.stream)?,
+                request,
+                self.entry.readiness_deadline,
+                external,
+            ) {
+                Ok(arming) => arming,
+                Err((error, route)) => {
+                    self.failed_route = Some(route);
+                    return Err(error);
+                }
+            },
+        );
         Ok(())
     }
 
@@ -234,20 +245,7 @@ impl RelayStartup {
                 return Ok(None);
             }
         }
-        if self.guard.is_none() {
-            let watch = self
-                .bootstrap
-                .take()
-                .unwrap()
-                .into_watch()?
-                .ok_or_else(|| invalid("relay startup watch missing"))?;
-            let channel = self.arming.take().unwrap().into_channel();
-            self.guard = Some(Guard::from_entry_restoring(
-                &mut self.entry,
-                watch,
-                vec![(Role::Worker, channel)],
-            )?);
-        }
+        self.prepare_guard()?;
         let go = self.authorization.as_ref().unwrap();
         if !self.children[0].send_authorization(go, self.entry.readiness_deadline)? {
             return Ok(None);
@@ -258,6 +256,34 @@ impl RelayStartup {
             .adopt_ready_children(&mut self.children)?;
         self.released = true;
         Ok(self.authorization.clone())
+    }
+
+    fn prepare_guard(&mut self) -> io::Result<()> {
+        if self.guard.is_none() {
+            if !self.ready {
+                return Err(invalid("guard before relay readiness"));
+            }
+            let watch = self
+                .bootstrap
+                .take()
+                .unwrap()
+                .into_watch()?
+                .ok_or_else(|| invalid("relay startup watch missing"))?;
+            let channel = self
+                .arming
+                .take()
+                .map(RelayArming::into_channel)
+                .or_else(|| self.failed_route.take());
+            self.guard = Some(Guard::from_entry_restoring(
+                &mut self.entry,
+                watch,
+                channel
+                    .into_iter()
+                    .map(|channel| (Role::Worker, channel))
+                    .collect(),
+            )?);
+        }
+        Ok(())
     }
 
     fn step<T>(&mut self, advance: impl FnOnce(&mut Self) -> io::Result<T>) -> io::Result<T> {

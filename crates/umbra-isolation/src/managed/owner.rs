@@ -736,6 +736,16 @@ pub struct Service {
 }
 
 impl Service {
+    /// Enter notified failure cleanup without releasing provider child custody.
+    pub fn fail(&mut self, reason: String) -> io::Result<()> {
+        self.disconnect(reason)
+    }
+
+    /// Collection after a failed exchange never changes the failed outcome.
+    pub fn failed(&self) -> bool {
+        self.owner.failed()
+    }
+
     /// Bind the identities established before GO to an exclusively owned channel.
     pub fn new(
         owner: Owner,
