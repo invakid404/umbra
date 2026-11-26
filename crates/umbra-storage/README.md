@@ -1,7 +1,9 @@
 # umbra-storage
 
-Synchronous, backend-independent storage contracts. The only dependency is
-`umbra-core`; this crate performs no filesystem I/O and selects no implementation.
+Synchronous, backend-independent storage contracts and a Unix provider protocol.
+Runtime dependencies are `umbra-core` and `serde`; this crate selects no storage
+implementation and performs no backend filesystem I/O. This document covers the
+trait, request validation, provider proxy/server, and their tests.
 Shared request/result, identity, error, capability, and byte-path types belong to
 core and are re-exported here. There are no implementation-specific associated
 types: every backend can be injected as `Box<dyn Storage>` or `&mut dyn Storage`.
@@ -59,6 +61,11 @@ confirmed termination/quiescence of the former writer or refuse takeover.
 Acquisition is atomic and competing writers cannot both succeed. Lease loss stops
 mutations. Close surfaces persistence failures and must not silently discard an
 active writer lease.
+
+Writer authority is distinct from managed process custody. These methods do not
+collect processes or validate a managed cleanup proof. The managed supervisor and
+namespace owner must establish quiescence and durable custody completion before
+requesting release; a storage reply alone cannot establish those facts.
 
 `flush` returns a durability receipt only after the requested data/metadata scope
 has reached the advertised persistence boundary. An operation completing or an
