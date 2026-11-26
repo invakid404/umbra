@@ -426,7 +426,7 @@ fn admit_run(
     Ok(())
 }
 
-fn validate(spec: &RunSpec) -> Result<()> {
+pub(crate) fn validate(spec: &RunSpec) -> Result<()> {
     spec.registry.validate()?;
     if !spec.experimental {
         return Err(error(

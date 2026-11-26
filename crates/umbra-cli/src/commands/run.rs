@@ -130,6 +130,11 @@ pub fn handle(args: RunArgs, storage: &StorageArgs) -> Result<()> {
     }
     let registry = composition::load_registry(&args.registry)?;
     let spec = composition::run_spec(args, registry, Some(Box::new(StderrStatus)))?;
+    #[cfg(target_os = "macos")]
+    {
+        umbra_supervisor::managed_entry::run(spec, false, 64)
+    }
+    #[cfg(not(target_os = "macos"))]
     umbra_supervisor::run(spec)
 }
 
