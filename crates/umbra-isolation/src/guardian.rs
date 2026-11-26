@@ -218,3 +218,24 @@ pub fn run(spec: &std::ffi::OsStr) -> ! {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guardian_cleanup_opportunity() {
+        // These are the approved cleanup allocations, not fixture timing.
+        // Process qualification separately checks the sweep and actual wait.
+        assert_eq!(
+            SWEEP,
+            Duration::from_secs(3),
+            "guardian sweep opportunity changed"
+        );
+        assert_eq!(
+            REAP,
+            Duration::from_secs(1),
+            "guardian parent-wait opportunity changed"
+        );
+    }
+}

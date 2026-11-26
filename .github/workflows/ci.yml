@@ -105,6 +105,10 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test -p umbra-isolation --lib managed::guard::policy_tests::custody_ticket_deadlines -- --exact --nocapture
 
+      - name: Guardian retains its approved cleanup allocations
+        if: runner.os == 'macOS'
+        run: cargo test -p umbra-isolation --lib guardian::tests::guardian_cleanup_opportunity -- --exact --nocapture
+
       - name: Managed worker fail-stop after publication failure
         if: runner.os == 'macOS'
         run: |
