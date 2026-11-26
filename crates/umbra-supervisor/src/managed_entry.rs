@@ -32,8 +32,8 @@ pub struct RegisteredRole {
 impl RegisteredRole {
     /// Invoke before ordinary argument parsing in every registered executable.
     pub fn enter() -> io::Result<Option<Self>> {
-        REGISTERED.store(true, Ordering::Relaxed);
         let Some(entry) = executable::entry()? else {
+            REGISTERED.store(true, Ordering::Relaxed);
             return Ok(None);
         };
         let (external, input) =
@@ -45,6 +45,7 @@ impl RegisteredRole {
             Role::Worker => State::Worker(Box::new(Some(WorkerStartup::new(entry)?))),
             _ => return Err(io::Error::other("unsupported registered run role")),
         };
+        REGISTERED.store(true, Ordering::Relaxed);
         Ok(Some(Self {
             state,
             input: Some(input),

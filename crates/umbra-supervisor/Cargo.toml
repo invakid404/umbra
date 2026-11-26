@@ -56,3 +56,7 @@ uuid.workspace = true
 [[test]]
 name = "managed_library"
 harness = false
+
+[[test]]
+name = "managed_registration"
+harness = false
