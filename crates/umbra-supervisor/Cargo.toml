@@ -7,6 +7,8 @@ edition.workspace = true
 publish = false
 
 [features]
+# D5's shared base/head fixture selects registered dispatch only on the head.
+cost-library-managed = []
 # Qualification-only: lose the response after authoritative Armed persistence.
 probe-managed-arm-reply-loss = []
 # Qualification-only: lose successful PrepareFinish and CommitCustody replies.
@@ -69,4 +71,8 @@ harness = false
 
 [[test]]
 name = "managed_registration"
+harness = false
+
+[[test]]
+name = "startup_cost_library"
 harness = false

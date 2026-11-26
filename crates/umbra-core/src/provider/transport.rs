@@ -649,6 +649,7 @@ impl Client {
             }
         };
         // macOS may inherit O_NONBLOCK from the accepting listener.
+        crate::cost_snapshot!("provider-connection-accepted", None, &[]);
         if let Err(error) = stream.set_nonblocking(false) {
             if !managed {
                 let _ = reap(child_slot.take().expect("spawned child"), REAP_GRACE);
@@ -687,6 +688,14 @@ impl Client {
         {
             return Err(protocol_error("provider handshake mismatch"));
         }
+        crate::cost_snapshot!(
+            &format!("provider-ready-{}", descriptor.role),
+            client.child.as_ref().or(child_slot.as_ref()).map(Child::id),
+            &[]
+        );
+        drop(listener);
+        drop(directory);
+        crate::cost_snapshot!("provider-listener-closed", None, &[]);
         tracing::debug!(provider = %descriptor.id, role = %descriptor.role, "connected provider");
         Ok(client)
     }

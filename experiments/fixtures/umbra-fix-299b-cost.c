@@ -140,9 +140,9 @@ int main(int argc, char **argv) {
         if (!fds) return 4;
         int read = proc_pidinfo(members[i].pid, PROC_PIDLISTFDS, 0, fds, size);
         if (read < 0 || read >= size || read % sizeof(*fds)) return 3;
-        fprintf(log, "%s{\"pid\":%d,\"parent\":%u,\"state\":%u,\"birth\":[%llu,%llu],\"fds\":[",
+        fprintf(log, "%s{\"pid\":%d,\"parent\":%u,\"state\":%u,\"session\":%d,\"birth\":[%llu,%llu],\"fds\":[",
                 first ? "" : ",", members[i].pid, members[i].info.pbi_ppid,
-                members[i].info.pbi_status,
+                members[i].info.pbi_status, getsid(members[i].pid),
                 (unsigned long long)members[i].info.pbi_start_tvsec,
                 (unsigned long long)members[i].info.pbi_start_tvusec);
         first = 0;
