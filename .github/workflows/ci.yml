@@ -91,6 +91,12 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test -p umbra-isolation --test managed_startup r2_ticket_publication_all_writes_fail -- --exact --nocapture
 
+      - name: RSP cancellation preserves the stream
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p umbra-platform-macos --lib rsp::tests::r3_cancel_ordinary_request_same_stream -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib rsp::tests::r3_cancel_partial_write -- --exact --nocapture
+
       - name: Test contract documentation
         run: cargo test --workspace --doc
 
@@ -326,7 +332,8 @@ jobs:
         run: |
           cargo test -p umbra-platform-macos --lib native::tests::owner_loss_wakes_a_pending_rsp_request -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib native::teardown_tests:: -- --nocapture --test-threads=1
-          cargo test -p umbra-platform-macos --lib rsp::tests::cancellation_preserves_partial_reply_and_same_stream_for_teardown -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib rsp::tests::r3_cancel_ordinary_request_same_stream -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib rsp::tests::r3_cancel_partial_write -- --exact --nocapture
           cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures --test idle_poll -- --nocapture --test-threads=1
           # #205: the launchd-zombie and teardown decisions, the stub resolution,
           # debugserver's ignored terminal signals, and the provider's lifetime.

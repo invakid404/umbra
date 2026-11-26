@@ -502,6 +502,12 @@ impl Rsp {
                 Ok(n) => {
                     offset += n;
                     self.aligned = offset == bytes.len();
+                    #[cfg(test)]
+                    WRITE_PROGRESS.with(|observer| {
+                        if let Some(observe) = observer.borrow_mut().as_mut() {
+                            observe(offset, bytes.len(), &self.stream);
+                        }
+                    });
                 }
                 Err(e)
                     if matches!(
@@ -825,8 +831,12 @@ impl Rsp {
     }
 }
 #[cfg(test)]
+type TestWriteProgress = Box<dyn FnMut(usize, usize, &TcpStream)>;
+#[cfg(test)]
 thread_local! {
     static RETIREMENT_WAIT_GATES: std::cell::RefCell<std::collections::HashMap<u32, usize>> = Default::default();
+    // Reports actual syscall progress; it never substitutes a write result.
+    static WRITE_PROGRESS: std::cell::RefCell<Option<TestWriteProgress>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
 impl Rsp {
@@ -912,7 +922,7 @@ impl Drop for Rsp {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn cancellation_preserves_partial_reply_and_same_stream_for_teardown() {
+    fn r3_cancel_ordinary_request_same_stream() {
         use std::io::{Read, Write};
         let (mut rsp, mut peer) = Rsp::retirement_test_pair();
         peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -931,9 +941,11 @@ mod tests {
         assert!(rsp.poll(std::time::Duration::from_secs(1)).is_err());
         assert_eq!(&rsp.buffer, b"$O");
         assert!(rsp.begin_teardown());
-        peer.write_all(b"K#00").unwrap();
+        peer.write_all(b"K#00")
+            .expect("cancellation closed the shared RSP stream");
         assert!(
-            matches!(rsp.teardown_read(std::time::Duration::from_millis(20)), TeardownRead::Packet(p) if p == "OK")
+            matches!(rsp.teardown_read(std::time::Duration::from_millis(20)), TeardownRead::Packet(p) if p == "OK"),
+            "cancellation destroyed the in-flight reply on the shared stream"
         );
         rsp.teardown_interrupt(crate::clock::now() + std::time::Duration::from_millis(20))
             .unwrap();
@@ -948,6 +960,93 @@ mod tests {
         let mut kill = [0; 5];
         peer.read_exact(&mut kill).unwrap();
         assert_eq!(&kill, b"$k#6b");
+    }
+
+    #[test]
+    fn r3_cancel_partial_write() {
+        use std::{
+            cell::Cell,
+            io::{Read, Write},
+            os::fd::AsRawFd,
+            rc::Rc,
+        };
+        fn buffer(stream: &TcpStream, option: libc::c_int, size: libc::c_int) {
+            // SAFETY: the owned socket and the integer option value are valid.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        option,
+                        std::ptr::from_ref(&size).cast(),
+                        std::mem::size_of_val(&size) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+        }
+        let (mut rsp, mut peer) = Rsp::retirement_test_pair();
+        buffer(&rsp.stream, libc::SO_SNDBUF, 4096);
+        buffer(&peer, libc::SO_RCVBUF, 4096);
+        let body = format!("q{}", "x".repeat(1 << 20));
+        let checksum = body.bytes().fold(0u8, u8::wrapping_add);
+        let expected = format!("${body}#{checksum:02x}").into_bytes();
+        let (release, ready) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            ready.recv_timeout(Duration::from_secs(1)).unwrap();
+            buffer(&peer, libc::SO_RCVBUF, 1 << 20);
+            let mut received = vec![0; expected.len()];
+            peer.read_exact(&mut received).unwrap();
+            assert!(
+                received == expected,
+                "cancellation corrupted the outgoing frame"
+            );
+            let mut interrupt = [0];
+            peer.read_exact(&mut interrupt).unwrap();
+            assert_eq!(interrupt, [3]);
+            peer.write_all(b"$T02thread:1;#00").unwrap();
+            let mut kill = [0; 5];
+            peer.read_exact(&mut kill).unwrap();
+            assert_eq!(&kill, b"$k#6b");
+        });
+        let first = Rc::new(Cell::new(0));
+        let recorded = first.clone();
+        let wakeup = rsp.wakeup.clone();
+        WRITE_PROGRESS.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move |offset, length, stream| {
+                if recorded.get() == 0 {
+                    assert!(
+                        offset > 0 && offset < length,
+                        "fixture did not produce a partial write"
+                    );
+                    recorded.set(offset);
+                    wakeup.signal();
+                    buffer(stream, libc::SO_SNDBUF, 1 << 20);
+                    release.send(()).unwrap();
+                }
+            }));
+        });
+        let sent = rsp.send(&body);
+        WRITE_PROGRESS.with(|observer| observer.borrow_mut().take());
+        assert!(
+            sent.is_ok(),
+            "cancellation truncated an ordinary outgoing frame: {sent:?}"
+        );
+        assert!(first.get() > 0 && first.get() < body.len());
+        eprintln!(
+            "RSP partial-write witness: first {} of {} frame bytes",
+            first.get(),
+            body.len() + 4
+        );
+        assert!(rsp.poll(Duration::from_millis(20)).is_err());
+        assert!(rsp.begin_teardown(), "partial write lost packet alignment");
+        rsp.teardown_interrupt(crate::clock::now() + Duration::from_millis(20))
+            .unwrap();
+        assert!(matches!(rsp.teardown_read(Duration::from_millis(20)),
+            TeardownRead::Packet(packet) if packet == "T02thread:1;"));
+        rsp.send_kill(Duration::from_millis(20)).unwrap();
+        reader.join().unwrap();
     }
 
     use super::*;
