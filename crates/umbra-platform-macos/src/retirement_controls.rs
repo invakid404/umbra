@@ -65,6 +65,28 @@ fn register(backend: &mut MacosTraceBackend, s: Session) {
 }
 
 #[test]
+fn shutdown_budgets_torn_down_sessions_that_still_own_resources() {
+    let mut backend = MacosTraceBackend::default();
+    let (mut session, _peer) = slot(99, true);
+    session.retirement = None;
+    session.torn_down = true;
+    backend.sessions.push(session);
+    let umbra_platform::shutdown::Start::Local { accepted, .. } = backend
+        .begin_shutdown(umbra_core::shutdown::Nonce::new_v4())
+        .unwrap()
+    else {
+        panic!("local backend");
+    };
+    let required = shutdown_allowance(rsp::TRACER_REAP_BOUND, 1, 0).unwrap();
+    assert!(
+        accepted.remaining_millis >= required.as_millis() as u64,
+        "torn-down session still owns task, transport and admission resources: {} < {}",
+        accepted.remaining_millis,
+        required.as_millis()
+    );
+}
+
+#[test]
 fn f284_sibling_window_stop_refuses_before_delivery() {
     signal_window_stop(false);
 }
