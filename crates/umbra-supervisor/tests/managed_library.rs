@@ -139,6 +139,27 @@ fn main() {
             br#"{"timeout_ms":20000}"#.to_vec(),
         ),
     );
+    let routed_custody = std::env::var_os("UMBRA_CUSTODY_STORAGE_DESCRIPTOR");
+    if let Some(path) = &routed_custody {
+        assert_eq!(mode, "r2_failed_closure_reopen");
+        let storage: ProviderDescriptor =
+            umbra_core::provider::decode(&std::fs::read(path).unwrap()).unwrap();
+        assert!(storage
+            .capabilities
+            .contains("experimental-userspace-routing-v1"));
+        providers.insert("storage".into(), storage);
+        providers
+            .get_mut("platform")
+            .unwrap()
+            .capabilities
+            .insert("experimental-userspace-interpose-v1".into());
+    }
+    if std::env::var_os("UMBRA_CUSTODY_REGISTRY_REQUIRED").is_some() {
+        assert!(
+            routed_custody.is_some(),
+            "routed custody descriptor required"
+        );
+    }
     if mode == "missing_provider" {
         providers.get_mut("platform").unwrap().executable = BytePath::new(
             workspace
@@ -215,7 +236,13 @@ fn main() {
     };
     let spec = RunSpec {
         registry: ProviderRegistry {
-            timeout_ms: 25_000,
+            // Routed storage advertises a 30 s renewal interval; each RPC
+            // must leave the same renewal headroom as the routed CLI fixture.
+            timeout_ms: if routed_custody.is_some() {
+                12_000
+            } else {
+                25_000
+            },
             providers,
         },
         launch: RunLaunch::Command(CommandLaunch {
@@ -225,7 +252,11 @@ fn main() {
             cwd: BytePath::new(b"/".to_vec()).unwrap(),
         }),
         workspace,
-        persistence: RunPersistence::LocalDevelopment,
+        persistence: if routed_custody.is_some() {
+            RunPersistence::NfsClientFsync
+        } else {
+            RunPersistence::LocalDevelopment
+        },
         experimental: true,
         state_root: temp.path().join("state"),
         observer: Some(Box::new(Observer {
@@ -276,7 +307,7 @@ fn main() {
         assert_eq!(entries.len(), 1, "expected exactly one persisted run");
         let run_id =
             RunId(uuid::Uuid::parse_str(entries[0].file_name().to_str().unwrap()).unwrap());
-        inspect_custody(&store, run_id, false);
+        inspect_custody(&store, run_id, false, false);
     } else if [
         "startup_abort",
         "missing_provider",
@@ -333,13 +364,18 @@ fn main() {
     }
     if mode == "r2_failed_closure_reopen" {
         r2_failed_closure_reopen(
-            &store,
+            &if routed_custody.is_some() {
+                temp.path().join("state")
+            } else {
+                store.clone()
+            },
             observed_run
                 .get()
                 .expect("failed closure never reached prepared"),
+            routed_custody.is_some(),
         );
     } else if let Some(run_id) = observed_run.get() {
-        inspect_custody(&store, run_id, expects_success);
+        inspect_custody(&store, run_id, expects_success, false);
     }
     drop(run);
     umbra_core::cost_snapshot!("library-after-return", None, &[]);
@@ -347,8 +383,8 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn r2_failed_closure_reopen(store: &std::path::Path, run_id: umbra_core::RunId) {
-    inspect_custody(store, run_id, false);
+fn r2_failed_closure_reopen(store: &std::path::Path, run_id: umbra_core::RunId, routed: bool) {
+    inspect_custody(store, run_id, false, routed);
 }
 
 #[cfg(target_os = "macos")]
@@ -364,14 +400,21 @@ fn r2_direct_drop_failed_result(marker: &std::path::Path) {
 }
 
 #[cfg(target_os = "macos")]
-fn inspect_custody(store: &std::path::Path, run_id: umbra_core::RunId, complete: bool) {
+fn inspect_custody(
+    store: &std::path::Path,
+    run_id: umbra_core::RunId,
+    complete: bool,
+    routed: bool,
+) {
     use std::os::unix::ffi::OsStrExt;
     use umbra_core::{
         BytePath, CustodyPhase, JournalAccess, JournalControlBinding, JournalFormatPolicy,
         JournalOpenRequest, PhysicalPath,
     };
     use umbra_journal::Journal;
-    let control = store.join(run_id.0.to_string()).join("control");
+    let control = store
+        .join(run_id.0.to_string())
+        .join(if routed { "journal" } else { "control" });
     let mut journal = umbra_journal_file::FileJournal::new();
     let replay = journal
         .open(&JournalOpenRequest {
