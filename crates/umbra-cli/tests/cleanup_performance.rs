@@ -185,13 +185,21 @@ mod workload;
 mod report;
 
 #[cfg(target_os = "macos")]
-fn qualify(paired: bool, sid1: bool) {
+fn configured() -> bool {
     if std::env::var_os("UMBRA_F299_PERF_BASE_MANIFEST").is_none() {
         assert!(
             std::env::var_os("UMBRA_F299_PERF_WORKLOAD").is_none(),
             "missing performance base manifest"
         );
         eprintln!("SKIP: performance measurement requires frozen artifact configuration");
+        return false;
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn qualify(paired: bool, sid1: bool) {
+    if !configured() {
         return;
     }
     let c = config::read(|key| std::env::var(key).ok(), paired).unwrap();
@@ -310,6 +318,9 @@ fn d6_tree_receipts_require_every_actual_parent_wait() {
 #[cfg(target_os = "macos")]
 #[test]
 fn baseline_tree_diagnosis() {
+    if !configured() {
+        return;
+    }
     let c = config::read(|key| std::env::var(key).ok(), false).unwrap();
     assert_eq!(c.workload, config::Workload::NativeTree5);
     assert_eq!(c.session, config::Session::OwnSession);
@@ -343,6 +354,9 @@ fn baseline_tree_diagnosis() {
 #[cfg(target_os = "macos")]
 #[test]
 fn r2_tree_native_control_and_recorded_registry_receipts() {
+    if !configured() {
+        return;
+    }
     use std::process::{Command, Stdio};
     let manifest_path = std::env::var("UMBRA_F299_PERF_BASE_MANIFEST").unwrap();
     let frozen = manifest::load(std::path::Path::new(&manifest_path), true).unwrap();
@@ -401,7 +415,9 @@ fn r2_parent_edge_middle() {
             .unwrap(),
         deadline,
     );
-    std::fs::write(path, child.id().to_string()).unwrap();
+    let staged = std::path::Path::new(&path).with_extension("pending");
+    std::fs::write(&staged, child.id().to_string()).unwrap();
+    std::fs::rename(staged, path).unwrap();
     assert!(child.collect_until(deadline).unwrap().unwrap().success());
 }
 
