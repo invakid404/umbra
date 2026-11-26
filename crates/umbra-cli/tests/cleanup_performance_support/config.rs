@@ -20,6 +20,7 @@ pub struct Config {
     pub head: Option<PathBuf>,
     pub evidence: PathBuf,
     pub registry: Option<PathBuf>,
+    pub head_registry: Option<PathBuf>,
     pub workload: Workload,
     pub session: Session,
 }
@@ -62,6 +63,11 @@ pub fn read(mut get: impl FnMut(&str) -> Option<String>, paired: bool) -> Result
     } else {
         None
     };
+    let head_registry = if paired && registry.is_some() {
+        Some(absolute("UMBRA_F299_PERF_HEAD_REGISTRY")?)
+    } else {
+        None
+    };
     if registry.is_some() && required("UMBRA_INTEGRATION_REQUIRED")? != "1" {
         return Err("registry measurement requires integration qualification".into());
     }
@@ -73,6 +79,7 @@ pub fn read(mut get: impl FnMut(&str) -> Option<String>, paired: bool) -> Result
         head,
         evidence,
         registry,
+        head_registry,
         workload,
         session,
     })

@@ -328,6 +328,26 @@ impl Guard {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        #[cfg(feature = "shutdown-witness")]
+        crate::performance_observation::record_details(
+            "managed_guard",
+            "managed_guard_completed",
+            Some(u64::from(self.local.pid)),
+            serde_json::json!({
+                "participant": self.local,
+                "failed": self.failed() || self.tickets.ticket().is_none(),
+                "expired": self.expired,
+                "unresolved": self.children.iter().filter(|child| !child.collected).count(),
+                "errors": events.iter().filter(|event| matches!(event, Event::Failed(_))).count(),
+                "opportunities_expired": events.iter().filter(|event| matches!(event, Event::OpportunityExpired(_))).count(),
+                "collected": events.iter().filter_map(|event| match event {
+                    Event::Collected(participant, status) => Some(serde_json::json!({
+                        "participant": participant, "status": status,
+                    })),
+                    _ => None,
+                }).collect::<Vec<_>>(),
+            }),
+        );
         Outcome {
             failed: self.failed() || self.tickets.ticket().is_none(),
             events,

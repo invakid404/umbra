@@ -138,6 +138,15 @@ fn measure_inner(
     }
     let events = Events::read(&events, &manifest.digest, &nonce)?;
     let intervals = events.intervals(invocation_start, invocation_return)?;
+    let guard_evidence = if member.build == super::schedule::Build::Head {
+        Some(super::guards::validate(
+            &events.rows,
+            pid,
+            workload == "admission_only",
+        )?)
+    } else {
+        None
+    };
     let admission = events
         .rows
         .iter()
@@ -163,6 +172,10 @@ fn measure_inner(
     }
     Ok(
         json!({"pid": pid, "birth": birth, "nonce": nonce, "intervals": intervals,
-        "helper_start_ns": helper_start, "admission_ns": admission}),
+        "helper_start_ns": helper_start, "admission_ns": admission,
+        "guard_failures": guard_evidence.as_ref().map(|v| &v["guard_failures"]),
+        "protocol_failures": guard_evidence.as_ref().map(|v| &v["protocol_failures"]),
+        "deadline_failures": guard_evidence.as_ref().map(|v| &v["deadline_failures"]),
+        "guard_evidence": guard_evidence}),
     )
 }

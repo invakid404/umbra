@@ -102,6 +102,9 @@ fn d6_manifest_rejects_changed_artifacts() {
 #[path = "cleanup_performance_support/config.rs"]
 mod config;
 
+#[path = "cleanup_performance_support/guards.rs"]
+mod guards;
+
 #[test]
 fn d6_requires_explicit_configuration() {
     use std::collections::BTreeMap;
@@ -124,6 +127,17 @@ fn d6_requires_explicit_configuration() {
     assert!(read(&env, true).is_err());
     env.insert("UMBRA_F299_PERF_WORKLOAD", "registry_true");
     assert!(read(&env, false).is_err());
+    env.insert("UMBRA_F299_PERF_REGISTRY", "/frozen/base-registry.json");
+    env.insert("UMBRA_INTEGRATION_REQUIRED", "1");
+    env.insert("UMBRA_F299_PERF_HEAD_MANIFEST", "/frozen/head.json");
+    assert!(read(&env, false).is_ok());
+    assert!(read(&env, true).is_err());
+    env.insert(
+        "UMBRA_F299_PERF_HEAD_REGISTRY",
+        "/frozen/head-registry.json",
+    );
+    let paired = read(&env, true).unwrap();
+    assert_ne!(paired.registry, paired.head_registry);
     env.insert("UMBRA_F299_PERF_WORKLOAD", "misspelled");
     assert!(read(&env, false).is_err());
 }
@@ -260,7 +274,7 @@ fn qualify(paired: bool, sid1: bool) {
             member.order
         );
         let setup = c.evidence.join(format!("{prefix}-setup"));
-        let args = workload::prepare(&c, selected, &setup)?;
+        let args = workload::prepare(&c, selected, &setup, member.build)?;
         invocation::measure(
             selected,
             &c.evidence.join(prefix),
@@ -381,7 +395,13 @@ fn baseline_tree_diagnosis() {
     assert_eq!(c.session, config::Session::OwnSession);
     let selected = manifest::load(&c.base, true).unwrap();
     std::fs::create_dir(&c.evidence).unwrap();
-    let args = workload::prepare(&c, &selected, &c.evidence.join("setup")).unwrap();
+    let args = workload::prepare(
+        &c,
+        &selected,
+        &c.evidence.join("setup"),
+        schedule::Build::Base,
+    )
+    .unwrap();
     let result = invocation::measure(
         &selected,
         &c.evidence.join("invocation"),

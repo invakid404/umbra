@@ -2,6 +2,7 @@
 use super::{
     config::{Config, Workload},
     manifest::Manifest,
+    schedule::Build,
 };
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -22,6 +23,7 @@ pub fn prepare(
     config: &Config,
     manifest: &Manifest,
     directory: &Path,
+    build: Build,
 ) -> Result<Vec<OsString>, String> {
     std::fs::create_dir(directory).map_err(|e| e.to_string())?;
     if config.workload == Workload::AdmissionOnly {
@@ -38,7 +40,11 @@ pub fn prepare(
     std::fs::create_dir(&workspace).map_err(|e| e.to_string())?;
     let store = directory.join("store");
     std::fs::create_dir(&store).map_err(|e| e.to_string())?;
-    let mut registry: Value = if let Some(path) = &config.registry {
+    let selected_registry = match build {
+        Build::Base => &config.registry,
+        Build::Head => &config.head_registry,
+    };
+    let mut registry: Value = if let Some(path) = selected_registry {
         serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?
     } else {
