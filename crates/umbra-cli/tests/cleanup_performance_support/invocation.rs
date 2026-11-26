@@ -167,6 +167,11 @@ fn measure_inner(
     } else {
         None
     };
+    if member.build == super::schedule::Build::Head
+        && (helper_start.is_none() || admission.as_ref().is_none_or(Vec::is_empty))
+    {
+        return Err("head sample lacks helper readiness or complete admission exchanges".into());
+    }
     if !own_session && helper_start.is_none() && workload != "admission_only" {
         return Err("SID1 baseline lacks helper-start observation".into());
     }

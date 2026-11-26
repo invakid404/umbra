@@ -166,6 +166,12 @@ pub(super) fn serve_shutdown(
     let owner_deadline = freeze_started
         .checked_add(Duration::from_millis(accepted.remaining_millis))
         .ok_or_else(|| protocol_error("shutdown envelope overflow"))?;
+    #[cfg(feature = "shutdown-witness")]
+    crate::shutdown::witness(serde_json::json!({
+        "event": "shutdown-accepted-budget",
+        "remaining_millis": accepted.remaining_millis,
+        "preparation_nanos": std::time::Instant::now().saturating_duration_since(freeze_started).as_nanos().to_string(),
+    }));
     if let Err(error) = handoff_tx.send(Handoff {
         connection,
         accepted,
@@ -179,12 +185,21 @@ pub(super) fn serve_shutdown(
         return Err(protocol_error("shutdown connection handoff failed"));
     }
     let acceptance = accepted_rx.recv_timeout(remaining());
+    #[cfg(feature = "shutdown-witness")]
+    crate::shutdown::witness(serde_json::json!({
+        "event": "shutdown-acceptance-written",
+        "elapsed_nanos": std::time::Instant::now().saturating_duration_since(freeze_started).as_nanos().to_string(),
+    }));
     // Always destroy on this thread, including an acceptance failure. No
     // WatchedTasks or transport snapshot lock is held during any destructor.
     let destroyed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(platform)));
     let completed_at = now();
     #[cfg(feature = "shutdown-witness")]
-    crate::shutdown::witness(serde_json::json!({"event": "owner-terminal"}));
+    crate::shutdown::witness(serde_json::json!({
+        "event": "owner-terminal",
+        "elapsed_nanos": completed_at.saturating_duration_since(freeze_started).as_nanos().to_string(),
+        "late_nanos": completed_at.saturating_duration_since(owner_deadline).as_nanos().to_string(),
+    }));
     let terminal = match destroyed {
         Ok(()) => ledger.final_snapshot(),
         Err(payload) => {
