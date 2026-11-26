@@ -4,7 +4,13 @@ fn main() {}
 
 #[cfg(target_os = "macos")]
 fn main() {
-    use std::{cell::RefCell, collections::BTreeMap, os::unix::ffi::OsStrExt, path::Path, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::BTreeMap,
+        os::unix::ffi::OsStrExt,
+        path::Path,
+        rc::Rc,
+    };
     use umbra_core::{
         BytePath, RunId,
         provider::{PROTOCOL_VERSION, ProviderDescriptor, ProviderRegistry, encode},
@@ -108,7 +114,7 @@ fn main() {
     struct Observer {
         caller: u32,
         events: Rc<RefCell<Vec<&'static str>>>,
-        run: Option<RunId>,
+        run: Rc<Cell<Option<RunId>>>,
         mode: String,
     }
     impl RunObserver for Observer {
@@ -119,7 +125,7 @@ fn main() {
         }
         fn prepared(&mut self, run: RunId) -> umbra_core::Result<()> {
             assert_eq!(std::process::id(), self.caller);
-            self.run = Some(run);
+            self.run.set(Some(run));
             self.events.borrow_mut().push("prepared");
             if self.mode == "prepared_panic" {
                 panic!("managed library prepared sentinel");
@@ -138,7 +144,7 @@ fn main() {
         }
         fn finished(&mut self, outcome: &RunOutcome) {
             assert_eq!(std::process::id(), self.caller);
-            assert_eq!(Some(outcome.run_id), self.run);
+            assert_eq!(Some(outcome.run_id), self.run.get());
             assert_eq!(outcome.root_status, Some(umbra_core::ExitStatus::Code(0)));
             self.events.borrow_mut().push("finished");
         }
@@ -147,6 +153,7 @@ fn main() {
         }
     }
     let events = Rc::new(RefCell::new(Vec::new()));
+    let observed_run = Rc::new(Cell::new(None));
     let executable = if mode == "missing" {
         workspace
             .join("missing-program")
@@ -174,7 +181,7 @@ fn main() {
         observer: Some(Box::new(Observer {
             caller: std::process::id(),
             events: events.clone(),
-            run: None,
+            run: observed_run.clone(),
             mode: mode.clone(),
         })),
     };
@@ -233,7 +240,51 @@ fn main() {
         }
         assert!(!events.borrow().contains(&"finished"));
     }
+    if let Some(run_id) = observed_run.get() {
+        inspect_custody(&store, run_id, mode == "success");
+    }
     println!("managed_library: {mode} capacity={capacity} elapsed={elapsed:?} passed");
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_custody(store: &std::path::Path, run_id: umbra_core::RunId, complete: bool) {
+    use std::os::unix::ffi::OsStrExt;
+    use umbra_core::{
+        BytePath, CustodyPhase, JournalAccess, JournalControlBinding, JournalFormatPolicy,
+        JournalOpenRequest, PhysicalPath,
+    };
+    use umbra_journal::Journal;
+    let control = store.join(run_id.0.to_string()).join("control");
+    let mut journal = umbra_journal_file::FileJournal::new();
+    let replay = journal
+        .open(&JournalOpenRequest {
+            control: JournalControlBinding {
+                run_id,
+                directory: PhysicalPath(
+                    BytePath::new(control.as_os_str().as_bytes().to_vec()).unwrap(),
+                ),
+            },
+            access: JournalAccess::ReadOnly,
+            format: JournalFormatPolicy {
+                readable_versions: vec![1],
+                write_version: 1,
+            },
+        })
+        .unwrap();
+    let custody = replay
+        .custody
+        .expect("managed run lost durable Armed custody");
+    assert_eq!(custody.record.run_id, run_id);
+    assert_eq!(
+        matches!(custody.record.state, CustodyPhase::Complete { .. }),
+        complete,
+        "whole-run outcome disagrees with durable custody: {:?}",
+        custody.record.state
+    );
+    if !complete {
+        assert!(custody.recovery_only(), "failed run became writable");
+    }
+    journal.close().unwrap();
 }
 
 #[cfg(target_os = "macos")]
