@@ -26,6 +26,10 @@ fn main() {
     }
     let mode = std::env::args().nth(1).unwrap_or_else(|| "success".into());
     assert!(["success", "missing", "prepared_error", "prepared_panic"].contains(&mode.as_str()));
+    let capacity: u64 = std::env::args()
+        .nth(2)
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(64);
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     let store = temp.path().join("store");
@@ -150,8 +154,19 @@ fn main() {
             mode: mode.clone(),
         })),
     };
-    let mut run = RegisteredRole::prepare(spec, true, 64).unwrap();
+    let began = std::time::Instant::now();
+    let mut run = RegisteredRole::prepare(spec, true, capacity).unwrap();
     let result = execute(&mut run);
+    let elapsed = began.elapsed();
+    let bound = if mode == "success" {
+        26.35 + 4.0 * capacity as f64
+    } else {
+        30.6 + 8.0 * capacity as f64
+    };
+    assert!(
+        elapsed.as_secs_f64() <= bound,
+        "managed run exceeded D4: {elapsed:?} > {bound}s"
+    );
     if mode == "success" {
         result.unwrap();
         assert_eq!(*events.borrow(), ["stdio", "prepared", "finished"]);
@@ -169,5 +184,5 @@ fn main() {
         );
         assert!(!events.borrow().contains(&"finished"));
     }
-    println!("managed_library: {mode} passed");
+    println!("managed_library: {mode} capacity={capacity} elapsed={elapsed:?} passed");
 }
