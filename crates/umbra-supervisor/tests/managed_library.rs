@@ -6,11 +6,11 @@ fn main() {}
 fn main() {
     use std::{cell::RefCell, collections::BTreeMap, os::unix::ffi::OsStrExt, path::Path, rc::Rc};
     use umbra_core::{
-        provider::{encode, ProviderDescriptor, ProviderRegistry, PROTOCOL_VERSION},
         BytePath, RunId,
+        provider::{PROTOCOL_VERSION, ProviderDescriptor, ProviderRegistry, encode},
     };
     use umbra_supervisor::{
-        managed_entry::{execute, RegisteredRole},
+        managed_entry::{RegisteredRole, execute},
         run::{CommandLaunch, RunLaunch, RunObserver, RunOutcome, RunPersistence, RunSpec},
     };
     if let Some(mut role) = RegisteredRole::enter().unwrap() {
@@ -25,7 +25,17 @@ fn main() {
         return;
     }
     let mode = std::env::args().nth(1).unwrap_or_else(|| "success".into());
-    assert!(["success", "missing", "prepared_error", "prepared_panic"].contains(&mode.as_str()));
+    assert!(
+        [
+            "success",
+            "missing",
+            "prepared_error",
+            "prepared_panic",
+            "startup_abort",
+            "missing_provider"
+        ]
+        .contains(&mode.as_str())
+    );
     let capacity: u64 = std::env::args()
         .nth(2)
         .map(|value| value.parse().unwrap())
@@ -84,6 +94,16 @@ fn main() {
             br#"{"timeout_ms":20000}"#.to_vec(),
         ),
     );
+    if mode == "missing_provider" {
+        providers.get_mut("platform").unwrap().executable = BytePath::new(
+            workspace
+                .join("missing-provider")
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+    }
     struct Observer {
         caller: u32,
         events: Rc<RefCell<Vec<&'static str>>>,
@@ -156,7 +176,11 @@ fn main() {
     };
     let began = std::time::Instant::now();
     let mut run = RegisteredRole::prepare(spec, true, capacity).unwrap();
-    let result = execute(&mut run);
+    let result = if mode == "startup_abort" {
+        run.cleanup_failure()
+    } else {
+        execute(&mut run)
+    };
     let elapsed = began.elapsed();
     let bound = if mode == "success" {
         26.35 + 4.0 * capacity as f64
@@ -167,7 +191,22 @@ fn main() {
         elapsed.as_secs_f64() <= bound,
         "managed run exceeded D4: {elapsed:?} > {bound}s"
     );
-    if mode == "success" {
+    if mode == "startup_abort" || mode == "missing_provider" {
+        if mode == "startup_abort" {
+            result.unwrap();
+        } else {
+            assert!(result.is_err(), "missing provider startup succeeded");
+        }
+        assert!(
+            events.borrow().is_empty(),
+            "callback before startup readiness"
+        );
+        assert_eq!(
+            std::fs::read_dir(&store).unwrap().count(),
+            0,
+            "storage acquired before GO"
+        );
+    } else if mode == "success" {
         result.unwrap();
         assert_eq!(*events.borrow(), ["stdio", "prepared", "finished"]);
     } else {
