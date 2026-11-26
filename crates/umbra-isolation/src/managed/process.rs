@@ -295,6 +295,53 @@ mod tests {
     use std::process::{Command, Stdio};
 
     #[test]
+    fn custody_watch_registration_race() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let setup = (|| -> io::Result<_> {
+            let participant = identity(child.id(), Role::Worker)?;
+            let mut watch = ProcessWatch::new()?;
+            watch.install(participant)?;
+
+            // Force a real kevent registration error while the identity is
+            // still live. A regular descriptor cannot act as a process queue.
+            let mut broken = ProcessWatch::new()?;
+            broken.queue = std::fs::File::open("/dev/null")?.into();
+            let registration_error = broken.install(participant).err();
+            Ok((
+                participant,
+                watch,
+                registration_error,
+                broken.covers(&[participant]),
+                child.try_wait()?.is_none(),
+            ))
+        })();
+        // Complete the actual parent wait before asserting, including when
+        // registration failed. An exit notification supplies no wait receipt.
+        drop(input);
+        let status = child.wait().unwrap();
+        let (participant, watch, error, covered, alive) = setup.unwrap();
+        assert!(status.success());
+        assert!(alive, "failed registration was mistaken for collection");
+        assert!(
+            error.is_some(),
+            "kernel watch registration failure was ignored"
+        );
+        assert!(!covered, "failed watch was advertised as ready");
+        assert_eq!(watch.exited().unwrap(), Some(participant));
+
+        // The opposite ordering also must refuse readiness: the process has
+        // already exited and its actual parent has collected it.
+        let mut late = ProcessWatch::new().unwrap();
+        assert!(late.install(participant).is_err());
+        assert!(!late.covers(&[participant]));
+    }
+
+    #[test]
     fn watch_exit_and_actual_parent_wait_are_distinct() {
         let mut child = Command::new("/bin/cat")
             .stdin(Stdio::piped())
