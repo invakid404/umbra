@@ -54,6 +54,13 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Exact startup control descriptor for the hosted inventory fixture.
+    #[cfg(feature = "managed-endpoint-probe")]
+    pub fn probe_bootstrap_fd(&self) -> Option<i32> {
+        self.bootstrap
+            .as_ref()
+            .map(|channel| channel.stream.as_raw_fd())
+    }
     /// Close startup routes only before this role has accepted durable GO.
     /// Child custody is separately retained by the startup coordinator.
     pub fn close_before_go(&mut self) -> io::Result<()> {
@@ -497,6 +504,11 @@ pub struct PendingRole {
     readiness_deadline: u64,
 }
 impl PendingRole {
+    /// Exact parent control descriptor for the hosted inventory fixture.
+    #[cfg(feature = "managed-endpoint-probe")]
+    pub fn probe_bootstrap_fd(&self) -> i32 {
+        self.bootstrap.stream.as_raw_fd()
+    }
     /// Publish the external caller's installed-watch receipt once, then flush.
     pub(super) fn publish_caller(
         &mut self,

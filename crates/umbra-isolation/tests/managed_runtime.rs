@@ -27,6 +27,25 @@ mod late_acquisition;
 #[path = "support/runtime_tree.rs"]
 mod runtime_tree;
 
+#[cfg(feature = "managed-endpoint-probe")]
+#[test]
+fn r2_exec_and_fork_endpoint_inventory() {
+    let mut failed = Vec::new();
+    for mode in ["cli", "library"] {
+        let evidence = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(env!("CARGO_BIN_EXE_umbra-managed-endpoint-probe"))
+            .arg(evidence.path())
+            .arg(mode)
+            .status()
+            .unwrap();
+        eprintln!("hosted endpoint inventory {mode}: {status}");
+        if !status.success() {
+            failed.push(mode);
+        }
+    }
+    assert!(failed.is_empty(), "{failed:?} endpoint inventory failed");
+}
+
 #[test]
 fn r2_creator_past_tail() {
     late_acquisition::run(true);

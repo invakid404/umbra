@@ -23,6 +23,12 @@ pub struct ProviderStartup {
 }
 
 impl ProviderStartup {
+    /// Exact provider control descriptor for the hosted inventory fixture.
+    #[cfg(feature = "managed-endpoint-probe")]
+    pub fn probe_bootstrap_fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.channel.stream.as_raw_fd()
+    }
     pub(super) fn new(
         channel: Channel,
         run: RunIdentity,

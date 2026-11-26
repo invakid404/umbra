@@ -14,6 +14,8 @@ publish = false
 [features]
 # Test harnesses can scope one shared boot clock without changing normal builds.
 test-clock = []
+# Hosted descriptor inventory fixture; no normal executable probe.
+managed-endpoint-probe = []
 # Qualification-only: corrupt the run generation on a validated provider offer.
 probe-managed-offer-generation = []
 # Observational D6 instrumentation; no lifecycle behavior change.
@@ -43,3 +45,8 @@ harness = false
 [[test]]
 name = "managed_startup"
 harness = false
+
+[[bin]]
+name = "umbra-managed-endpoint-probe"
+path = "tests/support/endpoint_inventory_main.rs"
+required-features = ["managed-endpoint-probe"]
