@@ -27,7 +27,7 @@ pub enum Command {
     Stop(RunIdArgs),
     /// Checkpoint a supervised run (not implemented).
     Checkpoint(RunIdArgs),
-    /// Resume an existing run and its recorded agent session (not implemented).
+    /// Reopen an existing run and report recovery requirements without relaunching.
     Resume(resume::ResumeArgs),
     /// Inspect an existing run (not implemented).
     Inspect(RunIdArgs),

@@ -1,15 +1,20 @@
 # umbra-cli
 
-Clap command interface for the `umbra` binary, plus the in-process composition that
+Clap command interface for the `umbra` binary, plus provider composition that
 turns an explicit provider registry into a run request. This crate owns
 `src/lib.rs`, `src/main.rs`, `src/composition.rs`, the `src/commands/` handlers and
 the CLI tests; `[dependencies]` names no implementation crate, so nothing links a
 backend into the binary. Exactly two reach the tests — `umbra-journal-file` and
 `umbra-storage-local`, for the reason recorded over `umbra-core` in
 `Cargo.toml`'s `[dev-dependencies]`. `umbra-isolation` is a runtime dependency
-but not a backend: it moves a run started in launchd's session into a session of
-its own (#193, below), and it is the one umbra crate in the binary's tree that
-permits `unsafe`; this crate keeps `#![forbid(unsafe_code)]`.
+but not a backend: it supervises managed cleanup and moves a run started in
+launchd's session into a session of its own (#193, below). It permits
+`unsafe` for process and descriptor ownership, while
+this crate keeps `#![forbid(unsafe_code)]`.
+
+On macOS, `run` enters the managed supervisor through `RegisteredRole`; other
+targets call the synchronous supervisor entry. `resume` classifies persisted
+recovery state through its separate reopen path.
 
 `run` and `resume` are operational. `stop`, `checkpoint` and `inspect` are stubs
 that report `not implemented` on stderr and exit 1; they no longer echo their
@@ -121,11 +126,10 @@ Unix stream socket, regular file (including offset and append flags), or
 before provider launch with `UnsupportedCapability` at `stdio-endpoint-kind`.
 This also restricts fd 2 kinds that previously passed through unchecked.
 
-In terminal and other non-launchd sessions, the CLI releases its stdin/stdout
-references after the platform acknowledges ownership. Under launchd-session
-isolation, the relay and guardian retain stdin/stdout until umbra exits: EOF
-and SIGPIPE back-pressure follow that exit, including when the tracee closes
-stdout and continues running. The CLI retains stderr for diagnostics; stderr EOF waits for
+Managed helpers release their unused stdin/stdout references after transfer.
+The worker releases its copies after the platform acknowledges ownership.
+Early EOF while a tracee continues running is qualified in non-SID-1 sessions;
+SID-1 coverage requires EOF by CLI exit. The CLI retains stderr for diagnostics; stderr EOF waits for
 umbra and its providers to exit. Embedded callers retain their own descriptors.
 Rust startup replaces closed standard slots with `/dev/null` on the qualified
 macOS host; closed-slot EBADF behavior is not preserved.
@@ -155,7 +159,8 @@ default SIGPIPE under umbra.
 Delivery is limited to clean stable stops. A signal during an exposed return
 window, at an armed syscall entry, during bootstrap or exec, or with ambiguous
 interrupt/stop identity is refused with a named capability error. Such refusals
-never record completion. A process in a synthetic parked wait cannot observe a
+never record successful command completion. Cleanup custody may reach Complete
+independently while the command remains failed. A process in a synthetic parked wait cannot observe a
 signal until its child exits; the delayed stop is then classified, and may be
 refused at the return window. These are temporary limitations tracked by #284
 and its signal-progress follow-ups, not full native signal parity. Ctrl-C role
@@ -165,25 +170,16 @@ its existing behavior, including killing the CLI in the foreground pty case.
 ### In launchd's session
 
 A launchd job, or a CI runner, starts `umbra` in launchd's session (session id
-1). There, `main` hands a `run` command to `umbra_isolation::isolate_run()`
-right after argument parsing, before any run is prepared (#193). The process
-the caller started stays as a relay. The run executes in a fresh session, as
-the same `umbra` binary with the same arguments, under a guardian process. The
-relay then exits with the supervisor's status, mirrored: the same exit code,
-or the same signal. All the rules above are unchanged.
+1). On macOS, managed helper entry runs before argument parsing. The CLI
+becomes the relay, which starts a guardian in a fresh session when its caller
+is in SID 1. Terminal callers retain their controlling session.
 
-The relay exits 1 instead when:
-- the run's cleanup was not complete;
-- its isolation record could not be written;
-- the isolation itself failed, including a guardian it could not reap within
-  its 1 s bound.
-
-Each case has a line on stderr, and the record is under
-`~/Library/Logs/umbra/isolation/`. A run's tracee and providers can no longer
-be SIGHUPed through the caller's process group. In every other session, every
-terminal included, nothing changes. `main` also calls
-`umbra_isolation::guardian_entry()` first, before argument parsing; it returns
-at once unless this process was started as a guardian. See
+The guardian owns the worker and a separate cleanup owner. The worker must
+persist Armed custody before launch; completion requires validated cleanup,
+actual parent collection and durable journal completion. A helper failure or
+unconfirmed cleanup makes the command fail. These are the managed run path's
+records and bounds; the legacy `isolate_run` entry remains separately available.
+SID-1 behavior requires its named CI qualification. See
 [umbra-isolation](../umbra-isolation/README.md).
 <!-- /memoria:section -->
 
@@ -218,13 +214,23 @@ cargo check -p umbra-cli
 cargo test -p umbra-cli
 ```
 
+Managed activation remains incompletely qualified. `tests/startup_cost.rs`
+measures process and descriptor ownership; the measured managed descriptor costs
+exceed the accepted budgets. `tests/cleanup_performance.rs` requires explicit
+immutable baseline/head manifests and retains every attempted sample. The
+completed native-true, registry-true and admission-only series missed unchanged
+acceptance thresholds; registry-tree5 stopped on a terminal failure. Ordinary
+workspace tests do not replace these opt-in readings. SID-1 readings remain
+CI-only.
+
 The committed `tests/run_fixtures.rs` runs seven cases each against local storage
 and an existing NFSv4 mount. Build providers with `cargo build --workspace --bins`
 and compile `experiments/fixtures/umbra-test-child.c` first. Set
 `UMBRA_TEST_FIXTURE_PATH` and `UMBRA_TEST_NFS_ROOT`, then run
 `UMBRA_INTEGRATION_REQUIRED=1 cargo test -p umbra-cli --test run_fixtures -- --nocapture`.
-Mounted-NFS cases are qualified on CI by name; agent sessions must not mount
-NFS or set `UMBRA_TEST_NFS_ROOT`. Required mode fails on missing inputs;
+Mounted-NFS cases are opted out of CI as described below and have not been
+requalified for managed cleanup; agent sessions must not mount NFS or set
+`UMBRA_TEST_NFS_ROOT`. Required mode fails on missing inputs;
 ordinary developer tests may skip. Failed
 commands report their captured stderr before any required run-ID parse. Cleanup
 uses an emitted prepared ID even when that status assertion fails; without one,
@@ -248,7 +254,9 @@ External fixtures that link the CLI
 library can enable `umbra-cli/shutdown-witness` through Cargo; the provider build
 needs its own `shutdown-witness` feature for acquisition and owner-thread records.
 
-`tests/isolation.rs` pins #193 on the production path. It compiles
+`tests/isolation.rs` retains the #193 production-path guards. Its parentage
+discovery and isolation-record expectations still describe the legacy topology;
+managed-topology qualification is incomplete. It compiles
 `experiments/fixtures/umbra-isolation-fixture.c` and the signal observer at test
 time, and runs when `UMBRA_TEST_ISOLATION` or `UMBRA_INTEGRATION_REQUIRED` is set.
 Two `jobc_` cases run anywhere: they check, without a run, how the sampler below
@@ -285,8 +293,10 @@ into two groups:
     `setsid`;
   - cleanup after a `killpg` of the caller's group, a SIGTERM to the relay, and
     a same-named process outside the run left untouched.
-- **Other cases.** A fresh-session run (no relay) and ten pty cases run
-  in any session. The pty cases put `umbra run` under a mini job-control shell
+- **Other cases.** The fresh-session test still expects no relay or guardian,
+  which conflicts with managed activation and needs a reviewed update.
+  The ten pty cases run in any session and passed with the managed path.
+  They put `umbra run` under a mini job-control shell
   and pin today's terminal semantics: Ctrl-C, Ctrl-Z then `fg`, Ctrl-\,
   TOSTOP, SIGWINCH, hangup, exit status and terminal ioctls. After a hangup
   the harness finds nothing of the run left to kill (`survivors=0`): the
@@ -354,7 +364,8 @@ exit surface: a child that exits 41, one that raises `SIGKILL` and one that
 raises `SIGSEGV`. The exit-41 case leaves `umbra` at exit 1 because a child's
 status is never propagated. The two signalled cases never reach that rule: the
 platform backend refuses a stop it cannot resume from, so the run fails with the
-platform's error, records no completion, and still exits 1.
+platform's error, records no successful command completion, and still exits 1.
+Independently confirmed cleanup may still produce Complete custody.
 
 Set `UMBRA_TEST_SKIP_NFS_MATRIX=1` to skip the `nfs_fixture_matrix` and
 `nfs_utility_matrix` cases even under `UMBRA_INTEGRATION_REQUIRED=1`. CI uses
