@@ -131,11 +131,10 @@ pub trait SyscallAbi {
     /// Report the tracee memory buffer this entry's data transfer names, if any.
     ///
     /// `None` is the answer for every operation that transfers no bytes through a
-    /// caller-supplied buffer, which is every path operation. `Some` is reachable
-    /// only for a [`FsOp::Read`] or [`FsOp::Write`] the same entry decoded, and
-    /// the two must agree about the byte count: the namespace is handed a length
-    /// in the operation and an address here, and a disagreement would write past
-    /// the binding.
+    /// caller-supplied buffer. For [`FsOp::Read`] and [`FsOp::Write`], the binding
+    /// must agree with the decoded byte count. Metadata and directory operations
+    /// also use this seam for their output buffers, whose bounds follow the
+    /// negotiated ABI and request. A disagreement can write past the binding.
     ///
     /// This is a second method rather than a field on [`FsOp`] because `FsOp` is
     /// deliberately ABI-independent -- it says how *many* bytes move, never

@@ -1,9 +1,11 @@
 # umbra-platform
 
-Pure synchronous tracing contracts, depending only on `umbra-core`. This crate has
-no native bindings, backend selection, implementation dependencies, or mandatory
-`Send` bound. Shared DTOs are defined in core and re-exported here. The workspace
-uses Rust 1.100.0 and edition 2021.
+Synchronous tracing contracts, provider transport, admission grants, and shutdown
+ledger support. This document covers those modules, directory encodings, and their
+tests. Runtime dependencies are `umbra-core` and `serde`, with optional
+`serde_json` for shutdown evidence. The crate has no native bindings or backend
+selection; tracing traits have no mandatory `Send` bound. Shared DTOs are defined
+in core and re-exported here.
 
 The public contracts preserve the spec's signatures:
 
@@ -66,7 +68,7 @@ Every `LaunchSpec` carries a `SandboxRequirement`. A backend that accepts
 stopped before its first instruction; if it cannot prove that boundary it must
 fail the launch, and it must not advertise `sandboxed-stopped-launch-v1`.
 
-On Unix, supervised composition uses `provider::connect_with_stdio` to require
+On Unix, direct supervised composition uses `provider::connect_with_stdio` to require
 `launch-stdio-v1` and transfer an owned `LaunchStdio` before root launch.
 `TraceBackend::adopt_stdio` defaults to refusal. Implementations that advertise
 support must consume the descriptors once, duplicate them into root slots 0/1/2,
@@ -74,6 +76,8 @@ and release their copies on launch success, failure or owner loss. The adoption
 response acknowledges ownership, allowing the CLI to release its stdin/stdout.
 Provider process streams retain their own null stdin/stdout and diagnostic stderr.
 The payload is ancillary descriptor state, not serialized launch metadata.
+Managed workers use `attach_managed_with_stdio` on the handed-off connection;
+the cleanup owner retains the provider child and its parent-wait obligation.
 
 Every `Result` is `umbra_core::Result`; errors retain category, operation/context,
 and optional platform errno. `decode_entry` returns `None` only for a positively
@@ -95,8 +99,17 @@ must advertise `platform.shutdown-ledger.v1` before launch. `BeginShutdown`
 freezes a complete inventory; each subsequent `PollShutdown` receives one
 correlated Pending or Final response. Accepted and EOF are never proof. The
 client validates identities, generations, slot relationships and every final
-disposition, then independently collects its owned provider process. An attached
-connection without that process ownership cannot close a supervised run.
+disposition. A direct client then collects its owned provider process. A managed
+worker instead obtains an identity-bound parent-wait receipt through
+`ManagedCleanup` under the original cleanup ticket. An attached connection alone
+cannot establish closure.
+
+Managed cleanup starts through independent control routes before ordinary
+provider cleanup. Drop or unwind notifies those routes even while the main
+provider connection is borrowed. This notification requests cleanup; it does not
+prove collection. Admission grants reserve capacity before creation, require an
+acknowledged entry, and retain the charge until all associated resources have
+terminal proof. Dropping a grant never releases capacity.
 
 Only the private connection, channels and immutable snapshots cross to the
 shutdown transport thread. The original owner destroys the ABI, backend,
