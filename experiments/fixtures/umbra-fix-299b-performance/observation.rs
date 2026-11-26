@@ -1,7 +1,6 @@
 //! Qualification-only events on one host boot clock. Included by the provider
 //! and external measurement harness so timestamps have identical units.
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub fn boot_nanos() -> u64 {
     let mut time: libc::timespec = unsafe { std::mem::zeroed() };
@@ -41,14 +40,20 @@ pub fn record(event: &str, resource: Option<u64>) {
 }
 
 pub fn record_as(role: &str, event: &str, resource: Option<u64>) {
+    record_details(role, event, resource, serde_json::Value::Null);
+}
+
+pub fn record_details(role: &str, event: &str, resource: Option<u64>, details: serde_json::Value) {
     let Some(directory) = std::env::var_os("UMBRA_F299_PERF_EVENTS") else {
         return;
     };
-    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _writer = WRITER.lock().expect("measurement writer poisoned");
+    static WRITERS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut writers = WRITERS.lock().expect("measurement writer poisoned");
     let timestamp = boot_nanos();
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let next = writers.entry(role.to_owned()).or_default();
+    let sequence = *next;
+    *next = next.checked_add(1).expect("measurement sequence exhausted");
     let pid = std::process::id();
     static BIRTH: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     let birth = BIRTH.get_or_init(|| birth(pid));
@@ -62,10 +67,11 @@ pub fn record_as(role: &str, event: &str, resource: Option<u64>) {
         "workload": required("UMBRA_F299_PERF_WORKLOAD"),
         "role": role,
         "pid": pid, "birth": birth, "sequence": sequence, "boot_nanos": timestamp,
-        "event": event, "resource": resource,
+        "event": event, "resource": resource, "details": details,
     });
-    // One file per producer; shared stderr is never an identity oracle.
-    let path = std::path::Path::new(&directory).join(format!("{pid}.jsonl"));
+    // Different linked crates can observe distinct roles in one process.
+    // Separate streams preserve each observer's sequence and process identity.
+    let path = std::path::Path::new(&directory).join(format!("{pid}-{role}.jsonl"));
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

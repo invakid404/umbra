@@ -1012,6 +1012,14 @@ impl Entry {
             self.launch.capacity,
         )?;
         self.authorization = Some(run);
+        #[cfg(feature = "shutdown-witness")]
+        if self.role == Role::Worker {
+            crate::performance_observation::record_as(
+                "worker",
+                "helpers_ready_go",
+                Some(u64::from(std::process::id())),
+            );
+        }
         if !matches!(self.role, Role::Worker | Role::Guardian | Role::Relay) {
             self.bootstrap.take();
         }

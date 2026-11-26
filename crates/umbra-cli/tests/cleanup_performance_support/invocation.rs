@@ -138,6 +138,12 @@ fn measure_inner(
     }
     let events = Events::read(&events, &manifest.digest, &nonce)?;
     let intervals = events.intervals(invocation_start, invocation_return)?;
+    let admission = events
+        .rows
+        .iter()
+        .any(|row| row["event"] == "admission_exchange")
+        .then(|| super::admission::components(&events.rows))
+        .transpose()?;
     let helper_start = if events
         .rows
         .iter()
@@ -157,6 +163,6 @@ fn measure_inner(
     }
     Ok(
         json!({"pid": pid, "birth": birth, "nonce": nonce, "intervals": intervals,
-        "helper_start_ns": helper_start, "admission_ns": null}),
+        "helper_start_ns": helper_start, "admission_ns": admission}),
     )
 }

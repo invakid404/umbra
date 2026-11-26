@@ -146,9 +146,26 @@ impl umbra_core::AdmissionTransport for AdmissionClient {
         operation: AdmissionOperation,
         deadline: u64,
     ) -> io::Result<Result<u64, AdmissionError>> {
+        #[cfg(feature = "shutdown-witness")]
+        let timing = (std::time::Instant::now(), operation.clone());
         self.begin(operation)?;
         loop {
             if let Some(result) = self.poll(deadline)? {
+                #[cfg(feature = "shutdown-witness")]
+                {
+                    let nanos = u64::try_from(timing.0.elapsed().as_nanos())
+                        .expect("admission measurement overflow");
+                    crate::performance_observation::record_details(
+                        "admission-client",
+                        "admission_exchange",
+                        None,
+                        serde_json::json!({
+                            "operation": timing.1,
+                            "nanos": nanos,
+                            "accepted": result.is_ok(),
+                        }),
+                    );
+                }
                 return Ok(result);
             }
             // A provider is thread-affine. Yield while the separate owner

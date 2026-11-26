@@ -1,6 +1,38 @@
 //! Cleanup performance qualification and retained-sample analysis.
+#[path = "cleanup_performance_support/admission.rs"]
+mod admission;
 #[path = "cleanup_performance_support/analysis.rs"]
 mod analysis;
+
+#[test]
+fn d6_admission_requires_every_acknowledged_phase_from_one_producer() {
+    use serde_json::json;
+    let rows = ["Reserve", "Entering", "Retiring", "Release"]
+        .iter()
+        .map(|phase| {
+            json!({"event": "admission_exchange", "pid": 10, "birth": [1, 2],
+                "details": {"accepted": true, "nanos": 7,
+                    "operation": {(*phase): {"obligation": "one"}}}})
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        admission::components(&rows).unwrap(),
+        vec![json!({"reserve": 7, "entering": 7, "completed": 14})]
+    );
+    assert!(admission::components(&rows[..3]).is_err());
+    let mut changed = rows.clone();
+    changed[3]["pid"] = json!(11);
+    assert!(admission::components(&changed).is_err());
+    changed = rows.clone();
+    changed[2]["details"]["accepted"] = json!(false);
+    assert!(admission::components(&changed).is_err());
+    changed = rows.clone();
+    changed.push(rows[3].clone());
+    assert!(admission::components(&changed).is_err());
+    changed = rows;
+    changed.swap(1, 2);
+    assert!(admission::components(&changed).is_err());
+}
 
 #[test]
 fn d6_uses_distribution_differences_not_paired_quantiles() {
@@ -268,13 +300,26 @@ fn paired_sid1() {
 mod child;
 
 #[cfg(target_os = "macos")]
+#[path = "cleanup_performance_support/admission_owner.rs"]
+mod admission_owner;
+
+#[cfg(target_os = "macos")]
+#[test]
+fn r2_performance_admission_owner() {
+    admission_owner::serve();
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn r2_performance_admission_driver() {
     if std::env::var_os("UMBRA_F299_PERF_EVENTS").is_none() {
         return;
     }
-    observation::record("acquisition_entry", None);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (admission, mut owner, cutoff) = admission_owner::start(deadline);
+    observation::record("acquisition_entry", None);
+    let mut grant = admission.reserve(cutoff).unwrap();
+    grant.enter(cutoff).unwrap();
     let mut child = child::OwnedChild::new(
         std::process::Command::new("/usr/bin/true").spawn().unwrap(),
         deadline + std::time::Duration::from_secs(1),
@@ -296,6 +341,16 @@ fn r2_performance_admission_driver() {
     observation::record("first_root_exit_observed", Some(child.id() as u64));
     observation::record("program_parent_collected", Some(child.id() as u64));
     assert!(status.success(), "ordinary child: {status}");
+    grant.collected(cutoff).unwrap();
+    let owner_status = owner
+        .collect_until(deadline)
+        .unwrap()
+        .expect("owner collection");
+    assert!(owner_status.success(), "admission owner: {owner_status}");
+    observation::record(
+        "admission_owner_parent_collected",
+        Some(u64::from(owner.id())),
+    );
 }
 
 #[path = "cleanup_performance_support/tree.rs"]

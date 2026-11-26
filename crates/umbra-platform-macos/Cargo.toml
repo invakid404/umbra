@@ -18,7 +18,7 @@ managed-watch-probe = []
 # Hold a real debugger during preaccepted setup; no normal-build controls.
 managed-cancel-probe = ["shutdown-witness", "umbra-isolation/probe-cancellation-ticket"]
 # Independent acquisition and Final-to-exit qualification records.
-shutdown-witness = ["umbra-platform/shutdown-witness"]
+shutdown-witness = ["umbra-platform/shutdown-witness", "umbra-isolation/shutdown-witness"]
 # Mutation probes for the two syscall decode arms this crate owns, on the same
 # terms as `umbra-overlay`'s: each BREAKS one arm on purpose so a test can prove
 # an end-to-end case depends on it, both are compile-time only so no product
