@@ -12,11 +12,11 @@ fn main() {
         rc::Rc,
     };
     use umbra_core::{
+        provider::{encode, ProviderDescriptor, ProviderRegistry, PROTOCOL_VERSION},
         BytePath, RunId,
-        provider::{PROTOCOL_VERSION, ProviderDescriptor, ProviderRegistry, encode},
     };
     use umbra_supervisor::{
-        managed_entry::{RegisteredRole, execute},
+        managed_entry::{execute, RegisteredRole},
         run::{CommandLaunch, RunLaunch, RunObserver, RunOutcome, RunPersistence, RunSpec},
     };
     if let Some(mut role) = RegisteredRole::enter().unwrap() {
@@ -31,23 +31,22 @@ fn main() {
         return;
     }
     let mode = std::env::args().nth(1).unwrap_or_else(|| "success".into());
-    assert!(
-        [
-            "success",
-            "finish_reply_loss",
-            "missing",
-            "prepared_error",
-            "prepared_panic",
-            "provider_death",
-            "owner_death",
-            "armed_reply_loss",
-            "startup_abort",
-            "missing_provider",
-            "readiness_timeout",
-            "malformed_offer"
-        ]
-        .contains(&mode.as_str())
-    );
+    assert!([
+        "success",
+        "finish_reply_loss",
+        "missing",
+        "prepared_error",
+        "prepared_panic",
+        "provider_death",
+        "owner_death",
+        "armed_reply_loss",
+        "startup_abort",
+        "missing_provider",
+        "readiness_timeout",
+        "malformed_offer",
+        "r2_direct_drop_failed_result"
+    ]
+    .contains(&mode.as_str()));
     #[cfg(not(feature = "probe-managed-arm-reply-loss"))]
     if mode == "armed_reply_loss" {
         panic!("armed_reply_loss requires its compile-time fault");
@@ -60,12 +59,21 @@ fn main() {
     if mode == "finish_reply_loss" {
         panic!("finish_reply_loss requires its compile-time fault");
     }
+    #[cfg(not(feature = "probe-managed-owner-drop"))]
+    if mode == "r2_direct_drop_failed_result" {
+        panic!("r2_direct_drop_failed_result requires its compile-time probe");
+    }
     let expects_success = ["success", "finish_reply_loss"].contains(&mode.as_str());
     let capacity: u64 = std::env::args()
         .nth(2)
         .map(|value| value.parse().unwrap())
         .unwrap_or(64);
     let temp = tempfile::tempdir().unwrap();
+    let drop_returned = temp.path().join("owner-drop-returned");
+    if mode == "r2_direct_drop_failed_result" {
+        // SAFETY: this harness-free caller has not started threads or children.
+        unsafe { std::env::set_var("UMBRA_FIX299_OWNER_DROP_RETURNED", &drop_returned) };
+    }
     let workspace = temp.path().join("workspace");
     let store = temp.path().join("store");
     std::fs::create_dir(&workspace).unwrap();
@@ -229,9 +237,18 @@ fn main() {
         elapsed.as_secs_f64() <= bound,
         "managed run exceeded D4: {elapsed:?} > {bound}s"
     );
-    if mode == "armed_reply_loss" {
-        assert!(result.is_err(), "lost Armed response authorized a run");
-        assert!(events.borrow().is_empty(), "callback before durable GO");
+    if mode == "armed_reply_loss" || mode == "r2_direct_drop_failed_result" {
+        assert!(
+            result.is_err(),
+            "interrupted custody authorized a successful run"
+        );
+        assert!(
+            events.borrow().is_empty(),
+            "callback after interrupted owner initialization"
+        );
+        if mode == "r2_direct_drop_failed_result" {
+            r2_direct_drop_failed_result(&drop_returned);
+        }
         let entries = std::fs::read_dir(&store)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -299,6 +316,18 @@ fn main() {
         inspect_custody(&store, run_id, expects_success);
     }
     println!("managed_library: {mode} capacity={capacity} elapsed={elapsed:?} passed");
+}
+
+#[cfg(target_os = "macos")]
+fn r2_direct_drop_failed_result(marker: &std::path::Path) {
+    assert!(
+        marker.with_extension("entered").exists(),
+        "direct-drop probe never reached an enrolled owner after GO"
+    );
+    assert!(
+        !marker.exists(),
+        "direct RunOwner drop returned instead of ending the failed worker"
+    );
 }
 
 #[cfg(target_os = "macos")]

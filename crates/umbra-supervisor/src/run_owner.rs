@@ -95,7 +95,35 @@ impl RunOwner {
             finish,
             failure_reporter: None,
         };
-        Ok((owner, client, cleanup))
+        #[cfg(feature = "probe-managed-owner-drop")]
+        {
+            let marker = std::env::var_os("UMBRA_FIX299_OWNER_DROP_RETURNED").ok_or_else(|| {
+                UmbraError::new(
+                    ErrorKind::InvalidState,
+                    "managed.owner",
+                    "missing drop probe marker",
+                )
+            })?;
+            let marker = std::path::PathBuf::from(marker);
+            std::fs::write(marker.with_extension("entered"), b"owner armed after GO").map_err(
+                |error| UmbraError::new(ErrorKind::Io, "managed.owner", error.to_string()),
+            )?;
+            drop(owner);
+            std::fs::write(marker, b"owner destructor returned").map_err(|error| {
+                UmbraError::new(ErrorKind::Io, "managed.owner", error.to_string())
+            })?;
+            drop(client);
+            drop(cleanup);
+            Err(UmbraError::new(
+                ErrorKind::InvalidState,
+                "managed.owner",
+                "abandoned owner destructor returned",
+            ))
+        }
+        #[cfg(not(feature = "probe-managed-owner-drop"))]
+        {
+            Ok((owner, client, cleanup))
+        }
     }
 
     /// Install one best-effort final error exchange without releasing custody.

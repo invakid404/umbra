@@ -13,6 +13,8 @@ probe-managed-arm-reply-loss = []
 probe-managed-finish-reply-loss = []
 # Qualification-only: reject an actual owner's mismatched descriptor offer.
 probe-managed-offer-generation = ["umbra-isolation/probe-managed-offer-generation"]
+# Qualification-only: drop an enrolled owner and detect a returning destructor.
+probe-managed-owner-drop = []
 # Test instrumentation: emit only successful writer-renewal observations.
 probe-idle-renewal = []
 # Forwarded to `umbra-overlay`; see its manifest for what each probe breaks and
