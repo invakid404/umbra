@@ -42,6 +42,7 @@ impl Topology {
         let mut topology = Self {
             endpoints: BTreeMap::new(),
         };
+        umbra_core::cost_snapshot!("topology-before", None, &[]);
         for (a, b, purpose) in [
             (Worker, CleanupOwner, OwnerControl),
             (Worker, Guardian, GuardianControl),
@@ -73,6 +74,7 @@ impl Topology {
             purpose,
             stream: right,
         });
+        umbra_core::cost_snapshot!("topology-pair", None, &[]);
         Ok(())
     }
 

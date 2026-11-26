@@ -10,6 +10,13 @@ use umbra_cli::Cli;
 /// child's own exit code is deliberately not propagated: 0 would then mean
 /// "the child succeeded", which says nothing about whether its writes persisted.
 fn main() -> ExitCode {
+    umbra_core::cost_snapshot!("cli-entry", None, &[]);
+    let result = execute();
+    umbra_core::cost_snapshot!("cli-return", None, &[]);
+    result
+}
+
+fn execute() -> ExitCode {
     #[cfg(target_os = "macos")]
     match umbra_supervisor::managed_entry::RegisteredRole::enter() {
         Ok(Some(mut role)) => {

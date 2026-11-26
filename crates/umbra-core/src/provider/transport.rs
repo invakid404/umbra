@@ -93,7 +93,9 @@ impl Connection {
     /// Duplicate the provider endpoint for non-consuming liveness observation.
     /// Closing the duplicate alone does not close this connection.
     pub fn observation_stream(&self) -> Result<UnixStream> {
-        self.stream.try_clone().map_err(unavailable)
+        let stream = self.stream.try_clone().map_err(unavailable)?;
+        crate::cost_snapshot!("provider-observation-duplicate", None, &[]);
+        Ok(stream)
     }
     /// Current absolute deadline, retained by nested callback requests.
     pub fn deadline(&self) -> Instant {
@@ -609,7 +611,9 @@ impl Client {
         if managed_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(unavailable("provider readiness expired before spawn"));
         }
+        crate::cost_snapshot!("provider-command-before", None, &[]);
         let child = command.spawn().map_err(unavailable)?;
+        crate::cost_snapshot!("provider-command-after", Some(child.id()), &[]);
         let mut local_child = None;
         let child_slot = custody.unwrap_or(&mut local_child);
         *child_slot = Some(child);

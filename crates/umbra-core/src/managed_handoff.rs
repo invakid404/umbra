@@ -78,6 +78,7 @@ pub fn receive(route: &UnixStream) -> io::Result<Option<UnixStream>> {
     // A listening Unix socket also reports STREAM. Require an established
     // connection; unnamed socketpair peers need not have an address.
     let _ = rustix::net::getpeername(&fd)?;
+    crate::cost_snapshot!("provider-handoff-received", None, &[]);
     Ok(Some(UnixStream::from(fd)))
 }
 

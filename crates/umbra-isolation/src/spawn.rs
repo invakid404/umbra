@@ -72,6 +72,7 @@ fn spawn_impl(
     keep: &[RawFd],
     managed: bool,
 ) -> Result<i32, i32> {
+    umbra_core::cost_snapshot!("spawn-before-actions", None, keep);
     let path = cstring(exe.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
     let argv: Vec<CString> = args
         .iter()
@@ -141,6 +142,7 @@ fn spawn_impl(
                 }
             }
             let mut pid: libc::pid_t = 0;
+            umbra_core::cost_snapshot!("spawn-actions-ready", None, keep);
             let r = libc::posix_spawn(
                 &mut pid,
                 path.as_ptr(),
@@ -156,6 +158,11 @@ fn spawn_impl(
         })();
         libc::posix_spawn_file_actions_destroy(&mut actions);
         libc::posix_spawnattr_destroy(&mut attr);
+        umbra_core::cost_snapshot!(
+            "spawn-after-actions",
+            result.as_ref().ok().map(|pid| *pid as u32),
+            keep
+        );
         result
     }
 }

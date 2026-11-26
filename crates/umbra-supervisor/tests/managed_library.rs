@@ -236,6 +236,7 @@ fn main() {
         })),
     };
     let began = std::time::Instant::now();
+    umbra_core::cost_snapshot!("library-before-prepare", None, &[]);
     let mut run = RegisteredRole::prepare(spec, true, capacity).unwrap();
     let result = if mode == "startup_abort" {
         run.cleanup_failure()
@@ -340,6 +341,8 @@ fn main() {
     } else if let Some(run_id) = observed_run.get() {
         inspect_custody(&store, run_id, expects_success);
     }
+    drop(run);
+    umbra_core::cost_snapshot!("library-after-return", None, &[]);
     println!("managed_library: {mode} capacity={capacity} elapsed={elapsed:?} passed");
 }
 

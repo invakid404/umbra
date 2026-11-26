@@ -124,6 +124,7 @@ impl Launch {
         }
         let (stream, welcome) = client.into_managed_handoff().map_err(io::Error::other)?;
         let cancellation = stream.try_clone()?;
+        umbra_core::cost_snapshot!("provider-handoff-duplicate", None, &[]);
         Ok(Handoff {
             provider,
             welcome,

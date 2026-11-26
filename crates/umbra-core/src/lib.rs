@@ -6,6 +6,8 @@
 #![deny(missing_docs)]
 
 pub mod capabilities;
+#[doc(hidden)]
+pub mod cost_witness;
 #[cfg(unix)]
 pub mod launch_stdio;
 pub mod managed;

@@ -70,6 +70,7 @@ impl Entry {
         self.bootstrap.take();
         self.endpoints.clear();
         self.descendants.clear();
+        umbra_core::cost_snapshot!("startup-rollback-closed", None, &[]);
         Ok(())
     }
 
@@ -153,6 +154,7 @@ pub fn spawn_tree(
     }
     let parent = identity(std::process::id(), parent_role)?;
     let (parent_bootstrap, child_bootstrap) = UnixStream::pair()?;
+    umbra_core::cost_snapshot!("helper-bootstrap-created", None, &[]);
     let parent_bootstrap = super::Channel::new(parent_bootstrap)?;
     let spec = Spec {
         bootstrap: child_bootstrap.as_raw_fd(),
@@ -183,6 +185,9 @@ pub fn spawn_tree(
     let mut fds: Vec<_> = spec.endpoints.iter().map(|endpoint| endpoint.fd).collect();
     fds.push(spec.bootstrap);
     let child = SpawnedChild::spawn(&executable, &args, &environment, new_session, &fds)?;
+    drop(assignments);
+    drop(child_bootstrap);
+    umbra_core::cost_snapshot!("helper-parent-copies-closed", Some(child.pid()), &[]);
     Ok(PendingRole {
         child,
         bootstrap: parent_bootstrap,
@@ -425,6 +430,7 @@ impl Entry {
             return Err(invalid("invalid provider endpoint inventory"));
         }
         let (parent_bootstrap, child_bootstrap) = UnixStream::pair()?;
+        umbra_core::cost_snapshot!("provider-bootstrap-created", None, &[]);
         let bootstrap = super::Channel::new(parent_bootstrap)?;
         let spec = Spec {
             role: Role::Provider,
@@ -476,6 +482,7 @@ impl Entry {
         )?;
         drop(endpoints);
         drop(child_bootstrap);
+        umbra_core::cost_snapshot!("provider-parent-copies-closed", None, &[]);
         let startup = super::provider_startup::ProviderStartup::new(
             bootstrap,
             self.launch.run,
@@ -1023,6 +1030,7 @@ impl Entry {
         if !matches!(self.role, Role::Worker | Role::Guardian | Role::Relay) {
             self.bootstrap.take();
         }
+        umbra_core::cost_snapshot!(&format!("role-go-{:?}", self.role), None, &[]);
         Ok(true)
     }
 

@@ -27,6 +27,7 @@ pub fn command_with_ledger(
     let slot = ledger
         .map(|ledger| ledger.reserve(ResourceKind::Tracee, None, 1, 0))
         .transpose()?;
+    umbra_core::cost_snapshot!("preparation-command-before", None, &[]);
     let mut child = match command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -40,6 +41,7 @@ pub fn command_with_ledger(
             return Err(error("signing command", e));
         }
     };
+    umbra_core::cost_snapshot!("preparation-command-after", Some(child.id()), &[]);
     if let Some(slot) = &slot {
         #[cfg(feature = "shutdown-witness")]
         umbra_platform::shutdown::witness(serde_json::json!({
@@ -65,6 +67,7 @@ pub fn command_with_ledger(
         }
     }
     let confirm = |status: std::process::ExitStatus| -> Result<()> {
+        umbra_core::cost_snapshot!("preparation-command-collected", None, &[]);
         if let Some(slot) = &slot {
             slot.confirm(Proof::Accounted {
                 evidence: format!("preparation helper parent wait: {status}"),

@@ -215,8 +215,12 @@ impl LaunchStdio {
             .write(true)
             .open("/dev/null")
             .map_err(io)?;
+        crate::cost_snapshot!("stdio-null-opened", None, &[]);
         rustix::stdio::dup2_stdin(&null).map_err(io)?;
-        rustix::stdio::dup2_stdout(&null).map_err(io)
+        rustix::stdio::dup2_stdout(&null).map_err(io)?;
+        drop(null);
+        crate::cost_snapshot!("stdio-forwarders-released", None, &[]);
+        Ok(())
     }
 }
 

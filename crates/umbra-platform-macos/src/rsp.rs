@@ -312,7 +312,9 @@ impl Rsp {
                 Ok(())
             });
         }
+        umbra_core::cost_snapshot!("debugserver-command-before", None, &[]);
         let child = command.spawn().map_err(|e| error("debugserver spawn", e))?;
+        umbra_core::cost_snapshot!("debugserver-command-after", Some(child.id()), &[]);
         let mut child = SetupChild {
             child: Some(child),
             ownership: ownership.clone(),

@@ -105,6 +105,7 @@ impl SpawnedChild {
         let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
         if result == self.pid {
             self.status = Some(status);
+            umbra_core::cost_snapshot!("helper-collected", Some(self.pid()), &[], Some(status));
         } else if result < 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ECHILD) {
@@ -181,6 +182,7 @@ impl ProcessWatch {
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
+        umbra_core::cost_snapshot!("private-queue-created", None, &[fd]);
         Ok(Self {
             queue,
             participants: Vec::new(),

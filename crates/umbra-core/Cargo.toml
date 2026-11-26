@@ -9,6 +9,8 @@ publish = false
 [features]
 # Explicit owned-child adapter for protocol contract tests only.
 test-owned-exit = []
+# Explicit startup descriptor/process census; absent from ordinary builds.
+cost-witness = []
 
 [dependencies]
 serde.workspace = true
