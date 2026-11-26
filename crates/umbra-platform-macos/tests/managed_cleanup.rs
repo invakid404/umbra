@@ -5,6 +5,9 @@ use umbra_core::shutdown::Nonce;
 use umbra_core::*;
 use umbra_platform::{TraceBackend, TraceControl};
 use umbra_platform_macos::{MacosTraceBackend, Options};
+#[cfg(feature = "managed-endpoint-probe")]
+#[path = "support/endpoint_family.rs"]
+mod endpoint_family;
 #[path = "support/managed_admission.rs"]
 mod managed_admission;
 
@@ -114,6 +117,7 @@ fn r2_native_debugserver_endpoint_inventory() {
         eprintln!("native endpoint identities: {report:?}; parent={parent:?}; debugger/root empty");
         Ok(())
     });
+    endpoint_family::run();
 }
 
 #[cfg(feature = "managed-endpoint-probe")]
