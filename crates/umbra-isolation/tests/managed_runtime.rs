@@ -41,6 +41,11 @@ fn custody_stuck_custodian_reaps_all() {
 }
 
 #[test]
+fn r2_uncancellable_work_outer_cleanup() {
+    runtime_tree::run(runtime_tree::Case::UncancellableWorker).unwrap();
+}
+
+#[test]
 fn r2_total_publication_loss_preserves_custody() {
     runtime_tree::total_publication_loss().unwrap();
 }

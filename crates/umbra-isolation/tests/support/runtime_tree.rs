@@ -46,6 +46,7 @@ const PUBLISHERS: [Role; 4] = [
 pub enum Case {
     Normal,
     StuckCustodian,
+    UncancellableWorker,
     TotalLoss,
     RelayStalled,
     GuardianStalled,
@@ -54,12 +55,24 @@ pub enum Case {
 }
 impl Case {
     fn acknowledged(self) -> bool {
-        matches!(self, Self::Normal | Self::StuckCustodian)
+        matches!(
+            self,
+            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker
+        )
+    }
+    fn stuck_role(self) -> Option<Role> {
+        match self {
+            Self::StuckCustodian => Some(Role::CleanupOwner),
+            Self::UncancellableWorker => Some(Role::Worker),
+            _ => None,
+        }
     }
     fn failed(self, role: Role) -> bool {
         match self {
             Self::Normal => false,
-            Self::StuckCustodian => matches!(role, Role::Caller | Role::Relay | Role::Guardian),
+            Self::StuckCustodian | Self::UncancellableWorker => {
+                matches!(role, Role::Caller | Role::Relay | Role::Guardian)
+            }
             _ => true,
         }
     }
@@ -72,7 +85,7 @@ impl Case {
     }
     fn held(self, role: Role) -> bool {
         match self {
-            Self::Normal | Self::StuckCustodian => false,
+            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker => false,
             Self::TotalLoss => false,
             Self::RelayStalled => role == Role::Relay,
             Self::GuardianStalled => role == Role::Guardian,
@@ -82,7 +95,7 @@ impl Case {
     }
     fn delivery(self) -> Option<Role> {
         match self {
-            Self::Normal | Self::StuckCustodian => None,
+            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker => None,
             Self::TotalLoss => None,
             Self::RelayStalled => Some(Role::Worker),
             Self::GuardianStalled => Some(Role::Relay),
@@ -505,16 +518,19 @@ pub fn child() -> io::Result<()> {
                         unresolved: 0,
                     },
                 )?;
-                wait(&root, || {
-                    Ok(root.join(name("receipt", Role::Worker)).exists())
-                })?;
+                if config.case != Case::UncancellableWorker {
+                    wait(&root, || {
+                        Ok(root.join(name("receipt", Role::Worker)).exists())
+                    })?;
+                }
                 if config.case == Case::StuckCustodian {
                     // Provider collection is already certified by the real
                     // owner wait and ECHILD check above. Only this now-empty
                     // custodian remains for its actual parent to stop and wait.
                     drop(rescue);
-                    write(&root, "stuck-owner", &true)?;
-                    while !root.join("unstick-owner").exists() {
+                    write(&root, &name("stuck", role), &true)?;
+                    while !root.join(name("unstick", role)).exists() && !root.join("abort").exists()
+                    {
                         tick();
                     }
                 }
@@ -629,6 +645,17 @@ pub fn child() -> io::Result<()> {
             if root.join("release").exists()
                 && root.join(name("receipt", Role::CleanupOwner)).exists()
             {
+                if config.case == Case::UncancellableWorker {
+                    drop(rescue);
+                    write(&root, &name("stuck", role), &true)?;
+                    // Deliberately stop reading cancellation or doing work.
+                    // Only the independent parent or invalidating rescue can
+                    // release this ordinary-child stand-in.
+                    while !root.join(name("unstick", role)).exists() && !root.join("abort").exists()
+                    {
+                        tick();
+                    }
+                }
                 return write(
                     &root,
                     &name("receipt", role),
@@ -668,7 +695,7 @@ pub fn child() -> io::Result<()> {
         guard.run_parent_with_test_observer(|state| record(&root, role, state, &mut prior));
     let failed = outcome.failed;
     finish_parent(&root, role, outcome)?;
-    if config.case == Case::StuckCustodian && failed {
+    if config.case.stuck_role().is_some() && failed {
         // The helper reports failure only after its actual child waits.
         drop(rescue);
         std::process::exit(1);
@@ -776,12 +803,12 @@ pub fn run(case: Case) -> io::Result<()> {
     let mut rescued = false;
     let mut wrong_caller_state = false;
     let mut caller_notified_before_ack = false;
-    let mut stopping_owner = false;
+    let mut stopping_child = false;
     let mut prior = None;
     let outcome = guard.run_parent_with_test_observer(|state| {
         caller_notified_before_ack |= state.ticket == Some(ticket) && boot_nanos()? == config.t0;
         wrong_caller_state |= state.expired
-            || (!stopping_owner && !state.stage_events.is_empty())
+            || (!stopping_child && !state.stage_events.is_empty())
             || match state.ticket {
                 None => state.receive_deadline != u64::MAX || (advanced && case != Case::TotalLoss),
                 Some(found) => {
@@ -794,24 +821,27 @@ pub fn run(case: Case) -> io::Result<()> {
             || (state.ticket == Some(ticket) && state.failed != case.acknowledged());
         let caller_published = !case.acknowledged() || state.pending_publication.is_empty();
         record(root, Role::Caller, state, &mut prior)?;
-        if case == Case::StuckCustodian
-            && released
-            && !stopping_owner
-            && root.join("stuck-owner").exists()
-        {
-            let owner = participant(&inventory, Role::CleanupOwner);
-            if identity(owner.pid, owner.role)? != owner {
-                return Err(invalid("custodian exited before its parent opportunity"));
+        if let Some(role) = case.stuck_role() {
+            if released && !stopping_child && root.join(name("stuck", role)).exists() {
+                let child = participant(&inventory, role);
+                if identity(child.pid, child.role)? != child {
+                    return Err(invalid("child exited before its parent opportunity"));
+                }
+                stopping_child = true;
+                // Guardian's owner slot follows its worker slot by one second,
+                // within the original four-second helper allocation.
+                let offset = if role == Role::CleanupOwner {
+                    1_000_000_000
+                } else {
+                    0
+                };
+                clock.advance_to(ticket.cutoffs(1).map_err(invalid)?.fallback + offset);
             }
-            stopping_owner = true;
-            // Guardian's owner slot follows its worker slot by one second,
-            // within the original four-second helper allocation.
-            clock.advance_to(ticket.cutoffs(1).map_err(invalid)?.fallback + 1_000_000_000);
-        }
-        if case == Case::StuckCustodian && Instant::now() >= bound {
-            rescued = true;
-            std::fs::write(root.join("unstick-owner"), b"rescue")?;
-            clock.advance_to(ticket.deadline);
+            if Instant::now() >= bound {
+                rescued = true;
+                std::fs::write(root.join(name("unstick", role)), b"rescue")?;
+                clock.advance_to(ticket.deadline);
+            }
         }
         if !released && Instant::now() >= bound {
             rescued = true;
@@ -926,6 +956,22 @@ pub fn run(case: Case) -> io::Result<()> {
         ));
     }
     for role in ROLES {
+        if case == Case::UncancellableWorker && role == Role::Worker {
+            if read::<Receipt>(root, &name("receipt", role))?.is_some()
+                || read::<Vec<(u32, i32)>>(root, &name("rescue", role))? != Some(Vec::new())
+                || inventory
+                    .members
+                    .iter()
+                    .any(|member| member.parent.is_some_and(|parent| parent.role == role))
+            {
+                return Err(invalid(
+                    "uncancellable worker produced a cooperative receipt",
+                ));
+            }
+            // Its actual Guardian wait (checked above) is the only collection
+            // receipt. The killed worker cannot provide one for itself.
+            continue;
+        }
         let receipt: Receipt =
             read(root, &name("receipt", role))?.ok_or_else(|| invalid("missing parent receipt"))?;
         let rescued: Vec<(u32, i32)> =
@@ -943,9 +989,9 @@ pub fn run(case: Case) -> io::Result<()> {
             .collect();
         if receipt.waits.len() != expected.len()
             || expected.iter().any(|peer| {
-                let status = if case == Case::StuckCustodian {
+                let status = if let Some(stuck) = case.stuck_role() {
                     match peer.role {
-                        Role::CleanupOwner => libc::SIGKILL,
+                        role if role == stuck => libc::SIGKILL,
                         Role::Guardian | Role::Relay => 1 << 8,
                         _ => 0,
                     }
