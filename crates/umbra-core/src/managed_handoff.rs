@@ -1,7 +1,7 @@
 //! One-shot provider connection handoff on an authenticated managed route.
 use rustix::net::{
-    recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags,
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
 };
 use std::io::{self, IoSlice, IoSliceMut};
 use std::os::fd::AsFd;
@@ -75,6 +75,9 @@ pub fn receive(route: &UnixStream) -> io::Result<Option<UnixStream>> {
     {
         return Err(io::ErrorKind::InvalidData.into());
     }
+    // A listening Unix socket also reports STREAM. Require an established
+    // connection; unnamed socketpair peers need not have an address.
+    let _ = rustix::net::getpeername(&fd)?;
     Ok(Some(UnixStream::from(fd)))
 }
 
@@ -82,6 +85,81 @@ pub fn receive(route: &UnixStream) -> io::Result<Option<UnixStream>> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::os::fd::BorrowedFd;
+
+    fn send_unchecked(route: &UnixStream, fds: &[BorrowedFd<'_>], marker: u8) {
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut space);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(fds)));
+        assert_eq!(
+            sendmsg(
+                route,
+                &[IoSlice::new(&[marker])],
+                &mut ancillary,
+                SendFlags::empty()
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn handoff_rejects_unconnected_listener() {
+        let path = std::path::Path::new("/tmp").join(format!("handoff-{}", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (route, receiver) = UnixStream::pair().unwrap();
+        send_unchecked(&route, &[listener.as_fd()], b'P');
+        let result = receive(&receiver);
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            result.is_err(),
+            "listening socket adopted as provider connection"
+        );
+    }
+
+    #[test]
+    fn handoff_rejects_wrong_marker_and_closes_received_descriptor() {
+        let (route, receiver) = UnixStream::pair().unwrap();
+        let (provider, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        send_unchecked(&route, &[provider.as_fd()], b'Q');
+        drop(provider);
+        assert!(receive(&receiver).is_err());
+        assert_eq!(
+            peer.read(&mut [0]).unwrap(),
+            0,
+            "rejected descriptor leaked"
+        );
+    }
+
+    #[test]
+    fn handoff_rejects_multiple_descriptors_and_closes_every_copy() {
+        let (route, receiver) = UnixStream::pair().unwrap();
+        let (first, mut first_peer) = UnixStream::pair().unwrap();
+        let (second, mut second_peer) = UnixStream::pair().unwrap();
+        first_peer.set_nonblocking(true).unwrap();
+        second_peer.set_nonblocking(true).unwrap();
+        send_unchecked(&route, &[first.as_fd(), second.as_fd()], b'P');
+        drop((first, second));
+        assert!(receive(&receiver).is_err());
+        for peer in [&mut first_peer, &mut second_peer] {
+            assert_eq!(
+                peer.read(&mut [0]).unwrap(),
+                0,
+                "rejected descriptor leaked"
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_rejects_missing_and_non_socket_descriptors() {
+        let (mut route, receiver) = UnixStream::pair().unwrap();
+        route.write_all(b"P").unwrap();
+        assert!(receive(&receiver).is_err());
+        let file = std::fs::File::open("/dev/null").unwrap();
+        send_unchecked(&route, &[file.as_fd()], b'P');
+        assert!(receive(&receiver).is_err());
+    }
 
     #[test]
     fn handoff_preserves_connection_and_closes_sender_reference() {
@@ -90,9 +168,11 @@ mod tests {
         assert!(send(&route, &provider).unwrap());
         let mut adopted = receive(&receiver).unwrap().unwrap();
         drop(provider);
-        assert!(rustix::io::fcntl_getfd(&adopted)
-            .unwrap()
-            .contains(rustix::io::FdFlags::CLOEXEC));
+        assert!(
+            rustix::io::fcntl_getfd(&adopted)
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
         peer.write_all(b"ok").unwrap();
         let mut bytes = [0; 2];
         adopted.read_exact(&mut bytes).unwrap();
