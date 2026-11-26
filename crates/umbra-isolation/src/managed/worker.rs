@@ -664,9 +664,9 @@ impl ManagedCleanup for WorkerCleanup {
 mod tests {
     use super::*;
     use crate::managed::{
-        Channel,
         owner::{Owner, Service},
         process::identity,
+        Channel,
     };
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;

@@ -3,11 +3,11 @@ use super::*;
 use std::process::{Child, Command};
 use umbra_core::managed::{Participant, Role, RunIdentity};
 use umbra_isolation::managed::{
-    Channel,
     owner::{Owner, Service},
     process::identity,
     publication::Route,
     worker::{ManagedCleanup as AdapterCleanup, SharedWorkerCleanup, WorkerCleanup},
+    Channel,
 };
 
 // The platform unit-test crate and isolation's platform dependency have distinct

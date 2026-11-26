@@ -402,6 +402,15 @@ jobs:
           git diff --stat -- experiments/fixtures/umbra-fix-227-observer-providers/Cargo.lock
           cargo build --locked --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           cargo test -p umbra-supervisor --test observer_failure -- --nocapture --test-threads=1
+      - name: Cancel accepted native setup through the independent route
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features probe-native-setup-cancel --test managed_library --no-run --message-format=json > /tmp/native-cancel-artifacts.jsonl
+          export UMBRA_NATIVE_MANAGED_CALLER=$(python3 -c 'import json; rows=[json.loads(line) for line in open("/tmp/native-cancel-artifacts.jsonl")]; paths=[r["executable"] for r in rows if r.get("reason")=="compiler-artifact" and r.get("target",{}).get("name")=="managed_library" and r.get("executable")]; assert len(paths)==1; print(paths[0])')
+          cargo build -p umbra-platform-macos --features managed-cancel-probe
+          cargo test -p umbra-platform-macos --features managed-cancel-probe --test managed_cleanup r2_native_preaccepted_work_cancel -- --exact --nocapture
+          cargo build --workspace --bins
+
       - name: Qualify adopted stdio ownership and launch consumption
         run: |
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880

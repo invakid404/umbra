@@ -4513,7 +4513,7 @@ fn enrolled_identity(sessions: &[SessionIdentity], pid: i32, birth: Option<(u64,
     })
 }
 
-fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
+pub(crate) fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
     // SAFETY: `info` is a writable buffer of exactly `size` bytes.
@@ -5248,6 +5248,11 @@ impl MacosTraceBackend {
                 drop(removed);
                 s.torn_down = true;
                 s.live.take();
+                // The tombstone outlives its resources. Settle its charge now,
+                // after debugger collection and task-right destruction.
+                if s.parent.is_some() || s.reaped {
+                    s.settle_tracee();
+                }
                 #[cfg(feature = "retirement-witness")]
                 eprintln!(
                     "retirement-ownership pid={} remaining={:?}",

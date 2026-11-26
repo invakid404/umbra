@@ -41,9 +41,17 @@ pub fn command_with_ledger(
         }
     };
     if let Some(slot) = &slot {
+        #[cfg(feature = "shutdown-witness")]
+        umbra_platform::shutdown::witness(serde_json::json!({
+            "event": "acquired",
+            "kind": "Tracee",
+            "pid": child.id(),
+            "preparation_helper": true,
+        }));
         if let Err(error) = slot.acquired(Identity {
             pid: Some(child.id() as i32),
-            birth: None,
+            birth: crate::native::bsd_info(child.id() as i32)
+                .map(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec)),
         }) {
             let _ = child.kill();
             if let Ok(status) = child.wait() {

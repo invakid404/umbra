@@ -1,7 +1,7 @@
 //! One-shot provider connection handoff on an authenticated managed route.
 use rustix::net::{
-    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
+    recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags,
 };
 use std::io::{self, IoSlice, IoSliceMut};
 use std::os::fd::AsFd;
@@ -168,11 +168,9 @@ mod tests {
         assert!(send(&route, &provider).unwrap());
         let mut adopted = receive(&receiver).unwrap().unwrap();
         drop(provider);
-        assert!(
-            rustix::io::fcntl_getfd(&adopted)
-                .unwrap()
-                .contains(rustix::io::FdFlags::CLOEXEC)
-        );
+        assert!(rustix::io::fcntl_getfd(&adopted)
+            .unwrap()
+            .contains(rustix::io::FdFlags::CLOEXEC));
         peer.write_all(b"ok").unwrap();
         let mut bytes = [0; 2];
         adopted.read_exact(&mut bytes).unwrap();

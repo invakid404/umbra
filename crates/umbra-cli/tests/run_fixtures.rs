@@ -10,8 +10,8 @@ use std::{
     time::Instant,
 };
 use umbra_core::{
-    BytePath, CustodyPhase, JournalAccess, JournalControlBinding, JournalFormatPolicy, JournalLifecycle,
-    JournalOpenRequest, JournalPayload, PhysicalPath, RunId, Sequence,
+    BytePath, CustodyPhase, JournalAccess, JournalControlBinding, JournalFormatPolicy,
+    JournalLifecycle, JournalOpenRequest, JournalPayload, PhysicalPath, RunId, Sequence,
 };
 use umbra_journal::Journal;
 use umbra_journal_file::FileJournal;

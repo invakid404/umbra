@@ -5,7 +5,7 @@ fn main() {}
 #[cfg(target_os = "macos")]
 fn main() {
     use std::{collections::BTreeMap, process::Command};
-    use umbra_core::{BytePath, provider::ProviderRegistry};
+    use umbra_core::{provider::ProviderRegistry, BytePath};
     use umbra_supervisor::{
         managed_entry::RegisteredRole,
         run::{CommandLaunch, RunLaunch, RunPersistence, RunSpec},

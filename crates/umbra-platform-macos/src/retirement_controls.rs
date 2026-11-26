@@ -277,6 +277,21 @@ fn retirement_release_owns_all_resources() {
         worker: None,
     });
     let (mut retiring, mut peer) = slot(104, true);
+    retiring.parent = None; // Controlled slot already carries a root wait receipt.
+    let ledger = umbra_platform::shutdown::Ledger::new();
+    let tracee = ledger
+        .reserve(umbra_core::shutdown::ResourceKind::Tracee, None, 1, 0)
+        .unwrap();
+    tracee
+        .acquired(umbra_core::shutdown::Identity {
+            pid: Some(retiring.id.0.native_id as i32),
+            birth: None,
+        })
+        .unwrap();
+    retiring.ownership = Some(TraceOwnership {
+        ledger: ledger.clone(),
+        tracee,
+    });
     let pid = retiring.id.0.native_id;
     let thread = retiring.thread;
     let breakpoint = Breakpoint {
@@ -320,6 +335,16 @@ fn retirement_release_owns_all_resources() {
     );
     backend.service_retirements();
     assert!(backend.sessions[0].live.is_none());
+    ledger
+        .freeze(
+            umbra_core::shutdown::Nonce::new_v4(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert!(
+        ledger.final_snapshot().unwrap().entries[0].confirms(),
+        "retained tombstone must record terminal evidence before Session drop"
+    );
     assert_eq!(crate::ownership::remaining(pid), Vec::<&str>::new());
     assert!(task.upgrade().is_none(), "both Task owners must release");
     assert!(backend

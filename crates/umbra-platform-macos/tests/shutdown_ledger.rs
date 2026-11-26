@@ -207,7 +207,12 @@ fn shutdown_native_root_ledger() {
         "creation-return witness must match every acquired ledger slot"
     );
     assert_eq!(
-        observed.len(),
+        records
+            .iter()
+            .filter(|record| {
+                record["event"] == "acquired" && record["preparation_helper"] != true
+            })
+            .count(),
         4,
         "root tracee, initial and exec task rights, and owned tracer"
     );

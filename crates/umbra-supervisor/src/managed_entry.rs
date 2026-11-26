@@ -152,7 +152,11 @@ impl RegisteredRole {
     /// An error preserves unresolved custody in this object for reporting.
     pub fn cleanup_failure(&mut self) -> io::Result<()> {
         if self.parent_finished {
-            return if self.unresolved.is_empty() { Ok(()) } else { Err(io::Error::other("managed children remain uncollected")) };
+            return if self.unresolved.is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::other("managed children remain uncollected"))
+            };
         }
         match &mut self.state {
             State::Caller(startup) => match startup.rollback() {
