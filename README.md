@@ -35,14 +35,25 @@ collection of the provider process before the journal records completion.
 Missing closure proof fails the run and records recovery-required when the
 journal remains writable.
 
+On macOS, CLI runs and registered executable-library runs use a cleanup owner
+that retains the provider while the worker unwinds. Resource admission precedes
+native acquisition, and durable journal custody precedes permission to launch.
+Cleanup completion and the command's outcome remain separate: collecting every
+resource does not turn a failed command into success. The
+[isolation crate](crates/umbra-isolation/README.md) documents the per-run bounds
+and the residual cases where notification or actual parent collection is lost.
+Managed cleanup qualification is incomplete: measured descriptor costs and
+latency exceed the accepted budgets, and some shutdown cases remain failed.
+
 ```sh
 umbra run --registry providers.json --workspace . --experimental   -- /absolute/path/to/program args...
 ```
 
-Measured on macOS 26.5.1 / Apple Silicon: all seven fixture subcommands captured
-into the run's shadow with exact expected bytes, no host writes, the writer lease
+Earlier qualification on macOS 26.5.1 / Apple Silicon captured all seven fixture
+subcommands into the run's shadow with exact expected bytes, no host writes, the writer lease
 released and a durable run-completion record, in both the local-development and
-mounted-NFSv4 storage modes.
+mounted-NFSv4 storage modes. Mounted-NFSv4 has not been requalified for the
+managed cleanup path.
 
 Vendor agent adapters remain stubs, so `--agent` reports `NotImplemented`.
 `umbra resume <run-id>` reopens an existing run and reports whether it can be
@@ -127,13 +138,32 @@ qualification job or the `native-userspace-routing` routing job -- and neither
 checkout persists job credentials. A labeled runner must be provisioned before
 those checks can supply a CI signal; a queued job is not enforcement evidence.
 
+The separate [managed performance workflow](.github/workflows/managed-performance.yml)
+schedules the four D6 workloads (`native_true`, `registry_true`, `registry_tree5`,
+and `admission_only`) in both own-session and CI-only SID-1 modes.
+It excludes `native_tree5`, blocks fork pull requests, and retains failed samples
+without rerunning them. Each case uses three warmup pairs and thirty alternating
+measured pairs, stopping that workload on a terminal failure.
+
+The runner must retain the original frozen baseline from commit
+`c85722bf4bb6f6818f42172e65b4bfce2cae2b17`. Repository variables
+`UMBRA_D6_BASE_MANIFEST`, `UMBRA_D6_BASE_REGISTRY_MANIFEST`, and
+`UMBRA_D6_BASE_REGISTRY` must name its absolute manifest and registry paths.
+The preparation script verifies the original observation patch, artifact hashes,
+compiler/profile and workload bytes before freezing the current head.
+Missing configuration fails; CI never rebuilds the baseline or counts a skip as
+a sample. The routed baseline registry must select the raw fixture at
+`127.0.0.1:12105`. These runner variables still require provisioning; adding the
+workflow does not establish a passing performance result.
+
 If you're contributing, [the Memoria guide](docs/memoria.md) explains how we keep
 READMEs connected to the code they describe. It covers the review flow and the
 documentation check that runs in CI.
 
 Quiet programs use bounded platform polls so the supervisor can renew writer
 authority between idle replies. This retains the provider request deadline and
-independent opt-in platform session watchdog; it adds no cancellation API.
+independent opt-in platform session watchdog. Managed cleanup has a separate
+notification route that can cancel accepted debugger work.
 The macOS provider has no default lifetime or inactivity limit and monitors
 supervisor exit and transport EOF for cleanup.
 

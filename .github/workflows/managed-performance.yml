@@ -1,0 +1,134 @@
+name: Managed cleanup performance
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Keep attempted samples even when another revision arrives.
+concurrency:
+  group: managed-performance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  paired:
+    name: D6 ${{ matrix.workload }} / ${{ matrix.session }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, umbra-integration]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        # native_tree5 is deliberately excluded from this qualification.
+        workload: [native_true, registry_true, registry_tree5, admission_only]
+        session: [own_session, sid1]
+    env:
+      D6_WORKLOAD: ${{ matrix.workload }}
+      D6_SESSION: ${{ matrix.session }}
+      # Runner-local immutable files, provisioned once from the original
+      # baseline. Missing settings fail preflight; CI never rebuilds the base.
+      UMBRA_D6_BASE_MANIFEST: ${{ vars.UMBRA_D6_BASE_MANIFEST }}
+      UMBRA_D6_BASE_REGISTRY_MANIFEST: ${{ vars.UMBRA_D6_BASE_REGISTRY_MANIFEST }}
+      UMBRA_D6_BASE_REGISTRY: ${{ vars.UMBRA_D6_BASE_REGISTRY }}
+      UMBRA_LIBNFS_SRC: ${{ github.workspace }}/third_party/libnfs
+      LIBNFS_PIN: 18c5c73ee88bb7dc8da0d55dc95164bb77e49dc6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable baseline and record initial process census
+        run: |
+          set -eu
+          ps -axo user,pid,ppid,stat,lstart,comm > "$RUNNER_TEMP/d6-before.txt"
+          test "$(df -k . | awk 'NR==2 {print $4}')" -ge 5242880
+          python3 experiments/fixtures/umbra-fix-299b-performance/ci.py preflight \
+            --workload "$D6_WORKLOAD" --session "$D6_SESSION" \
+            --output "$RUNNER_TEMP/d6-reading"
+      - name: Fetch pinned raw transport source
+        if: startsWith(matrix.workload, 'registry_')
+        run: |
+          set -eu
+          pinned=$(grep -v '^\s*#' crates/umbra-storage-nfs-userspace/libnfs.pin | tr -d '[:space:]')
+          test "$pinned" = "$LIBNFS_PIN"
+          if [ ! -d third_party/libnfs ]; then
+            git clone --filter=blob:none https://github.com/sahlberg/libnfs third_party/libnfs
+          fi
+          git -C third_party/libnfs fetch --depth 1 origin "$LIBNFS_PIN"
+          git -C third_party/libnfs -c advice.detachedHead=false checkout "$LIBNFS_PIN"
+      - name: Start raw fixture
+        id: raw
+        if: startsWith(matrix.workload, 'registry_')
+        run: |
+          docker compose -f experiments/nfs-raw/docker-compose.yml \
+            up -d --build --wait --wait-timeout 180
+      - name: Build unmutated head and measurement driver
+        run: |
+          set -eu
+          features='umbra-cli/shutdown-witness,umbra-platform-macos/shutdown-witness'
+          if [[ "$D6_WORKLOAD" == registry_* ]]; then
+            features="$features,umbra-storage-nfs-userspace/transport-raw"
+          fi
+          cargo build --locked --workspace --bins --features "$features"
+          cargo test --locked -p umbra-cli --features shutdown-witness \
+            --test cleanup_performance --no-run --message-format=json \
+            > "$RUNNER_TEMP/d6-driver.jsonl"
+      - name: Freeze head and prepare explicit measurement configuration
+        run: |
+          python3 experiments/fixtures/umbra-fix-299b-performance/ci.py prepare \
+            --workload "$D6_WORKLOAD" --session "$D6_SESSION" \
+            --output "$RUNNER_TEMP/d6-reading" --artifacts "$RUNNER_TEMP/d6-driver.jsonl"
+          cat > "$RUNNER_TEMP/d6-reading/predictions.txt" <<'EOF'
+          Expect actual parent collection, complete admission and cleanup receipts,
+          and no protocol, guard, or deadline failures. Apply the original D6
+          thresholds; retain every attempt, including failures and outliers.
+          A terminal failure stops this workload; no repeat-to-green.
+          EOF
+          cp "$RUNNER_TEMP/d6-reading/predictions.txt" "$RUNNER_TEMP/d6-reading/predictions-archived.txt"
+      - name: Run three warmup pairs and thirty alternating pairs
+        run: |
+          set -eu
+          entry=paired
+          if [ "$D6_SESSION" = sid1 ]; then entry=paired_sid1; fi
+          # paired_sid1 asserts the launchd-session prerequisite itself.
+          # No launchctl submission or fallback to an own-session sample.
+          cargo test --locked --config "$RUNNER_TEMP/d6-reading/cargo.toml" \
+            -p umbra-cli --features shutdown-witness --test cleanup_performance \
+            "$entry" -- --exact --nocapture --test-threads=1 \
+            > "$RUNNER_TEMP/d6-reading/test.log" 2>&1
+      - name: Final process census
+        if: always()
+        run: |
+          ps -axo user,pid,ppid,stat,lstart,comm > "$RUNNER_TEMP/d6-after.txt"
+          python3 - <<'PY'
+          import getpass, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          def zombies(name):
+              rows = [line.split(maxsplit=9) for line in (root / name).read_text().splitlines()[1:]]
+              return {tuple(row[1:2] + row[4:9]) for row in rows
+                      if len(row) == 10 and row[0] == getpass.getuser()
+                      and row[2] == "1" and row[3].startswith("Z")}
+          created = zombies("d6-after.txt") - zombies("d6-before.txt")
+          if created:
+              raise SystemExit(f"new launchd-parented zombies: {sorted(created)}")
+          PY
+      - name: Retain all attempted samples and manifests
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: d6-${{ matrix.workload }}-${{ matrix.session }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/d6-reading
+            ${{ runner.temp }}/d6-before.txt
+            ${{ runner.temp }}/d6-after.txt
+            ${{ runner.temp }}/d6-driver.jsonl
+          if-no-files-found: error
+      - name: Stop raw fixture
+        if: always() && steps.raw.outcome == 'success'
+        run: docker compose -f experiments/nfs-raw/docker-compose.yml down -v
