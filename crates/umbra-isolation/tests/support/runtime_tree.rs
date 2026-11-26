@@ -46,12 +46,13 @@ const PUBLISHERS: [Role; 4] = [
 pub enum Case {
     TotalLoss,
     RelayStalled,
+    GuardianStalled,
     OwnerDirect,
     ForwardBeforeExit,
 }
 impl Case {
     fn origin(self) -> Role {
-        if self == Self::RelayStalled {
+        if matches!(self, Self::RelayStalled | Self::GuardianStalled) {
             Role::Worker
         } else {
             Role::CleanupOwner
@@ -61,6 +62,7 @@ impl Case {
         match self {
             Self::TotalLoss => false,
             Self::RelayStalled => role == Role::Relay,
+            Self::GuardianStalled => role == Role::Guardian,
             Self::OwnerDirect => matches!(role, Role::Relay | Role::Guardian | Role::Worker),
             Self::ForwardBeforeExit => matches!(role, Role::Relay | Role::Worker),
         }
@@ -69,6 +71,7 @@ impl Case {
         match self {
             Self::TotalLoss => None,
             Self::RelayStalled => Some(Role::Worker),
+            Self::GuardianStalled => Some(Role::Relay),
             Self::OwnerDirect => Some(Role::CleanupOwner),
             Self::ForwardBeforeExit => Some(Role::Guardian),
         }
@@ -495,6 +498,15 @@ pub fn child() -> io::Result<()> {
             }
             tick();
         }
+    }
+    // With the guardian held, only the worker may deliver Start to the relay.
+    // Keep the redundant owner endpoint open so EOF cannot supply a trigger.
+    let mut blocked_owner = Vec::new();
+    if config.case == Case::GuardianStalled && role == Role::Relay {
+        let incoming = streams.remove(&Role::CleanupOwner).unwrap();
+        let (replacement, sink) = UnixStream::pair()?;
+        streams.insert(Role::CleanupOwner, replacement);
+        blocked_owner.push((incoming, sink));
     }
     let mut routes = streams
         .into_iter()

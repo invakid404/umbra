@@ -41,6 +41,50 @@ fn r2_library_relay_stalls_before_start() {
 }
 
 #[test]
+fn r2_guardian_stalls_before_first_trigger() {
+    relay_commits_before_ack();
+    runtime_tree::run(runtime_tree::Case::GuardianStalled).unwrap();
+}
+
+fn relay_commits_before_ack() {
+    let clock = SharedClock::new(boot_nanos().unwrap());
+    let _scope = clock.install();
+    let run = RunIdentity {
+        nonce: uuid::Uuid::new_v4(),
+        generation: 1,
+    };
+    let worker = identity(std::process::id(), Role::Worker).unwrap();
+    let relay = identity(std::process::id(), Role::Relay).unwrap();
+    let start = Start {
+        run,
+        origin: worker,
+        ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Trusted, 1).unwrap(),
+    };
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    let mut sender = Channel::new(sender).unwrap();
+    let mut receiver = Route::new(worker, Channel::new(receiver).unwrap()).unwrap();
+    let mut tickets = TicketState::new(run, 1).unwrap();
+    sender.queue(&ControlMessage::Start(start.clone())).unwrap();
+    assert!(sender.flush(start.ticket.deadline).unwrap());
+    clock.advance_to(start.ticket.started + 10_000_000);
+    let received = receiver
+        .receive_start_from(&mut tickets, relay, &[worker], start.ticket.deadline)
+        .unwrap()
+        .unwrap();
+    assert!(receiver.flush_ack(&received, &mut tickets).unwrap());
+    let Some(ControlMessage::Ack(ack)) = sender.receive(start.ticket.deadline).unwrap() else {
+        panic!("relay omitted the publication acknowledgement");
+    };
+    ack.validate(&start, relay).unwrap();
+    assert_eq!(
+        tickets.ticket(),
+        Some(start.ticket),
+        "relay acknowledged before committing the original ticket"
+    );
+    assert_eq!(received, start, "relay renewed the received cleanup ticket");
+}
+
+#[test]
 fn r2_library_owner_start_relay_stalled_worker_alive() {
     runtime_tree::run(runtime_tree::Case::OwnerDirect).unwrap();
 }
