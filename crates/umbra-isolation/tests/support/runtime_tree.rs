@@ -1,4 +1,5 @@
-//! Ordinary-child D1 fixture. File latches control work, never certify collection.
+//! Managed custody and notification through ordinary children.
+//! File latches control work, never certify collection.
 use super::runtime_clock::{self, SharedClock};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
@@ -41,11 +42,45 @@ const PUBLISHERS: [Role; 4] = [
     Role::CleanupOwner,
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Case {
+    TotalLoss,
+    RelayStalled,
+    OwnerDirect,
+    ForwardBeforeExit,
+}
+impl Case {
+    fn origin(self) -> Role {
+        if self == Self::RelayStalled {
+            Role::Worker
+        } else {
+            Role::CleanupOwner
+        }
+    }
+    fn held(self, role: Role) -> bool {
+        match self {
+            Self::TotalLoss => false,
+            Self::RelayStalled => role == Role::Relay,
+            Self::OwnerDirect => matches!(role, Role::Relay | Role::Guardian | Role::Worker),
+            Self::ForwardBeforeExit => matches!(role, Role::Relay | Role::Worker),
+        }
+    }
+    fn delivery(self) -> Option<Role> {
+        match self {
+            Self::TotalLoss => None,
+            Self::RelayStalled => Some(Role::Worker),
+            Self::OwnerDirect => Some(Role::CleanupOwner),
+            Self::ForwardBeforeExit => Some(Role::Guardian),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
     run: RunIdentity,
     t0: u64,
     clock: PathBuf,
+    case: Case,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Reading {
@@ -337,8 +372,8 @@ pub fn child() -> io::Result<()> {
     let inventory: Inventory = read(&root, "inventory")?.unwrap();
     inventory.validate(config.run, true)?;
     let mut streams = connections(&root, role, &listener)?;
-    let owner_identity = participant(&inventory, Role::CleanupOwner);
-    let start = original(&config, owner_identity);
+    let origin_identity = participant(&inventory, config.case.origin());
+    let start = original(&config, origin_identity);
     let mut prior = None;
     if role == Role::Provider {
         let mut channel = Channel::new(streams.remove(&Role::CleanupOwner).unwrap())?;
@@ -350,7 +385,7 @@ pub fn child() -> io::Result<()> {
                 match channel.receive::<Start>(u64::MAX) {
                     Ok(Some(received)) => {
                         tickets
-                            .accept(received, owner_identity, local)
+                            .accept(received, origin_identity, local)
                             .map_err(invalid)?;
                     }
                     Ok(None) => {}
@@ -397,18 +432,25 @@ pub fn child() -> io::Result<()> {
         owner.install_watch(watch, &inventory)?;
         write(&root, &name("ready", role), &true)?;
         wait(&root, || Ok(root.join("go").exists()))?;
-        owner.start(start.clone(), local)?;
-        // Scripted provider work starts under the same original local ticket.
-        provider_channel.queue(&start)?;
-        if !provider_channel.flush(start.ticket.deadline)? {
-            return Err(invalid("fixture provider Start backpressure"));
+        if config.case.origin() == role {
+            owner.start(start.clone(), local)?;
         }
+        let mut provider_started = false;
         let mut cancelled = false;
         loop {
             if root.join("abort").exists() {
                 return Err(invalid("fixture aborted"));
             }
             let status = owner.progress()?;
+            if owner.test_clock_ticket().is_some() && !provider_started {
+                // The scripted provider receives the same accepted origin,
+                // including a worker Start forwarded through its actual owner.
+                provider_channel.queue(&start)?;
+                if !provider_channel.flush(start.ticket.deadline)? {
+                    return Err(invalid("fixture provider Start backpressure"));
+                }
+                provider_started = true;
+            }
             if owner.failed() && !cancelled {
                 owner.cancel("caller notification acknowledgement lost".into())?;
                 cancelled = true;
@@ -418,7 +460,7 @@ pub fn child() -> io::Result<()> {
                 role,
                 GuardState {
                     ticket: owner.test_clock_ticket(),
-                    receive_deadline: start.ticket.deadline,
+                    receive_deadline: owner.test_clock_ticket().map_or(u64::MAX, |t| t.deadline),
                     failed: owner.failed(),
                     expired: owner.expired()?,
                     stage_events: Vec::new(),
@@ -463,6 +505,28 @@ pub fn child() -> io::Result<()> {
         let mut publication = None;
         let mut held = Vec::new();
         write(&root, &name("ready", role), &true)?;
+        while config.case.held(role) && !root.join("release").exists() {
+            record(&root, role, state(&tickets, Vec::new()), &mut prior)?;
+            tick();
+        }
+        wait(&root, || Ok(root.join("go").exists()))?;
+        if config.case.origin() == role {
+            let mut publishing = Publication::begin(
+                start.clone(),
+                local,
+                local,
+                &mut tickets,
+                std::mem::take(&mut routes),
+            )?;
+            publishing.inventory(
+                &inventory
+                    .members
+                    .iter()
+                    .map(|m| m.participant)
+                    .collect::<Vec<_>>(),
+            );
+            publication = Some(publishing);
+        }
         loop {
             if root.join("abort").exists() {
                 return Err(invalid("fixture aborted"));
@@ -480,8 +544,14 @@ pub fn child() -> io::Result<()> {
                             .collect::<Vec<_>>(),
                         u64::MAX,
                     )? {
-                        if !route.flush_ack(&received, &mut tickets)? {
-                            return Err(invalid("fixture peer ACK backpressure"));
+                        match route.flush_ack(&received, &mut tickets) {
+                            Ok(true) => {}
+                            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                                // A deliberately held peer may first run after A.
+                                // Keep its original ticket and sticky failure.
+                            }
+                            Ok(false) => return Err(invalid("fixture peer ACK backpressure")),
+                            Err(error) => return Err(error),
                         }
                         accepted = Some((index, received));
                         break;
@@ -554,12 +624,20 @@ pub fn child() -> io::Result<()> {
             .map_err(|_| invalid("child adoption mismatch"))?;
     }
     write(&root, &name("ready", role), &true)?;
+    while config.case.held(role) && !root.join("release").exists() {
+        record(&root, role, guard.test_clock_state(), &mut prior)?;
+        tick();
+    }
     let outcome =
         guard.run_parent_with_test_observer(|state| record(&root, role, state, &mut prior));
     finish_parent(&root, role, outcome)
 }
 
 pub fn total_publication_loss() -> io::Result<()> {
+    run(Case::TotalLoss)
+}
+
+pub fn run(case: Case) -> io::Result<()> {
     let directory = tempfile::Builder::new()
         .prefix("u-tree-")
         .tempdir_in("/tmp")?;
@@ -572,6 +650,7 @@ pub fn total_publication_loss() -> io::Result<()> {
         },
         t0: boot_nanos()?,
         clock: clock.path(),
+        case,
     };
     clock.set(config.t0);
     let _scope = clock.install();
@@ -622,10 +701,15 @@ pub fn total_publication_loss() -> io::Result<()> {
     guard
         .child(participant(&inventory, Role::Relay), relay)
         .map_err(|_| invalid("caller relay adoption"))?;
-    // Black-hole every caller route in both directions. Production caller
-    // endpoints remain installed and open, with no Start or ACK crossing.
+    // Leave only the case's selected delivery route usable. TotalLoss blocks
+    // every route. Production endpoints stay installed and open on both sides.
     let mut blocked = Vec::new();
     for (peer, incoming) in streams {
+        if case.delivery() == Some(peer) {
+            let peer = participant(&inventory, peer);
+            guard.route(peer, Route::new(peer, Channel::new(incoming)?)?);
+            continue;
+        }
         let (caller, sink) = UnixStream::pair()?;
         let peer = participant(&inventory, peer);
         guard.route(peer, Route::new(peer, Channel::new(caller)?)?);
@@ -637,7 +721,8 @@ pub fn total_publication_loss() -> io::Result<()> {
             .all(|role| root.join(name("ready", *role)).exists()))
     })?;
     write(root, "go", &true)?;
-    let ticket = original(&config, participant(&inventory, Role::CleanupOwner)).ticket;
+    let start = original(&config, participant(&inventory, case.origin()));
+    let ticket = start.ticket;
     let ack_checkpoint = config.t0 + ACK_NANOS + 10_000_000;
     if ack_checkpoint >= ticket.cutoffs(1).map_err(invalid)?.cooperative {
         return Err(invalid("checkpoint outside local window"));
@@ -647,12 +732,22 @@ pub fn total_publication_loss() -> io::Result<()> {
     let mut released = false;
     let mut rescued = false;
     let mut wrong_caller_state = false;
+    let mut caller_notified_before_ack = false;
     let mut prior = None;
     let outcome = guard.run_parent_with_test_observer(|state| {
-        wrong_caller_state |= state.ticket.is_some()
-            || state.receive_deadline != u64::MAX
-            || state.expired
-            || !state.stage_events.is_empty();
+        caller_notified_before_ack |= state.ticket == Some(ticket) && boot_nanos()? == config.t0;
+        wrong_caller_state |= state.expired
+            || !state.stage_events.is_empty()
+            || match state.ticket {
+                None => state.receive_deadline != u64::MAX || (advanced && case != Case::TotalLoss),
+                Some(found) => {
+                    case == Case::TotalLoss
+                        || found != ticket
+                        || state.receive_deadline != ticket.deadline
+                }
+            };
+        let caller_checkpoint =
+            case == Case::TotalLoss || (state.ticket == Some(ticket) && state.failed);
         record(root, Role::Caller, state, &mut prior)?;
         if !released && Instant::now() >= bound {
             rescued = true;
@@ -666,12 +761,19 @@ pub fn total_publication_loss() -> io::Result<()> {
             .collect::<io::Result<Vec<_>>>()?;
         let provider = read::<Reading>(root, &name("state", Role::Provider))?;
         if !advanced
-            && states.iter().all(|reading| {
+            && (case == Case::TotalLoss || caller_notified_before_ack)
+            && states.iter().zip(PUBLISHERS).all(|(reading, role)| {
                 reading.as_ref().is_some_and(|r| {
                     r.now == config.t0
-                        && r.state.ticket == Some(ticket)
+                        && r.state.ticket == (!case.held(role)).then_some(ticket)
                         && !r.state.failed
-                        && r.state.pending_publication == [local]
+                        && match case.delivery() {
+                            None => r.state.pending_publication == [local],
+                            Some(delivery) if delivery == role => {
+                                !r.state.pending_publication.contains(&local)
+                            }
+                            _ => true,
+                        }
                 })
             })
             && provider
@@ -682,11 +784,12 @@ pub fn total_publication_loss() -> io::Result<()> {
             advanced = true;
         } else if advanced
             && !released
-            && states.iter().all(|reading| {
+            && caller_checkpoint
+            && states.iter().zip(PUBLISHERS).all(|(reading, role)| {
                 reading.as_ref().is_some_and(|r| {
                     r.now == ack_checkpoint
-                        && r.state.ticket == Some(ticket)
-                        && r.state.failed
+                        && r.state.ticket == (!case.held(role)).then_some(ticket)
+                        && r.state.failed != case.held(role)
                         && !r.state.expired
                         && r.state.stage_events.is_empty()
                         && r.state.pending_publication.is_empty()
@@ -714,10 +817,10 @@ pub fn total_publication_loss() -> io::Result<()> {
         Ok(())
     });
     let failed = outcome.failed;
-    eprintln!("D1 controller: advanced={advanced} released={released} rescued={rescued}");
+    eprintln!("{case:?} controller: advanced={advanced} released={released} rescued={rescued}");
     for role in ROLES {
         eprintln!(
-            "D1 {role:?}: {}",
+            "{case:?} {role:?}: {}",
             std::fs::read_to_string(root.join(name("state", role))).unwrap_or_default()
         );
     }
@@ -725,6 +828,10 @@ pub fn total_publication_loss() -> io::Result<()> {
         .events
         .iter()
         .any(|event| matches!(event, Event::Start(_)));
+    let caller_original = outcome
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::Start(received) if *received == start));
     finish_parent(root, Role::Caller, outcome)?;
     drop(rescue);
     if advanced && !released {
@@ -732,10 +839,17 @@ pub fn total_publication_loss() -> io::Result<()> {
             "custodian exited before the original local-window checkpoint",
         ));
     }
-    if rescued || !advanced || !root.join("checkpoint").exists() {
-        return Err(invalid("full D1 shared-clock checkpoint was not reached"));
+    if case != Case::TotalLoss && !caller_original {
+        return Err(invalid(
+            "caller missed original Start while notification forwarders were held",
+        ));
     }
-    if wrong_caller_state || caller_starts || !failed {
+    if rescued || !advanced || !root.join("checkpoint").exists() {
+        return Err(invalid(
+            "original-ticket shared-clock checkpoint was not reached",
+        ));
+    }
+    if wrong_caller_state || (case == Case::TotalLoss && caller_starts) || !failed {
         return Err(invalid(
             "unnotified caller invented a deadline or successful outcome",
         ));
@@ -767,7 +881,7 @@ pub fn total_publication_loss() -> io::Result<()> {
             return Err(invalid("publication failure was not sticky"));
         }
         eprintln!(
-            "D1 actual parent receipt: {}",
+            "{case:?} actual parent receipt: {}",
             serde_json::to_string(&receipt)?
         );
     }

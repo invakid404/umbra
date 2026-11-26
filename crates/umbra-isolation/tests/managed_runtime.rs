@@ -35,6 +35,21 @@ fn r2_total_publication_loss_preserves_custody() {
 }
 
 #[test]
+fn r2_library_relay_stalls_before_start() {
+    runtime_tree::run(runtime_tree::Case::RelayStalled).unwrap();
+}
+
+#[test]
+fn r2_library_owner_start_relay_stalled_worker_alive() {
+    runtime_tree::run(runtime_tree::Case::OwnerDirect).unwrap();
+}
+
+#[test]
+fn r2_library_received_start_forwarded_before_origin_exit() {
+    runtime_tree::run(runtime_tree::Case::ForwardBeforeExit).unwrap();
+}
+
+#[test]
 fn r2_total_publication_loss_expired_window_unconfirmed() {
     let clock = SharedClock::new(boot_nanos().unwrap());
     let _scope = clock.install();

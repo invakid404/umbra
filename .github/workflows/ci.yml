@@ -79,6 +79,9 @@ jobs:
           cargo test -p umbra-isolation --test managed_runtime r2_library_earlier_start_after_observation -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_total_publication_loss_preserves_custody -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_total_publication_loss_expired_window_unconfirmed -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_library_relay_stalls_before_start -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_library_owner_start_relay_stalled_worker_alive -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_library_received_start_forwarded_before_origin_exit -- --exact --nocapture
 
       - name: Test contract documentation
         run: cargo test --workspace --doc
