@@ -12,6 +12,8 @@ publish = false
 # other target the API is a no-op.
 
 [features]
+# Qualification-only: corrupt the run generation on a validated provider offer.
+probe-managed-offer-generation = []
 # Observational D6 instrumentation; no lifecycle behavior change.
 shutdown-witness = []
 

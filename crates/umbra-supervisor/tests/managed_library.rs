@@ -42,13 +42,18 @@ fn main() {
             "armed_reply_loss",
             "startup_abort",
             "missing_provider",
-            "readiness_timeout"
+            "readiness_timeout",
+            "malformed_offer"
         ]
         .contains(&mode.as_str())
     );
     #[cfg(not(feature = "probe-managed-arm-reply-loss"))]
     if mode == "armed_reply_loss" {
         panic!("armed_reply_loss requires its compile-time fault");
+    }
+    #[cfg(not(feature = "probe-managed-offer-generation"))]
+    if mode == "malformed_offer" {
+        panic!("malformed_offer requires its compile-time fault");
     }
     let capacity: u64 = std::env::args()
         .nth(2)
@@ -233,7 +238,14 @@ fn main() {
         let run_id =
             RunId(uuid::Uuid::parse_str(entries[0].file_name().to_str().unwrap()).unwrap());
         inspect_custody(&store, run_id, false);
-    } else if ["startup_abort", "missing_provider", "readiness_timeout"].contains(&mode.as_str()) {
+    } else if [
+        "startup_abort",
+        "missing_provider",
+        "readiness_timeout",
+        "malformed_offer",
+    ]
+    .contains(&mode.as_str())
+    {
         if mode == "startup_abort" {
             result.unwrap();
         } else {

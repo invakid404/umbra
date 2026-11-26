@@ -165,6 +165,17 @@ impl Handoff {
                 welcome: self.welcome.clone(),
             };
             offer.validate(run)?;
+            #[cfg(feature = "probe-managed-offer-generation")]
+            let offer = ProviderOffer {
+                run: RunIdentity {
+                    generation: run
+                        .generation
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("probe generation overflow"))?,
+                    ..run
+                },
+                ..offer
+            };
             channel.queue(&offer)?;
             self.offered_run = Some(run);
         }
@@ -336,7 +347,7 @@ impl Owner {
     /// Receive notifications outside an active publication. ACKs use the
     /// original notification cutoff; a route failure cannot clear collection.
     fn poll_notifications(&mut self) -> io::Result<()> {
-        use umbra_core::managed::{CleanupPath, ControlMessage, Ticket, ACK_NANOS};
+        use umbra_core::managed::{ACK_NANOS, CleanupPath, ControlMessage, Ticket};
         let inventory = self.inventory.clone().unwrap_or_else(|| {
             self.routes
                 .iter()
@@ -811,7 +822,7 @@ impl Service {
     /// (or a disconnected worker). Expiry never turns into a collection receipt.
     pub fn poll(&mut self) -> io::Result<bool> {
         use std::os::unix::process::ExitStatusExt;
-        use umbra_core::managed::{ControlMessage, ProviderReceipt, ACK_NANOS};
+        use umbra_core::managed::{ACK_NANOS, ControlMessage, ProviderReceipt};
         if let Some(deadline) = self.response_deadline {
             match self.channel.flush(deadline) {
                 Ok(true) => self.response_deadline = None,
@@ -1125,7 +1136,7 @@ mod tests {
             }
         };
         let result = (|| -> io::Result<ExitStatus> {
-            use super::super::{admission::AdmissionClient, Channel};
+            use super::super::{Channel, admission::AdmissionClient};
             use umbra_core::{AdmissionError, AdmissionOperation};
             let (provider_admission, owner_admission) = UnixStream::pair()?;
             owner.install_admission(Channel::new(owner_admission)?)?;
