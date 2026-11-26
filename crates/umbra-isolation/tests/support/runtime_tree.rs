@@ -44,6 +44,7 @@ const PUBLISHERS: [Role; 4] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Case {
+    Normal,
     TotalLoss,
     RelayStalled,
     GuardianStalled,
@@ -60,6 +61,7 @@ impl Case {
     }
     fn held(self, role: Role) -> bool {
         match self {
+            Self::Normal => false,
             Self::TotalLoss => false,
             Self::RelayStalled => role == Role::Relay,
             Self::GuardianStalled => role == Role::Guardian,
@@ -69,6 +71,7 @@ impl Case {
     }
     fn delivery(self) -> Option<Role> {
         match self {
+            Self::Normal => None,
             Self::TotalLoss => None,
             Self::RelayStalled => Some(Role::Worker),
             Self::GuardianStalled => Some(Role::Relay),
@@ -717,7 +720,7 @@ pub fn run(case: Case) -> io::Result<()> {
     // every route. Production endpoints stay installed and open on both sides.
     let mut blocked = Vec::new();
     for (peer, incoming) in streams {
-        if case.delivery() == Some(peer) {
+        if case == Case::Normal || case.delivery() == Some(peer) {
             let peer = participant(&inventory, peer);
             guard.route(peer, Route::new(peer, Channel::new(incoming)?)?);
             continue;
@@ -758,8 +761,9 @@ pub fn run(case: Case) -> io::Result<()> {
                         || state.receive_deadline != ticket.deadline
                 }
             };
-        let caller_checkpoint =
-            case == Case::TotalLoss || (state.ticket == Some(ticket) && state.failed);
+        let caller_checkpoint = case == Case::TotalLoss
+            || (state.ticket == Some(ticket) && state.failed == (case != Case::Normal));
+        let caller_published = case != Case::Normal || state.pending_publication.is_empty();
         record(root, Role::Caller, state, &mut prior)?;
         if !released && Instant::now() >= bound {
             rescued = true;
@@ -774,14 +778,16 @@ pub fn run(case: Case) -> io::Result<()> {
         let provider = read::<Reading>(root, &name("state", Role::Provider))?;
         if !advanced
             && (case == Case::TotalLoss || caller_notified_before_ack)
+            && caller_published
             && states.iter().zip(PUBLISHERS).all(|(reading, role)| {
                 reading.as_ref().is_some_and(|r| {
                     r.now == config.t0
                         && r.state.ticket == (!case.held(role)).then_some(ticket)
                         && !r.state.failed
-                        && match case.delivery() {
-                            None => r.state.pending_publication == [local],
-                            Some(delivery) if delivery == role => {
+                        && match (case, case.delivery()) {
+                            (Case::Normal, _) => r.state.pending_publication.is_empty(),
+                            (_, None) => r.state.pending_publication == [local],
+                            (_, Some(delivery)) if delivery == role => {
                                 !r.state.pending_publication.contains(&local)
                             }
                             _ => true,
@@ -801,7 +807,7 @@ pub fn run(case: Case) -> io::Result<()> {
                 reading.as_ref().is_some_and(|r| {
                     r.now == ack_checkpoint
                         && r.state.ticket == (!case.held(role)).then_some(ticket)
-                        && r.state.failed != case.held(role)
+                        && r.state.failed == (case != Case::Normal && !case.held(role))
                         && !r.state.expired
                         && r.state.stage_events.is_empty()
                         && r.state.pending_publication.is_empty()
@@ -861,7 +867,10 @@ pub fn run(case: Case) -> io::Result<()> {
             "original-ticket shared-clock checkpoint was not reached",
         ));
     }
-    if wrong_caller_state || (case == Case::TotalLoss && caller_starts) || !failed {
+    if wrong_caller_state
+        || (case == Case::TotalLoss && caller_starts)
+        || failed != (case != Case::Normal)
+    {
         return Err(invalid(
             "unnotified caller invented a deadline or successful outcome",
         ));
@@ -889,7 +898,7 @@ pub fn run(case: Case) -> io::Result<()> {
         {
             return Err(invalid("missing exact successful production parent wait"));
         }
-        if PUBLISHERS.contains(&role) && !receipt.failed {
+        if PUBLISHERS.contains(&role) && receipt.failed != (case != Case::Normal) {
             return Err(invalid("publication failure was not sticky"));
         }
         eprintln!(

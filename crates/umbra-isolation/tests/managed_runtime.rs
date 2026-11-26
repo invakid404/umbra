@@ -31,6 +31,11 @@ fn runtime_tree_child() {
 }
 
 #[test]
+fn custody_normal_reaps_all() {
+    runtime_tree::run(runtime_tree::Case::Normal).unwrap();
+}
+
+#[test]
 fn r2_total_publication_loss_preserves_custody() {
     runtime_tree::total_publication_loss().unwrap();
 }
