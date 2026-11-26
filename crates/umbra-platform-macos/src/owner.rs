@@ -29,9 +29,9 @@ extern "C" fn ignore_lifetime_signal(_: libc::c_int) {}
 /// ^C, ^\ or `kill -pgid` reaches it. Dying there, without the backend's
 /// drop, leaves its debugserver holding the program; ending that debugserver
 /// later hands the program to launchd as a zombie nobody collects (#198,
-/// #205). With these handled, the provider ends when its owner, the
-/// supervisor, does: the IPC connection closes, the drop runs the ordered
-/// teardown, and the process exits.
+/// #205). The provider observes its actual parent: the cleanup owner on the
+/// managed path, or the direct supervisor otherwise. Owner loss or transport
+/// closure requests teardown; handled terminal signals do not bypass it.
 ///
 /// Each handler is installed only where the inherited disposition is the
 /// default. An inherited ignore (`nohup`, or a background command of a
