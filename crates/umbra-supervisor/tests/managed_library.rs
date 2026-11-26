@@ -38,6 +38,7 @@ fn main() {
             "prepared_error",
             "prepared_panic",
             "provider_death",
+            "owner_death",
             "armed_reply_loss",
             "startup_abort",
             "missing_provider"
@@ -142,8 +143,8 @@ fn main() {
                     "managed library prepared sentinel",
                 ));
             }
-            if self.mode == "provider_death" {
-                stop_owned_provider(self.caller);
+            if self.mode == "provider_death" || self.mode == "owner_death" {
+                stop_owned_role(self.caller, self.mode == "owner_death");
             }
             Ok(())
         }
@@ -246,7 +247,7 @@ fn main() {
             "missing" => Some("twin source"),
             "prepared_error" => Some("managed library prepared sentinel"),
             "prepared_panic" => Some("managed preparation observer panicked"),
-            "provider_death" => None,
+            "provider_death" | "owner_death" => None,
             _ => unreachable!(),
         };
         if let Some(expected) = expected {
@@ -256,7 +257,7 @@ fn main() {
             );
         } else {
             assert_eq!(*events.borrow(), ["stdio", "prepared"]);
-            eprintln!("provider death retained failure: {error}");
+            eprintln!("{mode} retained failure: {error}");
         }
         assert!(!events.borrow().contains(&"finished"));
     }
@@ -308,7 +309,7 @@ fn inspect_custody(store: &std::path::Path, run_id: umbra_core::RunId, complete:
 }
 
 #[cfg(target_os = "macos")]
-fn stop_owned_provider(caller: u32) {
+fn stop_owned_role(caller: u32, owner: bool) {
     use std::collections::BTreeMap;
     use umbra_core::managed::Role;
     use umbra_isolation::managed::process::{identity_with_parent, signal_current};
@@ -356,6 +357,16 @@ fn stop_owned_provider(caller: u32) {
     let (&pid, (parent, _)) = candidates[0];
     let (provider, actual_parent) = identity_with_parent(pid, Role::Provider).unwrap();
     assert_eq!(actual_parent, *parent);
+    let target = if owner {
+        let (owner, guardian) = identity_with_parent(actual_parent, Role::CleanupOwner).unwrap();
+        assert_eq!(
+            Some(guardian),
+            processes.get(&actual_parent).map(|(parent, _)| *parent)
+        );
+        owner
+    } else {
+        provider
+    };
     // The signal validates the captured birth and kernel audit identity again.
-    signal_current(provider, libc::SIGKILL).unwrap();
+    signal_current(target, libc::SIGKILL).unwrap();
 }
