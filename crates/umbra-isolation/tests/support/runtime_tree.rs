@@ -45,6 +45,7 @@ const PUBLISHERS: [Role; 4] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Case {
     Normal,
+    StuckCustodian,
     TotalLoss,
     RelayStalled,
     GuardianStalled,
@@ -52,6 +53,16 @@ pub enum Case {
     ForwardBeforeExit,
 }
 impl Case {
+    fn acknowledged(self) -> bool {
+        matches!(self, Self::Normal | Self::StuckCustodian)
+    }
+    fn failed(self, role: Role) -> bool {
+        match self {
+            Self::Normal => false,
+            Self::StuckCustodian => matches!(role, Role::Caller | Role::Relay | Role::Guardian),
+            _ => true,
+        }
+    }
     fn origin(self) -> Role {
         if matches!(self, Self::RelayStalled | Self::GuardianStalled) {
             Role::Worker
@@ -61,7 +72,7 @@ impl Case {
     }
     fn held(self, role: Role) -> bool {
         match self {
-            Self::Normal => false,
+            Self::Normal | Self::StuckCustodian => false,
             Self::TotalLoss => false,
             Self::RelayStalled => role == Role::Relay,
             Self::GuardianStalled => role == Role::Guardian,
@@ -71,7 +82,7 @@ impl Case {
     }
     fn delivery(self) -> Option<Role> {
         match self {
-            Self::Normal => None,
+            Self::Normal | Self::StuckCustodian => None,
             Self::TotalLoss => None,
             Self::RelayStalled => Some(Role::Worker),
             Self::GuardianStalled => Some(Role::Relay),
@@ -497,6 +508,16 @@ pub fn child() -> io::Result<()> {
                 wait(&root, || {
                     Ok(root.join(name("receipt", Role::Worker)).exists())
                 })?;
+                if config.case == Case::StuckCustodian {
+                    // Provider collection is already certified by the real
+                    // owner wait and ECHILD check above. Only this now-empty
+                    // custodian remains for its actual parent to stop and wait.
+                    drop(rescue);
+                    write(&root, "stuck-owner", &true)?;
+                    while !root.join("unstick-owner").exists() {
+                        tick();
+                    }
+                }
                 return Ok(());
             }
             tick();
@@ -645,7 +666,14 @@ pub fn child() -> io::Result<()> {
     }
     let outcome =
         guard.run_parent_with_test_observer(|state| record(&root, role, state, &mut prior));
-    finish_parent(&root, role, outcome)
+    let failed = outcome.failed;
+    finish_parent(&root, role, outcome)?;
+    if config.case == Case::StuckCustodian && failed {
+        // The helper reports failure only after its actual child waits.
+        drop(rescue);
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 pub fn total_publication_loss() -> io::Result<()> {
@@ -720,7 +748,7 @@ pub fn run(case: Case) -> io::Result<()> {
     // every route. Production endpoints stay installed and open on both sides.
     let mut blocked = Vec::new();
     for (peer, incoming) in streams {
-        if case == Case::Normal || case.delivery() == Some(peer) {
+        if case.acknowledged() || case.delivery() == Some(peer) {
             let peer = participant(&inventory, peer);
             guard.route(peer, Route::new(peer, Channel::new(incoming)?)?);
             continue;
@@ -748,11 +776,12 @@ pub fn run(case: Case) -> io::Result<()> {
     let mut rescued = false;
     let mut wrong_caller_state = false;
     let mut caller_notified_before_ack = false;
+    let mut stopping_owner = false;
     let mut prior = None;
     let outcome = guard.run_parent_with_test_observer(|state| {
         caller_notified_before_ack |= state.ticket == Some(ticket) && boot_nanos()? == config.t0;
         wrong_caller_state |= state.expired
-            || !state.stage_events.is_empty()
+            || (!stopping_owner && !state.stage_events.is_empty())
             || match state.ticket {
                 None => state.receive_deadline != u64::MAX || (advanced && case != Case::TotalLoss),
                 Some(found) => {
@@ -762,9 +791,28 @@ pub fn run(case: Case) -> io::Result<()> {
                 }
             };
         let caller_checkpoint = case == Case::TotalLoss
-            || (state.ticket == Some(ticket) && state.failed == (case != Case::Normal));
-        let caller_published = case != Case::Normal || state.pending_publication.is_empty();
+            || (state.ticket == Some(ticket) && state.failed != case.acknowledged());
+        let caller_published = !case.acknowledged() || state.pending_publication.is_empty();
         record(root, Role::Caller, state, &mut prior)?;
+        if case == Case::StuckCustodian
+            && released
+            && !stopping_owner
+            && root.join("stuck-owner").exists()
+        {
+            let owner = participant(&inventory, Role::CleanupOwner);
+            if identity(owner.pid, owner.role)? != owner {
+                return Err(invalid("custodian exited before its parent opportunity"));
+            }
+            stopping_owner = true;
+            // Guardian's owner slot follows its worker slot by one second,
+            // within the original four-second helper allocation.
+            clock.advance_to(ticket.cutoffs(1).map_err(invalid)?.fallback + 1_000_000_000);
+        }
+        if case == Case::StuckCustodian && Instant::now() >= bound {
+            rescued = true;
+            std::fs::write(root.join("unstick-owner"), b"rescue")?;
+            clock.advance_to(ticket.deadline);
+        }
         if !released && Instant::now() >= bound {
             rescued = true;
             clock.advance_to(ticket.deadline);
@@ -785,7 +833,9 @@ pub fn run(case: Case) -> io::Result<()> {
                         && r.state.ticket == (!case.held(role)).then_some(ticket)
                         && !r.state.failed
                         && match (case, case.delivery()) {
-                            (Case::Normal, _) => r.state.pending_publication.is_empty(),
+                            (case, _) if case.acknowledged() => {
+                                r.state.pending_publication.is_empty()
+                            }
                             (_, None) => r.state.pending_publication == [local],
                             (_, Some(delivery)) if delivery == role => {
                                 !r.state.pending_publication.contains(&local)
@@ -807,7 +857,7 @@ pub fn run(case: Case) -> io::Result<()> {
                 reading.as_ref().is_some_and(|r| {
                     r.now == ack_checkpoint
                         && r.state.ticket == (!case.held(role)).then_some(ticket)
-                        && r.state.failed == (case != Case::Normal && !case.held(role))
+                        && r.state.failed == (!case.acknowledged() && !case.held(role))
                         && !r.state.expired
                         && r.state.stage_events.is_empty()
                         && r.state.pending_publication.is_empty()
@@ -869,7 +919,7 @@ pub fn run(case: Case) -> io::Result<()> {
     }
     if wrong_caller_state
         || (case == Case::TotalLoss && caller_starts)
-        || failed != (case != Case::Normal)
+        || failed != case.failed(Role::Caller)
     {
         return Err(invalid(
             "unnotified caller invented a deadline or successful outcome",
@@ -892,14 +942,23 @@ pub fn run(case: Case) -> io::Result<()> {
             .map(|m| m.participant)
             .collect();
         if receipt.waits.len() != expected.len()
-            || expected
-                .iter()
-                .any(|peer| !receipt.waits.contains(&(*peer, 0)))
+            || expected.iter().any(|peer| {
+                let status = if case == Case::StuckCustodian {
+                    match peer.role {
+                        Role::CleanupOwner => libc::SIGKILL,
+                        Role::Guardian | Role::Relay => 1 << 8,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                !receipt.waits.contains(&(*peer, status))
+            })
         {
-            return Err(invalid("missing exact successful production parent wait"));
+            return Err(invalid("missing exact expected production parent wait"));
         }
-        if PUBLISHERS.contains(&role) && receipt.failed != (case != Case::Normal) {
-            return Err(invalid("publication failure was not sticky"));
+        if PUBLISHERS.contains(&role) && receipt.failed != case.failed(role) {
+            return Err(invalid("role failure outcome mismatch"));
         }
         eprintln!(
             "{case:?} actual parent receipt: {}",
