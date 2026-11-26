@@ -265,7 +265,7 @@ pub enum JournalLifecycle {
 /// recovery needs durable intent; abort does not assert that kernel writes vanished.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalPayload {
-    /// Dormant managed-run custody transition in the authoritative stream.
+    /// Managed-run custody transition in the authoritative stream.
     Custody(crate::CustodyRecord),
     /// Prepare.
     Prepare {

@@ -1,4 +1,4 @@
-//! Dormant per-run admission ledger. Callers must commit the returned grant
+//! Per-run admission ledger used by the managed cleanup owner. Callers must commit the returned grant
 //! before performing an acquisition; this module performs no resource I/O.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

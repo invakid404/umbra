@@ -1,4 +1,4 @@
-//! Dormant managed-run custody records. No runtime path arms these yet.
+//! Managed-run custody records persisted before runtime acquisition is authorized.
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
