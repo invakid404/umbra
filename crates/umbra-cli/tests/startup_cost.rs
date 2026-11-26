@@ -88,7 +88,12 @@ fn r2_startup_cost_reading() {
             }
             std::thread::sleep(Duration::from_millis(1));
         };
-        umbra_core::cost_snapshot!("driver-after-collection", Some(child.id()), &[]);
+        umbra_core::cost_snapshot!(
+            "driver-after-collection",
+            Some(child.id()),
+            &[],
+            Some(std::os::unix::process::ExitStatusExt::into_raw(status))
+        );
         assert_eq!(status.code(), Some(case.expected_exit));
         assert!(!directory.join("errors").exists(), "cost observer failed");
         let all_rows: Vec<Value> = std::fs::read_to_string(directory.join("events.jsonl"))
@@ -96,8 +101,28 @@ fn r2_startup_cost_reading() {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let rows = &all_rows[previous_rows..];
+        let mut rows = all_rows[previous_rows..].to_vec();
         previous_rows = all_rows.len();
+        let observers: BTreeSet<_> = std::fs::read_to_string(directory.join("observers"))
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let fields: Vec<u64> = line
+                    .split_whitespace()
+                    .map(|field| field.parse().unwrap())
+                    .collect();
+                assert_eq!(fields.len(), 3);
+                (fields[0], fields[1], fields[2])
+            })
+            .collect();
+        normalize_observers(&mut rows, &observers);
+        std::fs::write(
+            directory.join(format!("{index:02}.validated.jsonl")),
+            rows.iter()
+                .map(|row| format!("{}\n", serde_json::to_string(row).unwrap()))
+                .collect::<String>(),
+        )
+        .unwrap();
         let first = rows.first().unwrap();
         let last = rows.last().unwrap();
         assert_eq!(first["event"], "driver-before-spawn");
@@ -145,18 +170,6 @@ fn r2_startup_cost_reading() {
                 .iter()
                 .all(|process| process["session"] == child.id()));
         }
-        let observers: BTreeSet<_> = std::fs::read_to_string(directory.join("observers"))
-            .unwrap()
-            .lines()
-            .map(|line| {
-                let fields: Vec<u64> = line
-                    .split_whitespace()
-                    .map(|field| field.parse().unwrap())
-                    .collect();
-                assert_eq!(fields.len(), 3);
-                (fields[0], fields[1], fields[2])
-            })
-            .collect();
         assert!(
             observed.is_disjoint(&observers),
             "observer process counted as a product process"
@@ -207,6 +220,66 @@ fn r2_startup_cost_reading() {
                 .any(|process| { process["pid"] == child && process["parent"] == row["actor"] }));
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_observers(
+    rows: &mut [serde_json::Value],
+    observers: &std::collections::BTreeSet<(u64, u64, u64)>,
+) {
+    for row in rows {
+        let actor = row["actor"].as_u64().unwrap();
+        let mut late = Vec::new();
+        row["processes"].as_array_mut().unwrap().retain(|process| {
+            let identity = (
+                process["pid"].as_u64().unwrap(),
+                process["birth"][0].as_u64().unwrap(),
+                process["birth"][1].as_u64().unwrap(),
+            );
+            if observers.contains(&identity) {
+                assert_ne!(
+                    identity.0, actor,
+                    "observer registry excludes a product actor"
+                );
+                late.push(process.clone());
+                false
+            } else {
+                true
+            }
+        });
+        // A concurrent census can catch fork before the observer execs. Only
+        // its subsequently registered exact birth identity permits exclusion.
+        // Keep both the original raw stream and this explicit audit trail.
+        row["late_observer_exclusions"] = serde_json::json!(late);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn r2_startup_cost_observer_birth_identity() {
+    use serde_json::json;
+    let mut rows = vec![
+        json!({"actor": 1, "processes": [
+            {"pid": 1, "birth": [10, 0]}, {"pid": 2, "birth": [20, 0]}
+        ]}),
+        json!({"actor": 1, "processes": [
+            {"pid": 1, "birth": [10, 0]}, {"pid": 2, "birth": [21, 0]}
+        ]}),
+    ];
+    let observers = [(2, 20, 0)].into_iter().collect();
+    let mut bad = rows.clone();
+    bad[0]["actor"] = json!(2);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        normalize_observers(&mut bad, &observers);
+    }))
+    .is_err());
+    normalize_observers(&mut rows, &observers);
+    assert_eq!(rows[0]["processes"].as_array().unwrap().len(), 1);
+    assert_eq!(rows[1]["processes"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        rows[0]["late_observer_exclusions"][0]["birth"],
+        json!([20, 0])
+    );
 }
 
 /// An ordinary owned child and two sockets calibrate the observer independently
