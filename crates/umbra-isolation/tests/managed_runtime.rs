@@ -3,6 +3,7 @@
 
 use std::{
     io::{Read, Write},
+    os::fd::{AsRawFd, FromRawFd},
     os::unix::net::{UnixListener, UnixStream},
     path::Path,
     time::{Duration, Instant},
@@ -140,7 +141,13 @@ fn runtime_child() {
     let directory = Path::new(&directory);
     let clock_scope =
         std::env::var_os("UMBRA_R2_CLOCK").map(|path| runtime_clock::install(Path::new(&path)));
-    let mut stream = UnixStream::connect(directory.join("s")).unwrap();
+    let mut stream = if let Some(fd) = std::env::var_os("UMBRA_R2_INHERITED_FD") {
+        let fd = fd.to_str().unwrap().parse().unwrap();
+        // The test parent's explicit spawn file actions transferred this socket.
+        unsafe { UnixStream::from_raw_fd(fd) }
+    } else {
+        UnixStream::connect(directory.join("s")).unwrap()
+    };
     stream.write_all(b"R").unwrap();
     let mut channel = Channel::new(stream).unwrap();
     let bound = Instant::now() + Duration::from_secs(3);
@@ -200,6 +207,48 @@ struct Peer {
 }
 
 impl Peer {
+    fn inheriting(role: Role, stream: &UnixStream) -> Self {
+        let directory = tempfile::Builder::new()
+            .prefix("u-r2-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let environment = umbra_isolation::spawn::environment(
+            &[
+                umbra_isolation::managed::executable::ENV_ROLE,
+                "UMBRA_R2_CLOCK",
+                "UMBRA_R2_INHERITED_FD",
+            ],
+            &[
+                (
+                    "UMBRA_R2_PEER_DIR",
+                    directory.path().to_str().unwrap().to_owned(),
+                ),
+                ("UMBRA_R2_INHERITED_FD", stream.as_raw_fd().to_string()),
+            ],
+        );
+        let child = SpawnedChild::spawn(
+            &executable,
+            &[
+                executable.as_os_str().to_owned(),
+                "--exact".into(),
+                "runtime_child".into(),
+                "--nocapture".into(),
+            ],
+            &environment,
+            false,
+            &[stream.as_raw_fd()],
+        )
+        .unwrap();
+        let participant = identity(child.pid(), role).unwrap();
+        Self {
+            directory,
+            child: Some(child),
+            participant,
+            channel: None,
+        }
+    }
+
     fn spawn(role: Role) -> Self {
         Self::spawn_with_clock(role, None)
     }
@@ -222,6 +271,7 @@ impl Peer {
             &[
                 umbra_isolation::managed::executable::ENV_ROLE,
                 "UMBRA_R2_CLOCK",
+                "UMBRA_R2_INHERITED_FD",
             ],
             &added,
         );
@@ -462,6 +512,112 @@ fn r2_unknown_start_exit_never_renews() {
         .any(|event| matches!(event, Event::Start(_) | Event::OpportunityExpired(_))));
     assert!(outcome.events.iter().any(|event| matches!(event,
         Event::Collected(participant, 0) if *participant == peer.participant)));
+}
+
+#[test]
+fn r2_owner_exit_with_inherited_fd() {
+    let (mut parent_stream, inherited) = UnixStream::pair().unwrap();
+    parent_stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut owner = Peer::inheriting(Role::CleanupOwner, &inherited);
+    let mut ready = [0];
+    parent_stream.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, *b"R");
+    let mut holder = Peer::inheriting(Role::Worker, &inherited);
+    parent_stream.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, *b"R");
+    drop(inherited);
+    let run = RunIdentity {
+        nonce: uuid::Uuid::new_v4(),
+        generation: 1,
+    };
+    let local = identity(std::process::id(), Role::Guardian).unwrap();
+    let mut guard = Guard::new(local, run, 1).unwrap();
+    let mut independent_watch = ProcessWatch::new().unwrap();
+    independent_watch.install(owner.participant).unwrap();
+    for peer in [&mut owner, &mut holder] {
+        guard.watch(peer.participant).unwrap();
+    }
+    owner.release().unwrap();
+    let bound = Instant::now() + Duration::from_secs(2);
+    while independent_watch.exited().unwrap().is_none() {
+        assert!(Instant::now() < bound, "fixture owner did not exit");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut channel = Channel::new(parent_stream).unwrap();
+    assert!(
+        channel
+            .receive::<ControlMessage>(boot_nanos().unwrap() + 1_000_000_000)
+            .unwrap()
+            .is_none(),
+        "holder did not keep the owner endpoint open"
+    );
+    guard.route(
+        owner.participant,
+        Route::new(owner.participant, channel).unwrap(),
+    );
+    for peer in [&mut owner, &mut holder] {
+        assert!(guard
+            .child(peer.participant, peer.child.take().unwrap())
+            .is_ok());
+    }
+    let mut observed = false;
+    let mut rescued = false;
+    let mut events = Vec::new();
+    while !guard.collected() {
+        for event in guard.poll() {
+            if matches!(&event, Event::Exited(peer) if *peer == owner.participant) {
+                observed = true;
+                holder.release().unwrap();
+            }
+            events.push(event);
+        }
+        if Instant::now() >= bound {
+            // The external fixture releases its child on regression. This is
+            // not a production silence timer or successful watch observation.
+            rescued = true;
+            holder.release().unwrap();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    holder.release().unwrap();
+    // Any wait still available to this parent was omitted by production.
+    let mut missing_wait = false;
+    for peer in [&owner, &holder] {
+        loop {
+            let mut status = 0;
+            let result =
+                unsafe { libc::waitpid(peer.participant.pid as i32, &mut status, libc::WNOHANG) };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+                break;
+            }
+            missing_wait = true;
+            if result > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        observed && !rescued,
+        "independent owner exit observation was lost"
+    );
+    assert!(
+        !missing_wait,
+        "production guard omitted actual parent collection"
+    );
+    for peer in [&owner, &holder] {
+        assert!(events.iter().any(
+            |event| matches!(event, Event::Collected(found, 0) if *found == peer.participant)
+        ));
+    }
 }
 
 fn earlier_start(after_observation: bool) {
