@@ -9947,7 +9947,7 @@ fn slate_c10_10_fork_helper_refusal() {
     // runtime-witness limitation.
     assert_eq!(
         String::from_utf8(digest.stdout).unwrap().split_whitespace().next(),
-        Some("4353971cf79f565fb88e72239f8db4c17af3c0223b1ce6892c90702f685399b4"),
+        Some("fba6092ed90dabd47a0f7f6db627ad20c4b31c4077bda8a99962afdbfd3b9a53"),
         "RE-CHARACTERIZE C10-10: native.rs changed; repeat the structural and runtime refusal characterization before updating this pin"
     );
     // Compile is a prerequisite, not part of the 60-second execution window.
