@@ -21,12 +21,18 @@ pub mod publication;
 pub mod relay_startup;
 pub mod rollback;
 pub mod startup;
+#[cfg(feature = "test-clock")]
+pub mod test_clock;
 pub mod topology;
 pub mod worker;
 pub mod worker_startup;
 
 /// Checked boot-clock timestamp shared by every participant on this machine.
 pub fn boot_nanos() -> io::Result<u64> {
+    #[cfg(feature = "test-clock")]
+    if let Some(value) = test_clock::read() {
+        return value;
+    }
     let mut time = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,

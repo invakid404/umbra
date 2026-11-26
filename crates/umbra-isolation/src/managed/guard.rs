@@ -577,6 +577,9 @@ impl Guard {
                     // remain required. Partial frames and pending ACKs fail.
                     continue;
                 }
+                // A failed route cannot finish this ACK. Retaining it would
+                // block independent Start forwarding until the outer deadline.
+                peer.ack = None;
                 self.tickets.fail();
                 events.push(Event::Failed(format!(
                     "{:?} control: {error}",

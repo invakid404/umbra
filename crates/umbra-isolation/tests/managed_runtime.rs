@@ -7,27 +7,78 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-use umbra_core::managed::{CleanupPath, Participant, Role, RunIdentity, Start, Ticket, ACK_NANOS};
+use umbra_core::managed::{
+    CleanupPath, ControlMessage, Participant, Role, RunIdentity, Start, Ticket, TicketState,
+    ACK_NANOS,
+};
 use umbra_isolation::managed::{
     boot_nanos,
     guard::{Event, Guard},
-    process::{identity, SpawnedChild},
+    process::{identity, ProcessWatch, SpawnedChild},
     publication::Route,
     Channel,
 };
+#[path = "support/runtime_clock.rs"]
+mod runtime_clock;
+use runtime_clock::SharedClock;
 
-/// This child deliberately never acknowledges Start. Its release latch belongs
-/// to the test; that latch is not a production collection receipt.
+/// An idle peer withholds ACKs. When supplied an original Start, it scripts the
+/// concurrent Start/ACK exchange. Its release latch is not a collection receipt.
 #[test]
 fn runtime_child() {
     let Some(directory) = std::env::var_os("UMBRA_R2_PEER_DIR") else {
         return;
     };
     let directory = Path::new(&directory);
+    let clock_scope =
+        std::env::var_os("UMBRA_R2_CLOCK").map(|path| runtime_clock::install(Path::new(&path)));
     let mut stream = UnixStream::connect(directory.join("s")).unwrap();
     stream.write_all(b"R").unwrap();
+    let mut channel = Channel::new(stream).unwrap();
     let bound = Instant::now() + Duration::from_secs(3);
+    let mut last_clock = None;
+    let mut scripted = None;
     while !directory.join("release").exists() {
+        if scripted.is_none() && directory.join("start").exists() {
+            let start: Start =
+                serde_json::from_slice(&std::fs::read(directory.join("start")).unwrap()).unwrap();
+            let mut tickets = TicketState::new(start.run, 1).unwrap();
+            tickets
+                .accept(start.clone(), start.origin, start.origin)
+                .unwrap();
+            channel
+                .queue(&ControlMessage::Start(start.clone()))
+                .unwrap();
+            assert!(channel.flush(u64::MAX).unwrap());
+            scripted = Some((tickets, start));
+        }
+        if let Some((tickets, original)) = &mut scripted {
+            if let Some(message) = channel.receive::<ControlMessage>(u64::MAX).unwrap() {
+                let caller =
+                    identity(unsafe { libc::getppid() }.try_into().unwrap(), Role::Caller).unwrap();
+                match message {
+                    ControlMessage::Start(start) => {
+                        let ack = tickets.accept(start, caller, original.origin).unwrap();
+                        channel.queue(&ControlMessage::Ack(ack)).unwrap();
+                        assert!(channel.flush(u64::MAX).unwrap());
+                    }
+                    ControlMessage::Ack(ack) => ack.validate(original, caller).unwrap(),
+                    other => panic!("unexpected scripted message: {other:?}"),
+                }
+            }
+        }
+        if clock_scope.is_some() {
+            let now = boot_nanos().unwrap();
+            if last_clock != Some(now) {
+                std::fs::write(directory.join("clock-next"), now.to_le_bytes()).unwrap();
+                std::fs::rename(
+                    directory.join("clock-next"),
+                    directory.join("clock-observed"),
+                )
+                .unwrap();
+                last_clock = Some(now);
+            }
+        }
         assert!(Instant::now() < bound, "test release latch not opened");
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -42,6 +93,9 @@ struct Peer {
 
 impl Peer {
     fn spawn(role: Role) -> Self {
+        Self::spawn_with_clock(role, None)
+    }
+    fn spawn_with_clock(role: Role, clock: Option<&SharedClock>) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("u-r2-")
             .tempdir_in("/tmp")
@@ -49,12 +103,19 @@ impl Peer {
         let listener = UnixListener::bind(directory.path().join("s")).unwrap();
         listener.set_nonblocking(true).unwrap();
         let executable = std::env::current_exe().unwrap();
+        let mut added = vec![(
+            "UMBRA_R2_PEER_DIR",
+            directory.path().to_str().unwrap().to_owned(),
+        )];
+        if let Some(clock) = clock {
+            added.push(("UMBRA_R2_CLOCK", clock.path().to_str().unwrap().to_owned()));
+        }
         let environment = umbra_isolation::spawn::environment(
-            &[umbra_isolation::managed::executable::ENV_ROLE],
-            &[(
-                "UMBRA_R2_PEER_DIR",
-                directory.path().to_str().unwrap().to_owned(),
-            )],
+            &[
+                umbra_isolation::managed::executable::ENV_ROLE,
+                "UMBRA_R2_CLOCK",
+            ],
+            &added,
         );
         let child = SpawnedChild::spawn(
             &executable,
@@ -97,6 +158,20 @@ impl Peer {
     }
     fn release(&self) -> std::io::Result<()> {
         std::fs::write(self.directory.path().join("release"), b"release")
+    }
+    fn send_start(&self, start: &Start) -> std::io::Result<()> {
+        let next = self.directory.path().join("start-next");
+        std::fs::write(&next, serde_json::to_vec(start)?)?;
+        std::fs::rename(next, self.directory.path().join("start"))
+    }
+    fn collect_scripted_peer(&mut self) -> std::io::Result<i32> {
+        loop {
+            if let Some(status) = self.child.as_mut().unwrap().collect()? {
+                self.child.take();
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -213,6 +288,200 @@ fn r2_guardian_ack_loss_preserves_child_collection() {
 #[test]
 fn r2_relay_ack_loss_preserves_child_collection() {
     parent_ack_loss(Role::Relay, &[Role::Guardian]);
+}
+
+#[test]
+fn r2_unknown_start_exit_never_renews() {
+    let base = boot_nanos().unwrap();
+    let clock = SharedClock::new(base);
+    let _scope = clock.install();
+    let run = RunIdentity {
+        nonce: uuid::Uuid::new_v4(),
+        generation: 1,
+    };
+    let local = identity(std::process::id(), Role::Caller).unwrap();
+    let mut peer = Peer::spawn_with_clock(Role::Relay, Some(&clock));
+    let mut observed_exit = ProcessWatch::new().unwrap();
+    observed_exit.install(peer.participant).unwrap();
+    let mut guard = Guard::new(local, run, 1).unwrap();
+    guard.watch(peer.participant).unwrap();
+    assert!(guard
+        .child(peer.participant, peer.child.take().unwrap())
+        .is_ok());
+    assert!(guard.poll().is_empty());
+    // An arbitrarily old, unnotified caller still has no cleanup deadline.
+    clock.set(base + 1_000_000_000_000);
+    assert!(
+        guard.poll().is_empty(),
+        "session age invented a cleanup trigger"
+    );
+    assert_eq!(
+        identity(peer.participant.pid, Role::Relay).unwrap(),
+        peer.participant
+    );
+    let until = Instant::now() + Duration::from_secs(2);
+    while std::fs::read(peer.directory.path().join("clock-observed"))
+        .ok()
+        .as_deref()
+        != Some(&(base + 1_000_000_000_000).to_le_bytes()[..])
+    {
+        assert!(
+            Instant::now() < until,
+            "child did not observe the shared clock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    peer.release().unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while observed_exit.exited().unwrap().is_none() {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut invented = false;
+    let outcome = guard.run_parent_with_progress(|ticket| {
+        invented |= ticket.is_some();
+        Ok(())
+    });
+    assert!(
+        !invented,
+        "unknown-start late exit invented a fresh cleanup ticket"
+    );
+    assert!(outcome.failed, "unknown cleanup cannot certify success");
+    assert!(outcome.unresolved.is_empty());
+    assert!(!outcome
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::Start(_) | Event::OpportunityExpired(_))));
+    assert!(outcome.events.iter().any(|event| matches!(event,
+        Event::Collected(participant, 0) if *participant == peer.participant)));
+}
+
+fn earlier_start(after_observation: bool) {
+    let base = boot_nanos().unwrap();
+    let clock = SharedClock::new(base);
+    let _scope = clock.install();
+    let run = RunIdentity {
+        nonce: uuid::Uuid::new_v4(),
+        generation: 1,
+    };
+    let local = identity(std::process::id(), Role::Caller).unwrap();
+    let mut relay = Peer::spawn_with_clock(Role::Relay, Some(&clock));
+    let mut owner = Peer::spawn_with_clock(Role::CleanupOwner, Some(&clock));
+    let mut observed =
+        after_observation.then(|| Peer::spawn_with_clock(Role::Worker, Some(&clock)));
+    let mut guard = Guard::new(local, run, 1).unwrap();
+    guard.watch(relay.participant).unwrap();
+    guard.watch(owner.participant).unwrap();
+    guard.route(
+        owner.participant,
+        Route::new(owner.participant, owner.channel.take().unwrap()).unwrap(),
+    );
+    assert!(guard
+        .child(relay.participant, relay.child.take().unwrap())
+        .is_ok());
+    let now = if let Some(peer) = &observed {
+        guard.watch(peer.participant).unwrap();
+        let mut observation = ProcessWatch::new().unwrap();
+        observation.install(peer.participant).unwrap();
+        clock.set(base + 1_000_000_000_000);
+        peer.release().unwrap();
+        let bound = Instant::now() + Duration::from_secs(2);
+        while observation.exited().unwrap().is_none() {
+            assert!(Instant::now() < bound);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        boot_nanos().unwrap()
+    } else {
+        guard.notify_failure().unwrap();
+        base
+    };
+    let earlier = Start {
+        run,
+        origin: owner.participant,
+        ticket: Ticket::new(now - 100_000_000, CleanupPath::Failed, 1).unwrap(),
+    };
+    if !after_observation {
+        owner.send_start(&earlier).unwrap();
+    }
+    let observation_bound = clock.observation_bound(earlier.ticket.deadline);
+    let mut observation_without_ticket = false;
+    let mut committed = None;
+    let mut outcome = guard.run(|event, ticket| {
+        if let Event::Exited(participant) = event {
+            if observed
+                .as_ref()
+                .is_some_and(|peer| peer.participant == *participant)
+            {
+                observation_without_ticket = ticket.is_none();
+                owner.send_start(&earlier)?;
+            }
+        }
+        if let Event::Start(start) = event {
+            if *start == earlier {
+                committed = ticket;
+                // Release inside the original local window; the missing ACKs
+                // may fail publication but cannot renew this earlier ticket.
+                clock.advance_to(now + ACK_NANOS + 10_000_000);
+                relay.release()?;
+                owner.release()?;
+            }
+        }
+        Ok(Vec::new())
+    });
+    let completed_in_bound = observation_bound.finish();
+    relay.release().unwrap();
+    owner.release().unwrap();
+    let unresolved = outcome.unresolved.len();
+    for child in &mut outcome.unresolved {
+        while child.collect().unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let owner_status = owner.collect_scripted_peer().unwrap();
+    let observed_status = observed
+        .as_mut()
+        .map(|peer| peer.collect_scripted_peer().unwrap());
+    assert_eq!(
+        committed,
+        Some(earlier.ticket),
+        "caller did not commit the earlier original deadline"
+    );
+    assert!(
+        completed_in_bound,
+        "caller exhausted the external observation bound"
+    );
+    assert!(
+        !outcome
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::OpportunityExpired(_))),
+        "caller consumed a local cleanup opportunity after children were released"
+    );
+    if after_observation {
+        assert!(
+            observation_without_ticket,
+            "exit observation invented a ticket"
+        );
+    }
+    assert!(outcome.failed);
+    assert_eq!(owner_status, 0, "scripted owner peer failed");
+    assert!(
+        observed_status.is_none_or(|status| status == 0),
+        "scripted observation peer failed"
+    );
+    assert_eq!(unresolved, 0, "production caller omitted relay collection");
+    assert!(outcome.events.iter().any(|event| matches!(event,
+        Event::Collected(participant, 0) if *participant == relay.participant)));
+}
+
+#[test]
+fn r2_library_earlier_start_after_local_ticket() {
+    earlier_start(false);
+}
+
+#[test]
+fn r2_library_earlier_start_after_observation() {
+    earlier_start(true);
 }
 
 #[test]

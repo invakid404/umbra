@@ -12,6 +12,8 @@ publish = false
 # other target the API is a no-op.
 
 [features]
+# Test harnesses can scope one shared boot clock without changing normal builds.
+test-clock = []
 # Qualification-only: corrupt the run generation on a validated provider offer.
 probe-managed-offer-generation = []
 # Observational D6 instrumentation; no lifecycle behavior change.
@@ -29,6 +31,7 @@ libc = "=0.2.191"
 mach2.workspace = true
 
 [dev-dependencies]
+umbra-isolation = { path = ".", features = ["test-clock"] }
 tempfile.workspace = true
 umbra-journal-file = { path = "../umbra-journal-file" }
 umbra-journal = { path = "../umbra-journal" }

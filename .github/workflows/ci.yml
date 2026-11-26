@@ -71,6 +71,13 @@ jobs:
           cargo test -p umbra-isolation --test managed_runtime r2_guardian_ack_loss_preserves_child_collection -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_relay_ack_loss_preserves_child_collection -- --exact --nocapture
 
+      - name: Managed caller original clock
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p umbra-isolation --test managed_runtime r2_unknown_start_exit_never_renews -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_library_earlier_start_after_local_ticket -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_library_earlier_start_after_observation -- --exact --nocapture
+
       - name: Test contract documentation
         run: cargo test --workspace --doc
 
