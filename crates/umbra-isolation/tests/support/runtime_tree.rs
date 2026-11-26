@@ -47,6 +47,7 @@ pub enum Case {
     Normal,
     StuckCustodian,
     UncancellableWorker,
+    OwnerLost,
     TotalLoss,
     RelayStalled,
     GuardianStalled,
@@ -57,7 +58,7 @@ impl Case {
     fn acknowledged(self) -> bool {
         matches!(
             self,
-            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker
+            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker | Self::OwnerLost
         )
     }
     fn stuck_role(self) -> Option<Role> {
@@ -70,7 +71,7 @@ impl Case {
     fn failed(self, role: Role) -> bool {
         match self {
             Self::Normal => false,
-            Self::StuckCustodian | Self::UncancellableWorker => {
+            Self::StuckCustodian | Self::UncancellableWorker | Self::OwnerLost => {
                 matches!(role, Role::Caller | Role::Relay | Role::Guardian)
             }
             _ => true,
@@ -85,7 +86,9 @@ impl Case {
     }
     fn held(self, role: Role) -> bool {
         match self {
-            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker => false,
+            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker | Self::OwnerLost => {
+                false
+            }
             Self::TotalLoss => false,
             Self::RelayStalled => role == Role::Relay,
             Self::GuardianStalled => role == Role::Guardian,
@@ -95,7 +98,9 @@ impl Case {
     }
     fn delivery(self) -> Option<Role> {
         match self {
-            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker => None,
+            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker | Self::OwnerLost => {
+                None
+            }
             Self::TotalLoss => None,
             Self::RelayStalled => Some(Role::Worker),
             Self::GuardianStalled => Some(Role::Relay),
@@ -510,7 +515,14 @@ pub fn child() -> io::Result<()> {
                 }
                 write(
                     &root,
-                    &name("receipt", role),
+                    &name(
+                        if config.case == Case::OwnerLost {
+                            "forensic-wait"
+                        } else {
+                            "receipt"
+                        },
+                        role,
+                    ),
                     &Receipt {
                         role,
                         failed: owner.failed(),
@@ -522,6 +534,13 @@ pub fn child() -> io::Result<()> {
                     wait(&root, || {
                         Ok(root.join(name("receipt", Role::Worker)).exists())
                     })?;
+                }
+                if config.case == Case::OwnerLost {
+                    // No live child is orphaned. This test-only audit proves
+                    // that fact, but supplies no receipt to the managed tree.
+                    // The custodian disappears before reporting its result.
+                    drop(rescue);
+                    unsafe { libc::_exit(1) };
                 }
                 if config.case == Case::StuckCustodian {
                     // Provider collection is already certified by the real
@@ -642,8 +661,20 @@ pub fn child() -> io::Result<()> {
                 ),
                 &mut prior,
             )?;
+            if root.join("abort").exists() {
+                return Err(invalid("worker fixture observation rescue"));
+            }
             if root.join("release").exists()
-                && root.join(name("receipt", Role::CleanupOwner)).exists()
+                && root
+                    .join(name(
+                        if config.case == Case::OwnerLost {
+                            "forensic-wait"
+                        } else {
+                            "receipt"
+                        },
+                        Role::CleanupOwner,
+                    ))
+                    .exists()
             {
                 if config.case == Case::UncancellableWorker {
                     drop(rescue);
@@ -695,7 +726,7 @@ pub fn child() -> io::Result<()> {
         guard.run_parent_with_test_observer(|state| record(&root, role, state, &mut prior));
     let failed = outcome.failed;
     finish_parent(&root, role, outcome)?;
-    if config.case.stuck_role().is_some() && failed {
+    if (config.case.stuck_role().is_some() || config.case == Case::OwnerLost) && failed {
         // The helper reports failure only after its actual child waits.
         drop(rescue);
         std::process::exit(1);
@@ -843,9 +874,10 @@ pub fn run(case: Case) -> io::Result<()> {
                 clock.advance_to(ticket.deadline);
             }
         }
-        if !released && Instant::now() >= bound {
+        if !rescued && Instant::now() >= bound {
             rescued = true;
             clock.advance_to(ticket.deadline);
+            std::fs::write(root.join("abort"), b"rescue")?;
             std::fs::write(root.join("release"), b"rescue")?;
             released = true;
         }
@@ -956,6 +988,19 @@ pub fn run(case: Case) -> io::Result<()> {
         ));
     }
     for role in ROLES {
+        if case == Case::OwnerLost && role == Role::CleanupOwner {
+            let forensic: Receipt = read(root, &name("forensic-wait", role))?
+                .ok_or_else(|| invalid("missing owner test-only wait audit"))?;
+            let provider = participant(&inventory, Role::Provider);
+            if forensic.waits != [(provider, 0)]
+                || forensic.unresolved != 0
+                || read::<Receipt>(root, &name("receipt", role))?.is_some()
+                || read::<Vec<(u32, i32)>>(root, &name("rescue", role))? != Some(Vec::new())
+            {
+                return Err(invalid("lost owner manufactured a collection receipt"));
+            }
+            continue;
+        }
         if case == Case::UncancellableWorker && role == Role::Worker {
             if read::<Receipt>(root, &name("receipt", role))?.is_some()
                 || read::<Vec<(u32, i32)>>(root, &name("rescue", role))? != Some(Vec::new())
@@ -995,6 +1040,10 @@ pub fn run(case: Case) -> io::Result<()> {
                         Role::Guardian | Role::Relay => 1 << 8,
                         _ => 0,
                     }
+                } else if case == Case::OwnerLost
+                    && matches!(peer.role, Role::CleanupOwner | Role::Guardian | Role::Relay)
+                {
+                    1 << 8
                 } else {
                     0
                 };

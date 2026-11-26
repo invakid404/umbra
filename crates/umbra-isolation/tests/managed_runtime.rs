@@ -33,6 +33,11 @@ fn r2_creator_past_tail() {
 }
 
 #[test]
+fn r2_custody_owner_dies_no_false_collection() {
+    runtime_tree::run(runtime_tree::Case::OwnerLost).unwrap();
+}
+
+#[test]
 fn r2_acquire_after_expired_outer_census() {
     late_acquisition::run(false);
 }

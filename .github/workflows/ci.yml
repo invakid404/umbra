@@ -72,6 +72,7 @@ jobs:
           cargo test -p umbra-isolation --test managed_runtime custody_stuck_custodian_reaps_all -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_uncancellable_work_outer_cleanup -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_creator_past_tail -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_custody_owner_dies_no_false_collection -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_acquire_after_expired_outer_census -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_guardian_ack_loss_preserves_child_collection -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_relay_ack_loss_preserves_child_collection -- --exact --nocapture
