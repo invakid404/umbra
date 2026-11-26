@@ -7,6 +7,8 @@ edition.workspace = true
 publish = false
 
 [features]
+# Qualification-only: lose the response after authoritative Armed persistence.
+probe-managed-arm-reply-loss = []
 # Test instrumentation: emit only successful writer-renewal observations.
 probe-idle-renewal = []
 # Forwarded to `umbra-overlay`; see its manifest for what each probe breaks and

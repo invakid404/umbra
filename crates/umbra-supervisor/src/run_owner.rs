@@ -55,7 +55,14 @@ impl RunOwner {
                         ));
                     }
                     generation = Some(record.generation);
-                    namespace.arm_custody(record).map_err(std::io::Error::other)
+                    let sequence = namespace
+                        .arm_custody(record)
+                        .map_err(std::io::Error::other)?;
+                    if cfg!(feature = "probe-managed-arm-reply-loss") {
+                        Err(std::io::Error::other("injected lost Armed response"))
+                    } else {
+                        Ok(sequence)
+                    }
                 })?;
                 if ready {
                     break;

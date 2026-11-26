@@ -38,11 +38,16 @@ fn main() {
             "prepared_error",
             "prepared_panic",
             "provider_death",
+            "armed_reply_loss",
             "startup_abort",
             "missing_provider"
         ]
         .contains(&mode.as_str())
     );
+    #[cfg(not(feature = "probe-managed-arm-reply-loss"))]
+    if mode == "armed_reply_loss" {
+        panic!("armed_reply_loss requires its compile-time fault");
+    }
     let capacity: u64 = std::env::args()
         .nth(2)
         .map(|value| value.parse().unwrap())
@@ -202,7 +207,22 @@ fn main() {
         elapsed.as_secs_f64() <= bound,
         "managed run exceeded D4: {elapsed:?} > {bound}s"
     );
-    if mode == "startup_abort" || mode == "missing_provider" {
+    if mode == "armed_reply_loss" {
+        assert!(result.is_err(), "lost Armed response authorized a run");
+        assert!(events.borrow().is_empty(), "callback before durable GO");
+        let entries = std::fs::read_dir(&store)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            // LocalStorage keeps its capability probes beside run directories.
+            .filter(|entry| entry.file_name() != ".umbra-probes")
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "expected exactly one persisted run");
+        let run_id =
+            RunId(uuid::Uuid::parse_str(entries[0].file_name().to_str().unwrap()).unwrap());
+        inspect_custody(&store, run_id, false);
+    } else if mode == "startup_abort" || mode == "missing_provider" {
         if mode == "startup_abort" {
             result.unwrap();
         } else {
