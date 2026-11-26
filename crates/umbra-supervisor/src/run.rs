@@ -1324,7 +1324,7 @@ mod unix {
             };
             let (owner, client, cleanup) =
                 crate::run_owner::RunOwner::arm_worker(run_id, raw, &mut startup)?;
-            let namespace = crate::namespace_owner::NamespaceOwner::Managed(Box::new(owner));
+            let mut namespace = crate::namespace_owner::NamespaceOwner::Managed(Box::new(owner));
             let exchange = startup.entry.take_exchange().map_err(|failure| {
                 error(
                     ErrorKind::ProtocolMismatch,
@@ -1340,6 +1340,12 @@ mod unix {
                 }),
             ));
             let final_observer = shared_observer.clone();
+            let failure_observer = shared_observer.clone();
+            if let crate::namespace_owner::NamespaceOwner::Managed(owner) = &mut namespace {
+                owner.set_failure_reporter(Box::new(move |result| {
+                    failure_observer.borrow_mut().complete(result)
+                }));
+            }
             *completion = Some(Box::new(move |result| {
                 final_observer.borrow_mut().complete(result)
             }));
@@ -1842,6 +1848,10 @@ mod unix {
     ) -> UmbraError {
         let mut namespace = namespace.into();
         if namespace.is_managed() {
+            #[cfg(target_os = "macos")]
+            if let crate::namespace_owner::NamespaceOwner::Managed(owner) = &mut namespace {
+                owner.report_failure(&primary);
+            }
             return primary;
         }
         let cleanup = namespace.fail_run(&FailedRunRequest {

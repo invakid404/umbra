@@ -13,15 +13,12 @@ fn main() {
         managed_entry::{execute, RegisteredRole},
         run::{CommandLaunch, RunLaunch, RunObserver, RunOutcome, RunPersistence, RunSpec},
     };
-    match RegisteredRole::enter().unwrap() {
-        Some(mut role) => {
-            if let Err(error) = execute(&mut role) {
-                eprintln!("managed library helper: {error}");
-                std::process::exit(1);
-            }
-            return;
+    if let Some(mut role) = RegisteredRole::enter().unwrap() {
+        if let Err(error) = execute(&mut role) {
+            eprintln!("managed library helper: {error}");
+            std::process::exit(1);
         }
-        None => {}
+        return;
     }
     if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none() {
         eprintln!("SKIP: managed_library requires native qualification");

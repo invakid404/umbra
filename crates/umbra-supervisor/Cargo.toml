@@ -51,8 +51,8 @@ umbra-storage-local = { path = "../umbra-storage-local" }
 # it through the real provider executables, so it needs the backend as a library
 # as well as the binary cargo already builds for the workspace.
 umbra-journal-file = { path = "../umbra-journal-file" }
+uuid.workspace = true
 
 [[test]]
 name = "managed_library"
 harness = false
-uuid.workspace = true

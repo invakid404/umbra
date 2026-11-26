@@ -13,6 +13,7 @@ pub struct RunOwner {
     boundary: Option<WorkerBoundary>,
     cleanup: SharedWorkerCleanup,
     finish: crate::managed_finish::FinishArbitration,
+    failure_reporter: Option<crate::managed_observer::Completion>,
 }
 
 impl RunOwner {
@@ -85,8 +86,29 @@ impl RunOwner {
             boundary: Some(boundary),
             cleanup: cleanup.clone(),
             finish,
+            failure_reporter: None,
         };
         Ok((owner, client, cleanup))
+    }
+
+    /// Install one best-effort final error exchange without releasing custody.
+    pub fn set_failure_reporter(&mut self, reporter: crate::managed_observer::Completion) {
+        self.failure_reporter = Some(reporter);
+    }
+
+    /// Notify cleanup before delivering the original failure under its cutoff.
+    /// Reporter errors and unwinds cannot permit namespace destruction.
+    pub fn report_failure(&mut self, failure: &UmbraError) {
+        use umbra_platform::provider::ManagedCleanup;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.cleanup.failed(failure);
+            if let Some(report) = self.failure_reporter.take() {
+                let _ = report(Err(failure.clone()));
+            }
+        }));
+        if let Err(payload) = result {
+            std::mem::forget(payload);
+        }
     }
 
     /// Borrow namespace operations while the run owner retains finalization.
@@ -156,6 +178,7 @@ impl Drop for RunOwner {
                 "managed.owner",
                 "managed run abandoned before durable completion",
             );
+            self.report_failure(&failure);
             let _ = self.cleanup.fail_stop(boundary, &failure);
             // Returning means the registered-worker invariant was violated.
             // Never fall through to namespace destruction.
