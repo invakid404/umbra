@@ -122,6 +122,12 @@ jobs:
           UMBRA_INTEGRATION_REQUIRED: "1"
         run: cargo test -p umbra-supervisor --features probe-managed-owner-drop --test managed_library -- r2_direct_drop_failed_result 1
 
+      - name: Failed provider closure retains recovery-only custody
+        if: runner.os == 'macOS'
+        env:
+          UMBRA_INTEGRATION_REQUIRED: "1"
+        run: cargo test -p umbra-supervisor --test managed_library -- r2_failed_closure_reopen 1
+
       - name: Independent cancellation of accepted ordinary work
         if: runner.os == 'macOS'
         run: cargo test -p umbra-platform-macos --lib native::cancellation_tests::r2_preaccepted_work_cancel -- --exact --nocapture

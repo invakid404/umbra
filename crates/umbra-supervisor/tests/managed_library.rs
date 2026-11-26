@@ -38,6 +38,7 @@ fn main() {
         "prepared_error",
         "prepared_panic",
         "provider_death",
+        "r2_failed_closure_reopen",
         "owner_death",
         "armed_reply_loss",
         "startup_abort",
@@ -172,7 +173,10 @@ fn main() {
                     "managed library prepared sentinel",
                 ));
             }
-            if self.mode == "provider_death" || self.mode == "owner_death" {
+            if matches!(
+                self.mode.as_str(),
+                "provider_death" | "owner_death" | "r2_failed_closure_reopen"
+            ) {
                 stop_owned_role(self.caller, self.mode == "owner_death");
             }
             Ok(())
@@ -298,7 +302,7 @@ fn main() {
             "missing" => Some("twin source"),
             "prepared_error" => Some("managed library prepared sentinel"),
             "prepared_panic" => Some("managed preparation observer panicked"),
-            "provider_death" | "owner_death" => None,
+            "provider_death" | "owner_death" | "r2_failed_closure_reopen" => None,
             _ => unreachable!(),
         };
         if let Some(expected) = expected {
@@ -312,10 +316,22 @@ fn main() {
         }
         assert!(!events.borrow().contains(&"finished"));
     }
-    if let Some(run_id) = observed_run.get() {
+    if mode == "r2_failed_closure_reopen" {
+        r2_failed_closure_reopen(
+            &store,
+            observed_run
+                .get()
+                .expect("failed closure never reached prepared"),
+        );
+    } else if let Some(run_id) = observed_run.get() {
         inspect_custody(&store, run_id, expects_success);
     }
     println!("managed_library: {mode} capacity={capacity} elapsed={elapsed:?} passed");
+}
+
+#[cfg(target_os = "macos")]
+fn r2_failed_closure_reopen(store: &std::path::Path, run_id: umbra_core::RunId) {
+    inspect_custody(store, run_id, false);
 }
 
 #[cfg(target_os = "macos")]
