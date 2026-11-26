@@ -24,6 +24,8 @@ fn main() {
         eprintln!("SKIP: managed_library requires native qualification");
         return;
     }
+    let mode = std::env::args().nth(1).unwrap_or_else(|| "success".into());
+    assert!(["success", "missing", "prepared_error", "prepared_panic"].contains(&mode.as_str()));
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     let store = temp.path().join("store");
@@ -82,6 +84,7 @@ fn main() {
         caller: u32,
         events: Rc<RefCell<Vec<&'static str>>>,
         run: Option<RunId>,
+        mode: String,
     }
     impl RunObserver for Observer {
         fn stdio_adopted(&mut self) -> umbra_core::Result<()> {
@@ -93,6 +96,16 @@ fn main() {
             assert_eq!(std::process::id(), self.caller);
             self.run = Some(run);
             self.events.borrow_mut().push("prepared");
+            if self.mode == "prepared_panic" {
+                panic!("managed library prepared sentinel");
+            }
+            if self.mode == "prepared_error" {
+                return Err(umbra_core::UmbraError::new(
+                    umbra_core::ErrorKind::InvalidState,
+                    "library.observer",
+                    "managed library prepared sentinel",
+                ));
+            }
             Ok(())
         }
         fn finished(&mut self, outcome: &RunOutcome) {
@@ -106,14 +119,23 @@ fn main() {
         }
     }
     let events = Rc::new(RefCell::new(Vec::new()));
+    let executable = if mode == "missing" {
+        workspace
+            .join("missing-program")
+            .as_os_str()
+            .as_bytes()
+            .to_vec()
+    } else {
+        b"/usr/bin/true".to_vec()
+    };
     let spec = RunSpec {
         registry: ProviderRegistry {
             timeout_ms: 25_000,
             providers,
         },
         launch: RunLaunch::Command(CommandLaunch {
-            executable: BytePath::new(b"/usr/bin/true".to_vec()).unwrap(),
-            argv: vec![b"/usr/bin/true".to_vec()],
+            executable: BytePath::new(executable.clone()).unwrap(),
+            argv: vec![executable],
             environment: vec![],
             cwd: BytePath::new(b"/".to_vec()).unwrap(),
         }),
@@ -125,10 +147,27 @@ fn main() {
             caller: std::process::id(),
             events: events.clone(),
             run: None,
+            mode: mode.clone(),
         })),
     };
     let mut run = RegisteredRole::prepare(spec, true, 64).unwrap();
-    execute(&mut run).unwrap();
-    assert_eq!(*events.borrow(), ["stdio", "prepared", "finished"]);
-    println!("managed_library: caller callbacks and complete registered run passed");
+    let result = execute(&mut run);
+    if mode == "success" {
+        result.unwrap();
+        assert_eq!(*events.borrow(), ["stdio", "prepared", "finished"]);
+    } else {
+        let error = result.unwrap_err().to_string();
+        let expected = match mode.as_str() {
+            "missing" => "twin source",
+            "prepared_error" => "managed library prepared sentinel",
+            "prepared_panic" => "managed preparation observer panicked",
+            _ => unreachable!(),
+        };
+        assert!(
+            error.contains(expected),
+            "original failure missing: {error}"
+        );
+        assert!(!events.borrow().contains(&"finished"));
+    }
+    println!("managed_library: {mode} passed");
 }
