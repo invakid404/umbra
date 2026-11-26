@@ -1,9 +1,11 @@
 # umbra-overlay
 
-Storage-independent MVP overlay. **Runtime dependencies remain `umbra-core`,
-`umbra-storage`, `umbra-journal`, and `serde` only.** `umbra-storage-local`,
-`umbra-journal-file`, `tempfile`, and `uuid` are dev-dependencies for real-filesystem unit tests. There
-is no NFS dependency and no host filesystem I/O in the library.
+Storage-independent MVP overlay. Runtime dependencies are `umbra-core`,
+`umbra-storage`, `umbra-journal`, `serde`, `tracing`, and `uuid`.
+`umbra-storage-local`, `umbra-journal-file`, and `tempfile` are dev-dependencies
+for real-filesystem tests. This document covers the manifest, namespace contract,
+engine, provider protocol, and tests. The library selects no backend and performs
+no direct host filesystem I/O; storage and journal access use injected contracts.
 
 `standard_namespace(storage, journal)` returns `Box<dyn NamespaceSession + Send>`;
 `Overlay::new(Box<dyn Storage>, Box<dyn Journal>)` exposes the same engine directly.
@@ -922,11 +924,16 @@ evicts the directory snapshot before the number can be reused. This is an
 executable regular-file MVP, not complete POSIX coverage.
 <!-- /memoria:section -->
 
-<!-- memoria:section id="validation" files="src/engine/tests.rs" guidance="../../docs/guides/reviewing-test-sections.md" -->
+<!-- memoria:section id="validation" files="src/engine/tests.rs src/engine/tests/**" guidance="../../docs/guides/reviewing-test-sections.md" -->
 ## Validation
 
-Run `cargo test -p umbra-overlay`. Tests inject real `umbra-storage-local` base and
-shadow runs, with no NFS requirement. The optional
+Run `cargo test -p umbra-overlay`. By default, tests inject real
+`umbra-storage-local` base and shadow runs, with no NFS requirement. Selected
+custody tests also accept `UMBRA_CUSTODY_STORAGE_DESCRIPTOR` to exercise an actual
+routed storage provider with a host-side file journal. Set
+`UMBRA_CUSTODY_REGISTRY_REQUIRED=1` to require that descriptor. Those tests verify
+retained authority and recovery-only custody, including refusal of concurrent
+writers; the ordinary local run does not qualify routed storage. The optional
 `a_local_run_through_a_proxy_turns_on_the_parent_identity_branch` test locates the
 local provider through `UMBRA_BIN_DIR` or the normal build output and skips when
 that binary is absent; its positive ownership branch also depends on the host
@@ -989,9 +996,10 @@ crate's `standard_namespace` and never opens a namespace descriptor.
   writer marker is retained and the session is poisoned, so a later writer cannot
   take over a run whose effects are uncertain.
 
-The concrete `Overlay` also exposes dormant `arm_custody`, `prepare_finish`,
-`commit_custody` and `fail_custody` methods for the later managed owner. They are
-not wired into `NamespaceSession`, its provider protocol or the supervisor yet.
+The `arm_custody`, `prepare_finish`, `commit_custody` and `fail_custody`
+operations are exposed through `NamespaceSession` and its provider protocol.
+The managed supervisor uses them to retain writer authority until cleanup and
+durable completion are confirmed.
 The caller must hold the bound writer claim. Arming accepts only an Armed-phase
 record, then appends and flushes it;
 an uncertain append/flush retains custody conservatively. Preparation requires
@@ -1012,8 +1020,8 @@ even though the preceding generation was Complete. Nonterminal and Failed
 custody still refuse normal continuation.
 
 Unarmed finalization keeps its existing records, ordering and release timing.
-These methods add no active managed cleanup guarantee or new runtime wait.
-Activation and its bounded outer supervision arrive in PR 2; the
+The managed supervisor supplies bounded outer supervision; these storage
+operations do not establish process collection by themselves. The
 [core contract](../umbra-core/README.md) describes its accepted notification-loss,
 custody-loss and late-creation residuals. Such outcomes remain failed or
 unconfirmed and never authorize a clean resume.

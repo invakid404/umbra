@@ -704,8 +704,8 @@ impl Overlay {
         Ok(sequence)
     }
 
-    /// Persist a dormant managed generation before a future caller may send GO.
-    /// There are no production callers in the foundation slice.
+    /// Persist a managed generation before the caller may send GO.
+    /// The managed supervisor uses this durable boundary before target launch.
     pub fn arm_custody(&mut self, record: CustodyRecord) -> Result<Sequence> {
         self.idle()?;
         if !matches!(record.state, CustodyPhase::Armed { .. }) {
@@ -3725,8 +3725,8 @@ impl NamespaceSession for Overlay {
         // so the run is as finished as a refused `bind` would have left it — but
         // it is *open*, and an operator holds a bound session whose recovery
         // state can be read, rather than an error and no handle. That difference
-        // is what the widening actually buys today, given that nothing in the
-        // shipped supervisor reopens a run at all.
+        // lets the supervisor reopen path report recovery requirements without
+        // treating classification as permission to resume mutations.
         //
         // `any` rather than a per-operation verdict: one unreconcilable
         // transaction condemns the session, and the classification is not
