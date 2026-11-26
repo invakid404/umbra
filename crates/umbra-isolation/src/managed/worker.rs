@@ -190,6 +190,9 @@ impl WorkerCleanup {
             .enumerate()
         {
             let peer = route.peer();
+            if peer == self.owner && self.receipt.is_some() && self.awaiting[index].is_none() && pending.is_none() {
+                continue;
+            }
             let channel = route.channel();
             let deadline = self
                 .tickets
