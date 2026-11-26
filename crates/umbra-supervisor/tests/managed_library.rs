@@ -31,6 +31,7 @@ fn main() {
             "missing",
             "prepared_error",
             "prepared_panic",
+            "provider_death",
             "startup_abort",
             "missing_provider"
         ]
@@ -130,6 +131,9 @@ fn main() {
                     "managed library prepared sentinel",
                 ));
             }
+            if self.mode == "provider_death" {
+                stop_owned_provider(self.caller);
+            }
             Ok(())
         }
         fn finished(&mut self, outcome: &RunOutcome) {
@@ -212,16 +216,75 @@ fn main() {
     } else {
         let error = result.unwrap_err().to_string();
         let expected = match mode.as_str() {
-            "missing" => "twin source",
-            "prepared_error" => "managed library prepared sentinel",
-            "prepared_panic" => "managed preparation observer panicked",
+            "missing" => Some("twin source"),
+            "prepared_error" => Some("managed library prepared sentinel"),
+            "prepared_panic" => Some("managed preparation observer panicked"),
+            "provider_death" => None,
             _ => unreachable!(),
         };
-        assert!(
-            error.contains(expected),
-            "original failure missing: {error}"
-        );
+        if let Some(expected) = expected {
+            assert!(
+                error.contains(expected),
+                "original failure missing: {error}"
+            );
+        } else {
+            assert_eq!(*events.borrow(), ["stdio", "prepared"]);
+            eprintln!("provider death retained failure: {error}");
+        }
         assert!(!events.borrow().contains(&"finished"));
     }
     println!("managed_library: {mode} capacity={capacity} elapsed={elapsed:?} passed");
+}
+
+#[cfg(target_os = "macos")]
+fn stop_owned_provider(caller: u32) {
+    use std::collections::BTreeMap;
+    use umbra_core::managed::Role;
+    use umbra_isolation::managed::process::{identity_with_parent, signal_current};
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,comm="])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let processes: BTreeMap<u32, (u32, String)> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.parse().ok()?,
+                (
+                    fields.next()?.parse().ok()?,
+                    fields.collect::<Vec<_>>().join(" "),
+                ),
+            ))
+        })
+        .collect();
+    let candidates: Vec<_> = processes
+        .iter()
+        .filter(|(_, (_, command))| command.ends_with("/umbra-platform-macos"))
+        .filter(|(pid, _)| {
+            let mut next = **pid;
+            for _ in 0..8 {
+                let Some((parent, _)) = processes.get(&next) else {
+                    return false;
+                };
+                if *parent == caller {
+                    return true;
+                }
+                next = *parent;
+            }
+            false
+        })
+        .collect();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "expected one provider in this caller's tree"
+    );
+    let (&pid, (parent, _)) = candidates[0];
+    let (provider, actual_parent) = identity_with_parent(pid, Role::Provider).unwrap();
+    assert_eq!(actual_parent, *parent);
+    // The signal validates the captured birth and kernel audit identity again.
+    signal_current(provider, libc::SIGKILL).unwrap();
 }
