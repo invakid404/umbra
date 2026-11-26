@@ -6,7 +6,79 @@ fn setup() -> (Fixture, JournalOpenRequest, CustodyFinishProof) {
 }
 
 fn setup_with_arm(arm: bool) -> (Fixture, JournalOpenRequest, CustodyFinishProof) {
-    setup_fixture(Fixture::new(&[]), arm)
+    let mut fixture = Fixture::new(&[]);
+    if let Some(descriptor) = registry_descriptor() {
+        let config = fixture.overlay.config.as_mut().unwrap();
+        fixture
+            .overlay
+            .storage
+            .release_writer(&config.lease)
+            .unwrap();
+        fixture.overlay.storage.close_run().unwrap();
+        let mut storage = umbra_storage::provider::Proxy::connect(&descriptor, 12_000).unwrap();
+        let binding = storage
+            .open_run(&registry_request(config.context.run_id, false))
+            .unwrap();
+        assert!(
+            binding.root.physical_path.is_none(),
+            "registry qualification must use routed storage"
+        );
+        let writer_id = binding
+            .admitted_writer
+            .clone()
+            .expect("routed storage must identify its admitted writer");
+        let lease = storage
+            .acquire_writer(&AcquireWriterRequest {
+                run_id: binding.run_id,
+                writer_id,
+                takeover: TakeoverPolicy::Refuse,
+            })
+            .unwrap();
+        config.context.writer_epoch = Some(lease.epoch);
+        config.binding = binding;
+        config.lease = lease;
+        fixture.overlay.storage = Box::new(storage);
+        let config = fixture.overlay.config.take().unwrap();
+        let base = fixture.overlay.base.take().unwrap();
+        fixture.overlay.bind(config, base).unwrap();
+        eprintln!(
+            "CUSTODY_REGISTRY actual routed storage connected: {}",
+            descriptor.id
+        );
+    }
+    setup_fixture(fixture, arm)
+}
+
+fn registry_descriptor() -> Option<umbra_core::provider::ProviderDescriptor> {
+    let path = std::env::var_os("UMBRA_CUSTODY_STORAGE_DESCRIPTOR");
+    if std::env::var_os("UMBRA_CUSTODY_REGISTRY_REQUIRED").is_some() {
+        assert!(
+            path.is_some(),
+            "routed custody qualification needs its explicit descriptor"
+        );
+    }
+    path.map(|path| umbra_core::provider::decode(&std::fs::read(path).unwrap()).unwrap())
+}
+
+fn registry_request(run_id: RunId, existing: bool) -> OpenRunRequest {
+    OpenRunRequest {
+        run_id,
+        intent: if existing {
+            OpenRunIntent::OpenExisting
+        } else {
+            OpenRunIntent::CreateNew
+        },
+        immutable_base: ImmutableBaseContract {
+            identity: "test-base".into(),
+            fingerprint: vec![1],
+        },
+        policy: StoragePolicy {
+            read_only: false,
+            require_strict_remote_persistence: false,
+            require_kernel_shadow: false,
+            format_version: 1,
+        },
+    }
 }
 
 fn setup_fixture(mut f: Fixture, arm: bool) -> (Fixture, JournalOpenRequest, CustodyFinishProof) {
@@ -15,7 +87,7 @@ fn setup_fixture(mut f: Fixture, arm: bool) -> (Fixture, JournalOpenRequest, Cus
     let request = JournalOpenRequest {
         control: JournalControlBinding {
             run_id,
-            directory: PhysicalPath(config.binding.control.physical_path.clone().unwrap()),
+            directory: PhysicalPath(bytes(f.control.as_os_str().as_bytes())),
         },
         access: JournalAccess::Writer(JournalWriterAuthority {
             run_id,
@@ -355,6 +427,19 @@ fn r2_concurrent_resume_single_writer() {
             .map(|writer| {
                 let ready = &ready;
                 scope.spawn(move || {
+                    if let Some(descriptor) = registry_descriptor() {
+                        let mut contender =
+                            umbra_storage::provider::Proxy::connect(&descriptor, 12_000).unwrap();
+                        ready.wait();
+                        // Routed storage admits its writer during OpenExisting.
+                        // A second writer must be refused at that boundary.
+                        let error = contender
+                            .open_run(&registry_request(run_id, true))
+                            .expect_err("unresolved custody admitted a routed contender");
+                        assert_eq!(error.kind, ErrorKind::LeaseLost);
+                        assert!(error.context.contains("admission refused"), "{error}");
+                        return true;
+                    }
                     let mut contender = LocalStorage::new(path).unwrap();
                     contender
                         .open_run(&OpenRunRequest {
