@@ -1336,6 +1336,11 @@ mod unix {
             let observer_cleanup = cleanup.clone();
             let shared_observer = std::rc::Rc::new(std::cell::RefCell::new(
                 crate::managed_observer::WorkerObserver::new(run_id, move |request| {
+                    if matches!(&request.event, crate::managed_observer::Event::StdioAdopted) {
+                        // The platform owns the program's copies now. This
+                        // worker must not delay pipe EOF while it supervises.
+                        umbra_core::launch_stdio::LaunchStdio::release_cli_streams()?;
+                    }
                     transport.exchange(request, || observer_cleanup.observer_progress())
                 }),
             ));

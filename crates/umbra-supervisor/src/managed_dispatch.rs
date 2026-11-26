@@ -29,6 +29,7 @@ pub fn owner(
         while !startup.poll(descriptor, external_caller, input.timeout_ms())? {
             tick();
         }
+        umbra_core::launch_stdio::LaunchStdio::release_cli_streams().map_err(io::Error::other)?;
         *service = Some(startup.take_service()?);
     }
     while !service.as_mut().unwrap().poll()? {
@@ -67,6 +68,7 @@ pub fn guardian(
     while !startup.poll(external_caller)? {
         tick();
     }
+    umbra_core::launch_stdio::LaunchStdio::release_cli_streams().map_err(io::Error::other)?;
     let parent = startup.entry.take_exchange()?;
     let child = startup
         .guard
@@ -160,6 +162,7 @@ pub fn relay(
     while !startup.poll_readiness(external_caller)? {
         tick();
     }
+    umbra_core::launch_stdio::LaunchStdio::release_cli_streams().map_err(io::Error::other)?;
     let caller = if external_caller {
         loop {
             if let Some(receipt) = startup.entry.receive_caller_readiness()? {

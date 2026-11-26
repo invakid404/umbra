@@ -1354,16 +1354,44 @@ fn shadow_path(run: &Run) -> Vec<Vec<u8>> {
 /// before any payload is looked at. Every failure panics rather than answering
 /// `false`: a log this cannot read is not a log without a completion record.
 fn journal_records_completion(run: &Run) -> bool {
-    journal_has_lifecycle(run, |lifecycle| {
-        matches!(lifecycle, JournalLifecycle::RunCompleted { .. })
-    })
+    let (recovery, records) = journal_records(run);
+    if let Some(custody) = recovery.custody {
+        // Complete custody also settles cleanup after logical failure. Only a
+        // prepared observed root result records normal run completion.
+        let observed_root = records.iter().any(|record| {
+            matches!(&record.payload, JournalPayload::Custody(record)
+                if matches!(record.state, umbra_core::CustodyPhase::FinishPrepared {
+                    root_result, ..
+                } if root_result != i32::MIN))
+        });
+        recovery.clean
+            && observed_root
+            && matches!(
+                custody.record.state,
+                umbra_core::CustodyPhase::Complete { .. }
+            )
+    } else {
+        records.iter().any(|record| {
+            matches!(
+                record.payload,
+                JournalPayload::Lifecycle(JournalLifecycle::RunCompleted { .. })
+            )
+        })
+    }
 }
 
 fn journal_has_lifecycle(run: &Run, predicate: impl Fn(&JournalLifecycle) -> bool) -> bool {
+    journal_records(run).1.iter().any(|record| {
+        matches!(&record.payload,
+        JournalPayload::Lifecycle(lifecycle) if predicate(lifecycle))
+    })
+}
+
+fn journal_records(run: &Run) -> (umbra_core::RecoveryState, Vec<umbra_core::JournalRecord>) {
     let control = run.state_root().join("journal");
     let directory = PhysicalPath(BytePath::new(control.as_os_str().as_bytes().to_vec()).unwrap());
     let mut journal = FileJournal::new();
-    journal
+    let recovery = journal
         .open(&JournalOpenRequest {
             control: JournalControlBinding {
                 run_id: run.run_id,
@@ -1376,17 +1404,12 @@ fn journal_has_lifecycle(run: &Run, predicate: impl Fn(&JournalLifecycle) -> boo
             },
         })
         .unwrap_or_else(|e| panic!("opening {} read-only: {e}", control.display()));
-    let completed = journal
+    let records = journal
         .replay(Sequence(0))
         .unwrap_or_else(|e| panic!("replaying {}: {e}", control.display()))
         .map(|record| record.unwrap_or_else(|e| panic!("undecodable journal record: {e}")))
-        .any(|record| {
-            matches!(
-                record.payload,
-                JournalPayload::Lifecycle(ref lifecycle) if predicate(lifecycle)
-            )
-        });
-    completed
+        .collect();
+    (recovery, records)
 }
 
 /// Every NFS filesystem this host currently has mounted, as `(from, on)`.

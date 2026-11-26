@@ -61,7 +61,7 @@ impl RelayStartup {
         self.rollback.as_mut().unwrap().poll()
     }
 
-    /// Validate relay role before spawning its separate guardian session.
+    /// Validate relay role before spawning its guardian.
     pub fn new(entry: Entry) -> io::Result<Self> {
         if entry.role != Role::Relay {
             return Err(invalid("relay startup role mismatch"));
@@ -91,8 +91,10 @@ impl RelayStartup {
             return Ok(true);
         }
         if self.children.is_empty() {
-            self.children
-                .push(self.entry.spawn_child(Role::Guardian, true)?);
+            self.children.push(
+                self.entry
+                    .spawn_child(Role::Guardian, crate::in_launchd_session())?,
+            );
         }
         if !self.bootstrap.as_mut().unwrap().poll(
             &mut self.entry,
