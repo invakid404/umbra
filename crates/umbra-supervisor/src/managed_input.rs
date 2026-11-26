@@ -18,6 +18,45 @@ pub struct ManagedRunInput {
 }
 
 impl ManagedRunInput {
+    /// Build the same-executable dispatch payload before any run resource opens.
+    pub fn registered_launch(
+        &self,
+        external_caller: bool,
+        capacity: u64,
+    ) -> Result<umbra_core::managed::LaunchConfiguration> {
+        let launch = umbra_core::managed::LaunchConfiguration {
+            run: umbra_core::managed::RunIdentity {
+                nonce: uuid::Uuid::new_v4(),
+                generation: 1,
+            },
+            capacity,
+            dispatch: "umbra_run_v1".to_owned(),
+            payload: umbra_core::provider::encode(&(external_caller, self.encode()?))?,
+        };
+        launch.validate().map_err(|message| {
+            UmbraError::new(ErrorKind::ProtocolMismatch, "managed.input", message)
+        })?;
+        Ok(launch)
+    }
+
+    /// Decode only the registered run schema, preserving the original storage ID.
+    pub fn from_registered(
+        launch: &umbra_core::managed::LaunchConfiguration,
+    ) -> Result<(bool, Self)> {
+        launch.validate().map_err(|message| {
+            UmbraError::new(ErrorKind::ProtocolMismatch, "managed.input", message)
+        })?;
+        if launch.dispatch != "umbra_run_v1" {
+            return Err(UmbraError::new(
+                ErrorKind::ProtocolMismatch,
+                "managed.input",
+                "unregistered executable dispatch",
+            ));
+        }
+        let (external, bytes): (bool, Vec<u8>) = umbra_core::provider::decode(&launch.payload)?;
+        Ok((external, Self::decode(&bytes)?))
+    }
+
     /// Move serializable inputs out while retaining callbacks in the caller.
     pub fn split(spec: RunSpec) -> (Self, Option<Box<dyn RunObserver>>) {
         (

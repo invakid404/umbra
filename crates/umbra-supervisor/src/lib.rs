@@ -40,6 +40,8 @@ pub mod managed_input;
 pub mod managed_observer;
 #[cfg(target_os = "macos")]
 pub mod managed_dispatch;
+#[cfg(target_os = "macos")]
+pub mod managed_entry;
 pub mod namespace_owner;
 /// Open file descriptions routed descriptors share across fork and spawn.
 mod ofd;
