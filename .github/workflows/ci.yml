@@ -64,6 +64,47 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-targets
 
+      - name: Managed cleanup protocol and simultaneous admission
+        run: |
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_phase -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_nonce -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_begin_eof -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_poll_eof -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_deadline -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_invalid_accept -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_backwards -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_poll_phase -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_invalid_final -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_begin_timeout -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_poll_timeout -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_drop -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_panic -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_session_drop -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_shutdown_panic -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_unconfirmed_final -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_wrong_id -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_malformed_response -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_provider_error -- --exact --nocapture
+          cargo test -p umbra-core --test admission r2_grant_visible_before_acquire -- --exact --nocapture
+          cargo test -p umbra-core --test admission r2_freeze_races_grant -- --exact --nocapture
+          cargo test -p umbra-core --test admission r2_grant_before_entry_freeze -- --exact --nocapture
+          cargo test -p umbra-core --test admission r2_release_requires_terminal_proof -- --exact --nocapture
+          cargo test -p umbra-core --test admission r2_absent_stale_partial_inventory -- --exact --nocapture
+          cargo test -p umbra-core --lib admission::tests::r2_budget_overflow_and_writer_death -- --exact --nocapture
+          cargo test -p umbra-core --lib managed::tests::cleanup_deadline_no_renewal -- --exact --nocapture
+
+      - name: Durable custody and concurrent recovery
+        run: |
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_reopen_armed_before_go -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_reopen_after_admission_timeout -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_warning_unwind_retains_custody -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_recovery_cannot_erase_unknown_creator -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_reopen_final_without_wait -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_finish_prepare_retains_authority -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_stale_owner_failure_generation -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_finish_commit_ack_lost -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_concurrent_resume_single_writer -- --exact --nocapture
+
       - name: Managed parent custody after lost acknowledgements
         if: runner.os == 'macOS'
         run: |
@@ -382,6 +423,7 @@ jobs:
           cargo test -p umbra-platform-macos --test managed_cleanup r2_native_capacity_refusal_before_preparation -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib native::tests::owner_loss_wakes_a_pending_rsp_request -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib native::teardown_tests:: -- --nocapture --test-threads=1
+          cargo test -p umbra-platform-macos --lib rsp::tests::cancellation_preserves_partial_reply_and_same_stream_for_teardown -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib rsp::tests::r3_cancel_ordinary_request_same_stream -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib rsp::tests::r3_cancel_partial_write -- --exact --nocapture
           cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures --test idle_poll -- --nocapture --test-threads=1
@@ -912,6 +954,29 @@ jobs:
           for case in signals284::f284_initial_sigpipe_default signals284::f284_dispositions signals284::f284_sources signals284::f284_handler_io signals284::f284_fork_exec_resume signals284::f284_concurrency signals284::f284_thread_delivery signals284::f284_unsafe_entry signals284::f284_unsafe_return_window signals284::f284_unsafe_exec signals284::f284_unsafe_internal signals284::f284_unsafe_park signals284::f284_unsafe_identity signals284::f284_unsafe_ambiguous signals284::f284_send_error_reaps_owned_tree signals284::f284_teardown_confirmation_control stdio201::f201_pipe_sigpipe stdio201::f201_self_pipe_sigpipe; do
             cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run "$case" -- --exact --nocapture --test-threads=1
           done
+
+      - name: Durable custody against the userspace storage registry
+        env:
+          UMBRA_CUSTODY_REGISTRY_REQUIRED: "1"
+        run: |
+          export UMBRA_CUSTODY_STORAGE_DESCRIPTOR="$RUNNER_TEMP/managed-custody-storage.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          descriptor = json.loads(Path("crates/umbra-storage-nfs-userspace/provider.json").read_text())
+          descriptor["executable"] = list(os.fsencode(Path("target/debug/umbra-storage-nfs-userspace").resolve()))
+          host, port = os.environ["UMBRA_NFS_RAW_FIXTURE"].rsplit(":", 1)
+          options = {"host": list(host.encode()), "port": int(port),
+                     "export": list(b"umbra"), "run_parent": list(b"runs"),
+                     "root_anchor": list(b"root"), "control_anchor": list(b"control"),
+                     "deadline": {"millis": 10000}}
+          descriptor["options"] = list(json.dumps(options).encode())
+          Path(os.environ["UMBRA_CUSTODY_STORAGE_DESCRIPTOR"]).write_text(json.dumps(descriptor))
+          PY
+          for case in r2_reopen_armed_before_go r2_reopen_after_admission_timeout r2_warning_unwind_retains_custody r2_recovery_cannot_erase_unknown_creator r2_reopen_final_without_wait r2_finish_prepare_retains_authority r2_stale_owner_failure_generation r2_finish_commit_ack_lost r2_concurrent_resume_single_writer; do
+            cargo test -p umbra-overlay --lib "engine::tests::custody::$case" -- --exact --nocapture --test-threads=1
+          done
+          cargo test -p umbra-supervisor --test managed_library -- r2_failed_closure_reopen 1
 
       - name: Signal return-window rate reading
         env:

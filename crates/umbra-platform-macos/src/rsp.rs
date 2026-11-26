@@ -954,6 +954,13 @@ impl Drop for Rsp {
 
 #[cfg(test)]
 mod tests {
+    // Keep the original CI guard selectable alongside the managed cancellation
+    // name; both exercise the same partial-reply and stream-preservation oracle.
+    #[test]
+    fn cancellation_preserves_partial_reply_and_same_stream_for_teardown() {
+        r3_cancel_ordinary_request_same_stream();
+    }
+
     #[test]
     fn r3_cancel_ordinary_request_same_stream() {
         use std::io::{Read, Write};
