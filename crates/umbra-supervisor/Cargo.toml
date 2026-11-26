@@ -9,6 +9,8 @@ publish = false
 [features]
 # Qualification-only: lose the response after authoritative Armed persistence.
 probe-managed-arm-reply-loss = []
+# Qualification-only: lose successful PrepareFinish and CommitCustody replies.
+probe-managed-finish-reply-loss = []
 # Qualification-only: reject an actual owner's mismatched descriptor offer.
 probe-managed-offer-generation = ["umbra-isolation/probe-managed-offer-generation"]
 # Test instrumentation: emit only successful writer-renewal observations.

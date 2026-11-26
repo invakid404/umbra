@@ -34,6 +34,7 @@ fn main() {
     assert!(
         [
             "success",
+            "finish_reply_loss",
             "missing",
             "prepared_error",
             "prepared_panic",
@@ -55,6 +56,11 @@ fn main() {
     if mode == "malformed_offer" {
         panic!("malformed_offer requires its compile-time fault");
     }
+    #[cfg(not(feature = "probe-managed-finish-reply-loss"))]
+    if mode == "finish_reply_loss" {
+        panic!("finish_reply_loss requires its compile-time fault");
+    }
+    let expects_success = ["success", "finish_reply_loss"].contains(&mode.as_str());
     let capacity: u64 = std::env::args()
         .nth(2)
         .map(|value| value.parse().unwrap())
@@ -214,7 +220,7 @@ fn main() {
         execute(&mut run)
     };
     let elapsed = began.elapsed();
-    let bound = if mode == "success" {
+    let bound = if expects_success {
         26.35 + 4.0 * capacity as f64
     } else {
         30.6 + 8.0 * capacity as f64
@@ -266,7 +272,7 @@ fn main() {
             0,
             "storage acquired before GO"
         );
-    } else if mode == "success" {
+    } else if expects_success {
         result.unwrap();
         assert_eq!(*events.borrow(), ["stdio", "prepared", "finished"]);
     } else {
@@ -290,7 +296,7 @@ fn main() {
         assert!(!events.borrow().contains(&"finished"));
     }
     if let Some(run_id) = observed_run.get() {
-        inspect_custody(&store, run_id, mode == "success");
+        inspect_custody(&store, run_id, expects_success);
     }
     println!("managed_library: {mode} capacity={capacity} elapsed={elapsed:?} passed");
 }

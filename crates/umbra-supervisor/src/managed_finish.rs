@@ -73,12 +73,26 @@ impl FinishArbitration {
             self.epoch = Some(state.writer_epoch);
         }
         if !self.prepared {
-            if let Err(primary) = namespace.prepare_finish(proof) {
+            let prepared = namespace.prepare_finish(proof).and_then(|sequence| {
+                if cfg!(feature = "probe-managed-finish-reply-loss") {
+                    Err(invalid("injected lost PrepareFinish response"))
+                } else {
+                    Ok(sequence)
+                }
+            });
+            if let Err(primary) = prepared {
                 self.reconcile(namespace, proof, false, primary)?;
             }
             self.prepared = true;
         }
-        let receipt = match namespace.commit_custody(proof) {
+        let committed = namespace.commit_custody(proof).and_then(|receipt| {
+            if cfg!(feature = "probe-managed-finish-reply-loss") {
+                Err(invalid("injected lost CommitCustody response"))
+            } else {
+                Ok(receipt)
+            }
+        });
+        let receipt = match committed {
             Ok(receipt) => receipt,
             Err(primary) => {
                 self.reconcile(namespace, proof, true, primary.clone())?;
