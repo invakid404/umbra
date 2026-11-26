@@ -340,13 +340,20 @@ fn r2_stale_owner_failure_generation() {
 
 #[test]
 fn r2_concurrent_resume_single_writer() {
-    let (f, request, _) = setup();
+    let (mut f, request, _) = setup();
     let run_id = request.control.run_id;
+    let failed = f.overlay.fail_run(&FailedRunRequest {
+        run_id,
+        tree_terminated: true,
+        reason: "caller ended before managed custody was completed".into(),
+    });
+    let ready = std::sync::Barrier::new(2);
     std::thread::scope(|scope| {
         let path = f._dirs[1].path();
         let handles: Vec<_> = ["resume-a", "resume-b"]
             .into_iter()
             .map(|writer| {
+                let ready = &ready;
                 scope.spawn(move || {
                     let mut contender = LocalStorage::new(path).unwrap();
                     contender
@@ -365,6 +372,7 @@ fn r2_concurrent_resume_single_writer() {
                             },
                         })
                         .unwrap();
+                    ready.wait();
                     contender
                         .acquire_writer(&AcquireWriterRequest {
                             run_id,
@@ -379,6 +387,10 @@ fn r2_concurrent_resume_single_writer() {
             assert!(handle.join().unwrap());
         }
     });
+    assert!(
+        failed.is_err(),
+        "unresolved custody released writer authority"
+    );
     assert!(!reopen(&request).clean);
 }
 
