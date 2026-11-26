@@ -1,19 +1,88 @@
 # umbra-isolation
 
-Run isolation for `umbra run` when it starts in launchd's session (session id 1),
-issue #193. **Current state:** shipped on macOS and active only there, only in
-session 1. In every other session, every terminal session included, it does
-nothing, and on other platforms it compiles to no-ops. **Scope:** this crate's
-`src/` and `tests/`. The `umbra-cli` launch path that calls it is described in
-[the CLI README](../umbra-cli/README.md#exit-codes-and-streams), and how
-debugserver kills a traced process on a lost connection in
-[the platform README](../umbra-platform-macos/README.md).
+Process custody and run isolation. **Current state:** macOS CLI runs in every
+starting session and registered executable-library runs use the managed role
+tree. **Scope:** this crate's `src/` and `tests/`. Other platforms do not activate
+this topology. See [the CLI README](../umbra-cli/README.md#exit-codes-and-streams)
+and [the platform README](../umbra-platform-macos/README.md) for their boundaries.
 
-This is the one umbra crate in the `umbra` binary's tree that permits `unsafe`
-(third-party dependencies such as `libc` aside). Every
-`unsafe` block carries a `// SAFETY:` comment, and `unsafe_op_in_unsafe_fn` is
-denied. `umbra-cli` keeps `#![forbid(unsafe_code)]` and calls two safe functions:
-`guardian_entry()` first in `main`, and `isolate_run()` before a run.
+## Managed ownership and deadlines
+
+The caller starts a relay, which owns the guardian. The guardian owns both the
+worker and cleanup owner; only the cleanup owner holds the platform provider's
+child handle. Each parent retains actual collection responsibility. The CLI
+process itself becomes the relay; an executable-library caller remains separate.
+The guardian starts a fresh session for a launchd caller; terminal callers retain
+their controlling session and job-control behavior. Helpers release inherited
+stdin/stdout after passing them on, and the worker releases its copies after
+platform adoption so a live supervisor cannot delay program pipe EOF.
+Provider admission, independent cancellation,
+and direct Start/ACK routes are installed before durable Armed custody permits GO.
+
+```mermaid
+flowchart LR
+    caller --> relay
+    relay --> guardian
+    guardian --> worker
+    guardian --> owner["cleanup owner"]
+    owner --> provider["platform provider"]
+```
+
+`umbra_core::managed::Ticket` uses the first observed cleanup trigger and negotiated capacity
+`C`. Forwarding, progress, a lost acknowledgement and fallback never renew that
+origin. The windows in `umbra_core::managed::CleanupPath` are:
+
+| Path | Total allocation |
+|---|---|
+| Trusted cleanup | `26.35 + 4C` seconds |
+| Notified failure | `30.6 + 8C` seconds |
+
+The default `C` is 64 simultaneous obligations. Retiring work remains charged
+until terminal proof; completed lifetime work does not consume capacity forever.
+The Start publication/acknowledgement exchange shares 250 ms. Worker-only
+abandonment stops the worker; custodians retain their children through their
+original cleanup opportunities. Ordinary programs have no default age or
+inactivity limit.
+
+Compared with the old isolated CLI, this topology adds one process; compared
+with an old terminal CLI it adds three. An external library caller has four
+helper/worker processes. `managed::topology::Topology` creates seven CLI socketpairs
+(worker-owner, worker-guardian, guardian-owner, owner-provider admission,
+owner-provider cancellation, worker-relay and owner-relay). Measured managed
+overhead is 22 CLI descriptors: fourteen topology ends, three private queues,
+four retained bootstrap ends and one retained provider RPC duplicate. Library
+notification adds four pairs, a caller queue and two bootstrap ends, giving 33.
+These exceed the accepted 19/28 descriptor budgets; resource-cost acceptance
+remains unresolved.
+
+At the observed startup boundaries, the native CLI baseline peaked at seven
+processes and 42 descriptors, compared with ten and 73 on the managed path.
+The library comparison was seven/42 versus eleven/88. Additional helper stdio
+accounts for nine CLI descriptors and twelve library descriptors; the library
+reading also caught one additional descriptor in an existing preparation helper.
+Existing transport, journal and tracer handles remain separately inventoried.
+These sampled boundary peaks are not continuous maxima. Both callers returned
+to their original descriptor inventories, and the library pre-GO rollback
+collected its four helpers. The `cost-witness` feature and `startup_cost` test
+retain the process identities, parent edges, descriptors and collection records
+used for this comparison. Launchd-session costs still require CI qualification.
+
+Two limits remain explicit. Total loss of caller notification before any Start
+has no proven finite caller-return bound (D1); custody stays unresolved without
+an inactivity timer. Owner, guardian or relay death can orphan their children
+(D7). Fallback reports failure within its ticket but cannot turn disappearance
+or adoption into an actual parent wait. Late kernel creation and forced cleanup
+of a stalled owner can also leave collection unconfirmed. The kernel case where
+a tracer ends while holding a program remains outside this repair. These facts
+cannot establish successful whole-run collection.
+
+## Legacy launchd isolation
+
+The remainder describes the retained #193/#205 implementation and its tests.
+The macOS managed entrypoint above replaces its CLI activation. The legacy
+`isolate_run()` path applies only to launchd's session; it is a no-op elsewhere.
+The crate permits audited `unsafe` operations and denies
+`unsafe_op_in_unsafe_fn`; CLI callers use safe entrypoints.
 
 ## The problem
 
@@ -388,8 +457,12 @@ Stated, not closed here:
 
 The production-path tests in session 1 (P1-P4, topology, cleanup, and
 debugserver's arguments left as on master) and the terminal tests are `umbra-cli`'s
-`tests/isolation.rs`. CI's self-hosted runner, whose jobs run in session 1, runs
-both suites with `UMBRA_REQUIRE_SID1=1`.
+`tests/isolation.rs`. Its parentage discovery, fresh-session expectations and
+isolation-record checks still describe the legacy tree, so those guards do not
+yet qualify managed activation. The ten separate terminal cases passed with the
+managed path. SID-1 qualification belongs to CI's self-hosted runner with
+`UMBRA_REQUIRE_SID1=1`; a worker terminal session must not submit a launchd job
+to obtain that prerequisite.
 
 ```sh
 cargo test -p umbra-isolation

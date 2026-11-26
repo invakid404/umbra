@@ -6,10 +6,10 @@ license.workspace = true
 edition.workspace = true
 publish = false
 
-# #193: run isolation for `umbra run` in launchd's session (SID 1). The only
-# crate in the CLI's dependency tree that permits `unsafe`; `umbra-cli` keeps
-# `#![forbid(unsafe_code)]` and calls the safe API in `src/lib.rs`. On every
-# other target the API is a no-op.
+# Managed macOS process custody and legacy #193 launchd-session isolation.
+# This crate permits unsafe native ownership operations behind safe entry APIs;
+# umbra-cli keeps forbid(unsafe_code). Managed roles are macOS-only; the legacy
+# isolation entry is a no-op on other targets.
 
 [features]
 # Test harnesses can scope one shared boot clock without changing normal builds.

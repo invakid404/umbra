@@ -1,9 +1,14 @@
-//! Run isolation for `umbra run` in launchd's session (#193).
+//! Managed process custody and legacy launchd-session isolation.
 //!
-//! A run started in launchd's session (SID 1) is moved into a fresh session,
+//! The macOS `managed` module supplies the CLI and registered executable
+//! callers with a relay, guardian, worker and cleanup owner. Terminal callers
+//! keep their controlling session; launchd callers get a fresh guardian session.
+//!
+//! The legacy [`isolate_run`] entry moves a run started in launchd's session
+//! (SID 1) into a fresh session,
 //! so no exit inside the run can be counted against a group in launchd's
-//! session (the orphaned-process-group SIGHUP of #186/#193). In every other
-//! session, including every terminal session, this crate does nothing.
+//! session (the orphaned-process-group SIGHUP of #186/#193). That legacy entry
+//! does nothing in other sessions.
 //!
 //! Topology (README.md): the process the caller started stays where it is as
 //! the **relay**; a **guardian** leads the new session S and runs the
@@ -11,9 +16,10 @@
 //! S follows the #193 arc's T1 protocol (an external arc record, graph audit
 //! `dg-56gcxqyw`, not in this repository); README.md carries its XNU citations.
 //!
-//! This is the only umbra crate in the CLI's tree that permits `unsafe`; `umbra-cli`
-//! keeps `#![forbid(unsafe_code)]` and calls [`guardian_entry`] and
-//! [`isolate_run`].
+//! This crate permits `unsafe` for native process and descriptor ownership.
+//! `umbra-cli` keeps `#![forbid(unsafe_code)]` and enters managed roles through
+//! the supervisor's safe registration API. The legacy [`guardian_entry`] and
+//! [`isolate_run`] remain available separately.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
