@@ -200,8 +200,21 @@ impl Guard {
     /// Poll application forwarding alongside independent cleanup and collection.
     pub fn run_parent_with_progress(
         self,
-        progress: impl FnMut(Option<umbra_core::managed::Ticket>) -> io::Result<()>,
+        mut progress: impl FnMut(Option<umbra_core::managed::Ticket>) -> io::Result<()>,
     ) -> Outcome {
+        self.run_parent_observed(|guard| progress(guard.tickets.ticket()))
+    }
+
+    /// Observe the actual production state without replacing its timers or loop.
+    #[cfg(feature = "test-clock")]
+    pub fn run_parent_with_test_observer(
+        self,
+        mut observe: impl FnMut(super::test_clock::GuardState) -> io::Result<()>,
+    ) -> Outcome {
+        self.run_parent_observed(|guard| observe(guard.test_clock_state()))
+    }
+
+    fn run_parent_observed(self, progress: impl FnMut(&Self) -> io::Result<()>) -> Outcome {
         let local = self.local.role;
         let capacity = self.capacity;
         let children: Vec<_> = self.children.iter().map(|child| child.identity).collect();
@@ -243,7 +256,7 @@ impl Guard {
     fn run_with_progress(
         mut self,
         mut on_event: impl FnMut(&Event, Option<umbra_core::managed::Ticket>) -> io::Result<Vec<Action>>,
-        mut progress: impl FnMut(Option<umbra_core::managed::Ticket>) -> io::Result<()>,
+        mut progress: impl FnMut(&Self) -> io::Result<()>,
     ) -> Outcome {
         let mut progress_failed = false;
         let mut events = Vec::new();
@@ -253,7 +266,7 @@ impl Guard {
                 pending.push_front(Action::Publish(start));
             }
             if !progress_failed {
-                if let Err(error) = progress(self.tickets.ticket()) {
+                if let Err(error) = progress(&self) {
                     progress_failed = true;
                     self.tickets.fail();
                     events.push(Event::Failed(format!("parent forwarding: {error}")));
@@ -540,7 +553,7 @@ impl Guard {
         }
         // No ticket means no session-age timeout. Even a lost route cannot
         // manufacture a caller-return bound before an original Start arrives.
-        let deadline = self.tickets.ticket().map_or(u64::MAX, |t| t.deadline);
+        let deadline = self.receive_deadline();
         for peer in &mut self.peers {
             if peer.failed {
                 continue;
@@ -674,6 +687,28 @@ impl Guard {
     /// Parent collection never clears notification or protocol failure.
     pub fn failed(&self) -> bool {
         self.tickets.failed()
+    }
+
+    fn receive_deadline(&self) -> u64 {
+        self.tickets
+            .ticket()
+            .map_or(u64::MAX, |ticket| ticket.deadline)
+    }
+
+    /// Inspect the same state used by notification reads and stage polling.
+    #[cfg(feature = "test-clock")]
+    pub fn test_clock_state(&self) -> super::test_clock::GuardState {
+        super::test_clock::GuardState {
+            ticket: self.tickets.ticket(),
+            receive_deadline: self.receive_deadline(),
+            failed: self.tickets.failed(),
+            expired: self.expired,
+            stage_events: self.stage_events.iter().copied().collect(),
+            pending_publication: self
+                .publication
+                .as_ref()
+                .map_or_else(Vec::new, Publication::test_pending_peers),
+        }
     }
 
     /// True only after every owned child produced an actual parent wait receipt.

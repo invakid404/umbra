@@ -21,6 +21,99 @@ use umbra_isolation::managed::{
 #[path = "support/runtime_clock.rs"]
 mod runtime_clock;
 use runtime_clock::SharedClock;
+#[path = "support/runtime_tree.rs"]
+mod runtime_tree;
+
+#[test]
+fn runtime_tree_child() {
+    runtime_tree::child().unwrap();
+}
+
+#[test]
+fn r2_total_publication_loss_preserves_custody() {
+    runtime_tree::total_publication_loss().unwrap();
+}
+
+#[test]
+fn r2_total_publication_loss_expired_window_unconfirmed() {
+    let clock = SharedClock::new(boot_nanos().unwrap());
+    let _scope = clock.install();
+    let run = RunIdentity {
+        nonce: uuid::Uuid::new_v4(),
+        generation: 1,
+    };
+    let local = identity(std::process::id(), Role::Guardian).unwrap();
+    let mut peers: Vec<_> = [Role::Worker, Role::CleanupOwner]
+        .into_iter()
+        .map(|role| Peer::spawn_with_clock(role, Some(&clock)))
+        .collect();
+    let mut guard = Guard::new(local, run, 1).unwrap();
+    for peer in &mut peers {
+        guard.watch(peer.participant).unwrap();
+        guard.route(
+            peer.participant,
+            Route::new(peer.participant, peer.channel.take().unwrap()).unwrap(),
+        );
+        assert!(guard
+            .child(peer.participant, peer.child.take().unwrap())
+            .is_ok());
+    }
+    guard.notify_failure().unwrap();
+    let original = guard.test_clock_state().ticket.unwrap();
+    let mut phase = 0;
+    let mut changed = false;
+    let mut outcome = guard.run_parent_with_test_observer(|state| {
+        changed |= state.ticket != Some(original);
+        if phase == 0 && state.pending_publication.len() == peers.len() {
+            clock.advance_to(original.started + ACK_NANOS + 10_000_000);
+            phase = 1;
+        } else if phase == 1 && state.pending_publication.is_empty() {
+            for peer in &peers {
+                if identity(peer.participant.pid, peer.participant.role)? != peer.participant {
+                    return Err(std::io::Error::other(
+                        "custody lost before original window exhausted",
+                    ));
+                }
+            }
+            clock.advance_to(original.deadline);
+            phase = 2;
+        }
+        Ok(())
+    });
+    let unconfirmed = outcome.unresolved.len();
+    let invented_collection = outcome
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::Collected(_, _)));
+    let held = peers.iter().all(|peer| {
+        identity(peer.participant.pid, peer.participant.role).ok() == Some(peer.participant)
+    });
+    // These ordinary stand-ins belong directly to the test parent. Production
+    // has returned Unconfirmed; only the harness releases and collects them.
+    for peer in &peers {
+        peer.release().unwrap();
+    }
+    let mut rescue_statuses = Vec::new();
+    for child in &mut outcome.unresolved {
+        loop {
+            if let Some(status) = child.collect().unwrap() {
+                rescue_statuses.push(status);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(phase, 2, "parent abandoned custody at ACK expiry");
+    assert!(!changed, "expired window was renewed");
+    assert!(held && outcome.failed);
+    assert_eq!(unconfirmed, 2);
+    assert!(
+        !invented_collection,
+        "harness wait became a production receipt"
+    );
+    assert_eq!(rescue_statuses, [0, 0]);
+    assert!(outcome.events.iter().any(|event| matches!(event, Event::Failed(message) if message == "original cleanup ticket expired")));
+}
 
 /// An idle peer withholds ACKs. When supplied an original Start, it scripts the
 /// concurrent Start/ACK exchange. Its release latch is not a collection receipt.

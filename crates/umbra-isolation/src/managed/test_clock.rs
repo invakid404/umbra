@@ -3,6 +3,24 @@
 //! The development dependency enables this feature for tests. An ordinary role
 //! entry never installs a clock, so it always uses the OS clock.
 use std::{cell::RefCell, io, rc::Rc};
+use umbra_core::managed::{Participant, Ticket};
+
+/// Read-only production guard state for shared-clock runtime qualification.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GuardState {
+    /// Original minimum, or no caller cleanup origin.
+    pub ticket: Option<Ticket>,
+    /// Deadline passed to notification reads, including the unbounded sentinel.
+    pub receive_deadline: u64,
+    /// Sticky protocol failure.
+    pub failed: bool,
+    /// Whether the original total window expired.
+    pub expired: bool,
+    /// Original stage cutoffs already emitted by the production polling loop.
+    pub stage_events: Vec<u64>,
+    /// Routes whose active publication has not received an ACK or failed.
+    pub pending_publication: Vec<Participant>,
+}
 
 type Clock = Rc<dyn Fn() -> io::Result<u64>>;
 thread_local! {

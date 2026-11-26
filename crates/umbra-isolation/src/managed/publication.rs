@@ -167,6 +167,17 @@ impl Publication {
         &self.failures
     }
 
+    /// Inspect live publication state without advancing or acknowledging a route.
+    #[cfg(feature = "test-clock")]
+    pub fn test_pending_peers(&self) -> Vec<Participant> {
+        self.routes
+            .iter()
+            .filter_map(|(route, state)| {
+                matches!(state, State::Writing | State::AwaitingAck).then_some(route.peer)
+            })
+            .collect()
+    }
+
     /// Original notifications committed during this exchange, paired with the
     /// delivering peer. The role loop must retain them for forwarding.
     pub fn received(&self) -> &[(Participant, Start)] {

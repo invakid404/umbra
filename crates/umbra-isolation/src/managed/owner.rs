@@ -347,7 +347,7 @@ impl Owner {
     /// Receive notifications outside an active publication. ACKs use the
     /// original notification cutoff; a route failure cannot clear collection.
     fn poll_notifications(&mut self) -> io::Result<()> {
-        use umbra_core::managed::{ACK_NANOS, CleanupPath, ControlMessage, Ticket};
+        use umbra_core::managed::{CleanupPath, ControlMessage, Ticket, ACK_NANOS};
         let inventory = self.inventory.clone().unwrap_or_else(|| {
             self.routes
                 .iter()
@@ -732,6 +732,20 @@ impl Owner {
         self.tickets.failed()
     }
 
+    /// Inspect the owner's committed minimum during shared-clock qualification.
+    #[cfg(feature = "test-clock")]
+    pub fn test_clock_ticket(&self) -> Option<umbra_core::managed::Ticket> {
+        self.tickets.ticket()
+    }
+
+    /// Routes still awaiting publication completion at the shared-clock barrier.
+    #[cfg(feature = "test-clock")]
+    pub fn test_pending_publication(&self) -> Vec<Participant> {
+        self.publication
+            .as_ref()
+            .map_or_else(Vec::new, Publication::test_pending_peers)
+    }
+
     /// Preserve attribution for custody and the outer run result.
     pub fn failures(&self) -> &[String] {
         &self.failures
@@ -822,7 +836,7 @@ impl Service {
     /// (or a disconnected worker). Expiry never turns into a collection receipt.
     pub fn poll(&mut self) -> io::Result<bool> {
         use std::os::unix::process::ExitStatusExt;
-        use umbra_core::managed::{ACK_NANOS, ControlMessage, ProviderReceipt};
+        use umbra_core::managed::{ControlMessage, ProviderReceipt, ACK_NANOS};
         if let Some(deadline) = self.response_deadline {
             match self.channel.flush(deadline) {
                 Ok(true) => self.response_deadline = None,
@@ -1136,7 +1150,7 @@ mod tests {
             }
         };
         let result = (|| -> io::Result<ExitStatus> {
-            use super::super::{Channel, admission::AdmissionClient};
+            use super::super::{admission::AdmissionClient, Channel};
             use umbra_core::{AdmissionError, AdmissionOperation};
             let (provider_admission, owner_admission) = UnixStream::pair()?;
             owner.install_admission(Channel::new(owner_admission)?)?;
