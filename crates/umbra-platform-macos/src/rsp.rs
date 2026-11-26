@@ -285,7 +285,14 @@ impl Rsp {
         // stdio and the connection it opens after exec, never owner/admission
         // channels or other provider descriptors. CLOEXEC alone leaves those
         // endpoints open during the fork-to-exec interval.
-        let closes = umbra_isolation::spawn::ClosePlan::capture(&[])
+        #[cfg(feature = "managed-endpoint-probe")]
+        let mut probe =
+            crate::endpoint_probe::prepare().map_err(|e| error("debugserver endpoint probe", e))?;
+        #[cfg(feature = "managed-endpoint-probe")]
+        let inspection = probe.as_ref().map(|p| vec![p.fd()]).unwrap_or_default();
+        #[cfg(not(feature = "managed-endpoint-probe"))]
+        let inspection = [];
+        let closes = umbra_isolation::spawn::ClosePlan::capture(&inspection)
             .map_err(|e| error("debugserver descriptor inventory", e))?;
         // `pre_exec` makes `std` fork and exec rather than `posix_spawn`.
         // The precomputed close operations and signals are async-signal-safe.
@@ -293,6 +300,10 @@ impl Rsp {
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
                 closes.close_in_child()?;
+                #[cfg(feature = "managed-endpoint-probe")]
+                if let Some(probe) = &mut probe {
+                    probe.inspect()?;
+                }
                 for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
                     if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
                         return Err(std::io::Error::last_os_error());

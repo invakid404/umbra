@@ -49,6 +49,30 @@ fn main() {
 
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    if std::env::var_os("CARGO_FEATURE_MANAGED_ENDPOINT_PROBE").is_some()
+        && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
+    {
+        println!("cargo:rerun-if-changed=src/endpoint_probe.c");
+        let object = out.join("endpoint_probe.o");
+        run(
+            Command::new("clang")
+                .args(["-arch", "arm64", "-Wall", "-Wextra", "-Werror", "-c"])
+                .arg(manifest.join("src/endpoint_probe.c"))
+                .arg("-o")
+                .arg(&object),
+            "compiling endpoint inspection",
+        );
+        run(
+            Command::new("ar")
+                .arg("crs")
+                .arg(out.join("libumbra_endpoint_probe.a"))
+                .arg(object),
+            "archiving endpoint inspection",
+        );
+        println!("cargo:rustc-link-search=native={}", out.display());
+        println!("cargo:rustc-link-lib=static=umbra_endpoint_probe");
+        println!("cargo:rustc-link-lib=proc");
+    }
     let dylib = out.join("libumbra_interpose.dylib");
 
     let mut clang = Command::new("clang");

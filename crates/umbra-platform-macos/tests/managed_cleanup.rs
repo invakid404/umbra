@@ -78,6 +78,79 @@ fn r2_native_acquisition_ledger() {
 }
 
 fn root_acquisition(capacity: u64) {
+    root_acquisition_observe(capacity, |_| Ok(()));
+}
+
+#[cfg(feature = "managed-endpoint-probe")]
+#[test]
+fn r2_native_debugserver_endpoint_inventory() {
+    use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
+    use umbra_platform_macos::endpoint_probe::{inherited_sockets, Probe};
+    if !qualified() {
+        return;
+    }
+    let sentinel = UnixStream::pair().unwrap();
+    let probe = Probe::new().unwrap();
+    root_acquisition_observe(64, move |handle| {
+        let report = probe.finish().map_err(|e| e.to_string())?;
+        if report.sockets.len() < 2 || report.sockets.iter().any(|s| s.retained_before_exec) {
+            return Err(format!("debugger pre-exec endpoint inventory: {report:?}"));
+        }
+        let parent =
+            inherited_sockets(std::process::id(), &report.sockets).map_err(|e| e.to_string())?;
+        if parent.len() < 2 {
+            return Err("libproc did not identify the live parent admission endpoints".into());
+        }
+        let debugger = inherited_sockets(report.pid, &report.sockets).map_err(|e| e.to_string())?;
+        let root_pid = u32::try_from(handle.0 .0.native_id).map_err(|e| e.to_string())?;
+        let root = inherited_sockets(root_pid, &report.sockets).map_err(|e| e.to_string())?;
+        if !debugger.is_empty() || !root.is_empty() {
+            return Err(format!(
+                "inherited endpoints: debugger={debugger:?} root={root:?}"
+            ));
+        }
+        positive_inheritance(sentinel.0.as_raw_fd(), &report.sockets)?;
+        drop(sentinel);
+        eprintln!("native endpoint identities: {report:?}; parent={parent:?}; debugger/root empty");
+        Ok(())
+    });
+}
+
+#[cfg(feature = "managed-endpoint-probe")]
+fn positive_inheritance(
+    fd: std::os::fd::RawFd,
+    expected: &[umbra_platform_macos::endpoint_probe::Socket],
+) -> std::result::Result<(), String> {
+    use std::{
+        os::unix::process::CommandExt,
+        process::{Command, Stdio},
+    };
+    let mut command = Command::new("/bin/cat");
+    command.stdin(Stdio::piped()).stdout(Stdio::null());
+    // Positive inspection control: only this owned sentinel crosses exec.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let found = umbra_platform_macos::endpoint_probe::inherited_sockets(child.id(), expected);
+    drop(child.stdin.take());
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if !status.success() || !found.map_err(|e| e.to_string())?.contains(&fd) {
+        return Err("libproc failed the cross-process inherited-socket positive control".into());
+    }
+    Ok(())
+}
+
+fn root_acquisition_observe(
+    capacity: u64,
+    observe: impl FnOnce(ProcessHandle) -> std::result::Result<(), String>,
+) {
     if !qualified() {
         return;
     }
@@ -107,10 +180,14 @@ fn root_acquisition(capacity: u64) {
                 .unwrap(),
         ),
     });
-    if let Err(error) = launch {
-        drop(backend);
-        panic!("native launch failed: {error}");
-    }
+    let handle = match launch {
+        Ok(handle) => handle,
+        Err(error) => {
+            drop(backend);
+            panic!("native launch failed: {error}");
+        }
+    };
+    let observed = observe(handle);
     let live_charge = count.load(Ordering::Acquire);
     let start = backend.begin_shutdown(Nonce::new_v4()).unwrap();
     drop(backend);
@@ -122,6 +199,7 @@ fn root_acquisition(capacity: u64) {
     drop(ledger);
     let remaining = service.join().unwrap();
     // Assertions follow actual native teardown and service termination.
+    observed.unwrap();
     assert!(
         live_charge > 0 && live_charge <= capacity,
         "native program and replacement rights must retain bounded charges"

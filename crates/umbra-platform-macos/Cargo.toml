@@ -11,6 +11,8 @@ publish = false
 signal-witness = []
 # Qualification-only allocation witnesses; no fault injection.
 retirement-witness = []
+# Qualification-only pre-exec descriptor observations; no runtime environment switch.
+managed-endpoint-probe = []
 # Independent acquisition and Final-to-exit qualification records.
 shutdown-witness = ["umbra-platform/shutdown-witness"]
 # Mutation probes for the two syscall decode arms this crate owns, on the same

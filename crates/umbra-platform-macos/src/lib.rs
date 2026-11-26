@@ -5,6 +5,12 @@ mod spawn;
 pub use abi::DarwinArm64Abi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod cache;
+#[cfg(all(
+    feature = "managed-endpoint-probe",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+pub mod endpoint_probe;
 /// Publishing the embedded userspace-routing interposer, and its launch contract.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod interpose;
