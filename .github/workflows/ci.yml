@@ -87,6 +87,10 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test -p umbra-isolation --test managed_runtime r2_owner_exit_with_inherited_fd -- --exact --nocapture
 
+      - name: Managed worker fail-stop after publication failure
+        if: runner.os == 'macOS'
+        run: cargo test -p umbra-isolation --test managed_startup r2_ticket_publication_all_writes_fail -- --exact --nocapture
+
       - name: Test contract documentation
         run: cargo test --workspace --doc
 

@@ -3,13 +3,87 @@
 fn main() {}
 #[cfg(target_os = "macos")]
 fn main() {
-    if let Err(error) = run() {
+    let result = if std::env::args().any(|arg| arg == "r2_ticket_publication_all_writes_fail") {
+        r2_ticket_publication_all_writes_fail()
+    } else {
+        run(false)
+    };
+    if let Err(error) = result {
         eprintln!("managed startup: {error}");
         std::process::exit(1);
     }
 }
 #[cfg(target_os = "macos")]
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn r2_ticket_publication_all_writes_fail() -> Result<(), Box<dyn std::error::Error>> {
+    use std::{cell::Cell, os::unix::net::UnixStream, rc::Rc};
+    use umbra_core::managed::{
+        CleanupPath, Role, RunIdentity, Start, Ticket, TicketState, ACK_NANOS,
+    };
+    use umbra_isolation::managed::{
+        boot_nanos,
+        process::identity,
+        publication::{Publication, Route},
+        test_clock, Channel,
+    };
+    // Scripted protocol participants make deadline regressions fail before
+    // launching the real tree below, where an unbounded worker would be unsafe.
+    for lost_writes in [true, false] {
+        let clock = Rc::new(Cell::new(boot_nanos()?));
+        let source = clock.clone();
+        let _scope = test_clock::install(move || Ok(source.get()));
+        let run = RunIdentity {
+            nonce: uuid::Uuid::new_v4(),
+            generation: 1,
+        };
+        let local = identity(std::process::id(), Role::Worker)?;
+        let start = Start {
+            run,
+            origin: local,
+            ticket: Ticket::new(clock.get(), CleanupPath::Failed, 1)?,
+        };
+        let mut tickets = TicketState::new(run, 1)?;
+        let mut routes = Vec::new();
+        let mut silent_peers = Vec::new();
+        for role in [Role::CleanupOwner, Role::Guardian, Role::Relay] {
+            let (writer, reader) = UnixStream::pair()?;
+            routes.push(Route::new(
+                identity(std::process::id(), role)?,
+                Channel::new(writer)?,
+            )?);
+            if lost_writes {
+                drop(reader);
+            } else {
+                silent_peers.push(reader);
+            }
+        }
+        let mut publication =
+            Publication::begin(start.clone(), local, local, &mut tickets, routes)?;
+        if !lost_writes {
+            assert!(!publication.progress(&mut tickets)?);
+            clock.set(start.ticket.started + ACK_NANOS);
+        }
+        assert!(
+            publication.progress(&mut tickets)?,
+            "publication did not terminate at the original combined ACK cutoff"
+        );
+        assert_eq!(
+            publication.failures().len(),
+            3,
+            "publication failure was hidden"
+        );
+        assert_eq!(
+            tickets.ticket(),
+            Some(start.ticket),
+            "publication renewed its ticket"
+        );
+    }
+    run(true)?;
+    println!("r2_ticket_publication_all_writes_fail: actual parent collection and worker fail-stop passed");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run(fail_stop: bool) -> Result<(), Box<dyn std::error::Error>> {
     use std::{
         collections::BTreeMap,
         process::{Command, Stdio},
@@ -108,7 +182,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(owner) => owner,
                 Err((error, mut child, control, _)) => {
                     drop(control);
-                    let _ = child.kill();
+                    // The ordinary cat fixture exits on this EOF. This wait is
+                    // startup rescue, not a production collection receipt.
                     let _ = child.wait();
                     return Err(error.into());
                 }
@@ -241,14 +316,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(mut owner) = owner_runtime {
             let result = (|| -> std::io::Result<()> {
+                let mut original = None;
                 loop {
-                    if let Some(status) = owner.progress()? {
+                    let status = owner.progress()?;
+                    if let Some(ticket) = owner.test_clock_ticket() {
+                        if original.is_some_and(|prior| prior != ticket) {
+                            return Err(std::io::Error::other("owner renewed its cleanup ticket"));
+                        }
+                        original = Some(ticket);
+                    }
+                    if let Some(status) = status {
+                        let ticket = original.ok_or_else(|| {
+                            std::io::Error::other("provider collection lacked owner cleanup Start")
+                        })?;
                         assert!(status.success());
                         assert!(owner.failed(), "worker loss must remain a failed run");
                         assert!(owner
                             .failures()
                             .iter()
                             .any(|reason| reason.contains("Worker exit")));
+                        let provider = entry
+                            .inventory()
+                            .unwrap()
+                            .members
+                            .iter()
+                            .find(|member| member.participant.role == Role::Provider)
+                            .unwrap()
+                            .participant;
+                        let mut raw = 0;
+                        let result =
+                            unsafe { libc::waitpid(provider.pid as i32, &mut raw, libc::WNOHANG) };
+                        if result != -1
+                            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD)
+                        {
+                            return Err(std::io::Error::other(
+                                "production owner omitted actual provider parent wait",
+                            ));
+                        }
+                        println!("managed startup: owner cleanup Start {ticket:?}; actual provider wait {status}");
                         return Ok(());
                     }
                     if boot_nanos()? >= deadline + 5_000_000_000 {
@@ -258,11 +363,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })();
             let mut child = owner.into_child();
-            if result.is_err() {
-                let _ = child.kill();
-            }
-            child.wait()?;
+            // Consuming Owner closes the fixture cat's last input endpoint.
+            // Preserve the production error even if the rescue wait differs.
+            let waited = child.wait();
             result?;
+            waited?;
         }
         if let Some(mut guard) = parent_runtime.take() {
             guard.adopt_ready_children(&mut children)?;
@@ -319,7 +424,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let marker_dir = tempfile::tempdir()?;
     let marker = marker_dir.path().join("worker-destructor");
-    if std::env::var_os("UMBRA_MANAGED_FAIL_STOP").is_some() {
+    if fail_stop || std::env::var_os("UMBRA_MANAGED_FAIL_STOP").is_some() {
         launch.dispatch = "inventory-go".into();
         launch.payload = marker.to_str().unwrap().as_bytes().to_vec();
     } else if std::env::var_os("UMBRA_MANAGED_STARTUP_SUCCESS").is_some() {
