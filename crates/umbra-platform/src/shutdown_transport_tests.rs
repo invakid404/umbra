@@ -559,7 +559,7 @@ fn affinity_failure_paths(failures: &[Failure]) {
 }
 
 #[test]
-fn shutdown_poll_preserves_deadlines() {
+fn r2_grace_exhaustion_is_loud() {
     let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
     let start = std::time::Instant::now();
     let clock = Arc::new(Mutex::new(start));
@@ -638,6 +638,66 @@ fn shutdown_poll_preserves_deadlines() {
     assert!(error.context.contains("owner-progress failure"));
     release_tx.send(()).unwrap();
     assert!(owner.join().unwrap().is_err());
+    late_terminal_cannot_restore_success();
+}
+
+fn late_terminal_cannot_restore_success() {
+    // Queue an explicitly late model result before polling so scheduling cannot
+    // substitute an empty-channel timeout for the late-completion check.
+    let ledger = Ledger::new();
+    crate::shutdown::collected_model_root(&ledger);
+    let nonce = Nonce::new_v4();
+    let accepted = ledger.freeze(nonce, Duration::from_secs(5)).unwrap();
+    let generation = accepted.generation;
+    let final_state = ledger.final_snapshot().unwrap();
+    assert!(accepted.confirms(&final_state).unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let completed_at = deadline + Duration::from_secs(1);
+    let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (accepted_tx, _accepted_rx) = mpsc::sync_channel(1);
+    let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
+    terminal_tx.send((completed_at, Ok(final_state))).unwrap();
+    let owner = std::thread::spawn(move || {
+        CLOCK.with(|value| *value.borrow_mut() = Some(Arc::new(Mutex::new(completed_at))));
+        serve_polls(
+            Handoff {
+                connection: Connection::new(right, Duration::from_secs(1)),
+                accepted,
+                ledger,
+                request_id: 1,
+                owner_deadline: deadline,
+            },
+            accepted_tx,
+            terminal_rx,
+        )
+    });
+    let mut connection = Connection::new(left, Duration::from_secs(1));
+    assert!(matches!(
+        connection.receive::<Frame>().unwrap(),
+        Frame::Response {
+            id: 1,
+            result: Ok(_)
+        }
+    ));
+    let result = call(
+        &mut connection,
+        2,
+        Request::PollShutdown {
+            nonce,
+            generation,
+            max_wait_ms: 1,
+        },
+    );
+    let outcome = owner.join().unwrap();
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("late completion manufactured successful closure"),
+    };
+    assert!(error.context.contains("owner-progress failure"));
+    assert!(
+        outcome.is_err(),
+        "late completion erased the failed outcome"
+    );
 }
 
 /// #205: `close_client`'s unconfirmed-Final error names each unconfirmed

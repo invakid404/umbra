@@ -95,7 +95,7 @@ fn r2_library_received_start_forwarded_before_origin_exit() {
 }
 
 #[test]
-fn r2_total_publication_loss_expired_window_unconfirmed() {
+fn r2_grace_exhaustion_is_loud() {
     let clock = SharedClock::new(boot_nanos().unwrap());
     let _scope = clock.install();
     let run = RunIdentity {
