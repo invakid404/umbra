@@ -22,8 +22,20 @@ use umbra_isolation::managed::{
 #[path = "support/runtime_clock.rs"]
 mod runtime_clock;
 use runtime_clock::SharedClock;
+#[path = "support/late_acquisition.rs"]
+mod late_acquisition;
 #[path = "support/runtime_tree.rs"]
 mod runtime_tree;
+
+#[test]
+fn r2_creator_past_tail() {
+    late_acquisition::run(true);
+}
+
+#[test]
+fn r2_acquire_after_expired_outer_census() {
+    late_acquisition::run(false);
+}
 
 #[test]
 fn runtime_tree_child() {
