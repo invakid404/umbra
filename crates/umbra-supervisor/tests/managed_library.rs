@@ -115,8 +115,8 @@ fn main() {
             providers,
         },
         launch: RunLaunch::Command(CommandLaunch {
-            executable: BytePath::new(b"/bin/true".to_vec()).unwrap(),
-            argv: vec![b"/bin/true".to_vec()],
+            executable: BytePath::new(b"/usr/bin/true".to_vec()).unwrap(),
+            argv: vec![b"/usr/bin/true".to_vec()],
             environment: vec![],
             cwd: BytePath::new(b"/".to_vec()).unwrap(),
         }),
