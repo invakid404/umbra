@@ -1508,6 +1508,25 @@ mod unix {
             }
         }
         if let Some(mut primary) = failure {
+            // A logical run error does not erase independently confirmed
+            // process collection. Resolve custody before releasing the writer,
+            // while retaining the original failure and omitting `finished`.
+            #[cfg(target_os = "macos")]
+            if let (crate::namespace_owner::NamespaceOwner::Managed(owner), Some(terminal)) =
+                (&mut namespace, closure.managed.as_ref())
+            {
+                if !closure_failed {
+                    let root_result = match outcome.root_status {
+                        Some(ExitStatus::Code(code)) => code,
+                        Some(ExitStatus::Signal(signal)) => 128_i32.saturating_add(signal),
+                        None => i32::MIN,
+                    };
+                    match owner.finish_terminal(terminal, root_result) {
+                        Ok(_) => return Err(primary),
+                        Err(cleanup) => primary = with_cleanup(primary, Err(cleanup)),
+                    }
+                }
+            }
             if closure_failed {
                 if let Some(journal) = terminal_journal {
                     primary = with_cleanup(primary, journal.recovery_required());

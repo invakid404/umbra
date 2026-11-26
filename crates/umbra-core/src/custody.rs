@@ -19,7 +19,9 @@ pub struct CustodyFinishProof {
     pub creators_terminal: bool,
     /// No failed or unsettled cleanup remains.
     pub cleanup_confirmed: bool,
-    /// Root outcome committed with the namespace.
+    /// Root outcome committed with the namespace. `i32::MIN` denotes a
+    /// supervisor failure without an observed root outcome; it does not assert
+    /// a tracee exit status.
     pub root_result: i32,
 }
 
