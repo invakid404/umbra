@@ -516,7 +516,7 @@ impl Client {
 
     /// Validate provider registration and establish a private protocol session.
     pub fn connect(descriptor: &ProviderDescriptor, timeout_ms: u64) -> Result<Self> {
-        Self::connect_with_custody(descriptor, timeout_ms, None, |_| Ok(()))
+        Self::connect_with_custody(descriptor, timeout_ms, None, None, |_| Ok(()))
     }
 
     /// Connect from the cleanup-owner process, retaining its child on every error.
@@ -544,13 +544,34 @@ impl Client {
         if custody.is_some() {
             return Err(protocol_error("provider custody slot already occupied"));
         }
-        Self::connect_with_custody(descriptor, timeout_ms, Some(custody), configure)
+        Self::connect_with_custody(descriptor, timeout_ms, Some(custody), None, configure)
+    }
+
+    /// Apply the inherited readiness cutoff without changing subsequent RPC budgets.
+    pub fn connect_managed_configured_until(
+        descriptor: &ProviderDescriptor,
+        timeout_ms: u64,
+        readiness_deadline: Instant,
+        custody: &mut Option<Child>,
+        configure: impl FnOnce(&mut Command) -> std::io::Result<()>,
+    ) -> Result<Self> {
+        if custody.is_some() {
+            return Err(protocol_error("provider custody slot already occupied"));
+        }
+        Self::connect_with_custody(
+            descriptor,
+            timeout_ms,
+            Some(custody),
+            Some(readiness_deadline),
+            configure,
+        )
     }
 
     fn connect_with_custody(
         descriptor: &ProviderDescriptor,
         timeout_ms: u64,
         custody: Option<&mut Option<Child>>,
+        readiness_deadline: Option<Instant>,
         configure: impl FnOnce(&mut Command) -> std::io::Result<()>,
     ) -> Result<Self> {
         descriptor.validate(&descriptor.role)?;
@@ -559,10 +580,11 @@ impl Client {
         }
         let timeout = Duration::from_millis(timeout_ms);
         // Managed startup spends one allowance across preparation, spawn,
-        // socket acceptance and Hello/Welcome. The owner passed only the
-        // remaining portion of its shared readiness allocation.
+        // socket acceptance and Hello/Welcome. Ongoing RPCs retain their
+        // configured timeout independently of this startup cutoff.
         let managed = custody.is_some();
-        let managed_deadline = managed.then(|| Instant::now() + timeout);
+        let managed_deadline =
+            managed.then(|| readiness_deadline.unwrap_or_else(|| Instant::now() + timeout));
         let directory = tempfile::Builder::new()
             .prefix("umbra-provider-")
             .tempdir()
@@ -1283,6 +1305,45 @@ mod tests {
         connection.cap_cleanup_deadline(earlier);
         connection.begin();
         assert_eq!(connection.deadline(), earlier);
+    }
+
+    #[test]
+    fn managed_readiness_does_not_replace_configured_rpc_timeout() {
+        let descriptor = managed_stall_descriptor();
+        let mut custody = None;
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let result = Client::connect_managed_configured_until(
+            &descriptor,
+            20_000,
+            deadline,
+            &mut custody,
+            |command| {
+                let args: Vec<_> = command.get_args().collect();
+                assert!(args
+                    .windows(2)
+                    .any(|pair| pair[0] == "--umbra-timeout-ms" && pair[1] == "20000"));
+                Err(std::io::Error::other("checked RPC timeout before spawn"))
+            },
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("checked RPC timeout"));
+        assert!(custody.is_none());
+        let expired = Client::connect_managed_configured_until(
+            &descriptor,
+            20_000,
+            Instant::now() - Duration::from_millis(1),
+            &mut custody,
+            |_| Ok(()),
+        );
+        assert!(expired
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("readiness expired before spawn"));
+        assert!(custody.is_none());
     }
 
     #[test]

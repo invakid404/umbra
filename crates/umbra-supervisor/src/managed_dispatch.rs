@@ -26,7 +26,7 @@ pub fn owner(
 ) -> io::Result<()> {
     if service.is_none() {
         let descriptor = input.platform().map_err(io::Error::other)?;
-        while !startup.poll(descriptor, external_caller)? {
+        while !startup.poll(descriptor, external_caller, input.timeout_ms())? {
             tick();
         }
         *service = Some(startup.take_service()?);
@@ -35,7 +35,9 @@ pub fn owner(
         tick();
     }
     if service.as_ref().unwrap().failed() {
-        Err(io::Error::other("cleanup owner collected after failed cleanup"))
+        Err(io::Error::other(
+            "cleanup owner collected after failed cleanup",
+        ))
     } else {
         Ok(())
     }
@@ -49,7 +51,7 @@ pub fn worker_ready(
     external_caller: bool,
 ) -> io::Result<()> {
     let descriptor = input.platform().map_err(io::Error::other)?;
-    while !startup.poll(descriptor, 5_000, external_caller)? {
+    while !startup.poll(descriptor, input.timeout_ms(), external_caller)? {
         tick();
     }
     Ok(())

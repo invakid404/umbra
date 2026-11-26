@@ -185,11 +185,12 @@ impl OwnerStartup {
         &mut self,
         descriptor: &umbra_core::provider::ProviderDescriptor,
         external_caller: bool,
+        timeout_ms: u64,
     ) -> io::Result<bool> {
         if self.failed {
             return Err(invalid("owner startup already failed"));
         }
-        let result = self.progress(descriptor, external_caller);
+        let result = self.progress(descriptor, external_caller, timeout_ms);
         if result.is_err() {
             self.failed = true;
         }
@@ -200,6 +201,7 @@ impl OwnerStartup {
         &mut self,
         descriptor: &umbra_core::provider::ProviderDescriptor,
         external_caller: bool,
+        timeout_ms: u64,
     ) -> io::Result<bool> {
         match self.phase {
             0 => {
@@ -220,7 +222,8 @@ impl OwnerStartup {
                 let endpoint = self.entry.endpoints.remove(*index);
                 self.control = Some(Channel::new(endpoint.stream)?);
                 let (handoff, provider) =
-                    self.entry.connect_provider(&mut self.launch, descriptor)?;
+                    self.entry
+                        .connect_provider(&mut self.launch, descriptor, timeout_ms)?;
                 self.handoff = Some(handoff);
                 self.bootstrap = Some(Bootstrap::with_provider(provider)?);
                 self.phase = 1;

@@ -104,6 +104,11 @@ impl ManagedRunInput {
         self.run_id
     }
 
+    /// Registry RPC timeout shared by the owner handshake and worker client.
+    pub fn timeout_ms(&self) -> u64 {
+        self.registry.timeout_ms
+    }
+
     /// Resolve the same platform descriptor in cleanup-owner and worker roles.
     pub fn platform(&self) -> Result<&umbra_core::provider::ProviderDescriptor> {
         self.registry.get("platform")

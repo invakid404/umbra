@@ -85,18 +85,30 @@ impl Launch {
         readiness_deadline: u64,
         configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
     ) -> io::Result<Handoff> {
+        self.connect_configured_with_timeout(descriptor, readiness_deadline, 5_000, configure)
+    }
+
+    /// Keep configured RPC timeout distinct from the absolute startup cutoff.
+    pub fn connect_configured_with_timeout(
+        &mut self,
+        descriptor: &umbra_core::provider::ProviderDescriptor,
+        readiness_deadline: u64,
+        timeout_ms: u64,
+        configure: impl FnOnce(&mut std::process::Command) -> io::Result<()>,
+    ) -> io::Result<Handoff> {
         if self.attempted {
             return Err(invalid("provider launch already attempted"));
         }
         self.attempted = true;
+        let readiness_origin = std::time::Instant::now();
         let remaining = readiness_deadline.saturating_sub(boot_nanos()?);
-        let timeout_ms = remaining / 1_000_000;
-        if timeout_ms == 0 {
+        if remaining == 0 {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        let client = umbra_core::provider::Client::connect_managed_configured(
+        let client = umbra_core::provider::Client::connect_managed_configured_until(
             descriptor,
-            timeout_ms.min(60_000),
+            timeout_ms,
+            readiness_origin + std::time::Duration::from_nanos(remaining),
             &mut self.child,
             configure,
         )

@@ -387,6 +387,7 @@ impl Entry {
         &mut self,
         launch: &mut super::owner::Launch,
         descriptor: &umbra_core::provider::ProviderDescriptor,
+        timeout_ms: u64,
     ) -> io::Result<(
         super::owner::Handoff,
         super::provider_startup::ProviderStartup,
@@ -440,8 +441,11 @@ impl Entry {
         }
         let mut fds: Vec<_> = spec.endpoints.iter().map(|endpoint| endpoint.fd).collect();
         fds.push(spec.bootstrap);
-        let handoff =
-            launch.connect_configured(descriptor, self.readiness_deadline, |command| {
+        let handoff = launch.connect_configured_with_timeout(
+            descriptor,
+            self.readiness_deadline,
+            timeout_ms,
+            |command| {
                 command
                     .env_remove(crate::ENV_GUARDIAN)
                     .env(ENV_ROLE, encoded);
@@ -461,7 +465,8 @@ impl Entry {
                     });
                 }
                 Ok(())
-            })?;
+            },
+        )?;
         drop(endpoints);
         drop(child_bootstrap);
         let startup = super::provider_startup::ProviderStartup::new(
