@@ -107,7 +107,10 @@ jobs:
 
       - name: Managed worker fail-stop after publication failure
         if: runner.os == 'macOS'
-        run: cargo test -p umbra-isolation --test managed_startup r2_ticket_publication_all_writes_fail -- --exact --nocapture
+        run: |
+          cargo test -p umbra-isolation --test managed_startup r2_ticket_publication_all_writes_fail -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_startup custody_abrupt_owner_exit_reaps_all -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_startup custody_panic_reaps_all -- --exact --nocapture
 
       - name: Independent cancellation of accepted ordinary work
         if: runner.os == 'macOS'

@@ -5,14 +5,87 @@ fn main() {}
 fn main() {
     let result = if std::env::args().any(|arg| arg == "r2_ticket_publication_all_writes_fail") {
         r2_ticket_publication_all_writes_fail()
+    } else if std::env::args().any(|arg| arg == "custody_abrupt_owner_exit_reaps_all") {
+        custody_abrupt_owner_exit_reaps_all()
+    } else if std::env::args().any(|arg| arg == "custody_panic_reaps_all") {
+        custody_panic_reaps_all()
     } else {
-        run(false)
+        run(None)
     };
     if let Err(error) = result {
         eprintln!("managed startup: {error}");
         std::process::exit(1);
     }
 }
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+enum WorkerFailure {
+    PublicationLoss,
+    Abrupt,
+    NotificationPanic,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FailurePayload {
+    marker: std::path::PathBuf,
+    kind: WorkerFailure,
+}
+
+#[cfg(target_os = "macos")]
+fn custody_abrupt_owner_exit_reaps_all() -> Result<(), Box<dyn std::error::Error>> {
+    use umbra_core::managed::{Participant, Role, RunIdentity};
+    use umbra_isolation::managed::inventory::{Inventory, Member};
+    let roles = [
+        Role::Relay,
+        Role::Guardian,
+        Role::Worker,
+        Role::CleanupOwner,
+        Role::Provider,
+    ];
+    let peers: Vec<_> = roles
+        .into_iter()
+        .enumerate()
+        .map(|(index, role)| Participant {
+            role,
+            pid: 100 + index as u32,
+            birth: (1, 0),
+        })
+        .collect();
+    let mut inventory = Inventory {
+        run: RunIdentity {
+            nonce: uuid::Uuid::new_v4(),
+            generation: 1,
+        },
+        external_caller: false,
+        members: peers
+            .iter()
+            .enumerate()
+            .map(|(index, participant)| Member {
+                participant: *participant,
+                parent: [None, Some(0), Some(1), Some(1), Some(3)][index]
+                    .map(|parent| peers[parent]),
+            })
+            .collect(),
+    };
+    // Pure protocol preflight before any live child: the cleanup owner must
+    // survive worker loss as its sibling, never as the worker's child.
+    inventory.test_validate_topology(inventory.run, false)?;
+    inventory.members[3].parent = Some(peers[2]);
+    assert!(
+        inventory
+            .test_validate_topology(inventory.run, false)
+            .is_err(),
+        "cleanup owner was allowed beneath the worker"
+    );
+    run(Some(WorkerFailure::Abrupt))
+}
+
+#[cfg(target_os = "macos")]
+fn custody_panic_reaps_all() -> Result<(), Box<dyn std::error::Error>> {
+    run(Some(WorkerFailure::NotificationPanic))
+}
+
 #[cfg(target_os = "macos")]
 fn r2_ticket_publication_all_writes_fail() -> Result<(), Box<dyn std::error::Error>> {
     use std::{cell::Cell, os::unix::net::UnixStream, rc::Rc};
@@ -77,13 +150,13 @@ fn r2_ticket_publication_all_writes_fail() -> Result<(), Box<dyn std::error::Err
             "publication renewed its ticket"
         );
     }
-    run(true)?;
+    run(Some(WorkerFailure::PublicationLoss))?;
     println!("r2_ticket_publication_all_writes_fail: actual parent collection and worker fail-stop passed");
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn run(fail_stop: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run(failure: Option<WorkerFailure>) -> Result<(), Box<dyn std::error::Error>> {
     use std::{
         collections::BTreeMap,
         process::{Command, Stdio},
@@ -252,6 +325,7 @@ fn run(fail_stop: bool) -> Result<(), Box<dyn std::error::Error>> {
                 drop(arming.into_channel());
             }
         }
+        let mut worker_authority_matches = true;
         loop {
             match entry.await_go(deadline + 5_000_000_000) {
                 Ok(false) => tick(),
@@ -262,7 +336,8 @@ fn run(fail_stop: bool) -> Result<(), Box<dyn std::error::Error>> {
                     break
                 }
                 Ok(true) if entry.launch.dispatch == "inventory-go" => {
-                    assert_eq!(entry.worker_boundary().is_ok(), entry.role == Role::Worker);
+                    worker_authority_matches =
+                        entry.worker_boundary().is_ok() == (entry.role == Role::Worker);
                     for child in &mut children {
                         while !entry.forward_go(child, deadline + 5_000_000_000)? {
                             tick();
@@ -275,13 +350,23 @@ fn run(fail_stop: bool) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if !entry.launch.payload.is_empty() && entry.role == Role::Worker {
+            assert!(
+                worker_authority_matches,
+                "worker lacked registered fail-stop authority"
+            );
             struct Marker(std::path::PathBuf);
             impl Drop for Marker {
                 fn drop(&mut self) {
                     std::fs::write(&self.0, b"unwound").unwrap();
                 }
             }
-            let _marker = Marker(String::from_utf8(entry.launch.payload.clone())?.into());
+            let payload: FailurePayload = serde_json::from_slice(&entry.launch.payload)?;
+            let _marker = Marker(payload.marker);
+            if matches!(payload.kind, WorkerFailure::Abrupt) {
+                // Only the registered worker exits. Its sibling cleanup owner
+                // and both ancestors retain their actual child handles.
+                unsafe { libc::_exit(1) }
+            }
             let inventory = entry.inventory().unwrap().clone();
             let participant = |role| {
                 inventory
@@ -312,6 +397,12 @@ fn run(fail_stop: bool) -> Result<(), Box<dyn std::error::Error>> {
                 "fixture",
                 "injected total publication loss",
             );
+            let _panic_clock =
+                matches!(payload.kind, WorkerFailure::NotificationPanic).then(|| {
+                    umbra_isolation::managed::test_clock::install(|| {
+                        panic!("controlled worker notification panic");
+                    })
+                });
             entry.worker_boundary()?.fail_stop(&mut cleanup, &failure)?;
         }
         if let Some(mut owner) = owner_runtime {
@@ -370,6 +461,7 @@ fn run(fail_stop: bool) -> Result<(), Box<dyn std::error::Error>> {
             waited?;
         }
         if let Some(mut guard) = parent_runtime.take() {
+            let rejected_worker_authority = entry.worker_boundary().is_err();
             guard.adopt_ready_children(&mut children)?;
             let outcome = guard.run_parent();
             assert!(
@@ -389,6 +481,10 @@ fn run(fail_stop: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             assert_eq!(collected, 2);
+            assert!(
+                rejected_worker_authority,
+                "guardian acquired worker-only fail-stop authority"
+            );
         }
         if entry.launch.dispatch != "inventory-go" {
             rollback(std::mem::take(&mut children), deadline + 4_000_000_000)?;
@@ -417,6 +513,10 @@ fn run(fail_stop: bool) -> Result<(), Box<dyn std::error::Error>> {
                 tick();
             }
         }
+        assert!(
+            worker_authority_matches,
+            "registered role received wrong worker fail-stop authority"
+        );
         return Ok(());
     }
     let mut launch: LaunchConfiguration = serde_json::from_str(
@@ -424,9 +524,14 @@ fn run(fail_stop: bool) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let marker_dir = tempfile::tempdir()?;
     let marker = marker_dir.path().join("worker-destructor");
-    if fail_stop || std::env::var_os("UMBRA_MANAGED_FAIL_STOP").is_some() {
+    if let Some(kind) = failure.or_else(|| {
+        std::env::var_os("UMBRA_MANAGED_FAIL_STOP").map(|_| WorkerFailure::PublicationLoss)
+    }) {
         launch.dispatch = "inventory-go".into();
-        launch.payload = marker.to_str().unwrap().as_bytes().to_vec();
+        launch.payload = serde_json::to_vec(&FailurePayload {
+            marker: marker.clone(),
+            kind,
+        })?;
     } else if std::env::var_os("UMBRA_MANAGED_STARTUP_SUCCESS").is_some() {
         launch.dispatch = "inventory-go".into();
     }

@@ -146,6 +146,46 @@ impl Inventory {
 
     /// Verify exact role coverage, distinct PIDs and every kernel parent edge.
     pub fn validate(&self, run: RunIdentity, external_caller: bool) -> io::Result<()> {
+        self.validate_topology(run, external_caller)?;
+        // Preserve the root-to-provider kernel validation order. Structural
+        // validity alone never authorizes readiness or GO.
+        for role in [
+            Role::Caller,
+            Role::Relay,
+            Role::Guardian,
+            Role::Worker,
+            Role::CleanupOwner,
+            Role::Provider,
+        ] {
+            if role == Role::Caller && !external_caller {
+                continue;
+            }
+            let member = self
+                .members
+                .iter()
+                .find(|member| member.participant.role == role)
+                .ok_or_else(|| invalid("missing startup role"))?;
+            let (found, parent_pid) = process::identity_with_parent(member.participant.pid, role)?;
+            if found != member.participant
+                || member.parent.is_some_and(|parent| parent.pid != parent_pid)
+            {
+                return Err(invalid("startup inventory kernel identity mismatch"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Protocol-only preflight for mutation tests; this cannot authorize GO.
+    #[cfg(feature = "test-clock")]
+    pub fn test_validate_topology(
+        &self,
+        run: RunIdentity,
+        external_caller: bool,
+    ) -> io::Result<()> {
+        self.validate_topology(run, external_caller)
+    }
+
+    fn validate_topology(&self, run: RunIdentity, external_caller: bool) -> io::Result<()> {
         run.validate().map_err(invalid)?;
         if self.run != run
             || self.external_caller != external_caller
@@ -188,10 +228,6 @@ impl Inventory {
             };
             if member.parent != expected_parent {
                 return Err(invalid("startup inventory parent edge mismatch"));
-            }
-            let (found, parent_pid) = process::identity_with_parent(member.participant.pid, role)?;
-            if found != member.participant || expected_parent.is_some_and(|p| p.pid != parent_pid) {
-                return Err(invalid("startup inventory kernel identity mismatch"));
             }
         }
         Ok(())
