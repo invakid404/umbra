@@ -1,15 +1,16 @@
 # umbra-supervisor
 
-Synchronous run composition and the debug-control event loop. **Runtime
-dependencies remain `umbra-core`, the five contracts, `tracing` and `uuid` only.**
+Synchronous run composition and the debug-control event loop. Runtime
+dependencies include `umbra-core`, the five contracts, and, on macOS,
+`umbra-isolation` for managed process ownership.
 `umbra-storage-local` and `umbra-journal-file` are dev-dependencies: the
 integration tests bind a real overlay over real storage on tempdirs, and build a
 run's durable journal state directly before reopening it. The suites that spawn
 the real provider executables skip when those are absent, and fail instead under
 `UMBRA_INTEGRATION_REQUIRED` (`tests/reopen.rs:38-67`).
-This crate owns `src/lib.rs`, `src/run.rs`, `src/events.rs`, `src/ofd.rs`,
-`src/base.rs`, `src/sandbox.rs`, `src/directory.rs`, `src/filesystem.rs`,
-`src/spawn.rs`, `src/shutdown_journal.rs` and its manifest. `directory.rs` holds the
+This document covers the crate's manifest, `src/` and tests, including managed
+dispatch, observer forwarding, namespace custody and finish arbitration.
+`directory.rs` holds the
 `DirectoryEncoder` the overlay requires for `FsOp::ReadDir`: the engine resolves
 the merged entries and this side turns them into the native records the tracee's
 `getattrlistbulk` reply expects, using the wire format in `umbra_platform::dirents`
@@ -21,7 +22,16 @@ It links no backend and selects none: storage,
 journal, platform and agent arrive as contracts, and backend choice stays in
 registry descriptors.
 
-`umbra_supervisor::run(spec)` executes one command run end to end.
+`umbra_supervisor::run(spec)` retains the unarmed synchronous composition path.
+On macOS, managed library callers register helper entry and use
+`RegisteredRole::prepare` with `external_caller=true`, followed by `execute`;
+registration alone does not change the plain `run` call. The relay and guardian
+collect their children, while a separate cleanup
+owner retains the platform connection through worker failure. The worker
+persists Armed custody before launch and requires validated closure and actual
+provider collection before preparing durable completion. See
+[managed isolation](../umbra-isolation/README.md) for registration, bounds and
+failure guarantees.
 `umbra_supervisor::resume(spec)` — also reachable as `Supervisor::resume`, and as
 `Supervisor::recover`, which is the same call — reopens an existing run and
 reports whether what the last session left can be reconciled. Checkpoint and
@@ -117,14 +127,18 @@ The staged order is fixed, and each stage's failure decides what may be released
    stdin/stdout references. The default leaves embedding callers' originals
    unchanged; stderr remains available for CLI diagnostics. Provider stdin/stdout
    remain null. The platform consumes its received copies at root spawn.
-   Ordinary and hostile-payload unwinds from `stdio_adopted` follow preparation
-   failure cleanup: close the journal and release writer ownership before
-   returning `run.observer`. As with `prepared`, this contains unwinding panics,
-   not a process configured to abort on panic.
+   Ordinary and hostile-payload unwinds from `stdio_adopted` become
+   `run.observer` errors. Once Armed, managed failure handling retains unresolved
+   custody; the unarmed preparation path closes the journal and releases writer
+   ownership. As with `prepared`, this contains unwinding panics, not a process
+   configured to abort on panic.
 7. Drive events, then consume the platform session through confirmed shutdown:
    freeze its resource inventory, validate every final disposition after backend
-   destruction, and collect the owned provider process. Only then flush run data, append and flush a
-   completion record, close the journal, release the writer, close storage.
+   destruction, and collect the owned provider process. Managed finalization
+   uses PrepareFinish and CommitCustody with the same terminal certificate.
+   PrepareFinish flushes data and the durable decision; CommitCustody records
+   Complete before releasing writer authority. The unarmed path retains
+   `finish_run` and its completion record.
 
 A qualified signal event is resumed with the exact backend-issued token. The
 supervisor does not infer a disposition or retry a failed delivery. Handlers use
@@ -143,13 +157,14 @@ A failed launch uses the same shutdown barrier. The legacy
 
 `RunObserver::prepared` returns `Result<()>`. It runs after namespace preparation
 and the platform capability handshake, before target launch. A returned error or
-an unwind panic enters normal namespace failure cleanup with a proven-empty
-launch tree: close
-the journal, release the writer and close storage. Cleanup errors append to the
-original error; no completion record, `finished`, or teardown-warning callback
-is produced. A caught panic has a fixed diagnostic; its arbitrary payload is
+an unwind panic enters failure cleanup. An Armed managed namespace remains
+recovery-only unless its terminal custody proof is completed; an unarmed
+namespace can release its writer with a proven-empty launch tree. No `finished`
+or teardown-warning callback is produced. A caught panic has a fixed diagnostic; its arbitrary payload is
 neither formatted nor dropped, preventing a second panic from interrupting
-cleanup. Other observer callbacks retain their existing behaviour.
+cleanup. A terminal callback unwind fails the managed observer exchange while
+parent guards continue collecting their children. The unarmed path lets it
+unwind.
 
 A preliminary termination error may be superseded by a complete shutdown proof
 and provider collection; its diagnostic remains a teardown warning. Missing or
@@ -160,8 +175,12 @@ collection fails. Loop errors stay primary, with closure diagnostics appended.
 Before failure cleanup, a supervisor-private forwarding journal appends and
 flushes the existing `RecoveryRequired` marker when platform closure fails.
 Marker-write failures remain errors and cannot permit completion. A loop refusal
-with confirmed closure does not add that marker. No journal format changes.
-`RunObserver::finished` runs only after `finish_run` succeeds. A finish error
+with confirmed closure does not add that marker. Managed custody records are
+additional durable transitions. A logical loop failure may still complete
+cleanup custody when independent terminal proof exists, while returning the
+original error and suppressing `finished`.
+`RunObserver::finished` runs only after managed custody commit or unarmed
+`finish_run` succeeds. A finish error
 enters namespace failure cleanup; an error after a durable completion record
 cannot erase that record and still suppresses the success callback.
 

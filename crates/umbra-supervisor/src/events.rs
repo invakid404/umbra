@@ -1926,8 +1926,9 @@ impl Supervisor {
 
     /// Terminate the whole supervised tree and reap it.
     ///
-    /// Returns success only when the platform confirms termination; the caller
-    /// uses that confirmation to decide whether writer authority may be released.
+    /// Returns the platform's preliminary termination result. Final shutdown
+    /// inventory and parent collection are still required before releasing writer
+    /// authority; this result alone cannot establish closure.
     pub fn terminate_tree(&mut self, policy: TerminationPolicy) -> Result<()> {
         self.filesystem_queries.clear();
         let Some(process) = self.state.processes.root else {

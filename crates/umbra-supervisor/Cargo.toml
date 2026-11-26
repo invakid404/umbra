@@ -57,7 +57,7 @@ umbra-isolation = { path = "../umbra-isolation" }
 libc = "=0.2.191"
 tempfile.workspace = true
 # `tests/kernel_refusal.rs` binds a real `Overlay` to real storage on
-# tempdirs; this is the only backend a test target here selects.
+# tempdirs. Routed custody tests select storage through a provider descriptor.
 umbra-storage-local = { path = "../umbra-storage-local" }
 # `tests/reopen.rs` builds a run's durable journal state directly, then reopens
 # it through the real provider executables, so it needs the backend as a library

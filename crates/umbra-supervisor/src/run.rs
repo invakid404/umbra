@@ -129,14 +129,16 @@ pub trait RunObserver {
     }
     /// Called once, after preparation succeeds and before the target launches.
     ///
-    /// Returning `Err` aborts before launch through failure cleanup with
-    /// `tree_terminated=true`, because no target has launched. A caught unwind
+    /// Returning `Err` aborts before launch. Unarmed failure cleanup uses
+    /// `tree_terminated=true`; Armed managed custody remains unresolved until
+    /// independently confirmed terminal proof is available. A caught unwind
     /// panic becomes `InvalidState` with operation `run.observer`; its payload
     /// is leaked to avoid a second panic during destruction. This containment
     /// does not apply to `panic=abort`.
     ///
     /// Neither `finished` nor `teardown_warning` is called after `prepared`
-    /// fails. Panics in those other callbacks are not contained.
+    /// fails. A terminal callback unwind fails the managed observer exchange
+    /// while parent guards continue collection; the unarmed path lets it unwind.
     fn prepared(&mut self, run_id: RunId) -> Result<()>;
     /// Called once after confirmed platform closure and successful journal finish.
     fn finished(&mut self, outcome: &RunOutcome);
