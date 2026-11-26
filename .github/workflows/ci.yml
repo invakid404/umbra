@@ -377,6 +377,7 @@ jobs:
         run: |
           cargo test -p umbra-platform-macos --test managed_cleanup r2_native_acquisition_ledger -- --exact --nocapture
           cargo test -p umbra-platform-macos --features managed-endpoint-probe --test managed_cleanup r2_native_debugserver_endpoint_inventory -- --exact --nocapture
+          cargo test -p umbra-platform-macos --features managed-watch-probe --test managed_cleanup r2_native_watch_registration_race -- --exact --nocapture
           cargo test -p umbra-platform-macos --test managed_cleanup r2_native_capacity_refusal_before_preparation -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib native::tests::owner_loss_wakes_a_pending_rsp_request -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib native::teardown_tests:: -- --nocapture --test-threads=1

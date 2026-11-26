@@ -70,6 +70,13 @@ pub struct Options {
 mod owner;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use owner::{keep_lifetime_with_owner, OwnerIdentity};
+#[cfg(all(
+    feature = "managed-watch-probe",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+#[doc(hidden)]
+pub use owner::{probe_owner_watch, probe_watch_registration_error, WatchCheckpoint};
 
 /// Whether this host's packed-spawn ABI is the qualified profile: exactly the
 /// predicate `capture_spawn` refuses on (`spawn_host::qualify`), read-only.

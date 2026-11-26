@@ -10,6 +10,19 @@ use umbra_platform_macos::{MacosTraceBackend, Options};
 mod endpoint_family;
 #[path = "support/managed_admission.rs"]
 mod managed_admission;
+#[cfg(feature = "managed-watch-probe")]
+#[path = "support/watch_race.rs"]
+mod watch_race;
+
+#[cfg(feature = "managed-watch-probe")]
+#[test]
+fn r2_native_watch_registration_race() {
+    if let Some(path) = std::env::var_os("UMBRA_NATIVE_WATCH_PEER") {
+        watch_race::peer(Path::new(&path));
+    } else if qualified() {
+        watch_race::run();
+    }
+}
 
 fn path(value: &Path) -> BytePath {
     BytePath::new(value.as_os_str().as_bytes().to_vec()).unwrap()
