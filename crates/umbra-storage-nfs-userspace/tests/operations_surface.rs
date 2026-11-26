@@ -21,8 +21,8 @@
 //! * WRITE stability is reported as it happened, and an `UNSTABLE` write is
 //!   durable only when COMMIT returns the verifier the WRITE did;
 //! * capabilities M1 does not offer are refused with a typed error, and
-//!   capabilities the syscall matrix authorises but the frozen transport cannot
-//!   encode name their owner instead of claiming to work.
+//!   authorised namespace operations are refused when their context lacks a
+//!   dispatcher instead of claiming to work.
 //!
 //! # What is explicitly out of scope
 //!
@@ -208,8 +208,7 @@ impl RawTransport for SharedFake {
 
 /// A namespace dispatcher that reports a scripted effect.
 ///
-/// It stands in for the NFSv4.0 `RENAME`, `REMOVE`, `CREATE` and `SETATTR` the
-/// frozen `Nfs4Op` cannot encode. It proves this node's rules — the identity a
+/// It stands in for the namespace dispatcher. It proves this node's rules — the identity a
 /// rename must preserve, the outcome kind that must match — and it is **not**
 /// evidence that any server performed the mutation.
 struct StandIn {
@@ -939,8 +938,8 @@ fn unsupported_capabilities_are_refused_and_deferred_ones_name_their_owner() {
         );
     }
 
-    // Authorised by the syscall matrix, unreachable through the frozen transport:
-    // the refusal names the owner instead of claiming a capability either way.
+    // Authorised by the syscall matrix, but this context has no dispatcher:
+    // the refusal names that missing dependency instead of claiming success.
     for operation in [
         StorageOperation::Unlink {
             path: path(b"note"),

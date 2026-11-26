@@ -42,11 +42,12 @@
 //! # Two things this module will not do
 //!
 //! * **It binds no transport.** Every call goes through the frozen
-//!   `RawTransport` trait. The only implementation this crate has is the fake.
+//!   `RawTransport` trait. The caller selects the fake or the feature-gated
+//!   libnfs raw transport through [`crate::integration::StateSession`].
 //! * **It grants no writer authority.** A live lease is not admission, and an
 //!   expired lease is not proof anybody else is gone.
 //!   [`LeaseClock::takeover_by_timeout`] refuses, by construction and by test.
-//!   One-session-one-Umbra admission belongs to `authority_recovery`.
+//!   One-session-one-Umbra admission belongs to [`crate::authority`].
 
 pub mod client_id;
 pub mod lease;

@@ -37,6 +37,40 @@ mounted adapter is a separate boundary at
 [umbra-storage-nfs](../umbra-storage-nfs/README.md); the contract this crate
 implements is [umbra-storage](../umbra-storage/README.md).
 
+## Managed-run custody and completion
+
+Managed macOS runs use this storage provider with a host-side journal and
+separate process-cleanup custody. Releasing the storage writer lease is not
+proof that the native provider and its children were collected.
+
+The shared `journal_records_completion` reader in `userspace_run.rs` accepts
+legacy `RunCompleted` records. For managed runs it instead requires a clean
+journal, a latest custody record of `Complete` with both closure proofs set,
+and a `FinishPrepared` record carrying an observed root exit rather than the
+supervisor-failure sentinel `i32::MIN`. Cleanup without an observed root result
+therefore does not become logical run completion. Historical `RunCompleted`
+descriptions below record the earlier journal format; current completion
+assertions use this shared reader.
+
+Durable managed recovery is also exercised against an explicitly selected raw
+storage descriptor in the overlay custody tests. Set
+`UMBRA_CUSTODY_REGISTRY_REQUIRED=1` and
+`UMBRA_CUSTODY_STORAGE_DESCRIPTOR` to that descriptor's JSON file; the fixture
+requires userspace capabilities, an admitted writer lease, and no kernel-visible
+root. Its journal remains host-side. The managed-library failed-closure test
+uses the same selection and the routed 12-second provider timeout. These checks
+cover persisted custody and refusal of competing writers; they do not convert
+unconfirmed process cleanup into a released obligation.
+
+Managed cleanup activation is implemented, but qualification remains incomplete.
+The measured helper descriptor costs and cleanup/admission latency exceed their
+accepted bounds, the routed tree performance run failed terminally, and the
+region-cap writer-reopen and exact shutdown checks retain failures. C15 also
+retains an exact diagnostic mismatch: managed failure aggregation changes the
+last stderr line expected by the alias-exec case. That oracle has not been
+weakened or re-pinned. Passing filesystem cases and historical qualification
+counts below do not resolve these gates.
+
 ## Packed-spawn qualification
 
 The `fix_243_*` and rank-11 cases in `tests/userspace_run.rs` compare native
@@ -54,7 +88,9 @@ Packed spawn uses the platform's exact reviewed layout contract: current
 refused. See the [platform matrix and requalification procedure](../umbra-platform-macos/README.md#packed-spawn-descriptors-experimental).
 The 54 cases exercise their qualified bodies directly: 24 ordinary
 cases, 29 lifecycle-feature cases, and the #205 fork-window SETSID refusal.
-Qualification covers 51 of these 54 arms. The three guardian provider-loss
+The earlier qualification covered 51 of these 54 arms; the managed-run failures
+above prevent carrying that count forward as a complete current qualification.
+The three guardian provider-loss
 arms are blocked by [#303](https://github.com/invakid404/umbra/issues/303)
 and kept, with unchanged bodies and oracles, out of CI until that defect is fixed.
 The separate `fix_243_provider_loss_no_spawn_reading` and

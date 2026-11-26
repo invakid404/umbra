@@ -9,10 +9,9 @@
 //! **Run single-threaded.** Several tests restart the shared fixture, so
 //! `-- --test-threads=1` is required for the results to mean anything.
 //!
-//! Nothing here mounts anything, touches `~/umbra-scratch`, or reaches
-//! `Storage`. The live transport stays inside this suite and
-//! `integration::StateSession`; binding it into the provider is `m1_integrate`'s
-//! seam.
+//! Nothing here mounts anything or touches `~/umbra-scratch`. Most cases drive
+//! `integration::StateSession`; the barrier-flush restart case also exercises
+//! the public `Storage` surface.
 #![cfg(feature = "transport-raw")]
 
 use std::sync::{Arc, Mutex};

@@ -178,8 +178,9 @@ impl RunLedger {
 /// Server endpoint and run layout for one userspace NFSv4.0 session.
 ///
 /// There is no mount root and no host path: this provider talks to the server
-/// itself, so it exposes opaque handles and no `physical_path`. That also means
-/// it cannot be selected by `umbra run`, which needs a kernel-visible run root.
+/// itself, so it exposes opaque handles and no `physical_path`. `umbra run`
+/// selects the userspace-routing execution path when its live capability probe
+/// qualifies this provider.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NfsUserspaceConfig {
     /// Server host as bytes, exactly as configured. No name resolution policy is
@@ -774,9 +775,9 @@ impl NfsUserspaceStorage {
     ///
     /// Taken together rather than through three accessors because a request needs
     /// all three at once and each accessor would borrow the whole provider.
-    /// `mutations` is always `None` here: a mutation needs open owners from a
-    /// confirmed client incarnation, and establishing one is `authority_recovery`'s
-    /// work, not this method's.
+    /// A mutation context is supplied only while admission is held and a
+    /// confirmed client incarnation can supply open owners. It also carries the
+    /// retained create verifier and the namespace dispatcher.
     fn request(
         &mut self,
         operation: &str,

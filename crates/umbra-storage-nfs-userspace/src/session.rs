@@ -204,7 +204,9 @@ impl Session {
         Ok(self.lease())
     }
 
-    /// Release admission cooperatively, advancing the epoch by exactly one.
+    /// Release admission cooperatively at the held epoch.
+    ///
+    /// A later successful acquisition advances the epoch by exactly one.
     ///
     /// `outstanding` is the caller's honest statement about its own in-flight
     /// work. `Unknown` keeps the marker held, because a follow-on session that
