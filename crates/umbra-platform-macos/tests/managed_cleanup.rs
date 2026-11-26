@@ -67,6 +67,17 @@ fn r2_native_capacity_refusal_before_preparation() {
 
 #[test]
 fn r2_native_admission_root_parent_collection() {
+    root_acquisition(64);
+}
+
+#[test]
+fn r2_native_acquisition_ledger() {
+    // Root startup may overlap an exec replacement right with the original
+    // program charge. C=1 refusal before preparation is checked separately.
+    root_acquisition(64);
+}
+
+fn root_acquisition(capacity: u64) {
     if !qualified() {
         return;
     }
@@ -79,7 +90,7 @@ fn r2_native_admission_root_parent_collection() {
         timeout_ms: Some(30_000),
         ..Options::default()
     });
-    let (count, service) = managed_admission::install(&mut backend);
+    let (count, service) = managed_admission::install_with_capacity(&mut backend, capacity, false);
     let launch = backend.launch(LaunchSpec {
         executable: path(Path::new("/usr/bin/true")),
         argv: vec![b"/usr/bin/true".to_vec()],
@@ -100,22 +111,36 @@ fn r2_native_admission_root_parent_collection() {
         drop(backend);
         panic!("native launch failed: {error}");
     }
-    assert!(
-        count.load(Ordering::Acquire) > 0,
-        "live native resources must remain charged"
-    );
+    let live_charge = count.load(Ordering::Acquire);
     let start = backend.begin_shutdown(Nonce::new_v4()).unwrap();
     drop(backend);
     let umbra_platform::shutdown::Start::Local { accepted, ledger } = start else {
         panic!("native local custody required")
     };
-    assert!(accepted
-        .confirms(&ledger.final_snapshot().unwrap())
-        .unwrap());
+    let final_state = ledger.final_snapshot().unwrap();
+    let confirmed = accepted.confirms(&final_state).unwrap();
     drop(ledger);
+    let remaining = service.join().unwrap();
+    // Assertions follow actual native teardown and service termination.
+    assert!(
+        live_charge > 0 && live_charge <= capacity,
+        "native program and replacement rights must retain bounded charges"
+    );
+    for kind in [
+        umbra_core::shutdown::ResourceKind::Tracee,
+        umbra_core::shutdown::ResourceKind::TaskRight,
+        umbra_core::shutdown::ResourceKind::Tracer,
+    ] {
+        assert!(
+            final_state.entries.iter().any(|entry| {
+                entry.slot.kind == kind && entry.identity.is_some() && entry.confirms()
+            }),
+            "native acquisition omitted terminal inventory for {kind:?}"
+        );
+    }
+    assert!(confirmed);
     assert_eq!(
-        service.join().unwrap(),
-        0,
+        remaining, 0,
         "all native obligations must be collected before capacity release"
     );
 }
