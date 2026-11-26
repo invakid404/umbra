@@ -862,24 +862,26 @@ mod policy_tests {
     }
 
     #[test]
-    fn fallback_edges_share_one_helper_window() {
-        for path in [CleanupPath::Trusted, CleanupPath::Failed] {
-            let ticket = Ticket::new(1_000, path, 64).unwrap();
-            let stages = ticket.cutoffs(64).unwrap();
-            let edges = [
-                (Role::Guardian, Role::Worker),
-                (Role::Guardian, Role::CleanupOwner),
-                (Role::Relay, Role::Guardian),
-                (Role::Caller, Role::Relay),
-            ];
-            let mut prior = None;
-            for (parent, child) in edges {
-                let cutoff = parent_cutoff(parent, child, ticket, 64).unwrap();
-                assert!(cutoff >= stages.fallback && cutoff < stages.helpers);
-                assert!(prior.is_none_or(|before| cutoff > before));
-                prior = Some(cutoff);
+    fn custody_ticket_deadlines() {
+        for capacity in [1, 64] {
+            for path in [CleanupPath::Trusted, CleanupPath::Failed] {
+                let ticket = Ticket::new(1_000, path, capacity).unwrap();
+                let stages = ticket.cutoffs(capacity).unwrap();
+                let edges = [
+                    (Role::Guardian, Role::Worker),
+                    (Role::Guardian, Role::CleanupOwner),
+                    (Role::Relay, Role::Guardian),
+                    (Role::Caller, Role::Relay),
+                ];
+                let mut prior = None;
+                for (parent, child) in edges {
+                    let cutoff = parent_cutoff(parent, child, ticket, capacity).unwrap();
+                    assert!(cutoff >= stages.fallback && cutoff < stages.helpers);
+                    assert!(prior.is_none_or(|before| cutoff > before));
+                    prior = Some(cutoff);
+                }
+                assert!(parent_cutoff(Role::Relay, Role::Provider, ticket, capacity).is_err());
             }
-            assert!(parent_cutoff(Role::Relay, Role::Provider, ticket, 64).is_err());
         }
     }
 }

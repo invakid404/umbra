@@ -98,6 +98,10 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test -p umbra-isolation --lib managed::process::tests::custody_watch_registration_race -- --exact --nocapture
 
+      - name: Custody shares the original helper deadline window
+        if: runner.os == 'macOS'
+        run: cargo test -p umbra-isolation --lib managed::guard::policy_tests::custody_ticket_deadlines -- --exact --nocapture
+
       - name: Managed worker fail-stop after publication failure
         if: runner.os == 'macOS'
         run: cargo test -p umbra-isolation --test managed_startup r2_ticket_publication_all_writes_fail -- --exact --nocapture
