@@ -49,8 +49,8 @@ Boundaries the implementation keeps:
 - `close` surfaces the error from its final flush rather than reporting a clean
   shutdown over a failed write.
 
-Managed custody is dormant groundwork for the later cleanup-owner activation.
-No production path currently writes these records. The authoritative stream
+Managed CLI and executable-library runs write custody before allowing native
+acquisition and commit it after validated cleanup. The authoritative stream
 validates run, writer epoch, generation, sequence and phase transitions:
 Armed -> FinishPrepared -> Complete, or Armed/FinishPrepared -> Failed.
 Failed is terminal; advancing a writer epoch does not resolve custody.
@@ -62,6 +62,9 @@ Custody flush includes the journal directory and its parent before returning a
 durability receipt. Ordinary unarmed journals retain their existing record
 format, replay and flush ordering. Custody is separate from the irreversible
 `RecoveryRequired` latch: completing custody cannot clear that prior failure.
+Recovery inspection does not create a checkpoint directory. Directory creation
+waits until replay has established authorized writable access; an unresolved
+custody generation remains read-only even when supplied a candidate writer claim.
 
 Resumable checkpoint recovery is out of scope here: this backend publishes and
 reads checkpoints, but reconciling a nonempty recovery into a running namespace is
