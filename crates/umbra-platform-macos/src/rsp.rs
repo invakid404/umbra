@@ -281,11 +281,18 @@ impl Rsp {
         // debugserver, so it never inherits this. The platform still ends
         // debugserver with SIGKILL.
         //
-        // `pre_exec` makes `std` fork and exec rather than `posix_spawn`. The
-        // closure runs only `signal`, which is async-signal-safe.
+        // Capture inherited descriptors before fork. The debugger needs only
+        // stdio and the connection it opens after exec, never owner/admission
+        // channels or other provider descriptors. CLOEXEC alone leaves those
+        // endpoints open during the fork-to-exec interval.
+        let closes = umbra_isolation::spawn::ClosePlan::capture(&[])
+            .map_err(|e| error("debugserver descriptor inventory", e))?;
+        // `pre_exec` makes `std` fork and exec rather than `posix_spawn`.
+        // The precomputed close operations and signals are async-signal-safe.
         // SAFETY: only async-signal-safe libc between fork and exec.
         unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+                closes.close_in_child()?;
                 for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
                     if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
                         return Err(std::io::Error::last_os_error());

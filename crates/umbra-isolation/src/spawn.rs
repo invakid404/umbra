@@ -1,5 +1,5 @@
 //! Spawning the guardian and the supervisor: `posix_spawn` of the `umbra`
-//! binary itself (#193 ruling O2, fork safety). No `fork()` anywhere, so
+//! binary itself (#193 ruling O2, fork safety). Neither helper uses `fork`, so
 //! neither the relay nor the guardian ever runs non-async-signal-safe code in
 //! a forked copy of a possibly multi-threaded process.
 //!
@@ -14,6 +14,9 @@ use std::ffi::{CString, OsStr, OsString};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+
+mod descriptors;
+pub use descriptors::ClosePlan;
 
 /// `POSIX_SPAWN_SETSID` (`<sys/spawn.h>`, 0x0400): the child leads a new
 /// session (xnu-12377.121.6 kern_exec.c:5140-5145 -> setsid_internal).

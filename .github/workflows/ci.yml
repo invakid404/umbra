@@ -67,6 +67,7 @@ jobs:
       - name: Managed parent custody after lost acknowledgements
         if: runner.os == 'macOS'
         run: |
+          cargo test -p umbra-isolation --lib spawn::descriptors::tests:: -- --nocapture --test-threads=1
           cargo test -p umbra-isolation --test managed_runtime r2_ack_loss_preserves_owner_provider_custody -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime custody_normal_reaps_all -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime custody_stuck_custodian_reaps_all -- --exact --nocapture
