@@ -12,7 +12,8 @@ use umbra_core::managed::{
     TicketState,
 };
 use umbra_core::{ErrorKind, UmbraError};
-use umbra_platform::provider::ManagedCleanup;
+/// Platform cleanup contract implemented by the worker adapters.
+pub use umbra_platform::provider::ManagedCleanup;
 
 /// Worker owns control endpoints, never the platform provider child.
 pub struct WorkerCleanup {
@@ -437,7 +438,7 @@ impl WorkerCleanup {
                         Ok(())
                     } else {
                         Err(invalid("Start publication failed"))
-                    }
+                    };
                 }
                 Ok(false) => std::thread::sleep(Duration::from_millis(1)),
                 Err(error) => break Err(error),
@@ -663,9 +664,9 @@ impl ManagedCleanup for WorkerCleanup {
 mod tests {
     use super::*;
     use crate::managed::{
+        Channel,
         owner::{Owner, Service},
         process::identity,
-        Channel,
     };
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;

@@ -22,3 +22,6 @@ umbra-core = { path = "../umbra-core", features = ["test-owned-exit"] }
 # Test-only: `dirents`'s fixtures build `ObjectId`s, which are UUIDs. The crate
 # itself needs no generator.
 uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+umbra-isolation = { path = "../umbra-isolation" }

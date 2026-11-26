@@ -4,6 +4,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
+#[path = "cleanup_owner_managed_tests.rs"]
+mod managed_fixture;
+
 fn marker(dir: &str, mode: &str, name: &str) -> String {
     format!("{dir}/{mode}.{name}")
 }
@@ -154,7 +158,8 @@ fn r2_endpoint_child() {
 }
 
 fn endpoint(mode: &str) {
-    let dir = std::env::temp_dir().join(format!("umbra-fix-299b-{}", uuid::Uuid::new_v4()));
+    // Keep Unix socket names below SUN_LEN even with a long harness TMPDIR.
+    let dir = Path::new("/tmp").join(format!("umbra-fix-299b-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let dir = dir.to_str().unwrap().to_owned();
     let socket = format!("{dir}/s");
@@ -178,6 +183,7 @@ fn endpoint(mode: &str) {
             Err(e) => panic!("{e}"),
         }
     };
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
@@ -287,7 +293,12 @@ fn endpoint(mode: &str) {
 macro_rules! endpoint_tests {
     ($($name:ident => $mode:literal),* $(,)?) => { $(
         #[test]
-        fn $name() { endpoint($mode); }
+        fn $name() {
+            #[cfg(target_os = "macos")]
+            managed_fixture::endpoint($mode);
+            #[cfg(not(target_os = "macos"))]
+            endpoint($mode);
+        }
     )* };
 }
 endpoint_tests! {
