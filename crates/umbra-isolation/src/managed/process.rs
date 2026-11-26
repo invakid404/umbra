@@ -9,6 +9,17 @@ pub fn signal_current(participant: Participant, signal: i32) -> io::Result<()> {
     if ![libc::SIGTERM, libc::SIGKILL, libc::SIGCONT].contains(&signal) {
         return Err(io::ErrorKind::InvalidInput.into());
     }
+    signal_verified(participant, signal)
+}
+
+/// Native qualification hold, using the same birth and audit-token checks.
+#[cfg(feature = "probe-cancellation-ticket")]
+#[doc(hidden)]
+pub fn probe_stop_current(participant: Participant) -> io::Result<()> {
+    signal_verified(participant, libc::SIGSTOP)
+}
+
+fn signal_verified(participant: Participant, signal: i32) -> io::Result<()> {
     if identity(participant.pid, participant.role)? != participant {
         return Err(super::invalid("signal birth mismatch"));
     }

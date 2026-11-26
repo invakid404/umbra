@@ -22,6 +22,12 @@ mod ownership;
 mod retirement;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod rsp;
+#[cfg(all(
+    feature = "managed-cancel-probe",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod setup_probe;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod signals;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

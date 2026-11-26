@@ -16,6 +16,8 @@ publish = false
 test-clock = []
 # Hosted descriptor inventory fixture; no normal executable probe.
 managed-endpoint-probe = []
+# Observe validated cancellation tickets in native qualification only.
+probe-cancellation-ticket = []
 # Qualification-only: corrupt the run generation on a validated provider offer.
 probe-managed-offer-generation = []
 # Observational D6 instrumentation; no lifecycle behavior change.

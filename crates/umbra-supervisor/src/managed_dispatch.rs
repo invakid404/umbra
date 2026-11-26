@@ -101,6 +101,19 @@ fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
     let result = transport.result_handle();
     let mut transport = Some(transport);
     let mut outcome = guard.run_parent_with_progress(move |ticket| {
+        #[cfg(feature = "probe-native-setup-cancel")]
+        if let Some(directory) = std::env::var_os("UMBRA_NATIVE_SETUP_PROBE") {
+            let directory = std::path::PathBuf::from(directory);
+            let caller = std::fs::read_to_string(directory.join("caller.pid"))
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok());
+            if caller == Some(std::process::id()) && directory.join("setup.json").exists() {
+                let now = umbra_isolation::managed::boot_nanos()?;
+                std::fs::write(directory.join("triggered.json"), now.to_string())?;
+                transport.take();
+                return Err(io::Error::other("native setup probe caller cancellation"));
+            }
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             transport
                 .as_mut()

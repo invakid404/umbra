@@ -927,6 +927,25 @@ impl Service {
             }
         }
         if let Some(status) = collected {
+            #[cfg(feature = "probe-cancellation-ticket")]
+            if let Some(directory) = std::env::var_os("UMBRA_NATIVE_SETUP_PROBE") {
+                let directory = std::path::PathBuf::from(directory);
+                let receipt = ProviderReceipt {
+                    run: self.owner.run,
+                    owner: self.owner.participant,
+                    provider: self.provider,
+                    status: status.into_raw(),
+                    failed: self.owner.failed(),
+                };
+                std::fs::write(
+                    directory.join("collected.tmp"),
+                    serde_json::to_vec(&receipt).map_err(io::Error::other)?,
+                )?;
+                std::fs::rename(
+                    directory.join("collected.tmp"),
+                    directory.join("collected.json"),
+                )?;
+            }
             if self.disconnected {
                 return Ok(true);
             }

@@ -39,6 +39,7 @@ fn main() {
         "prepared_panic",
         "provider_death",
         "r2_failed_closure_reopen",
+        "r2_native_preaccepted_work_cancel",
         "owner_death",
         "armed_reply_loss",
         "startup_abort",
@@ -48,6 +49,16 @@ fn main() {
         "r2_direct_drop_failed_result"
     ]
     .contains(&mode.as_str()));
+    #[cfg(not(feature = "probe-native-setup-cancel"))]
+    if mode == "r2_native_preaccepted_work_cancel" {
+        panic!("native setup cancellation requires its compile-time probe");
+    }
+    if mode == "r2_native_preaccepted_work_cancel" {
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("UMBRA_NATIVE_SETUP_PROBE").expect("missing native probe directory"),
+        );
+        std::fs::write(directory.join("caller.pid"), std::process::id().to_string()).unwrap();
+    }
     #[cfg(not(feature = "probe-managed-arm-reply-loss"))]
     if mode == "armed_reply_loss" {
         panic!("armed_reply_loss requires its compile-time fault");
@@ -302,7 +313,10 @@ fn main() {
             "missing" => Some("twin source"),
             "prepared_error" => Some("managed library prepared sentinel"),
             "prepared_panic" => Some("managed preparation observer panicked"),
-            "provider_death" | "owner_death" | "r2_failed_closure_reopen" => None,
+            "provider_death"
+            | "owner_death"
+            | "r2_failed_closure_reopen"
+            | "r2_native_preaccepted_work_cancel" => None,
             _ => unreachable!(),
         };
         if let Some(expected) = expected {

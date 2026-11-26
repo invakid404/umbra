@@ -15,6 +15,8 @@ probe-managed-finish-reply-loss = []
 probe-managed-offer-generation = ["umbra-isolation/probe-managed-offer-generation"]
 # Qualification-only: drop an enrolled owner and detect a returning destructor.
 probe-managed-owner-drop = []
+# Native setup cancellation from the external caller's independent guard.
+probe-native-setup-cancel = ["umbra-platform/shutdown-witness", "umbra-isolation/probe-cancellation-ticket"]
 # Test instrumentation: emit only successful writer-renewal observations.
 probe-idle-renewal = []
 # Forwarded to `umbra-overlay`; see its manifest for what each probe breaks and

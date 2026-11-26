@@ -10,6 +10,17 @@ use umbra_platform_macos::{MacosTraceBackend, Options};
 mod endpoint_family;
 #[path = "support/managed_admission.rs"]
 mod managed_admission;
+#[cfg(feature = "managed-cancel-probe")]
+#[path = "support/native_cancel.rs"]
+mod native_cancel;
+
+#[cfg(feature = "managed-cancel-probe")]
+#[test]
+fn r2_native_preaccepted_work_cancel() {
+    if qualified() {
+        native_cancel::run();
+    }
+}
 #[cfg(feature = "managed-watch-probe")]
 #[path = "support/watch_race.rs"]
 mod watch_race;

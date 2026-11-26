@@ -701,6 +701,19 @@ impl Rsp {
         self.stream.read(bytes)
     }
     pub fn request(&mut self, body: &str) -> Result<String> {
+        #[cfg(feature = "managed-cancel-probe")]
+        {
+            let hold = crate::setup_probe::Hold::begin(body, self.child.id())?;
+            let result = self.request_inner(body);
+            if let Some(hold) = hold {
+                hold.finish(&result, self.managed_cutoff())?;
+            }
+            result
+        }
+        #[cfg(not(feature = "managed-cancel-probe"))]
+        self.request_inner(body)
+    }
+    fn request_inner(&mut self, body: &str) -> Result<String> {
         self.send(body)?;
         let limit = self.limit(Duration::from_secs(5));
         loop {

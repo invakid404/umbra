@@ -56,6 +56,13 @@ impl Receiver {
                 .map_err(invalid)?
                 .fallback,
         )?;
+        #[cfg(feature = "probe-cancellation-ticket")]
+        if let Some(directory) = std::env::var_os("UMBRA_NATIVE_SETUP_PROBE") {
+            let path = std::path::PathBuf::from(directory);
+            let bytes = serde_json::to_vec(&message).map_err(io::Error::other)?;
+            std::fs::write(path.join("ticket.tmp"), bytes)?;
+            std::fs::rename(path.join("ticket.tmp"), path.join("ticket.json"))?;
+        }
         Ok(true)
     }
 }
