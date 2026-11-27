@@ -1,0 +1,7 @@
+# Base preparation deadline comparison
+
+Base b0521d2e does not place namespace preparation inside its guardian two-second handshake. `crates/umbra-isolation/src/guardian.rs` sends Isolated, waits for Go with HANDSHAKE=2s, opens the supplied record, and only then spawns the supervisor. `relay.rs` sends Go after isolation record creation/rename, then waits separately for the supervisor Started report. Guardian sends Started immediately after spawn, before supervising its runtime. No namespace preparation is performed by relay or guardian in either handshake.
+
+The supervisor later prepares storage, binds the namespace and constructs the launch specification in `crates/umbra-supervisor/src/run.rs`, before connecting the platform. For non-launchd sessions, `isolate_run` does not enter the relay at all. Library callers likewise invoke the supervisor without that guardian handshake. Therefore there is no equivalent base two-second window over namespace preparation. Source ordering resolves the question; no base diagnostic run is necessary.
+
+PR2 creates the shared readiness deadline before helper startup and waits for Worker readiness after namespace preparation. This adds a startup failure mode. The visit12 ruling requires restoring base treatment of preparation, with a failing-first test that holds preparation past two seconds. D3 and D4 values must remain unchanged. Implementation and validation are still pending; the retained failure is not declared resolved by this comparison.
