@@ -468,20 +468,22 @@ impl WorkerCleanup {
             .iter()
             .position(|route| route.peer() == self.owner)
             .ok_or_else(|| invalid("owner route lost"))?;
+        use std::os::fd::AsRawFd;
+        let readiness = super::readiness::Readiness::new()?;
         let channel = self.routes[index].channel();
         let deadline = forwarding_cutoff(self.awaiting[index].as_ref(), deadline)?;
         if let Some(ack_deadline) = self.pending_ack[index] {
             while !channel.flush(ack_deadline.min(deadline))? {
-                std::thread::sleep(Duration::from_millis(1));
+                readiness.wait(channel.stream.as_raw_fd(), true, ack_deadline.min(deadline))?;
             }
             self.pending_ack[index] = None;
         }
         while !channel.flush(deadline)? {
-            std::thread::sleep(Duration::from_millis(1));
+            readiness.wait(channel.stream.as_raw_fd(), true, deadline)?;
         }
         channel.queue(&message)?;
         while !channel.flush(deadline)? {
-            std::thread::sleep(Duration::from_millis(1));
+            readiness.wait(channel.stream.as_raw_fd(), true, deadline)?;
         }
         Ok(())
     }

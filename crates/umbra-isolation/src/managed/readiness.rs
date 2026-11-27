@@ -129,6 +129,29 @@ mod tests {
     }
 
     #[test]
+    fn full_output_wait_keeps_original_cutoff() {
+        use std::io::Write;
+        let (mut stream, _peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let bytes = [0u8; 8192];
+        loop {
+            match stream.write(&bytes) {
+                Ok(n) => assert!(n > 0),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let wait = Readiness::new().unwrap();
+        let deadline = super::super::boot_nanos().unwrap() + 20_000_000;
+        assert_eq!(
+            wait.wait(stream.as_raw_fd(), true, deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
     fn peer_closure_wakes_read_wait() {
         let (stream, peer) = UnixStream::pair().unwrap();
         let wait = Readiness::new().unwrap();
