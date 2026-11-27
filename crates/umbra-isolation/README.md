@@ -101,6 +101,13 @@ of a stalled owner can also leave collection unconfirmed. The kernel case where
 a tracer ends while holding a program remains outside this repair. These facts
 cannot establish successful whole-run collection.
 
+`managed_runtime::r2_da_order_across_roles` checks causal receipts across actual
+parent waits with ordinary program and debugger stand-ins. Held operations,
+terminal evidence and resource release prevent early cleanup or certification.
+Its emergency case retains failure after all children are collected. The native
+Mach-right companion lives in `umbra-platform-macos`; these hosted stand-ins do
+not establish native debugger behavior or SID-1 qualification.
+
 ## Legacy launchd isolation
 
 The remainder describes the retained #193/#205 implementation and its tests.

@@ -143,9 +143,9 @@ checkout persists job credentials. A labeled runner must be provisioned before
 those checks can supply a CI signal; a queued job is not enforcement evidence.
 
 The separate [managed performance workflow](.github/workflows/managed-performance.yml)
-schedules the four D6 workloads (`native_true`, `registry_true`, `registry_tree5`,
+runs only through manual dispatch and selects four D6 workloads (`native_true`, `registry_true`, `registry_tree5`,
 and `admission_only`) in both own-session and CI-only SID-1 modes.
-It excludes `native_tree5`, blocks fork pull requests, and retains failed samples
+It excludes `native_tree5` and retains failed samples
 without rerunning them. Each case uses three warmup pairs and thirty alternating
 measured pairs, stopping that workload on a terminal failure.
 
