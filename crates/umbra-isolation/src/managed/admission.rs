@@ -60,6 +60,8 @@ pub struct AdmissionClient {
     pending_deadline: Option<u64>,
     failed: bool,
     cutoff: AdmissionCutoff,
+    #[cfg(test)]
+    before_wait: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl AdmissionClient {
@@ -73,6 +75,8 @@ impl AdmissionClient {
             pending: None,
             pending_deadline: None,
             failed: false,
+            #[cfg(test)]
+            before_wait: None,
             cutoff: AdmissionCutoff(Arc::new(CutoffState {
                 deadline: AtomicU64::new(u64::MAX),
                 waiter: Mutex::new(Weak::new()),
@@ -192,6 +196,10 @@ impl umbra_core::AdmissionTransport for AdmissionClient {
                 // Register before reading the cutoff: an earlier notification is
                 // seen by clamp, and a later one wakes the registered waiter.
                 let deadline = self.cutoff.clamp(self.pending_deadline.unwrap());
+                #[cfg(test)]
+                if let Some(before_wait) = self.before_wait.take() {
+                    before_wait();
+                }
                 readiness.as_ref().unwrap().wait(
                     self.channel.stream.as_raw_fd(),
                     self.channel.written != self.channel.output.len(),
@@ -215,6 +223,8 @@ impl AdmissionService {
             ledger,
             channel,
             failed: false,
+            #[cfg(test)]
+            before_wait: None,
             cutoff: u64::MAX,
         })
     }
@@ -286,22 +296,28 @@ mod tests {
 
     #[test]
     fn pending_exchange_observes_shortened_cutoff() {
-        use std::os::fd::AsRawFd;
         use umbra_core::AdmissionTransport;
         let (mut client, owner) = endpoints();
         let cutoff = client.cutoff();
         let deadline = super::super::boot_nanos().unwrap() + 5_000_000_000;
-        let reader = owner.channel.stream.try_clone().unwrap();
+        let (selected, ready) = std::sync::mpsc::sync_channel(1);
+        let (shortened, resume) = std::sync::mpsc::sync_channel(1);
+        // The test hook runs after registration and cutoff selection. The wake
+        // must remain pending even when it arrives before the kernel wait.
+        client.before_wait = Some(Box::new(move || {
+            selected.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+        }));
         let notification = std::thread::spawn(move || {
-            let mut fd = libc::pollfd {
-                fd: reader.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            assert_eq!(unsafe { libc::poll(&mut fd, 1, 1000) }, 1);
+            ready
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
             cutoff
                 .retain(super::super::boot_nanos().unwrap() + 20_000_000)
                 .unwrap();
+            shortened.send(()).unwrap();
         });
         let started = std::time::Instant::now();
         let error = client
