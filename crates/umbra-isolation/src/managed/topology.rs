@@ -43,6 +43,7 @@ impl Topology {
             endpoints: BTreeMap::new(),
         };
         umbra_core::cost_snapshot!("topology-before", None, &[]);
+        super::executable::resource_observation("topology-before");
         for (a, b, purpose) in [
             (Worker, CleanupOwner, OwnerControl),
             (Worker, Guardian, GuardianControl),
@@ -75,6 +76,7 @@ impl Topology {
             stream: right,
         });
         umbra_core::cost_snapshot!("topology-pair", None, &[]);
+        super::executable::resource_observation("topology-pair");
         Ok(())
     }
 

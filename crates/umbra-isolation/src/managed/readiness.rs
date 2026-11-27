@@ -18,6 +18,7 @@ impl Readiness {
             return Err(io::Error::last_os_error());
         }
         queue.change(1, libc::EVFILT_USER, libc::EV_ADD | libc::EV_CLEAR, 0)?;
+        super::executable::resource_observation("readiness-queue-created");
         Ok(queue)
     }
 

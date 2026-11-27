@@ -131,6 +131,7 @@ impl Launch {
         }
         let (stream, welcome) = client.into_managed_handoff().map_err(io::Error::other)?;
         umbra_core::cost_snapshot!("provider-handoff-ready", None, &[]);
+        super::executable::resource_observation("provider-handoff-ready");
         Ok(Handoff {
             provider,
             welcome,

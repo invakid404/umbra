@@ -106,6 +106,7 @@ impl SpawnedChild {
         if result == self.pid {
             self.status = Some(status);
             umbra_core::cost_snapshot!("helper-collected", Some(self.pid()), &[], Some(status));
+            super::executable::resource_observation("helper-collected");
         } else if result < 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ECHILD) {
@@ -187,6 +188,7 @@ impl ProcessWatch {
             return Err(io::Error::last_os_error());
         }
         umbra_core::cost_snapshot!("private-queue-created", None, &[fd]);
+        super::executable::resource_observation("private-queue-created");
         Ok(Self {
             queue,
             participants: Vec::new(),

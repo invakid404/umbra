@@ -71,6 +71,7 @@ impl Entry {
         self.endpoints.clear();
         self.descendants.clear();
         umbra_core::cost_snapshot!("startup-rollback-closed", None, &[]);
+        resource_observation("startup-rollback-closed");
         Ok(())
     }
 
@@ -156,6 +157,7 @@ pub fn spawn_tree(
     let parent = identity(std::process::id(), parent_role)?;
     let (parent_bootstrap, child_bootstrap) = UnixStream::pair()?;
     umbra_core::cost_snapshot!("helper-bootstrap-created", None, &[]);
+    resource_observation("helper-bootstrap-created");
     let parent_bootstrap = super::Channel::new(parent_bootstrap)?;
     let spec = Spec {
         bootstrap: child_bootstrap.as_raw_fd(),
@@ -191,6 +193,7 @@ pub fn spawn_tree(
     drop(assignments);
     drop(child_bootstrap);
     umbra_core::cost_snapshot!("helper-parent-copies-closed", Some(child.pid()), &[]);
+    resource_observation("helper-parent-copies-closed");
     Ok(PendingRole {
         child,
         bootstrap: parent_bootstrap,
@@ -449,6 +452,7 @@ impl Entry {
         }
         let (parent_bootstrap, child_bootstrap) = UnixStream::pair()?;
         umbra_core::cost_snapshot!("provider-bootstrap-created", None, &[]);
+        resource_observation("provider-bootstrap-created");
         let bootstrap = super::Channel::new(parent_bootstrap)?;
         let spec = Spec {
             role: Role::Provider,
@@ -501,6 +505,7 @@ impl Entry {
         drop(endpoints);
         drop(child_bootstrap);
         umbra_core::cost_snapshot!("provider-parent-copies-closed", None, &[]);
+        resource_observation("provider-parent-copies-closed");
         let startup = super::provider_startup::ProviderStartup::new(
             bootstrap,
             self.launch.run,
@@ -1109,6 +1114,16 @@ impl Entry {
             .take()
             .ok_or_else(|| invalid("exchange already transferred or root relay"))
     }
+}
+
+/// Record an allocation boundary without launching an external observer.
+pub(crate) fn resource_observation(stage: &str) {
+    #[cfg(feature = "shutdown-witness")]
+    if std::env::var_os("UMBRA_F299_STARTUP_RESOURCES").is_some() {
+        crate::performance_observation::record_as("startup-resources", stage, None);
+    }
+    #[cfg(not(feature = "shutdown-witness"))]
+    let _ = stage;
 }
 
 #[cfg(test)]

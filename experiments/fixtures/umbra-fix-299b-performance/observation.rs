@@ -58,6 +58,15 @@ pub fn record_details(role: &str, event: &str, resource: Option<u64>, details: s
     static BIRTH: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     let birth = BIRTH.get_or_init(|| birth(pid));
     let required = |key| std::env::var(key).expect("missing measurement identity");
+    let startup_resources = if std::env::var_os("UMBRA_F299_STARTUP_RESOURCES").is_some() {
+        let begin = boot_nanos();
+        let descriptors = own_descriptors().expect("startup descriptor inventory");
+        Some(serde_json::json!({
+            "begin": begin, "end": boot_nanos(), "descriptors": descriptors,
+        }))
+    } else {
+        None
+    };
     let record = serde_json::json!({
         "schema_version": 1,
         "manifest_digest": required("UMBRA_F299_PERF_MANIFEST_DIGEST"),
@@ -68,9 +77,7 @@ pub fn record_details(role: &str, event: &str, resource: Option<u64>, details: s
         "role": role,
         "pid": pid, "birth": birth, "sequence": sequence, "boot_nanos": timestamp,
         "event": event, "resource": resource, "details": details,
-        "startup_resources": if std::env::var_os("UMBRA_F299_STARTUP_RESOURCES").is_some() {
-            Some(own_descriptors().expect("startup descriptor inventory"))
-        } else { None },
+        "startup_resources": startup_resources,
     });
     // Different linked crates can observe distinct roles in one process.
     // Separate streams preserve each observer's sequence and process identity.
@@ -114,7 +121,7 @@ pub fn own_descriptors() -> std::io::Result<Vec<(i32, u32)>> {
             size,
         )
     };
-    if read <= 0 || read >= size || read as usize % width != 0 {
+    if read <= 0 || read >= size || !(read as usize).is_multiple_of(width) {
         return Err(std::io::Error::other(
             "incomplete startup descriptor inventory",
         ));
