@@ -24,6 +24,8 @@ pub mod rollback;
 pub mod startup;
 #[cfg(feature = "test-clock")]
 pub mod test_clock;
+#[cfg(feature = "probe-cancellation-ticket")]
+pub mod test_directory_wake;
 pub mod topology;
 pub mod worker;
 pub mod worker_startup;

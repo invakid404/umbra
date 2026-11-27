@@ -103,10 +103,26 @@ fn forward(guard: Guard, forwarder: Forwarder) -> Outcome {
 }
 
 fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
+    #[cfg(feature = "probe-native-setup-cancel")]
+    let probe = (|| -> io::Result<_> {
+        let Some(directory) = std::env::var_os("UMBRA_NATIVE_SETUP_PROBE") else {
+            return Ok(None);
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let caller = std::fs::read_to_string(directory.join("caller.pid"))?;
+        if caller.parse::<u32>().ok() != Some(std::process::id()) {
+            return Ok(None);
+        }
+        umbra_isolation::managed::test_directory_wake::DirectoryWake::new(&directory).map(Some)
+    })();
     let result = transport.result_handle();
     let observing = std::cell::RefCell::new(Some(transport));
     let mut outcome = guard.run_parent_with_wait(
         |ticket| {
+            #[cfg(feature = "probe-native-setup-cancel")]
+            let _ = probe
+                .as_ref()
+                .map_err(|error| io::Error::other(error.to_string()))?;
             let mut transport = observing.borrow_mut();
             #[cfg(feature = "probe-native-setup-cancel")]
             if let Some(directory) = std::env::var_os("UMBRA_NATIVE_SETUP_PROBE") {
@@ -143,7 +159,13 @@ fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
         },
         |guard| {
             let observing = observing.borrow();
-            guard.wait_for_activity(observing.as_ref().and_then(CallerTransport::wait_interest))
+            let application = observing.as_ref().and_then(CallerTransport::wait_interest);
+            #[cfg(feature = "probe-native-setup-cancel")]
+            if let Ok(Some(probe)) = &probe {
+                guard.wait_for_test_activity(application, probe.descriptor())?;
+                return probe.drain();
+            }
+            guard.wait_for_activity(application)
         },
     );
     match result.borrow().as_ref() {

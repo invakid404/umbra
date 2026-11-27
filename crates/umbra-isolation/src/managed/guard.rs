@@ -766,6 +766,25 @@ impl Guard {
         &mut self,
         application: Option<(std::os::fd::BorrowedFd<'_>, bool, u64)>,
     ) -> io::Result<()> {
+        self.wait_for_activity_sources(application.as_slice())
+    }
+
+    /// Include a test hook's file notification without replacing observer traffic.
+    #[cfg(feature = "probe-cancellation-ticket")]
+    pub fn wait_for_test_activity(
+        &mut self,
+        application: Option<(std::os::fd::BorrowedFd<'_>, bool, u64)>,
+        activity: std::os::fd::BorrowedFd<'_>,
+    ) -> io::Result<()> {
+        let mut sources = application.into_iter().collect::<Vec<_>>();
+        sources.push((activity, false, u64::MAX));
+        self.wait_for_activity_sources(&sources)
+    }
+
+    fn wait_for_activity_sources(
+        &mut self,
+        applications: &[(std::os::fd::BorrowedFd<'_>, bool, u64)],
+    ) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         if self.pending_failure.is_some() {
             return Ok(());
@@ -821,7 +840,7 @@ impl Guard {
             descriptors.extend(routes);
             deadline = deadline.min(cutoff);
         }
-        if let Some((fd, writing, cutoff)) = application {
+        for &(fd, writing, cutoff) in applications {
             descriptors.push(libc::pollfd {
                 fd: fd.as_raw_fd(),
                 events: if writing { libc::POLLOUT } else { libc::POLLIN },
