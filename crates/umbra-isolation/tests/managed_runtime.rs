@@ -441,6 +441,7 @@ impl Drop for Peer {
 }
 
 fn parent_ack_loss(role: Role, child_roles: &[Role]) {
+    use std::{cell::Cell, os::fd::AsFd};
     let run = RunIdentity {
         nonce: uuid::Uuid::new_v4(),
         generation: 1,
@@ -459,41 +460,59 @@ fn parent_ack_loss(role: Role, child_roles: &[Role]) {
             .is_ok());
     }
     guard.notify_failure().unwrap();
-    let mut original = None;
-    let mut held_past_ack = false;
-    let mut outcome = guard.run_parent_with_progress(|ticket| {
-        let ticket = ticket.ok_or_else(|| std::io::Error::other("missing original ticket"))?;
-        if let Some(prior) = original {
-            if ticket != prior {
-                return Err(std::io::Error::other("ticket renewed"));
+    let original = Cell::new(None);
+    let held_past_ack = Cell::new(false);
+    // The fixture releases its child ten milliseconds after ACK expiry.
+    // Include that existing observation time in the production wait.
+    let (observation, _held_endpoint) = UnixStream::pair().unwrap();
+    let mut outcome = guard.run_parent_with_wait(
+        |ticket| {
+            let ticket = ticket.ok_or_else(|| std::io::Error::other("missing original ticket"))?;
+            if let Some(prior) = original.get() {
+                if ticket != prior {
+                    return Err(std::io::Error::other("ticket renewed"));
+                }
+            } else {
+                original.set(Some(ticket));
             }
-        } else {
-            original = Some(ticket);
-        }
-        let now = boot_nanos()?;
-        if !held_past_ack && now >= ticket.started + ACK_NANOS + 10_000_000 {
-            if now
-                >= ticket
-                    .cutoffs(1)
-                    .map_err(std::io::Error::other)?
-                    .cooperative
-            {
-                return Err(std::io::Error::other(
-                    "observation missed local cleanup window",
-                ));
-            }
-            for peer in &peers {
-                if identity(peer.participant.pid, peer.participant.role)? != peer.participant {
-                    return Err(std::io::Error::other("child custody lost at ACK expiry"));
+            let now = boot_nanos()?;
+            if !held_past_ack.get() && now >= ticket.started + ACK_NANOS + 10_000_000 {
+                if now
+                    >= ticket
+                        .cutoffs(1)
+                        .map_err(std::io::Error::other)?
+                        .cooperative
+                {
+                    return Err(std::io::Error::other(
+                        "observation missed local cleanup window",
+                    ));
+                }
+                for peer in &peers {
+                    if identity(peer.participant.pid, peer.participant.role)? != peer.participant {
+                        return Err(std::io::Error::other("child custody lost at ACK expiry"));
+                    }
+                }
+                held_past_ack.set(true);
+                for peer in &peers {
+                    peer.release()?;
                 }
             }
-            held_past_ack = true;
-            for peer in &peers {
-                peer.release()?;
-            }
-        }
-        Ok(())
-    });
+            Ok(())
+        },
+        |guard| {
+            let observation = original
+                .get()
+                .filter(|_| !held_past_ack.get())
+                .map(|ticket| {
+                    (
+                        observation.as_fd(),
+                        false,
+                        ticket.started + ACK_NANOS + 10_000_000,
+                    )
+                });
+            guard.wait_for_activity(observation)
+        },
+    );
     // Recover test children before asserting, without crediting these rescue
     // waits as successful production collection.
     for peer in &peers {
@@ -505,7 +524,7 @@ fn parent_ack_loss(role: Role, child_roles: &[Role]) {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    assert!(held_past_ack, "parent stopped at combined ACK expiry");
+    assert!(held_past_ack.get(), "parent stopped at combined ACK expiry");
     assert!(outcome.failed);
     assert_eq!(
         unresolved, 0,

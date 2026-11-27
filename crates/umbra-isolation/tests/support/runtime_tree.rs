@@ -1,6 +1,8 @@
 //! Managed custody and notification through ordinary children.
 //! File latches control work, never certify collection.
 use super::runtime_clock::{self, SharedClock};
+#[path = "runtime_activity.rs"]
+mod runtime_activity;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -722,8 +724,11 @@ pub fn child() -> io::Result<()> {
         record(&root, role, guard.test_clock_state(), &mut prior)?;
         tick();
     }
-    let outcome =
-        guard.run_parent_with_test_observer(|state| record(&root, role, state, &mut prior));
+    let activity = runtime_activity::Activity::new(&root, &config.clock, false)?;
+    let outcome = guard.run_parent_with_test_activity(
+        |state| record(&root, role, state, &mut prior),
+        |guard| activity.wait(guard),
+    );
     let failed = outcome.failed;
     finish_parent(&root, role, outcome)?;
     if (config.case.stuck_role().is_some() || config.case == Case::OwnerLost) && failed {
@@ -836,116 +841,124 @@ pub fn run(case: Case) -> io::Result<()> {
     let mut caller_notified_before_ack = false;
     let mut stopping_child = false;
     let mut prior = None;
-    let outcome = guard.run_parent_with_test_observer(|state| {
-        caller_notified_before_ack |= state.ticket == Some(ticket) && boot_nanos()? == config.t0;
-        wrong_caller_state |= state.expired
-            || (!stopping_child && !state.stage_events.is_empty())
-            || match state.ticket {
-                None => state.receive_deadline != u64::MAX || (advanced && case != Case::TotalLoss),
-                Some(found) => {
-                    case == Case::TotalLoss
-                        || found != ticket
-                        || state.receive_deadline != ticket.deadline
-                }
-            };
-        let caller_checkpoint = case == Case::TotalLoss
-            || (state.ticket == Some(ticket) && state.failed != case.acknowledged());
-        let caller_published = !case.acknowledged() || state.pending_publication.is_empty();
-        record(root, Role::Caller, state, &mut prior)?;
-        if let Some(role) = case.stuck_role() {
-            if released && !stopping_child && root.join(name("stuck", role)).exists() {
-                let child = participant(&inventory, role);
-                if identity(child.pid, child.role)? != child {
-                    return Err(invalid("child exited before its parent opportunity"));
-                }
-                stopping_child = true;
-                // Guardian's owner slot follows its worker slot by one second,
-                // within the original four-second helper allocation.
-                let offset = if role == Role::CleanupOwner {
-                    1_000_000_000
-                } else {
-                    0
+    let activity = runtime_activity::Activity::new(root, &config.clock, true)?;
+    let outcome = guard.run_parent_with_test_activity(
+        |state| {
+            caller_notified_before_ack |=
+                state.ticket == Some(ticket) && boot_nanos()? == config.t0;
+            wrong_caller_state |= state.expired
+                || (!stopping_child && !state.stage_events.is_empty())
+                || match state.ticket {
+                    None => {
+                        state.receive_deadline != u64::MAX || (advanced && case != Case::TotalLoss)
+                    }
+                    Some(found) => {
+                        case == Case::TotalLoss
+                            || found != ticket
+                            || state.receive_deadline != ticket.deadline
+                    }
                 };
-                clock.advance_to(ticket.cutoffs(1).map_err(invalid)?.fallback + offset);
-            }
-            if Instant::now() >= bound {
-                rescued = true;
-                std::fs::write(root.join(name("unstick", role)), b"rescue")?;
-                clock.advance_to(ticket.deadline);
-            }
-        }
-        if !rescued && Instant::now() >= bound {
-            rescued = true;
-            clock.advance_to(ticket.deadline);
-            std::fs::write(root.join("abort"), b"rescue")?;
-            std::fs::write(root.join("release"), b"rescue")?;
-            released = true;
-        }
-        let states = PUBLISHERS
-            .iter()
-            .map(|role| read::<Reading>(root, &name("state", *role)))
-            .collect::<io::Result<Vec<_>>>()?;
-        let provider = read::<Reading>(root, &name("state", Role::Provider))?;
-        if !advanced
-            && (case == Case::TotalLoss || caller_notified_before_ack)
-            && caller_published
-            && states.iter().zip(PUBLISHERS).all(|(reading, role)| {
-                reading.as_ref().is_some_and(|r| {
-                    r.now == config.t0
-                        && r.state.ticket == (!case.held(role)).then_some(ticket)
-                        && !r.state.failed
-                        && match (case, case.delivery()) {
-                            (case, _) if case.acknowledged() => {
-                                r.state.pending_publication.is_empty()
-                            }
-                            (_, None) => r.state.pending_publication == [local],
-                            (_, Some(delivery)) if delivery == role => {
-                                !r.state.pending_publication.contains(&local)
-                            }
-                            _ => true,
-                        }
-                })
-            })
-            && provider
-                .as_ref()
-                .is_some_and(|r| r.state.ticket == Some(ticket))
-        {
-            clock.advance_to(ack_checkpoint);
-            advanced = true;
-        } else if advanced
-            && !released
-            && caller_checkpoint
-            && states.iter().zip(PUBLISHERS).all(|(reading, role)| {
-                reading.as_ref().is_some_and(|r| {
-                    r.now == ack_checkpoint
-                        && r.state.ticket == (!case.held(role)).then_some(ticket)
-                        && r.state.failed == (!case.acknowledged() && !case.held(role))
-                        && !r.state.expired
-                        && r.state.stage_events.is_empty()
-                        && r.state.pending_publication.is_empty()
-                })
-            })
-            && provider
-                .as_ref()
-                .is_some_and(|r| r.now == ack_checkpoint && r.state.ticket == Some(ticket))
-        {
-            for member in &inventory.members {
-                if identity(member.participant.pid, member.participant.role)? != member.participant
-                {
-                    return Err(invalid("custody lost at ACK checkpoint"));
+            let caller_checkpoint = case == Case::TotalLoss
+                || (state.ticket == Some(ticket) && state.failed != case.acknowledged());
+            let caller_published = !case.acknowledged() || state.pending_publication.is_empty();
+            record(root, Role::Caller, state, &mut prior)?;
+            if let Some(role) = case.stuck_role() {
+                if released && !stopping_child && root.join(name("stuck", role)).exists() {
+                    let child = participant(&inventory, role);
+                    if identity(child.pid, child.role)? != child {
+                        return Err(invalid("child exited before its parent opportunity"));
+                    }
+                    stopping_child = true;
+                    // Guardian's owner slot follows its worker slot by one second,
+                    // within the original four-second helper allocation.
+                    let offset = if role == Role::CleanupOwner {
+                        1_000_000_000
+                    } else {
+                        0
+                    };
+                    clock.advance_to(ticket.cutoffs(1).map_err(invalid)?.fallback + offset);
+                }
+                if Instant::now() >= bound {
+                    rescued = true;
+                    std::fs::write(root.join(name("unstick", role)), b"rescue")?;
+                    clock.advance_to(ticket.deadline);
                 }
             }
-            if live_watch.exited()?.is_some() {
-                return Err(invalid(
-                    "custodian exited before the original local-window checkpoint",
-                ));
+            if !rescued && Instant::now() >= bound {
+                rescued = true;
+                clock.advance_to(ticket.deadline);
+                std::fs::write(root.join("abort"), b"rescue")?;
+                std::fs::write(root.join("release"), b"rescue")?;
+                released = true;
             }
-            write(root, "checkpoint", &true)?;
-            std::fs::write(root.join("release"), b"release")?;
-            released = true;
-        }
-        Ok(())
-    });
+            let states = PUBLISHERS
+                .iter()
+                .map(|role| read::<Reading>(root, &name("state", *role)))
+                .collect::<io::Result<Vec<_>>>()?;
+            let provider = read::<Reading>(root, &name("state", Role::Provider))?;
+            if !advanced
+                && (case == Case::TotalLoss || caller_notified_before_ack)
+                && caller_published
+                && states.iter().zip(PUBLISHERS).all(|(reading, role)| {
+                    reading.as_ref().is_some_and(|r| {
+                        r.now == config.t0
+                            && r.state.ticket == (!case.held(role)).then_some(ticket)
+                            && !r.state.failed
+                            && match (case, case.delivery()) {
+                                (case, _) if case.acknowledged() => {
+                                    r.state.pending_publication.is_empty()
+                                }
+                                (_, None) => r.state.pending_publication == [local],
+                                (_, Some(delivery)) if delivery == role => {
+                                    !r.state.pending_publication.contains(&local)
+                                }
+                                _ => true,
+                            }
+                    })
+                })
+                && provider
+                    .as_ref()
+                    .is_some_and(|r| r.state.ticket == Some(ticket))
+            {
+                clock.advance_to(ack_checkpoint);
+                advanced = true;
+            } else if advanced
+                && !released
+                && caller_checkpoint
+                && states.iter().zip(PUBLISHERS).all(|(reading, role)| {
+                    reading.as_ref().is_some_and(|r| {
+                        r.now == ack_checkpoint
+                            && r.state.ticket == (!case.held(role)).then_some(ticket)
+                            && r.state.failed == (!case.acknowledged() && !case.held(role))
+                            && !r.state.expired
+                            && r.state.stage_events.is_empty()
+                            && r.state.pending_publication.is_empty()
+                    })
+                })
+                && provider
+                    .as_ref()
+                    .is_some_and(|r| r.now == ack_checkpoint && r.state.ticket == Some(ticket))
+            {
+                for member in &inventory.members {
+                    if identity(member.participant.pid, member.participant.role)?
+                        != member.participant
+                    {
+                        return Err(invalid("custody lost at ACK checkpoint"));
+                    }
+                }
+                if live_watch.exited()?.is_some() {
+                    return Err(invalid(
+                        "custodian exited before the original local-window checkpoint",
+                    ));
+                }
+                write(root, "checkpoint", &true)?;
+                std::fs::write(root.join("release"), b"release")?;
+                released = true;
+            }
+            Ok(())
+        },
+        |guard| activity.wait(guard),
+    );
     let failed = outcome.failed;
     eprintln!("{case:?} controller: advanced={advanced} released={released} rescued={rescued}");
     for role in ROLES {
