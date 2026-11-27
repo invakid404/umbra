@@ -1590,7 +1590,9 @@ mod unix {
                         ))
                     }
                 };
-                owner.finish_terminal(terminal, root_result)?;
+                if let Err(primary) = owner.finish_terminal(terminal, root_result) {
+                    return Err(fail(namespace, run_id, primary, closure.tree_terminated));
+                }
             }
         } else if let Err(e) = namespace.finish_run(&FinishRunRequest {
             run_id,
