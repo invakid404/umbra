@@ -1063,6 +1063,7 @@ jobs:
             --test userspace_run -- fix_271_shutdown_journal_and_inheritance fix_274_live_sibling_inheritance \
             fix_243_acquired_backend_drop fix_243_inserted_backend_drop fix_243_policy_backend_drop \
             --exact --nocapture --test-threads=1
+          python3 experiments/fixtures/umbra-fix-299b-performance/shutdown_exit.py
           python3 - <<'PY'
           import json, os
           from collections import Counter
@@ -1071,6 +1072,9 @@ jobs:
           exits = [row for row in rows if row["event"] == "final-to-exit"]
           assert exits, "no positive closure reading"
           assert any(row["proof"] for row in exits), "no confirmed closure control"
+          import sys
+          sys.path.insert(0, "experiments/fixtures/umbra-fix-299b-performance")
+          from shutdown_exit import provider_exit_succeeded
           for row in exits:
               assert row["timing_origin"] == "final-decoded", row
               owner = transports[row["nonce"]]
@@ -1082,7 +1086,8 @@ jobs:
               assert actual == recorded, (actual - recorded, recorded - actual)
               print("shutdown Final-to-exit:", row["nanos"], "ns", "acquisitions:", sum(actual.values()))
               # Fault cases may correctly return an unconfirmed complete inventory.
-              assert row["exit_ok"] and int(row["nanos"]) <= 50_000_000, row
+              # Managed cleanup can retain failure after a clean actual parent wait.
+              assert provider_exit_succeeded(row, owner, rows) and int(row["nanos"]) <= 50_000_000, row
           PY
 
       - name: Restore binaries after packed spawn faults

@@ -712,6 +712,12 @@ impl ManagedCleanup for WorkerCleanup {
             }
         }
         let receipt = self.receipt.as_ref().unwrap();
+        #[cfg(feature = "shutdown-witness")]
+        umbra_platform::shutdown::witness(serde_json::json!({
+            "event": "provider-parent-wait",
+            "receipt": receipt,
+            "cleanup_failed": receipt.failed || self.tickets.failed(),
+        }));
         if receipt.failed || receipt.status != 0 || self.tickets.failed() {
             return Err(error("managed cleanup retained a failure"));
         }

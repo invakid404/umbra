@@ -416,6 +416,7 @@ fn close_with_owner(
                         "event": "final-to-exit", "nonce": nonce,
                         "timing_origin": "final-decoded",
                         "nanos": elapsed.as_nanos().to_string(), "exit_ok": exit.is_ok(),
+                        "managed": owner.is_some(),
                         "proof": proof, "accepted": accepted, "final": final_state,
                     }));
                     if !proof {
