@@ -111,6 +111,7 @@ jobs:
           cargo test -p umbra-isolation --lib spawn::descriptors::tests:: -- --nocapture --test-threads=1
           cargo test -p umbra-isolation --test managed_runtime r2_ack_loss_preserves_owner_provider_custody -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime custody_normal_reaps_all -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_da_order_across_roles -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime custody_stuck_custodian_reaps_all -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_uncancellable_work_outer_cleanup -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_creator_past_tail -- --exact --nocapture
@@ -482,6 +483,12 @@ jobs:
           cargo build -p umbra-platform-macos --features retirement-witness --bin umbra-platform-macos
           cargo test -p umbra-platform-macos --lib retirement_ -- --nocapture
           cargo test -p umbra-cli --test child_retention -- --nocapture --test-threads=1
+      - name: Qualify native cleanup order
+        env:
+          UMBRA_NATIVE_CLEANUP_ORDER: /tmp/umbra-order-${{ github.run_id }}-${{ github.run_attempt }}
+          UMBRA_FIX_271_EVIDENCE_FILE: /tmp/umbra-order-${{ github.run_id }}-${{ github.run_attempt }}.jsonl
+        run: |
+          cargo test -p umbra-platform-macos --features test-native-cleanup-order --test shutdown_ledger r2_native_da_order_across_roles -- --exact --nocapture --test-threads=1
       - name: Qualify shutdown inventory and owner destruction
         env:
           UMBRA_RETIREMENT_WITNESS: "1"
