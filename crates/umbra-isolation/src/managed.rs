@@ -18,6 +18,7 @@ pub mod owner_startup;
 pub mod process;
 pub mod provider_startup;
 pub mod publication;
+mod readiness;
 pub mod relay_startup;
 pub mod rollback;
 pub mod startup;

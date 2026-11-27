@@ -3,7 +3,7 @@ use super::{invalid, Channel};
 use std::io;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex, Weak,
 };
 use umbra_core::managed::RunIdentity;
 use umbra_core::{
@@ -21,7 +21,12 @@ pub struct AdmissionService {
 
 /// Shared provider view of the owner's cutoff. Updates can only shorten it.
 #[derive(Clone)]
-pub struct AdmissionCutoff(Arc<AtomicU64>);
+pub struct AdmissionCutoff(Arc<CutoffState>);
+
+struct CutoffState {
+    deadline: AtomicU64,
+    waiter: Mutex<Weak<super::readiness::Readiness>>,
+}
 
 impl AdmissionCutoff {
     /// Retain an independently validated Start ticket or owner phase cutoff.
@@ -30,13 +35,18 @@ impl AdmissionCutoff {
         if deadline == 0 {
             return Err(invalid("invalid admission cutoff"));
         }
-        self.0.fetch_min(deadline, Ordering::AcqRel);
+        let original = self.0.deadline.fetch_min(deadline, Ordering::AcqRel);
+        if deadline < original {
+            if let Some(waiter) = self.0.waiter.lock().unwrap().upgrade() {
+                waiter.wake()?;
+            }
+        }
         Ok(())
     }
 
     /// Clamp a caller's existing operation deadline without creating a timer.
     pub fn clamp(&self, deadline: u64) -> u64 {
-        deadline.min(self.0.load(Ordering::Acquire))
+        deadline.min(self.0.deadline.load(Ordering::Acquire))
     }
 }
 
@@ -63,7 +73,10 @@ impl AdmissionClient {
             pending: None,
             pending_deadline: None,
             failed: false,
-            cutoff: AdmissionCutoff(Arc::new(AtomicU64::new(u64::MAX))),
+            cutoff: AdmissionCutoff(Arc::new(CutoffState {
+                deadline: AtomicU64::new(u64::MAX),
+                waiter: Mutex::new(Weak::new()),
+            })),
         })
     }
 
@@ -149,6 +162,7 @@ impl umbra_core::AdmissionTransport for AdmissionClient {
         #[cfg(feature = "shutdown-witness")]
         let timing = (std::time::Instant::now(), operation.clone());
         self.begin(operation)?;
+        let mut readiness = None;
         loop {
             if let Some(result) = self.poll(deadline)? {
                 #[cfg(feature = "shutdown-witness")]
@@ -168,9 +182,26 @@ impl umbra_core::AdmissionTransport for AdmissionClient {
                 }
                 return Ok(result);
             }
-            // A provider is thread-affine. Yield while the separate owner
-            // services this request; poll always checks the original cutoff.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            use std::os::fd::AsRawFd;
+            let result = (|| {
+                if readiness.is_none() {
+                    let waiter = Arc::new(super::readiness::Readiness::new()?);
+                    *self.cutoff.0.waiter.lock().unwrap() = Arc::downgrade(&waiter);
+                    readiness = Some(waiter);
+                }
+                // Register before reading the cutoff: an earlier notification is
+                // seen by clamp, and a later one wakes the registered waiter.
+                let deadline = self.cutoff.clamp(self.pending_deadline.unwrap());
+                readiness.as_ref().unwrap().wait(
+                    self.channel.stream.as_raw_fd(),
+                    self.channel.written != self.channel.output.len(),
+                    deadline,
+                )
+            })();
+            if result.is_err() {
+                self.failed = true;
+            }
+            result?;
         }
     }
 }

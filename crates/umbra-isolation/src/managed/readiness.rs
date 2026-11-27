@@ -1,0 +1,101 @@
+//! Descriptor readiness and explicit wakeups under an absolute boot-clock cutoff.
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+pub(super) struct Readiness(OwnedFd);
+
+impl Readiness {
+    pub(super) fn new() -> io::Result<Self> {
+        // SAFETY: kqueue has no pointer arguments and returns a new owned descriptor.
+        let raw = unsafe { libc::kqueue() };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: raw is a fresh descriptor, owned only here.
+        let queue = Self(unsafe { OwnedFd::from_raw_fd(raw) });
+        // SAFETY: fcntl operates on our valid descriptor.
+        if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        queue.change(1, libc::EVFILT_USER, libc::EV_ADD | libc::EV_CLEAR, 0)?;
+        Ok(queue)
+    }
+
+    fn change(&self, ident: usize, filter: i16, flags: u16, fflags: u32) -> io::Result<()> {
+        let change = libc::kevent {
+            ident,
+            filter,
+            flags,
+            fflags,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: one initialized input, no output array.
+        if unsafe {
+            libc::kevent(
+                self.0.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn wake(&self) -> io::Result<()> {
+        self.change(1, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER)
+    }
+
+    pub(super) fn wait(&self, fd: RawFd, writing: bool, deadline: u64) -> io::Result<()> {
+        self.change(
+            fd as usize,
+            if writing {
+                libc::EVFILT_WRITE
+            } else {
+                libc::EVFILT_READ
+            },
+            libc::EV_ADD | libc::EV_ONESHOT,
+            0,
+        )?;
+        loop {
+            let remaining = deadline
+                .checked_sub(super::boot_nanos()?)
+                .filter(|n| *n != 0)
+                .ok_or(io::ErrorKind::TimedOut)?;
+            let timeout = libc::timespec {
+                tv_sec: (remaining / 1_000_000_000) as libc::time_t,
+                tv_nsec: (remaining % 1_000_000_000) as libc::c_long,
+            };
+            // SAFETY: initialized output storage and finite timeout, no input changes.
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::kevent(
+                    self.0.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    &mut event,
+                    1,
+                    &timeout,
+                )
+            };
+            if result > 0 {
+                if event.flags & libc::EV_ERROR != 0 {
+                    return Err(io::Error::from_raw_os_error(event.data as i32));
+                }
+                return Ok(());
+            }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            // Recheck the original absolute cutoff after interruptions or timer expiry.
+        }
+    }
+}
