@@ -42,9 +42,11 @@ checks callback refusal and actual helper collection.
 
 Managed startup, observer forwarding and parent collection wait on descriptor
 readiness or process-exit events under their original cutoffs. A silent observer
-does not prevent independent cleanup notification. Managed errors retain their
-original structured cause; helper failure details precede it, with normal
-helper termination reported as an exit code.
+does not prevent independent cleanup notification. Once the managed completion
+channel is installed, reported errors retain their original structured cause;
+helper failure details precede it, with normal helper termination reported as an
+exit code. Earlier storage setup failures can still lose their original cause
+before that channel exists.
 
 `umbra_supervisor::resume(spec)` — also reachable as `Supervisor::resume`, and as
 `Supervisor::recover`, which is the same call — reopens an existing run and
