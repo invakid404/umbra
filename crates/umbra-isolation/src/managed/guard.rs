@@ -760,7 +760,13 @@ fn parent_cutoff(
 }
 
 fn exit_diagnostic(role: umbra_core::managed::Role, status: i32) -> String {
-    format!("{role:?} exited with status {status}")
+    if libc::WIFEXITED(status) {
+        format!("{role:?} exited with code {}", libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        format!("{role:?} ended by signal {}", libc::WTERMSIG(status))
+    } else {
+        format!("{role:?} returned unexpected wait status {status}")
+    }
 }
 
 #[cfg(test)]
