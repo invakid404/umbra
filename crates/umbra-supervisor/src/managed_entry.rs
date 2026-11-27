@@ -220,13 +220,21 @@ pub fn run(
     capacity: u64,
 ) -> umbra_core::Result<()> {
     let mut role = RegisteredRole::prepare(spec, external_caller, capacity)?;
-    execute(&mut role).map_err(|error| {
-        umbra_core::UmbraError::new(
-            umbra_core::ErrorKind::InvalidState,
-            "managed.run",
-            error.to_string(),
-        )
-    })
+    execute(&mut role).map_err(managed_error)
+}
+
+fn managed_error(error: io::Error) -> umbra_core::UmbraError {
+    if let Some(primary) = error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<umbra_core::UmbraError>())
+    {
+        return primary.clone();
+    }
+    umbra_core::UmbraError::new(
+        umbra_core::ErrorKind::InvalidState,
+        "managed.run",
+        error.to_string(),
+    )
 }
 
 /// Execute an entered helper or a prepared root, completing failure cleanup.
@@ -235,7 +243,11 @@ pub fn execute(role: &mut RegisteredRole) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(primary) => match role.cleanup_failure() {
             Ok(()) => Err(primary),
-            Err(cleanup) => Err(io::Error::other(format!("{primary}; cleanup: {cleanup}"))),
+            Err(cleanup) => {
+                let mut error = managed_error(primary);
+                error.diagnostics.push_str(&format!("cleanup: {cleanup}\n"));
+                Err(io::Error::other(error))
+            }
         },
     }
 }
@@ -260,6 +272,14 @@ fn check(
                 _ => None,
             })
             .collect();
+        if let Some(mut primary) = outcome.primary.take() {
+            if !failures.is_empty() {
+                primary
+                    .diagnostics
+                    .push_str(&format!("managed role failed: {}\n", failures.join("; ")));
+            }
+            return Err(io::Error::other(primary));
+        }
         return Err(io::Error::other(format!(
             "managed role failed: {}",
             failures.join("; ")
@@ -277,4 +297,40 @@ fn check_collection(
         return Err(io::Error::other("managed role has uncollected children"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn collected_role_details_preserve_typed_primary() {
+        let primary = umbra_core::UmbraError::new(
+            umbra_core::ErrorKind::Io,
+            "twin source",
+            "No such file or directory (os error 2)",
+        );
+        let expected = primary.to_string();
+        let outcome = umbra_isolation::managed::guard::Outcome {
+            primary: Some(primary.clone()),
+            failed: true,
+            unresolved: Vec::new(),
+            events: vec![umbra_isolation::managed::guard::Event::Failed(
+                "Guardian exited with code 1".into(),
+            )],
+        };
+        let mut retained = Vec::new();
+        let mut finished = false;
+        let error = managed_error(check(outcome, &mut retained, &mut finished).unwrap_err());
+        assert!(finished);
+        assert!(retained.is_empty());
+        assert_eq!(error.kind, primary.kind);
+        assert_eq!(error.operation, primary.operation);
+        assert_eq!(error.context, primary.context);
+        assert_eq!(
+            error.to_string(),
+            format!("managed role failed: Guardian exited with code 1\n{expected}")
+        );
+        assert_eq!(error.to_string().matches("(errno: None)").count(), 1);
+    }
 }

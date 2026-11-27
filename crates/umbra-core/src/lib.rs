@@ -112,8 +112,11 @@ pub enum ErrorKind {
 
 /// A machine-readable failure with the operation and diagnostic context preserved.
 #[derive(Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
-#[error("{kind:?} during {operation}: {context} (errno: {errno:?})")]
+#[error("{diagnostics}{kind:?} during {operation}: {context} (errno: {errno:?})")]
 pub struct UmbraError {
+    /// Earlier role and cleanup diagnostics, including their terminating newlines.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub diagnostics: String,
     /// Kind.
     pub kind: ErrorKind,
     /// Operation.
@@ -142,6 +145,7 @@ impl UmbraError {
             context: context.into(),
             errno: None,
             launch_tree_terminated: false,
+            diagnostics: String::new(),
         }
     }
 

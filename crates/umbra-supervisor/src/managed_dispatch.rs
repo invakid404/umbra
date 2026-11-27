@@ -141,7 +141,10 @@ fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
         result => {
             outcome.failed = true;
             let message = match result {
-                Some(Err(error)) => error.to_string(),
+                Some(Err(error)) => {
+                    outcome.primary = Some(error.clone());
+                    return outcome;
+                }
                 _ => "worker exited without a final result".to_owned(),
             };
             outcome

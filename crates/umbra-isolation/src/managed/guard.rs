@@ -36,6 +36,8 @@ pub enum Action {
 }
 /// Whole parent-role outcome; unresolved handles remain explicit at expiry.
 pub struct Outcome {
+    /// Original worker failure, retained separately from role collection diagnostics.
+    pub primary: Option<umbra_core::UmbraError>,
     /// Every accepted notification, wait receipt and attributed failure.
     pub events: Vec<Event>,
     /// Sticky failure independent of eventual collection.
@@ -349,6 +351,7 @@ impl Guard {
             }),
         );
         Outcome {
+            primary: None,
             failed: self.failed() || self.tickets.ticket().is_none(),
             events,
             unresolved: self
