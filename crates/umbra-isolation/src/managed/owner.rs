@@ -836,6 +836,90 @@ impl Service {
         self.owner.cancel(reason)
     }
 
+    /// Wait for control, admission, notification or process readiness under
+    /// the earliest retained cutoff; no Start means no run-age timer.
+    pub fn wait_for_activity(&mut self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut descriptors = Vec::new();
+        fn add(descriptors: &mut Vec<libc::pollfd>, interest: (std::os::fd::BorrowedFd<'_>, bool)) {
+            descriptors.push(libc::pollfd {
+                fd: interest.0.as_raw_fd(),
+                events: if interest.1 {
+                    libc::POLLOUT
+                } else {
+                    libc::POLLIN
+                },
+                revents: 0,
+            });
+        }
+        let mut deadline = self.owner.tickets.ticket().map_or(u64::MAX, |t| t.deadline);
+        if let Some(ticket) = self.owner.tickets.ticket() {
+            let cutoffs = ticket.cutoffs(self.owner.capacity).map_err(invalid)?;
+            if !self.owner.cancellation_requested {
+                deadline = deadline.min(cutoffs.cooperative);
+            }
+            if !self.forced && self.owner.collected.is_none() {
+                deadline = deadline.min(cutoffs.fallback);
+            }
+        }
+        if let Some(cutoff) = self.response_deadline {
+            deadline = deadline.min(cutoff);
+        }
+        if !self.disconnected && (!self.receipt_sent || self.response_deadline.is_some()) {
+            add(&mut descriptors, self.channel.wait_interest());
+        }
+        if let Some(watch) = &self.owner.watch {
+            descriptors.push(libc::pollfd {
+                fd: watch.descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        if !self.owner.admission_closed {
+            if let Some(admission) = &self.owner.admission {
+                add(&mut descriptors, admission.wait_interest());
+            }
+        }
+        if self.owner.cancellation_requested && !self.owner.transport_closed {
+            if let Some(channel) = &self.owner.independent_cancellation {
+                if !self.owner.cancellation_queued {
+                    return Ok(());
+                }
+                add(&mut descriptors, channel.wait_interest());
+            }
+        }
+        if let Some(publication) = &self.owner.publication {
+            let (routes, cutoff) = publication.wait_descriptors();
+            descriptors.extend(routes);
+            deadline = deadline.min(cutoff);
+        }
+        for (index, route) in self.owner.routes.iter_mut().enumerate() {
+            if self.owner.failed_routes[index] {
+                continue;
+            }
+            if !self.owner.forwarding[index].is_empty()
+                && self.owner.awaiting[index].is_none()
+                && self.owner.pending_ack[index].is_none()
+            {
+                return Ok(());
+            }
+            if let Some(cutoff) = self.owner.pending_ack[index] {
+                deadline = deadline.min(cutoff);
+            }
+            if let Some(start) = &self.owner.awaiting[index] {
+                deadline = deadline.min(
+                    start
+                        .ticket
+                        .started
+                        .checked_add(umbra_core::managed::ACK_NANOS)
+                        .ok_or_else(|| invalid("owner ACK cutoff overflow"))?,
+                );
+            }
+            add(&mut descriptors, route.channel().wait_interest());
+        }
+        super::readiness::wait_descriptors(&mut descriptors, deadline)
+    }
+
     /// One event-loop step; true requires parent collection and response delivery
     /// (or a disconnected worker). Expiry never turns into a collection receipt.
     pub fn poll(&mut self) -> io::Result<bool> {

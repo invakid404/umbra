@@ -33,7 +33,7 @@ pub fn owner(
         *service = Some(startup.take_service()?);
     }
     while !service.as_mut().unwrap().poll()? {
-        tick();
+        service.as_mut().unwrap().wait_for_activity()?;
     }
     if service.as_ref().unwrap().failed() {
         Err(io::Error::other(

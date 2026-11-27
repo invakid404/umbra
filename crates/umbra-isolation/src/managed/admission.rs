@@ -262,6 +262,10 @@ impl AdmissionService {
         result
     }
 
+    pub(super) fn wait_interest(&self) -> (std::os::fd::BorrowedFd<'_>, bool) {
+        self.channel.wait_interest()
+    }
+
     /// Stop new grants and entries before any cancellation or census operation.
     pub fn freeze(&mut self) -> u64 {
         self.ledger.freeze()
