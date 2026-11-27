@@ -115,6 +115,13 @@ impl Observation {
         })
     }
 
+    pub fn assert_held(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let errors = thread.join().unwrap();
+            assert!(errors.is_empty(), "native held barrier crossed: {errors:?}");
+        }
+    }
+
     pub fn directory(&self) -> &std::path::Path {
         &self.root
     }
@@ -129,8 +136,7 @@ impl Observation {
         emergency: Option<i32>,
     ) {
         self.stop.store(true, Ordering::Release);
-        let errors = self.thread.take().unwrap().join().unwrap();
-        assert!(errors.is_empty(), "native held barrier crossed: {errors:?}");
+        self.assert_held();
         assert!(
             !self.root.join("invalid-observation").exists(),
             "controller missed native latch"

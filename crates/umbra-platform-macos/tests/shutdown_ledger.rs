@@ -114,6 +114,10 @@ fn shutdown_native_root_ledger() {
         "closure proof={} error={:?} final-to-exit={:?}",
         closure.tree_terminated, closure.error, closure.final_to_exit
     );
+    #[cfg(feature = "test-native-cleanup-order")]
+    if let Some(order) = native_order.as_mut() {
+        order.assert_held();
+    }
     assert!(closure.tree_terminated, "{:?}", closure.error);
     assert!(closure.error.is_none(), "{:?}", closure.error);
     assert!(
