@@ -12,10 +12,6 @@ use umbra_isolation::managed::{
     relay_startup::RelayStartup,
 };
 
-fn tick() {
-    std::thread::sleep(std::time::Duration::from_millis(1));
-}
-
 /// Serve the cleanup owner while keeping its service in caller-owned custody
 /// on every polling error, including after the provider has been launched.
 pub fn owner(
@@ -177,7 +173,7 @@ pub fn relay(
     observer: Option<Box<dyn RunObserver>>,
 ) -> io::Result<Outcome> {
     while !startup.poll_readiness(external_caller)? {
-        tick();
+        startup.wait_for_readiness()?;
     }
     umbra_core::launch_stdio::LaunchStdio::release_cli_streams().map_err(io::Error::other)?;
     let caller = if external_caller {
@@ -185,14 +181,14 @@ pub fn relay(
             if let Some(receipt) = startup.entry.receive_caller_readiness()? {
                 break Some(receipt);
             }
-            tick();
+            startup.entry.wait_for_startup()?;
         }
     } else {
         None
     };
     startup.arm_storage(run_id, caller)?;
     while startup.poll_release()?.is_none() {
-        tick();
+        startup.wait_for_release()?;
     }
     let child = startup
         .guard

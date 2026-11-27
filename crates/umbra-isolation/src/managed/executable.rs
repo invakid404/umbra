@@ -513,7 +513,13 @@ pub struct PendingRole {
 impl PendingRole {
     /// Wait for the current bootstrap exchange without renewing its cutoff.
     pub(super) fn wait_for_activity(&self) -> io::Result<()> {
-        self.bootstrap.wait_until(self.readiness_deadline)
+        self.bootstrap.wait_until(
+            self.go_queued
+                .as_ref()
+                .map_or(self.readiness_deadline, |go| {
+                    self.readiness_deadline.min(go.deadline)
+                }),
+        )
     }
 
     /// Exact parent control descriptor for the hosted inventory fixture.

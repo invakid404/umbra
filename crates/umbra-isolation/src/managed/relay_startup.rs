@@ -25,6 +25,7 @@ pub struct RelayStartup {
     failed_route: Option<Channel>,
     authorization: Option<Go>,
     ready: bool,
+    readiness_queued: bool,
     released: bool,
     failed: bool,
     rollback: Option<super::rollback::Rollback>,
@@ -75,6 +76,7 @@ impl RelayStartup {
             failed_route: None,
             authorization: None,
             ready: false,
+            readiness_queued: false,
             released: false,
             failed: false,
             rollback: None,
@@ -96,15 +98,43 @@ impl RelayStartup {
                     .spawn_child(Role::Guardian, crate::in_launchd_session())?,
             );
         }
-        if !self.bootstrap.as_mut().unwrap().poll(
+        self.readiness_queued = self.bootstrap.as_mut().unwrap().poll(
             &mut self.entry,
             &mut self.children,
             external_caller,
-        )? {
+        )?;
+        if !self.readiness_queued {
             return Ok(false);
         }
         self.ready = self.entry.flush_readiness()?;
         Ok(self.ready)
+    }
+
+    /// Wait for incomplete readiness publication without delaying local phases.
+    pub fn wait_for_readiness(&self) -> io::Result<()> {
+        if self.readiness_queued {
+            self.entry.wait_for_startup()
+        } else {
+            self.bootstrap
+                .as_ref()
+                .unwrap()
+                .wait_for_activity(&self.entry, &self.children)
+        }
+    }
+
+    /// Wait for durable authorization or its delivery under existing cutoffs.
+    pub fn wait_for_release(&self) -> io::Result<()> {
+        if self.authorization.is_none() {
+            self.arming
+                .as_ref()
+                .ok_or_else(|| invalid("relay not arming"))?
+                .wait_for_activity()
+        } else {
+            self.children
+                .first()
+                .ok_or_else(|| invalid("relay child already transferred"))?
+                .wait_for_activity()
+        }
     }
 
     /// Request the exact Armed write using the existing worker notification route.

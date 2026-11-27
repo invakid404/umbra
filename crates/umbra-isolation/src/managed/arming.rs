@@ -35,6 +35,15 @@ pub struct RelayArming {
 }
 
 impl RelayArming {
+    /// Wait for the request write or response using that phase's original cutoff.
+    pub(super) fn wait_for_activity(&self) -> io::Result<()> {
+        self.channel.wait_until(if self.sent {
+            self.response_deadline
+        } else {
+            self.readiness_deadline
+        })
+    }
+
     /// Queue one immutable request after validating complete role readiness.
     pub fn new(
         channel: Channel,
