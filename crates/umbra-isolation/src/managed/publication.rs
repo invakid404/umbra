@@ -22,6 +22,7 @@ enum State {
     Writing,
     AwaitingAck,
     Acknowledged,
+    AcknowledgedClosed,
     Failed,
 }
 
@@ -95,7 +96,11 @@ impl Publication {
     pub fn progress(&mut self, tickets: &mut TicketState) -> io::Result<bool> {
         let expired = boot_nanos()? >= self.deadline;
         for (route, state) in &mut self.routes {
-            if matches!(state, State::Acknowledged | State::Failed) {
+            if matches!(state, State::AcknowledgedClosed | State::Failed)
+                || (expired
+                    && *state == State::Acknowledged
+                    && route.channel.written == route.channel.output.len())
+            {
                 continue;
             }
             let result: io::Result<()> = if expired {
@@ -108,7 +113,18 @@ impl Publication {
                     if *state == State::Writing {
                         *state = State::AwaitingAck;
                     }
-                    if let Some(message) = route.channel.receive::<ControlMessage>(self.deadline)? {
+                    let message = match route.channel.receive::<ControlMessage>(self.deadline) {
+                        Err(error)
+                            if *state == State::Acknowledged
+                                && error.kind() == io::ErrorKind::UnexpectedEof
+                                && route.channel.input.is_empty() =>
+                        {
+                            *state = State::AcknowledgedClosed;
+                            return Ok(());
+                        }
+                        result => result?,
+                    };
+                    if let Some(message) = message {
                         match message {
                             ControlMessage::Ack(ack) => {
                                 ack.validate(&self.start, route.peer).map_err(invalid)?;
@@ -156,10 +172,11 @@ impl Publication {
                 *state = State::Failed;
             }
         }
-        Ok(self
-            .routes
-            .iter()
-            .all(|(_, state)| matches!(state, State::Acknowledged | State::Failed)))
+        Ok(self.routes.iter().all(|(route, state)| {
+            matches!(state, State::AcknowledgedClosed | State::Failed)
+                || (*state == State::Acknowledged
+                    && route.channel.written == route.channel.output.len())
+        }))
     }
 
     /// Wait for any unfinished route under the already committed cutoff.
@@ -175,7 +192,7 @@ impl Publication {
             .routes
             .iter()
             .filter_map(|(route, state)| {
-                if matches!(state, State::Acknowledged | State::Failed) {
+                if matches!(state, State::AcknowledgedClosed | State::Failed) {
                     return None;
                 }
                 Some(libc::pollfd {
