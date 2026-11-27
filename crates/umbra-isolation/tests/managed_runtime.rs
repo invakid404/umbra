@@ -29,20 +29,18 @@ mod late_acquisition;
 #[path = "support/runtime_tree.rs"]
 mod runtime_tree;
 
-#[test]
 fn cleanup_order_waits_for_held_barriers() {
     runtime_tree::run_ordered(false).unwrap();
 }
 
-#[test]
 fn cleanup_order_emergency_stays_unconfirmed() {
     runtime_tree::run_ordered(true).unwrap();
 }
 
 #[test]
 fn r2_da_order_across_roles() {
-    runtime_tree::run_ordered(false).unwrap();
-    runtime_tree::run_ordered(true).unwrap();
+    cleanup_order_waits_for_held_barriers();
+    cleanup_order_emergency_stays_unconfirmed();
 }
 
 #[cfg(feature = "managed-endpoint-probe")]
