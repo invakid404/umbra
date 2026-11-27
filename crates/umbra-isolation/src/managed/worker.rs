@@ -25,6 +25,7 @@ pub struct WorkerCleanup {
     tickets: TicketState,
     routes: Vec<Route>,
     pending_ack: Vec<Option<u64>>,
+    retired: Vec<bool>,
     forwarding: Vec<std::collections::VecDeque<Start>>,
     awaiting: Vec<Option<Start>>,
     forwarded: Vec<Start>,
@@ -152,8 +153,8 @@ impl WorkerCleanup {
             return Err(invalid("worker forwarding bound exceeded"));
         }
         self.forwarded.push(start.clone());
-        for (route, queue) in self.routes.iter().zip(&mut self.forwarding) {
-            if route.peer() != source {
+        for (index, (route, queue)) in self.routes.iter().zip(&mut self.forwarding).enumerate() {
+            if !self.retired[index] && route.peer() != source {
                 queue.push_back(start.clone());
             }
         }
@@ -162,25 +163,38 @@ impl WorkerCleanup {
 
     fn progress_forwarding(&mut self) -> io::Result<()> {
         for index in 0..self.routes.len() {
-            if self.pending_ack[index].is_some() {
+            if self.retired[index] || self.pending_ack[index].is_some() {
                 continue;
             }
-            if self.awaiting[index].is_none() {
-                if let Some(start) = self.forwarding[index].pop_front() {
-                    self.routes[index]
-                        .channel()
-                        .queue(&ControlMessage::Start(start.clone()))?;
-                    self.awaiting[index] = Some(start);
+            let result = (|| -> io::Result<()> {
+                if self.awaiting[index].is_none() {
+                    if let Some(start) = self.forwarding[index].pop_front() {
+                        self.routes[index]
+                            .channel()
+                            .queue(&ControlMessage::Start(start.clone()))?;
+                        self.awaiting[index] = Some(start);
+                    }
                 }
-            }
-            if let Some(start) = &self.awaiting[index] {
-                let deadline = start
-                    .ticket
-                    .started
-                    .checked_add(umbra_core::managed::ACK_NANOS)
-                    .ok_or_else(|| invalid("worker forwarding clock overflow"))?
-                    .min(self.tickets.ticket().unwrap().deadline);
-                self.routes[index].channel().flush(deadline)?;
+                if let Some(start) = &self.awaiting[index] {
+                    let deadline = start
+                        .ticket
+                        .started
+                        .checked_add(umbra_core::managed::ACK_NANOS)
+                        .ok_or_else(|| invalid("worker forwarding clock overflow"))?
+                        .min(self.tickets.ticket().unwrap().deadline);
+                    self.routes[index].channel().flush(deadline)?;
+                }
+                Ok(())
+            })();
+            if let Err(failure) = result {
+                self.tickets.fail();
+                if self.routes[index].peer() == self.owner {
+                    return Err(failure);
+                }
+                self.retired[index] = true;
+                self.pending_ack[index] = None;
+                self.awaiting[index] = None;
+                self.forwarding[index].clear();
             }
         }
         Ok(())
@@ -214,6 +228,9 @@ impl WorkerCleanup {
             .zip(&mut self.pending_ack)
             .enumerate()
         {
+            if self.retired[index] {
+                continue;
+            }
             let peer = route.peer();
             if peer == self.owner
                 && self.receipt.is_some()
@@ -427,6 +444,7 @@ impl WorkerCleanup {
             capacity,
             tickets: TicketState::new(run, capacity).map_err(invalid)?,
             pending_ack: vec![None; routes.len()],
+            retired: vec![false; routes.len()],
             forwarding: vec![std::collections::VecDeque::new(); routes.len()],
             awaiting: vec![None; routes.len()],
             forwarded: Vec::new(),
@@ -504,6 +522,9 @@ impl WorkerCleanup {
             });
         }
         for (index, route) in self.routes.iter_mut().enumerate() {
+            if self.retired[index] {
+                continue;
+            }
             deadline = forwarding_cutoff(self.awaiting[index].as_ref(), deadline)?;
             if let Some(ack) = self.pending_ack[index] {
                 deadline = deadline.min(ack);
@@ -630,6 +651,9 @@ impl ManagedCleanup for WorkerCleanup {
                     .zip(&mut self.pending_ack)
                     .enumerate()
                 {
+                    if self.retired[index] {
+                        continue;
+                    }
                     let peer = route.peer();
                     let channel = route.channel();
                     if let Some(deadline) = *ack_deadline {
@@ -638,7 +662,14 @@ impl ManagedCleanup for WorkerCleanup {
                             Ok(false) => continue,
                             Err(failure) => {
                                 self.tickets.fail();
-                                return Err(error(failure));
+                                if peer == self.owner {
+                                    return Err(error(failure));
+                                }
+                                self.retired[index] = true;
+                                *ack_deadline = None;
+                                self.awaiting[index] = None;
+                                self.forwarding[index].clear();
+                                continue;
                             }
                         }
                     }
@@ -655,14 +686,28 @@ impl ManagedCleanup for WorkerCleanup {
                         Ok(false) => continue,
                         Err(failure) => {
                             self.tickets.fail();
-                            return Err(error(failure));
+                            if peer == self.owner {
+                                return Err(error(failure));
+                            }
+                            self.retired[index] = true;
+                            *ack_deadline = None;
+                            self.awaiting[index] = None;
+                            self.forwarding[index].clear();
+                            continue;
                         }
                     }
                     let message = match channel.receive::<ControlMessage>(deadline) {
                         Ok(message) => message,
                         Err(failure) => {
                             self.tickets.fail();
-                            return Err(error(failure));
+                            if peer == self.owner {
+                                return Err(error(failure));
+                            }
+                            self.retired[index] = true;
+                            *ack_deadline = None;
+                            self.awaiting[index] = None;
+                            self.forwarding[index].clear();
+                            continue;
                         }
                     };
                     match message {
@@ -684,7 +729,14 @@ impl ManagedCleanup for WorkerCleanup {
                                 .map_err(error)?;
                             if let Err(failure) = channel.queue(&ControlMessage::Ack(ack)) {
                                 self.tickets.fail();
-                                return Err(error(failure));
+                                if peer == self.owner {
+                                    return Err(error(failure));
+                                }
+                                self.retired[index] = true;
+                                *ack_deadline = None;
+                                self.awaiting[index] = None;
+                                self.forwarding[index].clear();
+                                continue;
                             }
                             *ack_deadline = Some(deadline);
                             forwarding.push((peer, start));
@@ -764,6 +816,80 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::process::{Command, Stdio};
     use umbra_core::managed::Role;
+
+    #[test]
+    fn closed_caller_route_does_not_prevent_owner_collection() {
+        let local = identity(std::process::id(), Role::Worker).unwrap();
+        let owner = Participant {
+            role: Role::CleanupOwner,
+            ..local
+        };
+        let provider = Participant {
+            role: Role::Provider,
+            ..local
+        };
+        let caller = Participant {
+            role: Role::Caller,
+            ..local
+        };
+        let run: RunIdentity = serde_json::from_str(
+            r#"{"nonce":"00000000-0000-0000-0000-000000000001","generation":1}"#,
+        )
+        .unwrap();
+        let (owner_socket, owner_peer) = UnixStream::pair().unwrap();
+        let (caller_socket, caller_peer) = UnixStream::pair().unwrap();
+        let mut worker = WorkerCleanup::new(
+            run,
+            local,
+            owner,
+            provider,
+            1,
+            vec![
+                Route::new(caller, Channel::new(caller_socket).unwrap()).unwrap(),
+                Route::new(owner, Channel::new(owner_socket).unwrap()).unwrap(),
+            ],
+        )
+        .unwrap();
+        let start = Start {
+            run,
+            origin: local,
+            ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Trusted, 1).unwrap(),
+        };
+        worker.tickets.accept(start.clone(), local, local).unwrap();
+        drop(caller_peer);
+        let deadline = start.ticket.deadline;
+        std::thread::scope(|scope| {
+            let peer = scope.spawn(move || {
+                let mut channel = Channel::new(owner_peer).unwrap();
+                loop {
+                    if let Some(message) = channel.receive::<ControlMessage>(deadline).unwrap() {
+                        assert!(matches!(message, ControlMessage::Collect { run: found } if found == run));
+                        break;
+                    }
+                    assert!(boot_nanos().unwrap() < deadline);
+                    std::thread::yield_now();
+                }
+                channel.queue(&ControlMessage::Collected(ProviderReceipt {
+                    run, owner, provider, status: 0, failed: false,
+                })).unwrap();
+                while !channel.flush(deadline).unwrap() { std::thread::yield_now(); }
+            });
+            assert!(
+                worker.collect_provider().is_err(),
+                "closed caller remains failed"
+            );
+            peer.join().unwrap();
+        });
+        assert!(
+            worker.receipt.is_some(),
+            "live owner must still be collected"
+        );
+        assert!(
+            worker.provider_receipt().is_none(),
+            "failure must remain sticky"
+        );
+        assert_eq!(worker.tickets.ticket(), Some(start.ticket));
+    }
 
     #[test]
     fn stored_receipt_waits_for_exchange_drain_on_retry() {
