@@ -41,6 +41,17 @@ fn cleanup_order_emergency_stays_unconfirmed() {
 fn r2_da_order_across_roles() {
     cleanup_order_waits_for_held_barriers();
     cleanup_order_emergency_stays_unconfirmed();
+    let mut failures = Vec::new();
+    for trigger in [
+        runtime_tree::Case::ShutdownError,
+        runtime_tree::Case::Unwind,
+        runtime_tree::Case::Cancellation,
+    ] {
+        if let Err(error) = runtime_tree::run_ordered_trigger(trigger) {
+            failures.push(format!("{trigger:?}: {error}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
 }
 
 #[cfg(feature = "managed-endpoint-probe")]

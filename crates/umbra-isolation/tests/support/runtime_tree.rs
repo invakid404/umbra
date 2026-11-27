@@ -49,6 +49,9 @@ const PUBLISHERS: [Role; 4] = [
 pub enum Case {
     Normal,
     OrderEmergency,
+    ShutdownError,
+    Unwind,
+    Cancellation,
     StuckCustodian,
     UncancellableWorker,
     OwnerLost,
@@ -59,11 +62,21 @@ pub enum Case {
     ForwardBeforeExit,
 }
 impl Case {
+    fn ordered_failure(self) -> bool {
+        matches!(
+            self,
+            Self::OrderEmergency | Self::ShutdownError | Self::Unwind | Self::Cancellation
+        )
+    }
+
     fn acknowledged(self) -> bool {
         matches!(
             self,
             Self::Normal
                 | Self::OrderEmergency
+                | Self::ShutdownError
+                | Self::Unwind
+                | Self::Cancellation
                 | Self::StuckCustodian
                 | Self::UncancellableWorker
                 | Self::OwnerLost
@@ -79,7 +92,9 @@ impl Case {
     fn failed(self, role: Role) -> bool {
         match self {
             Self::Normal => false,
-            Self::OrderEmergency => role != Role::Worker,
+            Self::OrderEmergency | Self::ShutdownError | Self::Unwind | Self::Cancellation => {
+                role != Role::Worker
+            }
             Self::StuckCustodian | Self::UncancellableWorker | Self::OwnerLost => {
                 matches!(role, Role::Caller | Role::Relay | Role::Guardian)
             }
@@ -97,6 +112,9 @@ impl Case {
         match self {
             Self::Normal
             | Self::OrderEmergency
+            | Self::ShutdownError
+            | Self::Unwind
+            | Self::Cancellation
             | Self::StuckCustodian
             | Self::UncancellableWorker
             | Self::OwnerLost => false,
@@ -111,6 +129,9 @@ impl Case {
         match self {
             Self::Normal
             | Self::OrderEmergency
+            | Self::ShutdownError
+            | Self::Unwind
+            | Self::Cancellation
             | Self::StuckCustodian
             | Self::UncancellableWorker
             | Self::OwnerLost => None,
@@ -354,7 +375,7 @@ fn finish_parent(root: &Path, role: Role, outcome: Outcome) -> io::Result<()> {
             read(root, &name("member", role))?.ok_or_else(|| invalid("missing parent identity"))?;
         let mut recorder = cleanup_order::Recorder::new(root, config.run, member.participant);
         for (child, status) in &waits {
-            if *status != 0 && config.case != Case::OrderEmergency {
+            if *status != 0 && !config.case.ordered_failure() {
                 return Err(invalid("ordered cleanup child failed"));
             }
             let (stage, dependencies): (_, &[_]) = match child.role {
@@ -485,8 +506,43 @@ pub fn child() -> io::Result<()> {
             tick();
         }
         if config.order {
-            ordered_provider(&root, &config, local)?;
-            if config.case == Case::OrderEmergency {
+            if config.case == Case::Cancellation {
+                wait(&root, || match channel.receive::<Start>(u64::MAX) {
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(true),
+                    Err(error) => Err(error),
+                    Ok(_) => Ok(false),
+                })?;
+                write(&root, "trigger-cancellation", &true)?;
+            }
+            if config.case == Case::Unwind {
+                struct Cleanup<'a>(&'a Path, &'a Config, Participant);
+                impl Drop for Cleanup<'_> {
+                    fn drop(&mut self) {
+                        ordered_provider(self.0, self.1, self.2).expect("unwind cleanup");
+                    }
+                }
+                let result = std::panic::catch_unwind(|| {
+                    let _cleanup = Cleanup(&root, &config, local);
+                    write(&root, "trigger-unwind", &true).unwrap();
+                    panic!("scripted operation unwind");
+                });
+                assert!(result.is_err(), "original unwind must remain failed");
+            } else {
+                let primary = if config.case == Case::ShutdownError {
+                    write(&root, "trigger-shutdown-error", &true)?;
+                    Err(invalid("scripted shutdown error"))
+                } else {
+                    Ok(())
+                };
+                ordered_provider(&root, &config, local)?;
+                if config.case == Case::ShutdownError {
+                    assert!(
+                        primary.is_err(),
+                        "collection must not erase shutdown failure"
+                    );
+                }
+            }
+            if config.case.ordered_failure() {
                 write(
                     &root,
                     &name("receipt", role),
@@ -543,6 +599,10 @@ pub fn child() -> io::Result<()> {
         loop {
             if root.join("abort").exists() {
                 return Err(invalid("fixture aborted"));
+            }
+            if config.case == Case::Cancellation && root.join("release").exists() && !cancelled {
+                owner.cancel("scripted cancellation after Start".into())?;
+                cancelled = true;
             }
             let status = owner.progress()?;
             if owner.test_clock_ticket().is_some() && !provider_started {
@@ -636,7 +696,7 @@ pub fn child() -> io::Result<()> {
                     {
                         tick();
                     }
-                } else if config.case == Case::OrderEmergency {
+                } else if config.case.ordered_failure() {
                     drop(rescue);
                     std::process::exit(1);
                 }
@@ -817,7 +877,7 @@ pub fn child() -> io::Result<()> {
     let failed = outcome.failed;
     finish_parent(&root, role, outcome)?;
     if (config.case.stuck_role().is_some()
-        || matches!(config.case, Case::OwnerLost | Case::OrderEmergency))
+        || (config.case == Case::OwnerLost || config.case.ordered_failure()))
         && failed
     {
         // The helper reports failure only after its actual child waits.
@@ -935,6 +995,14 @@ fn ordered_provider(root: &Path, config: &Config, local: Participant) -> io::Res
 
 pub fn run(case: Case) -> io::Result<()> {
     run_inner(case, false)
+}
+
+pub fn run_ordered_trigger(case: Case) -> io::Result<()> {
+    assert!(matches!(
+        case,
+        Case::ShutdownError | Case::Unwind | Case::Cancellation
+    ));
+    run_inner(case, true)
 }
 
 pub fn run_ordered(emergency: bool) -> io::Result<()> {
@@ -1276,7 +1344,7 @@ fn run_inner(case: Case, order: bool) -> io::Result<()> {
             .collect();
         if receipt.waits.len() != expected.len()
             || expected.iter().any(|peer| {
-                let status = if case == Case::OrderEmergency && peer.role != Role::Worker {
+                let status = if case.ordered_failure() && peer.role != Role::Worker {
                     1 << 8
                 } else if let Some(stuck) = case.stuck_role() {
                     match peer.role {
@@ -1305,6 +1373,16 @@ fn run_inner(case: Case, order: bool) -> io::Result<()> {
         );
     }
     if order {
+        let trigger = match case {
+            Case::ShutdownError => Some("trigger-shutdown-error"),
+            Case::Unwind => Some("trigger-unwind"),
+            Case::Cancellation => Some("trigger-cancellation"),
+            _ => None,
+        };
+        if let Some(trigger) = trigger {
+            assert_eq!(read::<bool>(root, trigger)?, Some(true));
+            assert!(failed, "ordered collection erased original failure");
+        }
         if order_violation {
             return Err(invalid("cleanup crossed a held barrier"));
         }

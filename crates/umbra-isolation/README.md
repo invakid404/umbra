@@ -104,7 +104,9 @@ cannot establish successful whole-run collection.
 `managed_runtime::r2_da_order_across_roles` checks causal receipts across actual
 parent waits with ordinary program and debugger stand-ins. Held operations,
 terminal evidence and resource release prevent early cleanup or certification.
-Its emergency case retains failure after all children are collected. The native
+Shutdown-error, unwind and cancellation cases retain their failed results after
+complete ordered collection; the emergency case also retains its unconfirmed
+result. The native
 Mach-right companion lives in `umbra-platform-macos`; these hosted stand-ins do
 not establish native debugger behavior or SID-1 qualification.
 
