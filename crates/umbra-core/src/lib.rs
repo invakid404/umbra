@@ -1272,6 +1272,28 @@ pub struct ResumeCommand {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_diagnostics_precede_original_error_line() {
+        let original = super::UmbraError::new(
+            super::ErrorKind::Io,
+            "twin source",
+            "No such file or directory (os error 2)",
+        );
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["diagnostics"] =
+            serde_json::json!("managed role failed: Guardian exited with code 1\n");
+        let restored: super::UmbraError = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.to_string(),
+            format!("managed role failed: Guardian exited with code 1\n{original}")
+        );
+        assert_eq!(
+            restored.to_string().lines().last(),
+            Some(original.to_string().as_str())
+        );
+        assert_eq!(restored.to_string().matches("(errno: None)").count(), 1);
+    }
+
     use super::*;
     use serde::de::value::{Error as ValueError, SeqDeserializer};
 
