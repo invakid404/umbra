@@ -144,7 +144,23 @@ impl Drop for Task {
         if cfg!(test) && self.0 == 0 && self.1.is_none() {
             return; // Synthetic task fixture owns no Mach send right.
         }
+        #[cfg(feature = "test-native-cleanup-order")]
+        if let Some(slot) = &self.1 {
+            crate::cleanup_order_probe::record(
+                "right-held",
+                serde_json::json!({"slot": slot.id(), "port": self.0}),
+                true,
+            );
+        }
         let result = unsafe { mach2::mach_port::mach_port_deallocate(mach_task_self(), self.0) };
+        #[cfg(feature = "test-native-cleanup-order")]
+        if let Some(slot) = &self.1 {
+            crate::cleanup_order_probe::record(
+                "right-released",
+                serde_json::json!({"slot": slot.id(), "port": self.0, "result": result}),
+                false,
+            );
+        }
         if let Some(slot) = self.1.take() {
             if result == 0 {
                 let _ = slot.confirm(umbra_core::shutdown::Proof::Released);
@@ -5093,6 +5109,14 @@ impl Session {
         }
         let timed_out = !matches!(reading, BarrierReading::Confirmed(_));
         steps.push(TeardownStep::Barrier(reading.clone()));
+        #[cfg(feature = "test-native-cleanup-order")]
+        crate::cleanup_order_probe::record(
+            "barrier-held",
+            serde_json::json!({"pid": pid, "birth": self.birth, "debugger": tracer,
+                "confirmed": !timed_out, "barrier": format!("{reading:?}"),
+                "operation_failure": failure}),
+            true,
+        );
         if timed_out {
             let warning = format!(
                 "umbra-platform-macos: tracee termination unconfirmed; tracer killed: \
@@ -5102,6 +5126,13 @@ impl Session {
             eprintln!("{warning}");
             steps.push(TeardownStep::Warning(warning));
         }
+        #[cfg(feature = "test-native-cleanup-order")]
+        crate::cleanup_order_probe::record(
+            "debugger-cleanup",
+            serde_json::json!({"pid": pid, "birth": self.birth, "debugger": tracer,
+                "emergency": timed_out}),
+            false,
+        );
         let emergency_limit = crate::clock::now() + rsp::TRACER_REAP_BOUND;
         let emergency = emergency_retirement
             .then(|| crate::retirement::emergency_finish(&mut self.rsp, emergency_limit));
@@ -5144,6 +5175,13 @@ impl Session {
             std::thread::sleep(Duration::from_millis(1));
         }
         steps.push(TeardownStep::TracerReaped(tracer_reaped));
+        #[cfg(feature = "test-native-cleanup-order")]
+        crate::cleanup_order_probe::record(
+            "debugger-collected",
+            serde_json::json!({"pid": pid, "birth": self.birth,
+                "debugger": self.rsp.tracer_pid(), "collected": tracer_reaped}),
+            false,
+        );
         self.rsp.mark_torn_down();
         let post_kill = after_kill.clone();
         match after_kill {

@@ -3,6 +3,15 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::Duration;
 use umbra_core::*;
+#[cfg(feature = "test-native-cleanup-order")]
+#[path = "support/native_order.rs"]
+mod native_order;
+
+#[cfg(feature = "test-native-cleanup-order")]
+#[test]
+fn r2_native_da_order_across_roles() {
+    shutdown_native_root_ledger();
+}
 
 fn path(path: &Path) -> BytePath {
     BytePath::new(path.as_os_str().as_bytes().to_vec()).unwrap()
@@ -16,6 +25,8 @@ fn shutdown_native_root_ledger() {
     }
     let evidence = std::env::var_os("UMBRA_FIX_271_EVIDENCE_FILE")
         .expect("dedicated acquisition evidence path");
+    #[cfg(feature = "test-native-cleanup-order")]
+    let order = native_order::Observation::start();
     // A whole qualification command may append observations from earlier tests.
     // Keep those bytes and inspect only this serial test's newly appended span.
     let witness_start = std::fs::metadata(&evidence)
@@ -159,6 +170,10 @@ fn shutdown_native_root_ledger() {
     let final_state: shutdown::Final =
         serde_json::from_value(final_record["final"].clone()).unwrap();
     assert!(accepted.confirms(&final_state).unwrap());
+    #[cfg(feature = "test-native-cleanup-order")]
+    order
+        .expect("native order directory required")
+        .finish(&final_state);
     let replacement = final_state
         .entries
         .iter()

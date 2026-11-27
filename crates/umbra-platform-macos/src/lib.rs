@@ -5,6 +5,8 @@ mod spawn;
 pub use abi::DarwinArm64Abi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod cache;
+#[cfg(all(target_os = "macos", feature = "test-native-cleanup-order"))]
+mod cleanup_order_probe;
 #[cfg(all(
     feature = "managed-endpoint-probe",
     target_os = "macos",
