@@ -60,7 +60,6 @@ pub struct Handoff {
     /// Negotiated handshake transferred with the connection.
     pub welcome: umbra_core::provider::Welcome,
     stream: UnixStream,
-    cancellation: UnixStream,
     sent: bool,
     offered_run: Option<RunIdentity>,
 }
@@ -123,13 +122,11 @@ impl Launch {
             return Err(invalid("provider parent mismatch or late handshake"));
         }
         let (stream, welcome) = client.into_managed_handoff().map_err(io::Error::other)?;
-        let cancellation = stream.try_clone()?;
-        umbra_core::cost_snapshot!("provider-handoff-duplicate", None, &[]);
+        umbra_core::cost_snapshot!("provider-handoff-ready", None, &[]);
         Ok(Handoff {
             provider,
             welcome,
             stream,
-            cancellation,
             sent: false,
             offered_run: None,
         })
@@ -200,10 +197,10 @@ impl Handoff {
         Ok(self.sent)
     }
 
-    /// Close the sender's RPC copy and retain the independent cancellation copy.
-    /// This is valid on both success and rollback.
+    /// Retain the original RPC endpoint for cancellation until the independent
+    /// route is installed. This is valid on both success and rollback.
     pub fn into_cancellation(self) -> UnixStream {
-        self.cancellation
+        self.stream
     }
 }
 
@@ -215,7 +212,7 @@ pub struct Owner {
     capacity: u64,
     participant: Participant,
     provider: Child,
-    cancellation: UnixStream,
+    cancellation: Option<UnixStream>,
     tickets: TicketState,
     publication: Option<Publication>,
     routes: Vec<Route>,
@@ -243,6 +240,7 @@ impl Owner {
             return Err(invalid("late or duplicate cancellation installation"));
         }
         self.independent_cancellation = Some(channel);
+        self.cancellation.take();
         Ok(())
     }
     /// Adopt the independently assigned admission route before cleanup starts.
@@ -524,7 +522,7 @@ impl Owner {
                 capacity,
                 participant,
                 provider,
-                cancellation,
+                cancellation: Some(cancellation),
                 tickets,
                 publication: None,
                 pending_ack: vec![None; routes.len()],
@@ -675,7 +673,12 @@ impl Owner {
             } else {
                 // shutdown reaches the worker's duplicate too, but leaves the provider
                 // process alive to complete EOF-triggered resource cleanup.
-                if let Err(error) = self.cancellation.shutdown(Shutdown::Both) {
+                if let Err(error) = self
+                    .cancellation
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing cancellation route"))?
+                    .shutdown(Shutdown::Both)
+                {
                     self.tickets.fail();
                     self.failures
                         .push(format!("provider transport closure: {error}"));
