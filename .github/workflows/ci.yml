@@ -521,8 +521,7 @@ jobs:
           UMBRA_REQUIRE_SID1: "1"
         run: |
           cargo test -p umbra-isolation -- --nocapture --test-threads=1
-          cargo build -p umbra-cli --features shutdown-witness
-          cargo test -p umbra-cli --test isolation -- --nocapture --test-threads=1
+          cargo test -p umbra-cli --features shutdown-witness --test isolation -- --nocapture --test-threads=1
           # Named SID-1 stdio contract: exact delivery and EOF by CLI exit.
           cargo test -p umbra-cli --test isolation f201_pipe_eof_isolated -- --exact --nocapture --test-threads=1
       # #205: fail the job on any launchd-parented zombie of this user born
