@@ -456,6 +456,40 @@ impl WorkerCleanup {
         result
     }
 
+    fn wait_for_collection(&mut self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut deadline = self
+            .tickets
+            .ticket()
+            .ok_or_else(|| invalid("collection before Start"))?
+            .deadline;
+        let mut descriptors = Vec::new();
+        for (index, route) in self.routes.iter_mut().enumerate() {
+            deadline = forwarding_cutoff(self.awaiting[index].as_ref(), deadline)?;
+            if let Some(ack) = self.pending_ack[index] {
+                deadline = deadline.min(ack);
+            }
+            // Queued forwarding can advance locally without a socket event.
+            if !self.forwarding[index].is_empty()
+                && self.awaiting[index].is_none()
+                && self.pending_ack[index].is_none()
+            {
+                return Ok(());
+            }
+            let channel = route.channel();
+            let writing = channel.written != channel.output.len();
+            if !writing && self.receipt.is_some() && self.awaiting[index].is_none() {
+                continue;
+            }
+            descriptors.push(libc::pollfd {
+                fd: channel.stream.as_raw_fd(),
+                events: if writing { libc::POLLOUT } else { libc::POLLIN },
+                revents: 0,
+            });
+        }
+        super::readiness::wait_descriptors(&mut descriptors, deadline)
+    }
+
     fn request(&mut self, message: ControlMessage) -> io::Result<()> {
         let deadline = self
             .tickets
@@ -650,7 +684,7 @@ impl ManagedCleanup for WorkerCleanup {
                 {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                self.wait_for_collection().map_err(error)?;
             }
         }
         let receipt = self.receipt.as_ref().unwrap();

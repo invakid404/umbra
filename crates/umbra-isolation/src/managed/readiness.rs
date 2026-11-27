@@ -166,3 +166,35 @@ mod tests {
         assert_eq!(std::io::Read::read(&mut &stream, &mut byte).unwrap(), 0);
     }
 }
+
+/// Wait for any selected route; expiry returns to its state machine.
+pub(super) fn wait_descriptors(descriptors: &mut [libc::pollfd], deadline: u64) -> io::Result<()> {
+    if descriptors.is_empty() {
+        return Ok(());
+    }
+    loop {
+        let now = super::boot_nanos()?;
+        if now >= deadline {
+            return Ok(());
+        }
+        let millis = (deadline - now).div_ceil(1_000_000).min(i32::MAX as u64) as i32;
+        // SAFETY: live exclusively borrowed route descriptors and initialized array.
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                millis,
+            )
+        };
+        if result > 0 {
+            return Ok(());
+        }
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        // An interruption or timeout never creates a new deadline.
+    }
+}
