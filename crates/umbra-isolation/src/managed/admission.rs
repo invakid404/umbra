@@ -253,6 +253,65 @@ mod tests {
         )
     }
 
+    #[test]
+    fn r9_ready_admission_roundtrip_budget() {
+        if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none() {
+            eprintln!("SKIP: admission timing requires an idle qualification host");
+            return;
+        }
+        use std::os::fd::AsRawFd;
+        use umbra_core::AdmissionTransport;
+        let (mut client, mut owner) = endpoints();
+        let deadline = super::super::boot_nanos().unwrap() + 5_000_000_000;
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let owner_ready = ready.clone();
+        let service = std::thread::spawn(move || {
+            owner_ready.wait();
+            for _ in 0..120 {
+                let mut fd = libc::pollfd {
+                    fd: owner.channel.stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // Test owner waits for the actual request, with a finite bound.
+                assert_eq!(unsafe { libc::poll(&mut fd, 1, 1000) }, 1);
+                owner.poll(deadline).unwrap();
+            }
+            assert_eq!(owner.outstanding(), 0);
+        });
+        ready.wait();
+        let mut samples = Vec::new();
+        for index in 0..30 {
+            let obligation = Uuid::from_u128(100 + index);
+            let resource = Uuid::from_u128(200 + index);
+            let started = std::time::Instant::now();
+            for operation in [
+                AdmissionOperation::Reserve { obligation },
+                AdmissionOperation::Entering {
+                    obligation,
+                    resource,
+                },
+                AdmissionOperation::Retiring { obligation },
+                AdmissionOperation::Release {
+                    obligation,
+                    certificate: TerminalCertificate::NoResource {
+                        resource,
+                        creator_terminal: true,
+                    },
+                },
+            ] {
+                client.exchange(operation, deadline).unwrap().unwrap();
+            }
+            samples.push(started.elapsed());
+        }
+        service.join().unwrap();
+        samples.sort();
+        let median = (samples[14] + samples[15]) / 2;
+        eprintln!("admission cycle median={median:?}, p95={:?}", samples[28]);
+        assert!(median <= std::time::Duration::from_millis(1));
+        assert!(samples[28] <= std::time::Duration::from_millis(5));
+    }
+
     fn exchange(
         client: &mut AdmissionClient,
         service: &mut AdmissionService,
