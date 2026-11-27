@@ -17,6 +17,11 @@ fn transport_now() -> Instant {
     }
     Instant::now()
 }
+
+fn wait_for_connection(_listener: &UnixListener, _deadline: Instant) -> std::io::Result<()> {
+    std::thread::sleep(Duration::from_millis(5));
+    Ok(())
+}
 #[cfg(test)]
 thread_local! { static FIX264_CLOCK: std::cell::Cell<Option<(Instant, Instant)>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
@@ -636,7 +641,9 @@ impl Client {
                         Err(e) => break Err(unavailable(e)),
                         _ => {}
                     }
-                    std::thread::sleep(Duration::from_millis(5));
+                    if let Err(error) = wait_for_connection(&listener, deadline) {
+                        break Err(unavailable(error));
+                    }
                 }
                 Err(e) => break Err(unavailable(e)),
             }
@@ -1569,5 +1576,34 @@ mod fix264_real_expiry {
             assert!(e.to_string().contains("request deadline exceeded"));
         }
         FIX264_CLOCK.with(|v| v.set(None));
+    }
+}
+
+#[cfg(test)]
+mod startup_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn queued_connection_has_no_timer_floor() {
+        if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ready");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..30 {
+            let peer = UnixStream::connect(&path).unwrap();
+            let start = Instant::now();
+            wait_for_connection(&listener, start + Duration::from_secs(1)).unwrap();
+            samples.push(start.elapsed());
+            let accepted = listener.accept().unwrap();
+            drop((peer, accepted));
+        }
+        samples.sort();
+        eprintln!("ready listener median={:?} p95={:?}", samples[15], samples[28]);
+        assert!(samples[15] <= Duration::from_millis(1));
+        assert!(samples[28] <= Duration::from_millis(5));
     }
 }
