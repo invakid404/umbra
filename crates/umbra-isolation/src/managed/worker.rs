@@ -440,7 +440,11 @@ impl WorkerCleanup {
                         Err(invalid("Start publication failed"))
                     };
                 }
-                Ok(false) => std::thread::sleep(Duration::from_millis(1)),
+                Ok(false) => {
+                    if let Err(error) = publication.wait() {
+                        break Err(error);
+                    }
+                }
                 Err(error) => break Err(error),
             }
         };

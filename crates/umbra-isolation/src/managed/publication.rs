@@ -162,6 +162,60 @@ impl Publication {
             .all(|(_, state)| matches!(state, State::Acknowledged | State::Failed)))
     }
 
+    /// Wait for any unfinished route under the already committed cutoff.
+    /// Expiry returns to progress so every remaining route records its failure.
+    pub(super) fn wait(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut descriptors: Vec<_> = self
+            .routes
+            .iter()
+            .filter_map(|(route, state)| {
+                if matches!(state, State::Acknowledged | State::Failed) {
+                    return None;
+                }
+                Some(libc::pollfd {
+                    fd: route.channel.stream.as_raw_fd(),
+                    events: if route.channel.written != route.channel.output.len() {
+                        libc::POLLOUT
+                    } else {
+                        libc::POLLIN
+                    },
+                    revents: 0,
+                })
+            })
+            .collect();
+        if descriptors.is_empty() {
+            return Ok(());
+        }
+        loop {
+            let now = boot_nanos()?;
+            if now >= self.deadline {
+                return Ok(());
+            }
+            let millis = (self.deadline - now)
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u64) as i32;
+            // SAFETY: live exclusively borrowed route descriptors and initialized array.
+            let result = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    millis,
+                )
+            };
+            if result > 0 {
+                return Ok(());
+            }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            // An interruption or timeout never creates a new deadline.
+        }
+    }
+
     /// Sticky attributable errors; later child collection never erases these.
     pub fn failures(&self) -> &[String] {
         &self.failures
@@ -409,6 +463,13 @@ mod tests {
             "timeout is not evidence of the closed direct route"
         );
         assert!(sender_tickets.failed());
+        let original_deadline = publication.deadline;
+        publication.deadline = boot_nanos().unwrap() + 20_000_000;
+        publication.wait().unwrap();
+        assert!(boot_nanos().unwrap() >= publication.deadline);
+        // Only the test selects a second cutoff to continue checking alternate
+        // delivery; production retains its original deadline throughout.
+        publication.deadline = original_deadline;
         let received = receiver
             .receive_start(&mut receiver_tickets, relay, origin, publication.deadline)
             .unwrap()
@@ -417,6 +478,7 @@ mod tests {
         assert!(receiver
             .flush_ack(&received, &mut receiver_tickets)
             .unwrap());
+        publication.wait().unwrap();
         assert!(publication.progress(&mut sender_tickets).unwrap());
         assert_eq!(publication.failures().len(), 1);
         assert!(
