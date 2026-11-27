@@ -325,6 +325,45 @@ fn r2_performance_admission_owner() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn r10_admission_owner_ready_exchange_budget() {
+    use std::time::{Duration, Instant};
+    if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none() {
+        return;
+    }
+    let mut samples = Vec::new();
+    for _ in 0..30 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (admission, mut owner, cutoff) = admission_owner::start(deadline);
+        let began = Instant::now();
+        let mut grant = admission.reserve(cutoff).unwrap();
+        grant.enter(cutoff).unwrap();
+        let before_child = began.elapsed();
+        let mut child = child::OwnedChild::new(
+            std::process::Command::new("/usr/bin/true").spawn().unwrap(),
+            deadline,
+        );
+        assert!(child.collect_until(deadline).unwrap().unwrap().success());
+        let began = Instant::now();
+        grant.collected(cutoff).unwrap();
+        samples.push(before_child + began.elapsed());
+        assert!(owner.collect_until(deadline).unwrap().unwrap().success());
+    }
+    eprintln!("admission owner exchange samples: {samples:?}");
+    samples.sort();
+    assert!(
+        samples[15] <= Duration::from_millis(1),
+        "median {:?}",
+        samples[15]
+    );
+    assert!(
+        samples[28] <= Duration::from_millis(5),
+        "p95 {:?}",
+        samples[28]
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn r2_performance_admission_driver() {
     if std::env::var_os("UMBRA_F299_PERF_EVENTS").is_none() {
         return;
