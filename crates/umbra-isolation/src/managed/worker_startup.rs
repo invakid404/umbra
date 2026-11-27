@@ -18,6 +18,7 @@ pub struct WorkerStartup {
     pub client: Option<umbra_core::provider::Client>,
     bootstrap: Bootstrap,
     ready: bool,
+    waiting_readiness: bool,
     failed: bool,
     arming: Option<super::arming::WorkerArming>,
     armed: bool,
@@ -48,6 +49,7 @@ impl WorkerStartup {
             client: None,
             bootstrap: Bootstrap::new(Vec::new(), Vec::new())?,
             ready: false,
+            waiting_readiness: false,
             failed: false,
             arming: None,
             armed: false,
@@ -226,8 +228,10 @@ impl WorkerStartup {
             }
         }
         if !self.entry.flush_readiness()? {
+            self.waiting_readiness = true;
             return Ok(false);
         }
+        self.waiting_readiness = false;
         let control = self
             .control
             .as_mut()
@@ -259,5 +263,19 @@ impl WorkerStartup {
             self.entry.readiness_deadline,
         )?;
         Ok(self.client.is_some())
+    }
+
+    /// Wait for the startup exchange that still owns the next step.
+    pub fn wait_for_activity(&self) -> io::Result<()> {
+        if !self.ready {
+            self.bootstrap.wait_for_activity(&self.entry, &[])
+        } else if self.waiting_readiness {
+            self.entry.wait_for_startup()
+        } else {
+            self.control
+                .as_ref()
+                .ok_or_else(|| invalid("worker control transferred early"))?
+                .wait_until(self.entry.readiness_deadline)
+        }
     }
 }

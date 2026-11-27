@@ -18,6 +18,7 @@ pub struct GuardianStartup {
     pub guard: Option<Guard>,
     bootstrap: Option<Bootstrap>,
     phase: u8,
+    stalled: bool,
     forwarded: usize,
     failed: bool,
     rollback: Option<super::rollback::Rollback>,
@@ -64,6 +65,7 @@ impl GuardianStartup {
             guard: None,
             bootstrap: Some(Bootstrap::new(Vec::new(), Vec::new())?),
             phase: 0,
+            stalled: false,
             forwarded: 0,
             failed: false,
             rollback: None,
@@ -75,11 +77,30 @@ impl GuardianStartup {
         if self.failed {
             return Err(invalid("guardian startup already failed"));
         }
+        let phase = self.phase;
         let result = self.progress(external_caller);
+        self.stalled = self.phase == phase;
         if result.is_err() {
             self.failed = true;
         }
         result
+    }
+
+    /// Local transitions continue immediately; only incomplete exchanges wait.
+    pub fn wait_for_activity(&self) -> io::Result<()> {
+        if !self.stalled {
+            return Ok(());
+        }
+        match self.phase {
+            1 => self
+                .bootstrap
+                .as_ref()
+                .unwrap()
+                .wait_for_activity(&self.entry, &self.children),
+            2 => self.entry.wait_for_startup(),
+            3 => self.children[self.forwarded].wait_for_activity(),
+            _ => Err(invalid("guardian wait outside startup")),
+        }
     }
 
     fn progress(&mut self, external_caller: bool) -> io::Result<bool> {

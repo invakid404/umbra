@@ -53,7 +53,7 @@ pub fn worker_ready(
 ) -> io::Result<()> {
     let descriptor = input.platform().map_err(io::Error::other)?;
     while !startup.poll(descriptor, input.timeout_ms(), external_caller)? {
-        tick();
+        startup.wait_for_activity()?;
     }
     Ok(())
 }
@@ -66,7 +66,7 @@ pub fn guardian(
     external_caller: bool,
 ) -> io::Result<Outcome> {
     while !startup.poll(external_caller)? {
-        tick();
+        startup.wait_for_activity()?;
     }
     umbra_core::launch_stdio::LaunchStdio::release_cli_streams().map_err(io::Error::other)?;
     let parent = startup.entry.take_exchange()?;
