@@ -11,9 +11,11 @@ pub struct ManagedRunInput {
     run_id: umbra_core::RunId,
     registry: ProviderRegistry,
     launch: RunLaunch,
+    #[cfg_attr(unix, serde(with = "native_path"))]
     workspace: PathBuf,
     persistence: RunPersistence,
     experimental: bool,
+    #[cfg_attr(unix, serde(with = "native_path"))]
     state_root: PathBuf,
 }
 
@@ -124,6 +126,67 @@ impl ManagedRunInput {
             experimental: self.experimental,
             state_root: self.state_root,
             observer,
+        }
+    }
+}
+
+#[cfg(unix)]
+mod native_path {
+    use serde::{Deserialize, Serialize};
+    use std::{
+        ffi::OsString,
+        os::unix::ffi::{OsStrExt, OsStringExt},
+        path::{Path, PathBuf},
+    };
+    pub fn serialize<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+        path.as_os_str().as_bytes().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<PathBuf, D::Error> {
+        Vec::<u8>::deserialize(deserializer).map(|bytes| PathBuf::from(OsString::from_vec(bytes)))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{
+        ffi::OsString,
+        os::unix::ffi::{OsStrExt, OsStringExt},
+    };
+    #[test]
+    fn managed_input_preserves_native_path_bytes() {
+        for (workspace, state_root) in [
+            (b"/workspace".as_slice(), b"/unused/\xff".as_slice()),
+            (b"/workspace/\xfe".as_slice(), b"/state/\xff".as_slice()),
+        ] {
+            let input = ManagedRunInput {
+                version: 1,
+                run_id: umbra_core::RunId(uuid::Uuid::new_v4()),
+                registry: ProviderRegistry {
+                    providers: Default::default(),
+                    timeout_ms: 1000,
+                },
+                launch: RunLaunch::Command(crate::run::CommandLaunch {
+                    executable: umbra_core::BytePath::new(b"/usr/bin/true".to_vec()).unwrap(),
+                    cwd: umbra_core::BytePath::new(b"/".to_vec()).unwrap(),
+                    argv: vec![b"true".to_vec()],
+                    environment: Vec::new(),
+                }),
+                workspace: PathBuf::from(OsString::from_vec(workspace.to_vec())),
+                persistence: RunPersistence::LocalDevelopment,
+                experimental: true,
+                state_root: PathBuf::from(OsString::from_vec(state_root.to_vec())),
+            };
+            let original_run = input.run_id();
+            let launch = input.registered_launch(true, 1).unwrap();
+            let (external, decoded) = ManagedRunInput::from_registered(&launch).unwrap();
+            assert!(external);
+            assert_eq!(decoded.run_id(), original_run);
+            let spec = decoded.into_spec(None);
+            assert_eq!(spec.workspace.as_os_str().as_bytes(), workspace);
+            assert_eq!(spec.state_root.as_os_str().as_bytes(), state_root);
         }
     }
 }
