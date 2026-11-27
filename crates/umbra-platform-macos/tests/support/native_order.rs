@@ -116,6 +116,7 @@ impl Observation {
     }
 
     pub fn assert_held(&mut self) {
+        self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let errors = thread.join().unwrap();
             assert!(errors.is_empty(), "native held barrier crossed: {errors:?}");
