@@ -484,10 +484,12 @@ impl Entry {
                 command
                     .env_remove(crate::ENV_GUARDIAN)
                     .env(ENV_ROLE, encoded);
-                // SAFETY: only fcntl runs after fork; owned descriptors remain
-                // live on this stack until connect returns. Parent flags stay intact.
+                // SAFETY: only fcntl runs after fork. The command owns the
+                // child-only descriptors until spawn returns; transport drops
+                // the command immediately afterward. Parent flags stay intact.
                 unsafe {
                     command.pre_exec(move || {
+                        let _retained = (&endpoints, &child_bootstrap);
                         for fd in &fds {
                             let flags = libc::fcntl(*fd, libc::F_GETFD);
                             if flags < 0
@@ -502,8 +504,6 @@ impl Entry {
                 Ok(())
             },
         )?;
-        drop(endpoints);
-        drop(child_bootstrap);
         umbra_core::cost_snapshot!("provider-parent-copies-closed", None, &[]);
         resource_observation("provider-parent-copies-closed");
         let startup = super::provider_startup::ProviderStartup::new(
@@ -796,6 +796,7 @@ impl Entry {
         while !self.flush_readiness()? {
             self.wait_for_bootstrap(&readiness)?;
         }
+        drop(readiness);
         while !self.await_go(u64::MAX)? {
             self.wait_for_preparation(None)?;
         }

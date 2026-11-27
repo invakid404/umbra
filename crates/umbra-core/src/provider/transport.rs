@@ -637,6 +637,9 @@ impl Client {
         #[cfg(feature = "startup-witness")]
         let stage_origin = Instant::now();
         let child = command.spawn().map_err(unavailable)?;
+        // Configuration may retain child-only descriptor owners for pre_exec.
+        // Spawn has transferred them; release parent copies before handshake.
+        drop(command);
         #[cfg(feature = "startup-witness")]
         let (spawn_duration, stage_child) = (stage_origin.elapsed(), child.id());
         crate::cost_snapshot!("provider-command-after", Some(child.id()), &[]);
