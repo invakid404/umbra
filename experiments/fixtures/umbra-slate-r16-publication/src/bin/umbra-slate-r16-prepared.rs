@@ -7,7 +7,7 @@ use std::{
 use umbra_core::{RunId, UmbraError};
 use umbra_supervisor::{RunObserver, RunOutcome};
 fn seed_error(context: impl Into<String>) -> UmbraError {
-    UmbraError { kind: umbra_core::ErrorKind::Io, operation: "fixture.seed".into(), context: context.into(), errno: None, launch_tree_terminated: false }
+    UmbraError::new(umbra_core::ErrorKind::Io, "fixture.seed", context)
 }
 struct Prepared {
     workspace: std::path::PathBuf,
