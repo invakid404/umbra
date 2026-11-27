@@ -775,6 +775,36 @@ impl Rsp {
             Err(e) => TeardownRead::Closed(e.to_string()),
         }
     }
+    #[cfg(feature = "test-native-cleanup-order")]
+    pub(crate) fn observe_tracer_end(&self) -> serde_json::Value {
+        // Observe our child without collecting it or changing cleanup timing.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return serde_json::json!({"error": std::io::Error::last_os_error().to_string()});
+        }
+        serde_json::json!({"running": info.si_pid == 0,
+            "normal_exit": info.si_pid != 0 && info.si_code == libc::CLD_EXITED,
+            "code": info.si_code, "status": info.si_status})
+    }
+
+    #[cfg(feature = "test-native-cleanup-order")]
+    pub(crate) fn collected_raw_status(&mut self) -> Option<i32> {
+        use std::os::unix::process::ExitStatusExt;
+        // Only query Child's cached status after production has collected it.
+        self.reaped
+            .then(|| self.child.try_wait().ok().flatten())
+            .flatten()
+            .map(|status| status.into_raw())
+    }
+
     /// `SIGKILL` the tracer. Harmless if it has already exited.
     pub fn kill_tracer(&mut self) {
         let _ = self.child.kill();

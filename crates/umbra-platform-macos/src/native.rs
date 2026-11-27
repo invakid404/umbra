@@ -5134,10 +5134,13 @@ impl Session {
             steps.push(TeardownStep::Warning(warning));
         }
         #[cfg(feature = "test-native-cleanup-order")]
+        let helper_before_request = self.rsp.observe_tracer_end();
+        #[cfg(feature = "test-native-cleanup-order")]
         crate::cleanup_order_probe::record(
             "debugger-cleanup",
             serde_json::json!({"pid": pid, "birth": self.birth, "debugger": tracer,
-                "emergency": timed_out}),
+                "emergency": timed_out, "helper_before_request": helper_before_request,
+                "allocation_expired": crate::clock::now() >= self.cleanup_limit(deadline)}),
             false,
         );
         let emergency_limit = crate::clock::now() + rsp::TRACER_REAP_BOUND;
@@ -5186,7 +5189,8 @@ impl Session {
         crate::cleanup_order_probe::record(
             "debugger-collected",
             serde_json::json!({"pid": pid, "birth": self.birth,
-                "debugger": self.rsp.tracer_pid(), "collected": tracer_reaped}),
+                "debugger": self.rsp.tracer_pid(), "collected": tracer_reaped,
+                "raw_wait_status": self.rsp.collected_raw_status()}),
             false,
         );
         self.rsp.mark_torn_down();

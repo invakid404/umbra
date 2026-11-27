@@ -77,7 +77,7 @@ impl Observation {
                     }) {
                         errors.push(format!("{forbidden} crossed held {stage}"));
                     }
-                    if stage == "barrier-held" {
+                    if stage == "barrier-held" && event["details"]["confirmed"] == true {
                         use umbra_isolation::managed::process::{identity, ProcessWatch};
                         let debugger = event["details"]["debugger"].as_u64().unwrap() as u32;
                         let observation = (|| -> std::io::Result<bool> {
@@ -179,6 +179,24 @@ impl Observation {
         assert_eq!(events[barrier]["details"]["confirmed"], emergency.is_none());
         assert_eq!(events[cleanup]["details"]["emergency"], emergency.is_some());
         assert_eq!(events[collected]["details"]["collected"], true);
+        if emergency.is_some() {
+            assert_eq!(events[cleanup]["details"]["allocation_expired"], true);
+            let before = &events[cleanup]["details"]["helper_before_request"];
+            assert!(
+                before["running"] == true || before["normal_exit"] == true,
+                "helper ended by signal before cleanup request, or observation failed: {before}"
+            );
+            let raw = events[collected]["details"]["raw_wait_status"]
+                .as_i64()
+                .expect("actual parent raw wait status") as i32;
+            if before["normal_exit"] == true {
+                assert!(libc::WIFEXITED(raw), "helper parent status: {raw}");
+                assert_eq!(
+                    i64::from(libc::WEXITSTATUS(raw)),
+                    before["status"].as_i64().unwrap()
+                );
+            }
+        }
         assert_eq!(
             events[barrier]["details"]["debugger"],
             events[collected]["details"]["debugger"]
