@@ -522,8 +522,40 @@ fn r11_head_tree_reproduction() {
 }
 
 #[cfg(target_os = "macos")]
+fn isolated_inventory_test(name: &str) -> bool {
+    const SELECTED: &str = "UMBRA_INVENTORY_TEST";
+    const PARENT: &str = "UMBRA_INVENTORY_TEST_PARENT";
+    if std::env::var(SELECTED).as_deref() == Ok(name) {
+        let parent: u32 = std::env::var(PARENT).unwrap().parse().unwrap();
+        assert_ne!(
+            std::process::id(),
+            parent,
+            "calibration must run outside the parallel test process"
+        );
+        return true;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let process = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(SELECTED, name)
+        .env(PARENT, std::process::id().to_string())
+        .spawn()
+        .unwrap();
+    let mut process = child::OwnedChild::new(process, deadline);
+    let status = process
+        .collect_until(deadline)
+        .unwrap()
+        .expect("inventory child deadline");
+    assert!(status.success(), "{name}: inventory child failed: {status}");
+    false
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn r11_startup_descriptor_inventory() {
+    if !isolated_inventory_test("r11_startup_descriptor_inventory") {
+        return;
+    }
     use std::os::fd::AsRawFd;
     let before = observation::own_descriptors().unwrap();
     let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -538,6 +570,9 @@ fn r11_startup_descriptor_inventory() {
 #[cfg(target_os = "macos")]
 #[test]
 fn r11_run_inventory_identity_and_counts() {
+    if !isolated_inventory_test("r11_run_inventory_identity_and_counts") {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let before = observation::own_descriptors().unwrap();
     let census = observation::run_inventory(directory.path());

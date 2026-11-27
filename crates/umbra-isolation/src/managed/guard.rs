@@ -1070,7 +1070,23 @@ mod policy_tests {
                 writer.write_all(&[0]).unwrap();
             }
             drop(writer);
-            let events = guard.poll();
+            // A nonblocking read may precede delivery of the peer's closure.
+            // Observe EOF, rather than treating one poll as proof of closure.
+            let deadline = guard
+                .receive_deadline()
+                .min(boot_nanos().unwrap() + umbra_core::managed::ACK_NANOS);
+            let mut events = Vec::new();
+            loop {
+                events.extend(guard.poll());
+                if guard.peers[0].failed {
+                    break;
+                }
+                assert!(
+                    boot_nanos().unwrap() < deadline,
+                    "notification EOF not observed"
+                );
+                guard.peers[0].route.channel().wait_until(deadline).unwrap();
+            }
             assert_eq!(
                 guard.failed(),
                 expected_failed,
