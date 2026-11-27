@@ -971,6 +971,62 @@ mod policy_tests {
         );
     }
 
+    #[cfg(feature = "test-clock")]
+    #[test]
+    fn test_observer_publishes_polled_state_before_wait() {
+        use super::super::process::identity;
+        use std::cell::Cell;
+        use std::os::unix::net::UnixStream;
+        let local = identity(std::process::id(), Role::Guardian).unwrap();
+        let run = RunIdentity {
+            nonce: uuid::Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut guard = Guard::new(local, run, 1).unwrap();
+        let child = SpawnedChild::spawn(
+            std::path::Path::new("/bin/sleep"),
+            &["sleep".into(), "30".into()],
+            &[],
+            false,
+            &[],
+        )
+        .unwrap();
+        let participant = identity(child.pid(), Role::Worker).unwrap();
+        assert!(guard.child(participant, child).is_ok());
+        let (writer, reader) = UnixStream::pair().unwrap();
+        guard.route(
+            participant,
+            Route::new(participant, super::super::Channel::new(reader).unwrap()).unwrap(),
+        );
+        drop(writer);
+        let observed = Cell::new(false);
+        let stale = Cell::new(false);
+        let first = Cell::new(true);
+        let outcome = guard.run_parent_with_test_activity(
+            |state| {
+                observed.set(state.failed);
+                Ok(())
+            },
+            |guard| {
+                if first.replace(false) {
+                    stale.set(guard.failed() && !observed.get());
+                    // Only this test's still-owned child is stopped; the guard
+                    // must subsequently produce the actual parent receipt.
+                    unsafe {
+                        libc::kill(participant.pid, libc::SIGKILL);
+                    }
+                }
+                guard.wait_for_activity(None)
+            },
+        );
+        assert!(outcome.unresolved.is_empty());
+        assert!(outcome
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Collected(p, _) if *p == participant)));
+        assert!(!stale.get(), "observer slept with stale pre-poll state");
+    }
+
     #[test]
     fn notification_eof_requires_start_and_complete_frames() {
         use std::io::Write;
