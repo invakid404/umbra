@@ -7,6 +7,7 @@ edition.workspace = true
 publish = false
 
 [features]
+test-slow-namespace-preparation = []
 # D5's shared base/head fixture selects registered dispatch only on the head.
 cost-library-managed = []
 # Qualification-only: lose the response after authoritative Armed persistence.

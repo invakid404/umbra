@@ -33,6 +33,7 @@ fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "success".into());
     assert!([
         "success",
+        "slow_preparation",
         "finish_reply_loss",
         "missing",
         "prepared_error",
@@ -75,7 +76,14 @@ fn main() {
     if mode == "r2_direct_drop_failed_result" {
         panic!("r2_direct_drop_failed_result requires its compile-time probe");
     }
-    let expects_success = ["success", "finish_reply_loss"].contains(&mode.as_str());
+    if mode == "slow_preparation" {
+        assert!(
+            cfg!(feature = "test-slow-namespace-preparation"),
+            "slow preparation requires its compile-time test hook"
+        );
+    }
+    let expects_success =
+        ["success", "finish_reply_loss", "slow_preparation"].contains(&mode.as_str());
     let capacity: u64 = std::env::args()
         .nth(2)
         .map(|value| value.parse().unwrap())
@@ -338,6 +346,9 @@ fn main() {
         );
     } else if expects_success {
         result.unwrap();
+        if mode == "slow_preparation" {
+            assert!(elapsed >= std::time::Duration::from_millis(2300));
+        }
         assert_eq!(*events.borrow(), ["stdio", "prepared", "finished"]);
     } else {
         let error = result.unwrap_err().to_string();

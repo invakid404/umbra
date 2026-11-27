@@ -963,6 +963,8 @@ mod unix {
             );
         };
         stage("worker-setup-begin");
+        #[cfg(feature = "test-slow-namespace-preparation")]
+        std::thread::sleep(std::time::Duration::from_millis(2300));
         validate(&spec)?;
         stage("worker-validation-end");
         let launch_stdio = umbra_core::launch_stdio::LaunchStdio::capture()?;
