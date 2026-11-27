@@ -1343,7 +1343,11 @@ mod unix {
                         // worker must not delay pipe EOF while it supervises.
                         umbra_core::launch_stdio::LaunchStdio::release_cli_streams()?;
                     }
-                    transport.exchange(request, || observer_cleanup.observer_progress())
+                    transport.exchange(
+                        request,
+                        || observer_cleanup.observer_progress(),
+                        |channel, deadline| observer_cleanup.observer_wait(channel, deadline),
+                    )
                 }),
             ));
             let final_observer = shared_observer.clone();

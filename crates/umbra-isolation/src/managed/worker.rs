@@ -49,6 +49,15 @@ impl SharedWorkerCleanup {
         Ok(cleanup.tickets.ticket().map(|ticket| ticket.deadline))
     }
 
+    /// Wait for observer I/O or independent cleanup notifications together.
+    pub fn observer_wait(&self, channel: &super::Channel, deadline: u64) -> umbra_core::Result<()> {
+        self.inner
+            .try_borrow_mut()
+            .map_err(error)?
+            .wait_for_activity(Some((channel, deadline)))
+            .map_err(error)
+    }
+
     /// Share an enrolled worker's independent notification routes.
     pub fn new(cleanup: WorkerCleanup) -> Self {
         Self {
@@ -457,13 +466,28 @@ impl WorkerCleanup {
     }
 
     fn wait_for_collection(&mut self) -> io::Result<()> {
+        if self.tickets.ticket().is_none() {
+            return Err(invalid("collection before Start"));
+        }
+        self.wait_for_activity(None)
+    }
+
+    fn wait_for_activity(&mut self, external: Option<(&super::Channel, u64)>) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         let mut deadline = self
             .tickets
             .ticket()
-            .ok_or_else(|| invalid("collection before Start"))?
-            .deadline;
+            .map_or(u64::MAX, |ticket| ticket.deadline);
         let mut descriptors = Vec::new();
+        if let Some((channel, cutoff)) = external {
+            deadline = deadline.min(cutoff);
+            let (fd, writing) = channel.wait_interest();
+            descriptors.push(libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: if writing { libc::POLLOUT } else { libc::POLLIN },
+                revents: 0,
+            });
+        }
         for (index, route) in self.routes.iter_mut().enumerate() {
             deadline = forwarding_cutoff(self.awaiting[index].as_ref(), deadline)?;
             if let Some(ack) = self.pending_ack[index] {
@@ -712,6 +736,55 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::process::{Command, Stdio};
     use umbra_core::managed::Role;
+
+    #[test]
+    fn observer_wait_wakes_for_independent_cleanup() {
+        let local = identity(std::process::id(), Role::Worker).unwrap();
+        let owner = Participant {
+            role: Role::CleanupOwner,
+            ..local
+        };
+        let provider = Participant {
+            role: Role::Provider,
+            ..local
+        };
+        let run: RunIdentity = serde_json::from_str(
+            r#"{"nonce":"00000000-0000-0000-0000-000000000001","generation":1}"#,
+        )
+        .unwrap();
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let cleanup = SharedWorkerCleanup::new(
+            WorkerCleanup::new(
+                run,
+                local,
+                owner,
+                provider,
+                1,
+                vec![Route::new(owner, Channel::new(socket).unwrap()).unwrap()],
+            )
+            .unwrap(),
+        );
+        let (observer, _silent_observer) = UnixStream::pair().unwrap();
+        let observer = Channel::new(observer).unwrap();
+        let start = Start {
+            run,
+            origin: owner,
+            ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Failed, 1).unwrap(),
+        };
+        let mut peer = Channel::new(peer).unwrap();
+        peer.queue(&ControlMessage::Start(start.clone())).unwrap();
+        assert!(peer.flush(start.ticket.deadline).unwrap());
+        let cutoff = boot_nanos().unwrap() + 1_000_000_000;
+        cleanup.observer_wait(&observer, cutoff).unwrap();
+        assert!(
+            boot_nanos().unwrap() < cutoff,
+            "cleanup route must wake a silent observer"
+        );
+        assert_eq!(
+            cleanup.observer_progress().unwrap(),
+            Some(start.ticket.deadline)
+        );
+    }
 
     #[test]
     fn forwarded_ack_uses_original_ack_cutoff_not_collection_deadline() {

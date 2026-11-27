@@ -62,6 +62,7 @@ impl WorkerTransport {
         &mut self,
         request: Request,
         mut progress: impl FnMut() -> Result<Option<u64>>,
+        mut wait: impl FnMut(&umbra_isolation::managed::Channel, u64) -> Result<()>,
     ) -> Result<Response> {
         if self.failed {
             return Err(transport_error("observer transport already failed"));
@@ -90,7 +91,7 @@ impl WorkerTransport {
                     return Ok(response);
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            wait(&self.channel, deadline)?;
         }
     }
 }
@@ -582,7 +583,11 @@ mod tests {
         });
         let mut transport = WorkerTransport::new(Channel::new(worker).unwrap());
         let mut worker = WorkerObserver::new(run, |request| {
-            transport.exchange(request, || Ok(Some(deadline)))
+            transport.exchange(
+                request,
+                || Ok(Some(deadline)),
+                |channel, cutoff| channel.wait_until(cutoff).map_err(transport_error),
+            )
         });
         worker.stdio_adopted().unwrap();
         worker.prepared(run).unwrap();
