@@ -51,6 +51,11 @@ pub fn compare(base: &[f64], head: &[f64]) -> Result<Comparison, &'static str> {
 }
 
 impl Comparison {
+    // Owner disposition, November27 2026: whole invocation median governs D6.
+    pub fn invocation_passes(&self) -> bool {
+        self.head.median - self.base.median <= 5_000_000.0_f64.max(self.base.median * 0.10)
+    }
+
     pub fn teardown_passes(&self) -> bool {
         self.head.median - self.base.median <= 5_000_000.0_f64.max(self.base.median * 0.10)
             && self.head.p95 - self.base.p95 <= 10_000_000.0_f64.max(self.base.p95 * 0.20)

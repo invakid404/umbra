@@ -50,6 +50,26 @@ fn d6_uses_distribution_differences_not_paired_quantiles() {
 }
 
 #[test]
+fn d6_owner_whole_invocation_margin() {
+    assert!(analysis::compare(&[20_000_000.0; 30], &[25_000_000.0; 30])
+        .unwrap()
+        .invocation_passes());
+    assert!(!analysis::compare(&[20_000_000.0; 30], &[25_000_001.0; 30])
+        .unwrap()
+        .invocation_passes());
+    assert!(
+        analysis::compare(&[200_000_000.0; 30], &[220_000_000.0; 30])
+            .unwrap()
+            .invocation_passes()
+    );
+    assert!(
+        !analysis::compare(&[200_000_000.0; 30], &[220_000_001.0; 30])
+            .unwrap()
+            .invocation_passes()
+    );
+}
+
+#[test]
 fn d6_keeps_outliers_and_rejects_incomplete_samples() {
     let base = vec![0.0; 30];
     let mut head = base.clone();
@@ -285,7 +305,7 @@ fn qualify(paired: bool, sid1: bool) {
         )
     })
     .unwrap();
-    report::summarize(&c.evidence, paired).unwrap();
+    report::summarize(&c.evidence, paired, workload::name(&c.workload)).unwrap();
 }
 
 #[cfg(target_os = "macos")]

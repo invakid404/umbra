@@ -9,7 +9,7 @@ fn distribution(values: &[f64]) -> Result<Value, String> {
     Ok(json!({"median": d.median, "p95": d.p95, "maximum": d.maximum}))
 }
 
-pub fn summarize(directory: &Path, paired: bool) -> Result<(), String> {
+pub fn summarize(directory: &Path, paired: bool, workload: &str) -> Result<(), String> {
     let text =
         std::fs::read_to_string(directory.join("samples.jsonl")).map_err(|e| e.to_string())?;
     let mut measured = BTreeMap::new();
@@ -44,6 +44,9 @@ pub fn summarize(directory: &Path, paired: bool) -> Result<(), String> {
     }
     let mut report = json!({"paired": paired, "warmups_retained": warmups.len(), "measured_retained": measured.len(), "metrics": {}});
     let mut accepted = true;
+    let mut original_stage_limits_pass = true;
+    report["acceptance_policy"] = json!("checkpoint12 owner option A, 2026-11-27");
+    report["workload"] = json!(workload);
     for metric in ["teardown_ns", "invocation_ns", "acquisition_ns"] {
         let values = |build: &str| -> Result<Vec<f64>, String> {
             (0..30)
@@ -67,7 +70,12 @@ pub fn summarize(directory: &Path, paired: bool) -> Result<(), String> {
             entry["paired_differences"] = json!(comparison.differences);
             entry["paired"] = distribution(&comparison.differences)?;
             if metric == "teardown_ns" {
-                accepted &= comparison.teardown_passes();
+                original_stage_limits_pass &= comparison.teardown_passes();
+                entry["original_limit_passes"] = json!(comparison.teardown_passes());
+            }
+            if metric == "invocation_ns" && workload != "admission_only" {
+                accepted &= comparison.invocation_passes();
+                entry["owner_limit_passes"] = json!(comparison.invocation_passes());
             }
         }
         report["metrics"][metric] = entry;
@@ -124,17 +132,19 @@ pub fn summarize(directory: &Path, paired: bool) -> Result<(), String> {
         }
         if absent_base_helpers == 30 {
             let helper = analysis::distribution(&helpers)?;
-            accepted &= helper.median <= 25_000_000.0 && helper.p95 <= 50_000_000.0;
+            original_stage_limits_pass &=
+                helper.median <= 25_000_000.0 && helper.p95 <= 50_000_000.0;
             report["helper_start"] =
                 json!({"baseline": null, "head_samples": helpers, "head": distribution(&helpers)?});
         } else {
             let comparison = analysis::compare(&base_helpers, &helpers)?;
-            accepted &= comparison.helper_start_passes();
+            original_stage_limits_pass &= comparison.helper_start_passes();
             report["helper_start"] = json!({"base_samples": base_helpers, "base": distribution(&base_helpers)?,
                 "head_samples": helpers, "head": distribution(&helpers)?, "paired_differences": comparison.differences});
         }
         report["admission"] = json!({"baseline": null, "combined_samples": admission, "combined": distribution(&admission)?});
     }
+    report["original_stage_limits_pass"] = json!(original_stage_limits_pass);
     report["accepted"] = if paired { json!(accepted) } else { Value::Null };
     std::fs::write(
         directory.join("summary.json"),
