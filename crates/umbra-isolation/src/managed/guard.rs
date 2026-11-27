@@ -640,10 +640,7 @@ impl Guard {
                     owned.collected = true;
                     if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
                         self.tickets.fail();
-                        events.push(Event::Failed(format!(
-                            "{:?} exited with status {status}",
-                            owned.identity.role
-                        )));
+                        events.push(Event::Failed(exit_diagnostic(owned.identity.role, status)));
                     }
                     events.push(Event::Collected(owned.identity, status));
                 }
@@ -762,10 +759,26 @@ fn parent_cutoff(
     Ok(cutoff)
 }
 
+fn exit_diagnostic(role: umbra_core::managed::Role, status: i32) -> String {
+    format!("{role:?} exited with status {status}")
+}
+
 #[cfg(test)]
 mod policy_tests {
     use super::*;
     use umbra_core::managed::{CleanupPath, Role, Ticket};
+
+    #[test]
+    fn child_failure_reports_exit_code() {
+        assert_eq!(
+            exit_diagnostic(Role::Guardian, 1 << 8),
+            "Guardian exited with code 1"
+        );
+        assert_eq!(
+            exit_diagnostic(Role::Worker, 7 << 8),
+            "Worker exited with code 7"
+        );
+    }
 
     #[test]
     fn notification_eof_requires_start_and_complete_frames() {
