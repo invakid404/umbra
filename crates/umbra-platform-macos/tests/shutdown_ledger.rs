@@ -38,7 +38,7 @@ fn shutdown_native_root_ledger() {
     let evidence = std::env::var_os("UMBRA_FIX_271_EVIDENCE_FILE")
         .expect("dedicated acquisition evidence path");
     #[cfg(feature = "test-native-cleanup-order")]
-    let order = native_order::Observation::start();
+    let mut order = native_order::Observation::start();
     // A whole qualification command may append observations from earlier tests.
     // Keep those bytes and inspect only this serial test's newly appended span.
     let witness_start = std::fs::metadata(&evidence)
@@ -115,7 +115,7 @@ fn shutdown_native_root_ledger() {
         closure.tree_terminated, closure.error, closure.final_to_exit
     );
     #[cfg(feature = "test-native-cleanup-order")]
-    if let Some(order) = native_order.as_mut() {
+    if let Some(order) = order.as_mut() {
         order.assert_held();
     }
     assert!(closure.tree_terminated, "{:?}", closure.error);
