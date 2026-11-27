@@ -66,8 +66,41 @@ struct Identity {
     dev: i32,
     ino: u64,
     mode: u16,
+    socket: u64,
+}
+unsafe extern "C" {
+    fn umbra_inventory_socket(
+        pid: i32,
+        fd: i32,
+        identity: *mut u64,
+        domain: *mut i32,
+        kind: *mut i32,
+    ) -> i32;
+}
+fn socket_details(fd: i32) -> io::Result<(u64, i32, i32)> {
+    let (mut id, mut domain, mut kind) = (0, 0, 0);
+    if unsafe {
+        umbra_inventory_socket(
+            std::process::id() as i32,
+            fd,
+            &mut id,
+            &mut domain,
+            &mut kind,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((id, domain, kind))
 }
 fn identity(fd: i32) -> io::Result<Identity> {
+    let mut id = stat_identity(fd)?;
+    if id.mode & libc::S_IFMT == libc::S_IFSOCK {
+        id.socket = socket_details(fd)?.0;
+    }
+    Ok(id)
+}
+fn stat_identity(fd: i32) -> io::Result<Identity> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // Also used in the fork child: no allocation or destructors.
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
@@ -78,6 +111,7 @@ fn identity(fd: i32) -> io::Result<Identity> {
         dev: stat.st_dev,
         ino: stat.st_ino,
         mode: stat.st_mode,
+        socket: 0,
     })
 }
 
@@ -152,6 +186,7 @@ fn inspect(
     role: Role,
     endpoints: &[Endpoint],
     extra: &[i32],
+    baseline: &[Identity],
     errors: &mut Vec<String>,
 ) -> Result<()> {
     let expected: Vec<_> = input
@@ -166,7 +201,11 @@ fn inspect(
         .collect::<io::Result<_>>()?;
     let mut found = Vec::new();
     for fd in 3..unsafe { libc::getdtablesize() } {
-        let Ok(id) = identity(fd) else { continue };
+        let id = match identity(fd) {
+            Ok(id) => id,
+            Err(error) if error.raw_os_error() == Some(libc::EBADF) => continue,
+            Err(error) => return Err(error.into()),
+        };
         if id.mode & libc::S_IFMT != libc::S_IFSOCK {
             continue;
         }
@@ -175,8 +214,9 @@ fn inspect(
             if unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC == 0 {
                 errors.push(format!("{role:?}: managed endpoint {fd} lacks CLOEXEC"));
             }
-        } else if !extras.contains(&id) {
-            errors.push(format!("{role:?}: unexpected socket {fd}: {id:?}"));
+        } else if !extras.contains(&id) && !baseline.contains(&id) {
+            let details = socket_details(fd);
+            errors.push(format!("{role:?}: unexpected socket {fd}: {id:?}, domain/type={details:?}, owning process={}", std::process::id()));
         }
     }
     if found.len() != expected.len() || expected.iter().any(|id| !found.contains(id)) {
@@ -187,7 +227,9 @@ fn inspect(
     if endpoints.len() != expected.len() {
         errors.push(format!("{role:?}: role assignment size differs"));
     }
-    fork_boundary(input, &extras, errors)?;
+    let mut fork_extras = extras;
+    fork_extras.extend_from_slice(baseline);
+    fork_boundary(input, &fork_extras, errors)?;
     std::fs::write(
         input.directory.join(format!("{role:?}.json")),
         serde_json::to_vec(errors)?,
@@ -220,8 +262,15 @@ fn fork_boundary(input: &Input, extras: &[Identity], errors: &mut Vec<String>) -
             reply[16] = 1;
         }
         for candidate in 3..limit {
-            if let Ok(id) = identity(candidate) {
-                if forbidden.contains(&id) {
+            if let Ok(id) = stat_identity(candidate) {
+                if candidate != fd
+                    || forbidden.iter().any(|item| {
+                        item.dev == id.dev
+                            && item.ino == id.ino
+                            && item.mode == id.mode
+                            && item.socket == 0
+                    })
+                {
                     reply[16] = 2;
                 }
             }
@@ -306,7 +355,7 @@ fn role(mut entry: Entry) -> Result<()> {
     let mut rpc = None;
     let mut connection = None;
     if entry.role == Role::CleanupOwner {
-        use umbra_core::provider::{ProviderDescriptor, PROTOCOL_VERSION};
+        use umbra_core::provider::{PROTOCOL_VERSION, ProviderDescriptor};
         let descriptor = ProviderDescriptor {
             id: "endpoint-inventory".into(),
             role: "platform".into(),
@@ -350,7 +399,14 @@ fn role(mut entry: Entry) -> Result<()> {
     for child in children.iter_mut() {
         ready(child, entry.readiness_deadline)?;
     }
-    inspect(&input, entry.role, &entry.endpoints, &extras, &mut errors)?;
+    inspect(
+        &input,
+        entry.role,
+        &entry.endpoints,
+        &extras,
+        &[],
+        &mut errors,
+    )?;
     entry.ready(Vec::new())?;
     loop {
         match entry.await_go(entry.readiness_deadline) {
@@ -394,6 +450,18 @@ pub fn run() -> Result<()> {
     } else {
         None
     };
+    let mut baseline = Vec::new();
+    for fd in 3..unsafe { libc::getdtablesize() } {
+        match identity(fd) {
+            Ok(id) => baseline.push(id),
+            Err(error) if error.raw_os_error() == Some(libc::EBADF) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    std::fs::write(
+        directory.join("root-baseline.json"),
+        serde_json::to_vec(&baseline)?,
+    )?;
     let mut topology = Topology::new(library)?;
     let mut roles = BTreeMap::new();
     for role in [
@@ -442,6 +510,7 @@ pub fn run() -> Result<()> {
             root,
             &endpoints,
             &[child.probe_bootstrap_fd()],
+            &baseline,
             &mut errors,
         )
     } else {
