@@ -132,6 +132,13 @@ fn forwarding_cutoff(start: Option<&Start>, deadline: u64) -> io::Result<u64> {
 }
 
 impl WorkerCleanup {
+    fn collection_complete(&self) -> bool {
+        self.receipt.is_some()
+            && self.pending_ack.iter().all(Option::is_none)
+            && self.awaiting.iter().all(Option::is_none)
+            && self.forwarding.iter().all(|queue| queue.is_empty())
+    }
+
     pub(super) fn belongs_to(&self, run: RunIdentity, local: Participant) -> bool {
         self.run == run && self.local == local
     }
@@ -563,7 +570,12 @@ impl ManagedCleanup for WorkerCleanup {
     fn provider_receipt(&self) -> Option<ProviderReceipt> {
         self.receipt
             .as_ref()
-            .filter(|receipt| !receipt.failed && receipt.status == 0 && !self.tickets.failed())
+            .filter(|receipt| {
+                self.collection_complete()
+                    && !receipt.failed
+                    && receipt.status == 0
+                    && !self.tickets.failed()
+            })
             .cloned()
     }
     fn start(&mut self) -> umbra_core::Result<Instant> {
@@ -597,9 +609,11 @@ impl ManagedCleanup for WorkerCleanup {
 
     fn collect_provider(&mut self) -> umbra_core::Result<Duration> {
         let began = Instant::now();
-        if self.receipt.is_none() {
-            self.request(ControlMessage::Collect { run: self.run })
-                .map_err(error)?;
+        if !self.collection_complete() {
+            if self.receipt.is_none() {
+                self.request(ControlMessage::Collect { run: self.run })
+                    .map_err(error)?;
+            }
             let inventory = self.inventory.clone().unwrap_or_else(|| {
                 self.routes
                     .iter()
@@ -709,11 +723,7 @@ impl ManagedCleanup for WorkerCleanup {
                 for (peer, start) in forwarding {
                     self.forward(start, peer).map_err(error)?;
                 }
-                if self.receipt.is_some()
-                    && self.pending_ack.iter().all(Option::is_none)
-                    && self.awaiting.iter().all(Option::is_none)
-                    && self.forwarding.iter().all(|queue| queue.is_empty())
-                {
+                if self.collection_complete() {
                     break;
                 }
                 self.wait_for_collection().map_err(error)?;
@@ -754,6 +764,68 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::process::{Command, Stdio};
     use umbra_core::managed::Role;
+
+    #[test]
+    fn stored_receipt_waits_for_exchange_drain_on_retry() {
+        let local = identity(std::process::id(), Role::Worker).unwrap();
+        let owner = Participant {
+            role: Role::CleanupOwner,
+            ..local
+        };
+        let provider = Participant {
+            role: Role::Provider,
+            ..local
+        };
+        let run: RunIdentity = serde_json::from_str(
+            r#"{"nonce":"00000000-0000-0000-0000-000000000001","generation":1}"#,
+        )
+        .unwrap();
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let mut worker = WorkerCleanup::new(
+            run,
+            local,
+            owner,
+            provider,
+            1,
+            vec![Route::new(owner, Channel::new(socket).unwrap()).unwrap()],
+        )
+        .unwrap();
+        let start = Start {
+            run,
+            origin: owner,
+            ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Trusted, 1).unwrap(),
+        };
+        let ack = worker.tickets.accept(start.clone(), owner, local).unwrap();
+        worker.routes[0]
+            .channel()
+            .queue(&ControlMessage::Ack(ack.clone()))
+            .unwrap();
+        worker.pending_ack[0] = Some(start.ticket.started + umbra_core::managed::ACK_NANOS);
+        worker.receipt = Some(ProviderReceipt {
+            run,
+            owner,
+            provider,
+            status: 0,
+            failed: false,
+        });
+        assert!(
+            worker.provider_receipt().is_none(),
+            "receipt arrival is not exchange completion"
+        );
+        worker.collect_provider().unwrap();
+        assert!(worker.provider_receipt().is_some());
+        let mut peer = Channel::new(peer).unwrap();
+        assert!(
+            matches!(peer.receive::<ControlMessage>(start.ticket.deadline).unwrap(),
+            Some(ControlMessage::Ack(found)) if found == ack)
+        );
+        assert!(
+            peer.receive::<ControlMessage>(start.ticket.deadline)
+                .unwrap()
+                .is_none(),
+            "receipt retry must not issue another Collect"
+        );
+    }
 
     #[test]
     fn observer_wait_wakes_for_independent_cleanup() {
