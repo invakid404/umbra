@@ -34,6 +34,7 @@ fn main() {
     assert!([
         "success",
         "slow_preparation",
+        "failed_preparation",
         "finish_reply_loss",
         "missing",
         "prepared_error",
@@ -76,11 +77,13 @@ fn main() {
     if mode == "r2_direct_drop_failed_result" {
         panic!("r2_direct_drop_failed_result requires its compile-time probe");
     }
+    #[cfg(not(feature = "test-slow-namespace-preparation"))]
     if mode == "slow_preparation" {
-        assert!(
-            cfg!(feature = "test-slow-namespace-preparation"),
-            "slow preparation requires its compile-time test hook"
-        );
+        panic!("slow preparation requires its compile-time test hook");
+    }
+    #[cfg(not(feature = "test-failed-namespace-preparation"))]
+    if mode == "failed_preparation" {
+        panic!("failed preparation requires its compile-time test hook");
     }
     let expects_success =
         ["success", "finish_reply_loss", "slow_preparation"].contains(&mode.as_str());
@@ -321,6 +324,7 @@ fn main() {
         "missing_provider",
         "readiness_timeout",
         "malformed_offer",
+        "failed_preparation",
     ]
     .contains(&mode.as_str())
     {
@@ -328,6 +332,9 @@ fn main() {
             result.unwrap();
         } else {
             assert!(result.is_err(), "invalid provider startup succeeded");
+        }
+        if mode == "failed_preparation" {
+            assert!(elapsed >= std::time::Duration::from_secs(12));
         }
         if mode == "readiness_timeout" {
             assert!(

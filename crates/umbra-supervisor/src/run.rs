@@ -965,6 +965,14 @@ mod unix {
         stage("worker-setup-begin");
         #[cfg(feature = "test-slow-namespace-preparation")]
         std::thread::sleep(std::time::Duration::from_millis(2300));
+        if cfg!(feature = "test-failed-namespace-preparation") {
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            return Err(UmbraError::new(
+                ErrorKind::InvalidState,
+                "run.prepare",
+                "preparation test failure",
+            ));
+        }
         validate(&spec)?;
         stage("worker-validation-end");
         let launch_stdio = umbra_core::launch_stdio::LaunchStdio::capture()?;

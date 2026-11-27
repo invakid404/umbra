@@ -213,11 +213,25 @@ impl Startup {
     /// Start the single five-second persistence allocation after readiness.
     pub fn begin_arming(&mut self, record: umbra_core::CustodyRecord) -> io::Result<u64> {
         let now = boot_nanos()?;
-        if !self.complete() || now >= self.deadline || self.persistence_deadline.is_some() {
+        if !self.complete() || self.persistence_deadline.is_some() {
             self.failed = true;
             return Err(invalid(
                 "Armed persistence requires timely complete readiness",
             ));
+        }
+        self.validate_arming_record(&record)?;
+        self.expected_armed = Some(record);
+        let deadline = now
+            .checked_add(5_000_000_000)
+            .ok_or_else(|| invalid("persistence clock overflow"))?;
+        self.persistence_deadline = Some(deadline);
+        Ok(deadline)
+    }
+
+    /// Validate the proposed record without starting persistence time.
+    pub fn validate_arming_record(&mut self, record: &umbra_core::CustodyRecord) -> io::Result<()> {
+        if !self.complete() {
+            return Err(invalid("arming without complete readiness"));
         }
         let valid = (|| {
             let umbra_core::CustodyPhase::Armed {
@@ -255,12 +269,7 @@ impl Startup {
                 "Armed record differs from validated readiness inventory",
             ));
         }
-        self.expected_armed = Some(record);
-        let deadline = now
-            .checked_add(5_000_000_000)
-            .ok_or_else(|| invalid("persistence clock overflow"))?;
-        self.persistence_deadline = Some(deadline);
-        Ok(deadline)
+        Ok(())
     }
 
     /// Accept the exact Armed record and sequence returned by durable persistence.
@@ -340,6 +349,79 @@ impl Startup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preparation_does_not_renew_readiness_or_persistence() {
+        let run = RunIdentity {
+            nonce: uuid::Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut startup = Startup::new(run, false).unwrap();
+        let parents = [
+            (Role::Relay, None),
+            (Role::Guardian, Some(Role::Relay)),
+            (Role::Worker, Some(Role::Guardian)),
+            (Role::CleanupOwner, Some(Role::Guardian)),
+            (Role::Provider, Some(Role::CleanupOwner)),
+        ];
+        let identities: BTreeMap<_, _> = parents
+            .iter()
+            .enumerate()
+            .map(|(i, (role, _))| {
+                (
+                    *role,
+                    Participant {
+                        role: *role,
+                        pid: i as u32 + 100,
+                        birth: (1, i as u64),
+                    },
+                )
+            })
+            .collect();
+        // Model an inventory already checked against the kernel before preparation.
+        for (role, parent) in parents {
+            startup.ready.insert(
+                role,
+                Ready {
+                    run,
+                    participant: identities[&role],
+                    parent: parent.map(|p| identities[&p]),
+                    watched: identities
+                        .values()
+                        .filter(|p| super::super::inventory::requires_watch(role, p.role))
+                        .copied()
+                        .collect(),
+                },
+            );
+        }
+        assert!(startup.complete());
+        startup.deadline = 1;
+        let record = umbra_core::CustodyRecord {
+            run_id: serde_json::from_value(serde_json::json!(run.nonce)).unwrap(),
+            generation: uuid::Uuid::new_v4(),
+            sequence: 1,
+            state: umbra_core::CustodyPhase::Armed {
+                capacity: 64,
+                startup_nonce: run.nonce,
+                participants: identities
+                    .values()
+                    .map(|p| umbra_core::CustodyParticipant {
+                        pid: p.pid,
+                        birth: p.birth.0 * 1_000_000 + p.birth.1,
+                    })
+                    .collect(),
+            },
+        };
+        let before = boot_nanos().unwrap();
+        let cutoff = startup.begin_arming(record.clone()).unwrap();
+        assert!(cutoff >= before + 5_000_000_000);
+        assert!(cutoff <= boot_nanos().unwrap() + 5_000_000_000);
+        assert_eq!(startup.deadline, 1);
+        assert!(startup.begin_arming(record).is_err());
+        assert_eq!(startup.persistence_deadline, Some(cutoff));
+        assert!(!startup.go());
+        assert!(Startup::from_readiness(run, false, 1, Vec::new()).is_err());
+    }
+
     #[test]
     fn go_requires_current_receipt_and_exact_receiver() {
         let nonce = "00000000-0000-0000-0000-000000000001";

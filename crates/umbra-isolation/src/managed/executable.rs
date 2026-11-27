@@ -543,9 +543,7 @@ impl PendingRole {
         self.bootstrap.wait_until(
             self.go_queued
                 .as_ref()
-                .map_or(self.readiness_deadline, |go| {
-                    self.readiness_deadline.min(go.deadline)
-                }),
+                .map_or(self.readiness_deadline, |go| go.deadline),
         )
     }
 
@@ -795,8 +793,11 @@ impl Entry {
             self.wait_for_bootstrap(&readiness)?;
         }
         self.ready(Vec::new())?;
-        while !self.await_go(self.readiness_deadline)? {
+        while !self.flush_readiness()? {
             self.wait_for_bootstrap(&readiness)?;
+        }
+        while !self.await_go(u64::MAX)? {
+            self.wait_for_preparation(None)?;
         }
         Ok(())
     }
@@ -807,6 +808,54 @@ impl Entry {
             .as_ref()
             .ok_or_else(|| invalid("startup already closed"))?
             .wait_until(self.readiness_deadline)
+    }
+
+    /// After timely readiness, preparation has the same lifetime as in the
+    /// original supervisor. Parent closure or a watched peer ending aborts it.
+    pub(super) fn wait_for_preparation(&self, watch: Option<i32>) -> io::Result<()> {
+        let channel = self
+            .bootstrap
+            .as_ref()
+            .ok_or_else(|| invalid("bootstrap closed"))?;
+        self.wait_for_preparation_route(channel, watch, u64::MAX)
+    }
+
+    pub(super) fn wait_for_preparation_route(
+        &self,
+        channel: &super::Channel,
+        watch: Option<i32>,
+        deadline: u64,
+    ) -> io::Result<()> {
+        let (fd, writing) = channel.wait_interest();
+        let mut descriptors = vec![libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: if writing { libc::POLLOUT } else { libc::POLLIN },
+            revents: 0,
+        }];
+        if let Some(fd) = watch {
+            descriptors.push(libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        descriptors.extend(self.endpoints.iter().map(|endpoint| libc::pollfd {
+            fd: endpoint.stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }));
+        super::readiness::wait_descriptors(&mut descriptors, deadline)?;
+        if descriptors[1..].iter().any(|fd| fd.revents != 0) {
+            return Err(invalid("peer activity interrupted namespace preparation"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn authorization_deadline(&self) -> io::Result<u64> {
+        self.authorization
+            .as_ref()
+            .map(|go| go.deadline)
+            .ok_or_else(|| invalid("durable authorization missing"))
     }
 
     fn wait_for_bootstrap(&self, readiness: &super::readiness::Readiness) -> io::Result<()> {
@@ -1053,7 +1102,7 @@ impl Entry {
         )
     }
 
-    /// Advance readiness and accept matching GO under the original deadline.
+    /// Accept matching GO under the supplied phase cutoff and its persistence cutoff.
     pub fn flush_readiness(&mut self) -> io::Result<bool> {
         if self.root {
             if super::boot_nanos()? >= self.readiness_deadline {
@@ -1067,7 +1116,7 @@ impl Entry {
             .flush(self.readiness_deadline)
     }
 
-    /// Advance readiness and accept matching GO under the original deadline.
+    /// Accept matching GO under the supplied phase cutoff and its persistence cutoff.
     pub fn await_go(&mut self, deadline: u64) -> io::Result<bool> {
         let bootstrap = self
             .bootstrap

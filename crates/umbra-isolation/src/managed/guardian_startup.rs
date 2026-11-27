@@ -105,7 +105,9 @@ impl GuardianStartup {
                 .as_ref()
                 .unwrap()
                 .wait_for_activity(&self.entry, &self.children),
-            2 => self.entry.wait_for_startup(),
+            2 => self
+                .entry
+                .wait_for_preparation(self.guard.as_ref().map(Guard::watch_descriptor)),
             3 => self.children[self.forwarded].wait_for_activity(),
             _ => Err(invalid("guardian wait outside startup")),
         }
@@ -139,7 +141,7 @@ impl GuardianStartup {
                 }
             }
             2 => {
-                if self.entry.await_go(self.entry.readiness_deadline)? {
+                if self.entry.await_go(u64::MAX)? {
                     self.phase = 3;
                 }
             }
@@ -147,7 +149,7 @@ impl GuardianStartup {
                 while let Some(child) = self.children.get_mut(self.forwarded) {
                     if !self
                         .entry
-                        .forward_go(child, self.entry.readiness_deadline)?
+                        .forward_go(child, self.entry.authorization_deadline()?)?
                     {
                         return Ok(false);
                     }

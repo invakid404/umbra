@@ -24,7 +24,8 @@ pub struct ProviderStartup {
 
 impl ProviderStartup {
     pub(super) fn wait_for_activity(&self) -> io::Result<()> {
-        self.channel.wait_until(self.deadline)
+        self.channel
+            .wait_until(self.go.as_ref().map_or(self.deadline, |go| go.deadline))
     }
 
     /// Exact provider control descriptor for the hosted inventory fixture.
@@ -118,6 +119,6 @@ impl ProviderStartup {
             super::executable::startup_observation("go-queued", Some(self.provider.role));
             self.go = Some(go.clone());
         }
-        self.channel.flush(self.deadline.min(go.deadline))
+        self.channel.flush(go.deadline)
     }
 }

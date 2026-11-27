@@ -40,6 +40,10 @@ pub struct Bootstrap {
 }
 
 impl Bootstrap {
+    pub(super) fn watch_descriptor(&self) -> Option<i32> {
+        self.watch.as_ref().map(ProcessWatch::descriptor)
+    }
+
     /// Extra members and receipts describe locally owned resources, such as the
     /// cleanup owner's provider. Descendant roles are gathered from bootstrap.
     pub fn new(members: Vec<Member>, receipts: Vec<Ready>) -> io::Result<Self> {

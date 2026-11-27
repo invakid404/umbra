@@ -136,7 +136,12 @@ impl RelayStartup {
             self.arming
                 .as_ref()
                 .ok_or_else(|| invalid("relay not arming"))?
-                .wait_for_activity()
+                .wait_for_activity(
+                    &self.entry,
+                    self.bootstrap
+                        .as_ref()
+                        .and_then(Bootstrap::watch_descriptor),
+                )
         } else {
             self.children
                 .first()
@@ -287,7 +292,7 @@ impl RelayStartup {
         }
         self.prepare_guard()?;
         let go = self.authorization.as_ref().unwrap();
-        if !self.children[0].send_authorization(go, self.entry.readiness_deadline)? {
+        if !self.children[0].send_authorization(go, go.deadline)? {
             return Ok(None);
         }
         self.guard

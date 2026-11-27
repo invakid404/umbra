@@ -80,6 +80,20 @@ impl WorkerStartup {
         if self.authorized {
             return Ok(true);
         }
+        self.ensure_arming()?;
+        if !self.armed {
+            self.armed = self.arming.as_mut().unwrap().poll(persist)?;
+            if !self.armed {
+                return Ok(false);
+            }
+        }
+        self.authorized = self
+            .entry
+            .await_go(self.arming.as_ref().unwrap().persistence_deadline()?)?;
+        Ok(self.authorized)
+    }
+
+    fn ensure_arming(&mut self) -> io::Result<()> {
         if self.arming.is_none() {
             let matches: Vec<_> = self
                 .entry
@@ -106,14 +120,25 @@ impl WorkerStartup {
                 self.entry.readiness_deadline,
             )?);
         }
-        if !self.armed {
-            self.armed = self.arming.as_mut().unwrap().poll(persist)?;
-            if !self.armed {
-                return Ok(false);
-            }
+        Ok(())
+    }
+
+    /// Retain complete timely readiness before entering namespace preparation.
+    /// No Armed write or GO is authorized by this step.
+    pub fn capture_preparation_readiness(&mut self) -> io::Result<bool> {
+        if self.failed || self.client.is_none() {
+            return Err(invalid("preparation before handoff or after failure"));
         }
-        self.authorized = self.entry.await_go(self.entry.readiness_deadline)?;
-        Ok(self.authorized)
+        self.ensure_arming()?;
+        self.arming.as_mut().unwrap().capture_readiness()
+    }
+
+    /// Wait for the readiness request under the unchanged startup cutoff.
+    pub fn wait_for_preparation_readiness(&self) -> io::Result<()> {
+        self.arming
+            .as_ref()
+            .ok_or_else(|| invalid("arming route missing"))?
+            .wait_for_readiness()
     }
 
     /// Transfer GO-authorized runtime state without any provider child handle.

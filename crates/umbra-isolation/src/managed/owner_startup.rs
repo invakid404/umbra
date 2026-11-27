@@ -27,16 +27,15 @@ pub struct OwnerStartup {
     phase: u8,
     stalled: bool,
     failed: bool,
+    rollback_deadline: Option<u64>,
 }
 
 impl OwnerStartup {
     /// Wait for the provider's exit while retaining its actual parent handle.
     pub fn wait_for_rollback(&mut self) -> io::Result<()> {
         let deadline = self
-            .entry
-            .readiness_deadline
-            .checked_add(9_000_000_000)
-            .ok_or_else(|| invalid("rollback clock overflow"))?;
+            .rollback_deadline
+            .ok_or_else(|| invalid("rollback has not started"))?;
         let Some(child) = self.launch.child.as_mut() else {
             return Ok(());
         };
@@ -67,6 +66,20 @@ impl OwnerStartup {
     /// in Launch on errors or expiry. No acquisition is authorized in this phase.
     pub fn rollback(&mut self) -> io::Result<bool> {
         self.failed = true;
+        if self.rollback_deadline.is_none() {
+            // Preparation is outside readiness. Allocate rollback once when that
+            // phase fails, retaining the existing nine-second collection budget.
+            let start = if self.phase >= 3 {
+                super::boot_nanos()?
+            } else {
+                self.entry.readiness_deadline
+            };
+            self.rollback_deadline = Some(
+                start
+                    .checked_add(9_000_000_000)
+                    .ok_or_else(|| invalid("rollback clock overflow"))?,
+            );
+        }
         if self.owner.is_some() {
             return Err(invalid("owner rollback after runtime adoption"));
         }
@@ -80,11 +93,7 @@ impl OwnerStartup {
         if child.try_wait()?.is_some() {
             return Ok(true);
         }
-        let deadline = self
-            .entry
-            .readiness_deadline
-            .checked_add(9_000_000_000)
-            .ok_or_else(|| invalid("rollback clock overflow"))?;
+        let deadline = self.rollback_deadline.unwrap();
         if super::boot_nanos()? >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
@@ -104,6 +113,7 @@ impl OwnerStartup {
             phase: 0,
             stalled: false,
             failed: false,
+            rollback_deadline: None,
         }
     }
 
@@ -250,7 +260,11 @@ impl OwnerStartup {
                 .as_ref()
                 .unwrap()
                 .wait_until(self.entry.readiness_deadline),
-            3 => self.entry.wait_for_startup(),
+            3 => self.entry.wait_for_preparation(
+                self.bootstrap
+                    .as_ref()
+                    .and_then(Bootstrap::watch_descriptor),
+            ),
             4 => self.bootstrap.as_ref().unwrap().wait_for_provider(),
             _ => Err(invalid("owner wait outside startup")),
         }
@@ -306,7 +320,7 @@ impl OwnerStartup {
                 }
             }
             3 => {
-                if self.entry.await_go(self.entry.readiness_deadline)? {
+                if self.entry.await_go(u64::MAX)? {
                     self.phase = 4;
                 }
             }

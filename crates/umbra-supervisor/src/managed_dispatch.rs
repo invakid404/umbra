@@ -51,6 +51,9 @@ pub fn worker_ready(
     while !startup.poll(descriptor, input.timeout_ms(), external_caller)? {
         startup.wait_for_activity()?;
     }
+    while !startup.capture_preparation_readiness()? {
+        startup.wait_for_preparation_readiness()?;
+    }
     Ok(())
 }
 

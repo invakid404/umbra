@@ -82,6 +82,10 @@ pub struct Guard {
 }
 
 impl Guard {
+    pub(super) fn watch_descriptor(&self) -> i32 {
+        self.watch.descriptor()
+    }
+
     /// Commit a failed cleanup trigger before returning to publication polling.
     /// An existing cleanup allocation is preserved without renewal.
     pub fn notify_failure(&mut self) -> io::Result<()> {
