@@ -741,3 +741,67 @@ fn close_client_names_its_unconfirmed_obligations() {
 
 #[path = "cleanup_owner_tests.rs"]
 mod cleanup_owner_tests;
+
+#[test]
+fn managed_start_failure_invalidates_and_collects_once() {
+    use std::io::Read;
+    struct FailedStart {
+        peer: std::os::unix::net::UnixStream,
+        events: Vec<&'static str>,
+        collection_fails: bool,
+    }
+    impl ManagedCleanup for FailedStart {
+        fn start(&mut self) -> Result<std::time::Instant> {
+            self.events.push("start");
+            Err(protocol_error("original start failure"))
+        }
+        fn failed(&mut self, error: &umbra_core::UmbraError) {
+            assert!(error.to_string().contains("original start failure"));
+            self.events.push("failed");
+        }
+        fn collect_provider(&mut self) -> Result<Duration> {
+            self.events.push("collect");
+            assert_eq!(
+                self.peer.read(&mut [0u8; 1]).unwrap(),
+                0,
+                "RPC must be invalidated before parent collection"
+            );
+            if self.collection_fails {
+                Err(protocol_error("collection fixture failure"))
+            } else {
+                Ok(Duration::ZERO)
+            }
+        }
+        fn abandon(&mut self) {
+            panic!("unexpected abandonment");
+        }
+    }
+    for collection_fails in [false, true] {
+        let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut client = Client::from_connection(
+            Connection::new(socket, Duration::from_secs(1)),
+            wire::Welcome {
+                id: "managed".into(),
+                role: "platform".into(),
+                version: wire::PROTOCOL_VERSION,
+                capabilities: Default::default(),
+            },
+        );
+        let mut owner = FailedStart {
+            peer,
+            events: Vec::new(),
+            collection_fails,
+        };
+        let closure = close_managed_client(&mut client, Nonce::new_v4(), &mut owner);
+        assert_eq!(owner.events, ["start", "failed", "collect"]);
+        assert!(!closure.tree_terminated);
+        assert!(closure.managed.is_none());
+        let error = closure.error.expect("Start failure must remain failed");
+        assert!(error.to_string().contains("original start failure"));
+        assert_eq!(
+            error.context.contains("collection fixture failure"),
+            collection_fails
+        );
+    }
+}

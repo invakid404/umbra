@@ -353,8 +353,14 @@ fn close_with_owner(
     if let Some(owner) = owner.as_deref_mut() {
         match owner.start() {
             Ok(deadline) => client.connection.cap_cleanup_deadline(deadline),
-            Err(error) => {
+            Err(mut error) => {
+                client.connection.invalidate();
                 owner.failed(&error);
+                if let Err(collection) = owner.collect_provider() {
+                    error
+                        .context
+                        .push_str(&format!("; managed provider collection: {collection}"));
+                }
                 return Closure::failed(error);
             }
         }
