@@ -292,6 +292,73 @@ mod tests {
     use umbra_core::managed::{CleanupPath, Role, RunIdentity, Ticket};
 
     #[test]
+    fn acknowledged_route_still_acknowledges_concurrent_start() {
+        let run: RunIdentity = serde_json::from_str(
+            r#"{"nonce":"00000000-0000-0000-0000-000000000001","generation":1}"#,
+        )
+        .unwrap();
+        let local = Participant {
+            role: Role::Worker,
+            pid: 42,
+            birth: (1, 0),
+        };
+        let peer = Participant {
+            role: Role::CleanupOwner,
+            pid: 43,
+            birth: (1, 0),
+        };
+        let silent = Participant {
+            role: Role::Guardian,
+            pid: 44,
+            birth: (1, 0),
+        };
+        let start = Start {
+            run,
+            origin: local,
+            ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Trusted, 1).unwrap(),
+        };
+        let deadline = start.ticket.started + ACK_NANOS;
+        let (left, right) = UnixStream::pair().unwrap();
+        let (other, _silent_peer) = UnixStream::pair().unwrap();
+        let mut tickets = TicketState::new(run, 1).unwrap();
+        let mut remote = TicketState::new(run, 1).unwrap();
+        let mut publication = Publication::begin(
+            start.clone(),
+            local,
+            local,
+            &mut tickets,
+            vec![
+                Route::new(peer, Channel::new(left).unwrap()).unwrap(),
+                Route::new(silent, Channel::new(other).unwrap()).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut channel = Channel::new(right).unwrap();
+        assert!(!publication.progress(&mut tickets).unwrap());
+        assert!(matches!(
+            channel.receive::<ControlMessage>(deadline).unwrap(),
+            Some(ControlMessage::Start(_))
+        ));
+        let ack = remote.accept(start.clone(), local, peer).unwrap();
+        channel.queue(&ControlMessage::Ack(ack)).unwrap();
+        assert!(channel.flush(deadline).unwrap());
+        assert!(!publication.progress(&mut tickets).unwrap());
+        let concurrent = Start {
+            origin: peer,
+            ..start.clone()
+        };
+        channel.queue(&ControlMessage::Start(concurrent)).unwrap();
+        assert!(channel.flush(deadline).unwrap());
+        assert!(!publication.progress(&mut tickets).unwrap());
+        assert!(!publication.progress(&mut tickets).unwrap());
+        assert!(
+            matches!(channel.receive::<ControlMessage>(deadline).unwrap(),
+            Some(ControlMessage::Ack(ack)) if ack.committed.ticket == start.ticket),
+            "an acknowledged route must answer Start while another peer is pending"
+        );
+    }
+
+    #[test]
     fn simultaneous_start_commits_earliest_before_acknowledging_both() {
         simultaneous(false);
     }
