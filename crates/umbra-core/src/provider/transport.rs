@@ -18,9 +18,23 @@ fn transport_now() -> Instant {
     Instant::now()
 }
 
-fn wait_for_connection(_listener: &UnixListener, _deadline: Instant) -> std::io::Result<()> {
-    std::thread::sleep(Duration::from_millis(5));
-    Ok(())
+fn wait_for_connection(listener: &UnixListener, deadline: Instant) -> std::io::Result<()> {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    // Readiness wakes immediately; the existing child-exit inspection cadence
+    // remains a fallback when a child ends without connecting.
+    let duration = remaining.min(Duration::from_millis(5));
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: duration.as_nanos() as _,
+    };
+    match poll(&mut [PollFd::new(listener, PollFlags::IN)], Some(&timeout)) {
+        Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 #[cfg(test)]
 thread_local! { static FIX264_CLOCK: std::cell::Cell<Option<(Instant, Instant)>> = const { std::cell::Cell::new(None) }; }
@@ -1584,6 +1598,21 @@ mod startup_readiness_tests {
     use super::*;
 
     #[test]
+    fn readiness_does_not_renew_expired_cutoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deadline");
+        let listener = UnixListener::bind(&path).unwrap();
+        let cutoff = Instant::now();
+        for ready in [false, true] {
+            let _peer = ready.then(|| UnixStream::connect(&path).unwrap());
+            assert_eq!(
+                wait_for_connection(&listener, cutoff).unwrap_err().kind(),
+                std::io::ErrorKind::TimedOut
+            );
+        }
+    }
+
+    #[test]
     fn queued_connection_has_no_timer_floor() {
         if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none() {
             return;
@@ -1602,7 +1631,10 @@ mod startup_readiness_tests {
             drop((peer, accepted));
         }
         samples.sort();
-        eprintln!("ready listener median={:?} p95={:?}", samples[15], samples[28]);
+        eprintln!(
+            "ready listener median={:?} p95={:?}",
+            samples[15], samples[28]
+        );
         assert!(samples[15] <= Duration::from_millis(1));
         assert!(samples[28] <= Duration::from_millis(5));
     }
