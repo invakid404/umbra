@@ -32,6 +32,13 @@ persists Armed custody before launch and requires validated closure and actual
 provider collection before preparing durable completion. See
 [managed isolation](../umbra-isolation/README.md) for registration, bounds and
 failure guarantees.
+
+Managed startup, observer forwarding and parent collection wait on descriptor
+readiness or process-exit events under their original cutoffs. A silent observer
+does not prevent independent cleanup notification. Managed errors retain their
+original structured cause; helper failure details precede it, with normal
+helper termination reported as an exit code.
+
 `umbra_supervisor::resume(spec)` — also reachable as `Supervisor::resume`, and as
 `Supervisor::recover`, which is the same call — reopens an existing run and
 reports whether what the last session left can be reconciled. Checkpoint and

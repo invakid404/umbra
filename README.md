@@ -42,8 +42,10 @@ Cleanup completion and the command's outcome remain separate: collecting every
 resource does not turn a failed command into success. The
 [isolation crate](crates/umbra-isolation/README.md) documents the per-run bounds
 and the residual cases where notification or actual parent collection is lost.
-Managed cleanup qualification is incomplete: measured descriptor costs and
-latency exceed the accepted budgets, and some shutdown cases remain failed.
+Managed cleanup qualification is incomplete. Admission and native teardown
+improved after replacing timer polling, but helper startup and routed teardown
+still miss performance bounds. Final descriptor-cost measurement remains
+incomplete.
 
 ```sh
 umbra run --registry providers.json --workspace . --experimental   -- /absolute/path/to/program args...

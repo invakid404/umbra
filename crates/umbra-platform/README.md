@@ -104,6 +104,12 @@ worker instead obtains an identity-bound parent-wait receipt through
 `ManagedCleanup` under the original cleanup ticket. An attached connection alone
 cannot establish closure.
 
+Shutdown test evidence records the managed provider's actual parent-wait receipt
+separately from cleanup success. A zero exit status can coexist with a retained
+cleanup failure; neither that exit nor the receipt clears the failure. The exact
+shutdown test matches worker and provider identities before using the receipt
+to establish process exit.
+
 Managed cleanup starts through independent control routes before ordinary
 provider cleanup. Drop or unwind notifies those routes even while the main
 provider connection is borrowed. This notification requests cleanup; it does not

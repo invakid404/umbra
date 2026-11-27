@@ -44,28 +44,40 @@ abandonment stops the worker; custodians retain their children through their
 original cleanup opportunities. Ordinary programs have no default age or
 inactivity limit.
 
+Managed startup and cleanup wait on descriptor readiness and process-exit
+events. Admission cancellation wakes a pending exchange to observe a shortened
+cutoff. Observer traffic shares the guard wait with independent cleanup routes.
+Each wake retains the original deadline. A route that acknowledged Start still
+answers a concurrent Start while another route is pending; queued acknowledgments
+must finish writing before publication completes.
+
 Compared with the old isolated CLI, this topology adds one process; compared
 with an old terminal CLI it adds three. An external library caller has four
 helper/worker processes. `managed::topology::Topology` creates seven CLI socketpairs
 (worker-owner, worker-guardian, guardian-owner, owner-provider admission,
-owner-provider cancellation, worker-relay and owner-relay). Measured managed
-overhead is 22 CLI descriptors: fourteen topology ends, three private queues,
-four retained bootstrap ends and one retained provider RPC duplicate. Library
-notification adds four pairs, a caller queue and two bootstrap ends, giving 33.
-These exceed the accepted 19/28 descriptor budgets; resource-cost acceptance
-remains unresolved.
+owner-provider cancellation, worker-relay and owner-relay). The steady layout
+accounts for 21 CLI descriptors: fourteen topology ends, three private process
+queues and four parent-channel ends. Library notification adds four pairs,
+a caller queue and two parent-channel ends, giving 32. The cleanup owner releases
+its RPC copy after installing independent cancellation.
 
-At the observed startup boundaries, the native CLI baseline peaked at seven
-processes and 42 descriptors, compared with ten and 73 on the managed path.
-The library comparison was seven/42 versus eleven/88. Additional helper stdio
-accounts for nine CLI descriptors and twelve library descriptors; the library
-reading also caught one additional descriptor in an existing preparation helper.
-Existing transport, journal and tracer handles remain separately inventoried.
-These sampled boundary peaks are not continuous maxima. Both callers returned
-to their original descriptor inventories, and the library pre-GO rollback
-collected its four helpers. The `cost-witness` feature and `startup_cost` test
-retain the process identities, parent edges, descriptors and collection records
-used for this comparison. Launchd-session costs still require CI qualification.
+The parent channels remain necessary after startup for observer callbacks and
+the worker's typed result. Against the original 19/28 budgets, the additional
+ends are:
+
+| Channel | Owning roles | Ends above the original budget |
+|---|---|---|
+| Guardian-to-relay result forwarding | guardian and relay | 2, CLI and library |
+| Relay-to-caller result forwarding | relay and external caller | 2, library only |
+
+These source counts remain within the revised ceilings of 22/33, but final
+resource-cost qualification is incomplete. The latest `cost-witness` reading
+stopped when the managed CLI warmup exceeded the unchanged startup deadline
+while taking snapshots. It supplies no final steady count or startup peak.
+Earlier measurements preceded RPC-copy removal and cannot qualify the current
+counts. `startup_cost` retains process identities, parent edges, descriptor
+inventories and actual collection records; sampled boundary peaks are not
+continuous maxima. Launchd-session costs require CI qualification.
 
 Two limits remain explicit. Total loss of caller notification before any Start
 has no proven finite caller-return bound (D1); custody stays unresolved without
@@ -457,10 +469,10 @@ Stated, not closed here:
 
 The production-path tests in session 1 (P1-P4, topology, cleanup, and
 debugserver's arguments left as on master) and the terminal tests are `umbra-cli`'s
-`tests/isolation.rs`. Its parentage discovery, fresh-session expectations and
-isolation-record checks still describe the legacy tree, so those guards do not
-yet qualify managed activation. The ten separate terminal cases passed with the
-managed path. SID-1 qualification belongs to CI's self-hosted runner with
+`tests/isolation.rs`. It identifies the worker and cleanup owner separately,
+checks each provider's actual parent, and validates managed collection receipts
+against kernel birth identities. The fresh-session guard passed with
+`shutdown-witness` enabled on the test command. SID-1 qualification belongs to CI's self-hosted runner with
 `UMBRA_REQUIRE_SID1=1`; a worker terminal session must not submit a launchd job
 to obtain that prerequisite.
 

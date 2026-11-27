@@ -126,6 +126,10 @@ Unix stream socket, regular file (including offset and append flags), or
 before provider launch with `UnsupportedCapability` at `stdio-endpoint-kind`.
 This also restricts fd 2 kinds that previously passed through unchecked.
 
+Managed-role failure details precede the original structured error, which stays
+on the last line. Normal helper exits report their decoded exit code; the
+structured error renders its errno suffix once.
+
 Managed helpers release their unused stdin/stdout references after transfer.
 The worker releases its copies after the platform acknowledges ownership.
 Early EOF while a tracee continues running is qualified in non-SID-1 sessions;
@@ -215,11 +219,15 @@ cargo test -p umbra-cli
 ```
 
 Managed activation remains incompletely qualified. `tests/startup_cost.rs`
-measures process and descriptor ownership; the measured managed descriptor costs
-exceed the accepted budgets. `tests/cleanup_performance.rs` requires explicit
+measures process and descriptor ownership; its latest managed warmup exceeded
+the unchanged startup deadline while taking snapshots, leaving final counts
+unqualified. `tests/cleanup_performance.rs` requires explicit
 immutable baseline/head manifests and retains every attempted sample. The
-completed native-true, registry-true and admission-only series missed unchanged
-acceptance thresholds; registry-tree5 stopped on a terminal failure. Ordinary
+four latest series completed all prescribed pairs without terminal failures.
+Admission passed for the three traced workloads, and native teardown passed;
+helper startup and routed teardown still missed limits. Admission-only also
+missed; its separate qualification owner still uses a timer wait. The earlier
+registry-tree5 disconnection did not recur, but its cause remains unproven. Ordinary
 workspace tests do not replace these opt-in readings. SID-1 readings remain
 CI-only.
 
@@ -254,9 +262,12 @@ External fixtures that link the CLI
 library can enable `umbra-cli/shutdown-witness` through Cargo; the provider build
 needs its own `shutdown-witness` feature for acquisition and owner-thread records.
 
-`tests/isolation.rs` retains the #193 production-path guards. Its parentage
-discovery and isolation-record expectations still describe the legacy topology;
-managed-topology qualification is incomplete. It compiles
+`tests/isolation.rs` retains the #193 production-path guards. Its discovery
+distinguishes the guardian's worker and cleanup-owner children and checks the
+platform provider beneath the cleanup owner. Managed collection records must
+match observed process birth identities and actual parent waits. Enable
+`--features shutdown-witness` on the test command to collect those records.
+It compiles
 `experiments/fixtures/umbra-isolation-fixture.c` and the signal observer at test
 time, and runs when `UMBRA_TEST_ISOLATION` or `UMBRA_INTEGRATION_REQUIRED` is set.
 Two `jobc_` cases run anywhere: they check, without a run, how the sampler below
@@ -293,17 +304,18 @@ into two groups:
     `setsid`;
   - cleanup after a `killpg` of the caller's group, a SIGTERM to the relay, and
     a same-named process outside the run left untouched.
-- **Other cases.** The fresh-session test still expects no relay or guardian,
-  which conflicts with managed activation and needs a reviewed update.
-  The ten pty cases run in any session and passed with the managed path.
+- **Other cases.** The fresh-session test requires the complete managed tree
+  to retain the launcher's session and checks actual helper/provider collection.
+  The ten pty cases run in any session.
   They put `umbra run` under a mini job-control shell
   and pin today's terminal semantics: Ctrl-C, Ctrl-Z then `fg`, Ctrl-\,
   TOSTOP, SIGWINCH, hangup, exit status and terminal ioctls. After a hangup
   the harness finds nothing of the run left to kill (`survivors=0`): the
   platform provider ends with its owner, not the terminal (#198, #205).
 
-The harness signals only pids it found by parentage from its own launcher, and
-cleans up by the run's session. Its cleanup is debugger-last (#205): it ends
+The harness signals only pids it found by parentage from its own launcher.
+It uses session cleanup only when the run's guardian leads that session.
+Its cleanup is debugger-last (#205): it ends
 the supervisor first, waits (capped at 3 s + 4 s per debugserver) until no
 recorded debugserver is live, and only then kills what is left. Every case
 that asserts nothing survives, every pty case, and

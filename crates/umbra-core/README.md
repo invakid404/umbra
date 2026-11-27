@@ -86,6 +86,11 @@ on the wire. Error categories alone provide no termination evidence.
 Supervised completion requires the separate complete shutdown ledger and owned
 provider-exit confirmation; this legacy flag cannot replace either.
 
+`UmbraError::diagnostics` carries preceding context across managed result
+forwarding. Display writes those details before the original category, operation,
+context and errno line. The primary error remains typed rather than being
+embedded in another error's context.
+
 `ErrorKind::ProcessFailed` reports a supervised child that exited nonzero or was
 signalled, which is a run result rather than an Umbra malfunction.
 `TraceEvent::Signal` carries a single-use `SignalToken`; the matching
