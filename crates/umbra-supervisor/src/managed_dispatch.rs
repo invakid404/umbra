@@ -207,7 +207,9 @@ fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
                 if caller == Some(std::process::id()) && directory.join("setup.json").exists() {
                     let now = umbra_isolation::managed::boot_nanos()?;
                     std::fs::write(directory.join("triggered.json"), now.to_string())?;
-                    transport.take();
+                    if let Some(transport) = transport.take() {
+                        transport.discard();
+                    }
                     return Err(io::Error::other("native setup probe caller cancellation"));
                 }
             }
@@ -220,13 +222,17 @@ fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
             match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => {
-                    transport.take();
+                    if let Some(transport) = transport.take() {
+                        transport.discard();
+                    }
                     Err(io::Error::other(error))
                 }
                 Err(payload) => {
                     // Collection must continue even if a terminal callback unwinds.
                     std::mem::forget(payload);
-                    transport.take();
+                    if let Some(transport) = transport.take() {
+                        transport.discard();
+                    }
                     Err(io::Error::other("managed terminal observer panicked"))
                 }
             }

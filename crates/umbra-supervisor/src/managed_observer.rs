@@ -282,6 +282,20 @@ pub struct CallerTransport {
 
 #[cfg(target_os = "macos")]
 impl CallerTransport {
+    /// Close the route before dropping callbacks that may panic during cleanup.
+    pub(crate) fn discard(self) {
+        let Self {
+            channel, observer, ..
+        } = self;
+        drop(channel);
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(observer)))
+        {
+            // A panic payload may itself have a panicking destructor.
+            std::mem::forget(payload);
+        }
+    }
+
     /// Guardian wait receipt; never inferred from a helper's exit signal.
     pub fn worker_status_handle(&self) -> std::rc::Rc<std::cell::Cell<Option<i32>>> {
         self.observer.worker_status.clone()
@@ -785,5 +799,74 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::InvalidState);
         assert_eq!(error.operation, "run.observer");
         assert!(worker.prepared(run).is_err());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finished_and_drop_panics_preserve_parent_collection() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use umbra_isolation::managed::Channel;
+        struct DoublePanic(UnixStream, std::rc::Rc<std::cell::Cell<bool>>);
+        impl RunObserver for DoublePanic {
+            fn prepared(&mut self, _: RunId) -> Result<()> {
+                Ok(())
+            }
+            fn teardown_warning(&mut self, _: &UmbraError) {}
+            fn finished(&mut self, _: &RunOutcome) {
+                panic!("finished fixture panic");
+            }
+        }
+        impl Drop for DoublePanic {
+            fn drop(&mut self) {
+                assert_eq!(
+                    self.0.read(&mut [0; 1]).unwrap(),
+                    0,
+                    "observer route must close before callback destruction"
+                );
+                self.1.set(true);
+                panic!("drop fixture panic");
+            }
+        }
+        let (socket, peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let run = RunId(uuid::Uuid::new_v4());
+        let closed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut observer =
+            CallerObserver::new(run, Some(Box::new(DoublePanic(peer, closed.clone()))));
+        observer.adopted = true;
+        observer.prepared = true;
+        let mut transport = CallerTransport::new(Channel::new(socket).unwrap(), observer);
+        let callback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            transport
+                .observer
+                .observer
+                .as_mut()
+                .unwrap()
+                .finished(&RunOutcome {
+                    run_id: run,
+                    root_status: None,
+                    processes_exited: 0,
+                });
+        }));
+        assert!(callback.is_err());
+        // Parent collection after callback failure must remain reachable.
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        transport.discard();
+        assert!(
+            closed.get(),
+            "callback destructor did not observe closed route"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent collection expired"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
