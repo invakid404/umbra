@@ -104,6 +104,10 @@ impl Launch {
         if remaining == 0 {
             return Err(io::ErrorKind::TimedOut.into());
         }
+        super::executable::startup_observation(
+            "provider-launch-begin",
+            Some(umbra_core::managed::Role::Provider),
+        );
         let client = umbra_core::provider::Client::connect_managed_configured_until(
             descriptor,
             timeout_ms,
@@ -112,6 +116,10 @@ impl Launch {
             configure,
         )
         .map_err(io::Error::other)?;
+        super::executable::startup_observation(
+            "provider-launch-end",
+            Some(umbra_core::managed::Role::Provider),
+        );
         let child = self
             .child
             .as_ref()

@@ -12,7 +12,11 @@ def table(directory):
     go = [r for r in rows if r["event"] == "helpers_ready_go"]
     if len(go) != 1:
         raise ValueError("exactly one worker GO required")
+    if go[0]["run_nonce"] != receipt["nonce"]:
+        raise ValueError("cross-run GO")
     end = go[0]["boot_nanos"]
+    if end < start:
+        raise ValueError("GO precedes invocation")
     events = [r for r in rows if r["role"] == "startup" and r["boot_nanos"] <= end]
     if not events:
         raise ValueError("startup instrumentation missing")

@@ -955,7 +955,16 @@ mod unix {
         >,
         #[cfg(target_os = "macos")] completion: &mut Option<crate::managed_observer::Completion>,
     ) -> Result<()> {
+        let stage = |_name: &str| {
+            #[cfg(target_os = "macos")]
+            umbra_isolation::managed::executable::startup_observation(
+                _name,
+                Some(umbra_core::managed::Role::Worker),
+            );
+        };
+        stage("worker-setup-begin");
         validate(&spec)?;
+        stage("worker-validation-end");
         let launch_stdio = umbra_core::launch_stdio::LaunchStdio::capture()?;
         let mut observer = spec.observer.take();
         let RunLaunch::Command(command) = spec.launch.clone() else {
@@ -965,6 +974,7 @@ mod unix {
         // Fingerprint the approved workspace before anything is opened, so the
         // run's base identity describes the state preparation actually saw.
         let inventory = WorkspaceInventory::capture(&spec.workspace)?;
+        stage("workspace-inventory-end");
         let immutable_base = inventory.contract();
 
         let timeout = spec.registry.timeout_ms;
@@ -972,6 +982,7 @@ mod unix {
             spec.registry.get("storage")?,
             timeout,
         )?);
+        stage("storage-connect-end");
 
         let policy = StoragePolicy {
             read_only: false,
@@ -1319,6 +1330,7 @@ mod unix {
         };
 
         let namespace: crate::namespace_owner::NamespaceOwner = namespace.into();
+        stage("namespace-prepared");
         #[cfg(target_os = "macos")]
         let (namespace, platform_result) = if let Some(mut startup) = startup {
             let crate::namespace_owner::NamespaceOwner::Unmanaged(raw) = namespace else {
@@ -1326,6 +1338,7 @@ mod unix {
             };
             let (owner, client, cleanup) =
                 crate::run_owner::RunOwner::arm_worker(run_id, raw, &mut startup)?;
+            stage("worker-armed");
             let mut namespace = crate::namespace_owner::NamespaceOwner::Managed(Box::new(owner));
             let exchange = startup.entry.take_exchange().map_err(|failure| {
                 error(
