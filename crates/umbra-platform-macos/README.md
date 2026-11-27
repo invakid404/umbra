@@ -784,6 +784,9 @@ debugger-collection and task-right receipts, holding selected boundaries for
 the controller. A hold exceeding two seconds invalidates the observation and
 releases cleanup. Unset means no ordering records or holds; normal builds
 contain none of these controls.
+A per-process `withhold-terminal-<pid>` file in that directory makes terminal
+lookup return its existing error outcome. It does not change the operation
+directed at the program, cached confirmation, parent collection, or deadlines.
 
 The same feature includes startup and cleanup timing observations.
 `UMBRA_F299_PERF_EVENTS` selects their output directory; unset produces no
@@ -1156,6 +1159,14 @@ The `r2_native_da_order_across_roles` selector adds held barriers with
 that test with `--exact --nocapture --test-threads=1`. Its controller checks a
 confirmed terminal barrier before debugger cleanup, successful debugger
 collection, and task-right deallocation before each matching final slot confirms.
+The native controller also observes the debug helper while the barrier is held;
+moving the actual cleanup request before that barrier is rejected even when
+later collection completes.
+
+`r2_native_da_order_emergency` uses a fork descendant and the terminal-observation
+hook to exercise deadline expiry, Unconfirmed before the cleanup request, and
+a retained failed result after collection. Its final-code qualification remains
+unresolved: the held-barrier observer found the debug helper already absent.
 The ordinary-child causal-order and emergency controls are in `umbra-isolation`.
 Neither fixture qualifies the unresolved provider-loss or SID-1 cases.
 
