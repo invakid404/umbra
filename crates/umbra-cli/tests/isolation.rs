@@ -350,6 +350,38 @@ impl Tree {
     }
 }
 
+fn managed_worker(rows: &[Proc], guardian: i32) -> i32 {
+    rows.iter()
+        .find(|row| row.ppid == guardian && row.comm == "umbra")
+        .expect("supervisor")
+        .pid
+}
+
+#[test]
+fn managed_worker_discovery_ignores_sibling_enumeration_order() {
+    let process = |pid, ppid, comm: &str| Proc {
+        pid,
+        ppid,
+        pgid: 20,
+        sid: 20,
+        stat: 2,
+        start_us: i64::from(pid),
+        comm: comm.into(),
+    };
+    let rows = vec![
+        process(21, 20, "umbra"),
+        process(22, 20, "umbra"),
+        process(23, 21, "umbra-platform-macos"),
+        process(24, 22, "umbra-journal-file"),
+        process(25, 22, "umbra-storage-local"),
+    ];
+    assert_eq!(
+        managed_worker(&rows, 20),
+        22,
+        "the cleanup owner is not the worker"
+    );
+}
+
 #[derive(Debug)]
 struct Outcome {
     /// The launcher's raw wait status of `umbra`, if it reported one.
@@ -527,11 +559,7 @@ impl Run {
             Some(guardian) => {
                 tree.relay = Some(umbra);
                 tree.guardian = Some(guardian.pid);
-                tree.supervisor = kids(guardian.pid)
-                    .into_iter()
-                    .find(|r| r.comm == "umbra")
-                    .expect("supervisor")
-                    .pid;
+                tree.supervisor = managed_worker(&rows, guardian.pid);
                 // The guardian is the relay's unreaped child now and was alive
                 // at `before`: S is this run's session at that instant.
                 assert!(guardian.start_us < before);
