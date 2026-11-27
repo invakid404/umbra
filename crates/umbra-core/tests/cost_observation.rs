@@ -33,6 +33,7 @@ fn observation_child() {
         return;
     }
     for event in [
+        "cli-entry",
         "topology-before",
         "topology-pair",
         "helper-bootstrap-created",

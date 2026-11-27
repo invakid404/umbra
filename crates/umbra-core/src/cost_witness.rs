@@ -19,12 +19,30 @@ macro_rules! cost_snapshot {
     ($($argument:tt)*) => {};
 }
 
-/// Run and collect the explicit observer without allocating output pipes.
+/// Run and collect the explicit observer at selected boundaries without output pipes.
 ///
 /// Its own process and descriptors are excluded from the census. These builds
 /// measure resource counts, not latency, and must never supply D6 samples.
+/// Startup allocation hooks are ignored: the first managed snapshot is after
+/// worker GO. These readings do not measure the peak during startup.
 #[cfg(feature = "cost-witness")]
 pub fn snapshot(event: &str, child: Option<u32>, keep: &[i32], status: Option<i32>) {
+    if !event.starts_with("control-")
+        && !matches!(
+            event,
+            "driver-before-spawn"
+                | "driver-after-collection"
+                | "cli-return"
+                | "library-before-prepare"
+                | "library-after-return"
+                | "role-go-Worker"
+                | "run-ready"
+                | "helper-collected"
+                | "startup-rollback-closed"
+        )
+    {
+        return;
+    }
     if std::env::var_os("UMBRA_COST_OBSERVER").is_none() {
         return;
     }

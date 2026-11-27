@@ -1489,6 +1489,7 @@ mod unix {
         budget: RunBudget,
         observer: &mut Option<Box<dyn RunObserver>>,
     ) -> Result<()> {
+        umbra_core::cost_snapshot!("run-ready", None, &[]);
         if let Err(primary) = supervisor.launch_prepared(launch_spec, budget) {
             return finish_supervision(supervisor, Err(primary), observer);
         }
