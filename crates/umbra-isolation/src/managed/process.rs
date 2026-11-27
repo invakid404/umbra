@@ -162,6 +162,10 @@ pub struct ProcessWatch {
 }
 
 impl ProcessWatch {
+    pub(super) fn descriptor(&self) -> std::os::fd::RawFd {
+        self.queue.as_raw_fd()
+    }
+
     /// Check that a transferred queue retains every required startup watch.
     pub fn covers(&self, participants: &[Participant]) -> bool {
         participants

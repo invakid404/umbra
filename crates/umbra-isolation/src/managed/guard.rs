@@ -704,6 +704,78 @@ impl Guard {
         events
     }
 
+    /// Wait on cleanup, process-exit and application traffic without renewing a cutoff.
+    /// The borrowed application descriptor remains owned by the progress callback.
+    pub fn wait_for_activity(
+        &mut self,
+        application: Option<(std::os::fd::BorrowedFd<'_>, bool, u64)>,
+    ) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        if self.pending_failure.is_some() {
+            return Ok(());
+        }
+        let mut deadline = self.receive_deadline();
+        if let Some(ticket) = self.tickets.ticket() {
+            let cutoffs = ticket.cutoffs(self.capacity).map_err(invalid)?;
+            let mut stages = vec![cutoffs.cooperative, cutoffs.fallback, cutoffs.helpers];
+            for child in &self.children {
+                stages.push(parent_cutoff(
+                    self.local.role,
+                    child.identity.role,
+                    ticket,
+                    self.capacity,
+                )?);
+            }
+            for cutoff in stages {
+                if !self.stage_events.contains(&cutoff) {
+                    deadline = deadline.min(cutoff);
+                }
+            }
+        }
+        let mut descriptors = Vec::new();
+        if !self.watch_failed {
+            descriptors.push(libc::pollfd {
+                fd: self.watch.descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        for peer in &mut self.peers {
+            if peer.failed {
+                continue;
+            }
+            if let Some(start) = &peer.ack {
+                deadline = deadline.min(
+                    start
+                        .ticket
+                        .started
+                        .checked_add(umbra_core::managed::ACK_NANOS)
+                        .ok_or_else(|| invalid("ACK cutoff overflow"))?,
+                );
+            }
+            let (fd, writing) = peer.route.channel().wait_interest();
+            descriptors.push(libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: if writing { libc::POLLOUT } else { libc::POLLIN },
+                revents: 0,
+            });
+        }
+        if let Some(publication) = &self.publication {
+            let (routes, cutoff) = publication.wait_descriptors();
+            descriptors.extend(routes);
+            deadline = deadline.min(cutoff);
+        }
+        if let Some((fd, writing, cutoff)) = application {
+            descriptors.push(libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: if writing { libc::POLLOUT } else { libc::POLLIN },
+                revents: 0,
+            });
+            deadline = deadline.min(cutoff);
+        }
+        super::readiness::wait_descriptors(&mut descriptors, deadline)
+    }
+
     /// Parent collection never clears notification or protocol failure.
     pub fn failed(&self) -> bool {
         self.tickets.failed()
@@ -776,6 +848,28 @@ fn exit_diagnostic(role: umbra_core::managed::Role, status: i32) -> String {
 mod policy_tests {
     use super::*;
     use umbra_core::managed::{CleanupPath, Role, Ticket};
+
+    #[test]
+    fn application_readiness_wakes_guard_without_start() {
+        use std::io::Write;
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+        let local = super::super::process::identity(std::process::id(), Role::Caller).unwrap();
+        let run = RunIdentity {
+            nonce: uuid::Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut guard = Guard::new(local, run, 1).unwrap();
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(&[1]).unwrap();
+        let cutoff = boot_nanos().unwrap() + 1_000_000_000;
+        guard
+            .wait_for_activity(Some((reader.as_fd(), false, cutoff)))
+            .unwrap();
+        assert!(boot_nanos().unwrap() < cutoff);
+        assert!(guard.tickets.ticket().is_none());
+        assert!(!guard.failed());
+    }
 
     #[test]
     fn child_failure_reports_exit_code() {

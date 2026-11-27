@@ -165,8 +165,13 @@ impl Publication {
     /// Wait for any unfinished route under the already committed cutoff.
     /// Expiry returns to progress so every remaining route records its failure.
     pub(super) fn wait(&self) -> io::Result<()> {
+        let (mut descriptors, deadline) = self.wait_descriptors();
+        super::readiness::wait_descriptors(&mut descriptors, deadline)
+    }
+
+    pub(super) fn wait_descriptors(&self) -> (Vec<libc::pollfd>, u64) {
         use std::os::fd::AsRawFd;
-        let mut descriptors: Vec<_> = self
+        let descriptors: Vec<_> = self
             .routes
             .iter()
             .filter_map(|(route, state)| {
@@ -184,7 +189,7 @@ impl Publication {
                 })
             })
             .collect();
-        super::readiness::wait_descriptors(&mut descriptors, self.deadline)
+        (descriptors, self.deadline)
     }
 
     /// Sticky attributable errors; later child collection never erases these.
