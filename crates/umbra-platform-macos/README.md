@@ -1159,14 +1159,23 @@ The `r2_native_da_order_across_roles` selector adds held barriers with
 that test with `--exact --nocapture --test-threads=1`. Its controller checks a
 confirmed terminal barrier before debugger cleanup, successful debugger
 collection, and task-right deallocation before each matching final slot confirms.
-The native controller also observes the debug helper while the barrier is held;
+For the normal selector, the native controller also observes the debug helper
+while the barrier is held;
 moving the actual cleanup request before that barrier is rejected even when
 later collection completes.
 
 `r2_native_da_order_emergency` uses a fork descendant and the terminal-observation
 hook to exercise deadline expiry, Unconfirmed before the cleanup request, and
-a retained failed result after collection. Its final-code qualification remains
-unresolved: the held-barrier observer found the debug helper already absent.
+a retained failed result after collection. The emergency oracle permits the helper
+to end normally before the cleanup request. Its actual parent observes that
+boundary with nonblocking, non-consuming `waitid` and records the raw wait
+status after collection. A signal-ended helper before the request, an unavailable
+observation, or missing parent status fails the case. The request record must
+show the original allocation expired. Normal-case liveness checks stay intact.
+The scoped emergency reading and the subsequent normal/emergency selector pair
+passed; both emergency readings recorded normal helper exit status 0 before the
+request and raw collected status 0. The earlier shared-observer failure remains
+retained; it required liveness where the emergency contract permits normal exit.
 The ordinary-child causal-order and emergency controls are in `umbra-isolation`.
 Neither fixture qualifies the unresolved provider-loss or SID-1 cases.
 
