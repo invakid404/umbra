@@ -30,6 +30,39 @@ pub struct OwnerStartup {
 }
 
 impl OwnerStartup {
+    /// Wait for the provider's exit while retaining its actual parent handle.
+    pub fn wait_for_rollback(&mut self) -> io::Result<()> {
+        let deadline = self
+            .entry
+            .readiness_deadline
+            .checked_add(9_000_000_000)
+            .ok_or_else(|| invalid("rollback clock overflow"))?;
+        let Some(child) = self.launch.child.as_mut() else {
+            return Ok(());
+        };
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let mut watch = super::process::ProcessWatch::new()?;
+        let installed = super::process::identity(child.id(), Role::Provider)
+            .and_then(|participant| watch.install(participant));
+        if let Err(error) = installed {
+            return if child.try_wait()?.is_some() {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        super::readiness::wait_descriptors(
+            &mut [libc::pollfd {
+                fd: watch.descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            }],
+            deadline,
+        )
+    }
+
     /// Collect a provider that never received GO; preserve the actual Child
     /// in Launch on errors or expiry. No acquisition is authorized in this phase.
     pub fn rollback(&mut self) -> io::Result<bool> {

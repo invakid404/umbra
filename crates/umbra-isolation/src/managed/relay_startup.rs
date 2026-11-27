@@ -32,6 +32,14 @@ pub struct RelayStartup {
 }
 
 impl RelayStartup {
+    /// Wait for retained children during pre-GO rollback.
+    pub fn wait_for_rollback(&mut self) -> io::Result<()> {
+        self.rollback
+            .as_mut()
+            .ok_or_else(|| invalid("rollback not started"))?
+            .wait_for_activity()
+    }
+
     /// Continue failed cleanup after readiness when GO may have reached a child.
     /// Pending child handles stay here if runtime adoption cannot be validated.
     pub fn fail_runtime(&mut self) -> io::Result<super::guard::Outcome> {

@@ -8,6 +8,8 @@ pub struct Rollback {
     children: Vec<SpawnedChild>,
     statuses: Vec<Option<i32>>,
     deadline: u64,
+    roles: Vec<umbra_core::managed::Role>,
+    watch: Option<super::process::ProcessWatch>,
 }
 
 impl Rollback {
@@ -47,6 +49,8 @@ impl Rollback {
         }
         Ok(Self {
             statuses: vec![None; children.len()],
+            roles: children.iter().map(PendingRole::role).collect(),
+            watch: None,
             children: children.into_iter().map(PendingRole::into_child).collect(),
             deadline,
         })
@@ -78,6 +82,54 @@ impl Rollback {
         Ok(false)
     }
 
+    /// Watch actual children without replacing their required parent waits.
+    pub fn wait_for_activity(&mut self) -> io::Result<()> {
+        if self.poll()? {
+            return Ok(());
+        }
+        if self.watch.is_none() {
+            self.watch = Some(super::process::ProcessWatch::new()?);
+        }
+        let watch = self.watch.as_mut().unwrap();
+        for ((child, status), role) in self
+            .children
+            .iter_mut()
+            .zip(&mut self.statuses)
+            .zip(&self.roles)
+        {
+            if status.is_some() {
+                continue;
+            }
+            let installed = super::process::identity(child.pid(), *role).and_then(|participant| {
+                if watch.covers(&[participant]) {
+                    Ok(())
+                } else {
+                    watch.install(participant)
+                }
+            });
+            if let Err(error) = installed {
+                // Exit can race watch installation. Only the parent receipt resolves it.
+                *status = child.collect()?;
+                if status.is_none() {
+                    return Err(error);
+                }
+            }
+        }
+        if self.statuses.iter().all(Option::is_some) {
+            return Ok(());
+        }
+        super::readiness::wait_descriptors(
+            &mut [libc::pollfd {
+                fd: watch.descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            }],
+            self.deadline,
+        )?;
+        while watch.exited()?.is_some() {}
+        Ok(())
+    }
+
     /// Actual wait statuses in original child order; absent means unresolved.
     pub fn statuses(&self) -> &[Option<i32>] {
         &self.statuses
@@ -90,5 +142,61 @@ impl Rollback {
             .zip(self.statuses)
             .filter_map(|(child, status)| status.is_none().then_some(child))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use umbra_core::managed::Role;
+
+    #[test]
+    fn exit_wait_preserves_cutoff_and_actual_child_custody() {
+        let child = SpawnedChild::spawn(
+            std::path::Path::new("/bin/sleep"),
+            &["sleep".into(), "5".into()],
+            &[],
+            false,
+            &[],
+        )
+        .unwrap();
+        let participant = super::super::process::identity(child.pid(), Role::Worker).unwrap();
+        let deadline = boot_nanos().unwrap() + 20_000_000;
+        let mut rollback = Rollback {
+            children: vec![child],
+            statuses: vec![None],
+            deadline,
+            roles: vec![Role::Worker],
+            watch: None,
+        };
+        let waited = rollback.wait_for_activity();
+        let finished = boot_nanos().unwrap();
+        let expired = rollback.poll();
+        let retained = rollback.statuses[0].is_none();
+        // End and collect the owned fixture before checking the deadline assertions.
+        super::super::process::signal_current(participant, libc::SIGKILL).unwrap();
+        let cleanup_cutoff = boot_nanos().unwrap() + 1_000_000_000;
+        while rollback.children[0].collect().unwrap().is_none() {
+            assert!(boot_nanos().unwrap() < cleanup_cutoff);
+            if let Some(watch) = &rollback.watch {
+                super::super::readiness::wait_descriptors(
+                    &mut [libc::pollfd {
+                        fd: watch.descriptor(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }],
+                    cleanup_cutoff,
+                )
+                .unwrap();
+            }
+        }
+        waited.unwrap();
+        assert_eq!(expired.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(retained);
+        assert_eq!(rollback.deadline, deadline);
+        assert!(
+            finished < deadline + 500_000_000,
+            "wait exceeded its original cutoff"
+        );
     }
 }

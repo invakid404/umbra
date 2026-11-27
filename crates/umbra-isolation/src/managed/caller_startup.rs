@@ -33,6 +33,14 @@ pub struct CallerStartup {
 }
 
 impl CallerStartup {
+    /// Wait for retained children during pre-GO rollback.
+    pub fn wait_for_rollback(&mut self) -> io::Result<()> {
+        self.rollback
+            .as_mut()
+            .ok_or_else(|| invalid("rollback not started"))?
+            .wait_for_activity()
+    }
+
     /// Wait after a stalled startup step, retaining the relay and original cutoff.
     pub fn wait_for_activity(&self) -> io::Result<()> {
         if self.failed || self.complete {

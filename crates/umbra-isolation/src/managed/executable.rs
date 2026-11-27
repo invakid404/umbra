@@ -511,6 +511,10 @@ pub struct PendingRole {
     readiness_deadline: u64,
 }
 impl PendingRole {
+    pub(super) fn role(&self) -> Role {
+        self.role
+    }
+
     /// Wait for the current bootstrap exchange without renewing its cutoff.
     pub(super) fn wait_for_activity(&self) -> io::Result<()> {
         self.bootstrap.wait_until(

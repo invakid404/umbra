@@ -163,7 +163,7 @@ impl RegisteredRole {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     while !startup.rollback()? {
-                        tick();
+                        startup.wait_for_rollback()?;
                     }
                     Ok(())
                 }
@@ -174,7 +174,7 @@ impl RegisteredRole {
                     check_collection(startup.fail_runtime()?, &mut self.unresolved)
                 } else {
                     while !startup.rollback()? {
-                        tick();
+                        startup.wait_for_rollback()?;
                     }
                     Ok(())
                 }
@@ -184,7 +184,7 @@ impl RegisteredRole {
                     check_collection(startup.fail_runtime()?, &mut self.unresolved)
                 } else {
                     while !startup.rollback()? {
-                        tick();
+                        startup.wait_for_rollback()?;
                     }
                     Ok(())
                 }
@@ -193,12 +193,12 @@ impl RegisteredRole {
                 if let Some(service) = service.as_mut() {
                     service.fail("registered owner dispatch failed".to_owned())?;
                     while !service.poll()? {
-                        tick();
+                        service.wait_for_activity()?;
                     }
                     Ok(())
                 } else {
                     while !startup.rollback()? {
-                        tick();
+                        startup.wait_for_rollback()?;
                     }
                     Ok(())
                 }
@@ -250,10 +250,6 @@ pub fn execute(role: &mut RegisteredRole) -> io::Result<()> {
             }
         },
     }
-}
-
-fn tick() {
-    std::thread::sleep(std::time::Duration::from_millis(1));
 }
 
 fn check(
