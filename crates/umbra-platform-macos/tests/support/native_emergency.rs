@@ -12,7 +12,7 @@ pub fn run() {
         eprintln!("SKIP native emergency: qualified host required");
         return;
     }
-    let order = native_order::Observation::start().expect("fresh order directory");
+    let order = native_order::Observation::start_emergency().expect("fresh order directory");
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("family.c");
     let program = dir.path().join("family");

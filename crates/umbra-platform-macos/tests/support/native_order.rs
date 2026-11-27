@@ -30,6 +30,14 @@ fn records(root: &std::path::Path) -> Vec<Value> {
 
 impl Observation {
     pub fn start() -> Option<Self> {
+        Self::start_case(false)
+    }
+
+    pub fn start_emergency() -> Option<Self> {
+        Self::start_case(true)
+    }
+
+    fn start_case(emergency_case: bool) -> Option<Self> {
         let root = PathBuf::from(std::env::var_os("UMBRA_NATIVE_CLEANUP_ORDER")?);
         std::fs::create_dir(&root).expect("fresh native order directory");
         let run = uuid::Uuid::new_v4().to_string();
@@ -77,7 +85,7 @@ impl Observation {
                     }) {
                         errors.push(format!("{forbidden} crossed held {stage}"));
                     }
-                    if stage == "barrier-held" && event["details"]["confirmed"] == true {
+                    if stage == "barrier-held" && !emergency_case {
                         use umbra_isolation::managed::process::{identity, ProcessWatch};
                         let debugger = event["details"]["debugger"].as_u64().unwrap() as u32;
                         let observation = (|| -> std::io::Result<bool> {
