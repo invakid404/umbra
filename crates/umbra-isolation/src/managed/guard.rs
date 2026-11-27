@@ -702,6 +702,15 @@ impl Guard {
                         events.push(Event::Failed(exit_diagnostic(owned.identity.role, status)));
                     }
                     events.push(Event::Collected(owned.identity, status));
+                    #[cfg(feature = "shutdown-witness")]
+                    crate::performance_observation::record_details(
+                        "collection_stage",
+                        "child-collected",
+                        Some(u64::from(owned.identity.pid)),
+                        serde_json::json!({
+                            "parent": self.local, "child": owned.identity, "status": status,
+                        }),
+                    );
                 }
                 Ok(None) => {}
                 Err(error) => {

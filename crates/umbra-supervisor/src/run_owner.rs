@@ -190,6 +190,13 @@ impl RunOwner {
 
     /// Release namespace destruction only after the matching durable receipt.
     fn finish(&mut self, proof: &CustodyFinishProof) -> Result<FinishRunReceipt> {
+        let stage = |name| {
+            umbra_isolation::managed::executable::startup_observation(
+                name,
+                Some(umbra_core::managed::Role::Worker),
+            );
+        };
+        stage("writer-finish-begin");
         let namespace: &mut Box<dyn NamespaceSession> =
             self.namespace.as_mut().ok_or_else(|| {
                 UmbraError::new(
@@ -199,8 +206,10 @@ impl RunOwner {
                 )
             })?;
         let receipt = self.finish.finish(namespace.as_mut(), proof)?;
+        stage("writer-finish-durable");
         self.boundary.take();
         drop(ManuallyDrop::into_inner(self.namespace.take().unwrap()));
+        stage("namespace-destroyed");
         Ok(receipt)
     }
 }

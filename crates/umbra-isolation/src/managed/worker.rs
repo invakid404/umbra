@@ -86,12 +86,20 @@ impl ManagedCleanup for SharedWorkerCleanup {
         self.inner.try_borrow().ok()?.provider_receipt()
     }
     fn start(&mut self) -> umbra_core::Result<Instant> {
+        super::executable::startup_observation(
+            "cleanup-start-requested",
+            Some(umbra_core::managed::Role::Worker),
+        );
         self.inner.try_borrow_mut().map_err(error)?.start()
     }
     fn failed(&mut self, failure: &UmbraError) {
         self.inner.borrow_mut().failed(failure);
     }
     fn collect_provider(&mut self) -> umbra_core::Result<Duration> {
+        super::executable::startup_observation(
+            "provider-collection-begin",
+            Some(umbra_core::managed::Role::Worker),
+        );
         self.inner
             .try_borrow_mut()
             .map_err(error)?
@@ -712,6 +720,10 @@ impl ManagedCleanup for WorkerCleanup {
             }
         }
         let receipt = self.receipt.as_ref().unwrap();
+        super::executable::startup_observation(
+            "provider-collection-received",
+            Some(umbra_core::managed::Role::Worker),
+        );
         #[cfg(feature = "shutdown-witness")]
         umbra_platform::shutdown::witness(serde_json::json!({
             "event": "provider-parent-wait",
