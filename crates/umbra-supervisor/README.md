@@ -102,8 +102,10 @@ here would be a fifth mechanism racing four.
 `RunSpec` carries the provider registry, a `RunLaunch` (a `CommandLaunch`, or an
 `AgentLaunchRequest` that is refused as unimplemented), the approved workspace,
 a `RunPersistence` selection, the experimental acknowledgement, and an optional
-`RunObserver`. The observer is how status reaches a caller; normal builds of this crate write to
-no stream and read none. The test-only renewal probe described below writes a successful-renewal marker to stderr.
+`RunObserver`. The observer carries run status to the caller; the synchronous
+`run` path reads and writes no stream. Managed dispatch also reports failed
+cleanup and abrupt worker termination on stderr. The test-only renewal probe
+described below writes a successful-renewal marker to stderr.
 
 The staged order is fixed, and each stage's failure decides what may be released:
 
