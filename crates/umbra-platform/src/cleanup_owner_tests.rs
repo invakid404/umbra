@@ -292,14 +292,23 @@ fn endpoint(mode: &str) {
 
 macro_rules! endpoint_tests {
     ($($name:ident => $mode:literal),* $(,)?) => { $(
+        // These assertions require the separate macOS cleanup owner. The
+        // legacy Client deliberately kills its owned provider on failure and
+        // cannot promise that provider-side cleanup finishes afterward.
+        #[cfg(target_os = "macos")]
         #[test]
         fn $name() {
-            #[cfg(target_os = "macos")]
             managed_fixture::endpoint($mode);
-            #[cfg(not(target_os = "macos"))]
-            endpoint($mode);
         }
     )* };
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn legacy_endpoint_eof_allows_cooperative_cleanup() {
+    // The legacy control closes its transport without invoking the failure
+    // stop path, then verifies successful provider and resource parent waits.
+    endpoint("control");
 }
 endpoint_tests! {
     r2_cleanup_eof_control => "control",
