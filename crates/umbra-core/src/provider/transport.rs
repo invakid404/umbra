@@ -1241,6 +1241,16 @@ mod tests {
     }
 
     #[test]
+    fn reap_collects_a_wait_ready_child_before_returning() {
+        let (child, control) = fake_child(false, false);
+        // The child becomes waitable after the initial nonblocking inspection.
+        control.release.send(()).unwrap();
+        assert_eq!(reap(child, Duration::from_millis(50)), Reaped::Exited);
+        assert_eq!(control.wait_calls.load(Ordering::SeqCst), 1);
+        control.finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
     fn reap_detaches_a_child_whose_wait_never_returns() {
         let (child, control) = fake_child(false, false); // try_wait: Ok(None) forever
         let start = Instant::now();
