@@ -1013,7 +1013,7 @@ mod policy_tests {
                     // Only this test's still-owned child is stopped; the guard
                     // must subsequently produce the actual parent receipt.
                     unsafe {
-                        libc::kill(participant.pid, libc::SIGKILL);
+                        libc::kill(participant.pid.try_into().unwrap(), libc::SIGKILL);
                     }
                 }
                 guard.wait_for_activity(None)
