@@ -4,6 +4,12 @@ use std::path::Path;
 use std::time::Duration;
 use umbra_core::*;
 #[cfg(feature = "test-native-cleanup-order")]
+#[path = "support/managed_admission.rs"]
+mod managed_admission;
+#[cfg(feature = "test-native-cleanup-order")]
+#[path = "support/native_emergency.rs"]
+mod native_emergency;
+#[cfg(feature = "test-native-cleanup-order")]
 #[path = "support/native_order.rs"]
 mod native_order;
 
@@ -11,6 +17,12 @@ mod native_order;
 #[test]
 fn r2_native_da_order_across_roles() {
     shutdown_native_root_ledger();
+}
+
+#[cfg(feature = "test-native-cleanup-order")]
+#[test]
+fn r2_native_da_order_emergency() {
+    native_emergency::run();
 }
 
 fn path(path: &Path) -> BytePath {

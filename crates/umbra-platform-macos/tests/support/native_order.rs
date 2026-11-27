@@ -100,7 +100,19 @@ impl Observation {
         })
     }
 
-    pub fn finish(mut self, final_state: &umbra_core::shutdown::Final) {
+    pub fn directory(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    pub fn finish(self, final_state: &umbra_core::shutdown::Final) {
+        self.finish_case(final_state, None);
+    }
+
+    pub fn finish_case(
+        mut self,
+        final_state: &umbra_core::shutdown::Final,
+        emergency: Option<i32>,
+    ) {
         self.stop.store(true, Ordering::Release);
         assert!(
             self.thread.take().unwrap().join().unwrap().is_empty(),
@@ -124,19 +136,28 @@ impl Observation {
         }
         let barrier = events
             .iter()
-            .position(|e| e["stage"] == "barrier-held")
+            .position(|e| {
+                e["stage"] == "barrier-held"
+                    && emergency.is_none_or(|pid| e["details"]["pid"] == pid)
+            })
             .unwrap();
         let cleanup = events
             .iter()
-            .position(|e| e["stage"] == "debugger-cleanup")
+            .position(|e| {
+                e["stage"] == "debugger-cleanup"
+                    && emergency.is_none_or(|pid| e["details"]["pid"] == pid)
+            })
             .unwrap();
         let collected = events
             .iter()
-            .position(|e| e["stage"] == "debugger-collected")
+            .position(|e| {
+                e["stage"] == "debugger-collected"
+                    && emergency.is_none_or(|pid| e["details"]["pid"] == pid)
+            })
             .unwrap();
         assert!(barrier < cleanup && cleanup < collected);
-        assert_eq!(events[barrier]["details"]["confirmed"], true);
-        assert_eq!(events[cleanup]["details"]["emergency"], false);
+        assert_eq!(events[barrier]["details"]["confirmed"], emergency.is_none());
+        assert_eq!(events[cleanup]["details"]["emergency"], emergency.is_some());
         assert_eq!(events[collected]["details"]["collected"], true);
         assert_eq!(
             events[barrier]["details"]["debugger"],
