@@ -376,46 +376,49 @@ enum Reaped {
     Detached,
     /// The reaper thread could not be spawned; the child was dropped unreaped.
     Abandoned,
+    /// The actual wait returned an error, so collection remains unconfirmed.
+    WaitFailed,
 }
 
 /// SIGKILL a provider and reap it without blocking the caller past `grace`.
 ///
-/// Poll `try_wait` for up to `grace` (the same 5ms idiom as [`Client::connect`]'s
-/// accept loop). A healthy provider exits at once, so the reap stays synchronous and
-/// spawns nothing. A provider stuck on an uninterruptible kernel wait is moved into a
-/// detached named thread that blocks on `wait`, so the caller returns in about
-/// `grace`, leaking at most one parked thread and one zombie until the kernel releases
-/// the wait (both cleaned up when the process exits and the provider is reparented to
-/// init). A `try_wait` error does *not* prove the child was reaped -- std's Unix
-/// `try_wait` propagates the `waitpid(WNOHANG)` error, so a transient EINTR leaves the
-/// child alive -- so it too routes to the detached wait, which actually reaps a live
-/// child and returns immediately (ECHILD) for one already reaped elsewhere.
+/// Check once without blocking, then wait for the actual owned child on a
+/// reaper thread. The caller waits only to the original grace cutoff. A child
+/// stuck in the kernel retains its reaper after the caller returns. An inspection
+/// error follows the existing immediate-detach path; it is not collection proof.
 fn reap(mut child: impl Reap, grace: Duration) -> Reaped {
     let _ = child.kill();
     let deadline = Instant::now() + grace;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Reaped::Exited,
-            Err(error) => {
-                // An error is not proof of reaping (only ECHILD is): hand the wait to
-                // the detached thread, which reaps a still-live child and resolves an
-                // already-reaped one immediately.
-                tracing::warn!(%error, "provider try_wait failed; reaping on a detached thread");
-                break;
-            }
-            Ok(None) if Instant::now() >= deadline => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+    let await_result = match child.try_wait() {
+        Ok(Some(_)) => return Reaped::Exited,
+        Ok(None) => true,
+        Err(error) => {
+            tracing::warn!(%error, "provider inspection failed; retaining detached wait");
+            false
         }
-    }
-    tracing::warn!("provider did not exit after SIGKILL; reaping on a detached thread");
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     match std::thread::Builder::new()
         .name("umbra-provider-reap".into())
         .spawn(move || {
-            let _ = child.wait();
+            let result = child.wait();
+            let _ = sender.send(result);
         }) {
-        // Dropping the `JoinHandle` detaches the thread; std's `Child::drop` never
-        // waits, so the `Abandoned` path leaves only a zombie until process exit.
-        Ok(_) => Reaped::Detached,
+        Ok(_handle) => {
+            if !await_result {
+                return Reaped::Detached;
+            }
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                // Receipt proves the owned wait completed. Dropping the handle
+                // avoids an unbounded wait for the thread's final return.
+                Ok(Ok(_)) => Reaped::Exited,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "provider wait failed; collection unconfirmed");
+                    Reaped::WaitFailed
+                }
+                Err(_) => Reaped::Detached,
+            }
+        }
         Err(_) => Reaped::Abandoned,
     }
 }
@@ -1182,6 +1185,7 @@ mod tests {
         killed: Arc<AtomicBool>,
         exits: bool,
         errs: bool,
+        wait_error: bool,
         wait_calls: Arc<AtomicUsize>,
         entered_wait: mpsc::Sender<std::thread::ThreadId>,
         release: mpsc::Receiver<()>,
@@ -1204,7 +1208,11 @@ mod tests {
             let _ = self.entered_wait.send(std::thread::current().id());
             let _ = self.release.recv();
             let _ = self.finished.send(());
-            Ok(exit_status())
+            if self.wait_error {
+                Err(std::io::Error::other("wait failed"))
+            } else {
+                Ok(exit_status())
+            }
         }
     }
     struct FakeControl {
@@ -1225,6 +1233,7 @@ mod tests {
                 killed: killed.clone(),
                 exits,
                 errs,
+                wait_error: false,
                 wait_calls: wait_calls.clone(),
                 entered_wait: entered_tx,
                 release: release_rx,
@@ -1247,7 +1256,19 @@ mod tests {
         control.release.send(()).unwrap();
         assert_eq!(reap(child, Duration::from_millis(50)), Reaped::Exited);
         assert_eq!(control.wait_calls.load(Ordering::SeqCst), 1);
-        control.finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        control
+            .finished
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn reap_does_not_confirm_a_failed_wait() {
+        let (mut child, control) = fake_child(false, false);
+        child.wait_error = true;
+        control.release.send(()).unwrap();
+        assert_eq!(reap(child, Duration::from_millis(50)), Reaped::WaitFailed);
+        assert_eq!(control.wait_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
