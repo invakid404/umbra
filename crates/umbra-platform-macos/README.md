@@ -777,6 +777,14 @@ With `shutdown-witness`, `UMBRA_FIX_271_EVIDENCE_FILE` selects an append-only
 JSONL file for acquisition, thread-order and closure timing observations. Unset
 means no witness output; builds without the feature do not read the variable.
 
+The `test-native-cleanup-order` feature also enables `shutdown-witness`.
+`UMBRA_NATIVE_CLEANUP_ORDER` selects a fresh directory containing the controller's
+run identity and release files. The provider records sequential barrier,
+debugger-collection and task-right receipts, holding selected boundaries for
+the controller. A hold exceeding two seconds invalidates the observation and
+releases cleanup. Unset means no ordering records or holds; normal builds
+contain none of these controls.
+
 The same feature includes startup and cleanup timing observations.
 `UMBRA_F299_PERF_EVENTS` selects their output directory; unset produces no
 records. When selected, the harness must also supply
@@ -1141,6 +1149,15 @@ owned-child wait control precedes the sandboxed provider run. Independent
 acquisition records must match the complete ledger, retain birth/replacement
 identities, and show same-owner destruction before transport Final.
 Final-to-owned-exit must be at most 50 ms.
+
+The `r2_native_da_order_across_roles` selector adds held barriers with
+`--features test-native-cleanup-order`. Supply a fresh
+`UMBRA_NATIVE_CLEANUP_ORDER` directory path and the witness file above, then select
+that test with `--exact --nocapture --test-threads=1`. Its controller checks a
+confirmed terminal barrier before debugger cleanup, successful debugger
+collection, and task-right deallocation before each matching final slot confirms.
+The ordinary-child causal-order and emergency controls are in `umbra-isolation`.
+Neither fixture qualifies the unresolved provider-loss or SID-1 cases.
 
 Deterministic unit tests cover shared terminal-cause attribution, late reserved
 results, old tracer collection and Drop during a channel-held latch. Platform
