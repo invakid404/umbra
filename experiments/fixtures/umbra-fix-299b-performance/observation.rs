@@ -63,6 +63,7 @@ pub fn record_details(role: &str, event: &str, resource: Option<u64>, details: s
         let descriptors = own_descriptors().expect("startup descriptor inventory");
         Some(serde_json::json!({
             "begin": begin, "end": boot_nanos(), "descriptors": descriptors,
+            "run_inventory": run_inventory(std::path::Path::new(&directory)),
         }))
     } else {
         None
@@ -95,7 +96,10 @@ pub fn record_details(role: &str, event: &str, resource: Option<u64>, details: s
 /// Inspect this process before opening the observation file. No helper or wait.
 /// Return descriptor identities as well as counts so stdio is classified exactly.
 pub fn own_descriptors() -> std::io::Result<Vec<(i32, u32)>> {
-    let pid = std::process::id() as i32;
+    descriptors_for(std::process::id() as i32)
+}
+
+fn descriptors_for(pid: i32) -> std::io::Result<Vec<(i32, u32)>> {
     // SAFETY: a null buffer requests the required byte count.
     let bytes =
         unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
@@ -132,4 +136,58 @@ pub fn own_descriptors() -> std::io::Result<Vec<(i32, u32)>> {
         .collect::<Vec<_>>();
     result.sort_unstable();
     Ok(result)
+}
+
+// Sequential kernel census, not a sum of historical per-process maxima. Keep
+// each query interval and any error: an incomplete census cannot prove a peak.
+pub fn run_inventory(directory: &std::path::Path) -> serde_json::Value {
+    let mut participants = std::collections::BTreeMap::new();
+    participants.insert(std::process::id(), birth(std::process::id()));
+    // Read and close discovery files before counting descriptors.
+    for entry in std::fs::read_dir(directory).expect("inventory directory") {
+        let path = entry.expect("inventory entry").path();
+        if path.extension().is_none_or(|ext| ext != "jsonl") {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("inventory discovery");
+        if let Some(first) = text.lines().next() {
+            if let Ok(row) = serde_json::from_str::<serde_json::Value>(first) {
+                if let (Some(pid), Some(sec), Some(usec)) = (
+                    row["pid"].as_u64(),
+                    row["birth"][0].as_u64(),
+                    row["birth"][1].as_u64(),
+                ) {
+                    participants.insert(pid as u32, (sec, usec));
+                }
+            }
+        }
+    }
+    let begin = boot_nanos();
+    let mut rows = Vec::new();
+    for (pid, expected_birth) in participants {
+        let start = boot_nanos();
+        let descriptors = descriptors_for(pid as i32);
+        // Do not call the asserting birth helper for a process which exited.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as i32;
+        // SAFETY: info is valid aligned output storage of size bytes.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid as i32,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        let identity_matches =
+            read == size && (info.pbi_start_tvsec, info.pbi_start_tvusec) == expected_birth;
+        rows.push(serde_json::json!({
+            "pid": pid, "birth": expected_birth, "begin": start, "end": boot_nanos(),
+            "identity_matches": identity_matches,
+            "descriptors": descriptors.as_ref().ok(),
+            "error": descriptors.err().map(|error| error.to_string()),
+        }));
+    }
+    serde_json::json!({"begin": begin, "end": boot_nanos(), "participants": rows})
 }

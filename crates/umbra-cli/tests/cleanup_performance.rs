@@ -515,6 +515,42 @@ fn r11_startup_descriptor_inventory() {
     assert_eq!(observation::own_descriptors().unwrap(), before);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn r11_run_inventory_identity_and_counts() {
+    let directory = tempfile::tempdir().unwrap();
+    let before = observation::own_descriptors().unwrap();
+    let census = observation::run_inventory(directory.path());
+    let rows = census["participants"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["pid"], std::process::id());
+    assert_eq!(rows[0]["identity_matches"], true);
+    assert!(rows[0]["error"].is_null());
+    assert_eq!(
+        rows[0]["descriptors"],
+        serde_json::to_value(&before).unwrap()
+    );
+    assert!(census["begin"].as_u64().unwrap() <= census["end"].as_u64().unwrap());
+    let pair = std::os::unix::net::UnixStream::pair().unwrap();
+    let census = observation::run_inventory(directory.path());
+    assert_eq!(
+        census["participants"][0]["descriptors"]
+            .as_array()
+            .unwrap()
+            .len(),
+        before.len() + 2
+    );
+    drop(pair);
+    assert_eq!(observation::own_descriptors().unwrap(), before);
+    std::fs::write(
+        directory.path().join("stale.jsonl"),
+        format!("{{\"pid\":{},\"birth\":[0,0]}}\n", std::process::id()),
+    )
+    .unwrap();
+    let stale = observation::run_inventory(directory.path());
+    assert_eq!(stale["participants"][0]["identity_matches"], false);
+}
+
 /// One diagnostic invocation, not a D6 series or a successful-product assertion.
 #[cfg(target_os = "macos")]
 #[test]
