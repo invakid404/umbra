@@ -1,6 +1,6 @@
 # umbra-journal
 
-Pure synchronous journal contract, depending only on `umbra-core`. Shared request,
+Synchronous journal contract with `umbra-core` and `serde` dependencies. Shared request,
 record, recovery and checkpoint types are owned by core. This crate contains no
 journal-file I/O, CRC implementation, storage backend or lease service.
 Its `provider` module implements the journal server harness and IPC proxy.
@@ -41,8 +41,9 @@ length framing and CRC32 checksums. `flush(through)` returns a durability receip
 only after that sequence reaches the backing store's promised persistence boundary.
 It does not flush tracee-owned files. `close` surfaces pending flush failures.
 
-Managed custody is dormant: no production caller writes it in this foundation
-slice. Implementations validate Armed, FinishPrepared, Complete and Failed under
+Managed runs persist custody through the namespace owner before launch and at
+completion. Journal durability alone does not prove process cleanup.
+Implementations validate Armed, FinishPrepared, Complete and Failed under
 the run, writer epoch, generation and custody sequence. Armed and FinishPrepared
 retain authority; only a durable Complete receipt permits normal final release.
 Failed and nonterminal custody reopen for inspection only. Acquiring a candidate
