@@ -114,11 +114,19 @@ Only the root may match that baseline; child roles still require assigned
 endpoints. Unexpected sockets report domain, type and the queried process.
 The managed endpoint, close-on-exec and nonce checks remain in place.
 
-The managed SID-1 case with an abruptly ended worker and a paused journal is
-unresolved. The journal is an ordinary worker-owned provider child; it can remain
-paused after re-parenting, and the caller reports a generic missing-result error.
-The legacy session sweep below does not establish managed parent collection for
-that child. This case requires an ownership repair and fresh CI qualification.
+After collecting its managed children, a guardian that leads the run's session
+uses the existing `sweep::end_run` drain and sweep for ordinary journal and storage
+clients. This preserves their legacy contract without moving them into managed
+custody. Terminal guardians that share the caller's session never sweep it.
+The sweep retains its existing bounds and reports incomplete or unverifiable
+cleanup loudly; it does not establish a parent wait for re-parented clients.
+Only after a complete sweep may the guardian report its actual failed-worker wait
+status over the existing observer channel. That report retains the committed
+cleanup cutoff and cannot replace an interrupted observer exchange.
+The CLI mirrors the status after collecting its guardian; external library
+callers receive a failure. An own-session test covers the paused-journal case
+through the `test-managed-session` test hook. The unchanged SID-1 case still
+requires fresh CI qualification.
 
 ## Legacy launchd isolation
 

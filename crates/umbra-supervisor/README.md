@@ -154,6 +154,16 @@ The staged order is fixed, and each stage's failure decides what may be released
    Complete before releasing writer authority. The unarmed path retains
    `finish_run` and its completion record.
 
+When the worker ends abruptly in a dedicated guardian session, the guardian
+first collects its managed children, then applies the existing session drain and
+sweep to ordinary journal and storage clients. Their sweep outcome is separate
+from managed parent collection. After a complete sweep, the guardian can report
+the actual worker wait status on the existing ordered observer channel within
+the committed cleanup cutoff. Interrupted exchanges or incomplete cleanup stay
+failures. The CLI mirrors that status after collecting the guardian; a library
+caller receives an error and remains alive. A guardian sharing a terminal
+session has no authority to sweep it.
+
 A qualified signal event is resumed with the exact backend-issued token. The
 supervisor does not infer a disposition or retry a failed delivery. Handlers use
 the ordinary event/namespace path. Signal stops themselves are not journaled;
