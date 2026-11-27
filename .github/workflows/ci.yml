@@ -971,6 +971,7 @@ jobs:
           import json, os
           from pathlib import Path
           descriptor = json.loads(Path("crates/umbra-storage-nfs-userspace/provider.json").read_text())
+          descriptor["capabilities"] = ["userspace-nfsv4-v1", "experimental-userspace-routing-v1"]
           descriptor["executable"] = list(os.fsencode(Path("target/debug/umbra-storage-nfs-userspace").resolve()))
           host, port = os.environ["UMBRA_NFS_RAW_FIXTURE"].rsplit(":", 1)
           options = {"host": list(host.encode()), "port": int(port),
