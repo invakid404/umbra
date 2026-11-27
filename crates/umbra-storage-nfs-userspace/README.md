@@ -62,14 +62,19 @@ uses the same selection and the routed 12-second provider timeout. These checks
 cover persisted custody and refusal of competing writers; they do not convert
 unconfirmed process cleanup into a released obligation.
 
-Managed cleanup activation is implemented, but qualification remains incomplete.
-The measured helper descriptor costs and cleanup/admission latency exceed their
-accepted bounds, the routed tree performance run failed terminally, and the
-region-cap writer-reopen and exact shutdown checks retain failures. C15 also
-retains an exact diagnostic mismatch: managed failure aggregation changes the
-last stderr line expected by the alias-exec case. That oracle has not been
-weakened or re-pinned. Passing filesystem cases and historical qualification
-counts below do not resolve these gates.
+Managed cleanup activation is implemented. The final local performance series
+passed the owner's whole-invocation and admission criteria with zero guard,
+protocol and deadline failures; original stage misses remain follow-up costs.
+See the [performance report](../../experiments/fixtures/umbra-fix-299b-performance/checkpoint12-acceptance.md)
+for retained distributions and the accepted descriptor census limitations.
+The region-cap writer-reopen and exact shutdown cases subsequently passed.
+C15's original diagnostic assertion also passed after typed errors were
+preserved; its oracle was not weakened or re-pinned. Earlier failed readings
+remain historical evidence. The historical after-root-exit tree failure is
+tracked separately in #314; the pre-GO preparation failure was repaired.
+Hosted endpoint socket provenance and self-hosted SID-1 checkpoint failures
+remain CI qualification obligations. Local filesystem success does not settle
+those findings or qualify the known provider-loss residuals.
 
 ## Packed-spawn qualification
 

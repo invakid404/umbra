@@ -11,12 +11,15 @@ module remains available on those hosts.
 This document covers the crate's ABI decoder, native tracer, spawn protocol,
 interposer, provider executable and integration tests.
 
-The managed provider path is active, but its qualification is incomplete.
-Earlier descriptor and latency readings missed the accepted budgets. The
-readiness descriptor inventory now meets its revised ceilings; performance
-qualification still misses bounds and unresolved provider-loss cases remain
-separate. Passing
-ordinary tests does not certify them.
+The managed provider path is active. The final local performance series passed
+owner option A: whole-invocation and admission criteria, with zero guard,
+protocol and deadline failures. Earlier stage-budget misses remain recorded as
+follow-up costs in the [performance report](../../experiments/fixtures/umbra-fix-299b-performance/checkpoint12-acceptance.md).
+Readiness and startup descriptor counts meet their revised accepted ceilings,
+subject to the census limitations documented there. This does not qualify the
+unresolved provider-loss cases, hosted endpoint socket provenance, or the
+self-hosted SID-1 checkpoint failures. Those CI findings require verification
+on the corrected head; passing local tests does not settle them.
 
 The crate implements the v2 experimental tracer described in
 `experiments/tracer/umbra_tracer.py` and `experiments/tracer/REPORT-v2.md`
