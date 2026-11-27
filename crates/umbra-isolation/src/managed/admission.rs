@@ -266,6 +266,20 @@ impl AdmissionService {
         self.channel.wait_interest()
     }
 
+    /// Wait for the next service step using the same readiness wait as the
+    /// production owner. Expiry returns to `poll`; the cutoff cannot renew.
+    pub fn wait_for_activity(&mut self, deadline: u64) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        self.cutoff = self.cutoff.min(deadline);
+        let (descriptor, writing) = self.wait_interest();
+        let mut descriptors = [libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: if writing { libc::POLLOUT } else { libc::POLLIN },
+            revents: 0,
+        }];
+        super::readiness::wait_descriptors(&mut descriptors, self.cutoff)
+    }
+
     /// Stop new grants and entries before any cancellation or census operation.
     pub fn freeze(&mut self) -> u64 {
         self.ledger.freeze()
@@ -335,6 +349,19 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(client.begin(AdmissionOperation::Freeze).is_err());
         assert_eq!(owner.outstanding(), 0);
+    }
+
+    #[test]
+    fn service_activity_wait_retains_original_cutoff() {
+        let (_client, mut owner) = endpoints();
+        let deadline = super::super::boot_nanos().unwrap();
+        owner.wait_for_activity(deadline).unwrap();
+        owner.wait_for_activity(deadline + 5_000_000_000).unwrap();
+        assert_eq!(owner.cutoff, deadline);
+        assert_eq!(
+            owner.poll(deadline + 5_000_000_000).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 
     #[test]

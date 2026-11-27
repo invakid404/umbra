@@ -75,6 +75,6 @@ pub fn serve() {
         if entered && owner.outstanding() == 0 {
             break;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        owner.wait_for_activity(cutoff).unwrap();
     }
 }
