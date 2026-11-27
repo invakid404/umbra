@@ -30,4 +30,4 @@ The new tree failure is a startup failure before helpers_ready_go or a root-exit
 
 D6 remains BLOCKED pending the anchor's decision. No further startup/teardown redesign or bound change is taken. The stage and distribution records support a remaining miss, not a proven architectural lower bound. Other qualification and documentation work continues independently.
 
-The historical tree issue note is checkpoint10-tree5-note.md. It preserves the earlier exit1/owner-progress failure and successful subsequent evidence without claiming a cause. Current owner failure controls pass. No external issue or PR was posted.
+The historical tree issue note is [historical-tree-failure.md](historical-tree-failure.md). It preserves the earlier exit1/owner-progress failure and successful subsequent evidence without claiming a cause. Current owner failure controls pass. No external issue or PR was posted.

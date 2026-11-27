@@ -11,12 +11,15 @@ module remains available on those hosts.
 This document covers the crate's ABI decoder, native tracer, spawn protocol,
 interposer, provider executable and integration tests.
 
-The managed provider path is active. The final local performance series passed
-owner option A: whole-invocation and admission criteria, with zero guard,
+The managed provider path is active. The local performance series at `80e8b9c9`
+passed owner option A: whole-invocation and admission criteria, with zero guard,
 protocol and deadline failures. Earlier stage-budget misses remain recorded as
 follow-up costs in the [performance report](../../experiments/fixtures/umbra-fix-299b-performance/checkpoint12-acceptance.md).
 Readiness and startup descriptor counts meet their revised accepted ceilings,
-subject to the census limitations documented there. This does not qualify the
+at that measured revision, subject to the census limitations documented there.
+The series was not retaken after `ca11b82a`, which adds untimed `getpid`/`getsid`
+calls before provider spawn; it is not a performance claim for the current head.
+This does not qualify the
 unresolved provider-loss cases, hosted endpoint socket provenance, or the
 self-hosted SID-1 checkpoint failures. Those CI findings require verification
 on the corrected head; passing local tests does not settle them.

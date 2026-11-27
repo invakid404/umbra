@@ -105,8 +105,9 @@ limit includes JSON's byte-array expansion and transport envelope overhead. Only
 ordinary request is outstanding per connection, providing backpressure. Configured I/O
 deadlines are bounded to 1–60000 ms; malformed, disconnected or timed-out connections
 are invalidated. This per-request deadline is authoritative: storage backends size
-their own probe and layout bounds to fit inside it. Ordinary provider ownership
-kills and collects a provider after a failed call. Managed platform ownership
+their own probe and layout bounds to fit inside it. Transport or protocol failure
+invalidates the connection; a well-formed operation error leaves it open. Dropping
+an ordinary owning client kills and collects its provider. Managed platform ownership
 instead notifies the separate cleanup owner, which retains the provider process
 through bounded cleanup and actual parent collection. No failed ordinary call is
 retried automatically or redirected to host writes.

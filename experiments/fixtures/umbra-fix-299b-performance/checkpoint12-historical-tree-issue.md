@@ -2,7 +2,7 @@
 
 PR #313 retains a historical after-root-exit failure at head 7441501a: measured registry_tree5 pair 15 (zero-based index 14, head order 1) exited with status 1, cancelled=false and forced=false. The diagnostic reported shutdown owner-progress failure and failed managed provider collection. No sample was discarded.
 
-A diagnostic using the same frozen binaries succeeded, as did the subsequent thirty-pair series at 648dbda2. The historical failure also did not recur in 100 later head-only runs. These successes neither establish its cause nor invalidate the original failed reading. The retained analysis is summarized in checkpoint11-retained-analysis.md beside this file.
+A diagnostic using the same frozen binaries succeeded, as did the subsequent thirty-pair series at 648dbda2. The historical failure also did not recur in 100 later head-only runs. These successes neither establish its cause nor invalidate the original failed reading. The retained analysis is summarized in [checkpoint11-tree-analysis.md](checkpoint11-tree-analysis.md) beside this file.
 
 The newer pre-GO preparation deadline failure has a different timeline and was repaired separately. It does not establish the historical cause. Issue #314 tracks the historical failure; further broad reproduction is outside this change.
 
