@@ -66,6 +66,13 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// Borrow readiness interest without transferring or duplicating ownership.
+    /// Pending output must drain before the next input frame is read.
+    pub fn wait_interest(&self) -> (std::os::fd::BorrowedFd<'_>, bool) {
+        use std::os::fd::AsFd;
+        (self.stream.as_fd(), self.written != self.output.len())
+    }
+
     /// No incomplete incoming frame or pending outgoing bytes remain.
     pub fn at_frame_boundary(&self) -> bool {
         self.input.is_empty() && self.written == self.output.len()

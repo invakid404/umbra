@@ -138,6 +138,21 @@ impl Forwarder {
         }
     }
 
+    /// Borrow the active phase's socket and retained cutoff for the parent wait.
+    pub fn wait_interest(&self) -> Option<(std::os::fd::BorrowedFd<'_>, bool, u64)> {
+        if self.failed {
+            return None;
+        }
+        let channel = match self.phase {
+            0 | 3 => &self.child,
+            1 | 2 => &self.parent,
+            4 => return None,
+            _ => unreachable!(),
+        };
+        let (fd, writing) = channel.wait_interest();
+        Some((fd, writing, self.deadline))
+    }
+
     /// Advance at most one request/response phase under the original cutoff.
     pub fn poll(&mut self, cutoff: Option<u64>) -> Result<()> {
         if self.failed {
@@ -227,6 +242,15 @@ impl CallerTransport {
             deadline: u64::MAX,
             complete: false,
         }
+    }
+
+    /// A completed response needs no further readiness after its bytes drain.
+    pub fn wait_interest(&self) -> Option<(std::os::fd::BorrowedFd<'_>, bool, u64)> {
+        if self.failed || (self.complete && !self.pending) {
+            return None;
+        }
+        let (fd, writing) = self.channel.wait_interest();
+        Some((fd, writing, self.deadline))
     }
 
     /// One nonblocking step, sharing the caller runtime's original cutoff.
@@ -506,6 +530,34 @@ impl<F: FnMut(Request) -> Result<Response>> RunObserver for WorkerObserver<F> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn observer_wait_interest_follows_pending_response() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use umbra_isolation::managed::Channel;
+        let (child, _child_peer) = UnixStream::pair().unwrap();
+        let (parent, _parent_peer) = UnixStream::pair().unwrap();
+        let child_fd = child.as_raw_fd();
+        let parent_fd = parent.as_raw_fd();
+        let mut forward = super::Forwarder::new(
+            umbra_core::RunId(uuid::Uuid::new_v4()),
+            Channel::new(child).unwrap(),
+            Channel::new(parent).unwrap(),
+        );
+        assert_eq!(forward.wait_interest().unwrap().0.as_raw_fd(), child_fd);
+        forward.parent.queue(&42u64).unwrap();
+        forward.phase = 1;
+        let (fd, writing, cutoff) = forward.wait_interest().unwrap();
+        assert_eq!(fd.as_raw_fd(), parent_fd);
+        assert!(writing);
+        assert_eq!(cutoff, u64::MAX);
+        forward.deadline = 123;
+        assert_eq!(forward.wait_interest().unwrap().2, 123);
+        forward.phase = 4;
+        assert!(forward.wait_interest().is_none());
+    }
+
     use super::*;
 
     #[cfg(target_os = "macos")]
