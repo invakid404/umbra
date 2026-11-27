@@ -42,10 +42,12 @@ Cleanup completion and the command's outcome remain separate: collecting every
 resource does not turn a failed command into success. The
 [isolation crate](crates/umbra-isolation/README.md) documents the per-run bounds
 and the residual cases where notification or actual parent collection is lost.
-Managed cleanup qualification is incomplete. Admission and native teardown
-improved after replacing timer polling, but helper startup and routed teardown
-still miss performance bounds. Readiness snapshots measured the
-managed descriptor costs within their ceilings; they do not measure startup peaks.
+Local managed qualification retains explicit limits: SID-1, mounted NFS and
+known provider-loss residuals are not qualified here. All four paired workloads
+passed the owner's whole-invocation and admission criteria. Helper startup,
+the routed-tree teardown tail and fixed costs on short commands remain known
+performance costs. The [CLI report](crates/umbra-cli/README.md) distinguishes
+these costs from acceptance and documents the startup resource census limits.
 
 ```sh
 umbra run --registry providers.json --workspace . --experimental   -- /absolute/path/to/program args...

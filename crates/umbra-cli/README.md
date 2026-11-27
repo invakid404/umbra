@@ -218,23 +218,34 @@ cargo check -p umbra-cli
 cargo test -p umbra-cli
 ```
 
-Managed activation remains incompletely qualified. `tests/startup_cost.rs`
-measures process and descriptor ownership after readiness, without pausing
-startup. The nine-invocation reading passed with managed descriptor counts
-within the revised ceilings and no retained caller descriptors or observed
-owned processes. It does not measure startup peaks; the earlier observer-induced
-startup timeout remains failed evidence. `tests/cleanup_performance.rs` requires explicit
-immutable baseline/head manifests and retains every attempted sample. The final
-native-true, registry-true and admission-only series completed three warmup pairs
-and thirty measured pairs each. Admission passed in all three. Native teardown
-and admission-only helper startup passed; native and routed helper startup,
-routed teardown p95, and admission-only teardown still missed the original
-limits. The admission-only owner uses the production readiness wait.
-The registry-tree5 series stopped at pair 26 on a startup failure before GO,
-so it has no complete distribution. That failure is recorded separately from
-the earlier registry-tree5 disconnection, whose cause remains unproven. Ordinary
-workspace tests do not replace these opt-in readings. SID-1 readings remain
-CI-only.
+Managed resource readings separate readiness from startup. Readiness inventories
+measured 21 CLI / 32 library managed descriptors within the 22/33 ceilings,
+with no retained caller descriptors or observed owned survivors. A separate
+startup census observed conservative managed counts of 24/35; the owner accepts
+those startup-only counts under the documented sequential census method.
+[Isolation's resource report](../umbra-isolation/README.md) states the discovery
+limits and keeps helper standard I/O separate. These are not absolute maxima.
+
+`tests/cleanup_performance.rs` requires immutable baseline/head manifests and
+retains every attempted sample. All four final workloads completed three warmup
+pairs and thirty measured pairs, including registry_tree5. The owner accepts D6
+on whole-invocation median, with a margin of max(5 ms, 10% of base median) for the
+three command workloads, zero guard/protocol failures, and the unchanged
+admission limits of 1 ms median / 5 ms p95. All four passed. The whole medians
+base/head were 2064.537/2013.619 ms native, 1984.507/1946.255 ms routed-true,
+3948.046/4263.257 ms routed-tree5, and 15.087/24.348 ms admission-only.
+
+Known costs remain: command helper startup misses the original 25/50 ms
+median/p95 limits (native 52.520/67.723 ms, routed-true 162.330/179.389 ms,
+routed-tree5 147.948/171.091 ms). Tree5 teardown p95 is 217.193 ms versus
+135.431 ms base. Admission-only adds 9.261 ms to whole-invocation median.
+These are PR3 follow-ups, not further performance changes in PR2. The
+[final report](../../experiments/fixtures/umbra-fix-299b-performance/checkpoint12-acceptance.md)
+retains the distributions, outliers and two pre-launch registry configuration
+failures. The historical after-root-exit tree failure remains a separate issue;
+the new pre-GO preparation deadline failure has a failing-first regression and
+phase correction. Ordinary workspace tests do not replace opt-in qualification.
+SID-1 readings remain CI-only.
 
 The committed `tests/run_fixtures.rs` runs seven cases each against local storage
 and an existing NFSv4 mount. Build providers with `cargo build --workspace --bins`

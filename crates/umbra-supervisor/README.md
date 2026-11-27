@@ -33,6 +33,13 @@ provider collection before preparing durable completion. See
 [managed isolation](../umbra-isolation/README.md) for registration, bounds and
 failure guarantees.
 
+Helper readiness is validated before namespace preparation under the shared
+two-second cutoff. Preparation runs outside that allocation, as it did in the
+original supervisor. The existing five-second Armed persistence allocation starts
+once afterward; authorization carries that cutoff through forwarding. A delayed
+preparation test covers success past two seconds and a separate late failure
+checks callback refusal and actual helper collection.
+
 Managed startup, observer forwarding and parent collection wait on descriptor
 readiness or process-exit events under their original cutoffs. A silent observer
 does not prevent independent cleanup notification. Managed errors retain their

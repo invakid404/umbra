@@ -70,14 +70,27 @@ ends are:
 | Guardian-to-relay result forwarding | guardian and relay | 2, CLI and library |
 | Relay-to-caller result forwarding | relay and external caller | 2, library only |
 
-Readiness snapshots measured these 21/32 counts within the revised ceilings of
-22/33. The observer runs after worker GO, leaving startup allocation and
-executable entry uninterrupted. An earlier reading that paused startup exceeded
-the unchanged deadline and remains failed evidence. The new method measures
-readiness inventories, not startup peaks. `startup_cost` retains process
-identities, parent edges, descriptor inventories and actual collection records.
-The library caller returned to its original descriptor inventory, including
-pre-GO rollback. Launchd-session costs require CI qualification.
+Readiness snapshots measured 21/32 managed descriptors within the 22/33 ceilings.
+Startup observations after releasing child-only parent copies measured a
+conservative managed count of 24 CLI / 35 library. The owner accepts these
+startup-only counts under the visit-11 measurement method; readiness ceilings
+remain unchanged. Helper standard I/O is separately nine/twelve descriptors.
+Sequential startup censuses observed 52/67 total descriptors across five/six
+managed participants. These totals include legacy resources, and per-role maxima
+occur at different stages. Discovery can miss a child before its first record;
+the census is neither atomic nor proof of an absolute maximum. The
+[resource report](../../experiments/fixtures/umbra-fix-299b-performance/checkpoint12-startup-resources.md)
+retains the inventories and limits. The library caller returned to its original
+descriptor inventory, including pre-GO rollback. Launchd-session costs require
+CI qualification.
+
+Complete helper readiness must arrive within the original two seconds, before
+namespace preparation. Preparation has the original supervisor's lifetime;
+waiting helpers observe parent closure, notifications and installed process
+watches. The worker starts the single five-second durable-persistence allocation
+after preparation and sends its exact cutoff on the existing route. GO forwarding
+never renews it. Preparation failure starts the existing nine-second pre-GO
+provider-collection budget once. This is separate from the D4 cleanup tickets.
 
 Two limits remain explicit. Total loss of caller notification before any Start
 has no proven finite caller-return bound (D1); custody stays unresolved without
