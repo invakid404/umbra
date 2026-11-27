@@ -63,6 +63,7 @@ impl ProviderStartup {
             return Ok(None);
         };
         announcement.validate(self.run, self.provider, self.owner)?;
+        super::executable::startup_observation("announcement-received", Some(self.provider.role));
         self.member = announcement.members.into_iter().next();
         Ok(self.member.clone())
     }
@@ -84,6 +85,7 @@ impl ProviderStartup {
         }
         if self.inventory.is_none() {
             self.channel.queue(inventory)?;
+            super::executable::startup_observation("inventory-queued", Some(self.provider.role));
             self.inventory = Some(inventory.clone());
         }
         self.channel.flush(self.deadline)
@@ -101,6 +103,7 @@ impl ProviderStartup {
             return Ok(None);
         };
         inventory.validate_readiness(self.provider, &receipts)?;
+        super::executable::startup_observation("readiness-received", Some(self.provider.role));
         self.ready = receipts.into_iter().next();
         Ok(self.ready.clone())
     }
@@ -112,6 +115,7 @@ impl ProviderStartup {
         go.validate(self.run, self.provider, self.capacity)?;
         if self.go.is_none() {
             self.channel.queue(go)?;
+            super::executable::startup_observation("go-queued", Some(self.provider.role));
             self.go = Some(go.clone());
         }
         self.channel.flush(self.deadline.min(go.deadline))

@@ -16,6 +16,10 @@ fn run() -> umbra_core::Result<()> {
     // #205: end with the owner, not with the terminal's signals.
     umbra_platform_macos::keep_lifetime_with_owner()?;
     let owner = umbra_platform_macos::OwnerIdentity::parent()?;
+    umbra_isolation::managed::executable::startup_observation(
+        "provider-accept-begin",
+        Some(umbra_core::managed::Role::Provider),
+    );
     let (connection, mut backend) = umbra_core::provider::accept("macos", "platform", |options| {
         let options = if options.is_empty() {
             umbra_platform_macos::Options::default()
@@ -27,6 +31,10 @@ fn run() -> umbra_core::Result<()> {
         let caps = backend.capabilities().capabilities;
         Ok((backend, caps))
     })?;
+    umbra_isolation::managed::executable::startup_observation(
+        "provider-accept-end",
+        Some(umbra_core::managed::Role::Provider),
+    );
     backend.observe_owner(owner, connection.observation_stream()?)?;
     if let Some(entry) = managed.as_mut() {
         entry

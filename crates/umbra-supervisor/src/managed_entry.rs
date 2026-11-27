@@ -36,8 +36,11 @@ impl RegisteredRole {
             REGISTERED.store(true, Ordering::Relaxed);
             return Ok(None);
         };
+        let role = entry.role;
+        executable::startup_observation("entry-adopted", Some(role));
         let (external, input) =
             ManagedRunInput::from_registered(&entry.launch).map_err(io::Error::other)?;
+        executable::startup_observation("configuration-decoded", Some(role));
         let state = match entry.role {
             Role::Relay => State::Relay(Box::new(RelayStartup::new(entry)?)),
             Role::Guardian => State::Guardian(Box::new(GuardianStartup::new(entry)?)),
@@ -46,6 +49,7 @@ impl RegisteredRole {
             _ => return Err(io::Error::other("unsupported registered run role")),
         };
         REGISTERED.store(true, Ordering::Relaxed);
+        executable::startup_observation("dispatch-registered", Some(role));
         Ok(Some(Self {
             state,
             input: Some(input),
@@ -76,9 +80,12 @@ impl RegisteredRole {
                 "executable has not registered managed role dispatch".into(),
             ));
         }
+        executable::startup_observation("caller-validation-begin", Some(Role::Caller));
         crate::run::validate(&spec)?;
+        executable::startup_observation("caller-validation-end", Some(Role::Caller));
         let (input, observer) = ManagedRunInput::split(spec);
         let launch = input.registered_launch(external, capacity)?;
+        executable::startup_observation("launch-configuration-ready", Some(Role::Caller));
         let deadline = umbra_isolation::managed::startup::Startup::new(launch.run, external)
             .map_err(|e| failure(e.to_string()))?
             .readiness_deadline();

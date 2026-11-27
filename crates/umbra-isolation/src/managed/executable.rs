@@ -76,6 +76,7 @@ impl Entry {
 
     /// Create the CLI relay before any descendants or run resources exist.
     pub fn root_relay(launch: LaunchConfiguration, readiness_deadline: u64) -> io::Result<Self> {
+        startup_observation("root-relay-entry", Some(Role::Relay));
         launch.validate().map_err(invalid)?;
         if super::boot_nanos()? >= readiness_deadline {
             return Err(io::ErrorKind::TimedOut.into());
@@ -184,7 +185,9 @@ pub fn spawn_tree(
         crate::spawn::environment(&[ENV_ROLE, crate::ENV_GUARDIAN], &[(ENV_ROLE, encoded)]);
     let mut fds: Vec<_> = spec.endpoints.iter().map(|endpoint| endpoint.fd).collect();
     fds.push(spec.bootstrap);
+    startup_observation("spawn-begin", Some(role));
     let child = SpawnedChild::spawn(&executable, &args, &environment, new_session, &fds)?;
+    startup_observation("spawn-return", Some(role));
     drop(assignments);
     drop(child_bootstrap);
     umbra_core::cost_snapshot!("helper-parent-copies-closed", Some(child.pid()), &[]);
@@ -206,6 +209,7 @@ pub fn spawn_tree(
 /// Call before ordinary argument parsing. Validate the inherited configuration
 /// and consume each listed descriptor once, restoring close-on-exec immediately.
 pub fn entry() -> io::Result<Option<Entry>> {
+    startup_observation("executable-entry", None);
     let Some(encoded) = std::env::var_os(ENV_ROLE) else {
         return Ok(None);
     };
@@ -264,6 +268,7 @@ pub fn entry() -> io::Result<Option<Entry>> {
             });
     }
     spec.launch.validate().map_err(invalid)?;
+    startup_observation("configuration-validated", Some(spec.role));
     let (_, parent_pid) = identity_with_parent(std::process::id(), spec.role)?;
     if parent_pid != spec.parent.pid || identity(parent_pid, spec.parent.role)? != spec.parent {
         return Err(invalid("managed re-entry parent identity mismatch"));
@@ -282,6 +287,19 @@ pub fn entry() -> io::Result<Option<Entry>> {
         readiness: None,
         root: false,
     }))
+}
+
+/// Qualification-only startup timestamps; this never waits for an observer.
+pub fn startup_observation(stage: &str, role: Option<Role>) {
+    #[cfg(feature = "shutdown-witness")]
+    crate::performance_observation::record_details(
+        "startup",
+        stage,
+        None,
+        serde_json::json!({ "managed_role": role }),
+    );
+    #[cfg(not(feature = "shutdown-witness"))]
+    let _ = (stage, role);
 }
 
 fn validate_socket(stream: &UnixStream) -> io::Result<()> {
@@ -573,6 +591,7 @@ impl PendingRole {
         };
         let root = identity(self.child.pid(), self.role)?;
         announcement.validate(self.run, root, self.parent)?;
+        startup_observation("announcement-received", Some(self.role));
         self.member = announcement
             .members
             .iter()
@@ -604,6 +623,7 @@ impl PendingRole {
         }
         if self.inventory_sent.is_none() {
             self.bootstrap.queue(inventory)?;
+            startup_observation("inventory-queued", Some(self.role));
             self.inventory_sent = Some(inventory.clone());
         }
         self.bootstrap.flush(self.readiness_deadline)
@@ -645,6 +665,7 @@ impl PendingRole {
             return Err(invalid("child readiness identity mismatch"));
         }
         self.ready = true;
+        startup_observation("readiness-received", Some(self.role));
         Ok(Some(receipts))
     }
     /// Publish GO only after durable Armed.
@@ -680,6 +701,7 @@ impl PendingRole {
         }
         if self.go_queued.is_none() {
             self.bootstrap.queue(authorization)?;
+            startup_observation("go-queued", Some(self.role));
             self.go_queued = Some(authorization.clone());
         }
         self.bootstrap.flush(deadline.min(authorization.deadline))
@@ -742,6 +764,7 @@ impl Entry {
             .ok_or_else(|| invalid("startup already closed"))?;
         if self.announced.is_none() {
             bootstrap.queue(&announcement)?;
+            startup_observation("announcement-queued", Some(self.role));
             self.announced = Some(announcement);
         }
         bootstrap.flush(self.readiness_deadline)
@@ -847,6 +870,7 @@ impl Entry {
             return Err(invalid("received inventory changed announced subtree"));
         }
         self.inventory = Some(inventory);
+        startup_observation("inventory-received", Some(self.role));
         Ok(true)
     }
 
@@ -970,6 +994,7 @@ impl Entry {
                 .queue(&descendants)?;
         }
         self.readiness = Some(descendants);
+        startup_observation("readiness-queued", Some(self.role));
         Ok(())
     }
     /// Adopt the provider's unique admission endpoint after durable GO.
@@ -1055,6 +1080,7 @@ impl Entry {
             self.launch.capacity,
         )?;
         self.authorization = Some(run);
+        startup_observation("go-received", Some(self.role));
         #[cfg(feature = "shutdown-witness")]
         if self.role == Role::Worker {
             crate::performance_observation::record_as(
