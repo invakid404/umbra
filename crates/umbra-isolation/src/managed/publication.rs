@@ -220,7 +220,10 @@ impl Publication {
         self.routes
             .iter()
             .filter_map(|(route, state)| {
-                matches!(state, State::Writing | State::AwaitingAck).then_some(route.peer)
+                (matches!(state, State::Writing | State::AwaitingAck)
+                    || (*state == State::Acknowledged
+                        && route.channel.written != route.channel.output.len()))
+                .then_some(route.peer)
             })
             .collect()
     }
