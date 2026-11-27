@@ -478,6 +478,10 @@ impl Run {
         if case == "P1" {
             command.env("UMBRA_TEARDOWN_LOG", "1");
         }
+        #[cfg(feature = "test-managed-session")]
+        if case == "OWN-P4" {
+            command.env("UMBRA_TEST_MANAGED_SESSION", "1");
+        }
         if observe {
             std::fs::create_dir(dir.join("signals")).unwrap();
             command
@@ -1359,6 +1363,28 @@ fn sid1_p3_platform_killed() {
 /// SIGHUP to the providers and to the caller's group. Now nothing of the run
 /// survives the guardian's sweep, and the relay reports the supervisor's
 /// SIGKILL.
+#[test]
+#[cfg(feature = "test-managed-session")]
+fn own_session_worker_killed_with_a_stopped_provider() {
+    if !qualified() {
+        return;
+    }
+    let mut run = Run::start("OWN-P4", true, false, 20_000, &["sleep"]);
+    std::thread::sleep(Duration::from_millis(500));
+    let tree = run.discover();
+    assert_ne!(tree.sid(tree.supervisor), 1);
+    assert_eq!(tree.sid(tree.supervisor), tree.guardian.unwrap());
+    signal(tree.journal, "STOP");
+    std::thread::sleep(Duration::from_millis(100));
+    signal(tree.supervisor, "KILL");
+    let o = run.finish(Duration::from_secs(30));
+    assert!(
+        o.term_signal() == Some(SIGKILL) && o.survivors.is_empty(),
+        "worker status must be mirrored and no provider left running: {o:?}"
+    );
+    assert_nothing_survives(o);
+}
+
 #[test]
 fn sid1_p4_supervisor_killed_with_a_stopped_provider() {
     if !qualified() || !in_launchd_session() {

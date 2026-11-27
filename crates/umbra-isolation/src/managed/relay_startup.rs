@@ -103,7 +103,7 @@ impl RelayStartup {
         if self.children.is_empty() {
             self.children.push(
                 self.entry
-                    .spawn_child(Role::Guardian, crate::in_launchd_session())?,
+                    .spawn_child(Role::Guardian, dedicated_session())?,
             );
         }
         self.readiness_queued = self.bootstrap.as_mut().unwrap().poll(
@@ -341,4 +341,12 @@ impl RelayStartup {
         }
         result
     }
+}
+
+fn dedicated_session() -> bool {
+    #[cfg(feature = "test-managed-session")]
+    if std::env::var_os("UMBRA_TEST_MANAGED_SESSION").is_some() {
+        return true;
+    }
+    crate::in_launchd_session()
 }

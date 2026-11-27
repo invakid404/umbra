@@ -483,6 +483,9 @@ jobs:
           cargo build -p umbra-platform-macos --features retirement-witness --bin umbra-platform-macos
           cargo test -p umbra-platform-macos --lib retirement_ -- --nocapture
           cargo test -p umbra-cli --test child_retention -- --nocapture --test-threads=1
+      - name: Qualify abrupt worker end in a dedicated session
+        run: |
+          cargo test -p umbra-cli --features test-managed-session --test isolation own_session_worker_killed_with_a_stopped_provider -- --exact --nocapture --test-threads=1
       - name: Qualify native cleanup order
         env:
           UMBRA_NATIVE_CLEANUP_ORDER: /tmp/umbra-order-${{ github.run_id }}-${{ github.run_attempt }}

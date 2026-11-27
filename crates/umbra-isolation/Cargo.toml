@@ -12,6 +12,8 @@ publish = false
 # isolation entry is a no-op on other targets.
 
 [features]
+# Test hook for the launchd topology in an ordinary test session.
+test-managed-session = []
 # Test harnesses can scope one shared boot clock without changing normal builds.
 test-clock = []
 # Hosted descriptor inventory fixture; no normal executable probe.

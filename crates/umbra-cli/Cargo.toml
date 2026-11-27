@@ -11,6 +11,8 @@ name = "umbra"
 path = "src/main.rs"
 
 [features]
+# Test hook: exercise the dedicated guardian session without running in SID 1.
+test-managed-session = ["umbra-isolation/test-managed-session"]
 # Test-only closure measurements, also usable by external CLI-library fixtures.
 shutdown-witness = ["umbra-platform/shutdown-witness", "umbra-isolation/shutdown-witness"]
 probe-idle-renewal = ["umbra-supervisor/probe-idle-renewal"]
