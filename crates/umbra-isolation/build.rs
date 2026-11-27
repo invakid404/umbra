@@ -13,32 +13,28 @@ fn main() {
         "x86_64" => "x86_64",
         other => panic!("unsupported inspection architecture: {other}"),
     };
-    assert!(
-        Command::new("clang")
-            .args([
-                "-arch",
-                arch,
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-c",
-                "tests/support/socket_inventory.c",
-                "-o"
-            ])
-            .arg(out.join("socket_inventory.o"))
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        Command::new("ar")
-            .arg("crs")
-            .arg(out.join("libumbra_socket_inventory.a"))
-            .arg(out.join("socket_inventory.o"))
-            .status()
-            .unwrap()
-            .success()
-    );
+    assert!(Command::new("clang")
+        .args([
+            "-arch",
+            arch,
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-c",
+            "tests/support/socket_inventory.c",
+            "-o"
+        ])
+        .arg(out.join("socket_inventory.o"))
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("ar")
+        .arg("crs")
+        .arg(out.join("libumbra_socket_inventory.a"))
+        .arg(out.join("socket_inventory.o"))
+        .status()
+        .unwrap()
+        .success());
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=umbra_socket_inventory");
     println!("cargo:rustc-link-lib=proc");

@@ -355,7 +355,7 @@ fn role(mut entry: Entry) -> Result<()> {
     let mut rpc = None;
     let mut connection = None;
     if entry.role == Role::CleanupOwner {
-        use umbra_core::provider::{PROTOCOL_VERSION, ProviderDescriptor};
+        use umbra_core::provider::{ProviderDescriptor, PROTOCOL_VERSION};
         let descriptor = ProviderDescriptor {
             id: "endpoint-inventory".into(),
             role: "platform".into(),
