@@ -744,17 +744,30 @@ impl Entry {
         if self.role != Role::Provider || !self.descendants.is_empty() {
             return Err(invalid("provider startup used by another role"));
         }
+        let readiness = super::readiness::Readiness::new()?;
         while !self.announce_members(&[])? {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            self.wait_for_bootstrap(&readiness)?;
         }
         while !self.receive_inventory_mode(None)? {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            self.wait_for_bootstrap(&readiness)?;
         }
         self.ready(Vec::new())?;
         while !self.await_go(self.readiness_deadline)? {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            self.wait_for_bootstrap(&readiness)?;
         }
         Ok(())
+    }
+
+    fn wait_for_bootstrap(&self, readiness: &super::readiness::Readiness) -> io::Result<()> {
+        let channel = self
+            .bootstrap
+            .as_ref()
+            .ok_or_else(|| invalid("startup already closed"))?;
+        readiness.wait(
+            channel.stream.as_raw_fd(),
+            channel.written != channel.output.len(),
+            self.readiness_deadline,
+        )
     }
 
     fn receive_inventory_mode(&mut self, external_caller: Option<bool>) -> io::Result<bool> {
@@ -1090,6 +1103,15 @@ mod admission_tests {
         let (child, parent) = UnixStream::pair().unwrap();
         entry.bootstrap = Some(super::super::Channel::new(child).unwrap());
         let mut parent = super::super::Channel::new(parent).unwrap();
+        let readiness = super::super::readiness::Readiness::new().unwrap();
+        entry.readiness_deadline = super::super::boot_nanos().unwrap() + 20_000_000;
+        assert_eq!(
+            entry.wait_for_bootstrap(&readiness).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(entry.authorization.is_none());
+        assert_eq!(entry.endpoints.len(), 1);
+        entry.readiness_deadline = u64::MAX;
         let local = identity(std::process::id(), Role::Provider).unwrap();
         let deadline = super::super::boot_nanos().unwrap() + 1_000_000_000;
         let go = super::super::startup::Go {
