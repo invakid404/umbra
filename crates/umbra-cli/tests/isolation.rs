@@ -332,6 +332,7 @@ struct Tree {
     relay: Option<i32>,
     guardian: Option<i32>,
     supervisor: i32,
+    cleanup_owner: i32,
     platform: i32,
     journal: i32,
     storage: i32,
@@ -351,10 +352,25 @@ impl Tree {
 }
 
 fn managed_worker(rows: &[Proc], guardian: i32) -> i32 {
-    rows.iter()
-        .find(|row| row.ppid == guardian && row.comm == "umbra")
-        .expect("supervisor")
-        .pid
+    let workers: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.ppid == guardian
+                && row.comm == "umbra"
+                && ["umbra-journal", "umbra-storage"].iter().all(|prefix| {
+                    rows.iter()
+                        .filter(|child| child.ppid == row.pid && child.comm.starts_with(prefix))
+                        .count()
+                        == 1
+                })
+        })
+        .collect();
+    assert_eq!(
+        workers.len(),
+        1,
+        "one worker must own journal and storage: {rows:?}"
+    );
+    workers[0].pid
 }
 
 #[test]
@@ -396,7 +412,7 @@ struct Outcome {
     jobc: Jobc,
     /// Observer deliveries: (image, signal, sender).
     delivered: Vec<(String, i32, i32)>,
-    /// The isolation record of session S, if any.
+    /// Managed parent collection observations from this run's private file.
     record: Vec<Value>,
     stderr: String,
 }
@@ -452,6 +468,7 @@ impl Run {
             .arg(if fresh { "fresh" } else { "group" })
             .arg("--")
             .args(umbra_command(&dir, platform_timeout_ms, tracee))
+            .env("UMBRA_FIX_271_EVIDENCE_FILE", dir.join("managed.jsonl"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -545,6 +562,26 @@ impl Run {
         let root = kv(&ready, "pid").unwrap();
         let before = now_us();
         let rows = procs();
+        // Record the actual descendant tree before any topology assertion can fail.
+        // Terminal runs share a session with their launcher, so session-wide
+        // cleanup would include processes that this run does not own.
+        let mut descendants = std::collections::BTreeSet::from([umbra]);
+        loop {
+            let count = descendants.len();
+            for row in &rows {
+                if descendants.contains(&row.ppid) {
+                    descendants.insert(row.pid);
+                }
+            }
+            if count == descendants.len() {
+                break;
+            }
+        }
+        self.recorded.extend(
+            rows.iter()
+                .filter(|row| descendants.contains(&row.pid))
+                .map(|row| (row.pid, row.start_us)),
+        );
         let kids = |p: i32| {
             rows.iter()
                 .filter(move |r| r.ppid == p)
@@ -555,19 +592,51 @@ impl Run {
             root,
             ..Tree::default()
         };
-        match kids(umbra).into_iter().find(|r| r.comm == "umbra") {
+        let guardians: Vec<_> = kids(umbra)
+            .into_iter()
+            .filter(|r| r.comm == "umbra")
+            .collect();
+        assert_eq!(guardians.len(), 1, "relay must have exactly one guardian");
+        match guardians.into_iter().next() {
             Some(guardian) => {
                 tree.relay = Some(umbra);
                 tree.guardian = Some(guardian.pid);
                 tree.supervisor = managed_worker(&rows, guardian.pid);
+                let owners: Vec<_> = kids(guardian.pid)
+                    .into_iter()
+                    .filter(|row| {
+                        row.comm == "umbra"
+                            && kids(row.pid)
+                                .iter()
+                                .filter(|child| child.comm.starts_with("umbra-platform"))
+                                .count()
+                                == 1
+                    })
+                    .collect();
+                assert_eq!(owners.len(), 1, "one cleanup owner must own the platform");
+                tree.cleanup_owner = owners[0].pid;
+                assert_ne!(tree.cleanup_owner, tree.supervisor);
+                assert_eq!(
+                    kids(guardian.pid)
+                        .iter()
+                        .filter(|row| row.comm == "umbra")
+                        .count(),
+                    2,
+                    "guardian must own exactly worker and cleanup owner"
+                );
                 // The guardian is the relay's unreaped child now and was alive
                 // at `before`: S is this run's session at that instant.
                 assert!(guardian.start_us < before);
-                self.session = Some((guardian.pid, before));
+                if guardian.sid == guardian.pid {
+                    self.session = Some((guardian.pid, before));
+                }
             }
-            None => tree.supervisor = umbra,
+            None => panic!("managed guardian missing from relay children"),
         }
-        for r in kids(tree.supervisor) {
+        for r in kids(tree.supervisor)
+            .into_iter()
+            .chain(kids(tree.cleanup_owner))
+        {
             if r.comm.starts_with("umbra-platform") {
                 tree.platform = r.pid;
             } else if r.comm.starts_with("umbra-journal") {
@@ -585,6 +654,7 @@ impl Run {
         let mut pids = vec![
             umbra,
             tree.supervisor,
+            tree.cleanup_owner,
             tree.platform,
             tree.journal,
             tree.storage,
@@ -689,10 +759,7 @@ impl Run {
         let jobc =
             parse_jobc(&std::fs::read_to_string(self.dir.join("jobc.log")).unwrap_or_default());
         let delivered = observer_deliveries(&self.dir.join("signals"));
-        let record = self
-            .session
-            .map(|(s, _)| isolation_record(s))
-            .unwrap_or_default();
+        let record = managed_record(&self.dir);
         let stderr = self.lines.lock().unwrap().join("\n");
         if let Ok(record_text) = serde_json::to_string_pretty(&record) {
             let _ = std::fs::write(self.dir.join("isolation-record.json"), record_text);
@@ -828,29 +895,160 @@ fn observer_deliveries(directory: &Path) -> Vec<(String, i32, i32)> {
     rows
 }
 
-/// The isolation record of session `sid` (`~/Library/Logs/umbra/isolation/`).
-fn isolation_record(sid: i32) -> Vec<Value> {
-    let out = Command::new(fixture()).arg("home").output().unwrap();
-    let home = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    let dir = home.join("Library/Logs/umbra/isolation");
-    let suffix = format!("-s{sid}.jsonl");
-    let mut matches: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
-        .unwrap_or_default();
-    matches.retain(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(&suffix))
-    });
-    matches.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-    let Some(path) = matches.last() else {
-        return Vec::new();
-    };
-    std::fs::read_to_string(path)
-        .unwrap()
+/// Read only the private run's actual parent collection observations.
+fn managed_record(dir: &Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join("managed.jsonl"))
+        .unwrap_or_default()
         .lines()
         .map(|l| serde_json::from_str(l).expect("every record line is one JSON object"))
+        .filter(|row: &Value| {
+            matches!(
+                row["event"].as_str(),
+                Some("managed-guard-completed" | "provider-parent-wait")
+            )
+        })
         .collect()
+}
+
+fn assert_managed_collection(tree: &Tree, outcome: &Outcome) {
+    let participant = |value: &Value, pid: i32, role: &str| {
+        let process = tree.rows.iter().find(|row| row.pid == pid).unwrap();
+        assert_eq!(value["pid"].as_i64(), Some(i64::from(pid)));
+        assert_eq!(value["role"], role);
+        let birth = value["birth"].as_array().unwrap();
+        assert_eq!(
+            birth[0].as_i64().unwrap() * 1_000_000 + birth[1].as_i64().unwrap(),
+            process.start_us,
+            "parent receipt must name the observed process instance"
+        );
+    };
+    let guards: Vec<_> = outcome
+        .record
+        .iter()
+        .filter(|row| row["event"] == "managed-guard-completed")
+        .collect();
+    assert_eq!(
+        guards.len(),
+        2,
+        "relay and guardian must each report actual collection"
+    );
+    for (pid, role, children) in [
+        (
+            tree.relay.unwrap(),
+            "Relay",
+            vec![(tree.guardian.unwrap(), "Guardian")],
+        ),
+        (
+            tree.guardian.unwrap(),
+            "Guardian",
+            vec![
+                (tree.supervisor, "Worker"),
+                (tree.cleanup_owner, "CleanupOwner"),
+            ],
+        ),
+    ] {
+        let records: Vec<_> = guards
+            .iter()
+            .filter(|row| row["writer_pid"].as_i64() == Some(i64::from(pid)))
+            .collect();
+        assert_eq!(records.len(), 1);
+        let details = &records[0]["details"];
+        participant(&details["participant"], pid, role);
+        assert_eq!(details["expired"], false);
+        assert_eq!(details["unresolved"], 0);
+        assert_eq!(details["opportunities_expired"], 0);
+        let collected = details["collected"].as_array().unwrap();
+        assert_eq!(collected.len(), children.len());
+        for (child, child_role) in children {
+            let receipts: Vec<_> = collected
+                .iter()
+                .filter(|receipt| receipt["participant"]["pid"].as_i64() == Some(i64::from(child)))
+                .collect();
+            assert_eq!(receipts.len(), 1);
+            participant(&receipts[0]["participant"], child, child_role);
+            let status = receipts[0]["status"].as_i64().unwrap() as i32;
+            assert_eq!(
+                status & 0x7f,
+                0,
+                "normal run must collect a normally exited helper"
+            );
+            if role == "Relay" {
+                assert_eq!(
+                    outcome.status,
+                    Some(status),
+                    "relay mirrors its collected guardian status"
+                );
+            }
+        }
+    }
+    let waits: Vec<_> = outcome
+        .record
+        .iter()
+        .filter(|row| row["event"] == "provider-parent-wait")
+        .collect();
+    assert!(
+        !waits.is_empty(),
+        "provider must have an actual parent receipt"
+    );
+    for row in waits {
+        assert_eq!(row["writer_pid"].as_i64(), Some(i64::from(tree.supervisor)));
+        participant(&row["receipt"]["owner"], tree.cleanup_owner, "CleanupOwner");
+        participant(&row["receipt"]["provider"], tree.platform, "Provider");
+        assert_eq!(row["receipt"]["status"], 0);
+    }
+}
+
+fn assert_guardian_collected_after_relay_loss(tree: &Tree, outcome: &Outcome) {
+    let records: Vec<_> = outcome
+        .record
+        .iter()
+        .filter(|row| {
+            row["event"] == "managed-guard-completed"
+                && row["writer_pid"].as_i64() == Some(i64::from(tree.guardian.unwrap()))
+        })
+        .collect();
+    assert_eq!(
+        records.len(),
+        1,
+        "guardian must record its real child waits"
+    );
+    let details = &records[0]["details"];
+    assert_eq!(details["unresolved"], 0);
+    assert_eq!(details["expired"], false);
+    let same_process = |value: &Value, pid| {
+        let row = tree.rows.iter().find(|row| row.pid == pid).unwrap();
+        value["pid"].as_i64() == Some(i64::from(pid))
+            && value["birth"][0].as_i64().unwrap() * 1_000_000 + value["birth"][1].as_i64().unwrap()
+                == row.start_us
+    };
+    assert!(same_process(
+        &details["participant"],
+        tree.guardian.unwrap()
+    ));
+    assert!(
+        details["observed_exits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|peer| peer["role"] == "Relay" && same_process(peer, tree.relay.unwrap())),
+        "guardian must observe the actual relay instance ending"
+    );
+    let collected = details["collected"].as_array().unwrap();
+    assert_eq!(collected.len(), 2);
+    for (pid, role) in [
+        (tree.supervisor, "Worker"),
+        (tree.cleanup_owner, "CleanupOwner"),
+    ] {
+        let receipts: Vec<_> = collected
+            .iter()
+            .filter(|receipt| {
+                receipt["participant"]["role"] == role && same_process(&receipt["participant"], pid)
+            })
+            .collect();
+        assert_eq!(receipts.len(), 1);
+        let status = receipts[0]["status"].as_i64().unwrap() as i32;
+        assert!(status & 0x7f != 0x7f, "a stopped child is not collected");
+    }
 }
 
 /// The `jobc` sampler's log (fixture `jobc` mode), by line kind.
@@ -1215,6 +1413,7 @@ fn sid1_topology_status_and_record() {
     }
     for (what, pid) in [
         ("supervisor", tree.supervisor),
+        ("cleanup owner", tree.cleanup_owner),
         ("platform", tree.platform),
         ("journal", tree.journal),
         ("storage", tree.storage),
@@ -1224,25 +1423,12 @@ fn sid1_topology_status_and_record() {
         assert_eq!(tree.sid(pid), s, "{what} {pid} is in the run's session");
     }
     let o = run.finish(Duration::from_secs(30));
-    let outcome = o
-        .record
-        .iter()
-        .find(|v| v["event"] == "outcome")
-        .expect("an outcome line");
-    assert_eq!(outcome["cleanup"], "COMPLETE");
-    let supervisor_status = outcome["supervisor_status"].as_i64().unwrap() as i32;
-    assert_eq!(
-        o.status,
-        Some(supervisor_status),
-        "the relay mirrors the supervisor's status"
-    );
+    assert_managed_collection(&tree, o);
     assert_eq!(
         o.exit_code(),
         Some(1),
         "a failing program is umbra's exit 1, as before"
     );
-    assert_eq!(o.record.first().unwrap()["event"], "relay-start");
-    assert_eq!(o.record.last().unwrap()["event"], "guardian-reaped");
     assert_caller_group_untouched(o);
     assert_nothing_survives(o);
 }
@@ -1328,14 +1514,7 @@ fn sid1_killpg_with_a_stopped_tracer_leaves_nothing() {
         decoy_alive,
         "a same-named process outside the run's session was touched"
     );
-    if tree.guardian.is_some() {
-        let death = o
-            .record
-            .iter()
-            .find(|v| v["event"] == "relay-death")
-            .expect("the guardian recorded relay death");
-        assert_eq!(death["outcome"], "COMPLETE", "{death}");
-    }
+    assert_guardian_collected_after_relay_loss(&tree, o);
 }
 
 /// O9: an external terminating signal to the relay cancels the run; it is
@@ -1357,12 +1536,7 @@ fn sid1_sigterm_to_the_relay_cancels_the_run() {
     assert!(left.is_empty(), "the run survived its relay: {left:?}");
     assert_eq!(o.term_signal(), Some(15), "{o:?}");
     assert_caller_group_untouched(o);
-    let death = o
-        .record
-        .iter()
-        .find(|v| v["event"] == "relay-death")
-        .expect("the guardian recorded relay death");
-    assert_eq!(death["outcome"], "COMPLETE", "{death}");
+    assert_guardian_collected_after_relay_loss(&tree, o);
     // The guardian reports only members it enrolled; the finish census also
     // counts a launchd-parented zombie of the run that was never enrolled.
     assert!(
@@ -1372,9 +1546,8 @@ fn sid1_sigterm_to_the_relay_cancels_the_run() {
     );
 }
 
-/// Outside launchd's session nothing changes: no relay, no guardian; the
-/// supervisor is the launched process and the tracee is in the caller's
-/// session.
+/// Outside launchd's session every managed role and the tracee retain the
+/// caller's session.
 #[test]
 fn fresh_session_is_unchanged() {
     if !qualified() {
@@ -1383,11 +1556,9 @@ fn fresh_session_is_unchanged() {
     let mut run = Run::start("FRESH", true, false, 20_000, &["exit", "3"]);
     let launcher_sid = kv(&run.line("ISO LAUNCH", Duration::from_secs(10)), "sid").unwrap();
     let tree = run.discover();
-    assert!(
-        tree.guardian.is_none(),
-        "no guardian outside SID 1: {:?}",
-        tree.relay
-    );
+    let guardian = tree
+        .guardian
+        .expect("managed guardian in the caller session");
     assert!(!tree.debugservers.is_empty());
     for d in &tree.debugservers {
         let args = args_of(*d);
@@ -1396,10 +1567,26 @@ fn fresh_session_is_unchanged() {
             "debugserver {d} has {PIN} outside an isolated run: {args}"
         );
     }
-    assert_eq!(tree.sid(tree.supervisor), launcher_sid);
-    assert_eq!(tree.sid(tree.root), launcher_sid);
+    for pid in [
+        tree.relay.unwrap(),
+        guardian,
+        tree.supervisor,
+        tree.cleanup_owner,
+        tree.platform,
+        tree.journal,
+        tree.storage,
+        tree.root,
+        tree.root_tracer,
+    ] {
+        assert_eq!(
+            tree.sid(pid),
+            launcher_sid,
+            "managed role {pid} changed the caller session"
+        );
+    }
     let o = run.finish(Duration::from_secs(30));
     assert_eq!(o.exit_code(), Some(1), "{o:?}");
+    assert_managed_collection(&tree, o);
     assert_nothing_survives(o);
 }
 

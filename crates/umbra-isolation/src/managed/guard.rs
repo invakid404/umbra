@@ -363,25 +363,35 @@ impl Guard {
             }
         }
         #[cfg(feature = "shutdown-witness")]
-        crate::performance_observation::record_details(
-            "managed_guard",
-            "managed_guard_completed",
-            Some(u64::from(self.local.pid)),
-            serde_json::json!({
+        {
+            let details = serde_json::json!({
                 "participant": self.local,
                 "failed": self.failed() || self.tickets.ticket().is_none(),
                 "expired": self.expired,
                 "unresolved": self.children.iter().filter(|child| !child.collected).count(),
                 "errors": events.iter().filter(|event| matches!(event, Event::Failed(_))).count(),
                 "opportunities_expired": events.iter().filter(|event| matches!(event, Event::OpportunityExpired(_))).count(),
+                "observed_exits": events.iter().filter_map(|event| match event {
+                    Event::Exited(participant) => Some(participant),
+                    _ => None,
+                }).collect::<Vec<_>>(),
                 "collected": events.iter().filter_map(|event| match event {
                     Event::Collected(participant, status) => Some(serde_json::json!({
                         "participant": participant, "status": status,
                     })),
                     _ => None,
                 }).collect::<Vec<_>>(),
-            }),
-        );
+            });
+            crate::performance_observation::record_details(
+                "managed_guard",
+                "managed_guard_completed",
+                Some(u64::from(self.local.pid)),
+                details.clone(),
+            );
+            umbra_platform::shutdown::witness(serde_json::json!({
+                "event": "managed-guard-completed", "details": details,
+            }));
+        }
         Outcome {
             primary: None,
             failed: self.failed() || self.tickets.ticket().is_none(),
