@@ -254,6 +254,41 @@ mod tests {
     }
 
     #[test]
+    fn pending_exchange_observes_shortened_cutoff() {
+        use std::os::fd::AsRawFd;
+        use umbra_core::AdmissionTransport;
+        let (mut client, owner) = endpoints();
+        let cutoff = client.cutoff();
+        let deadline = super::super::boot_nanos().unwrap() + 5_000_000_000;
+        let reader = owner.channel.stream.try_clone().unwrap();
+        let notification = std::thread::spawn(move || {
+            let mut fd = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut fd, 1, 1000) }, 1);
+            cutoff
+                .retain(super::super::boot_nanos().unwrap() + 20_000_000)
+                .unwrap();
+        });
+        let started = std::time::Instant::now();
+        let error = client
+            .exchange(
+                AdmissionOperation::Reserve {
+                    obligation: Uuid::from_u128(55),
+                },
+                deadline,
+            )
+            .unwrap_err();
+        notification.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(client.begin(AdmissionOperation::Freeze).is_err());
+        assert_eq!(owner.outstanding(), 0);
+    }
+
+    #[test]
     fn r9_ready_admission_roundtrip_budget() {
         if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none() {
             eprintln!("SKIP: admission timing requires an idle qualification host");
