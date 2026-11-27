@@ -77,6 +77,21 @@ impl Observation {
                     }) {
                         errors.push(format!("{forbidden} crossed held {stage}"));
                     }
+                    if stage == "barrier-held" {
+                        use umbra_isolation::managed::process::{identity, ProcessWatch};
+                        let debugger = event["details"]["debugger"].as_u64().unwrap() as u32;
+                        let observation = (|| -> std::io::Result<bool> {
+                            let peer = identity(debugger, umbra_core::managed::Role::Provider)?;
+                            let mut watch = ProcessWatch::new()?;
+                            watch.install(peer)?;
+                            Ok(watch.exited()?.is_none())
+                        })();
+                        if !matches!(observation, Ok(true)) {
+                            errors.push(format!(
+                                "debugger {debugger} ended before barrier release: {observation:?}"
+                            ));
+                        }
+                    }
                     // Always release the test latch, even after a violation:
                     // the actual owner must finish collection before assertions.
                     std::fs::write(
@@ -114,10 +129,8 @@ impl Observation {
         emergency: Option<i32>,
     ) {
         self.stop.store(true, Ordering::Release);
-        assert!(
-            self.thread.take().unwrap().join().unwrap().is_empty(),
-            "native held barrier crossed"
-        );
+        let errors = self.thread.take().unwrap().join().unwrap();
+        assert!(errors.is_empty(), "native held barrier crossed: {errors:?}");
         assert!(
             !self.root.join("invalid-observation").exists(),
             "controller missed native latch"
