@@ -367,6 +367,11 @@ mod tests {
         channel.queue(&ControlMessage::Start(concurrent)).unwrap();
         assert!(channel.flush(deadline).unwrap());
         assert!(!publication.progress(&mut tickets).unwrap());
+        #[cfg(feature = "test-clock")]
+        assert!(
+            publication.test_pending_peers().contains(&peer),
+            "queued concurrent ACK must keep the observation pending"
+        );
         assert!(!publication.progress(&mut tickets).unwrap());
         assert!(
             matches!(channel.receive::<ControlMessage>(deadline).unwrap(),
