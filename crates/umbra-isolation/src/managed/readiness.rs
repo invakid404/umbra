@@ -99,3 +99,47 @@ impl Readiness {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn explicit_wake_cannot_renew_original_cutoff() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let wait = Readiness::new().unwrap();
+        let deadline = super::super::boot_nanos().unwrap() + 20_000_000;
+        wait.wake().unwrap();
+        wait.wait(stream.as_raw_fd(), false, deadline).unwrap();
+        assert_eq!(
+            wait.wait(stream.as_raw_fd(), false, deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        // A subsequent wake cannot authorize a wait after the original cutoff.
+        wait.wake().unwrap();
+        assert_eq!(
+            wait.wait(stream.as_raw_fd(), false, deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn peer_closure_wakes_read_wait() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let wait = Readiness::new().unwrap();
+        drop(peer);
+        wait.wait(
+            stream.as_raw_fd(),
+            false,
+            super::super::boot_nanos().unwrap() + 1_000_000_000,
+        )
+        .unwrap();
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(&mut &stream, &mut byte).unwrap(), 0);
+    }
+}
