@@ -993,6 +993,9 @@ mod tests {
         let participant =
             super::super::process::identity(std::process::id(), Role::CleanupOwner).unwrap();
         let (control, mut rpc) = UnixStream::pair().unwrap();
+        // Model the worker retaining its transferred endpoint.
+        let _worker_rpc = control.try_clone().unwrap();
+        let owner_rpc_fd = std::os::fd::AsRawFd::as_raw_fd(&control);
         rpc.set_nonblocking(true).unwrap();
         let child = Command::new("/usr/bin/true").spawn().unwrap();
         let mut owner = match Owner::new(participant, run, 1, child, control, Vec::new()) {
@@ -1006,6 +1009,9 @@ mod tests {
         let result = (|| -> io::Result<()> {
             let (sender, receiver) = UnixStream::pair()?;
             owner.install_cancellation(super::super::Channel::new(sender)?)?;
+            // Record before later allocations can reuse the descriptor number.
+            let owner_rpc_closed = unsafe { libc::fcntl(owner_rpc_fd, libc::F_GETFD) } == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
             let ticket = Ticket::new(boot_nanos()?, CleanupPath::Failed, 1).map_err(invalid)?;
             owner.start(
                 Start {
@@ -1036,6 +1042,10 @@ mod tests {
                 }
                 std::thread::yield_now();
             };
+            assert!(
+                owner_rpc_closed,
+                "dedicated cancellation must release the owner RPC copy"
+            );
             assert_eq!(message.run, run);
             assert_eq!(message.ticket, ticket);
             assert_eq!(
