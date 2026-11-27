@@ -68,6 +68,9 @@ pub fn record_details(role: &str, event: &str, resource: Option<u64>, details: s
         "role": role,
         "pid": pid, "birth": birth, "sequence": sequence, "boot_nanos": timestamp,
         "event": event, "resource": resource, "details": details,
+        "startup_resources": if std::env::var_os("UMBRA_F299_STARTUP_RESOURCES").is_some() {
+            Some(own_descriptors().expect("startup descriptor inventory"))
+        } else { None },
     });
     // Different linked crates can observe distinct roles in one process.
     // Separate streams preserve each observer's sequence and process identity.
@@ -80,4 +83,46 @@ pub fn record_details(role: &str, event: &str, resource: Option<u64>, details: s
     let mut bytes = serde_json::to_vec(&record).expect("measurement encoding");
     bytes.push(b'\n');
     file.write_all(&bytes).expect("measurement write");
+}
+
+/// Inspect this process before opening the observation file. No helper or wait.
+/// Return descriptor identities as well as counts so stdio is classified exactly.
+pub fn own_descriptors() -> std::io::Result<Vec<(i32, u32)>> {
+    let pid = std::process::id() as i32;
+    // SAFETY: a null buffer requests the required byte count.
+    let bytes =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if bytes <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let width = std::mem::size_of::<libc::proc_fdinfo>();
+    let capacity = bytes as usize / width + 128;
+    let mut entries: Vec<libc::proc_fdinfo> = (0..capacity)
+        .map(|_| libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        })
+        .collect();
+    let size = i32::try_from(capacity * width).map_err(std::io::Error::other)?;
+    // SAFETY: entries owns size bytes of properly aligned output storage.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            entries.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read <= 0 || read >= size || read as usize % width != 0 {
+        return Err(std::io::Error::other(
+            "incomplete startup descriptor inventory",
+        ));
+    }
+    let mut result = entries[..read as usize / width]
+        .iter()
+        .map(|fd| (fd.proc_fd, fd.proc_fdtype))
+        .collect::<Vec<_>>();
+    result.sort_unstable();
+    Ok(result)
 }

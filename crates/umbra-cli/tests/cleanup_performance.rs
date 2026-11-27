@@ -501,6 +501,20 @@ fn r11_head_tree_reproduction() {
     assert!(result.is_ok());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn r11_startup_descriptor_inventory() {
+    use std::os::fd::AsRawFd;
+    let before = observation::own_descriptors().unwrap();
+    let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+    let during = observation::own_descriptors().unwrap();
+    assert_eq!(during.len(), before.len() + 2);
+    assert!(during.iter().any(|entry| entry.0 == left.as_raw_fd()));
+    assert!(during.iter().any(|entry| entry.0 == right.as_raw_fd()));
+    drop((left, right));
+    assert_eq!(observation::own_descriptors().unwrap(), before);
+}
+
 /// One diagnostic invocation, not a D6 series or a successful-product assertion.
 #[cfg(target_os = "macos")]
 #[test]
