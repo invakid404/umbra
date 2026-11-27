@@ -52,6 +52,20 @@ pub fn guardian_entry() {
     }
 }
 
+/// Apply the legacy end-of-run handling only when this process owns the session.
+/// Managed parents must collect their actual children before calling this.
+#[cfg(target_os = "macos")]
+pub fn finish_managed_session() -> Option<sweep::Outcome> {
+    guardian::finish_managed_session()
+}
+
+/// Mirror an actual worker wait status after the caller has finished cleanup.
+/// This terminates the calling process; external library callers must not use it.
+#[cfg(target_os = "macos")]
+pub fn mirror_worker_status(status: i32) -> ! {
+    relay::mirror(status)
+}
+
 /// Whether this process is in launchd's session (SID 1).
 pub fn in_launchd_session() -> bool {
     #[cfg(target_os = "macos")]

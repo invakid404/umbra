@@ -36,6 +36,10 @@ pub enum Action {
 }
 /// Whole parent-role outcome; unresolved handles remain explicit at expiry.
 pub struct Outcome {
+    /// Committed cleanup cutoff, retained for terminal reporting without renewal.
+    pub completion_deadline: Option<u64>,
+    /// Guardian-reported worker wait status, separate from cleanup success.
+    pub worker_status: Option<i32>,
     /// Original worker failure, retained separately from role collection diagnostics.
     pub primary: Option<umbra_core::UmbraError>,
     /// Every accepted notification, wait receipt and attributed failure.
@@ -416,6 +420,8 @@ impl Guard {
             }));
         }
         Outcome {
+            completion_deadline: self.tickets.ticket().map(|ticket| ticket.deadline),
+            worker_status: None,
             primary: None,
             failed: self.failed() || self.tickets.ticket().is_none(),
             events,

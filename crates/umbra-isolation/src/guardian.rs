@@ -21,6 +21,26 @@ const HANDSHAKE: Duration = Duration::from_secs(2);
 const SWEEP: Duration = Duration::from_secs(3);
 const REAP: Duration = Duration::from_secs(1);
 
+pub(crate) fn finish_managed_session() -> Option<sweep::Outcome> {
+    // SAFETY: these identity queries take no pointers. A terminal guardian
+    // shares its caller's session and has no authority to sweep that session.
+    let (me, sid) = unsafe { (libc::getpid(), libc::getsid(0)) };
+    (me > 1 && sid == me).then(|| {
+        let outcome = sweep::end_run(&mut MacHost::new(|| true), me, None, SWEEP);
+        #[cfg(feature = "shutdown-witness")]
+        umbra_platform::shutdown::witness(serde_json::json!({
+            "event": "managed-session-sweep",
+            "outcome": outcome.kind.as_str(),
+            "owned_alive": outcome.owned_alive,
+            "unverifiable": outcome.unverifiable,
+            "launchd_zombies": outcome.launchd_zombies,
+            "drain_exceeded": outcome.drain_exceeded,
+            "error": outcome.error,
+        }));
+        outcome
+    })
+}
+
 fn parse_fds(spec: &str) -> Option<(RawFd, RawFd, RawFd)> {
     let v: Vec<RawFd> = spec
         .split(',')

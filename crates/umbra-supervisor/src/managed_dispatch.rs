@@ -79,7 +79,44 @@ pub fn guardian(
         .guard
         .take()
         .ok_or_else(|| io::Error::other("guardian guard transferred"))?;
-    Ok(forward(guard, forwarder))
+    let (mut outcome, mut forwarder) = forward_retaining(guard, forwarder);
+    if outcome.unresolved.is_empty() {
+        if let Some(sweep) = umbra_isolation::finish_managed_session() {
+            // These are legacy session observations, never parent wait receipts.
+            if sweep.kind != umbra_isolation::sweep::Kind::Complete {
+                eprintln!("umbra: managed guardian session cleanup: {sweep:?}");
+                outcome.failed = true;
+                outcome
+                    .events
+                    .push(umbra_isolation::managed::guard::Event::Failed(format!(
+                        "session cleanup {}",
+                        sweep.kind.as_str()
+                    )));
+            } else {
+                use std::os::unix::process::ExitStatusExt;
+                let status = outcome.events.iter().find_map(|event| match event {
+                    umbra_isolation::managed::guard::Event::Collected(participant, status)
+                        if participant.role == Role::Worker
+                            && !std::process::ExitStatus::from_raw(*status).success() =>
+                    {
+                        Some(*status)
+                    }
+                    _ => None,
+                });
+                if let (Some(status), Some(deadline)) = (status, outcome.completion_deadline) {
+                    if let Err(error) = forwarder.report_worker_exit(status, deadline) {
+                        outcome.failed = true;
+                        outcome
+                            .events
+                            .push(umbra_isolation::managed::guard::Event::Failed(format!(
+                                "worker status report: {error}"
+                            )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 fn forward(guard: Guard, forwarder: Forwarder) -> Outcome {
@@ -92,9 +129,36 @@ fn forward(guard: Guard, forwarder: Forwarder) -> Outcome {
                 .unwrap()
                 .poll(ticket.map(|ticket| ticket.deadline));
             if result.is_err() {
-                // Closing both exchange ends wakes the worker and its real parent;
-                // the independent guard continues collecting its actual children.
                 forwarder.take();
+            }
+            result.map_err(io::Error::other)
+        },
+        |guard| {
+            guard.wait_for_activity(
+                forwarding
+                    .borrow()
+                    .as_ref()
+                    .and_then(Forwarder::wait_interest),
+            )
+        },
+    )
+}
+
+fn forward_retaining(
+    guard: Guard,
+    forwarder: Forwarder,
+) -> (Outcome, crate::managed_observer::ExitReporter) {
+    let forwarding = std::cell::RefCell::new(Some(forwarder));
+    let reporter = std::cell::RefCell::new(None);
+    let outcome = guard.run_parent_with_wait(
+        |ticket| {
+            let mut forwarding = forwarding.borrow_mut();
+            let result = forwarding
+                .as_mut()
+                .unwrap()
+                .poll(ticket.map(|ticket| ticket.deadline));
+            if result.is_err() {
+                *reporter.borrow_mut() = Some(forwarding.take().unwrap().into_exit_reporter());
             }
             result.map_err(io::Error::other)
         },
@@ -102,6 +166,12 @@ fn forward(guard: Guard, forwarder: Forwarder) -> Outcome {
             let forwarding = forwarding.borrow();
             guard.wait_for_activity(forwarding.as_ref().and_then(Forwarder::wait_interest))
         },
+    );
+    (
+        outcome,
+        reporter
+            .into_inner()
+            .unwrap_or_else(|| forwarding.into_inner().unwrap().into_exit_reporter()),
     )
 }
 
@@ -119,6 +189,7 @@ fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
         umbra_isolation::managed::test_directory_wake::DirectoryWake::new(&directory).map(Some)
     })();
     let result = transport.result_handle();
+    let worker_status = transport.worker_status_handle();
     let observing = std::cell::RefCell::new(Some(transport));
     let mut outcome = guard.run_parent_with_wait(
         |ticket| {
@@ -171,6 +242,11 @@ fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
             guard.wait_for_activity(application)
         },
     );
+    outcome.worker_status = worker_status.get();
+    if outcome.worker_status.is_some() && result.borrow().is_none() {
+        outcome.failed = true;
+        return outcome;
+    }
     match result.borrow().as_ref() {
         Some(Ok(())) => {}
         result => {

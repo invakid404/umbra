@@ -15,6 +15,8 @@ pub enum Event {
     TeardownWarning(UmbraError),
     /// Final worker return value, distinct from successful-finish callbacks.
     RunResult(Result<()>),
+    /// Guardian's actual worker wait receipt, after managed and session cleanup.
+    WorkerExit(i32),
 }
 
 /// Identity and sequence prevent cross-run or repeated callback delivery.
@@ -121,6 +123,57 @@ pub struct Forwarder {
 
 #[cfg(target_os = "macos")]
 impl Forwarder {
+    /// Close the child exchange while retaining only a possible terminal report.
+    pub fn into_exit_reporter(self) -> ExitReporter {
+        ExitReporter {
+            allowed: self.phase == 0 && self.child.at_frame_boundary(),
+            completed: self.terminal,
+            parent: self.parent,
+            run_id: self.run_id,
+            sequence: self.sequence,
+        }
+    }
+}
+
+/// Guardian's existing parent channel after the worker exchange has closed.
+#[cfg(target_os = "macos")]
+pub struct ExitReporter {
+    allowed: bool,
+    completed: bool,
+    parent: umbra_isolation::managed::Channel,
+    run_id: RunId,
+    sequence: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl ExitReporter {
+    /// Publish a failed worker's actual wait receipt after collection and sweep.
+    /// An interrupted callback cannot be replaced with a new terminal message.
+    /// This makes one nonblocking flush attempt; it allocates no new wait budget.
+    pub fn report_worker_exit(&mut self, status: i32, deadline: u64) -> Result<()> {
+        // A final worker result already forwarded retains its structured error.
+        if self.completed {
+            return Ok(());
+        }
+        if !self.allowed {
+            return Err(transport_error("worker exit interrupted an observer frame"));
+        }
+        self.parent
+            .queue(&Request {
+                run_id: self.run_id,
+                sequence: self.sequence,
+                event: Event::WorkerExit(status),
+            })
+            .map_err(transport_error)?;
+        if !self.parent.flush(deadline).map_err(transport_error)? {
+            return Err(transport_error("worker exit report would block"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Forwarder {
     /// Adopt only the channels for the observer's worker-to-caller path.
     pub fn new(
         run_id: RunId,
@@ -176,7 +229,8 @@ impl Forwarder {
                     if request.run_id != self.run_id || request.sequence != self.sequence {
                         return Err(transport_error("forwarded observer request mismatch"));
                     }
-                    self.terminal = matches!(request.event, Event::RunResult(_));
+                    self.terminal =
+                        matches!(request.event, Event::RunResult(_) | Event::WorkerExit(_));
                     self.parent.queue(&request).map_err(transport_error)?;
                     self.phase = 1;
                 }
@@ -228,6 +282,10 @@ pub struct CallerTransport {
 
 #[cfg(target_os = "macos")]
 impl CallerTransport {
+    /// Guardian wait receipt; never inferred from a helper's exit signal.
+    pub fn worker_status_handle(&self) -> std::rc::Rc<std::cell::Cell<Option<i32>>> {
+        self.observer.worker_status.clone()
+    }
     /// Observe the final return without moving callback ownership.
     pub fn result_handle(&self) -> std::rc::Rc<std::cell::RefCell<Option<Result<()>>>> {
         self.observer.result_handle()
@@ -279,7 +337,7 @@ impl CallerTransport {
             .receive::<Request>(self.deadline)
             .map_err(transport_error)?
         {
-            let terminal = matches!(request.event, Event::RunResult(_));
+            let terminal = matches!(request.event, Event::RunResult(_) | Event::WorkerExit(_));
             let response = self.observer.dispatch(request)?;
             self.complete = terminal && response.result.is_ok();
             self.channel.queue(&response).map_err(transport_error)?;
@@ -300,6 +358,7 @@ pub struct CallerObserver {
     prepared: bool,
     finished: bool,
     result: std::rc::Rc<std::cell::RefCell<Option<Result<()>>>>,
+    worker_status: std::rc::Rc<std::cell::Cell<Option<i32>>>,
 }
 
 impl CallerObserver {
@@ -314,6 +373,7 @@ impl CallerObserver {
             prepared: false,
             finished: false,
             result: Default::default(),
+            worker_status: Default::default(),
         }
     }
 
@@ -358,15 +418,27 @@ impl CallerObserver {
                 "invalid managed callback identity, sequence or phase",
             )
         };
-        let terminal = matches!(request.event, Event::RunResult(_));
+        let terminal = matches!(request.event, Event::RunResult(_) | Event::WorkerExit(_));
         if ((self.failed || self.finished) && !terminal)
             || self.result.borrow().is_some()
+            || self.worker_status.get().is_some()
             || request.run_id != self.run_id
             || request.sequence != self.next
         {
             return Err(invalid());
         }
         self.next = self.next.checked_add(1).ok_or_else(invalid)?;
+        if let Event::WorkerExit(status) = request.event {
+            use std::os::unix::process::ExitStatusExt;
+            let status_value = std::process::ExitStatus::from_raw(status);
+            if status_value.success()
+                || (status_value.code().is_none() && status_value.signal().is_none())
+            {
+                return Err(invalid());
+            }
+            self.worker_status.set(Some(status));
+            return Ok(());
+        }
         if let Event::RunResult(result) = &request.event {
             if result.is_ok() && (self.failed || !self.finished) {
                 return Err(invalid());
@@ -412,7 +484,7 @@ impl CallerObserver {
                     observer.teardown_warning(error);
                 }
             }
-            Event::RunResult(_) => unreachable!(),
+            Event::RunResult(_) | Event::WorkerExit(_) => unreachable!(),
         }
         self.failed = false;
         Ok(())
@@ -531,6 +603,44 @@ impl<F: FnMut(Request) -> Result<Response>> RunObserver for WorkerObserver<F> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_wait_receipt_is_terminal_and_cannot_report_success() {
+        let run = RunId(uuid::Uuid::new_v4());
+        for status in [0, 0x137f] {
+            let mut caller = CallerObserver::new(run, None);
+            assert!(caller
+                .dispatch(Request {
+                    run_id: run,
+                    sequence: 1,
+                    event: Event::WorkerExit(status),
+                })
+                .unwrap()
+                .result
+                .is_err());
+            assert_eq!(caller.worker_status.get(), None);
+        }
+        let mut caller = CallerObserver::new(run, None);
+        caller
+            .dispatch(Request {
+                run_id: run,
+                sequence: 1,
+                event: Event::WorkerExit(9),
+            })
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(caller.worker_status.get(), Some(9));
+        assert!(caller
+            .dispatch(Request {
+                run_id: run,
+                sequence: 2,
+                event: Event::WorkerExit(9),
+            })
+            .unwrap()
+            .result
+            .is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn observer_wait_interest_follows_pending_response() {

@@ -227,8 +227,35 @@ pub fn run(
     capacity: u64,
 ) -> umbra_core::Result<()> {
     let mut role = RegisteredRole::prepare(spec, external_caller, capacity)?;
-    execute(&mut role).map_err(managed_error)
+    let result = execute(&mut role);
+    if !external_caller {
+        if let Err(error) = &result {
+            if let Some(exit) = error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<WorkerExit>())
+            {
+                eprintln!("{exit}");
+                umbra_isolation::mirror_worker_status(exit.0);
+            }
+        }
+    }
+    result.map_err(managed_error)
 }
+
+#[derive(Debug)]
+struct WorkerExit(i32);
+
+impl std::fmt::Display for WorkerExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "managed worker ended with wait status {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for WorkerExit {}
 
 fn managed_error(error: io::Error) -> umbra_core::UmbraError {
     if let Some(primary) = error
@@ -266,6 +293,16 @@ fn check(
 ) -> io::Result<()> {
     *finished = true;
     retained.append(&mut outcome.unresolved);
+    if retained.is_empty() && outcome.primary.is_none() {
+        if let Some(status) = outcome.worker_status {
+            for event in &outcome.events {
+                if let umbra_isolation::managed::guard::Event::Failed(message) = event {
+                    eprintln!("umbra: {message}");
+                }
+            }
+            return Err(io::Error::other(WorkerExit(status)));
+        }
+    }
     if outcome.failed {
         let failures: Vec<_> = outcome
             .events
@@ -315,6 +352,8 @@ mod diagnostic_tests {
         );
         let expected = primary.to_string();
         let outcome = umbra_isolation::managed::guard::Outcome {
+            completion_deadline: None,
+            worker_status: None,
             primary: Some(primary.clone()),
             failed: true,
             unresolved: Vec::new(),
