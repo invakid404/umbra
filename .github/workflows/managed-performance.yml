@@ -1,9 +1,6 @@
 name: Managed cleanup performance
 
 on:
-  push:
-    branches: [master]
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -17,7 +14,6 @@ concurrency:
 jobs:
   paired:
     name: D6 ${{ matrix.workload }} / ${{ matrix.session }}
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, umbra-integration]
     timeout-minutes: 30
     strategy:
@@ -85,8 +81,11 @@ jobs:
             --output "$RUNNER_TEMP/d6-reading" --artifacts "$RUNNER_TEMP/d6-driver.jsonl"
           cat > "$RUNNER_TEMP/d6-reading/predictions.txt" <<'EOF'
           Expect actual parent collection, complete admission and cleanup receipts,
-          and no protocol, guard, or deadline failures. Apply the original D6
-          thresholds; retain every attempt, including failures and outliers.
+          and zero protocol, guard, or deadline failures. Apply owner option A:
+          whole-invocation median no slower than base by more than max(5 ms,
+          10% of the base median) for native_true, registry_true and registry_tree5;
+          admission within 1 ms median and 5 ms p95. Report stage misses without
+          gating on them. Retain every attempt, including failures and outliers.
           A terminal failure stops this workload; no repeat-to-green.
           EOF
           cp "$RUNNER_TEMP/d6-reading/predictions.txt" "$RUNNER_TEMP/d6-reading/predictions-archived.txt"

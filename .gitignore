@@ -4,3 +4,5 @@
 # libnfs is vendored on demand via git clone (see build.rs) or pointed at by
 # UMBRA_LIBNFS_SRC; keep out-of-tree checkouts out of the workspace.
 /third_party/
+
+__pycache__/
