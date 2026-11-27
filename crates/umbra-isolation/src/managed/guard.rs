@@ -224,10 +224,19 @@ impl Guard {
     #[cfg(feature = "test-clock")]
     pub fn run_parent_with_test_activity(
         self,
-        mut observe: impl FnMut(super::test_clock::GuardState) -> io::Result<()>,
-        wait: impl FnMut(&mut Self) -> io::Result<()>,
+        observe: impl FnMut(super::test_clock::GuardState) -> io::Result<()>,
+        mut wait: impl FnMut(&mut Self) -> io::Result<()>,
     ) -> Outcome {
-        self.run_parent_waiting(|guard| observe(guard.test_clock_state()), wait)
+        let observe = std::cell::RefCell::new(observe);
+        self.run_parent_waiting(
+            |guard| observe.borrow_mut()(guard.test_clock_state()),
+            |guard| {
+                // Polling may settle an ACK or accept a Start after the top
+                // observation. Publish that state before the fixture sleeps.
+                observe.borrow_mut()(guard.test_clock_state())?;
+                wait(guard)
+            },
+        )
     }
 
     fn run_parent_observed(self, progress: impl FnMut(&Self) -> io::Result<()>) -> Outcome {
