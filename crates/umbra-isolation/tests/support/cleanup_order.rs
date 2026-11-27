@@ -115,6 +115,7 @@ pub fn verify(
     run: RunIdentity,
     emergency: bool,
     parents: &[(Participant, Participant)],
+    expected_children: &[(Stage, Participant)],
 ) -> Result<(), String> {
     use Stage::*;
     let mut accepted: Vec<&Receipt> = Vec::new();
@@ -153,6 +154,9 @@ pub fn verify(
         );
         if wait {
             let child = receipt.collected.ok_or("missing actual wait identity")?;
+            if !expected_children.contains(&(receipt.stage, child)) {
+                return Err("parent wait names the wrong child for its stage".into());
+            }
             if !parents.contains(&(child, receipt.id.producer)) {
                 return Err("wait receipt is not from the child's enrolled parent".into());
             }

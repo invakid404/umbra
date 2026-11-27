@@ -1391,10 +1391,26 @@ fn run_inner(case: Case, order: bool) -> io::Result<()> {
             .iter()
             .filter_map(|m| m.parent.map(|p| (m.participant, p)))
             .collect();
-        parents.extend(
-            read::<Vec<(Participant, Participant)>>(root, "order-native-parents")?
-                .ok_or_else(|| invalid("missing resource parents"))?,
-        );
+        let native_parents = read::<Vec<(Participant, Participant)>>(root, "order-native-parents")?
+            .ok_or_else(|| invalid("missing resource parents"))?;
+        if native_parents.len() != 2 {
+            return Err(invalid("wrong resource parent count"));
+        }
+        use cleanup_order::Stage;
+        let mut expected_children = vec![
+            (Stage::ProgramParentCollected, native_parents[0].0),
+            (Stage::DebuggerParentCollected, native_parents[1].0),
+        ];
+        for (stage, role) in [
+            (Stage::ProviderParentCollected, Role::Provider),
+            (Stage::WorkerParentCollected, Role::Worker),
+            (Stage::OwnerParentCollected, Role::CleanupOwner),
+            (Stage::GuardianParentCollected, Role::Guardian),
+            (Stage::RelayParentCollected, Role::Relay),
+        ] {
+            expected_children.push((stage, participant(&inventory, role)));
+        }
+        parents.extend(native_parents);
         let mut pending = Vec::<cleanup_order::Receipt>::new();
         for entry in std::fs::read_dir(root)? {
             let path = entry?.path();
@@ -1425,6 +1441,7 @@ fn run_inner(case: Case, order: bool) -> io::Result<()> {
             config.run,
             config.case == Case::OrderEmergency,
             &parents,
+            &expected_children,
         )
         .map_err(|error| invalid(&error))?;
         // Exercise the parser against the receipts from these actual processes.
@@ -1437,13 +1454,35 @@ fn run_inner(case: Case, order: bool) -> io::Result<()> {
                     .filter(|r| r.stage != missing)
                     .cloned()
                     .collect();
-                if cleanup_order::verify(&damaged, config.run, false, &parents).is_ok() {
+                if cleanup_order::verify(&damaged, config.run, false, &parents, &expected_children)
+                    .is_ok()
+                {
                     return Err(invalid("missing proof accepted"));
+                }
+            }
+            for (left, right) in [
+                (ProgramParentCollected, DebuggerParentCollected),
+                (WorkerParentCollected, OwnerParentCollected),
+            ] {
+                let mut swapped = ordered.clone();
+                let a = swapped.iter().position(|r| r.stage == left).unwrap();
+                let b = swapped.iter().position(|r| r.stage == right).unwrap();
+                let child = swapped[a].collected;
+                swapped[a].collected = swapped[b].collected;
+                swapped[b].collected = child;
+                if cleanup_order::verify(&swapped, config.run, false, &parents, &expected_children)
+                    .is_ok()
+                {
+                    return Err(invalid(
+                        "collection identities swapped across named stages accepted",
+                    ));
                 }
             }
             let mut stale = ordered.clone();
             stale[0].run.generation += 1;
-            if cleanup_order::verify(&stale, config.run, false, &parents).is_ok() {
+            if cleanup_order::verify(&stale, config.run, false, &parents, &expected_children)
+                .is_ok()
+            {
                 return Err(invalid("stale generation accepted"));
             }
             let mut forged = ordered.clone();
@@ -1452,7 +1491,9 @@ fn run_inner(case: Case, order: bool) -> io::Result<()> {
                 .find(|r| r.stage == ProviderParentCollected)
                 .unwrap();
             wait.id.producer = participant(&inventory, Role::Worker);
-            if cleanup_order::verify(&forged, config.run, false, &parents).is_ok() {
+            if cleanup_order::verify(&forged, config.run, false, &parents, &expected_children)
+                .is_ok()
+            {
                 return Err(invalid("nonparent collection accepted"));
             }
         }
