@@ -466,6 +466,44 @@ fn startup_stage_reading() {
 /// One diagnostic invocation, not a D6 series or a successful-product assertion.
 #[cfg(target_os = "macos")]
 #[test]
+fn r11_head_tree_reproduction() {
+    if !configured() {
+        return;
+    }
+    let c = config::read(|key| std::env::var(key).ok(), true).unwrap();
+    assert!(matches!(c.workload, config::Workload::RegistryTree5));
+    assert_eq!(c.session, config::Session::OwnSession);
+    let selected =
+        manifest::load(c.head.as_deref().expect("head manifest required"), false).unwrap();
+    std::fs::create_dir(&c.evidence).unwrap();
+    let args = workload::prepare(
+        &c,
+        &selected,
+        &c.evidence.join("setup"),
+        schedule::Build::Head,
+    )
+    .unwrap();
+    let result = invocation::measure(
+        &selected,
+        &c.evidence.join("invocation"),
+        &args,
+        workload::name(&c.workload),
+        true,
+        schedule::Member {
+            warmup: false,
+            index: 0,
+            order: 0,
+            build: schedule::Build::Head,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(900),
+        },
+    );
+    eprintln!("head tree reproduction (not D6 qualification): {result:?}");
+    assert!(result.is_ok());
+}
+
+/// One diagnostic invocation, not a D6 series or a successful-product assertion.
+#[cfg(target_os = "macos")]
+#[test]
 fn baseline_tree_diagnosis() {
     if !configured() {
         return;
