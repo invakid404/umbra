@@ -12,9 +12,11 @@ This document covers the crate's ABI decoder, native tracer, spawn protocol,
 interposer, provider executable and integration tests.
 
 The managed provider path is active, but its qualification is incomplete.
-Measured descriptor and latency costs missed the accepted budgets, and retained
-shutdown failures remain open. Passing ordinary tests does not certify those
-costs or the unresolved provider-loss cases.
+Earlier descriptor and latency readings missed the accepted budgets. The
+readiness descriptor inventory now meets its revised ceilings; performance
+qualification still misses bounds and unresolved provider-loss cases remain
+separate. Passing
+ordinary tests does not certify them.
 
 The crate implements the v2 experimental tracer described in
 `experiments/tracer/umbra_tracer.py` and `experiments/tracer/REPORT-v2.md`
@@ -106,8 +108,9 @@ envelope overrun fails closure rather than claiming successful cleanup.
 Managed cancellation clamps these windows to the original cleanup ticket;
 neither polling nor teardown starts a replacement ticket. Sessions that have
 completed ordered teardown but still retain resources remain in the owner
-allowance. This correction has a deterministic regression test, but the live
-region-cap failure still did not reopen writer authority successfully.
+allowance. This correction has a deterministic regression test. The live
+region-cap case subsequently passed with writer authority reopened after
+admission and owner waits changed to readiness events.
 No session-age or inactivity policy is added.
 
 The shared monitor stores a typed terminal cause. Genuine explicit deadline
@@ -731,6 +734,10 @@ owner connection. It decodes JSON `Options` from opaque provider options (empty
 falls back to `Options::default()`). Register it via `umbra providers --registry <path>
 --role platform`.
 
+`UMBRA_MANAGED_ROLE` is private launch metadata supplied by the registered
+parent. It is consumed on entry; an absent value selects ordinary provider
+entry, and invalid metadata fails before backend setup.
+
 **Environment.** `UMBRA_DEBUGSERVER` overrides discovery when the JSON
 `debugserver` option is absent; if both are unset, `xcode-select -p` supplies the
 Xcode path. With no `twin_cache` option, `HOME` selects
@@ -766,6 +773,20 @@ backend, so disposal cannot erase earlier acquisition obligations.
 With `shutdown-witness`, `UMBRA_FIX_271_EVIDENCE_FILE` selects an append-only
 JSONL file for acquisition, thread-order and closure timing observations. Unset
 means no witness output; builds without the feature do not read the variable.
+
+The same feature includes startup and cleanup timing observations.
+`UMBRA_F299_PERF_EVENTS` selects their output directory; unset produces no
+records. When selected, the harness must also supply
+`UMBRA_F299_PERF_MANIFEST_DIGEST`, `UMBRA_F299_PERF_RUN_NONCE`,
+`UMBRA_F299_PERF_PAIR_INDEX`, `UMBRA_F299_PERF_ORDER`, and
+`UMBRA_F299_PERF_WORKLOAD`. Missing identity fields fail the measurement.
+The observations bracket provider acceptance and retain per-producer sequences
+and process birth identities. They do not change deadlines.
+
+The separate `umbra-core/cost-witness` feature uses `UMBRA_COST_OBSERVER` and
+`UMBRA_COST_DIRECTORY` for explicit resource inventories. Unset observer means
+no output. Startup allocation hooks do not invoke that observer; managed
+snapshots run after worker readiness. Cost builds must not supply latency samples.
 
 The `managed-endpoint-probe` feature observes inherited descriptor identities
 at root and debugger pre-exec boundaries; it has no environment switch.

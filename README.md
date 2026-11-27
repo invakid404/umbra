@@ -44,8 +44,8 @@ resource does not turn a failed command into success. The
 and the residual cases where notification or actual parent collection is lost.
 Managed cleanup qualification is incomplete. Admission and native teardown
 improved after replacing timer polling, but helper startup and routed teardown
-still miss performance bounds. Final descriptor-cost measurement remains
-incomplete.
+still miss performance bounds. Readiness snapshots measured the
+managed descriptor costs within their ceilings; they do not measure startup peaks.
 
 ```sh
 umbra run --registry providers.json --workspace . --experimental   -- /absolute/path/to/program args...

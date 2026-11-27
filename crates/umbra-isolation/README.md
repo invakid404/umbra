@@ -70,14 +70,14 @@ ends are:
 | Guardian-to-relay result forwarding | guardian and relay | 2, CLI and library |
 | Relay-to-caller result forwarding | relay and external caller | 2, library only |
 
-These source counts remain within the revised ceilings of 22/33, but final
-resource-cost qualification is incomplete. The latest `cost-witness` reading
-stopped when the managed CLI warmup exceeded the unchanged startup deadline
-while taking snapshots. It supplies no final steady count or startup peak.
-Earlier measurements preceded RPC-copy removal and cannot qualify the current
-counts. `startup_cost` retains process identities, parent edges, descriptor
-inventories and actual collection records; sampled boundary peaks are not
-continuous maxima. Launchd-session costs require CI qualification.
+Readiness snapshots measured these 21/32 counts within the revised ceilings of
+22/33. The observer runs after worker GO, leaving startup allocation and
+executable entry uninterrupted. An earlier reading that paused startup exceeded
+the unchanged deadline and remains failed evidence. The new method measures
+readiness inventories, not startup peaks. `startup_cost` retains process
+identities, parent edges, descriptor inventories and actual collection records.
+The library caller returned to its original descriptor inventory, including
+pre-GO rollback. Launchd-session costs require CI qualification.
 
 Two limits remain explicit. Total loss of caller notification before any Start
 has no proven finite caller-return bound (D1); custody stays unresolved without

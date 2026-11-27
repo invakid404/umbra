@@ -219,14 +219,20 @@ cargo test -p umbra-cli
 ```
 
 Managed activation remains incompletely qualified. `tests/startup_cost.rs`
-measures process and descriptor ownership; its latest managed warmup exceeded
-the unchanged startup deadline while taking snapshots, leaving final counts
-unqualified. `tests/cleanup_performance.rs` requires explicit
+measures process and descriptor ownership after readiness, without pausing
+startup. The nine-invocation reading passed with managed descriptor counts
+within the revised ceilings and no retained caller descriptors or observed
+owned processes. It does not measure startup peaks; the earlier observer-induced
+startup timeout remains failed evidence. `tests/cleanup_performance.rs` requires explicit
 immutable baseline/head manifests and retains every attempted sample. The
 four latest series completed all prescribed pairs without terminal failures.
 Admission passed for the three traced workloads, and native teardown passed;
 helper startup and routed teardown still missed limits. Admission-only also
-missed; its separate qualification owner still uses a timer wait. The earlier
+missed; its separate qualification owner now uses the production readiness wait,
+and the focused exchange test passes the original limits. Final paired readings
+now pass the admission limits but still miss teardown. The final native and
+routed `true` series miss helper startup; routed `true` also misses teardown p95.
+The tree series stopped on a startup failure before GO. The earlier
 registry-tree5 disconnection did not recur, but its cause remains unproven. Ordinary
 workspace tests do not replace these opt-in readings. SID-1 readings remain
 CI-only.
