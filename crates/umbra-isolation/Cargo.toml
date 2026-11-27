@@ -21,7 +21,7 @@ probe-cancellation-ticket = []
 # Qualification-only: corrupt the run generation on a validated provider offer.
 probe-managed-offer-generation = []
 # Observational D6 instrumentation; no lifecycle behavior change.
-shutdown-witness = ["umbra-platform/shutdown-witness"]
+shutdown-witness = ["umbra-platform/shutdown-witness", "umbra-core/startup-witness"]
 
 [dependencies]
 umbra-core = { path = "../umbra-core" }

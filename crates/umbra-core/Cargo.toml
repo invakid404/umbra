@@ -11,6 +11,8 @@ publish = false
 test-owned-exit = []
 # Explicit startup descriptor/process census; absent from ordinary builds.
 cost-witness = []
+# Explicit transport-stage durations for startup qualification.
+startup-witness = []
 
 [dependencies]
 serde.workspace = true

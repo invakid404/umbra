@@ -612,7 +612,11 @@ impl Client {
             return Err(unavailable("provider readiness expired before spawn"));
         }
         crate::cost_snapshot!("provider-command-before", None, &[]);
+        #[cfg(feature = "startup-witness")]
+        let stage_origin = Instant::now();
         let child = command.spawn().map_err(unavailable)?;
+        #[cfg(feature = "startup-witness")]
+        let (spawn_duration, stage_child) = (stage_origin.elapsed(), child.id());
         crate::cost_snapshot!("provider-command-after", Some(child.id()), &[]);
         let mut local_child = None;
         let child_slot = custody.unwrap_or(&mut local_child);
@@ -650,6 +654,8 @@ impl Client {
         };
         // macOS may inherit O_NONBLOCK from the accepting listener.
         crate::cost_snapshot!("provider-connection-accepted", None, &[]);
+        #[cfg(feature = "startup-witness")]
+        let accept_duration = stage_origin.elapsed();
         if let Err(error) = stream.set_nonblocking(false) {
             if !managed {
                 let _ = reap(child_slot.take().expect("spawned child"), REAP_GRACE);
@@ -679,6 +685,26 @@ impl Client {
             options: descriptor.options.clone(),
         })?;
         client.welcome = client.connection.receive::<Result<Welcome>>()??;
+        #[cfg(feature = "startup-witness")]
+        if let Some(directory) = std::env::var_os("UMBRA_F299_PERF_EVENTS") {
+            use std::io::Write;
+            let row = serde_json::json!({
+                "event": "provider-transport-stages", "pid": std::process::id(),
+                "child": stage_child, "provider_role": descriptor.role,
+                "run_nonce": std::env::var("UMBRA_F299_PERF_RUN_NONCE").expect("measurement nonce"),
+                "spawn_ns": spawn_duration.as_nanos(),
+                "accept_ns": accept_duration.as_nanos(),
+                "welcome_ns": stage_origin.elapsed().as_nanos(),
+            });
+            let path = std::path::Path::new(&directory)
+                .join(format!("{}-transport-stages.transport", std::process::id()));
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("transport stage file");
+            writeln!(file, "{row}").expect("transport stage write");
+        }
         if client.welcome.id != descriptor.id
             || client.welcome.role != descriptor.role
             || client.welcome.version != PROTOCOL_VERSION
