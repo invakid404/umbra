@@ -93,6 +93,7 @@ struct Original {
 struct Input {
     directory: PathBuf,
     originals: Vec<Original>,
+    caller_file: Option<Identity>,
 }
 fn prepare(directory: PathBuf, roles: &BTreeMap<Role, Vec<Endpoint>>) -> Result<Input> {
     let mut originals = Vec::new();
@@ -112,6 +113,7 @@ fn prepare(directory: PathBuf, roles: &BTreeMap<Role, Vec<Endpoint>>) -> Result<
     Ok(Input {
         directory,
         originals,
+        caller_file: None,
     })
 }
 
@@ -277,6 +279,13 @@ fn collect(pending: PendingRole, deadline: u64) -> Result<()> {
 fn role(mut entry: Entry) -> Result<()> {
     let input: Input = serde_json::from_slice(&entry.launch.payload)?;
     let mut errors = Vec::new();
+    if let Some(caller_file) = input.caller_file {
+        for fd in 3..unsafe { libc::getdtablesize() } {
+            if identity(fd).ok() == Some(caller_file) {
+                errors.push(format!("{:?}: inherited caller file at {fd}", entry.role));
+            }
+        }
+    }
     challenge(&input, entry.role, &entry.endpoints, &mut errors);
     let mut children = Children {
         items: Vec::new(),
@@ -371,6 +380,20 @@ pub fn run() -> Result<()> {
     );
     let library = std::env::args().nth(2).as_deref() == Some("library");
     let root = if library { Role::Caller } else { Role::Relay };
+    // Model descriptors supplied by the invoking process without close-on-exec.
+    // Keep them alive throughout the topology reading and actual collection.
+    let inherited = if std::env::args().nth(3).as_deref() == Some("inherited") {
+        let pair = UnixStream::pair()?;
+        let file = std::fs::File::create(directory.join("caller-file"))?;
+        for fd in [pair.0.as_raw_fd(), pair.1.as_raw_fd(), file.as_raw_fd()] {
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+        }
+        Some((pair, file))
+    } else {
+        None
+    };
     let mut topology = Topology::new(library)?;
     let mut roles = BTreeMap::new();
     for role in [
@@ -385,7 +408,11 @@ pub fn run() -> Result<()> {
     if library {
         roles.insert(Role::Caller, topology.take(Role::Caller)?);
     }
-    let input = prepare(directory, &roles)?;
+    let mut input = prepare(directory, &roles)?;
+    input.caller_file = inherited
+        .as_ref()
+        .map(|(_, file)| identity(file.as_raw_fd()))
+        .transpose()?;
     let launch = LaunchConfiguration {
         run: umbra_core::managed::RunIdentity {
             nonce: uuid::Uuid::new_v4(),

@@ -46,12 +46,24 @@ fn r2_da_order_across_roles() {
 #[cfg(feature = "managed-endpoint-probe")]
 #[test]
 fn r2_exec_and_fork_endpoint_inventory() {
+    endpoint_inventory(false);
+}
+
+#[cfg(feature = "managed-endpoint-probe")]
+#[test]
+fn r2_caller_descriptors_stay_out_of_roles() {
+    endpoint_inventory(true);
+}
+
+#[cfg(feature = "managed-endpoint-probe")]
+fn endpoint_inventory(inherited: bool) {
     let mut failed = Vec::new();
     for mode in ["cli", "library"] {
         let evidence = tempfile::tempdir().unwrap();
         let status = std::process::Command::new(env!("CARGO_BIN_EXE_umbra-managed-endpoint-probe"))
             .arg(evidence.path())
             .arg(mode)
+            .arg(if inherited { "inherited" } else { "ordinary" })
             .status()
             .unwrap();
         eprintln!("hosted endpoint inventory {mode}: {status}");
