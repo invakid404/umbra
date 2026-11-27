@@ -391,7 +391,10 @@ fn baseline_tree_diagnosis() {
         return;
     }
     let c = config::read(|key| std::env::var(key).ok(), false).unwrap();
-    assert_eq!(c.workload, config::Workload::NativeTree5);
+    assert!(matches!(
+        c.workload,
+        config::Workload::NativeTree5 | config::Workload::RegistryTree5
+    ));
     assert_eq!(c.session, config::Session::OwnSession);
     let selected = manifest::load(&c.base, true).unwrap();
     std::fs::create_dir(&c.evidence).unwrap();
@@ -406,7 +409,7 @@ fn baseline_tree_diagnosis() {
         &selected,
         &c.evidence.join("invocation"),
         &args,
-        "native_tree5",
+        workload::name(&c.workload),
         true,
         schedule::Member {
             warmup: false,
