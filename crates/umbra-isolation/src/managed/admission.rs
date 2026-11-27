@@ -223,8 +223,6 @@ impl AdmissionService {
             ledger,
             channel,
             failed: false,
-            #[cfg(test)]
-            before_wait: None,
             cutoff: u64::MAX,
         })
     }
