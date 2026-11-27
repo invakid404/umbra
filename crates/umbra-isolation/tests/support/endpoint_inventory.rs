@@ -181,6 +181,32 @@ fn challenge(input: &Input, role: Role, endpoints: &[Endpoint], errors: &mut Vec
     }
 }
 
+fn extra_allowed(fd: i32, id: Identity, extras: &[(i32, Identity)]) -> bool {
+    extras.contains(&(fd, id))
+}
+
+fn duplicate_extra_socket_requires_its_own_descriptor_allowance() {
+    let (stream, _peer) = UnixStream::pair().unwrap();
+    let intentional = stream.try_clone().unwrap();
+    let unexpected = stream.try_clone().unwrap();
+    let id = identity(stream.as_raw_fd()).unwrap();
+    let extras = [(stream.as_raw_fd(), id), (intentional.as_raw_fd(), id)];
+    assert!(extra_allowed(stream.as_raw_fd(), id, &extras));
+    assert!(extra_allowed(
+        intentional.as_raw_fd(),
+        identity(intentional.as_raw_fd()).unwrap(),
+        &extras
+    ));
+    assert!(
+        !extra_allowed(
+            unexpected.as_raw_fd(),
+            identity(unexpected.as_raw_fd()).unwrap(),
+            &extras
+        ),
+        "unlisted third copy of an allowed RPC socket must be rejected"
+    );
+}
+
 fn inspect(
     input: &Input,
     role: Role,
@@ -197,7 +223,7 @@ fn inspect(
         .collect();
     let extras: Vec<_> = extra
         .iter()
-        .map(|fd| identity(*fd))
+        .map(|fd| identity(*fd).map(|id| (*fd, id)))
         .collect::<io::Result<_>>()?;
     let mut found = Vec::new();
     for fd in 3..unsafe { libc::getdtablesize() } {
@@ -214,7 +240,7 @@ fn inspect(
             if unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC == 0 {
                 errors.push(format!("{role:?}: managed endpoint {fd} lacks CLOEXEC"));
             }
-        } else if !extras.contains(&id) && !baseline.contains(&id) {
+        } else if !extra_allowed(fd, id, &extras) && !baseline.contains(&id) {
             let details = socket_details(fd);
             errors.push(format!("{role:?}: unexpected socket {fd}: {id:?}, domain/type={details:?}, owning process={}", std::process::id()));
         }
@@ -227,7 +253,7 @@ fn inspect(
     if endpoints.len() != expected.len() {
         errors.push(format!("{role:?}: role assignment size differs"));
     }
-    let mut fork_extras = extras;
+    let mut fork_extras: Vec<_> = extras.iter().map(|(_, id)| *id).collect();
     fork_extras.extend_from_slice(baseline);
     fork_boundary(input, &fork_extras, errors)?;
     std::fs::write(
@@ -390,9 +416,11 @@ fn role(mut entry: Entry) -> Result<()> {
         if &nonce != entry.launch.run.nonce.as_bytes() {
             errors.push("provider RPC nonce mismatch".into());
         }
-        // Both descriptors are explicit copies of this one provider RPC socket.
-        // Inspection compares file descriptions, including the connection's FD.
-        extras.push(stream.as_raw_fd());
+        // Authorize exactly the connection and its intentional observation copy.
+        extras.extend([
+            stream.as_raw_fd(),
+            accepted.observation_descriptor().as_raw_fd(),
+        ]);
         rpc = Some(stream);
         connection = Some(accepted);
     }
@@ -426,6 +454,7 @@ fn role(mut entry: Entry) -> Result<()> {
 }
 
 pub fn run() -> Result<()> {
+    duplicate_extra_socket_requires_its_own_descriptor_allowance();
     if let Some(entry) = executable::entry()? {
         return role(entry);
     }

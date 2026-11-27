@@ -109,6 +109,12 @@ impl Connection {
             cleanup_limit: None,
         }
     }
+    /// Borrow the exact connection descriptor for endpoint inventory observation.
+    pub fn observation_descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.stream.as_fd()
+    }
+
     /// Duplicate the provider endpoint for non-consuming liveness observation.
     /// Closing the duplicate alone does not close this connection.
     pub fn observation_stream(&self) -> Result<UnixStream> {
