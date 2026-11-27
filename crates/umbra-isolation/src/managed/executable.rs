@@ -511,6 +511,11 @@ pub struct PendingRole {
     readiness_deadline: u64,
 }
 impl PendingRole {
+    /// Wait for the current bootstrap exchange without renewing its cutoff.
+    pub(super) fn wait_for_activity(&self) -> io::Result<()> {
+        self.bootstrap.wait_until(self.readiness_deadline)
+    }
+
     /// Exact parent control descriptor for the hosted inventory fixture.
     #[cfg(feature = "managed-endpoint-probe")]
     pub fn probe_bootstrap_fd(&self) -> i32 {

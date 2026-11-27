@@ -223,7 +223,7 @@ pub fn caller(
     observer: Option<Box<dyn RunObserver>>,
 ) -> io::Result<Outcome> {
     while !startup.poll()? {
-        tick();
+        startup.wait_for_activity()?;
     }
     let mut guard = startup.take_guard()?;
     let channel = guard.take_exchange(Role::Relay)?;

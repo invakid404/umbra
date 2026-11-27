@@ -66,6 +66,20 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// Wait for pending output or incoming bytes under the original cutoff.
+    pub fn wait_until(&self, deadline: u64) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let (fd, writing) = self.wait_interest();
+        readiness::wait_descriptors(
+            &mut [libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: if writing { libc::POLLOUT } else { libc::POLLIN },
+                revents: 0,
+            }],
+            deadline,
+        )
+    }
+
     /// Borrow readiness interest without transferring or duplicating ownership.
     /// Pending output must drain before the next input frame is read.
     pub fn wait_interest(&self) -> (std::os::fd::BorrowedFd<'_>, bool) {
@@ -171,6 +185,34 @@ fn check_deadline(deadline: u64) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_wait_retains_cutoff_and_endpoint() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let mut channel = Channel::new(reader).unwrap();
+        let deadline = boot_nanos().unwrap() + 20_000_000;
+        channel.wait_until(deadline).unwrap();
+        assert!(boot_nanos().unwrap() >= deadline);
+        writer.write_all(&encode_frame(&42u64).unwrap()).unwrap();
+        channel.wait_until(deadline).unwrap();
+        assert_eq!(
+            channel.receive::<u64>(deadline).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        // Timeout preserves the endpoint and unread bytes for owned rollback.
+        assert_eq!(channel.receive::<u64>(u64::MAX).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn startup_wait_wakes_for_peer_closure() {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        let mut channel = Channel::new(reader).unwrap();
+        drop(writer);
+        let deadline = boot_nanos().unwrap() + 1_000_000_000;
+        channel.wait_until(deadline).unwrap();
+        assert!(boot_nanos().unwrap() < deadline);
+        assert!(channel.receive::<u64>(deadline).is_err());
+    }
 
     #[test]
     fn partial_control_frame_does_not_publish_or_renew_deadline() {

@@ -33,6 +33,17 @@ pub struct CallerStartup {
 }
 
 impl CallerStartup {
+    /// Wait after a stalled startup step, retaining the relay and original cutoff.
+    pub fn wait_for_activity(&self) -> io::Result<()> {
+        if self.failed || self.complete {
+            return Err(invalid("caller wait outside startup"));
+        }
+        self.children
+            .first()
+            .ok_or_else(|| invalid("caller relay missing"))?
+            .wait_for_activity()
+    }
+
     /// Continue failed cleanup after readiness when GO may have reached a child.
     /// Pending child handles stay here if runtime adoption cannot be validated.
     pub fn fail_runtime(&mut self) -> io::Result<super::guard::Outcome> {
