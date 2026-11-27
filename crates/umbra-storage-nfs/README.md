@@ -185,7 +185,7 @@ failure. Exposed transport and writeback errors are injected to verify error
 classification and retention. These tests do not qualify server storage or
 exercise NFS wire recovery.
 
-`tests/mounted.rs` contains eight ordinary tests and two automated fault tests
+`tests/mounted.rs` contains eight ordinary tests and three automated fault tests
 that are ignored by default. Seven ordinary tests use `UMBRA_TEST_NFS_MOUNT` and
 skip only when it is unset; an explicitly supplied mount that is not writable
 fails the fixture. `absent_mount_rejected_without_creating_it` always runs.
@@ -219,7 +219,8 @@ UMBRA_TEST_NFS_MOUNT=/absolute/path/to/mount cargo test -p umbra-storage-nfs -- 
 
 ### Automated scratch fault tests
 
-Both tests are automated and have passed. Run them individually with explicit
+The transport and server-crash tests have the historical results recorded above.
+Run fault tests individually with explicit
 opt-in, only on the idle scratch export. They validate the scratch mount,
 Compose identity, and export volume before disrupting `umbra-nfs-nfs-1`.
 
@@ -247,6 +248,18 @@ Compose identity, and export volume before disrupting `umbra-nfs-nfs-1`.
    ```
 
 5. Immediately repeat step 3 and leave the server `running false healthy`.
+
+The third ignored test, `provider_drop_after_deadline_miss_returns_promptly`,
+pauses the same scratch server, requires a provider flush to fail its IPC deadline,
+and checks that dropping the proxy returns within five seconds. It resumes the
+server before asserting the elapsed bound. Run it separately, then repeat step 3:
+
+```sh
+UMBRA_TEST_NFS_FAULTS=1 UMBRA_TEST_NFS_MOUNT=~/umbra-scratch/nfs/mnt/umbra-nfs cargo test -p umbra-storage-nfs -- --ignored --test-threads=1 provider_drop_after_deadline_miss_returns_promptly
+```
+
+This test exercises the legacy storage proxy's drop path; it does not qualify
+managed process-tree cleanup or remote durability.
 
 The transport test synchronizes and closes the external writer, pauses the
 server, and checks that the barrier does not return during a two-second outage.
