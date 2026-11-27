@@ -183,6 +183,10 @@ persist Armed custody before launch; completion requires validated cleanup,
 actual parent collection and durable journal completion. A helper failure or
 unconfirmed cleanup makes the command fail. These are the managed run path's
 records and bounds; the legacy `isolate_run` entry remains separately available.
+The SID-1 case with a paused journal and an abruptly ended worker remains
+unqualified: CI observed the journal surviving under process 1 and the CLI
+returning a generic failure rather than the worker's end status. The assertion
+remains unchanged pending the helper-ownership repair.
 SID-1 behavior requires its named CI qualification. See
 [umbra-isolation](../umbra-isolation/README.md).
 <!-- /memoria:section -->

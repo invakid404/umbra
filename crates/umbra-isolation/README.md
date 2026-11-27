@@ -108,6 +108,18 @@ Its emergency case retains failure after all children are collected. The native
 Mach-right companion lives in `umbra-platform-macos`; these hosted stand-ins do
 not establish native debugger behavior or SID-1 qualification.
 
+The endpoint fixture captures the root inventory before topology creation and
+matches later sockets by both stat fields and the platform socket identity.
+Only the root may match that baseline; child roles still require assigned
+endpoints. Unexpected sockets report domain, type and the queried process.
+The managed endpoint, close-on-exec and nonce checks remain in place.
+
+The managed SID-1 case with an abruptly ended worker and a paused journal is
+unresolved. The journal is an ordinary worker-owned provider child; it can remain
+paused after re-parenting, and the caller reports a generic missing-result error.
+The legacy session sweep below does not establish managed parent collection for
+that child. This case requires an ownership repair and fresh CI qualification.
+
 ## Legacy launchd isolation
 
 The remainder describes the retained #193/#205 implementation and its tests.

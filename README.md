@@ -158,7 +158,10 @@ compiler/profile and workload bytes before freezing the current head.
 Missing configuration fails; CI never rebuilds the baseline or counts a skip as
 a sample. The routed baseline registry must select the raw fixture at
 `127.0.0.1:12105`. These runner variables still require provisioning; adding the
-workflow does not establish a passing performance result.
+workflow does not establish a passing performance result. Provisioning paths and frozen hashes are documented in
+`experiments/fixtures/umbra-fix-299b-performance/baseline-provisioning.md`.
+The first SID-1 performance dispatch is tracked in #315; it is not a merge
+requirement for PR #313.
 
 If you're contributing, [the Memoria guide](docs/memoria.md) explains how we keep
 READMEs connected to the code they describe. It covers the review flow and the
