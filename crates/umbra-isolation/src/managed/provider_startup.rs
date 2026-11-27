@@ -23,6 +23,10 @@ pub struct ProviderStartup {
 }
 
 impl ProviderStartup {
+    pub(super) fn wait_for_activity(&self) -> io::Result<()> {
+        self.channel.wait_until(self.deadline)
+    }
+
     /// Exact provider control descriptor for the hosted inventory fixture.
     #[cfg(feature = "managed-endpoint-probe")]
     pub fn probe_bootstrap_fd(&self) -> i32 {

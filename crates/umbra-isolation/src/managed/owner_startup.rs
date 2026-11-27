@@ -25,6 +25,7 @@ pub struct OwnerStartup {
     /// Provider custody retained if runtime construction fails after adoption.
     pub owner: Option<super::owner::Owner>,
     phase: u8,
+    stalled: bool,
     failed: bool,
 }
 
@@ -68,6 +69,7 @@ impl OwnerStartup {
             control: None,
             owner: None,
             phase: 0,
+            stalled: false,
             failed: false,
         }
     }
@@ -190,11 +192,35 @@ impl OwnerStartup {
         if self.failed {
             return Err(invalid("owner startup already failed"));
         }
+        let phase = self.phase;
         let result = self.progress(descriptor, external_caller, timeout_ms);
+        self.stalled = self.phase == phase;
         if result.is_err() {
             self.failed = true;
         }
         result
+    }
+
+    /// Wait on the stalled phase without delaying local transitions.
+    pub fn wait_for_activity(&self) -> io::Result<()> {
+        if !self.stalled {
+            return Ok(());
+        }
+        match self.phase {
+            1 => self
+                .bootstrap
+                .as_ref()
+                .unwrap()
+                .wait_for_activity(&self.entry, &[]),
+            2 => self
+                .control
+                .as_ref()
+                .unwrap()
+                .wait_until(self.entry.readiness_deadline),
+            3 => self.entry.wait_for_startup(),
+            4 => self.bootstrap.as_ref().unwrap().wait_for_provider(),
+            _ => Err(invalid("owner wait outside startup")),
+        }
     }
 
     fn progress(

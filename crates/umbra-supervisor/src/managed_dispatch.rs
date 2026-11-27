@@ -27,7 +27,7 @@ pub fn owner(
     if service.is_none() {
         let descriptor = input.platform().map_err(io::Error::other)?;
         while !startup.poll(descriptor, external_caller, input.timeout_ms())? {
-            tick();
+            startup.wait_for_activity()?;
         }
         umbra_core::launch_stdio::LaunchStdio::release_cli_streams().map_err(io::Error::other)?;
         *service = Some(startup.take_service()?);

@@ -763,6 +763,14 @@ impl Entry {
         Ok(())
     }
 
+    /// Wait on the current startup exchange under its inherited cutoff.
+    pub fn wait_for_startup(&self) -> io::Result<()> {
+        self.bootstrap
+            .as_ref()
+            .ok_or_else(|| invalid("startup already closed"))?
+            .wait_until(self.readiness_deadline)
+    }
+
     fn wait_for_bootstrap(&self, readiness: &super::readiness::Readiness) -> io::Result<()> {
         let channel = self
             .bootstrap

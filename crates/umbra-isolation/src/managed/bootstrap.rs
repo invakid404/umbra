@@ -19,10 +19,18 @@ enum Phase {
     Failed,
 }
 
+enum Pending {
+    Local,
+    Entry,
+    Child(usize),
+    Provider,
+}
+
 /// Retains installed watches across readiness. Child handles remain with the
 /// caller on every error so the actual parent can perform startup rollback.
 pub struct Bootstrap {
     phase: Phase,
+    pending: Pending,
     index: usize,
     members: Vec<Member>,
     receipts: Vec<Ready>,
@@ -37,6 +45,7 @@ impl Bootstrap {
     pub fn new(members: Vec<Member>, receipts: Vec<Ready>) -> io::Result<Self> {
         Ok(Self {
             phase: Phase::Members,
+            pending: Pending::Local,
             index: 0,
             members,
             receipts,
@@ -62,6 +71,13 @@ impl Bootstrap {
         )
     }
 
+    pub(super) fn wait_for_provider(&self) -> io::Result<()> {
+        self.provider
+            .as_ref()
+            .ok_or_else(|| invalid("bootstrap has no provider"))?
+            .wait_for_activity()
+    }
+
     /// One bounded startup step. True means readiness has been queued, never
     /// permission to run; the caller must still accept durable GO.
     pub fn poll(
@@ -70,11 +86,22 @@ impl Bootstrap {
         children: &mut [PendingRole],
         external_caller: bool,
     ) -> io::Result<bool> {
+        self.pending = Pending::Local;
         let result = self.progress(entry, children, external_caller);
         if result.is_err() {
             self.phase = Phase::Failed;
         }
         result
+    }
+
+    /// Wait only for the exchange that stalled; local phase changes run immediately.
+    pub fn wait_for_activity(&self, entry: &Entry, children: &[PendingRole]) -> io::Result<()> {
+        match self.pending {
+            Pending::Local => Ok(()),
+            Pending::Entry => entry.wait_for_startup(),
+            Pending::Child(index) => children[index].wait_for_activity(),
+            Pending::Provider => self.provider.as_ref().unwrap().wait_for_activity(),
+        }
     }
 
     fn progress(
@@ -101,6 +128,7 @@ impl Bootstrap {
                         .any(|m| m.participant.role == umbra_core::managed::Role::Provider)
                     {
                         let Some(member) = provider.member()? else {
+                            self.pending = Pending::Provider;
                             return Ok(false);
                         };
                         self.members.push(member);
@@ -108,6 +136,7 @@ impl Bootstrap {
                 }
                 while let Some(child) = children.get_mut(self.index) {
                     let Some(members) = child.receive_members()? else {
+                        self.pending = Pending::Child(self.index);
                         return Ok(false);
                     };
                     self.members.extend(members);
@@ -116,6 +145,8 @@ impl Bootstrap {
                 if entry.announce_members(&self.members)? {
                     self.phase = Phase::Inventory;
                     self.index = 0;
+                } else {
+                    self.pending = Pending::Entry;
                 }
             }
             Phase::Inventory => {
@@ -132,6 +163,8 @@ impl Bootstrap {
                         self.watch = Some(watch);
                     }
                     self.phase = Phase::Distribute;
+                } else {
+                    self.pending = Pending::Entry;
                 }
             }
             Phase::Distribute => {
@@ -140,12 +173,14 @@ impl Bootstrap {
                     .ok_or_else(|| invalid("bootstrap inventory missing"))?;
                 while let Some(child) = children.get_mut(self.index) {
                     if !child.send_inventory(inventory, external_caller)? {
+                        self.pending = Pending::Child(self.index);
                         return Ok(false);
                     }
                     self.index += 1;
                 }
                 if let Some(provider) = &mut self.provider {
                     if !provider.distribute(inventory)? {
+                        self.pending = Pending::Provider;
                         return Ok(false);
                     }
                 }
@@ -160,6 +195,7 @@ impl Bootstrap {
                         .any(|r| r.participant.role == umbra_core::managed::Role::Provider)
                     {
                         let Some(receipt) = provider.readiness()? else {
+                            self.pending = Pending::Provider;
                             return Ok(false);
                         };
                         self.receipts.push(receipt);
@@ -167,6 +203,7 @@ impl Bootstrap {
                 }
                 while let Some(child) = children.get_mut(self.index) {
                     let Some(receipts) = child.receive_readiness(entry.readiness_deadline)? else {
+                        self.pending = Pending::Child(self.index);
                         return Ok(false);
                     };
                     self.receipts.extend(receipts);
