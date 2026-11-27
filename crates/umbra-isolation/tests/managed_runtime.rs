@@ -22,10 +22,22 @@ use umbra_isolation::managed::{
 #[path = "support/runtime_clock.rs"]
 mod runtime_clock;
 use runtime_clock::SharedClock;
+#[path = "support/cleanup_order.rs"]
+mod cleanup_order;
 #[path = "support/late_acquisition.rs"]
 mod late_acquisition;
 #[path = "support/runtime_tree.rs"]
 mod runtime_tree;
+
+#[test]
+fn cleanup_order_waits_for_held_barriers() {
+    runtime_tree::run_ordered(false).unwrap();
+}
+
+#[test]
+fn cleanup_order_emergency_stays_unconfirmed() {
+    runtime_tree::run_ordered(true).unwrap();
+}
 
 #[cfg(feature = "managed-endpoint-probe")]
 #[test]

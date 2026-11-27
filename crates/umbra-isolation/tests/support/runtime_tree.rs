@@ -1,5 +1,6 @@
 //! Managed custody and notification through ordinary children.
 //! File latches control work, never certify collection.
+use super::cleanup_order;
 use super::runtime_clock::{self, SharedClock};
 #[path = "runtime_activity.rs"]
 mod runtime_activity;
@@ -47,6 +48,7 @@ const PUBLISHERS: [Role; 4] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Case {
     Normal,
+    OrderEmergency,
     StuckCustodian,
     UncancellableWorker,
     OwnerLost,
@@ -60,7 +62,11 @@ impl Case {
     fn acknowledged(self) -> bool {
         matches!(
             self,
-            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker | Self::OwnerLost
+            Self::Normal
+                | Self::OrderEmergency
+                | Self::StuckCustodian
+                | Self::UncancellableWorker
+                | Self::OwnerLost
         )
     }
     fn stuck_role(self) -> Option<Role> {
@@ -73,6 +79,7 @@ impl Case {
     fn failed(self, role: Role) -> bool {
         match self {
             Self::Normal => false,
+            Self::OrderEmergency => role != Role::Worker,
             Self::StuckCustodian | Self::UncancellableWorker | Self::OwnerLost => {
                 matches!(role, Role::Caller | Role::Relay | Role::Guardian)
             }
@@ -88,9 +95,11 @@ impl Case {
     }
     fn held(self, role: Role) -> bool {
         match self {
-            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker | Self::OwnerLost => {
-                false
-            }
+            Self::Normal
+            | Self::OrderEmergency
+            | Self::StuckCustodian
+            | Self::UncancellableWorker
+            | Self::OwnerLost => false,
             Self::TotalLoss => false,
             Self::RelayStalled => role == Role::Relay,
             Self::GuardianStalled => role == Role::Guardian,
@@ -100,9 +109,11 @@ impl Case {
     }
     fn delivery(self) -> Option<Role> {
         match self {
-            Self::Normal | Self::StuckCustodian | Self::UncancellableWorker | Self::OwnerLost => {
-                None
-            }
+            Self::Normal
+            | Self::OrderEmergency
+            | Self::StuckCustodian
+            | Self::UncancellableWorker
+            | Self::OwnerLost => None,
             Self::TotalLoss => None,
             Self::RelayStalled => Some(Role::Worker),
             Self::GuardianStalled => Some(Role::Relay),
@@ -118,6 +129,8 @@ struct Config {
     t0: u64,
     clock: PathBuf,
     case: Case,
+    #[serde(default)]
+    order: bool,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Reading {
@@ -326,7 +339,7 @@ fn state(tickets: &TicketState, pending: Vec<Participant>) -> GuardState {
     }
 }
 fn finish_parent(root: &Path, role: Role, outcome: Outcome) -> io::Result<()> {
-    let waits = outcome
+    let waits: Vec<_> = outcome
         .events
         .iter()
         .filter_map(|event| match event {
@@ -334,6 +347,42 @@ fn finish_parent(root: &Path, role: Role, outcome: Outcome) -> io::Result<()> {
             _ => None,
         })
         .collect();
+    let config: Config = read(root, "config")?.ok_or_else(|| invalid("missing config"))?;
+    if config.order {
+        use cleanup_order::Stage::*;
+        let member: Member =
+            read(root, &name("member", role))?.ok_or_else(|| invalid("missing parent identity"))?;
+        let mut recorder = cleanup_order::Recorder::new(root, config.run, member.participant);
+        for (child, status) in &waits {
+            if *status != 0 && config.case != Case::OrderEmergency {
+                return Err(invalid("ordered cleanup child failed"));
+            }
+            let (stage, dependencies): (_, &[_]) = match child.role {
+                Role::Provider if config.case == Case::OrderEmergency => (
+                    ProviderParentCollected,
+                    &[DebuggerParentCollected, Unconfirmed],
+                ),
+                Role::Provider => (ProviderParentCollected, &[ResourceCertificate]),
+                Role::Worker => (WorkerParentCollected, &[]),
+                Role::CleanupOwner => (OwnerParentCollected, &[ProviderParentCollected]),
+                Role::Guardian => (
+                    GuardianParentCollected,
+                    &[WorkerParentCollected, OwnerParentCollected],
+                ),
+                Role::Relay => (RelayParentCollected, &[GuardianParentCollected]),
+                Role::Caller => return Err(invalid("caller cannot be collected child")),
+            };
+            recorder.record(stage, dependencies, Some(*child), None)?;
+        }
+        if role == Role::Caller && config.case != Case::OrderEmergency {
+            recorder.record(
+                NamespaceComplete,
+                &[RelayParentCollected, ResourceCertificate],
+                None,
+                None,
+            )?;
+        }
+    }
     write(
         root,
         &name("receipt", role),
@@ -435,6 +484,23 @@ pub fn child() -> io::Result<()> {
             record(&root, role, state(&tickets, Vec::new()), &mut prior)?;
             tick();
         }
+        if config.order {
+            ordered_provider(&root, &config, local)?;
+            if config.case == Case::OrderEmergency {
+                write(
+                    &root,
+                    &name("receipt", role),
+                    &Receipt {
+                        role,
+                        failed: true,
+                        waits: Vec::new(),
+                        unresolved: 0,
+                    },
+                )?;
+                drop(rescue);
+                std::process::exit(1);
+            }
+        }
         return write(
             &root,
             &name("receipt", role),
@@ -510,6 +576,22 @@ pub fn child() -> io::Result<()> {
                     return Err(invalid("owner claimed collection while provider latched"));
                 }
                 let provider = participant(&inventory, Role::Provider);
+                if config.order {
+                    use cleanup_order::Stage::*;
+                    cleanup_order::Recorder::new(&root, config.run, local).record(
+                        ProviderParentCollected,
+                        if config.case == Case::OrderEmergency {
+                            &[
+                                cleanup_order::Stage::DebuggerParentCollected,
+                                cleanup_order::Stage::Unconfirmed,
+                            ]
+                        } else {
+                            &[ResourceCertificate]
+                        },
+                        Some(provider),
+                        None,
+                    )?;
+                }
                 let mut raw = 0;
                 let result = unsafe { libc::waitpid(provider.pid as i32, &mut raw, libc::WNOHANG) };
                 if result != -1 || io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD) {
@@ -554,6 +636,9 @@ pub fn child() -> io::Result<()> {
                     {
                         tick();
                     }
+                } else if config.case == Case::OrderEmergency {
+                    drop(rescue);
+                    std::process::exit(1);
                 }
                 return Ok(());
             }
@@ -731,7 +816,10 @@ pub fn child() -> io::Result<()> {
     );
     let failed = outcome.failed;
     finish_parent(&root, role, outcome)?;
-    if (config.case.stuck_role().is_some() || config.case == Case::OwnerLost) && failed {
+    if (config.case.stuck_role().is_some()
+        || matches!(config.case, Case::OwnerLost | Case::OrderEmergency))
+        && failed
+    {
         // The helper reports failure only after its actual child waits.
         drop(rescue);
         std::process::exit(1);
@@ -743,7 +831,124 @@ pub fn total_publication_loss() -> io::Result<()> {
     run(Case::TotalLoss)
 }
 
+fn ordered_provider(root: &Path, config: &Config, local: Participant) -> io::Result<()> {
+    use cleanup_order::Stage::*;
+    struct Owned(std::process::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = || {
+        Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(Owned)
+    };
+    let mut program = spawn()?;
+    let mut debugger = spawn()?;
+    let program_id = identity(program.0.id(), Role::Provider)?;
+    let debugger_id = identity(debugger.0.id(), Role::Provider)?;
+    write(
+        root,
+        "order-native-parents",
+        &[(program_id, local), (debugger_id, local)],
+    )?;
+    let rights = UnixStream::pair()?;
+    let mut recorder = cleanup_order::Recorder::new(root, config.run, local);
+    let hold = |step: &str| {
+        write(root, &format!("order-held-{step}"), &true)?;
+        wait(root, || {
+            Ok(root.join(format!("order-release-{step}")).exists())
+        })
+    };
+    hold("operations")?;
+    recorder.record(ProgramOperationsComplete, &[], None, None)?;
+    hold("terminal")?;
+    let emergency = config.case == Case::OrderEmergency;
+    if emergency {
+        // This scripted operation's allocation was fixed when the tree started.
+        // It is not a new cleanup ticket or a production allowance.
+        let cutoff = config.t0 + 500_000_000;
+        if boot_nanos()? < cutoff {
+            return Err(invalid("emergency before the original operation cutoff"));
+        }
+        recorder.record(
+            Unconfirmed,
+            &[ProgramOperationsComplete],
+            None,
+            Some((ProgramTerminal, cutoff, boot_nanos()?)),
+        )?;
+        recorder.record(DebuggerCleanupStarted, &[Unconfirmed], None, None)?;
+    }
+    drop(program.0.stdin.take());
+    if !program.0.wait()?.success() {
+        return Err(invalid("program failed"));
+    }
+    recorder.record(ProgramTerminal, &[ProgramOperationsComplete], None, None)?;
+    recorder.record(
+        ProgramParentCollected,
+        &[ProgramTerminal],
+        Some(program_id),
+        None,
+    )?;
+    if !emergency {
+        recorder.record(
+            DebuggerCleanupStarted,
+            &[ProgramOperationsComplete, ProgramTerminal],
+            None,
+            None,
+        )?;
+    }
+    drop(debugger.0.stdin.take());
+    if !debugger.0.wait()?.success() {
+        return Err(invalid("debugger failed"));
+    }
+    recorder.record(
+        DebuggerParentCollected,
+        &[DebuggerCleanupStarted],
+        Some(debugger_id),
+        None,
+    )?;
+    hold("rights")?;
+    drop(rights);
+    recorder.record(RightsReleased, &[DebuggerParentCollected], None, None)?;
+    if emergency {
+        return Ok(());
+    }
+    recorder.record(
+        ResourceCertificate,
+        &[
+            ProgramOperationsComplete,
+            ProgramTerminal,
+            ProgramParentCollected,
+            DebuggerParentCollected,
+            RightsReleased,
+        ],
+        None,
+        None,
+    )
+}
+
 pub fn run(case: Case) -> io::Result<()> {
+    run_inner(case, false)
+}
+
+pub fn run_ordered(emergency: bool) -> io::Result<()> {
+    run_inner(
+        if emergency {
+            Case::OrderEmergency
+        } else {
+            Case::Normal
+        },
+        true,
+    )
+}
+
+fn run_inner(case: Case, order: bool) -> io::Result<()> {
     let directory = tempfile::Builder::new()
         .prefix("u-tree-")
         .tempdir_in("/tmp")?;
@@ -757,6 +962,7 @@ pub fn run(case: Case) -> io::Result<()> {
         t0: boot_nanos()?,
         clock: clock.path(),
         case,
+        order,
     };
     clock.set(config.t0);
     let _scope = clock.install();
@@ -839,11 +1045,34 @@ pub fn run(case: Case) -> io::Result<()> {
     let mut rescued = false;
     let mut wrong_caller_state = false;
     let mut caller_notified_before_ack = false;
+    let mut order_violation = false;
     let mut stopping_child = false;
     let mut prior = None;
     let activity = runtime_activity::Activity::new(root, &config.clock, true)?;
     let outcome = guard.run_parent_with_test_activity(
         |state| {
+            if order {
+                use cleanup_order::Stage::*;
+                for (step, forbidden) in [
+                    ("operations", DebuggerCleanupStarted),
+                    ("terminal", DebuggerCleanupStarted),
+                    ("rights", ResourceCertificate),
+                ] {
+                    if root.join(format!("order-held-{step}")).exists()
+                        && !root.join(format!("order-release-{step}")).exists()
+                    {
+                        if cleanup_order::load(root, forbidden)?.is_some() {
+                            // Preserve the observation, but release the fixture
+                            // so every actual parent still collects its children.
+                            order_violation = true;
+                        }
+                        if case == Case::OrderEmergency && step == "terminal" {
+                            clock.advance_to(config.t0 + 500_000_000);
+                        }
+                        write(root, &format!("order-release-{step}"), &true)?;
+                    }
+                }
+            }
             caller_notified_before_ack |=
                 state.ticket == Some(ticket) && boot_nanos()? == config.t0;
             wrong_caller_state |= state.expired
@@ -1047,7 +1276,9 @@ pub fn run(case: Case) -> io::Result<()> {
             .collect();
         if receipt.waits.len() != expected.len()
             || expected.iter().any(|peer| {
-                let status = if let Some(stuck) = case.stuck_role() {
+                let status = if case == Case::OrderEmergency && peer.role != Role::Worker {
+                    1 << 8
+                } else if let Some(stuck) = case.stuck_role() {
                     match peer.role {
                         role if role == stuck => libc::SIGKILL,
                         Role::Guardian | Role::Relay => 1 << 8,
@@ -1071,6 +1302,85 @@ pub fn run(case: Case) -> io::Result<()> {
         eprintln!(
             "{case:?} actual parent receipt: {}",
             serde_json::to_string(&receipt)?
+        );
+    }
+    if order {
+        if order_violation {
+            return Err(invalid("cleanup crossed a held barrier"));
+        }
+        let mut parents: Vec<_> = inventory
+            .members
+            .iter()
+            .filter_map(|m| m.parent.map(|p| (m.participant, p)))
+            .collect();
+        parents.extend(
+            read::<Vec<(Participant, Participant)>>(root, "order-native-parents")?
+                .ok_or_else(|| invalid("missing resource parents"))?,
+        );
+        let mut pending = Vec::<cleanup_order::Receipt>::new();
+        for entry in std::fs::read_dir(root)? {
+            let path = entry?.path();
+            let name = path.file_name().unwrap().to_string_lossy();
+            if name.starts_with("order-") && name.ends_with(".json") {
+                pending.push(serde_json::from_slice(&std::fs::read(path)?)?);
+            }
+        }
+        let mut ordered: Vec<cleanup_order::Receipt> = Vec::new();
+        while !pending.is_empty() {
+            let index = pending
+                .iter()
+                .position(|r| {
+                    r.predecessors
+                        .iter()
+                        .all(|id| ordered.iter().any(|p| p.id == *id))
+                        && r.id.sequence
+                            == 1 + ordered
+                                .iter()
+                                .filter(|p| p.id.producer == r.id.producer)
+                                .count() as u64
+                })
+                .ok_or_else(|| invalid("order receipts missing causal predecessor"))?;
+            ordered.push(pending.remove(index));
+        }
+        cleanup_order::verify(
+            &ordered,
+            config.run,
+            config.case == Case::OrderEmergency,
+            &parents,
+        )
+        .map_err(|error| invalid(&error))?;
+        // Exercise the parser against the receipts from these actual processes.
+        // A census with the same final empty state cannot recover missing proof.
+        if case == Case::Normal {
+            use cleanup_order::Stage::*;
+            for missing in [ProgramTerminal, DebuggerParentCollected, RightsReleased] {
+                let damaged: Vec<_> = ordered
+                    .iter()
+                    .filter(|r| r.stage != missing)
+                    .cloned()
+                    .collect();
+                if cleanup_order::verify(&damaged, config.run, false, &parents).is_ok() {
+                    return Err(invalid("missing proof accepted"));
+                }
+            }
+            let mut stale = ordered.clone();
+            stale[0].run.generation += 1;
+            if cleanup_order::verify(&stale, config.run, false, &parents).is_ok() {
+                return Err(invalid("stale generation accepted"));
+            }
+            let mut forged = ordered.clone();
+            let wait = forged
+                .iter_mut()
+                .find(|r| r.stage == ProviderParentCollected)
+                .unwrap();
+            wait.id.producer = participant(&inventory, Role::Worker);
+            if cleanup_order::verify(&forged, config.run, false, &parents).is_ok() {
+                return Err(invalid("nonparent collection accepted"));
+            }
+        }
+        eprintln!(
+            "ordered cleanup receipts: {}",
+            serde_json::to_string(&ordered)?
         );
     }
     Ok(())
