@@ -122,6 +122,17 @@ fn spawn_impl(
                 // inherited, including descriptors lacking FD_CLOEXEC.
                 flags |= 0x4000;
                 for fd in 0..=2 {
+                    // Preserve the legacy allowance for absent standard streams.
+                    // Explicit inheritance of a closed descriptor fails with EBADF.
+                    if libc::fcntl(fd, libc::F_GETFD) == -1 {
+                        let error = std::io::Error::last_os_error()
+                            .raw_os_error()
+                            .unwrap_or(libc::EIO);
+                        if error == libc::EBADF {
+                            continue;
+                        }
+                        return Err(error);
+                    }
                     let result = posix_spawn_file_actions_addinherit_np(&mut actions, fd);
                     if result != 0 {
                         return Err(result);
@@ -222,6 +233,51 @@ mod tests {
         // SAFETY: valid out-pointer; `pid` is our child.
         unsafe { libc::waitpid(pid, &mut st, 0) };
         st
+    }
+
+    #[test]
+    fn managed_spawn_accepts_closed_standard_error() {
+        const CHILD: &str = "UMBRA_TEST_CLOSED_STDERR";
+        if std::env::var_os(CHILD).is_some() {
+            // Isolated exec child: leave the test runner's descriptor table alone.
+            assert_eq!(unsafe { libc::close(2) }, 0);
+            let args = vec![OsString::from("/usr/bin/true")];
+            let env = environment(&[], &[]);
+            let legacy = spawn(Path::new("/usr/bin/true"), &args, &env, false, &[]).unwrap();
+            assert_eq!(wait(legacy), 0, "base spawn accepts closed stderr");
+            assert_eq!(unsafe { libc::fcntl(2, libc::F_GETFD) }, -1);
+            let managed = spawn_managed(Path::new("/usr/bin/true"), &args, &env, false, &[]);
+            println!("legacy exited0 with fd2 absent; managed spawn result: {managed:?}");
+            let managed = managed.expect("managed spawn must preserve base closed-stderr behavior");
+            assert_eq!(wait(managed), 0);
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "spawn::tests::managed_spawn_accepts_closed_standard_error",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "isolated closed-stderr case failed: {status}"
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("isolated closed-stderr case exceeded bound");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// The test process ignores SIGPIPE (the Rust runtime does). The spawned
