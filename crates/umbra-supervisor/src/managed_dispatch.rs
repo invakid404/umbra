@@ -84,58 +84,72 @@ pub fn guardian(
 }
 
 fn forward(guard: Guard, forwarder: Forwarder) -> Outcome {
-    let mut forwarder = Some(forwarder);
-    guard.run_parent_with_progress(move |ticket| {
-        let result = forwarder
-            .as_mut()
-            .unwrap()
-            .poll(ticket.map(|ticket| ticket.deadline));
-        if result.is_err() {
-            // Closing both exchange ends wakes the worker and its real parent;
-            // the independent guard continues collecting its actual children.
-            forwarder.take();
-        }
-        result.map_err(io::Error::other)
-    })
+    let forwarding = std::cell::RefCell::new(Some(forwarder));
+    guard.run_parent_with_wait(
+        |ticket| {
+            let mut forwarder = forwarding.borrow_mut();
+            let result = forwarder
+                .as_mut()
+                .unwrap()
+                .poll(ticket.map(|ticket| ticket.deadline));
+            if result.is_err() {
+                // Closing both exchange ends wakes the worker and its real parent;
+                // the independent guard continues collecting its actual children.
+                forwarder.take();
+            }
+            result.map_err(io::Error::other)
+        },
+        |guard| {
+            let forwarding = forwarding.borrow();
+            guard.wait_for_activity(forwarding.as_ref().and_then(Forwarder::wait_interest))
+        },
+    )
 }
 
 fn observe(guard: Guard, transport: CallerTransport) -> Outcome {
     let result = transport.result_handle();
-    let mut transport = Some(transport);
-    let mut outcome = guard.run_parent_with_progress(move |ticket| {
-        #[cfg(feature = "probe-native-setup-cancel")]
-        if let Some(directory) = std::env::var_os("UMBRA_NATIVE_SETUP_PROBE") {
-            let directory = std::path::PathBuf::from(directory);
-            let caller = std::fs::read_to_string(directory.join("caller.pid"))
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok());
-            if caller == Some(std::process::id()) && directory.join("setup.json").exists() {
-                let now = umbra_isolation::managed::boot_nanos()?;
-                std::fs::write(directory.join("triggered.json"), now.to_string())?;
-                transport.take();
-                return Err(io::Error::other("native setup probe caller cancellation"));
+    let observing = std::cell::RefCell::new(Some(transport));
+    let mut outcome = guard.run_parent_with_wait(
+        |ticket| {
+            let mut transport = observing.borrow_mut();
+            #[cfg(feature = "probe-native-setup-cancel")]
+            if let Some(directory) = std::env::var_os("UMBRA_NATIVE_SETUP_PROBE") {
+                let directory = std::path::PathBuf::from(directory);
+                let caller = std::fs::read_to_string(directory.join("caller.pid"))
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok());
+                if caller == Some(std::process::id()) && directory.join("setup.json").exists() {
+                    let now = umbra_isolation::managed::boot_nanos()?;
+                    std::fs::write(directory.join("triggered.json"), now.to_string())?;
+                    transport.take();
+                    return Err(io::Error::other("native setup probe caller cancellation"));
+                }
             }
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            transport
-                .as_mut()
-                .unwrap()
-                .poll(ticket.map(|ticket| ticket.deadline))
-        }));
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                transport.take();
-                Err(io::Error::other(error))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                transport
+                    .as_mut()
+                    .unwrap()
+                    .poll(ticket.map(|ticket| ticket.deadline))
+            }));
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => {
+                    transport.take();
+                    Err(io::Error::other(error))
+                }
+                Err(payload) => {
+                    // Collection must continue even if a terminal callback unwinds.
+                    std::mem::forget(payload);
+                    transport.take();
+                    Err(io::Error::other("managed terminal observer panicked"))
+                }
             }
-            Err(payload) => {
-                // Collection must continue even if a terminal callback unwinds.
-                std::mem::forget(payload);
-                transport.take();
-                Err(io::Error::other("managed terminal observer panicked"))
-            }
-        }
-    });
+        },
+        |guard| {
+            let observing = observing.borrow();
+            guard.wait_for_activity(observing.as_ref().and_then(CallerTransport::wait_interest))
+        },
+    );
     match result.borrow().as_ref() {
         Some(Ok(())) => {}
         result => {

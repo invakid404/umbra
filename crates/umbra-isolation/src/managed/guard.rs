@@ -217,6 +217,23 @@ impl Guard {
     }
 
     fn run_parent_observed(self, progress: impl FnMut(&Self) -> io::Result<()>) -> Outcome {
+        self.run_parent_waiting(progress, |guard| guard.wait_for_activity(None))
+    }
+
+    /// Run application progress and its borrowed readiness together with cleanup.
+    pub fn run_parent_with_wait(
+        self,
+        mut progress: impl FnMut(Option<umbra_core::managed::Ticket>) -> io::Result<()>,
+        wait: impl FnMut(&mut Self) -> io::Result<()>,
+    ) -> Outcome {
+        self.run_parent_waiting(|guard| progress(guard.tickets.ticket()), wait)
+    }
+
+    fn run_parent_waiting(
+        self,
+        progress: impl FnMut(&Self) -> io::Result<()>,
+        wait: impl FnMut(&mut Self) -> io::Result<()>,
+    ) -> Outcome {
         let local = self.local.role;
         let capacity = self.capacity;
         let children: Vec<_> = self.children.iter().map(|child| child.identity).collect();
@@ -242,6 +259,7 @@ impl Guard {
                 Ok(actions)
             },
             progress,
+            wait,
         )
     }
 
@@ -252,13 +270,14 @@ impl Guard {
         self,
         on_event: impl FnMut(&Event, Option<umbra_core::managed::Ticket>) -> io::Result<Vec<Action>>,
     ) -> Outcome {
-        self.run_with_progress(on_event, |_| Ok(()))
+        self.run_with_progress(on_event, |_| Ok(()), |guard| guard.wait_for_activity(None))
     }
 
     fn run_with_progress(
         mut self,
         mut on_event: impl FnMut(&Event, Option<umbra_core::managed::Ticket>) -> io::Result<Vec<Action>>,
         mut progress: impl FnMut(&Self) -> io::Result<()>,
+        mut wait: impl FnMut(&mut Self) -> io::Result<()>,
     ) -> Outcome {
         let mut progress_failed = false;
         let mut events = Vec::new();
@@ -328,7 +347,20 @@ impl Guard {
             {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            let waiting = if progress_failed {
+                self.wait_for_activity(None)
+            } else {
+                wait(&mut self)
+            };
+            if let Err(error) = waiting {
+                self.tickets.fail();
+                events.push(Event::Failed(format!("parent readiness: {error}")));
+                if let Err(error) = self.notify_failure() {
+                    events.push(Event::Failed(format!(
+                        "parent failure notification: {error}"
+                    )));
+                }
+            }
         }
         #[cfg(feature = "shutdown-witness")]
         crate::performance_observation::record_details(
@@ -518,6 +550,10 @@ impl Guard {
         if child.pid() != identity.pid
             || self.children.iter().any(|c| c.identity.pid == identity.pid)
         {
+            return Err(child);
+        }
+        if !self.watch.covers(&[identity]) && self.watch.install(identity).is_err() {
+            self.tickets.fail();
             return Err(child);
         }
         self.children.push(Owned {
