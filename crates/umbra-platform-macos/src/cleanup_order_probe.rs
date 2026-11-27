@@ -4,6 +4,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// A per-test, per-process observation fault. Never changes the operation
+/// directed at the program or the deadline governing cleanup.
+pub(crate) fn withhold_terminal(pid: i32) -> bool {
+    std::env::var_os("UMBRA_NATIVE_CLEANUP_ORDER").is_some_and(|root| {
+        std::path::PathBuf::from(root)
+            .join(format!("withhold-terminal-{pid}"))
+            .is_file()
+    })
+}
+
 pub(crate) fn record(stage: &str, details: serde_json::Value, hold: bool) {
     let Some(root) = std::env::var_os("UMBRA_NATIVE_CLEANUP_ORDER") else {
         return;

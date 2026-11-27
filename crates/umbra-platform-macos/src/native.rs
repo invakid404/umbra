@@ -4925,9 +4925,16 @@ impl Session {
             self.reaped = true;
             return BarrierReading::Confirmed(BarrierEvidence::ReapedByPlatform);
         }
-        let found = settled_lookup(lookup(pid), || {
-            std::thread::sleep(LAUNCHD_ZOMBIE_SETTLE);
+        let observe = || {
+            #[cfg(feature = "test-native-cleanup-order")]
+            if crate::cleanup_order_probe::withhold_terminal(pid) {
+                return Lookup::Error("test withheld terminal observation".into());
+            }
             lookup(pid)
+        };
+        let found = settled_lookup(observe(), || {
+            std::thread::sleep(LAUNCHD_ZOMBIE_SETTLE);
+            observe()
         });
         barrier_decision(self.exit_report.as_deref(), self.birth, &found)
     }

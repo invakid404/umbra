@@ -492,6 +492,7 @@ jobs:
           UMBRA_FIX_271_EVIDENCE_FILE: /tmp/umbra-order-${{ github.run_id }}-${{ github.run_attempt }}.jsonl
         run: |
           cargo test -p umbra-platform-macos --features test-native-cleanup-order --test shutdown_ledger r2_native_da_order_across_roles -- --exact --nocapture --test-threads=1
+          UMBRA_NATIVE_CLEANUP_ORDER="${UMBRA_NATIVE_CLEANUP_ORDER}-emergency" UMBRA_FIX_271_EVIDENCE_FILE="${UMBRA_FIX_271_EVIDENCE_FILE}.emergency" cargo test -p umbra-platform-macos --features test-native-cleanup-order --test shutdown_ledger r2_native_da_order_emergency -- --exact --nocapture --test-threads=1
       - name: Qualify shutdown inventory and owner destruction
         env:
           UMBRA_RETIREMENT_WITNESS: "1"
