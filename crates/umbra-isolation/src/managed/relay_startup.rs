@@ -398,6 +398,72 @@ mod construction_tests {
     use std::{os::unix::net::UnixStream, panic::AssertUnwindSafe, path::Path};
 
     #[test]
+    fn expired_readiness_still_collects_pre_go_guardian() {
+        let launch = serde_json::from_str(
+            r#"{"version":1,"run":{"nonce":"00000000-0000-4000-8000-000000000001","generation":1},"capacity":64,"dispatch":"admission","payload":[]}"#,
+        ).unwrap();
+        let now = super::super::boot_nanos().unwrap();
+        let mut startup =
+            RelayStartup::new(Entry::root_relay(launch, now + 2_000_000_000).unwrap()).unwrap();
+        // Model elapsed namespace preparation after readiness, before GO. No
+        // production deadline is changed by this feature-gated fixture.
+        let expired = now.checked_sub(10_000_000_000).unwrap();
+        startup.entry.readiness_deadline = expired;
+        let child = super::super::process::SpawnedChild::spawn(
+            Path::new("/bin/sleep"),
+            &["sleep".into(), "0.1".into()],
+            &[],
+            false,
+            &[],
+        )
+        .unwrap();
+        let pid = child.pid();
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        startup.children.push(PendingRole::test_unreleased(
+            child,
+            stream,
+            startup.entry.launch.run,
+            expired,
+        ));
+        startup.ready = true;
+        startup.bootstrap.take();
+        let result = startup.fail_runtime();
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        let collected =
+            observed == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+        // Reap the short-lived fixture after recording the production outcome.
+        // poll still performs real-parent waits before checking its cutoff.
+        if !collected {
+            let cleanup_limit = super::super::boot_nanos().unwrap() + 2_000_000_000;
+            loop {
+                if matches!(startup.rollback(), Ok(true)) {
+                    break;
+                }
+                assert!(
+                    super::super::boot_nanos().unwrap() < cleanup_limit,
+                    "fixture collection failed"
+                );
+                std::thread::yield_now();
+            }
+        }
+        assert!(
+            collected,
+            "expired readiness must not strand an uncollected pre-GO guardian: {result:?}"
+        );
+        let outcome = result.unwrap();
+        assert!(outcome.failed);
+        assert!(outcome.unresolved.is_empty());
+    }
+
+    #[test]
     fn consumed_preparation_collects_guardian_without_panicking() {
         let launch = serde_json::from_str(
             r#"{"version":1,"run":{"nonce":"00000000-0000-4000-8000-000000000001","generation":1},"capacity":64,"dispatch":"admission","payload":[]}"#,

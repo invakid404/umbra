@@ -457,6 +457,10 @@ jobs:
         run: |
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
           cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::owner_startup::construction_tests::adopted_provider_is_collected_during_failed_startup -- --exact --nocapture --test-threads=1
+      - name: Qualify expired readiness rollback
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::relay_startup::construction_tests::expired_readiness_still_collects_pre_go_guardian -- --exact --nocapture --test-threads=1
       - name: Qualify consumed relay preparation failure
         run: |
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
