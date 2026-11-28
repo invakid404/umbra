@@ -217,11 +217,34 @@ impl OwnerStartup {
             match watched {
                 Ok(watch) => self.rollback_watch = Some(watch),
                 Err(error) => {
-                    return if child.try_wait()?.is_some() {
-                        Ok(true)
-                    } else {
-                        Err(error)
-                    };
+                    if child.try_wait()?.is_some() {
+                        return Ok(true);
+                    }
+                    // Descriptor exhaustion must not prevent the real parent
+                    // from stopping and collecting its unstarted provider.
+                    if let Err(stop) = child.kill() {
+                        if child.try_wait()?.is_none() {
+                            return Err(io::Error::other(format!(
+                                "rollback watch failed: {error}; provider stop failed: {stop}"
+                            )));
+                        }
+                    }
+                    loop {
+                        if child.try_wait()?.is_some() {
+                            return Err(error);
+                        }
+                        let now = super::boot_nanos()?;
+                        if now >= deadline {
+                            return Err(io::Error::other(format!(
+                                "rollback watch failed: {error}; provider collection timed out"
+                            )));
+                        }
+                        // No further descriptor allocation; retain the original
+                        // absolute rollback cutoff for bounded parent waits.
+                        std::thread::sleep(std::time::Duration::from_nanos(
+                            (deadline - now).min(1_000_000),
+                        ));
+                    }
                 }
             }
         }

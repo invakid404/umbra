@@ -445,6 +445,14 @@ jobs:
           git diff --stat -- experiments/fixtures/umbra-fix-227-observer-providers/Cargo.lock
           cargo build --locked --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           cargo test -p umbra-supervisor --test observer_failure -- --nocapture --test-threads=1
+      - name: Qualify rollback watch allocation failure
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::owner_startup::construction_tests::watch_allocation_failure_still_collects_provider -- --exact --nocapture --test-threads=1
+      - name: Qualify rollback watch installation failure
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::owner_startup::construction_tests::watch_install_failure_still_collects_provider -- --exact --nocapture --test-threads=1
       - name: Qualify adopted provider construction failure
         run: |
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
