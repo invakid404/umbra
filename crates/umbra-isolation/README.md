@@ -44,6 +44,12 @@ abandonment stops the worker; custodians retain their children through their
 original cleanup opportunities. Ordinary programs have no default age or
 inactivity limit.
 
+Runtime construction failures retain actual-parent custody: the owner closes
+its startup endpoints and collects its adopted provider, and the relay collects
+its guardian without repeating consumed preparation. Both reuse the existing
+rollback allocation and retain the construction error as primary. Incomplete
+collection remains a reported failure.
+
 Managed startup and cleanup wait on descriptor readiness and process-exit
 events. Admission cancellation wakes a pending exchange to observe a shortened
 cutoff. Observer traffic shares the guard wait with independent cleanup routes.
