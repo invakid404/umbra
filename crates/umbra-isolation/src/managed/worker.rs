@@ -31,6 +31,8 @@ pub struct WorkerCleanup {
     forwarded: Vec<Start>,
     inventory: Option<Vec<Participant>>,
     receipt: Option<ProviderReceipt>,
+    #[cfg(test)]
+    before_collection_complete: Option<Box<dyn FnOnce()>>,
 }
 
 /// Thread-affine shared cleanup state for the worker run owner and platform proxy.
@@ -451,6 +453,8 @@ impl WorkerCleanup {
             routes,
             inventory: None,
             receipt: None,
+            #[cfg(test)]
+            before_collection_complete: None,
         })
     }
 
@@ -788,6 +792,10 @@ impl ManagedCleanup for WorkerCleanup {
                 }
                 // Revisit routes after each message, including frames already
                 // buffered in Channel, before declaring the collection clean.
+                #[cfg(test)]
+                if let Some(inject) = self.before_collection_complete.take() {
+                    inject();
+                }
                 if self.collection_complete() && !received_control {
                     break;
                 }
@@ -1144,15 +1152,20 @@ mod tests {
 
     #[test]
     fn collection_drains_failed_start_buffered_after_owner_receipt() {
-        buffered_collection_failure(false);
+        buffered_collection_failure(false, false);
     }
 
     #[test]
     fn stored_receipt_drains_buffered_independent_failure() {
-        buffered_collection_failure(true);
+        buffered_collection_failure(true, false);
     }
 
-    fn buffered_collection_failure(stored_receipt: bool) {
+    #[test]
+    fn collection_drains_start_arriving_after_route_scan() {
+        buffered_collection_failure(true, true);
+    }
+
+    fn buffered_collection_failure(stored_receipt: bool, late: bool) {
         // Both messages are buffered before collection; owner route is visited first.
         let local = identity(std::process::id(), Role::Worker).unwrap();
         let owner = Participant {
@@ -1222,9 +1235,18 @@ mod tests {
                 .queue(&ControlMessage::Collected(receipt))
                 .unwrap();
         }
-        guardian_channel
-            .queue(&ControlMessage::Start(notification.clone()))
-            .unwrap();
+        if late {
+            let mut sender = Channel::new(guardian_channel.stream.try_clone().unwrap()).unwrap();
+            let notification = notification.clone();
+            worker.before_collection_complete = Some(Box::new(move || {
+                sender.queue(&ControlMessage::Start(notification)).unwrap();
+                assert!(sender.flush(deadline).unwrap());
+            }));
+        } else {
+            guardian_channel
+                .queue(&ControlMessage::Start(notification.clone()))
+                .unwrap();
+        }
         assert!(owner_channel.flush(deadline).unwrap());
         assert!(guardian_channel.flush(deadline).unwrap());
         let done = std::sync::atomic::AtomicBool::new(false);
