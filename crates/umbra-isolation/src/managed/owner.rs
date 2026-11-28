@@ -714,7 +714,11 @@ impl Owner {
             }
         }
         #[cfg(feature = "test-exit-before-wait")]
-        if self.defer_exit_wait && self.test_exit_observed {
+        if self.defer_exit_wait {
+            // Do not let collection race ahead of consuming the exit notification.
+            if !self.exit_observed {
+                return Ok(None);
+            }
             self.defer_exit_wait = false;
             if let Some(path) = std::env::var_os("UMBRA_TEST_PROVIDER_EXIT_BEFORE_WAIT") {
                 std::fs::write(path, b"exit-before-parent-wait\n")?;

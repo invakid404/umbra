@@ -747,10 +747,12 @@ impl Guard {
             if self.defer_exit_wait
                 && (self.local.role != umbra_core::managed::Role::Guardian
                     || owned.identity.role == umbra_core::managed::Role::Worker)
-                && events
-                    .iter()
-                    .any(|event| matches!(event, Event::Exited(peer) if *peer == owned.identity))
             {
+                // Keep collection held until this loop consumes the notification,
+                // even if the child exits after the watch was polled this turn.
+                if !owned.exit_observed {
+                    continue;
+                }
                 // Model NOTE_EXIT arriving before the parent's nonblocking wait
                 // can return a status. Keep the actual child handle untouched.
                 self.defer_exit_wait = false;
