@@ -546,6 +546,27 @@ pub struct PendingRole {
     readiness_deadline: u64,
 }
 impl PendingRole {
+    #[cfg(all(test, feature = "test-managed-construction-failure"))]
+    pub(super) fn test_unreleased(
+        child: SpawnedChild,
+        stream: UnixStream,
+        run: umbra_core::managed::RunIdentity,
+        readiness_deadline: u64,
+    ) -> Self {
+        Self {
+            child,
+            bootstrap: super::Channel::new(stream).unwrap(),
+            role: Role::Guardian,
+            run,
+            ready: true,
+            member: None,
+            parent: identity(std::process::id(), Role::Relay).unwrap(),
+            inventory_sent: None,
+            go_queued: None,
+            capacity: 64,
+            readiness_deadline,
+        }
+    }
     pub(super) fn role(&self) -> Role {
         self.role
     }

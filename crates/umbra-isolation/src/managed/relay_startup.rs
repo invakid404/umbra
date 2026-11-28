@@ -354,3 +354,62 @@ fn dedicated_session() -> bool {
     }
     crate::in_launchd_session()
 }
+
+#[cfg(all(test, feature = "test-managed-construction-failure"))]
+mod construction_tests {
+    use super::*;
+    use std::{os::unix::net::UnixStream, panic::AssertUnwindSafe, path::Path};
+
+    #[test]
+    fn consumed_preparation_collects_guardian_without_panicking() {
+        let launch = serde_json::from_str(
+            r#"{"version":1,"run":{"nonce":"00000000-0000-4000-8000-000000000001","generation":1},"capacity":64,"dispatch":"admission","payload":[]}"#,
+        ).unwrap();
+        let deadline = super::super::boot_nanos().unwrap() + 2_000_000_000;
+        let mut startup = RelayStartup::new(Entry::root_relay(launch, deadline).unwrap()).unwrap();
+        let child = super::super::process::SpawnedChild::spawn(
+            Path::new("/bin/sleep"),
+            &["sleep".into(), "0.1".into()],
+            &[],
+            false,
+            &[],
+        )
+        .unwrap();
+        let pid = child.pid();
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        startup.children.push(PendingRole::test_unreleased(
+            child,
+            stream,
+            startup.entry.launch.run,
+            deadline,
+        ));
+        startup.ready = true;
+        startup.bootstrap.take();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| startup.fail_runtime()));
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        let collected =
+            observed == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+        // Baseline recovery panics with the child still retained. Reap the
+        // short-lived fixture before asserting, without supplying the proof.
+        for child in &mut startup.children {
+            while child.child.collect().unwrap().is_none() {
+                assert!(super::super::boot_nanos().unwrap() < deadline);
+                std::thread::yield_now();
+            }
+        }
+        let outcome = result
+            .expect("recovery must not repeat consumed preparation")
+            .unwrap();
+        assert!(outcome.failed);
+        assert!(outcome.unresolved.is_empty());
+        assert!(collected, "relay must perform the guardian parent wait");
+    }
+}
