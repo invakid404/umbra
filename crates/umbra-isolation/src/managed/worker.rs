@@ -1271,6 +1271,77 @@ mod tests {
     }
 
     #[test]
+    fn unsolicited_collection_ack_remains_failed_on_retry() {
+        let local = identity(std::process::id(), Role::Worker).unwrap();
+        let owner = Participant {
+            role: Role::CleanupOwner,
+            ..local
+        };
+        let guardian = Participant {
+            role: Role::Guardian,
+            ..local
+        };
+        let provider = Participant {
+            role: Role::Provider,
+            ..local
+        };
+        let run: RunIdentity = serde_json::from_str(
+            r#"{"nonce":"00000000-0000-0000-0000-000000000001","generation":1}"#,
+        )
+        .unwrap();
+        let (worker_owner, _owner_socket) = UnixStream::pair().unwrap();
+        let (worker_guardian, guardian_socket) = UnixStream::pair().unwrap();
+        let mut worker = WorkerCleanup::new(
+            run,
+            local,
+            owner,
+            provider,
+            1,
+            vec![
+                Route::new(owner, Channel::new(worker_owner).unwrap()).unwrap(),
+                Route::new(guardian, Channel::new(worker_guardian).unwrap()).unwrap(),
+            ],
+        )
+        .unwrap();
+        let original = Start {
+            run,
+            origin: local,
+            ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Trusted, 1).unwrap(),
+        };
+        worker
+            .tickets
+            .accept(original.clone(), local, local)
+            .unwrap();
+        worker.receipt = Some(ProviderReceipt {
+            run,
+            owner,
+            provider,
+            status: 0,
+            failed: false,
+        });
+        let mut peer_tickets = TicketState::new(run, 1).unwrap();
+        let ack = peer_tickets
+            .accept(original.clone(), local, guardian)
+            .unwrap();
+        let mut channel = Channel::new(guardian_socket).unwrap();
+        channel.queue(&ControlMessage::Ack(ack)).unwrap();
+        assert!(channel.flush(original.ticket.deadline).unwrap());
+        let first = worker.collect_provider().unwrap_err();
+        assert!(
+            first.to_string().contains("unsolicited collection ACK"),
+            "{first}"
+        );
+        assert!(
+            worker.collect_provider().is_err(),
+            "quiet retry must retain the collection failure"
+        );
+        assert!(
+            worker.provider_receipt().is_none(),
+            "failed exchange cannot expose a clean receipt"
+        );
+    }
+
+    #[test]
     fn collection_commits_independent_start_before_ack_and_retains_failure() {
         // Live control sockets with a scripted owner receipt: the owner withholds
         // its receipt until the guardian has received the worker's ACK.
