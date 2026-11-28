@@ -115,11 +115,29 @@ impl Rollback {
             return Ok(());
         }
         if self.watch.is_none() {
-            #[cfg(test)]
-            if self.fail_watch_allocation {
-                return Err(io::Error::from_raw_os_error(libc::EMFILE));
+            let allocated = (|| {
+                #[cfg(test)]
+                if self.fail_watch_allocation {
+                    return Err(io::Error::from_raw_os_error(libc::EMFILE));
+                }
+                super::process::ProcessWatch::new()
+            })();
+            match allocated {
+                Ok(watch) => self.watch = Some(watch),
+                Err(failure) => {
+                    // Closing bootstrap already requests recursive rollback.
+                    // Allocation failure cannot replace actual parent waits.
+                    // Keep the existing cutoff and return the original failure
+                    // after collection; expiry retains unresolved custody.
+                    while !self.poll()? {
+                        let now = boot_nanos()?;
+                        std::thread::sleep(std::time::Duration::from_nanos(
+                            self.deadline.saturating_sub(now).min(1_000_000),
+                        ));
+                    }
+                    return Err(failure);
+                }
             }
-            self.watch = Some(super::process::ProcessWatch::new()?);
         }
         let watch = self.watch.as_mut().unwrap();
         for ((child, status), role) in self
