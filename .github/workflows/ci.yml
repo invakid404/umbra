@@ -449,6 +449,7 @@ jobs:
         run: |
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
           cargo test -p umbra-isolation --features test-exit-before-wait --lib managed::guard::policy_tests::exit_notification_before_wait_keeps_collection_ready -- --exact --nocapture --test-threads=1
+          cargo test -p umbra-isolation --features test-exit-before-wait --lib managed::owner::tests::owner_exit_notification_before_wait_keeps_collection_ready -- --exact --nocapture --test-threads=1
       - name: Qualify rollback watch allocation failure
         run: |
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880

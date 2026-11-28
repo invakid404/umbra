@@ -234,6 +234,7 @@ pub struct Owner {
     transport_closed: bool,
     cancellation_requested: bool,
     collected: Option<ExitStatus>,
+    exit_observed: bool,
     #[cfg(all(test, feature = "test-exit-before-wait"))]
     defer_exit_wait: bool,
     #[cfg(all(test, feature = "test-exit-before-wait"))]
@@ -311,7 +312,11 @@ impl Owner {
         let Some(watch) = &self.watch else {
             return Ok(());
         };
-        let reason = match watch.exited() {
+        let observed = watch.exited();
+        if matches!(&observed, Ok(Some(peer)) if peer.pid == self.provider.id()) {
+            self.exit_observed = true;
+        }
+        let reason = match observed {
             Ok(None) => return Ok(()),
             Ok(Some(peer)) if peer.pid == self.provider.id() && self.tickets.ticket().is_some() => {
                 #[cfg(all(test, feature = "test-exit-before-wait"))]
@@ -552,6 +557,7 @@ impl Owner {
                 transport_closed: false,
                 cancellation_requested: false,
                 collected: None,
+                exit_observed: false,
                 #[cfg(all(test, feature = "test-exit-before-wait"))]
                 defer_exit_wait: false,
                 #[cfg(all(test, feature = "test-exit-before-wait"))]
@@ -865,6 +871,12 @@ impl Service {
     /// Wait for control, admission, notification or process readiness under
     /// the earliest retained cutoff; no Start means no run-age timer.
     pub fn wait_for_activity(&mut self) -> io::Result<()> {
+        if self.owner.exit_observed && self.owner.collected.is_none() {
+            // The one-shot exit notification may precede parent-wait readiness.
+            // Poll again under the original cutoffs until collection is possible.
+            std::thread::yield_now();
+            return Ok(());
+        }
         use std::os::fd::AsRawFd;
         let mut descriptors = Vec::new();
         fn add(descriptors: &mut Vec<libc::pollfd>, interest: (std::os::fd::BorrowedFd<'_>, bool)) {
