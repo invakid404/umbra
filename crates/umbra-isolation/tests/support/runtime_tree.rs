@@ -796,6 +796,9 @@ pub fn child() -> io::Result<()> {
             }
             if let Some(publication) = &mut publication {
                 publication.progress(&mut tickets)?;
+                if !publication.failures().is_empty() {
+                    write(&root, "worker-publication-failures", &publication.failures())?;
+                }
             }
             record(
                 &root,
@@ -1265,6 +1268,9 @@ fn run_inner(case: Case, order: bool) -> io::Result<()> {
     );
     let failed = outcome.failed;
     eprintln!("{case:?} controller: advanced={advanced} released={released} rescued={rescued}");
+    if let Some(failures) = read::<Vec<String>>(root, "worker-publication-failures")? {
+        eprintln!("{case:?} worker publication failures: {failures:?}");
+    }
     for role in ROLES {
         eprintln!(
             "{case:?} {role:?}: {}",
