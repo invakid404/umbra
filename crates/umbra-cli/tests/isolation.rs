@@ -479,8 +479,15 @@ impl Run {
             command.env("UMBRA_TEARDOWN_LOG", "1");
         }
         #[cfg(feature = "test-managed-session")]
-        if case == "OWN-P4" {
+        if case == "OWN-P4" || case == "OWN-P4-EXIT" {
             command.env("UMBRA_TEST_MANAGED_SESSION", "1");
+        }
+        #[cfg(feature = "test-exit-before-wait")]
+        if case == "OWN-P4-EXIT" {
+            command.env(
+                "UMBRA_TEST_WORKER_EXIT_BEFORE_WAIT",
+                dir.join("worker-exit-before-wait"),
+            );
         }
         if observe {
             std::fs::create_dir(dir.join("signals")).unwrap();
@@ -1366,10 +1373,21 @@ fn sid1_p3_platform_killed() {
 #[test]
 #[cfg(feature = "test-managed-session")]
 fn own_session_worker_killed_with_a_stopped_provider() {
+    own_session_stopped_provider("OWN-P4", false);
+}
+
+#[test]
+#[cfg(feature = "test-exit-before-wait")]
+fn own_session_worker_exit_before_parent_wait() {
+    own_session_stopped_provider("OWN-P4-EXIT", true);
+}
+
+#[cfg(feature = "test-managed-session")]
+fn own_session_stopped_provider(case: &str, forced: bool) {
     if !qualified() {
         return;
     }
-    let mut run = Run::start("OWN-P4", true, false, 20_000, &["sleep"]);
+    let mut run = Run::start(case, true, false, 20_000, &["sleep"]);
     std::thread::sleep(Duration::from_millis(500));
     let tree = run.discover();
     assert_ne!(tree.sid(tree.supervisor), 1);
@@ -1377,7 +1395,11 @@ fn own_session_worker_killed_with_a_stopped_provider() {
     signal(tree.journal, "STOP");
     std::thread::sleep(Duration::from_millis(100));
     signal(tree.supervisor, "KILL");
+    let marker = run.dir.join("worker-exit-before-wait");
     let o = run.finish(Duration::from_secs(30));
+    if forced {
+        assert_eq!(std::fs::read(marker).unwrap(), b"exit-before-parent-wait\n");
+    }
     assert!(
         o.term_signal() == Some(SIGKILL) && o.survivors.is_empty(),
         "worker status must be mirrored and no provider left running: {o:?}"

@@ -498,9 +498,14 @@ impl Guard {
             exchanges: std::collections::BTreeMap::new(),
             pending_failure: None,
             #[cfg(feature = "test-exit-before-wait")]
-            defer_exit_wait: false,
+            defer_exit_wait: local.role == umbra_core::managed::Role::Guardian
+                && std::env::var_os("UMBRA_TEST_WORKER_EXIT_BEFORE_WAIT").is_some(),
             #[cfg(feature = "test-exit-before-wait")]
-            exit_wait_evidence: None,
+            exit_wait_evidence: if local.role == umbra_core::managed::Role::Guardian {
+                std::env::var_os("UMBRA_TEST_WORKER_EXIT_BEFORE_WAIT").map(Into::into)
+            } else {
+                None
+            },
         })
     }
 
@@ -740,6 +745,8 @@ impl Guard {
             }
             #[cfg(feature = "test-exit-before-wait")]
             if self.defer_exit_wait
+                && (self.local.role != umbra_core::managed::Role::Guardian
+                    || owned.identity.role == umbra_core::managed::Role::Worker)
                 && events
                     .iter()
                     .any(|event| matches!(event, Event::Exited(peer) if *peer == owned.identity))
