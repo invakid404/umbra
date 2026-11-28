@@ -234,6 +234,10 @@ pub struct Owner {
     transport_closed: bool,
     cancellation_requested: bool,
     collected: Option<ExitStatus>,
+    #[cfg(all(test, feature = "test-exit-before-wait"))]
+    defer_exit_wait: bool,
+    #[cfg(all(test, feature = "test-exit-before-wait"))]
+    test_exit_observed: bool,
     failures: Vec<String>,
     watch: Option<super::process::ProcessWatch>,
     admission: Option<super::admission::AdmissionService>,
@@ -310,6 +314,10 @@ impl Owner {
         let reason = match watch.exited() {
             Ok(None) => return Ok(()),
             Ok(Some(peer)) if peer.pid == self.provider.id() && self.tickets.ticket().is_some() => {
+                #[cfg(all(test, feature = "test-exit-before-wait"))]
+                {
+                    self.test_exit_observed = true;
+                }
                 // Only try_wait below may convert provider exit to collection.
                 return Ok(());
             }
@@ -544,6 +552,10 @@ impl Owner {
                 transport_closed: false,
                 cancellation_requested: false,
                 collected: None,
+                #[cfg(all(test, feature = "test-exit-before-wait"))]
+                defer_exit_wait: false,
+                #[cfg(all(test, feature = "test-exit-before-wait"))]
+                test_exit_observed: false,
                 failures: Vec::new(),
                 watch: None,
                 admission: None,
@@ -694,6 +706,11 @@ impl Owner {
                 }
                 self.transport_closed = true;
             }
+        }
+        #[cfg(all(test, feature = "test-exit-before-wait"))]
+        if self.defer_exit_wait && self.test_exit_observed {
+            self.defer_exit_wait = false;
+            return Ok(None);
         }
         if self.collected.is_none() {
             match self.provider.try_wait() {
@@ -1078,6 +1095,69 @@ mod tests {
     use std::os::fd::OwnedFd;
     use std::process::{Command, Stdio};
     use umbra_core::managed::{CleanupPath, Role, Ticket};
+
+    #[cfg(feature = "test-exit-before-wait")]
+    #[test]
+    fn owner_exit_notification_before_wait_keeps_collection_ready() {
+        use super::super::{
+            process::{identity, ProcessWatch},
+            Channel,
+        };
+        use std::time::{Duration, Instant};
+        let (control, _input) = UnixStream::pair().unwrap();
+        let child = Command::new("/bin/sleep").arg("0.1").spawn().unwrap();
+        let provider = identity(child.id(), Role::Provider).unwrap();
+        let local = identity(std::process::id(), Role::CleanupOwner).unwrap();
+        let worker = Participant {
+            role: Role::Worker,
+            ..local
+        };
+        let run = RunIdentity {
+            nonce: uuid::Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut watch = ProcessWatch::new().unwrap();
+        watch.install(provider).unwrap();
+        let mut owner = Owner::new(local, run, 1, child, control, vec![])
+            .unwrap_or_else(|_| panic!("owner construction"));
+        owner.watch = Some(watch);
+        owner
+            .start(
+                Start {
+                    run,
+                    origin: local,
+                    ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Trusted, 1).unwrap(),
+                },
+                local,
+            )
+            .unwrap();
+        owner.defer_exit_wait = true;
+        super::super::readiness::wait_descriptors(
+            &mut [libc::pollfd {
+                fd: owner.watch.as_ref().unwrap().descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            }],
+            boot_nanos().unwrap() + 2_000_000_000,
+        )
+        .unwrap();
+        assert!(owner.progress().unwrap().is_none());
+        assert!(owner.test_exit_observed);
+        let (channel, _peer) = UnixStream::pair().unwrap();
+        let mut service = Service::new(owner, worker, provider, Channel::new(channel).unwrap())
+            .unwrap_or_else(|_| panic!("service construction"));
+        service.response_deadline = Some(boot_nanos().unwrap() + 1_000_000_000);
+        let began = Instant::now();
+        let waited = service.wait_for_activity();
+        let elapsed = began.elapsed();
+        // Collect the actual child before asserting the scheduling result.
+        service.owner.provider.wait().unwrap();
+        waited.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "consumed owner exit lost the collection wake: {elapsed:?}"
+        );
+    }
 
     #[test]
     fn dedicated_cancellation_preserves_rpc_and_collects_actual_child() {
