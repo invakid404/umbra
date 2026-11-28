@@ -37,6 +37,7 @@ fn main() {
     assert!([
         "success",
         "owner_construction",
+        "missing_storage",
         "relay_construction",
         "slow_preparation",
         "failed_preparation",
@@ -262,7 +263,7 @@ fn main() {
     } else {
         b"/usr/bin/true".to_vec()
     };
-    let spec = RunSpec {
+    let mut spec = RunSpec {
         registry: ProviderRegistry {
             // Routed storage advertises a 30 s renewal interval; each RPC
             // must leave the same renewal headroom as the routed CLI fixture.
@@ -294,6 +295,34 @@ fn main() {
             mode: mode.clone(),
         })),
     };
+    let base_error = if mode == "missing_storage" {
+        spec.registry
+            .providers
+            .get_mut("storage")
+            .unwrap()
+            .executable = BytePath::new(
+            temp.path()
+                .join("missing-storage")
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        Some(
+            umbra_supervisor::run::run(RunSpec {
+                registry: spec.registry.clone(),
+                launch: spec.launch.clone(),
+                workspace: spec.workspace.clone(),
+                persistence: spec.persistence,
+                experimental: spec.experimental,
+                state_root: spec.state_root.clone(),
+                observer: None,
+            })
+            .expect_err("unarmed storage setup must fail"),
+        )
+    } else {
+        None
+    };
     let began = std::time::Instant::now();
     umbra_core::cost_snapshot!("library-before-prepare", None, &[]);
     let mut run = RegisteredRole::prepare(spec, true, capacity).unwrap();
@@ -312,6 +341,18 @@ fn main() {
         elapsed.as_secs_f64() <= bound,
         "managed run exceeded D4: {elapsed:?} > {bound}s"
     );
+    if let Some(expected) = base_error {
+        let error = result.expect_err("missing storage must fail");
+        let actual = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<umbra_core::UmbraError>())
+            .expect("managed path must return the original structured storage error");
+        assert_eq!(actual.kind, expected.kind);
+        assert_eq!(actual.operation, expected.operation);
+        assert_eq!(actual.context, expected.context);
+        assert!(events.borrow().is_empty());
+        return;
+    }
     if ["owner_construction", "relay_construction"].contains(&mode.as_str()) {
         assert!(result.is_err(), "construction failure became success");
         let checked = std::fs::read_to_string(construction_record.with_extension("checked"))
