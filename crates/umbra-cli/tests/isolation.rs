@@ -1875,3 +1875,61 @@ fn f201_pipe_eof_isolated() {
     assert_eq!(out.stdout, payload);
     eprintln!("f201_pipe_eof_isolated: exact bytes and stdout EOF at CLI exit");
 }
+
+/// Compare the pre-arm CLI error surface against a retained base executable.
+#[test]
+fn missing_storage_preserves_base_cli_error() {
+    use std::os::unix::process::CommandExt;
+    if !qualified() {
+        return;
+    }
+    let Some(base) = std::env::var_os("UMBRA_TEST_BASE_CLI") else {
+        eprintln!("SKIP: base CLI comparison requires UMBRA_TEST_BASE_CLI");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let path = registry(temp.path(), 25_000);
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    value["providers"]["storage"]["executable"] =
+        json!(temp.path().join("missing-storage").as_os_str().as_bytes());
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let invoke = |binary: &Path| {
+        let mut command = Command::new(binary);
+        command
+            .args(["run", "--registry"])
+            .arg(&path)
+            .arg("--workspace")
+            .arg(&workspace)
+            .args(["--experimental", "--local-dev", "--", "/usr/bin/true"])
+            .stdin(std::process::Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                assert_ne!(libc::getsid(0), 1);
+                Ok(())
+            });
+        }
+        command.output().unwrap()
+    };
+    let baseline = invoke(Path::new(&base));
+    let managed = invoke(&bin_dir().join("umbra"));
+    eprintln!(
+        "base status={:?} stderr={}",
+        baseline.status.code(),
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    eprintln!(
+        "managed status={:?} stderr={}",
+        managed.status.code(),
+        String::from_utf8_lossy(&managed.stderr)
+    );
+    assert!(!baseline.status.success());
+    assert!(String::from_utf8_lossy(&baseline.stderr).contains("StorageUnavailable"));
+    assert_eq!(managed.status.code(), baseline.status.code());
+    assert_eq!(managed.stderr, baseline.stderr);
+    assert_eq!(managed.stdout, baseline.stdout);
+}
