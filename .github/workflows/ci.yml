@@ -596,6 +596,11 @@ jobs:
       - name: Qualify abrupt worker end in a dedicated session
         run: |
           cargo test -p umbra-cli --features test-managed-session --test isolation own_session_worker_killed_with_a_stopped_provider -- --exact --nocapture --test-threads=1
+      - name: Qualify exit notification before native parent wait
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build --workspace --features umbra-cli/test-exit-before-wait,umbra-cli/shutdown-witness
+          cargo test -p umbra-cli --features test-exit-before-wait,shutdown-witness --test isolation own_session_worker_exit_before_parent_wait -- --exact --nocapture --test-threads=1
       - name: Qualify native cleanup order
         env:
           UMBRA_NATIVE_CLEANUP_ORDER: /tmp/umbra-order-${{ github.run_id }}-${{ github.run_attempt }}
