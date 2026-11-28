@@ -114,6 +114,16 @@ impl Publication {
                         *state = State::AwaitingAck;
                     }
                     let message = match route.channel.receive::<ControlMessage>(self.deadline) {
+                        // The receive clock can cross the cutoff after progress
+                        // sampled it. Apply the same completed-route rule as the
+                        // expiry branch above, without extending the deadline.
+                        Err(error)
+                            if *state == State::Acknowledged
+                                && error.kind() == io::ErrorKind::TimedOut
+                                && route.channel.written == route.channel.output.len() =>
+                        {
+                            return Ok(());
+                        }
                         Err(error)
                             if *state == State::Acknowledged
                                 && error.kind() == io::ErrorKind::UnexpectedEof
