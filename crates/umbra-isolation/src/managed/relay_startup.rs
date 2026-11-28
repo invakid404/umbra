@@ -44,7 +44,29 @@ impl RelayStartup {
     /// Pending child handles stay here if runtime adoption cannot be validated.
     pub fn fail_runtime(&mut self) -> io::Result<super::guard::Outcome> {
         self.failed = true;
-        self.prepare_guard()?;
+        if self.guard.is_none() {
+            // Guard construction precedes guardian authorization. Preparation
+            // may already have consumed its watch and routes; retain the real
+            // child handles and use their original pre-GO rollback allocation.
+            while !self.rollback()? {
+                self.wait_for_rollback()?;
+            }
+            return Ok(super::guard::Outcome {
+                completion_deadline: Some(
+                    self.entry
+                        .readiness_deadline
+                        .checked_add(9_000_000_000)
+                        .ok_or_else(|| invalid("rollback clock overflow"))?,
+                ),
+                worker_status: None,
+                primary: None,
+                events: vec![super::guard::Event::Failed(
+                    "relay startup failed before guard construction completed".into(),
+                )],
+                failed: true,
+                unresolved: Vec::new(),
+            });
+        }
         let guard = self
             .guard
             .as_mut()
@@ -67,6 +89,8 @@ impl RelayStartup {
         self.entry.close_before_go()?;
         self.guard.take();
         self.bootstrap.take();
+        self.arming.take();
+        self.failed_route.take();
         self.rollback.as_mut().unwrap().poll()
     }
 
