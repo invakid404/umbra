@@ -53,7 +53,8 @@ collection remains a reported failure.
 Managed startup and cleanup wait on descriptor readiness and process-exit
 events. If a provider rollback watch cannot be allocated or installed, its real
 parent stops it and checks for collection at intervals of at most one millisecond
-under the original rollback cutoff; the watch error remains a failure. Admission cancellation wakes a pending exchange to observe a shortened
+under the original rollback cutoff; the watch error remains a failure.
+Admission cancellation wakes a pending exchange to observe a shortened
 cutoff. Observer traffic shares the guard wait with independent cleanup routes.
 Each wake retains the original deadline. A route that acknowledged Start still
 answers a concurrent Start while another route is pending; queued acknowledgments
@@ -98,7 +99,11 @@ waiting helpers observe parent closure, notifications and installed process
 watches. The worker starts the single five-second durable-persistence allocation
 after preparation and sends its exact cutoff on the existing route. GO forwarding
 never renews it. Preparation failure starts the existing nine-second pre-GO
-provider-collection budget once. This is separate from the D4 cleanup tickets.
+provider-collection budget once. Relay and guardian pre-GO rollback retain the
+readiness-plus-nine-second cutoff while it is ahead. If preparation outlasted
+that cutoff, each retained child receives one nine-second interval at failure.
+Retries keep that same cutoff; rollback after GO remains refused. Expiry reports
+uncollected custody as failure. These allocations are separate from D4 cleanup tickets.
 
 Two limits remain explicit. Total loss of caller notification before any Start
 has no proven finite caller-return bound (D1); custody stays unresolved without

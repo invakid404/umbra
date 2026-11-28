@@ -428,6 +428,7 @@ mod construction_tests {
             startup.entry.launch.run,
             expired,
         ));
+        startup.children[0].test_rollback_rejections(super::super::boot_nanos().unwrap());
         startup.ready = true;
         startup.bootstrap.take();
         let result = startup.fail_runtime();
@@ -490,6 +491,7 @@ mod construction_tests {
             startup.entry.launch.run,
             deadline,
         ));
+        startup.children[0].test_rollback_rejections(super::super::boot_nanos().unwrap());
         startup.ready = true;
         startup.bootstrap.take();
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| startup.fail_runtime()));

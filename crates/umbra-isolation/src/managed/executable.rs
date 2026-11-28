@@ -570,6 +570,48 @@ impl PendingRole {
             rollback_cutoff: None,
         }
     }
+    #[cfg(all(test, feature = "test-managed-construction-failure"))]
+    pub(super) fn test_rollback_rejections(&mut self, now: u64) {
+        self.ready = false;
+        assert!(self.preparation_rollback_cutoff(now).is_err());
+        assert!(self.rollback_cutoff.is_none());
+        self.ready = true;
+        let original = self.readiness_deadline + 9_000_000_000;
+        let expected = if now >= original {
+            now + 9_000_000_000
+        } else {
+            original
+        };
+        let cutoff = self.preparation_rollback_cutoff(now).unwrap();
+        assert_eq!(cutoff, expected);
+        assert_eq!(
+            self.preparation_rollback_cutoff(expected + 1).unwrap(),
+            expected
+        );
+        assert!(self.permits_rollback(expected));
+        assert!(!self.permits_rollback(expected + 1));
+        self.go_queued = Some(super::startup::Go {
+            run: self.run,
+            record: umbra_core::CustodyRecord {
+                run_id: serde_json::from_value(serde_json::json!(self.run.nonce)).unwrap(),
+                generation: uuid::Uuid::nil(),
+                sequence: 1,
+                state: umbra_core::CustodyPhase::Armed {
+                    capacity: 64,
+                    startup_nonce: self.run.nonce,
+                    participants: Vec::new(),
+                },
+            },
+            durable_sequence: umbra_core::Sequence(1),
+            deadline: expected,
+        });
+        assert!(!self.permits_rollback(expected));
+        assert!(self.preparation_rollback_cutoff(now).is_err());
+        self.go_queued = None;
+        // Return the fixture to its original state so production owns allocation.
+        self.rollback_cutoff = None;
+    }
+
     pub(super) fn role(&self) -> Role {
         self.role
     }
