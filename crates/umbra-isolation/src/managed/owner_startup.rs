@@ -12,7 +12,9 @@ mod construction_tests {
         let deadline = super::super::boot_nanos().unwrap() + 2_000_000_000;
         let entry = Entry::root_relay(launch, deadline).unwrap();
         let mut startup = OwnerStartup::new(entry);
+        startup.entry.role = Role::CleanupOwner;
         let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
         let (cancellation, _peer) = UnixStream::pair().unwrap();
         let participant =
             super::super::process::identity(std::process::id(), Role::CleanupOwner).unwrap();
@@ -29,6 +31,7 @@ mod construction_tests {
             .unwrap(),
         );
         startup.phase = 5;
+        startup.rollback_deadline = Some(deadline);
         // Model the retained state at the construction hook. No service has polled
         // admission, so no program acquisition can have been granted.
         let result = (|| {
@@ -38,6 +41,19 @@ mod construction_tests {
             Ok::<_, io::Error>(())
         })();
         let retained_failure = startup.failed;
+        // WNOWAIT observes without supplying a parent receipt for the code
+        // under test. ECHILD means production already performed the wait.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        let collected =
+            observed == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
         // Keep the failing-first reading safe: collect our fixture even when
         // production rollback refuses it, then assert on the earlier result.
         if let Some(owner) = startup.owner.take() {
@@ -50,6 +66,8 @@ mod construction_tests {
             }
         }
         result.expect("the real owner must collect its adopted provider");
+        assert!(collected, "production must perform the actual parent wait");
+        assert_eq!(startup.rollback_deadline, Some(deadline));
         assert!(
             retained_failure,
             "collection must not turn failed startup into success"
@@ -85,6 +103,7 @@ pub struct OwnerStartup {
     stalled: bool,
     failed: bool,
     rollback_deadline: Option<u64>,
+    rollback_watch: Option<super::process::ProcessWatch>,
 }
 
 impl OwnerStartup {
@@ -99,16 +118,10 @@ impl OwnerStartup {
         if child.try_wait()?.is_some() {
             return Ok(());
         }
-        let mut watch = super::process::ProcessWatch::new()?;
-        let installed = super::process::identity(child.id(), Role::Provider)
-            .and_then(|participant| watch.install(participant));
-        if let Err(error) = installed {
-            return if child.try_wait()?.is_some() {
-                Ok(())
-            } else {
-                Err(error)
-            };
-        }
+        let watch = self
+            .rollback_watch
+            .as_ref()
+            .ok_or_else(|| invalid("rollback watch not installed"))?;
         super::readiness::wait_descriptors(
             &mut [libc::pollfd {
                 fd: watch.descriptor(),
@@ -119,10 +132,13 @@ impl OwnerStartup {
         )
     }
 
-    /// Collect a provider that never received GO; preserve the actual Child
-    /// in Launch on errors or expiry. No acquisition is authorized in this phase.
+    /// Collect a provider before the owner service starts; preserve the actual
+    /// Child in Launch on errors or expiry. No admission has been polled here.
     pub fn rollback(&mut self) -> io::Result<bool> {
         self.failed = true;
+        if self.phase >= 6 {
+            return Err(invalid("startup rollback after service transfer"));
+        }
         if self.rollback_deadline.is_none() {
             // Preparation is outside readiness. Allocate rollback once when that
             // phase fails, retaining the existing nine-second collection budget.
@@ -137,10 +153,16 @@ impl OwnerStartup {
                     .ok_or_else(|| invalid("rollback clock overflow"))?,
             );
         }
-        if self.owner.is_some() {
-            return Err(invalid("owner rollback after runtime adoption"));
+        if let Some(owner) = self.owner.take() {
+            // Installation does not poll admission. Only Service::poll can do
+            // that, after successful construction transfers custody out of here.
+            self.launch.child = Some(owner.into_child());
         }
-        self.entry.close_before_go()?;
+        if self.phase >= 4 {
+            self.entry.close_unstarted_owner()?;
+        } else {
+            self.entry.close_before_go()?;
+        }
         self.bootstrap.take();
         self.handoff.take();
         self.control.take();
@@ -154,7 +176,30 @@ impl OwnerStartup {
         if super::boot_nanos()? >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        child.kill()?;
+        if self.rollback_watch.is_none() {
+            // Install before asking the provider to exit: a process completing
+            // exit may no longer expose identity while its wait is not ready yet.
+            let mut watch = super::process::ProcessWatch::new()?;
+            let installed = super::process::identity(child.id(), Role::Provider)
+                .and_then(|participant| watch.install(participant));
+            if let Err(error) = installed {
+                return if child.try_wait()?.is_some() {
+                    Ok(true)
+                } else {
+                    Err(error)
+                };
+            }
+            self.rollback_watch = Some(watch);
+        }
+        if let Err(error) = child.kill() {
+            // Exit can race the bounded stop. Only the real parent wait, not
+            // ESRCH by itself, establishes that the child was collected.
+            return if child.try_wait()?.is_some() {
+                Ok(true)
+            } else {
+                Err(error)
+            };
+        }
         Ok(child.try_wait()?.is_some())
     }
 
@@ -171,6 +216,7 @@ impl OwnerStartup {
             stalled: false,
             failed: false,
             rollback_deadline: None,
+            rollback_watch: None,
         }
     }
 

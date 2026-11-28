@@ -54,6 +54,18 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Construction of the owner service has not polled admission yet. Its
+    /// startup coordinator retains the provider handle while closing these routes.
+    pub(super) fn close_unstarted_owner(&mut self) -> io::Result<()> {
+        if self.role != Role::CleanupOwner {
+            return Err(invalid("unstarted owner closure in another role"));
+        }
+        self.bootstrap.take();
+        self.endpoints.clear();
+        self.descendants.clear();
+        Ok(())
+    }
+
     /// Exact startup control descriptor for the hosted inventory fixture.
     #[cfg(feature = "managed-endpoint-probe")]
     pub fn probe_bootstrap_fd(&self) -> Option<i32> {
