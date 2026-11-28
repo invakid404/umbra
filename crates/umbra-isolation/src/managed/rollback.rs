@@ -11,7 +11,7 @@ pub struct Rollback {
     roles: Vec<umbra_core::managed::Role>,
     watch: Option<super::process::ProcessWatch>,
     #[cfg(test)]
-    fail_watch_allocation: bool,
+    watch_failure_release: Option<std::os::unix::net::UnixStream>,
 }
 
 impl Rollback {
@@ -77,7 +77,7 @@ impl Rollback {
             roles: children.iter().map(PendingRole::role).collect(),
             watch: None,
             #[cfg(test)]
-            fail_watch_allocation: false,
+            watch_failure_release: None,
             children: children.into_iter().map(PendingRole::into_child).collect(),
             deadline,
         })
@@ -117,7 +117,8 @@ impl Rollback {
         if self.watch.is_none() {
             let allocated = (|| {
                 #[cfg(test)]
-                if self.fail_watch_allocation {
+                if let Some(release) = self.watch_failure_release.take() {
+                    drop(release);
                     return Err(io::Error::from_raw_os_error(libc::EMFILE));
                 }
                 super::process::ProcessWatch::new()
@@ -201,14 +202,21 @@ mod tests {
 
     #[test]
     fn watch_allocation_failure_retains_parent_collection() {
+        use std::os::fd::AsRawFd;
+        let (input, release) = std::os::unix::net::UnixStream::pair().unwrap();
         let child = SpawnedChild::spawn(
-            std::path::Path::new("/bin/sleep"),
-            &["sleep".into(), "0.05".into()],
+            std::path::Path::new("/bin/sh"),
+            &[
+                "sh".into(),
+                "-c".into(),
+                format!("read -r value <&{}; exit 0", input.as_raw_fd()).into(),
+            ],
             &[],
             false,
-            &[],
+            &[input.as_raw_fd()],
         )
         .unwrap();
+        drop(input);
         let deadline = boot_nanos().unwrap() + 1_000_000_000;
         let mut rollback = Rollback {
             children: vec![child],
@@ -216,7 +224,7 @@ mod tests {
             deadline,
             roles: vec![Role::Guardian],
             watch: None,
-            fail_watch_allocation: true,
+            watch_failure_release: Some(release),
         };
         let failure = rollback.wait_for_activity().unwrap_err();
         let collected_at_return = rollback.statuses()[0];
@@ -253,7 +261,7 @@ mod tests {
             roles: vec![Role::Worker],
             watch: None,
             #[cfg(test)]
-            fail_watch_allocation: false,
+            watch_failure_release: None,
         };
         let waited = rollback.wait_for_activity();
         let finished = boot_nanos().unwrap();
