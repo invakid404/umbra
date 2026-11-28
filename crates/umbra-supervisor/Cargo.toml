@@ -41,7 +41,7 @@ mutation-probe-spawn-lifecycle = []
 
 [dependencies]
 serde.workspace = true
-sha2 = "=0.10.9"
+sha2 = "=0.11.2"
 tracing.workspace = true
 # Run and operation identities are allocated here, so the generator is a direct
 # dependency rather than something borrowed from a backend crate.
