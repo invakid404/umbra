@@ -62,6 +62,7 @@ struct Owned {
     child: SpawnedChild,
     identity: Participant,
     collected: bool,
+    exit_observed: bool,
     lost: bool,
 }
 
@@ -189,6 +190,7 @@ impl Guard {
                 child,
                 identity,
                 collected: false,
+                exit_observed: false,
                 lost: false,
             });
         }
@@ -603,6 +605,7 @@ impl Guard {
             child,
             identity,
             collected: false,
+            exit_observed: false,
             lost: false,
         });
         Ok(())
@@ -704,7 +707,14 @@ impl Guard {
         }
         if !self.watch_failed {
             match self.watch.exited() {
-                Ok(Some(participant)) => events.push(Event::Exited(participant)),
+                Ok(Some(participant)) => {
+                    for owned in &mut self.children {
+                        if owned.identity == participant {
+                            owned.exit_observed = true;
+                        }
+                    }
+                    events.push(Event::Exited(participant));
+                }
                 Ok(None) => {}
                 Err(error) => {
                     self.watch_failed = true;
@@ -830,6 +840,17 @@ impl Guard {
     ) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         if self.pending_failure.is_some() {
+            return Ok(());
+        }
+        if self
+            .children
+            .iter()
+            .any(|owned| owned.exit_observed && !owned.collected && !owned.lost)
+        {
+            // NOTE_EXIT can precede waitpid readiness. Its one-shot wake has
+            // already been consumed; retain the parent-wait work until collected.
+            // The next poll still enforces the original ticket and stage cutoffs.
+            std::thread::yield_now();
             return Ok(());
         }
         let mut deadline = self.receive_deadline();
