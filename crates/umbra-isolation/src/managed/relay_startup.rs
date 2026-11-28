@@ -456,7 +456,8 @@ mod construction_tests {
         }
         assert!(
             collected,
-            "expired readiness must not strand an uncollected pre-GO guardian: {result:?}"
+            "expired readiness must not strand an uncollected pre-GO guardian: {:?}",
+            result.as_ref().err()
         );
         let outcome = result.unwrap();
         assert!(outcome.failed);
