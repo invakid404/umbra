@@ -51,7 +51,9 @@ rollback allocation and retain the construction error as primary. Incomplete
 collection remains a reported failure.
 
 Managed startup and cleanup wait on descriptor readiness and process-exit
-events. Admission cancellation wakes a pending exchange to observe a shortened
+events. If a provider rollback watch cannot be allocated or installed, its real
+parent stops it and checks for collection at intervals of at most one millisecond
+under the original rollback cutoff; the watch error remains a failure. Admission cancellation wakes a pending exchange to observe a shortened
 cutoff. Observer traffic shares the guard wait with independent cleanup routes.
 Each wake retains the original deadline. A route that acknowledged Start still
 answers a concurrent Start while another route is pending; queued acknowledgments
