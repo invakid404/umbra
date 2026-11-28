@@ -100,8 +100,10 @@ fn main() {
     let temp = tempfile::tempdir().unwrap();
     let construction_record = temp.path().join("construction");
     if ["owner_construction", "relay_construction"].contains(&mode.as_str()) {
-        assert!(cfg!(feature = "test-managed-construction-failure"));
+        #[cfg(not(feature = "test-managed-construction-failure"))]
+        panic!("construction cases require test-managed-construction-failure");
         // This test entry is single-threaded and helpers have not been spawned.
+        #[cfg(feature = "test-managed-construction-failure")]
         unsafe {
             std::env::set_var(
                 "UMBRA_TEST_CONSTRUCTION_FAILURE",
