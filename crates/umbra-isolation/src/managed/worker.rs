@@ -630,7 +630,9 @@ impl ManagedCleanup for WorkerCleanup {
 
     fn collect_provider(&mut self) -> umbra_core::Result<Duration> {
         let began = Instant::now();
-        if !self.collection_complete() {
+        // A receipt does not prove independent routes are drained. Poll them
+        // even on a retry with an already stored receipt.
+        {
             if self.receipt.is_none() {
                 self.request(ControlMessage::Collect { run: self.run })
                     .map_err(error)?;
@@ -645,6 +647,7 @@ impl ManagedCleanup for WorkerCleanup {
             loop {
                 self.progress_forwarding().map_err(error)?;
                 let mut forwarding = Vec::new();
+                let mut received_control = false;
                 for (index, (route, ack_deadline)) in self
                     .routes
                     .iter_mut()
@@ -673,7 +676,10 @@ impl ManagedCleanup for WorkerCleanup {
                             }
                         }
                     }
-                    if self.receipt.is_some() && self.awaiting[index].is_none() {
+                    if self.receipt.is_some()
+                        && peer == self.owner
+                        && self.awaiting[index].is_none()
+                    {
                         continue;
                     }
                     let deadline = forwarding_cutoff(
@@ -710,6 +716,7 @@ impl ManagedCleanup for WorkerCleanup {
                             continue;
                         }
                     };
+                    received_control |= message.is_some();
                     match message {
                         None => {}
                         Some(ControlMessage::Start(start)) => {
@@ -775,10 +782,14 @@ impl ManagedCleanup for WorkerCleanup {
                 for (peer, start) in forwarding {
                     self.forward(start, peer).map_err(error)?;
                 }
-                if self.collection_complete() {
+                // Revisit routes after each message, including frames already
+                // buffered in Channel, before declaring the collection clean.
+                if self.collection_complete() && !received_control {
                     break;
                 }
-                self.wait_for_collection().map_err(error)?;
+                if !received_control {
+                    self.wait_for_collection().map_err(error)?;
+                }
             }
         }
         let receipt = self.receipt.as_ref().unwrap();
@@ -1129,6 +1140,15 @@ mod tests {
 
     #[test]
     fn collection_drains_failed_start_buffered_after_owner_receipt() {
+        buffered_collection_failure(false);
+    }
+
+    #[test]
+    fn stored_receipt_drains_buffered_independent_failure() {
+        buffered_collection_failure(true);
+    }
+
+    fn buffered_collection_failure(stored_receipt: bool) {
         // Both messages are buffered before collection; owner route is visited first.
         let local = identity(std::process::id(), Role::Worker).unwrap();
         let owner = Participant {
@@ -1184,15 +1204,20 @@ mod tests {
         };
         let mut owner_channel = Channel::new(owner_socket).unwrap();
         let mut guardian_channel = Channel::new(guardian_socket).unwrap();
-        owner_channel
-            .queue(&ControlMessage::Collected(ProviderReceipt {
-                run,
-                owner,
-                provider,
-                status: 0,
-                failed: false,
-            }))
-            .unwrap();
+        let receipt = ProviderReceipt {
+            run,
+            owner,
+            provider,
+            status: 0,
+            failed: false,
+        };
+        if stored_receipt {
+            worker.receipt = Some(receipt);
+        } else {
+            owner_channel
+                .queue(&ControlMessage::Collected(receipt))
+                .unwrap();
+        }
         guardian_channel
             .queue(&ControlMessage::Start(notification.clone()))
             .unwrap();
