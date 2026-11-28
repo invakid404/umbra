@@ -10,6 +10,30 @@ use umbra_cli::Cli;
 /// child's own exit code is deliberately not propagated: 0 would then mean
 /// "the child succeeded", which says nothing about whether its writes persisted.
 fn main() -> ExitCode {
+    umbra_core::cost_snapshot!("cli-entry", None, &[]);
+    let result = execute();
+    umbra_core::cost_snapshot!("cli-return", None, &[]);
+    result
+}
+
+fn execute() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    match umbra_supervisor::managed_entry::RegisteredRole::enter() {
+        Ok(Some(mut role)) => {
+            return match umbra_supervisor::managed_entry::execute(&mut role) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
     // #193: a guardian process (spawned by a relay below) runs here and never
     // returns. Before argument parsing, so nothing else runs in it first.
     umbra_isolation::guardian_entry();
@@ -17,6 +41,7 @@ fn main() -> ExitCode {
     // #193: a supervised run started in launchd's session moves into a fresh
     // session; this process becomes its relay and never returns. Anywhere
     // else (every terminal session included) this does nothing.
+    #[cfg(not(target_os = "macos"))]
     if cli.starts_a_supervised_run() {
         umbra_isolation::isolate_run();
     }

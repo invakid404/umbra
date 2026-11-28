@@ -50,8 +50,8 @@
 //! [`outage::Deferral::M3Fencing`]. Nothing in this module selects a winner,
 //! deletes a rival's marker, or treats an increasing epoch as a fence.
 //!
-//! Binding any of this to a live transport is `m1_integrate`'s seam. Everything
-//! here is driven over the frozen facades, and the tests run against the fake.
+//! [`crate::storage`] binds this authority to the live transport through
+//! [`ServerMarkerStore`]. Unit tests also drive the same facades against the fake.
 
 pub mod admission;
 pub mod journal;

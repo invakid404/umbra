@@ -4,16 +4,18 @@ Shared byte paths, stable IDs, filesystem IR, storage/journal/namespace/agent DT
 and structured errors. Persisted and wire DTO families support serde; BytePath, RegisterSet and
 StoragePath validate during deserialization, and write payloads have an explicit bound.
 Storage types are available both at the root and through `storage` for compatibility.
-Core has no Umbra dependencies and forbids unsafe code.
+This document covers the crate's manifest, `src/` and tests. Core has no Umbra
+dependencies and forbids unsafe code.
 
-## Dormant cleanup-owner foundation
+## Managed cleanup contracts
 
-`AdmissionLedger` is a pure per-run state machine with no production callers.
+`AdmissionLedger` is the pure per-run state machine used by the cleanup owner.
 The exported default simultaneous capacity is 64; callers negotiate the limit. Reserve commits a charge
-before returning a grant; Entering commits the resource identity before a future
-caller may acquire it. Retiring keeps the charge. Release requires a terminal
-creator checkpoint and actual parent collection, or proof that entry never
-occurred. EOF and disappearance are not collection certificates.
+before returning a grant; Entering commits permission before the
+caller may acquire a resource. Retiring keeps the charge. Release requires a terminal
+creator checkpoint and actual parent collection, a definitive creation failure
+with no resource, or proof that entry never occurred. EOF and disappearance are
+not collection certificates.
 
 Exclusive mutable access serializes Freeze with grants and entries. Freeze
 forbids both. Capacity refusal reports the configured capacity and current count;
@@ -35,11 +37,13 @@ permits normal work and finalization after reopen. A later writer may start a
 distinct Armed generation at custody sequence one only with a strictly newer
 writer epoch; same-epoch or reused-generation restart is refused.
 
-These APIs do not activate the managed topology or repair the provider-drop
-endpoints yet (Refs #299, Refs #205). PR 2 supplies the cleanup-owner process,
-all acquisition fences, runtime deadlines, CLI activation and managed executable
-library entrypoint. PR 3 addresses trusted-inventory waits and admission overhead;
-PR 4 supplies library adapters and migration examples.
+The macOS runtime uses these contracts for CLI and registered executable-library
+runs. `managed::Ticket` retains the first cleanup origin and deadline; progress
+and forwarding cannot renew it. `CleanupPath` allocates `26.35 + 4C` seconds for
+trusted cleanup and `30.6 + 8C` seconds for notified failure, where `C` is the
+negotiated simultaneous obligation capacity. These are conditional cleanup
+windows, not command lifetime limits. Runtime process ownership belongs to
+`umbra-isolation`; this crate defines and validates the messages.
 
 The accepted activation residuals remain explicit: total loss of all caller
 notification routes before any Start has no proven finite caller-return bound.
@@ -48,9 +52,9 @@ session-age or inactivity timeout. Cleanup-owner, guardian or relay loss can
 leave orphaned helpers; a stalled owner requiring forced fallback and late
 kernel creation after Entering can also leave collection unconfirmed. The kernel
 case where the tracer itself ends while holding a program remains outside this
-work. These conditions never establish clean completion. This dormant slice adds
-no runtime waits, processes or descriptors; its state-machine calls perform no
-I/O. The later activation must enforce its separately accepted timing bounds.
+work. These conditions never establish clean completion. Admission and custody
+state-machine transitions perform no I/O; runtime peers supply durable and
+parent-collection evidence before invoking them.
 
 On Unix, `launch_stdio::LaunchStdio` owns validated copies of the caller's
 standard streams. It accepts tty, pipe/FIFO, Unix stream, regular-file and
@@ -81,6 +85,11 @@ failed launch's tracees were reaped; it defaults to false, including when absent
 on the wire. Error categories alone provide no termination evidence.
 Supervised completion requires the separate complete shutdown ledger and owned
 provider-exit confirmation; this legacy flag cannot replace either.
+
+`UmbraError::diagnostics` carries preceding context across managed result
+forwarding. Display writes those details before the original category, operation,
+context and errno line. The primary error remains typed rather than being
+embedded in another error's context.
 
 `ErrorKind::ProcessFailed` reports a supervised child that exited nonzero or was
 signalled, which is a run result rather than an Umbra malfunction.
@@ -176,9 +185,13 @@ A registry's `timeout_ms` (default `provider::DEFAULT_TIMEOUT_MS`, 5000, bounded
 1–60000) is the authoritative deadline for a whole request, callbacks included: it is
 the bound a backend's own in-process timeouts are sized to fit inside, so the backend's
 outcome surfaces instead of a deadline miss. A missed deadline invalidates the
-connection, and dropping the client kills the provider and reaps it with a bounded
+connection. For a client that owns its provider child, dropping the client kills
+the provider and reaps it with a bounded
 wait — a child still stuck in the kernel is handed to a detached reaper thread rather
 than blocking the caller, so teardown proceeds and at worst a zombie outlives the drop.
+Managed connection setup places the child in the cleanup owner's custody and
+hands the stream to the worker separately. Dropping that worker connection
+invalidates the stream without taking over the owner's collection responsibility.
 
 `shutdown` defines `platform.shutdown-ledger.v1`: instance-scoped slots reserved
 before acquisition, a frozen accepted inventory, and final resource dispositions.
@@ -194,8 +207,10 @@ journal format change.
 
 After a validated platform Final, `Client::confirm_provider_exit` waits for its
 owned child without killing it, using the existing 100 ms reap grace. Failure
-preserves the ledger proof but prevents successful closure. Emergency client Drop
-retains its existing kill/reap behavior and never establishes ledger proof.
+preserves the ledger proof but prevents successful closure. Emergency Drop of a
+client with an owned child retains its existing kill/reap behavior and never
+establishes ledger proof. A managed worker client has no owned exit waiter; its
+cleanup owner supplies the separate parent receipt.
 
 Check with `cargo check -p umbra-core`.
 

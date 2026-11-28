@@ -1926,8 +1926,9 @@ impl Supervisor {
 
     /// Terminate the whole supervised tree and reap it.
     ///
-    /// Returns success only when the platform confirms termination; the caller
-    /// uses that confirmation to decide whether writer authority may be released.
+    /// Returns the platform's preliminary termination result. Final shutdown
+    /// inventory and parent collection are still required before releasing writer
+    /// authority; this result alone cannot establish closure.
     pub fn terminate_tree(&mut self, policy: TerminationPolicy) -> Result<()> {
         self.filesystem_queries.clear();
         let Some(process) = self.state.processes.root else {
@@ -2213,11 +2214,12 @@ mod tests {
             let renewals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut s = supervisor();
             s.platform.control = Box::new(QuietControl(polls.clone(), false));
-            s.namespace = Box::new(RenewalCounter {
-                count: renewals.clone(),
-                fail,
-                polls: polls.clone(),
-            });
+            s.namespace =
+                crate::namespace_owner::NamespaceOwner::Unmanaged(Box::new(RenewalCounter {
+                    count: renewals.clone(),
+                    fail,
+                    polls: polls.clone(),
+                }));
             let mut budget = routed_budget(100);
             budget.renew_after = Duration::from_millis(10);
             s.budget = Some(budget);
@@ -2977,7 +2979,8 @@ mod tests {
         let memory = Arc::new(Mutex::new(vec![0; 2168]));
         s.platform.control = Box::new(Canary(memory.clone()));
         s.platform.abi = Box::new(Canary(memory.clone()));
-        s.namespace = Box::new(FilesystemFault(0, None));
+        s.namespace =
+            crate::namespace_owner::NamespaceOwner::Unmanaged(Box::new(FilesystemFault(0, None)));
         let binding = FilesystemBinding::overlay(s.state.run_id);
         let token = FilesystemQueryToken {
             request: 1,
@@ -3063,7 +3066,9 @@ mod tests {
             let mut s = supervisor();
             s.budget = Some(routed_budget(8));
             let cleanup = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            s.namespace = Box::new(FilesystemFault(fault, Some(cleanup.clone())));
+            s.namespace = crate::namespace_owner::NamespaceOwner::Unmanaged(Box::new(
+                FilesystemFault(fault, Some(cleanup.clone())),
+            ));
             s.platform.abi = Box::new(FilesystemFault(fault, None));
             let mut fd = bound_fd(b"/gone");
             fd.filesystem = Some(FilesystemBinding::overlay(s.state.run_id));

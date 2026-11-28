@@ -632,7 +632,9 @@ pub struct Overlay {
     poisoned: bool,
     completed_run: Option<RunId>,
     custody: Option<CustodyState>,
-    prepared_custody: Option<(CustodyFinishProof, DurabilityReceipt)>,
+    custody_durable: bool,
+    prepared_custody: Option<(CustodyFinishProof, DurabilityReceipt, Sequence)>,
+    completed_custody: Option<(CustodyFinishProof, FinishRunReceipt)>,
     serial: u64,
     last_committed: Sequence,
     pages: BTreeMap<Vec<u8>, (StoragePath, Vec<DirectoryEntry>)>,
@@ -702,8 +704,8 @@ impl Overlay {
         Ok(sequence)
     }
 
-    /// Persist a dormant managed generation before a future caller may send GO.
-    /// There are no production callers in the foundation slice.
+    /// Persist a managed generation before the caller may send GO.
+    /// The managed supervisor uses this durable boundary before target launch.
     pub fn arm_custody(&mut self, record: CustodyRecord) -> Result<Sequence> {
         self.idle()?;
         if !matches!(record.state, CustodyPhase::Armed { .. }) {
@@ -735,9 +737,11 @@ impl Overlay {
             &record,
         )?;
         let operation = config.context.operation_id;
+        self.custody_durable = false;
         match self.record(operation, JournalPayload::Custody(record), true) {
             Ok(sequence) => {
                 self.custody = Some(next);
+                self.custody_durable = true;
                 Ok(sequence)
             }
             Err(e) => {
@@ -759,6 +763,18 @@ impl Overlay {
     /// Flush data and prepare an exact terminal decision while retaining the
     /// writer claim. Ordinary namespace operations stop after preparation.
     pub fn prepare_finish(&mut self, proof: CustodyFinishProof) -> Result<Sequence> {
+        if !self.poisoned || self.completed_custody.is_some() {
+            if let Some((prepared, _, sequence)) = &self.prepared_custody {
+                return if prepared == &proof {
+                    Ok(*sequence)
+                } else {
+                    Err(error(
+                        ErrorKind::InvalidState,
+                        "custody certificate changed",
+                    ))
+                };
+            }
+        }
         self.idle()?;
         if self.planned.is_some()
             || !proof.ledger_final
@@ -809,17 +825,27 @@ impl Overlay {
             ));
         }
         let sequence = self.persist_custody(next)?;
-        self.prepared_custody = Some((proof, durability));
+        self.prepared_custody = Some((proof, durability, sequence));
         Ok(sequence)
     }
 
     /// Commit the prepared decision durably before releasing writer authority.
     /// A lost acknowledgement is resolved by replaying this exact generation.
     pub fn commit_custody(&mut self, proof: &CustodyFinishProof) -> Result<FinishRunReceipt> {
+        if let Some((completed, receipt)) = &self.completed_custody {
+            return if completed == proof {
+                Ok(receipt.clone())
+            } else {
+                Err(error(
+                    ErrorKind::InvalidState,
+                    "custody certificate changed",
+                ))
+            };
+        }
         if self.poisoned {
             return Err(error(ErrorKind::InvalidState, "custody requires recovery"));
         }
-        let (prepared, durability) = self
+        let (prepared, durability, _) = self
             .prepared_custody
             .as_ref()
             .ok_or_else(|| error(ErrorKind::InvalidState, "custody finish is not prepared"))?;
@@ -863,11 +889,13 @@ impl Overlay {
         self.config = None;
         self.base = None;
         cleanup?;
-        Ok(FinishRunReceipt {
+        let receipt = FinishRunReceipt {
             run_id: lease.run_id,
             durability,
             completed_through,
-        })
+        };
+        self.completed_custody = Some((proof.clone(), receipt.clone()));
+        Ok(receipt)
     }
 
     /// Inject contracts without selecting, opening, or acquiring a backend.
@@ -882,7 +910,9 @@ impl Overlay {
             poisoned: false,
             completed_run: None,
             custody: None,
+            custody_durable: false,
             prepared_custody: None,
+            completed_custody: None,
             serial: 0,
             last_committed: Sequence(0),
             pages: BTreeMap::new(),
@@ -3489,6 +3519,39 @@ fn reconcilable_on_reopen(operation: &JournalPendingOperation) -> bool {
         )
 }
 impl NamespaceSession for Overlay {
+    fn query_custody(&mut self, run: RunId, generation: uuid::Uuid) -> Result<CustodyState> {
+        if !self.custody_durable {
+            return Err(error(
+                ErrorKind::InvalidState,
+                "custody durability requires disk replay",
+            ));
+        }
+        self.custody
+            .as_ref()
+            .filter(|state| state.record.run_id == run && state.record.generation == generation)
+            .cloned()
+            .ok_or_else(|| error(ErrorKind::InvalidState, "custody generation not found"))
+    }
+
+    fn arm_custody(&mut self, record: &umbra_core::CustodyRecord) -> Result<umbra_core::Sequence> {
+        Overlay::arm_custody(self, record.clone())
+    }
+    fn fail_custody(&mut self, record: &umbra_core::CustodyRecord) -> Result<umbra_core::Sequence> {
+        Overlay::fail_custody(self, record.clone())
+    }
+    fn prepare_finish(
+        &mut self,
+        proof: &umbra_core::CustodyFinishProof,
+    ) -> Result<umbra_core::Sequence> {
+        Overlay::prepare_finish(self, proof.clone())
+    }
+    fn commit_custody(
+        &mut self,
+        proof: &umbra_core::CustodyFinishProof,
+    ) -> Result<umbra_core::FinishRunReceipt> {
+        Overlay::commit_custody(self, proof)
+    }
+
     fn filesystem_metadata_capabilities(&self) -> &'static [&'static str] {
         &[umbra_core::capabilities::NAMESPACE_FILESYSTEM_METADATA_V1]
     }
@@ -3662,8 +3725,8 @@ impl NamespaceSession for Overlay {
         // so the run is as finished as a refused `bind` would have left it — but
         // it is *open*, and an operator holds a bound session whose recovery
         // state can be read, rather than an error and no handle. That difference
-        // is what the widening actually buys today, given that nothing in the
-        // shipped supervisor reopens a run at all.
+        // lets the supervisor reopen path report recovery requirements without
+        // treating classification as permission to resume mutations.
         //
         // `any` rather than a per-operation verdict: one unreconcilable
         // transaction condemns the session, and the classification is not
@@ -3768,6 +3831,7 @@ impl NamespaceSession for Overlay {
         self.used_operations
             .extend(config.recovery.pending.iter().map(|p| p.operation_id));
         self.custody = config.recovery.custody.clone();
+        self.custody_durable = self.custody.is_some();
         self.config = Some(config);
         self.base = Some(base);
         self.poisoned = poisoned;
@@ -4914,14 +4978,19 @@ impl NamespaceSession for Overlay {
         // Close the journal so its accepted records are not silently discarded,
         // but keep its error rather than reporting a tidy shutdown.
         let closed = self.journal.close();
-        if !request.tree_terminated || self.custody.as_ref().is_some_and(|c| c.recovery_only()) {
+        let unresolved_custody = self.custody.as_ref().is_some_and(|c| c.recovery_only());
+        if !request.tree_terminated || unresolved_custody {
             // Something may still hold a writable descriptor into this run.
             // Retaining the writer marker blocks takeover; storage stays open
             // because closing it would invalidate that evidence for this session.
             self.poisoned = true;
             return closed.and(Err(error(
                 ErrorKind::LeaseLost,
-                "run left recovery-required: supervised tree termination unproven",
+                if unresolved_custody {
+                    "run left recovery-required: managed custody unresolved"
+                } else {
+                    "run left recovery-required: supervised tree termination unproven"
+                },
             )));
         }
         let released = self.storage.release_writer(&lease);

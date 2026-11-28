@@ -65,6 +65,28 @@ fn register(backend: &mut MacosTraceBackend, s: Session) {
 }
 
 #[test]
+fn shutdown_budgets_torn_down_sessions_that_still_own_resources() {
+    let mut backend = MacosTraceBackend::default();
+    let (mut session, _peer) = slot(99, true);
+    session.retirement = None;
+    session.torn_down = true;
+    backend.sessions.push(session);
+    let umbra_platform::shutdown::Start::Local { accepted, .. } = backend
+        .begin_shutdown(umbra_core::shutdown::Nonce::new_v4())
+        .unwrap()
+    else {
+        panic!("local backend");
+    };
+    let required = shutdown_allowance(rsp::TRACER_REAP_BOUND, 1, 0).unwrap();
+    assert!(
+        accepted.remaining_millis >= required.as_millis() as u64,
+        "torn-down session still owns task, transport and admission resources: {} < {}",
+        accepted.remaining_millis,
+        required.as_millis()
+    );
+}
+
+#[test]
 fn f284_sibling_window_stop_refuses_before_delivery() {
     signal_window_stop(false);
 }
@@ -277,6 +299,21 @@ fn retirement_release_owns_all_resources() {
         worker: None,
     });
     let (mut retiring, mut peer) = slot(104, true);
+    retiring.parent = None; // Controlled slot already carries a root wait receipt.
+    let ledger = umbra_platform::shutdown::Ledger::new();
+    let tracee = ledger
+        .reserve(umbra_core::shutdown::ResourceKind::Tracee, None, 1, 0)
+        .unwrap();
+    tracee
+        .acquired(umbra_core::shutdown::Identity {
+            pid: Some(retiring.id.0.native_id as i32),
+            birth: None,
+        })
+        .unwrap();
+    retiring.ownership = Some(TraceOwnership {
+        ledger: ledger.clone(),
+        tracee,
+    });
     let pid = retiring.id.0.native_id;
     let thread = retiring.thread;
     let breakpoint = Breakpoint {
@@ -320,6 +357,16 @@ fn retirement_release_owns_all_resources() {
     );
     backend.service_retirements();
     assert!(backend.sessions[0].live.is_none());
+    ledger
+        .freeze(
+            umbra_core::shutdown::Nonce::new_v4(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert!(
+        ledger.final_snapshot().unwrap().entries[0].confirms(),
+        "retained tombstone must record terminal evidence before Session drop"
+    );
     assert_eq!(crate::ownership::remaining(pid), Vec::<&str>::new());
     assert!(task.upgrade().is_none(), "both Task owners must release");
     assert!(backend

@@ -1,19 +1,176 @@
 # umbra-isolation
 
-Run isolation for `umbra run` when it starts in launchd's session (session id 1),
-issue #193. **Current state:** shipped on macOS and active only there, only in
-session 1. In every other session, every terminal session included, it does
-nothing, and on other platforms it compiles to no-ops. **Scope:** this crate's
-`src/` and `tests/`. The `umbra-cli` launch path that calls it is described in
-[the CLI README](../umbra-cli/README.md#exit-codes-and-streams), and how
-debugserver kills a traced process on a lost connection in
-[the platform README](../umbra-platform-macos/README.md).
+Process custody and run isolation. **Current state:** macOS CLI runs in every
+starting session and registered executable-library runs use the managed role
+tree. **Scope:** this crate's `src/` and `tests/`. Other platforms do not activate
+this topology. See [the CLI README](../umbra-cli/README.md#exit-codes-and-streams)
+and [the platform README](../umbra-platform-macos/README.md) for their boundaries.
 
-This is the one umbra crate in the `umbra` binary's tree that permits `unsafe`
-(third-party dependencies such as `libc` aside). Every
-`unsafe` block carries a `// SAFETY:` comment, and `unsafe_op_in_unsafe_fn` is
-denied. `umbra-cli` keeps `#![forbid(unsafe_code)]` and calls two safe functions:
-`guardian_entry()` first in `main`, and `isolate_run()` before a run.
+## Managed ownership and deadlines
+
+The caller starts a relay, which owns the guardian. The guardian owns both the
+worker and cleanup owner; only the cleanup owner holds the platform provider's
+child handle. Each parent retains actual collection responsibility. The CLI
+process itself becomes the relay; an executable-library caller remains separate.
+The guardian starts a fresh session for a launchd caller; terminal callers retain
+their controlling session and job-control behavior. Helpers release inherited
+stdin/stdout after passing them on, and the worker releases its copies after
+platform adoption so a live supervisor cannot delay program pipe EOF.
+Provider admission, independent cancellation,
+and direct Start/ACK routes are installed before durable Armed custody permits GO.
+
+```mermaid
+flowchart LR
+    caller --> relay
+    relay --> guardian
+    guardian --> worker
+    guardian --> owner["cleanup owner"]
+    owner --> provider["platform provider"]
+```
+
+`umbra_core::managed::Ticket` uses the first observed cleanup trigger and negotiated capacity
+`C`. Forwarding, progress, a lost acknowledgement and fallback never renew that
+origin. The windows in `umbra_core::managed::CleanupPath` are:
+
+| Path | Total allocation |
+|---|---|
+| Trusted cleanup | `26.35 + 4C` seconds |
+| Notified failure | `30.6 + 8C` seconds |
+
+The default `C` is 64 simultaneous obligations. Retiring work remains charged
+until terminal proof; completed lifetime work does not consume capacity forever.
+The Start publication/acknowledgement exchange shares 250 ms. Worker-only
+abandonment stops the worker; custodians retain their children through their
+original cleanup opportunities. Ordinary programs have no default age or
+inactivity limit.
+
+Runtime construction failures retain actual-parent custody: the owner closes
+its startup endpoints and collects its adopted provider, and the relay collects
+its guardian without repeating consumed preparation. Both reuse the existing
+rollback allocation and retain the construction error as primary. Incomplete
+collection remains a reported failure.
+
+Managed startup and cleanup wait on descriptor readiness and process-exit
+events. If a provider rollback watch cannot be allocated or installed, its real
+parent first checks for collection. If the provider remains uncollected, the
+parent requests its stop and polls with sleeps capped at one millisecond under
+the original rollback cutoff; scheduling may delay those polls. An already
+collected provider completes rollback; otherwise the watch error remains a
+failure. Pre-GO helper rollback also retains parent collection if watch allocation
+fails: bootstrap closure requests recursive rollback, and parent polling uses
+the retained cutoff without allocating another watch. Expiry retains unresolved
+custody, and successful collection still reports the allocation error.
+Admission cancellation wakes a pending exchange to observe a shortened
+cutoff. Observer traffic shares the guard wait with independent cleanup routes.
+Each wake retains the original deadline. A route that acknowledged Start still
+answers a concurrent Start while another route is pending; queued acknowledgments
+must finish writing before publication completes.
+
+An exit notification can arrive before a nonblocking parent wait returns a
+status. Guards and the cleanup owner retain that collection work after consuming
+the one-shot notification, yielding and polling again under the original stage
+and ticket cutoffs. Only the actual parent wait establishes collection.
+The `test-exit-before-wait` feature forces this ordering in unit tests and the
+hosted shutdown-error case; the CLI forwards it for the own-session
+paused-journal regression. The hooks hold collection until the parent loop has
+consumed the exit notification, then defer one parent wait. These tests retain
+their original cleanup assertions.
+
+Worker collection retains unsolicited or invalid acknowledgement errors across
+retries. After draining routes sequentially, it checks their readiness together
+before returning, so a Start arriving on an already-scanned route is processed.
+Only a complete exchange with no retained failure exposes a clean receipt.
+
+Compared with the old isolated CLI, this topology adds one process; compared
+with an old terminal CLI it adds three. An external library caller has four
+helper/worker processes. `managed::topology::Topology` creates seven CLI socketpairs
+(worker-owner, worker-guardian, guardian-owner, owner-provider admission,
+owner-provider cancellation, worker-relay and owner-relay). The steady layout
+accounts for 21 CLI descriptors: fourteen topology ends, three private process
+queues and four parent-channel ends. Library notification adds four pairs,
+a caller queue and two parent-channel ends, giving 32. The cleanup owner releases
+its RPC copy after installing independent cancellation.
+
+The parent channels remain necessary after startup for observer callbacks and
+the worker's typed result. Against the original 19/28 budgets, the additional
+ends are:
+
+| Channel | Owning roles | Ends above the original budget |
+|---|---|---|
+| Guardian-to-relay result forwarding | guardian and relay | 2, CLI and library |
+| Relay-to-caller result forwarding | relay and external caller | 2, library only |
+
+Readiness snapshots measured 21/32 managed descriptors within the 22/33 ceilings.
+Startup observations after releasing child-only parent copies measured a
+conservative managed count of 24 CLI / 35 library. The owner accepts these
+startup-only counts under the visit-11 measurement method; readiness ceilings
+remain unchanged. Helper standard I/O is separately nine/twelve descriptors.
+Sequential startup censuses observed 52/67 total descriptors across five/six
+managed participants. These totals include legacy resources, and per-role maxima
+occur at different stages. Discovery can miss a child before its first record;
+the census is neither atomic nor proof of an absolute maximum. The
+[resource report](../../experiments/fixtures/umbra-fix-299b-performance/checkpoint12-startup-resources.md)
+retains the inventories and limits. The library caller returned to its original
+descriptor inventory, including pre-GO rollback. Launchd-session costs require
+CI qualification.
+
+Complete helper readiness must arrive within the original two seconds, before
+namespace preparation. Preparation has the original supervisor's lifetime;
+waiting helpers observe parent closure, notifications and installed process
+watches. The worker starts the single five-second durable-persistence allocation
+after preparation and sends its exact cutoff on the existing route. GO forwarding
+never renews it. Preparation failure starts the existing nine-second pre-GO
+provider-collection budget once. Relay and guardian pre-GO rollback retain the
+readiness-plus-nine-second cutoff while it is ahead. If preparation outlasted
+that cutoff, each retained child receives one nine-second interval at failure.
+Retries keep that same cutoff; rollback after GO remains refused. Expiry reports
+uncollected custody as failure. These allocations are separate from D4 cleanup tickets.
+
+Two limits remain explicit. Total loss of caller notification before any Start
+has no proven finite caller-return bound (D1); custody stays unresolved without
+an inactivity timer. Owner, guardian or relay death can orphan their children
+(D7). Fallback reports failure within its ticket but cannot turn disappearance
+or adoption into an actual parent wait. Late kernel creation and forced cleanup
+of a stalled owner can also leave collection unconfirmed. The kernel case where
+a tracer ends while holding a program remains outside this repair. These facts
+cannot establish successful whole-run collection.
+
+`managed_runtime::r2_da_order_across_roles` checks causal receipts across actual
+parent waits with ordinary program and debugger stand-ins. Held operations,
+terminal evidence and resource release prevent early cleanup or certification.
+Shutdown-error, unwind and cancellation cases retain their failed results after
+complete ordered collection; the emergency case also retains its unconfirmed
+result. The native
+Mach-right companion lives in `umbra-platform-macos`; these hosted stand-ins do
+not establish native debugger behavior or SID-1 qualification.
+
+The endpoint fixture captures the root inventory before topology creation and
+matches later sockets by both stat fields and the platform socket identity.
+Only the root may match that baseline; child roles still require assigned
+endpoints. Unexpected sockets report domain, type and the queried process.
+The managed endpoint, close-on-exec and nonce checks remain in place.
+
+After collecting its managed children, a guardian that leads the run's session
+uses the existing `sweep::end_run` drain and sweep for ordinary journal and storage
+clients. This preserves their legacy contract without moving them into managed
+custody. Terminal guardians that share the caller's session never sweep it.
+The sweep retains its existing bounds and reports incomplete or unverifiable
+cleanup loudly; it does not establish a parent wait for re-parented clients.
+Only after a complete sweep may the guardian report its actual failed-worker wait
+status over the existing observer channel. That report retains the committed
+cleanup cutoff and cannot replace an interrupted observer exchange.
+The CLI mirrors the status after collecting its guardian; external library
+callers receive a failure. An own-session test covers the paused-journal case
+through the `test-managed-session` test hook. The unchanged SID-1 case still
+requires fresh CI qualification.
+
+## Legacy launchd isolation
+
+The remainder describes the retained #193/#205 implementation and its tests.
+The macOS managed entrypoint above replaces its CLI activation. The legacy
+`isolate_run()` path applies only to launchd's session; it is a no-op elsewhere.
+The crate permits audited `unsafe` operations and denies
+`unsafe_op_in_unsafe_fn`; CLI callers use safe entrypoints.
 
 ## The problem
 
@@ -388,8 +545,12 @@ Stated, not closed here:
 
 The production-path tests in session 1 (P1-P4, topology, cleanup, and
 debugserver's arguments left as on master) and the terminal tests are `umbra-cli`'s
-`tests/isolation.rs`. CI's self-hosted runner, whose jobs run in session 1, runs
-both suites with `UMBRA_REQUIRE_SID1=1`.
+`tests/isolation.rs`. It identifies the worker and cleanup owner separately,
+checks each provider's actual parent, and validates managed collection receipts
+against kernel birth identities. The fresh-session guard passed with
+`shutdown-witness` enabled on the test command. SID-1 qualification belongs to CI's self-hosted runner with
+`UMBRA_REQUIRE_SID1=1`; a worker terminal session must not submit a launchd job
+to obtain that prerequisite.
 
 ```sh
 cargo test -p umbra-isolation

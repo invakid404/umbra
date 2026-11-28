@@ -1,4 +1,4 @@
-//! CLI parsing and concrete, in-process supervisor composition.
+//! CLI parsing and provider-based supervisor composition.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser};
 use umbra_core::Result;
 
-/// Umbra's command-line surface. `run` is operational; the run-management
+/// Umbra's command-line surface. `run`, provider diagnostics and recovery
+/// classification through `resume` are operational. Other run-management
 /// commands remain unimplemented and report that explicitly.
 #[derive(Debug, Parser)]
 #[command(

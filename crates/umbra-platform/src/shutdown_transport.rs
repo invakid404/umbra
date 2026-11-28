@@ -166,6 +166,12 @@ pub(super) fn serve_shutdown(
     let owner_deadline = freeze_started
         .checked_add(Duration::from_millis(accepted.remaining_millis))
         .ok_or_else(|| protocol_error("shutdown envelope overflow"))?;
+    #[cfg(feature = "shutdown-witness")]
+    crate::shutdown::witness(serde_json::json!({
+        "event": "shutdown-accepted-budget",
+        "remaining_millis": accepted.remaining_millis,
+        "preparation_nanos": std::time::Instant::now().saturating_duration_since(freeze_started).as_nanos().to_string(),
+    }));
     if let Err(error) = handoff_tx.send(Handoff {
         connection,
         accepted,
@@ -179,12 +185,21 @@ pub(super) fn serve_shutdown(
         return Err(protocol_error("shutdown connection handoff failed"));
     }
     let acceptance = accepted_rx.recv_timeout(remaining());
+    #[cfg(feature = "shutdown-witness")]
+    crate::shutdown::witness(serde_json::json!({
+        "event": "shutdown-acceptance-written",
+        "elapsed_nanos": std::time::Instant::now().saturating_duration_since(freeze_started).as_nanos().to_string(),
+    }));
     // Always destroy on this thread, including an acceptance failure. No
     // WatchedTasks or transport snapshot lock is held during any destructor.
     let destroyed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(platform)));
     let completed_at = now();
     #[cfg(feature = "shutdown-witness")]
-    crate::shutdown::witness(serde_json::json!({"event": "owner-terminal"}));
+    crate::shutdown::witness(serde_json::json!({
+        "event": "owner-terminal",
+        "elapsed_nanos": completed_at.saturating_duration_since(freeze_started).as_nanos().to_string(),
+        "late_nanos": completed_at.saturating_duration_since(owner_deadline).as_nanos().to_string(),
+    }));
     let terminal = match destroyed {
         Ok(()) => ledger.final_snapshot(),
         Err(payload) => {
@@ -319,12 +334,46 @@ fn unconfirmed_final(final_state: &Final, exit: &impl std::fmt::Debug) -> String
 }
 
 pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
-    if !client.owns_provider() {
+    close_with_owner(client, nonce, None)
+}
+
+pub(super) fn close_managed_client(
+    client: &mut Client,
+    nonce: Nonce,
+    owner: &mut dyn ManagedCleanup,
+) -> Closure {
+    close_with_owner(client, nonce, Some(owner))
+}
+
+fn close_with_owner(
+    client: &mut Client,
+    nonce: Nonce,
+    mut owner: Option<&mut dyn ManagedCleanup>,
+) -> Closure {
+    if let Some(owner) = owner.as_deref_mut() {
+        match owner.start() {
+            Ok(deadline) => client.connection.cap_cleanup_deadline(deadline),
+            Err(mut error) => {
+                client.connection.invalidate();
+                owner.failed(&error);
+                if let Err(collection) = owner.collect_provider() {
+                    error
+                        .context
+                        .push_str(&format!("; managed provider collection: {collection}"));
+                }
+                return Closure::failed(error);
+            }
+        }
+    }
+    if owner.is_none() && !client.owns_provider() {
         client.connection.invalidate();
         return Closure::failed(protocol_error("platform provider has no owned exit waiter"));
     }
     let mut proof = false;
+    let managed_run = owner.is_some();
+    let mut managed = None;
     let mut final_to_exit = None;
+    let mut collection_attempted = false;
     let result = (|| {
         let Response::ShutdownAccepted(accepted) =
             client.call(&Request::BeginShutdown { nonce })?
@@ -359,7 +408,13 @@ pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
                     // Measure from decoded-Final receipt, including validation.
                     let started = now();
                     proof = accepted.confirms(&final_state)?;
-                    let exit = client.confirm_provider_exit();
+                    let exit = if let Some(owner) = owner.as_deref_mut() {
+                        client.connection.invalidate();
+                        collection_attempted = true;
+                        owner.collect_provider()
+                    } else {
+                        client.confirm_provider_exit()
+                    };
                     let elapsed = now().saturating_duration_since(started);
                     final_to_exit = Some(elapsed);
                     #[cfg(feature = "shutdown-witness")]
@@ -367,10 +422,25 @@ pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
                         "event": "final-to-exit", "nonce": nonce,
                         "timing_origin": "final-decoded",
                         "nanos": elapsed.as_nanos().to_string(), "exit_ok": exit.is_ok(),
+                        "managed": owner.is_some(),
                         "proof": proof, "accepted": accepted, "final": final_state,
                     }));
                     if !proof {
                         return Err(protocol_error(unconfirmed_final(&final_state, &exit)));
+                    }
+                    if managed_run && proof && exit.is_ok() {
+                        if let Some(receipt) =
+                            owner.as_deref().and_then(ManagedCleanup::provider_receipt)
+                        {
+                            if receipt.failed || receipt.status != 0 {
+                                return Err(protocol_error("failed managed collection receipt"));
+                            }
+                            managed = Some(Box::new(crate::shutdown::ManagedTerminal::collected(
+                                accepted.clone(),
+                                final_state,
+                                receipt,
+                            )));
+                        }
                     }
                     return exit;
                 }
@@ -380,13 +450,27 @@ pub(super) fn close_client(client: &mut Client, nonce: Nonce) -> Closure {
     })();
     match result {
         Ok(_) => Closure {
+            managed,
             tree_terminated: proof,
             error: None,
             final_to_exit,
         },
-        Err(error) => {
+        Err(mut error) => {
             client.connection.invalidate();
+            if let Some(owner) = owner {
+                owner.failed(&error);
+                if let Err(collection) = if collection_attempted {
+                    Ok(Duration::ZERO)
+                } else {
+                    owner.collect_provider()
+                } {
+                    error
+                        .context
+                        .push_str(&format!("; managed provider collection: {collection}"));
+                }
+            }
             Closure {
+                managed: None,
                 tree_terminated: proof,
                 error: Some(error),
                 final_to_exit,

@@ -265,7 +265,7 @@ pub enum JournalLifecycle {
 /// recovery needs durable intent; abort does not assert that kernel writes vanished.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalPayload {
-    /// Dormant managed-run custody transition in the authoritative stream.
+    /// Managed-run custody transition in the authoritative stream.
     Custody(crate::CustodyRecord),
     /// Prepare.
     Prepare {
@@ -507,7 +507,20 @@ mod tests {
         // `path` is a `BytePath`, which serializes as `Vec<u8>` rather than a
         // string: paths are bytes, not UTF-8, and the array form is what makes
         // that true on disk as well as in the type.
-        let cases: [(JournalPayload, &[u8]); 5] = [
+        let cases: [(JournalPayload, &[u8]); 6] = [
+            (
+                JournalPayload::Custody(crate::CustodyRecord {
+                    run_id: crate::RunId(Uuid::from_u128(0x5150)),
+                    generation: Uuid::from_u128(0x2323),
+                    sequence: 1,
+                    state: crate::CustodyPhase::Armed {
+                        capacity: 64,
+                        startup_nonce: Uuid::from_u128(0x1234),
+                        participants: vec![crate::CustodyParticipant { pid: 42, birth: 100 }],
+                    },
+                }),
+                br#"{"format_version":1,"sequence":7,"operation_id":"00000000-0000-0000-0000-000000005150","writer_epoch":3,"payload":{"Custody":{"run_id":"00000000-0000-0000-0000-000000005150","generation":"00000000-0000-0000-0000-000000002323","sequence":1,"state":{"Armed":{"capacity":64,"startup_nonce":"00000000-0000-0000-0000-000000001234","participants":[{"pid":42,"birth":100}]}}}}}"#,
+            ),
             (
                 JournalPayload::Prepare {
                     intent: JournalIntent::Create {

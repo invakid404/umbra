@@ -3,6 +3,27 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::Duration;
 use umbra_core::*;
+#[cfg(feature = "test-native-cleanup-order")]
+#[path = "support/managed_admission.rs"]
+mod managed_admission;
+#[cfg(feature = "test-native-cleanup-order")]
+#[path = "support/native_emergency.rs"]
+mod native_emergency;
+#[cfg(feature = "test-native-cleanup-order")]
+#[path = "support/native_order.rs"]
+mod native_order;
+
+#[cfg(feature = "test-native-cleanup-order")]
+#[test]
+fn r2_native_da_order_across_roles() {
+    shutdown_native_root_ledger();
+}
+
+#[cfg(feature = "test-native-cleanup-order")]
+#[test]
+fn r2_native_da_order_emergency() {
+    native_emergency::run();
+}
 
 fn path(path: &Path) -> BytePath {
     BytePath::new(path.as_os_str().as_bytes().to_vec()).unwrap()
@@ -16,6 +37,8 @@ fn shutdown_native_root_ledger() {
     }
     let evidence = std::env::var_os("UMBRA_FIX_271_EVIDENCE_FILE")
         .expect("dedicated acquisition evidence path");
+    #[cfg(feature = "test-native-cleanup-order")]
+    let mut order = native_order::Observation::start();
     // A whole qualification command may append observations from earlier tests.
     // Keep those bytes and inspect only this serial test's newly appended span.
     let witness_start = std::fs::metadata(&evidence)
@@ -91,6 +114,10 @@ fn shutdown_native_root_ledger() {
         "closure proof={} error={:?} final-to-exit={:?}",
         closure.tree_terminated, closure.error, closure.final_to_exit
     );
+    #[cfg(feature = "test-native-cleanup-order")]
+    if let Some(order) = order.as_mut() {
+        order.assert_held();
+    }
     assert!(closure.tree_terminated, "{:?}", closure.error);
     assert!(closure.error.is_none(), "{:?}", closure.error);
     assert!(
@@ -159,6 +186,10 @@ fn shutdown_native_root_ledger() {
     let final_state: shutdown::Final =
         serde_json::from_value(final_record["final"].clone()).unwrap();
     assert!(accepted.confirms(&final_state).unwrap());
+    #[cfg(feature = "test-native-cleanup-order")]
+    order
+        .expect("native order directory required")
+        .finish(&final_state);
     let replacement = final_state
         .entries
         .iter()
@@ -207,7 +238,12 @@ fn shutdown_native_root_ledger() {
         "creation-return witness must match every acquired ledger slot"
     );
     assert_eq!(
-        observed.len(),
+        records
+            .iter()
+            .filter(|record| {
+                record["event"] == "acquired" && record["preparation_helper"] != true
+            })
+            .count(),
         4,
         "root tracee, initial and exec task rights, and owned tracer"
     );

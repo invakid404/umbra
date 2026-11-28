@@ -290,10 +290,7 @@ impl Journal for FileJournal {
         let log = directory.join("log");
         let writable = epoch.is_some();
 
-        if writable {
-            std::fs::create_dir_all(directory.join("checkpoints"))
-                .map_err(|e| io_error("journal_file.open", &directory, e))?;
-        } else if !directory.is_dir() {
+        if !writable && !directory.is_dir() {
             return Err(error(
                 ErrorKind::NotFound,
                 "journal_file.open",
@@ -400,6 +397,8 @@ impl Journal for FileJournal {
             }
         }
         let session_file = if writable {
+            std::fs::create_dir_all(directory.join("checkpoints"))
+                .map_err(|e| io_error("journal_file.open", &directory, e))?;
             let mut file = OpenOptions::new()
                 .create(true)
                 .read(true)
@@ -486,9 +485,9 @@ impl Journal for FileJournal {
                 epoch,
                 next,
             )?),
-            _ => state.custody.clone(),
+            _ => None,
         };
-        if matches!(record.payload, JournalPayload::Custody(_)) && custody == state.custody {
+        if custody.is_some() && custody == state.custody {
             return state.custody_sequence.ok_or_else(|| {
                 error(
                     ErrorKind::InvalidState,
@@ -528,8 +527,8 @@ impl Journal for FileJournal {
             .map_err(|e| io_error("journal_file.append", &state.log, e))?;
         state.valid_bytes += frame.len() as u64;
         state.last_sequence = sequence;
-        state.custody = custody;
-        if matches!(record.payload, JournalPayload::Custody(_)) {
+        if let Some(custody) = custody {
+            state.custody = Some(custody);
             state.custody_sequence = Some(sequence);
         }
         Ok(sequence)
@@ -906,8 +905,16 @@ mod tests {
             journal.flush(sequence).unwrap();
             journal.close().unwrap();
         }
+        let checkpoints = control_directory(&request(scratch.path(), run_id, 2))
+            .unwrap()
+            .join("checkpoints");
+        std::fs::remove_dir(&checkpoints).unwrap();
         let mut reopened = FileJournal::new();
         let recovered = reopened.open(&request(scratch.path(), run_id, 2)).unwrap();
+        assert!(
+            !checkpoints.exists(),
+            "an unresolved candidate writer must not create checkpoint directories"
+        );
         assert!(recovered.pending.is_empty());
         assert!(
             !recovered.recovery_required,

@@ -44,6 +44,7 @@ impl RunObserver for Observer {
             1 => panic!("observer failure"),
             2 | 4 | 5 | 6 => {
                 return Err(umbra_core::UmbraError {
+                    diagnostics: String::new(),
                     kind: umbra_core::ErrorKind::Io,
                     operation: "test.prepared".into(),
                     context: "observer rejected preparation".into(),

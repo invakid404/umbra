@@ -304,8 +304,10 @@ umbra-storage-nfs-userspace --features mutation-probe-spawn-lifecycle --example
 umbra243relay`. The guardian fault cases require a COMPLETE sweep, independent
 child-identity disappearance and CLEAN cleanup without harness kills. Retained local
 readings passed the provider-loss, unregistered-child, copyout-failure and
-free-failure guardian cases. CI selects all four with
-`mutation-probe-spawn-lifecycle`; a COMPLETE sweep alone does not establish reap.
+free-failure guardian cases. Those historical readings did not establish actual
+parent collection. CI now selects only the unregistered-child case; the provider,
+copyout and free-failure loss cases remain excluded because they leave
+launchd-parented zombies. A COMPLETE sweep alone does not establish reap.
 
 ## Quiet-program regression fixtures
 
@@ -316,7 +318,8 @@ tests compile these fixtures themselves and run native controls before traced
 comparisons. The CLI requires Code(0) for an 8-second quiet interval; the native
 platform test requires Idle across child/exec phases and all exits successful.
 These tests require macOS arm64, a C compiler and debugger permission. They do
-not qualify arbitrary-duration runs beyond the platform session watchdog.
+not qualify arbitrary workloads. The platform has no default session-age or
+inactivity limit; an explicitly configured watchdog is a separate mechanism.
 
 ## Inherited stdio controls (#201)
 

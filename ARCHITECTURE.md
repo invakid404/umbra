@@ -31,7 +31,7 @@ library and provider binary belong to the same package. Existing
 | --- | --- | --- |
 | [umbra-core](crates/umbra-core/README.md) | Byte paths, filesystem operation IR, stable IDs, structured errors, process/thread/fd state, shared DTOs, policy and persistent records | None |
 | [umbra-platform](crates/umbra-platform/README.md) | Tracing, syscall ABI, memory and lifecycle contracts; platform protocol | `umbra-core` |
-| [umbra-platform-macos](crates/umbra-platform-macos/README.md) | macOS transport, Darwin arm64 ABI, descendant capture and sandbox integration | `umbra-platform`, `umbra-core` |
+| [umbra-platform-macos](crates/umbra-platform-macos/README.md) | macOS transport, Darwin arm64 ABI, descendant capture and sandbox integration | `umbra-platform`, `umbra-core`, `umbra-isolation` on macOS |
 | [umbra-platform-linux](crates/umbra-platform-linux/README.md) | Linux ptrace, aarch64/x86-64 ABIs and enforcement | `umbra-platform`, `umbra-core` |
 | [umbra-storage](crates/umbra-storage/README.md) | Run storage operations, capabilities, durability and writer authority; storage protocol | `umbra-core` |
 | [umbra-storage-nfs](crates/umbra-storage-nfs/README.md) | Validated mounted NFS layout, shadow primitives, remote durability and fencing | `umbra-storage`, `umbra-core` |
@@ -44,9 +44,9 @@ library and provider binary belong to the same package. Existing
 | [umbra-agent](crates/umbra-agent/README.md) | Declarative launch/resume/stop plans and session contracts; agent protocol | `umbra-core` |
 | [umbra-agent-codex](crates/umbra-agent-codex/README.md) | Codex plans, logical state roots and session metadata | `umbra-agent`, `umbra-core` |
 | [umbra-agent-claude](crates/umbra-agent-claude/README.md) | Claude plans, stable project identity and session metadata | `umbra-agent`, `umbra-core` |
-| [umbra-supervisor](crates/umbra-supervisor/README.md) | Ordered event loop, process tree, transactions, recovery and checkpoint/handoff assembly | `umbra-core` and the five trait crates |
+| [umbra-supervisor](crates/umbra-supervisor/README.md) | Ordered event loop, process tree, transactions, recovery and checkpoint/handoff assembly | `umbra-core`, the five trait crates, `umbra-isolation` on macOS |
 | [umbra-cli](crates/umbra-cli/README.md) | `run`, `stop`, `checkpoint`, `resume`, `inspect`; configuration and provider connections | `umbra-core`, `umbra-supervisor`, the five trait crates as needed, `umbra-isolation` |
-| [umbra-isolation](crates/umbra-isolation/README.md) | Moves a run started in launchd's session into a session of its own (relay, guardian, session sweep); inert everywhere else | None |
+| [umbra-isolation](crates/umbra-isolation/README.md) | Per-run managed process custody, admission and notification on macOS; retained legacy session isolation | `umbra-core`, `umbra-platform` |
 
 The five trait crates are platform, storage, overlay, journal, and agent. Overlay
 also owns the backend-independent namespace engine: it receives `dyn Storage` and
@@ -63,7 +63,8 @@ requirement to import every allowed crate.
   and build dependencies. Overlay currently uses `umbra-storage-local` as a
   dev-dependency for real-filesystem tests; the other trait crates do not.
 - Each leaf backend has only its own trait crate and core as direct Umbra runtime
-  dependencies. NFS cannot import local storage; the file journal cannot import
+  dependencies, except that the macOS platform uses `umbra-isolation` for
+  managed process custody. NFS cannot import local storage; the file journal cannot import
   storage; agent adapters cannot import platform implementations. Transitive trait
   dependencies do not authorize additional direct edges. `umbra-platform-macos`
   currently dev-depends on `umbra-overlay`, `umbra-storage`, `umbra-journal` and
@@ -79,8 +80,9 @@ requirement to import every allowed crate.
 - Native OS bindings and target-specific build settings stay in platform and
   storage backends, with two exceptions. Core uses safe Unix descriptor APIs
   for owned launch stdio and its private platform transfer. `umbra-isolation`
-  (#193) moves a run out of launchd's session before any supervisor or provider
-  exists. That crate holds the process-session bindings and permits `unsafe`, and
+  holds managed process custody and the process-session bindings. Its guardian
+  moves launchd runs into a fresh session before starting the worker and cleanup
+  owner. That crate permits `unsafe`, and
   `umbra-cli` keeps `#![forbid(unsafe_code)]`.
   Shared DTOs belong in core, and per-trait protocols/factories in the trait crate.
 - Conformance helpers belong with contracts and use fakes or injected trait objects.
@@ -161,13 +163,14 @@ or OS pointers. Journal replay uses bounded pages/cursors on the wire. Platform 
 decoding requires a separate or multiplexed `TraceMemory` callback lane; keep the
 transport available and never hold a connection lock across a callback.
 
-Process topology: `umbra run` is the supervisor process, and it starts each
-provider as a child; the platform provider starts one debugserver per traced
-process. In launchd's session (session id 1: a launchd job or a CI runner) the
-launched `umbra` instead stays as a relay in its caller's process group and the
-whole run executes in a fresh session under a guardian, so no exit inside the run
-is counted against a group in launchd's session
-([umbra-isolation](crates/umbra-isolation/README.md), #193).
+On macOS, `umbra run` becomes a relay. Its guardian owns a worker and a cleanup
+owner; the cleanup owner alone retains the platform provider's child handle and
+forced-stop authority. The worker starts the other providers and runs the
+supervisor. A registered executable-library caller owns a separate relay.
+The platform provider starts one debugserver per traced process. For launchd
+callers, the guardian starts a fresh session; terminal callers retain their
+controlling session. The [isolation crate](crates/umbra-isolation/README.md)
+describes the collection responsibilities, bounds and residual failures.
 
 Providers are trusted supervisor components outside the tracee sandbox. Their
 private control sockets/pipes and descriptors must never be inherited by tracees.
@@ -219,6 +222,12 @@ userspace-routed runs that directory lives on the host under `--state-dir`, sinc
 the storage provider exposes no physical path; resume requires the retained log.
 This is single-host recovery, not cross-machine handoff. A torn final
 frame may be recovered under documented rules; interior corruption is an error.
+
+Managed resource acquisition requires admission before entry. Durable Armed
+custody binds the writer epoch and generation before the worker receives GO.
+FinishPrepared preserves the command outcome; Complete requires independently
+confirmed cleanup before writer release. Unresolved custody permits recovery
+inspection without admitting another writer.
 
 Run completion requires a complete platform resource ledger after same-owner
 destruction, followed by collection of the owned provider process. A separate

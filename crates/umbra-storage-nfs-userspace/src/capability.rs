@@ -14,19 +14,14 @@
 //!   them to the overlay rather than to storage. Answering
 //!   [`ErrorKind::UnsupportedCapability`] is the whole contract: no silent
 //!   fallback, no empty-but-successful answer, no discarded write.
-//! * [`Support::Deferred`] — authorised by the syscall matrix (it marks them
-//!   *emulated*) but not reachable from this crate today, because the frozen
-//!   [`Nfs4Op`](crate::transport::Nfs4Op) carries no argument variant for the
-//!   NFSv4.0 operation they need. Reporting these as unsupported would understate
-//!   the design exactly as reporting them as supported would overstate it, so they
-//!   answer [`ErrorKind::NotImplemented`] naming the owner, which is the idiom
-//!   [`crate::storage`] already uses for "authorised but not yet wired".
+//! * [`Support::Deferred`] — authorised but not available through this surface.
+//!   The row names the owner of the missing capability, such as immutable-base
+//!   materialisation above storage. It answers [`ErrorKind::NotImplemented`]
+//!   rather than promising behavior that is not wired.
 //!
-//! The distinction is load-bearing. `OpCode::Remove`, `OpCode::Rename`,
-//! `OpCode::Create` and `OpCode::SetAttr` all exist in the frozen transport, but
-//! `Nfs4Op` has no variant that can carry their arguments, so no COMPOUND in this
-//! crate can encode them. That is a contracts gap, not a capability decision, and
-//! it is recorded as such.
+//! Namespace mutations have wire argument variants and are bound through
+//! [`crate::namespace::dispatch::TransportDispatcher`]. A request without its
+//! required dispatcher is refused; the historical transport gap is closed.
 
 use umbra_core::{CreateKind, ErrorKind, Result, StorageOperation, UmbraError};
 

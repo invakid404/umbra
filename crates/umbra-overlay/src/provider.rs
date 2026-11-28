@@ -7,6 +7,34 @@ use umbra_core::provider::{self as wire, protocol_error, Client, Connection, Pro
 /// Owned requests for protocol version 1.
 #[derive(Serialize, Deserialize)]
 pub enum Request {
+    /// Inspect the exact generation after a lost acknowledgement.
+    QueryCustody {
+        /// Stable run identity.
+        run: umbra_core::RunId,
+        /// Expected custody generation.
+        generation: uuid::Uuid,
+    },
+    /// Persist Armed before GO.
+    ArmCustody {
+        /// Exact transition input.
+        record: umbra_core::CustodyRecord,
+    },
+    /// Persist an attributable managed failure.
+    FailCustody {
+        /// Exact transition input.
+        record: umbra_core::CustodyRecord,
+    },
+    /// Prepare an exact terminal certificate while retaining authority.
+    PrepareFinish {
+        /// Exact transition input.
+        proof: umbra_core::CustodyFinishProof,
+    },
+    /// Commit the prepared certificate before releasing authority.
+    CommitCustody {
+        /// Exact transition input.
+        proof: umbra_core::CustodyFinishProof,
+    },
+
     /// Read logical bytes without a native syscall buffer layout.
     ReadAt {
         /// Logical path beneath the tracee root anchor.
@@ -98,6 +126,17 @@ pub enum Request {
 /// Method-tagged successful responses; errors travel in the transport envelope.
 #[derive(Serialize, Deserialize)]
 pub enum Response {
+    /// Exact durable custody state.
+    QueryCustody(umbra_core::CustodyState),
+    /// Persist Armed before GO.
+    ArmCustody(umbra_core::Sequence),
+    /// Persist an attributable managed failure.
+    FailCustody(umbra_core::Sequence),
+    /// Prepare an exact terminal certificate while retaining authority.
+    PrepareFinish(umbra_core::Sequence),
+    /// Commit the prepared certificate before releasing authority.
+    CommitCustody(umbra_core::FinishRunReceipt),
+
     /// Read bytes.
     ReadAt(Vec<u8>),
     /// Merged directory page.
@@ -159,6 +198,62 @@ impl NamespaceResolver for Proxy {
     }
 }
 impl NamespaceSession for Proxy {
+    fn query_custody(
+        &mut self,
+        run: umbra_core::RunId,
+        generation: uuid::Uuid,
+    ) -> Result<umbra_core::CustodyState> {
+        match self.call(&Request::QueryCustody { run, generation })? {
+            Response::QueryCustody(state)
+                if state.record.run_id == run && state.record.generation == generation =>
+            {
+                Ok(state)
+            }
+            _ => Err(protocol_error(
+                "namespace.query_custody identity or response mismatch",
+            )),
+        }
+    }
+
+    fn arm_custody(&mut self, record: &umbra_core::CustodyRecord) -> Result<umbra_core::Sequence> {
+        match self.call(&Request::ArmCustody {
+            record: record.clone(),
+        })? {
+            Response::ArmCustody(value) => Ok(value),
+            _ => Err(protocol_error("namespace.arm_custody response mismatch")),
+        }
+    }
+    fn fail_custody(&mut self, record: &umbra_core::CustodyRecord) -> Result<umbra_core::Sequence> {
+        match self.call(&Request::FailCustody {
+            record: record.clone(),
+        })? {
+            Response::FailCustody(value) => Ok(value),
+            _ => Err(protocol_error("namespace.fail_custody response mismatch")),
+        }
+    }
+    fn prepare_finish(
+        &mut self,
+        proof: &umbra_core::CustodyFinishProof,
+    ) -> Result<umbra_core::Sequence> {
+        match self.call(&Request::PrepareFinish {
+            proof: proof.clone(),
+        })? {
+            Response::PrepareFinish(value) => Ok(value),
+            _ => Err(protocol_error("namespace.prepare_finish response mismatch")),
+        }
+    }
+    fn commit_custody(
+        &mut self,
+        proof: &umbra_core::CustodyFinishProof,
+    ) -> Result<umbra_core::FinishRunReceipt> {
+        match self.call(&Request::CommitCustody {
+            proof: proof.clone(),
+        })? {
+            Response::CommitCustody(value) => Ok(value),
+            _ => Err(protocol_error("namespace.commit_custody response mismatch")),
+        }
+    }
+
     fn read_link(&mut self, path: &StoragePath) -> Result<BytePath> {
         match self.call(&Request::ReadLink { path: path.clone() })? {
             Response::ReadLink(target) => Ok(target),
@@ -312,6 +407,18 @@ pub fn serve_provider<B: NamespaceSession>(
 /// exercised over a socketpair without a provider process.
 fn serve_session<B: NamespaceSession>(connection: Connection, mut backend: B) -> Result<()> {
     wire::serve(connection, |request| match request {
+        Request::QueryCustody { run, generation } => backend
+            .query_custody(run, generation)
+            .map(Response::QueryCustody),
+        Request::ArmCustody { record } => backend.arm_custody(&record).map(Response::ArmCustody),
+        Request::FailCustody { record } => backend.fail_custody(&record).map(Response::FailCustody),
+        Request::PrepareFinish { proof } => {
+            backend.prepare_finish(&proof).map(Response::PrepareFinish)
+        }
+        Request::CommitCustody { proof } => {
+            backend.commit_custody(&proof).map(Response::CommitCustody)
+        }
+
         Request::ReadLink { path } => backend.read_link(&path).map(Response::ReadLink),
         Request::Stat { path, follow } => backend.stat(&path, follow).map(Response::Stat),
         Request::SetReadLinkBuffer { address, len } => backend
@@ -462,6 +569,13 @@ mod tests {
         }
     }
     impl NamespaceSession for FakeBackend {
+        fn arm_custody(&mut self, record: &umbra_core::CustodyRecord) -> Result<Sequence> {
+            self.record(
+                format!("arm:{}:{}", record.generation, record.sequence),
+                Sequence(9),
+            )
+        }
+
         fn prepare(&mut self, _: OperationId, _: &ResolvedAction) -> Result<PreparedAction> {
             self.unused()
         }
@@ -647,6 +761,28 @@ mod tests {
             panic!("FailRun decoded as another response");
         };
         assert_eq!(wire::encode(&Response::FailRun(value)).unwrap(), failed);
+    }
+
+    #[test]
+    fn custody_arm_crosses_the_real_dispatcher() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut proxy, worker) = connected(FakeBackend::new(&calls, None));
+        let record = umbra_core::CustodyRecord {
+            run_id: run_id(),
+            generation: Uuid::new_v4(),
+            sequence: 1,
+            state: umbra_core::CustodyPhase::Armed {
+                capacity: 64,
+                startup_nonce: Uuid::new_v4(),
+                participants: vec![umbra_core::CustodyParticipant { pid: 42, birth: 1 }],
+            },
+        };
+        assert_eq!(proxy.arm_custody(&record).unwrap(), Sequence(9));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [format!("arm:{}:1", record.generation)]
+        );
+        shut_down(proxy, worker);
     }
 
     #[test]

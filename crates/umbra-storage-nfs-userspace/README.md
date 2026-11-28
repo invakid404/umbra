@@ -37,6 +37,45 @@ mounted adapter is a separate boundary at
 [umbra-storage-nfs](../umbra-storage-nfs/README.md); the contract this crate
 implements is [umbra-storage](../umbra-storage/README.md).
 
+## Managed-run custody and completion
+
+Managed macOS runs use this storage provider with a host-side journal and
+separate process-cleanup custody. Releasing the storage writer lease is not
+proof that the native provider and its children were collected.
+
+The shared `journal_records_completion` reader in `userspace_run.rs` accepts
+legacy `RunCompleted` records. For managed runs it instead requires a clean
+journal, a latest custody record of `Complete` with both closure proofs set,
+and a `FinishPrepared` record carrying an observed root exit rather than the
+supervisor-failure sentinel `i32::MIN`. Cleanup without an observed root result
+therefore does not become logical run completion. Historical `RunCompleted`
+descriptions below record the earlier journal format; current completion
+assertions use this shared reader.
+
+Durable managed recovery is also exercised against an explicitly selected raw
+storage descriptor in the overlay custody tests. Set
+`UMBRA_CUSTODY_REGISTRY_REQUIRED=1` and
+`UMBRA_CUSTODY_STORAGE_DESCRIPTOR` to that descriptor's JSON file; the fixture
+requires userspace capabilities, an admitted writer lease, and no kernel-visible
+root. Its journal remains host-side. The managed-library failed-closure test
+uses the same selection and the routed 12-second provider timeout. These checks
+cover persisted custody and refusal of competing writers; they do not convert
+unconfirmed process cleanup into a released obligation.
+
+Managed cleanup activation is implemented. The final local performance series
+passed the owner's whole-invocation and admission criteria with zero guard,
+protocol and deadline failures; original stage misses remain follow-up costs.
+See the [performance report](../../experiments/fixtures/umbra-fix-299b-performance/checkpoint12-acceptance.md)
+for retained distributions and the accepted descriptor census limitations.
+The region-cap writer-reopen and exact shutdown cases subsequently passed.
+C15's original diagnostic assertion also passed after typed errors were
+preserved; its oracle was not weakened or re-pinned. Earlier failed readings
+remain historical evidence. The historical after-root-exit tree failure is
+tracked separately in #314; the pre-GO preparation failure was repaired.
+Hosted endpoint socket provenance and self-hosted SID-1 checkpoint failures
+remain CI qualification obligations. Local filesystem success does not settle
+those findings or qualify the known provider-loss residuals.
+
 ## Packed-spawn qualification
 
 The `fix_243_*` and rank-11 cases in `tests/userspace_run.rs` compare native
@@ -54,7 +93,9 @@ Packed spawn uses the platform's exact reviewed layout contract: current
 refused. See the [platform matrix and requalification procedure](../umbra-platform-macos/README.md#packed-spawn-descriptors-experimental).
 The 54 cases exercise their qualified bodies directly: 24 ordinary
 cases, 29 lifecycle-feature cases, and the #205 fork-window SETSID refusal.
-Qualification covers 51 of these 54 arms. The three guardian provider-loss
+The earlier qualification covered 51 of these 54 arms; the managed-run failures
+above prevent carrying that count forward as a complete current qualification.
+The three guardian provider-loss
 arms are blocked by [#303](https://github.com/invakid404/umbra/issues/303)
 and kept, with unchanged bodies and oracles, out of CI until that defect is fixed.
 The separate `fix_243_provider_loss_no_spawn_reading` and
@@ -77,8 +118,8 @@ profile-refusal reading is not positive coverage.
 The optional `mutation-probe-spawn-lifecycle` feature enables lifecycle fault
 tests. CI builds both the CLI and platform provider with that feature and
 builds the `umbra243relay` example for guardian cases. The selected tests cover
-registered cleanup, policy and completion failures, guardian-contained provider
-loss, overlapping backing regions, the 16-token cap, repeated mapping release,
+registered cleanup, policy and completion failures, guardian handling of an
+unregistered child, overlapping backing regions, the 16-token cap, repeated mapping release,
 and allocation/write errors. Tests retain ownership observations separately from
 cleanup results. Guardian completion does not prove a child was reaped;
 provider-loss comparisons outside the guardian remain distinct

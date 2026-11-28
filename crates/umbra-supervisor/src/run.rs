@@ -81,7 +81,7 @@ fn select_abi(
 /// There is no automatic selection and no fallback between these: a run that
 /// cannot use the storage it asked for fails, rather than silently persisting
 /// somewhere weaker than the caller believes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RunPersistence {
     /// Default. A validated, already-mounted NFSv4 export whose durability
     /// boundary is the client fsync. Remote commit is not qualified.
@@ -96,7 +96,7 @@ pub enum RunPersistence {
 /// An explicitly constructed executable, argument vector and environment.
 /// argv includes argv[0] and the environment is exactly what the caller built;
 /// [`run`] separately captures the caller's standard streams.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandLaunch {
     /// Absolute executable path; never resolved by scanning PATH.
     pub executable: BytePath,
@@ -109,7 +109,7 @@ pub struct CommandLaunch {
 }
 
 /// What this run supervises.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum RunLaunch {
     /// A directly named command.
     Command(CommandLaunch),
@@ -129,14 +129,16 @@ pub trait RunObserver {
     }
     /// Called once, after preparation succeeds and before the target launches.
     ///
-    /// Returning `Err` aborts before launch through failure cleanup with
-    /// `tree_terminated=true`, because no target has launched. A caught unwind
+    /// Returning `Err` aborts before launch. Unarmed failure cleanup uses
+    /// `tree_terminated=true`; Armed managed custody remains unresolved until
+    /// independently confirmed terminal proof is available. A caught unwind
     /// panic becomes `InvalidState` with operation `run.observer`; its payload
     /// is leaked to avoid a second panic during destruction. This containment
     /// does not apply to `panic=abort`.
     ///
     /// Neither `finished` nor `teardown_warning` is called after `prepared`
-    /// fails. Panics in those other callbacks are not contained.
+    /// fails. A terminal callback unwind fails the managed observer exchange
+    /// while parent guards continue collection; the unarmed path lets it unwind.
     fn prepared(&mut self, run_id: RunId) -> Result<()>;
     /// Called once after confirmed platform closure and successful journal finish.
     fn finished(&mut self, outcome: &RunOutcome);
@@ -232,7 +234,7 @@ pub struct ResumeOutcome {
 }
 
 /// What the supervised tree actually did.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunOutcome {
     /// Stable run identity; independent of the physical mount root.
     pub run_id: RunId,
@@ -426,7 +428,7 @@ fn admit_run(
     Ok(())
 }
 
-fn validate(spec: &RunSpec) -> Result<()> {
+pub(crate) fn validate(spec: &RunSpec) -> Result<()> {
     spec.registry.validate()?;
     if !spec.experimental {
         return Err(error(
@@ -867,6 +869,27 @@ pub fn run(spec: RunSpec) -> Result<()> {
     unix::run(spec)
 }
 
+/// Execute staged setup inside a registered, ready managed worker.
+#[cfg(target_os = "macos")]
+pub fn run_worker(
+    spec: RunSpec,
+    run_id: RunId,
+    startup: umbra_isolation::managed::worker_startup::WorkerStartup,
+) -> Result<()> {
+    let mut completion = None;
+    let mut startup = Some(startup);
+    let result = unix::run_inner(spec, run_id, &mut startup, &mut completion);
+    if let (Some(startup), Err(error)) = (startup.as_mut(), &result) {
+        if let Err(delivery) = startup.report_setup_failure(error.clone()) {
+            eprintln!("managed setup error delivery failed: {delivery}");
+        }
+    }
+    if let Some(complete) = completion {
+        complete(result.clone())?;
+    }
+    result
+}
+
 /// Unsupported hosts fail explicitly rather than importing a backend.
 #[cfg(not(unix))]
 pub fn run(_spec: RunSpec) -> Result<()> {
@@ -915,15 +938,51 @@ mod unix {
         JournalOpenRequest, JournalWriterAuthority, OpenRunIntent, OpenRunRequest, PhysicalPath,
         RequestContext, StorageAnchor, StoragePath, StoragePolicy, TakeoverPolicy,
     };
-    use umbra_overlay::{standard_namespace, NamespaceSession, SessionConfig};
+    use umbra_overlay::{standard_namespace, SessionConfig};
     use umbra_storage::Storage;
     use uuid::Uuid;
 
-    pub fn run(mut spec: RunSpec) -> Result<()> {
+    pub fn run(spec: RunSpec) -> Result<()> {
+        run_inner(
+            spec,
+            RunId(Uuid::new_v4()),
+            #[cfg(target_os = "macos")]
+            &mut None,
+            #[cfg(target_os = "macos")]
+            &mut None,
+        )
+    }
+
+    pub(super) fn run_inner(
+        mut spec: RunSpec,
+        run_id: RunId,
+        #[cfg(target_os = "macos")] startup: &mut Option<
+            umbra_isolation::managed::worker_startup::WorkerStartup,
+        >,
+        #[cfg(target_os = "macos")] completion: &mut Option<crate::managed_observer::Completion>,
+    ) -> Result<()> {
+        let stage = |_name: &str| {
+            #[cfg(target_os = "macos")]
+            umbra_isolation::managed::executable::startup_observation(
+                _name,
+                Some(umbra_core::managed::Role::Worker),
+            );
+        };
+        stage("worker-setup-begin");
+        #[cfg(feature = "test-slow-namespace-preparation")]
+        std::thread::sleep(std::time::Duration::from_millis(2300));
+        if cfg!(feature = "test-failed-namespace-preparation") {
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            return Err(UmbraError::new(
+                ErrorKind::InvalidState,
+                "run.prepare",
+                "preparation test failure",
+            ));
+        }
         validate(&spec)?;
+        stage("worker-validation-end");
         let launch_stdio = umbra_core::launch_stdio::LaunchStdio::capture()?;
         let mut observer = spec.observer.take();
-        let run_id = RunId(Uuid::new_v4());
         let RunLaunch::Command(command) = spec.launch.clone() else {
             unreachable!("validated above");
         };
@@ -931,6 +990,7 @@ mod unix {
         // Fingerprint the approved workspace before anything is opened, so the
         // run's base identity describes the state preparation actually saw.
         let inventory = WorkspaceInventory::capture(&spec.workspace)?;
+        stage("workspace-inventory-end");
         let immutable_base = inventory.contract();
 
         let timeout = spec.registry.timeout_ms;
@@ -938,6 +998,7 @@ mod unix {
             spec.registry.get("storage")?,
             timeout,
         )?);
+        stage("storage-connect-end");
 
         let policy = StoragePolicy {
             read_only: false,
@@ -1284,11 +1345,77 @@ mod unix {
             Err(e) => return Err(fail(namespace, run_id, e, true)),
         };
 
-        let platform = match umbra_platform::provider::connect_with_stdio(
+        let namespace: crate::namespace_owner::NamespaceOwner = namespace.into();
+        stage("namespace-prepared");
+        #[cfg(target_os = "macos")]
+        let (namespace, platform_result) = if let Some(mut startup) = startup.take() {
+            let crate::namespace_owner::NamespaceOwner::Unmanaged(raw) = namespace else {
+                unreachable!("namespace has not been armed yet");
+            };
+            let (owner, client, cleanup) =
+                crate::run_owner::RunOwner::arm_worker(run_id, raw, &mut startup)?;
+            stage("worker-armed");
+            let mut namespace = crate::namespace_owner::NamespaceOwner::Managed(Box::new(owner));
+            let exchange = startup.entry.take_exchange().map_err(|failure| {
+                error(
+                    ErrorKind::ProtocolMismatch,
+                    "run.observer",
+                    failure.to_string(),
+                )
+            })?;
+            let mut transport = crate::managed_observer::WorkerTransport::new(exchange);
+            let observer_cleanup = cleanup.clone();
+            let shared_observer = std::rc::Rc::new(std::cell::RefCell::new(
+                crate::managed_observer::WorkerObserver::new(run_id, move |request| {
+                    if matches!(&request.event, crate::managed_observer::Event::StdioAdopted) {
+                        // The platform owns the program's copies now. This
+                        // worker must not delay pipe EOF while it supervises.
+                        umbra_core::launch_stdio::LaunchStdio::release_cli_streams()?;
+                    }
+                    transport.exchange(
+                        request,
+                        || observer_cleanup.observer_progress(),
+                        |channel, deadline| observer_cleanup.observer_wait(channel, deadline),
+                    )
+                }),
+            ));
+            let final_observer = shared_observer.clone();
+            let failure_observer = shared_observer.clone();
+            if let crate::namespace_owner::NamespaceOwner::Managed(owner) = &mut namespace {
+                owner.set_failure_reporter(Box::new(move |result| {
+                    failure_observer.borrow_mut().complete(result)
+                }));
+            }
+            *completion = Some(Box::new(move |result| {
+                final_observer.borrow_mut().complete(result)
+            }));
+            observer = Some(Box::new(crate::managed_observer::SharedObserver(
+                shared_observer,
+            )));
+            let platform = umbra_platform::provider::attach_managed_with_stdio(
+                client,
+                timeout,
+                Box::new(cleanup),
+                launch_stdio,
+            );
+            (namespace, platform)
+        } else {
+            (
+                namespace,
+                umbra_platform::provider::connect_with_stdio(
+                    spec.registry.get("platform")?,
+                    timeout,
+                    launch_stdio,
+                ),
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let platform_result = umbra_platform::provider::connect_with_stdio(
             spec.registry.get("platform")?,
             timeout,
             launch_stdio,
-        ) {
+        );
+        let platform = match platform_result {
             Ok(platform) => platform,
             Err(e) => return Err(fail(namespace, run_id, e, true)),
         };
@@ -1367,7 +1494,7 @@ mod unix {
             }
         }
 
-        let mut supervisor = Supervisor::with_namespace(run_id, platform, namespace, None);
+        let mut supervisor = Supervisor::assemble(run_id, platform, namespace, None);
         supervisor.terminal_journal = Some(terminal_journal);
         supervise_prepared(supervisor, launch_spec, budget, &mut observer)
     }
@@ -1378,6 +1505,7 @@ mod unix {
         budget: RunBudget,
         observer: &mut Option<Box<dyn RunObserver>>,
     ) -> Result<()> {
+        umbra_core::cost_snapshot!("run-ready", None, &[]);
         if let Err(primary) = supervisor.launch_prepared(launch_spec, budget) {
             return finish_supervision(supervisor, Err(primary), observer);
         }
@@ -1421,6 +1549,25 @@ mod unix {
             }
         }
         if let Some(mut primary) = failure {
+            // A logical run error does not erase independently confirmed
+            // process collection. Resolve custody before releasing the writer,
+            // while retaining the original failure and omitting `finished`.
+            #[cfg(target_os = "macos")]
+            if let (crate::namespace_owner::NamespaceOwner::Managed(owner), Some(terminal)) =
+                (&mut namespace, closure.managed.as_ref())
+            {
+                if !closure_failed {
+                    let root_result = match outcome.root_status {
+                        Some(ExitStatus::Code(code)) => code,
+                        Some(ExitStatus::Signal(signal)) => 128_i32.saturating_add(signal),
+                        None => i32::MIN,
+                    };
+                    match owner.finish_terminal(terminal, root_result) {
+                        Ok(_) => return Err(primary),
+                        Err(cleanup) => primary = with_cleanup(primary, Err(cleanup)),
+                    }
+                }
+            }
             if closure_failed {
                 if let Some(journal) = terminal_journal {
                     primary = with_cleanup(primary, journal.recovery_required());
@@ -1428,7 +1575,32 @@ mod unix {
             }
             return Err(fail(namespace, run_id, primary, closure.tree_terminated));
         }
-        if let Err(e) = namespace.finish_run(&FinishRunRequest {
+        if namespace.is_managed() {
+            #[cfg(target_os = "macos")]
+            if let crate::namespace_owner::NamespaceOwner::Managed(owner) = &mut namespace {
+                let terminal = closure.managed.as_ref().ok_or_else(|| {
+                    error(
+                        ErrorKind::InvalidState,
+                        "managed.finish",
+                        "missing ordered terminal certificate",
+                    )
+                })?;
+                let root_result = match outcome.root_status {
+                    Some(ExitStatus::Code(code)) => code,
+                    Some(ExitStatus::Signal(signal)) => 128_i32.saturating_add(signal),
+                    None => {
+                        return Err(error(
+                            ErrorKind::InvalidState,
+                            "managed.finish",
+                            "missing root outcome",
+                        ))
+                    }
+                };
+                if let Err(primary) = owner.finish_terminal(terminal, root_result) {
+                    return Err(fail(namespace, run_id, primary, closure.tree_terminated));
+                }
+            }
+        } else if let Err(e) = namespace.finish_run(&FinishRunRequest {
             run_id,
             root_status: outcome.root_status,
             processes_exited: outcome.processes_exited,
@@ -1731,11 +1903,19 @@ mod unix {
     }
 
     fn fail(
-        mut namespace: Box<dyn NamespaceSession + Send>,
+        namespace: impl Into<crate::namespace_owner::NamespaceOwner>,
         run_id: RunId,
         primary: UmbraError,
         tree_terminated: bool,
     ) -> UmbraError {
+        let mut namespace = namespace.into();
+        if namespace.is_managed() {
+            #[cfg(target_os = "macos")]
+            if let crate::namespace_owner::NamespaceOwner::Managed(owner) = &mut namespace {
+                owner.report_failure(&primary);
+            }
+            return primary;
+        }
         let cleanup = namespace.fail_run(&FailedRunRequest {
             run_id,
             reason: primary.to_string(),

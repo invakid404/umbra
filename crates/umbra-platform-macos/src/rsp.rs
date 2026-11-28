@@ -139,7 +139,13 @@ impl Drop for SetupChild {
                 Err(_) => break,
                 Ok(None) => {}
             }
-            if crate::clock::now() >= deadline {
+            let bounded = self
+                .ownership
+                .as_ref()
+                .map(|slot| slot.ledger().admission_cutoff())
+                .transpose()
+                .and_then(|cutoff| crate::clock::clamp_deadline(deadline, cutoff.flatten()));
+            if bounded.is_err() || crate::clock::now() >= bounded.unwrap_or(deadline) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -168,21 +174,37 @@ pub enum TeardownRead {
 ///
 /// `connect` and its handshake test share this so the test cannot silently skip
 /// on a host where only the override names a usable binary.
+#[cfg(test)]
 pub fn discover_debugserver() -> Option<std::path::PathBuf> {
+    discover_debugserver_owned(crate::clock::now() + Duration::from_secs(10), None).ok()
+}
+
+fn discover_debugserver_owned(
+    deadline: Instant,
+    ledger: Option<&umbra_platform::shutdown::Ledger>,
+) -> Result<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("UMBRA_DEBUGSERVER") {
-        return Some(std::path::PathBuf::from(path));
+        return Ok(std::path::PathBuf::from(path));
     }
-    Command::new("/usr/bin/xcode-select")
-        .arg("-p")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| {
-            std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
-                .join("Library/PrivateFrameworks/LLDB.framework/Resources/debugserver")
-        })
+    let out = crate::cache::command_with_ledger(
+        Command::new("/usr/bin/xcode-select").arg("-p"),
+        deadline,
+        ledger,
+    )?;
+    Ok(
+        std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+            .join("Library/PrivateFrameworks/LLDB.framework/Resources/debugserver"),
+    )
 }
 impl Rsp {
+    fn managed_cutoff(&self) -> Result<Option<u64>> {
+        self.ownership
+            .as_ref()
+            .map(|slot| slot.ledger().admission_cutoff())
+            .transpose()
+            .map(Option::flatten)
+    }
+
     pub fn deadline(&self) -> Instant {
         self.limit(Duration::from_secs(10))
     }
@@ -223,8 +245,14 @@ impl Rsp {
     ) -> Result<Self> {
         let executable = match &options.debugserver {
             Some(p) => p.clone(),
-            None => discover_debugserver()
-                .ok_or_else(|| error("xcode-select", "developer tools unavailable"))?,
+            None => {
+                let ledger = ownership.as_ref().map(|slot| slot.ledger());
+                let cutoff = crate::clock::now() + Duration::from_secs(10);
+                discover_debugserver_owned(
+                    deadline.map_or(cutoff, |deadline| deadline.min(cutoff)),
+                    ledger.as_ref(),
+                )?
+            }
         };
         let listener =
             TcpListener::bind("127.0.0.1:0").map_err(|e| error("debugserver listen", e))?;
@@ -253,11 +281,29 @@ impl Rsp {
         // debugserver, so it never inherits this. The platform still ends
         // debugserver with SIGKILL.
         //
-        // `pre_exec` makes `std` fork and exec rather than `posix_spawn`. The
-        // closure runs only `signal`, which is async-signal-safe.
+        // Capture inherited descriptors before fork. The debugger needs only
+        // stdio and the connection it opens after exec, never owner/admission
+        // channels or other provider descriptors. CLOEXEC alone leaves those
+        // endpoints open during the fork-to-exec interval.
+        #[cfg(feature = "managed-endpoint-probe")]
+        let mut probe =
+            crate::endpoint_probe::prepare().map_err(|e| error("debugserver endpoint probe", e))?;
+        #[cfg(feature = "managed-endpoint-probe")]
+        let inspection = probe.as_ref().map(|p| vec![p.fd()]).unwrap_or_default();
+        #[cfg(not(feature = "managed-endpoint-probe"))]
+        let inspection = [];
+        let closes = umbra_isolation::spawn::ClosePlan::capture(&inspection)
+            .map_err(|e| error("debugserver descriptor inventory", e))?;
+        // `pre_exec` makes `std` fork and exec rather than `posix_spawn`.
+        // The precomputed close operations and signals are async-signal-safe.
         // SAFETY: only async-signal-safe libc between fork and exec.
         unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+                closes.close_in_child()?;
+                #[cfg(feature = "managed-endpoint-probe")]
+                if let Some(probe) = &mut probe {
+                    probe.inspect()?;
+                }
                 for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
                     if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
                         return Err(std::io::Error::last_os_error());
@@ -266,7 +312,9 @@ impl Rsp {
                 Ok(())
             });
         }
+        umbra_core::cost_snapshot!("debugserver-command-before", None, &[]);
         let child = command.spawn().map_err(|e| error("debugserver spawn", e))?;
+        umbra_core::cost_snapshot!("debugserver-command-after", Some(child.id()), &[]);
         let mut child = SetupChild {
             child: Some(child),
             ownership: ownership.clone(),
@@ -297,7 +345,13 @@ impl Rsp {
                     return Err(error("debugserver accept", e));
                 }
             }
-            if crate::clock::now() >= limit
+            let cutoff = ownership
+                .as_ref()
+                .map(|slot| slot.ledger().admission_cutoff())
+                .transpose()?
+                .flatten();
+            let bounded = crate::clock::clamp_deadline(limit, cutoff)?;
+            if crate::clock::now() >= bounded
                 || child
                     .try_wait()
                     .map_err(|e| error("debugserver wait", e))?
@@ -375,7 +429,9 @@ impl Rsp {
                     "ordinary work cancelled; stream retained for teardown",
                 ));
             }
-            let remaining = limit.saturating_duration_since(crate::clock::now());
+            let cutoff = self.managed_cutoff()?;
+            let bounded = crate::clock::clamp_deadline(limit, cutoff)?;
+            let remaining = bounded.saturating_duration_since(crate::clock::now());
             if remaining.is_zero() {
                 return Ok(false);
             }
@@ -395,7 +451,14 @@ impl Rsp {
                     revents: 0,
                 },
             ];
-            let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+            // Re-read a managed cutoff while blocked: an independent Start
+            // can shorten it without making the debugger socket readable.
+            let poll_bound = if cutoff.is_some() {
+                10
+            } else {
+                i32::MAX as u128
+            };
+            let millis = remaining.as_millis().min(poll_bound) as i32;
             // SAFETY: poll receives the valid stack array for this call only.
             let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
             if rc < 0 {
@@ -459,6 +522,12 @@ impl Rsp {
                 Ok(n) => {
                     offset += n;
                     self.aligned = offset == bytes.len();
+                    #[cfg(test)]
+                    WRITE_PROGRESS.with(|observer| {
+                        if let Some(observe) = observer.borrow_mut().as_mut() {
+                            observe(offset, bytes.len(), &self.stream);
+                        }
+                    });
                 }
                 Err(e)
                     if matches!(
@@ -634,6 +703,19 @@ impl Rsp {
         self.stream.read(bytes)
     }
     pub fn request(&mut self, body: &str) -> Result<String> {
+        #[cfg(feature = "managed-cancel-probe")]
+        {
+            let hold = crate::setup_probe::Hold::begin(body, self.child.id())?;
+            let result = self.request_inner(body);
+            if let Some(hold) = hold {
+                hold.finish(&result, self.managed_cutoff())?;
+            }
+            result
+        }
+        #[cfg(not(feature = "managed-cancel-probe"))]
+        self.request_inner(body)
+    }
+    fn request_inner(&mut self, body: &str) -> Result<String> {
         self.send(body)?;
         let limit = self.limit(Duration::from_secs(5));
         loop {
@@ -693,6 +775,36 @@ impl Rsp {
             Err(e) => TeardownRead::Closed(e.to_string()),
         }
     }
+    #[cfg(feature = "test-native-cleanup-order")]
+    pub(crate) fn observe_tracer_end(&self) -> serde_json::Value {
+        // Observe our child without collecting it or changing cleanup timing.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return serde_json::json!({"error": std::io::Error::last_os_error().to_string()});
+        }
+        serde_json::json!({"running": info.si_pid == 0,
+            "normal_exit": info.si_pid != 0 && info.si_code == libc::CLD_EXITED,
+            "code": info.si_code, "status": info.si_status})
+    }
+
+    #[cfg(feature = "test-native-cleanup-order")]
+    pub(crate) fn collected_raw_status(&mut self) -> Option<i32> {
+        use std::os::unix::process::ExitStatusExt;
+        // Only query Child's cached status after production has collected it.
+        self.reaped
+            .then(|| self.child.try_wait().ok().flatten())
+            .flatten()
+            .map(|status| status.into_raw())
+    }
+
     /// `SIGKILL` the tracer. Harmless if it has already exited.
     pub fn kill_tracer(&mut self) {
         let _ = self.child.kill();
@@ -716,7 +828,10 @@ impl Rsp {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => return false,
             }
-            if crate::clock::now() >= limit {
+            let bounded = self
+                .managed_cutoff()
+                .and_then(|cutoff| crate::clock::clamp_deadline(limit, cutoff));
+            if bounded.is_err() || crate::clock::now() >= bounded.unwrap_or(limit) {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -779,8 +894,12 @@ impl Rsp {
     }
 }
 #[cfg(test)]
+type TestWriteProgress = Box<dyn FnMut(usize, usize, &TcpStream)>;
+#[cfg(test)]
 thread_local! {
     static RETIREMENT_WAIT_GATES: std::cell::RefCell<std::collections::HashMap<u32, usize>> = Default::default();
+    // Reports actual syscall progress; it never substitutes a write result.
+    static WRITE_PROGRESS: std::cell::RefCell<Option<TestWriteProgress>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
 impl Rsp {
@@ -865,8 +984,15 @@ impl Drop for Rsp {
 
 #[cfg(test)]
 mod tests {
+    // Keep the original CI guard selectable alongside the managed cancellation
+    // name; both exercise the same partial-reply and stream-preservation oracle.
     #[test]
     fn cancellation_preserves_partial_reply_and_same_stream_for_teardown() {
+        r3_cancel_ordinary_request_same_stream();
+    }
+
+    #[test]
+    fn r3_cancel_ordinary_request_same_stream() {
         use std::io::{Read, Write};
         let (mut rsp, mut peer) = Rsp::retirement_test_pair();
         peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -885,9 +1011,11 @@ mod tests {
         assert!(rsp.poll(std::time::Duration::from_secs(1)).is_err());
         assert_eq!(&rsp.buffer, b"$O");
         assert!(rsp.begin_teardown());
-        peer.write_all(b"K#00").unwrap();
+        peer.write_all(b"K#00")
+            .expect("cancellation closed the shared RSP stream");
         assert!(
-            matches!(rsp.teardown_read(std::time::Duration::from_millis(20)), TeardownRead::Packet(p) if p == "OK")
+            matches!(rsp.teardown_read(std::time::Duration::from_millis(20)), TeardownRead::Packet(p) if p == "OK"),
+            "cancellation destroyed the in-flight reply on the shared stream"
         );
         rsp.teardown_interrupt(crate::clock::now() + std::time::Duration::from_millis(20))
             .unwrap();
@@ -902,6 +1030,93 @@ mod tests {
         let mut kill = [0; 5];
         peer.read_exact(&mut kill).unwrap();
         assert_eq!(&kill, b"$k#6b");
+    }
+
+    #[test]
+    fn r3_cancel_partial_write() {
+        use std::{
+            cell::Cell,
+            io::{Read, Write},
+            os::fd::AsRawFd,
+            rc::Rc,
+        };
+        fn buffer(stream: &TcpStream, option: libc::c_int, size: libc::c_int) {
+            // SAFETY: the owned socket and the integer option value are valid.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        option,
+                        std::ptr::from_ref(&size).cast(),
+                        std::mem::size_of_val(&size) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+        }
+        let (mut rsp, mut peer) = Rsp::retirement_test_pair();
+        buffer(&rsp.stream, libc::SO_SNDBUF, 4096);
+        buffer(&peer, libc::SO_RCVBUF, 4096);
+        let body = format!("q{}", "x".repeat(1 << 20));
+        let checksum = body.bytes().fold(0u8, u8::wrapping_add);
+        let expected = format!("${body}#{checksum:02x}").into_bytes();
+        let (release, ready) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            ready.recv_timeout(Duration::from_secs(1)).unwrap();
+            buffer(&peer, libc::SO_RCVBUF, 1 << 20);
+            let mut received = vec![0; expected.len()];
+            peer.read_exact(&mut received).unwrap();
+            assert!(
+                received == expected,
+                "cancellation corrupted the outgoing frame"
+            );
+            let mut interrupt = [0];
+            peer.read_exact(&mut interrupt).unwrap();
+            assert_eq!(interrupt, [3]);
+            peer.write_all(b"$T02thread:1;#00").unwrap();
+            let mut kill = [0; 5];
+            peer.read_exact(&mut kill).unwrap();
+            assert_eq!(&kill, b"$k#6b");
+        });
+        let first = Rc::new(Cell::new(0));
+        let recorded = first.clone();
+        let wakeup = rsp.wakeup.clone();
+        WRITE_PROGRESS.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move |offset, length, stream| {
+                if recorded.get() == 0 {
+                    assert!(
+                        offset > 0 && offset < length,
+                        "fixture did not produce a partial write"
+                    );
+                    recorded.set(offset);
+                    wakeup.signal();
+                    buffer(stream, libc::SO_SNDBUF, 1 << 20);
+                    release.send(()).unwrap();
+                }
+            }));
+        });
+        let sent = rsp.send(&body);
+        WRITE_PROGRESS.with(|observer| observer.borrow_mut().take());
+        assert!(
+            sent.is_ok(),
+            "cancellation truncated an ordinary outgoing frame: {sent:?}"
+        );
+        assert!(first.get() > 0 && first.get() < body.len());
+        eprintln!(
+            "RSP partial-write witness: first {} of {} frame bytes",
+            first.get(),
+            body.len() + 4
+        );
+        assert!(rsp.poll(Duration::from_millis(20)).is_err());
+        assert!(rsp.begin_teardown(), "partial write lost packet alignment");
+        rsp.teardown_interrupt(crate::clock::now() + Duration::from_millis(20))
+            .unwrap();
+        assert!(matches!(rsp.teardown_read(Duration::from_millis(20)),
+            TeardownRead::Packet(packet) if packet == "T02thread:1;"));
+        rsp.send_kill(Duration::from_millis(20)).unwrap();
+        reader.join().unwrap();
     }
 
     use super::*;
@@ -1042,6 +1257,51 @@ fn read_timeout(remaining: Duration) -> Duration {
 #[cfg(test)]
 mod poll_bound_tests {
     use super::*;
+    #[test]
+    fn blocked_rsp_observes_shortened_managed_cutoff() {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+        struct Authority;
+        impl umbra_core::AdmissionTransport for Authority {
+            fn exchange(
+                &mut self,
+                _: umbra_core::AdmissionOperation,
+                _: u64,
+            ) -> std::io::Result<std::result::Result<u64, umbra_core::AdmissionError>> {
+                Ok(Ok(1))
+            }
+        }
+        let cutoff = Arc::new(AtomicU64::new(u64::MAX));
+        let observed = cutoff.clone();
+        let ledger = umbra_platform::shutdown::Ledger::new();
+        ledger
+            .install_admission(
+                umbra_platform::admission::Admission::new(Box::new(Authority)),
+                Box::new(move || Ok(observed.load(Ordering::Acquire))),
+            )
+            .unwrap();
+        let slot = ledger
+            .reserve(umbra_core::shutdown::ResourceKind::Tracee, None, 1, 0)
+            .unwrap();
+        let (mut rsp, _peer) = Rsp::retirement_test_pair();
+        rsp.set_test_ownership(slot);
+        rsp.torn_down = true; // Synthetic accounting; fixture child is already waited.
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cutoff.store(crate::clock::boot_nanos().unwrap(), Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = rsp.ready(libc::POLLIN, started + Duration::from_secs(2), false);
+        setter.join().unwrap();
+        assert!(!result.unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "blocked socket must observe a shortened shared cutoff"
+        );
+    }
+
     #[test]
     fn partial_packet_survives_idle() {
         use std::io::Write;

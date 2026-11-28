@@ -1,0 +1,9 @@
+# Routed tree failure investigation
+
+The two retained failures remain one open defect. A bounded head-only reproduction ran 100 invocations in four batches of 25, under the original deadlines, against the frozen visit-10 runtime. All 100 passed the existing tree, guard and parent-collection checks. Every wrapper exited successfully, with no reported leak. Reproduction stops at the prescribed cap; successful later invocations do not resolve either failure.
+
+The newer failure began at boot time 600133469957541 ns. Launch configuration was recorded at +27.409 ms and root relay entry at +37.353 ms. `Startup::new` creates the shared two-second readiness cutoff between those observations, putting its deadline within [600135497366541, 600135507310541] ns. The exact value was not recorded. CleanupOwner was collected at +2133.629 ms with exit code 1, while Worker reached namespace preparation only at +3824.444 ms. No GO was recorded. Owner startup phase 3 waits for GO against that same readiness cutoff. This is consistent with startup expiry during preparation; the interleaved stderr does not prove which operation first returned timeout or whether host load caused it. No deadline is changed.
+
+The historical failure began at boot time 520659445684333 ns. GO was observed at +298.833 ms, root exit at +5997.825 ms, Guardian collection at +6539.277 ms and caller return at +6553.440 ms. Its diagnostic reports provider disconnection and shutdown owner-progress failure. That build did not record individual startup stages or the exact expired operation deadline. Both guards retained failure and collected their children. A common cause is neither established nor excluded.
+
+No production fix is justified by these records. The earlier separate-issue referral is withdrawn: the defect remains in this PR for the anchor disposition. The reproduction fixture is a diagnostic and does not replace paired performance qualification.

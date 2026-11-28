@@ -3,15 +3,15 @@
 //!
 //! # Safety contract for this module
 //!
-//! This is the only module in the crate that enables `unsafe`. Everything it
-//! exposes is a raw C declaration; every invariant below is upheld by
+//! The parent `raw` module enables `unsafe` for this FFI boundary. Everything
+//! this module exposes is a raw C declaration; every invariant below is upheld by
 //! [`super::pump`] and [`super::args`], not here.
 //!
 //! 1. **The binding is allowlisted.** `build.rs` generates only the public raw
 //!    RPC/XDR and task primitives, and fails the build if a managed-lifecycle
 //!    symbol (`nfs_context`, any `nfs_*` entry point) reaches this file. The
 //!    managed API is therefore not merely unused, it is absent.
-//! 2. **C never receives a Rust pointer.** The only `private_data` handed to
+//! 2. **Callback identity is not a Rust pointer.** The only `private_data` handed to
 //!    libnfs is a `u64` call id cast to `*mut c_void`. A completion for a call
 //!    that has been retired resolves to no entry in the global registry and is
 //!    discarded, so a late or duplicated callback cannot dereference anything.

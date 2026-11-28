@@ -17,6 +17,25 @@ fn transport_now() -> Instant {
     }
     Instant::now()
 }
+
+fn wait_for_connection(listener: &UnixListener, deadline: Instant) -> std::io::Result<()> {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    // Readiness wakes immediately; the existing child-exit inspection cadence
+    // remains a fallback when a child ends without connecting.
+    let duration = remaining.min(Duration::from_millis(5));
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: duration.as_nanos() as _,
+    };
+    match poll(&mut [PollFd::new(listener, PollFlags::IN)], Some(&timeout)) {
+        Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
 #[cfg(test)]
 thread_local! { static FIX264_CLOCK: std::cell::Cell<Option<(Instant, Instant)>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
@@ -53,6 +72,7 @@ pub struct Connection {
     deadline: Instant,
     timeout: Duration,
     failed: bool,
+    cleanup_limit: Option<Instant>,
 }
 impl Connection {
     fn send_launch_stdio(&mut self, stdio: &crate::launch_stdio::LaunchStdio) -> Result<()> {
@@ -86,12 +106,21 @@ impl Connection {
             deadline: transport_now() + timeout,
             timeout,
             failed: false,
+            cleanup_limit: None,
         }
     }
+    /// Borrow the exact connection descriptor for endpoint inventory observation.
+    pub fn observation_descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.stream.as_fd()
+    }
+
     /// Duplicate the provider endpoint for non-consuming liveness observation.
     /// Closing the duplicate alone does not close this connection.
     pub fn observation_stream(&self) -> Result<UnixStream> {
-        self.stream.try_clone().map_err(unavailable)
+        let stream = self.stream.try_clone().map_err(unavailable)?;
+        crate::cost_snapshot!("provider-observation-duplicate", None, &[]);
+        Ok(stream)
     }
     /// Current absolute deadline, retained by nested callback requests.
     pub fn deadline(&self) -> Instant {
@@ -99,7 +128,18 @@ impl Connection {
     }
     /// Restore an outer request deadline after a nested control request.
     pub fn set_deadline(&mut self, deadline: Instant) {
-        self.deadline = deadline;
+        self.deadline = self
+            .cleanup_limit
+            .map_or(deadline, |limit| limit.min(deadline));
+    }
+    /// Permanently cap this connection to an original managed cleanup ticket.
+    /// Neither nested requests nor later notifications can extend the cap.
+    pub fn cap_cleanup_deadline(&mut self, deadline: Instant) {
+        let limit = self
+            .cleanup_limit
+            .map_or(deadline, |current| current.min(deadline));
+        self.cleanup_limit = Some(limit);
+        self.deadline = self.deadline.min(limit);
     }
     /// Wait for an idle server's next request, then bound the remainder of its frame.
     pub fn receive_request<T: serde::de::DeserializeOwned>(&mut self) -> Result<T> {
@@ -129,7 +169,7 @@ impl Connection {
     }
     /// Begin.
     pub fn begin(&mut self) {
-        self.deadline = transport_now() + self.timeout;
+        self.set_deadline(transport_now() + self.timeout);
     }
     /// Remaining time in the current frame's original request deadline.
     pub fn remaining(&self) -> Result<Duration> {
@@ -184,7 +224,7 @@ impl Connection {
                         if is_deadline_timeout(e)
                             || e.kind() == std::io::ErrorKind::Interrupted =>
                     {
-                        continue
+                        continue;
                     }
                     Err(e) => return Err(unavailable(e)),
                 },
@@ -234,7 +274,7 @@ impl Connection {
                 Err(ref e)
                     if is_deadline_timeout(e) || e.kind() == std::io::ErrorKind::Interrupted =>
                 {
-                    continue
+                    continue;
                 }
                 Err(e) => return Err(unavailable(e)),
             };
@@ -295,10 +335,41 @@ impl Reap for Child {
         Child::kill(self)
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        Child::try_wait(self)
+        let result = Child::try_wait(self);
+        #[cfg(feature = "test-owned-exit")]
+        if let Ok(Some(status)) = &result {
+            observed_exit(self.id(), *status);
+        }
+        result
     }
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        Child::wait(self)
+        let result = Child::wait(self);
+        #[cfg(feature = "test-owned-exit")]
+        if let Ok(status) = &result {
+            observed_exit(self.id(), *status);
+        }
+        result
+    }
+}
+
+#[cfg(feature = "test-owned-exit")]
+type ExitObservation = std::sync::Arc<std::sync::Mutex<Option<std::process::ExitStatus>>>;
+#[cfg(feature = "test-owned-exit")]
+static EXIT_OBSERVATIONS: std::sync::Mutex<
+    std::collections::BTreeMap<
+        u32,
+        std::sync::Weak<std::sync::Mutex<Option<std::process::ExitStatus>>>,
+    >,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(feature = "test-owned-exit")]
+fn observed_exit(pid: u32, status: std::process::ExitStatus) {
+    if let Some(observer) = EXIT_OBSERVATIONS
+        .lock()
+        .unwrap()
+        .remove(&pid)
+        .and_then(|value| value.upgrade())
+    {
+        *observer.lock().unwrap() = Some(status);
     }
 }
 
@@ -311,46 +382,49 @@ enum Reaped {
     Detached,
     /// The reaper thread could not be spawned; the child was dropped unreaped.
     Abandoned,
+    /// The actual wait returned an error, so collection remains unconfirmed.
+    WaitFailed,
 }
 
 /// SIGKILL a provider and reap it without blocking the caller past `grace`.
 ///
-/// Poll `try_wait` for up to `grace` (the same 5ms idiom as [`Client::connect`]'s
-/// accept loop). A healthy provider exits at once, so the reap stays synchronous and
-/// spawns nothing. A provider stuck on an uninterruptible kernel wait is moved into a
-/// detached named thread that blocks on `wait`, so the caller returns in about
-/// `grace`, leaking at most one parked thread and one zombie until the kernel releases
-/// the wait (both cleaned up when the process exits and the provider is reparented to
-/// init). A `try_wait` error does *not* prove the child was reaped -- std's Unix
-/// `try_wait` propagates the `waitpid(WNOHANG)` error, so a transient EINTR leaves the
-/// child alive -- so it too routes to the detached wait, which actually reaps a live
-/// child and returns immediately (ECHILD) for one already reaped elsewhere.
+/// Check once without blocking, then wait for the actual owned child on a
+/// reaper thread. The caller waits only to the original grace cutoff. A child
+/// stuck in the kernel retains its reaper after the caller returns. An inspection
+/// error follows the existing immediate-detach path; it is not collection proof.
 fn reap(mut child: impl Reap, grace: Duration) -> Reaped {
     let _ = child.kill();
     let deadline = Instant::now() + grace;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Reaped::Exited,
-            Err(error) => {
-                // An error is not proof of reaping (only ECHILD is): hand the wait to
-                // the detached thread, which reaps a still-live child and resolves an
-                // already-reaped one immediately.
-                tracing::warn!(%error, "provider try_wait failed; reaping on a detached thread");
-                break;
-            }
-            Ok(None) if Instant::now() >= deadline => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+    let await_result = match child.try_wait() {
+        Ok(Some(_)) => return Reaped::Exited,
+        Ok(None) => true,
+        Err(error) => {
+            tracing::warn!(%error, "provider inspection failed; retaining detached wait");
+            false
         }
-    }
-    tracing::warn!("provider did not exit after SIGKILL; reaping on a detached thread");
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     match std::thread::Builder::new()
         .name("umbra-provider-reap".into())
         .spawn(move || {
-            let _ = child.wait();
+            let result = child.wait();
+            let _ = sender.send(result);
         }) {
-        // Dropping the `JoinHandle` detaches the thread; std's `Child::drop` never
-        // waits, so the `Abandoned` path leaves only a zombie until process exit.
-        Ok(_) => Reaped::Detached,
+        Ok(_handle) => {
+            if !await_result {
+                return Reaped::Detached;
+            }
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                // Receipt proves the owned wait completed. Dropping the handle
+                // avoids an unbounded wait for the thread's final return.
+                Ok(Ok(_)) => Reaped::Exited,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "provider wait failed; collection unconfirmed");
+                    Reaped::WaitFailed
+                }
+                Err(_) => Reaped::Detached,
+            }
+        }
         Err(_) => Reaped::Abandoned,
     }
 }
@@ -379,6 +453,34 @@ impl Drop for Client {
     }
 }
 impl Client {
+    /// Move a fresh managed connection to the worker without shutting down its
+    /// socket. The cleanup owner retains the independently stored child handle.
+    /// No requests may have been sent after the handshake.
+    pub fn into_managed_handoff(mut self) -> Result<(UnixStream, Welcome)> {
+        if self.child.is_some() || self.next_id != 1 || self.connection.failed {
+            return Err(protocol_error(
+                "connection is not eligible for managed handoff",
+            ));
+        }
+        let (replacement, peer) = UnixStream::pair().map_err(unavailable)?;
+        drop(peer);
+        let timeout = self.connection.timeout;
+        let connection =
+            std::mem::replace(&mut self.connection, Connection::new(replacement, timeout));
+        Ok((connection.stream, self.welcome.clone()))
+    }
+
+    /// Qualification receipt populated only by this transport's actual parent wait.
+    #[cfg(feature = "test-owned-exit")]
+    pub fn observe_owned_exit(pid: u32) -> ExitObservation {
+        let observation = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut registry = EXIT_OBSERVATIONS.lock().unwrap();
+        registry.retain(|_, value| value.strong_count() > 0);
+        assert!(registry
+            .insert(pid, std::sync::Arc::downgrade(&observation))
+            .is_none());
+        observation
+    }
     /// Whether this client can independently confirm its provider's exit.
     /// Attached storage/journal clients remain valid for their own protocols.
     pub fn owns_provider(&self) -> bool {
@@ -399,6 +501,8 @@ impl Client {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    #[cfg(feature = "test-owned-exit")]
+                    observed_exit(child.id(), status);
                     self.child.take();
                     if !status.success() {
                         return Err(protocol_error(format!("provider exited with {status}")));
@@ -442,11 +546,75 @@ impl Client {
 
     /// Validate provider registration and establish a private protocol session.
     pub fn connect(descriptor: &ProviderDescriptor, timeout_ms: u64) -> Result<Self> {
+        Self::connect_with_custody(descriptor, timeout_ms, None, None, |_| Ok(()))
+    }
+
+    /// Connect from the cleanup-owner process, retaining its child on every error.
+    /// The caller supplies an empty custody slot and must collect it under the
+    /// original cleanup ticket, including connection and handshake failures.
+    /// The returned client has no child and cannot kill the provider on drop.
+    pub fn connect_managed(
+        descriptor: &ProviderDescriptor,
+        timeout_ms: u64,
+        custody: &mut Option<Child>,
+    ) -> Result<Self> {
+        Self::connect_managed_configured(descriptor, timeout_ms, custody, |_| Ok(()))
+    }
+
+    /// Install private managed startup descriptors and environment before spawn.
+    /// Configuration spends the same readiness allowance as the handshake.
+    /// A configuration failure cannot leave a spawned child; after spawn the
+    /// supplied custody slot retains the child even if the handshake fails.
+    pub fn connect_managed_configured(
+        descriptor: &ProviderDescriptor,
+        timeout_ms: u64,
+        custody: &mut Option<Child>,
+        configure: impl FnOnce(&mut Command) -> std::io::Result<()>,
+    ) -> Result<Self> {
+        if custody.is_some() {
+            return Err(protocol_error("provider custody slot already occupied"));
+        }
+        Self::connect_with_custody(descriptor, timeout_ms, Some(custody), None, configure)
+    }
+
+    /// Apply the inherited readiness cutoff without changing subsequent RPC budgets.
+    pub fn connect_managed_configured_until(
+        descriptor: &ProviderDescriptor,
+        timeout_ms: u64,
+        readiness_deadline: Instant,
+        custody: &mut Option<Child>,
+        configure: impl FnOnce(&mut Command) -> std::io::Result<()>,
+    ) -> Result<Self> {
+        if custody.is_some() {
+            return Err(protocol_error("provider custody slot already occupied"));
+        }
+        Self::connect_with_custody(
+            descriptor,
+            timeout_ms,
+            Some(custody),
+            Some(readiness_deadline),
+            configure,
+        )
+    }
+
+    fn connect_with_custody(
+        descriptor: &ProviderDescriptor,
+        timeout_ms: u64,
+        custody: Option<&mut Option<Child>>,
+        readiness_deadline: Option<Instant>,
+        configure: impl FnOnce(&mut Command) -> std::io::Result<()>,
+    ) -> Result<Self> {
         descriptor.validate(&descriptor.role)?;
         if timeout_ms == 0 || timeout_ms > 60_000 {
             return Err(protocol_error("invalid timeout"));
         }
         let timeout = Duration::from_millis(timeout_ms);
+        // Managed startup spends one allowance across preparation, spawn,
+        // socket acceptance and Hello/Welcome. Ongoing RPCs retain their
+        // configured timeout independently of this startup cutoff.
+        let managed = custody.is_some();
+        let managed_deadline =
+            managed.then(|| readiness_deadline.unwrap_or_else(|| Instant::now() + timeout));
         let directory = tempfile::Builder::new()
             .prefix("umbra-provider-")
             .tempdir()
@@ -456,19 +624,35 @@ impl Client {
         let socket = directory.path().join("ipc");
         let listener = UnixListener::bind(&socket).map_err(unavailable)?;
         listener.set_nonblocking(true).map_err(unavailable)?;
-        let mut child = Command::new(std::ffi::OsStr::from_bytes(
+        let mut command = Command::new(std::ffi::OsStr::from_bytes(
             descriptor.executable.as_bytes(),
-        ))
-        .arg("--umbra-socket")
-        .arg(&socket)
-        .arg("--umbra-timeout-ms")
-        .arg(timeout_ms.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(unavailable)?;
-        let deadline = Instant::now() + timeout;
+        ));
+        command
+            .arg("--umbra-socket")
+            .arg(&socket)
+            .arg("--umbra-timeout-ms")
+            .arg(timeout_ms.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        configure(&mut command).map_err(unavailable)?;
+        if managed_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(unavailable("provider readiness expired before spawn"));
+        }
+        crate::cost_snapshot!("provider-command-before", None, &[]);
+        #[cfg(feature = "startup-witness")]
+        let stage_origin = Instant::now();
+        let child = command.spawn().map_err(unavailable)?;
+        // Configuration may retain child-only descriptor owners for pre_exec.
+        // Spawn has transferred them; release parent copies before handshake.
+        drop(command);
+        #[cfg(feature = "startup-witness")]
+        let (spawn_duration, stage_child) = (stage_origin.elapsed(), child.id());
+        crate::cost_snapshot!("provider-command-after", Some(child.id()), &[]);
+        let mut local_child = None;
+        let child_slot = custody.unwrap_or(&mut local_child);
+        *child_slot = Some(child);
+        let deadline = managed_deadline.unwrap_or_else(|| Instant::now() + timeout);
         let accepted = loop {
             match listener.accept() {
                 Ok((stream, _)) => break Ok(stream),
@@ -476,14 +660,16 @@ impl Client {
                     if Instant::now() >= deadline {
                         break Err(unavailable("provider connection timeout"));
                     }
-                    match child.try_wait() {
+                    match child_slot.as_mut().expect("spawned child").try_wait() {
                         Ok(Some(status)) => {
                             break Err(unavailable(format!("provider exited: {status}")))
                         }
                         Err(e) => break Err(unavailable(e)),
                         _ => {}
                     }
-                    std::thread::sleep(Duration::from_millis(5));
+                    if let Err(error) = wait_for_connection(&listener, deadline) {
+                        break Err(unavailable(error));
+                    }
                 }
                 Err(e) => break Err(unavailable(e)),
             }
@@ -493,13 +679,20 @@ impl Client {
             Err(e) => {
                 // A provider stuck exec-paging from a dead mount must not wedge this
                 // failure path, so reap it through the same bounded helper as `Drop`.
-                let _ = reap(child, REAP_GRACE);
+                if !managed {
+                    let _ = reap(child_slot.take().expect("spawned child"), REAP_GRACE);
+                }
                 return Err(e);
             }
         };
         // macOS may inherit O_NONBLOCK from the accepting listener.
+        crate::cost_snapshot!("provider-connection-accepted", None, &[]);
+        #[cfg(feature = "startup-witness")]
+        let accept_duration = stage_origin.elapsed();
         if let Err(error) = stream.set_nonblocking(false) {
-            let _ = reap(child, REAP_GRACE);
+            if !managed {
+                let _ = reap(child_slot.take().expect("spawned child"), REAP_GRACE);
+            }
             return Err(unavailable(error));
         }
         let welcome = Welcome {
@@ -510,10 +703,13 @@ impl Client {
         };
         let mut client = Self {
             connection: Connection::new(stream, timeout),
-            child: Some(child),
+            child: if managed { None } else { child_slot.take() },
             next_id: 1,
             welcome,
         };
+        if managed {
+            client.connection.set_deadline(deadline);
+        }
         client.connection.send(&Hello {
             id: descriptor.id.clone(),
             role: descriptor.role.clone(),
@@ -522,6 +718,26 @@ impl Client {
             options: descriptor.options.clone(),
         })?;
         client.welcome = client.connection.receive::<Result<Welcome>>()??;
+        #[cfg(feature = "startup-witness")]
+        if let Some(directory) = std::env::var_os("UMBRA_F299_PERF_EVENTS") {
+            use std::io::Write;
+            let row = serde_json::json!({
+                "event": "provider-transport-stages", "pid": std::process::id(),
+                "child": stage_child, "provider_role": descriptor.role,
+                "run_nonce": std::env::var("UMBRA_F299_PERF_RUN_NONCE").expect("measurement nonce"),
+                "spawn_ns": spawn_duration.as_nanos(),
+                "accept_ns": accept_duration.as_nanos(),
+                "welcome_ns": stage_origin.elapsed().as_nanos(),
+            });
+            let path = std::path::Path::new(&directory)
+                .join(format!("{}-transport-stages.transport", std::process::id()));
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("transport stage file");
+            writeln!(file, "{row}").expect("transport stage write");
+        }
         if client.welcome.id != descriptor.id
             || client.welcome.role != descriptor.role
             || client.welcome.version != PROTOCOL_VERSION
@@ -531,6 +747,14 @@ impl Client {
         {
             return Err(protocol_error("provider handshake mismatch"));
         }
+        crate::cost_snapshot!(
+            &format!("provider-ready-{}", descriptor.role),
+            client.child.as_ref().or(child_slot.as_ref()).map(Child::id),
+            &[]
+        );
+        drop(listener);
+        drop(directory);
+        crate::cost_snapshot!("provider-listener-closed", None, &[]);
         tracing::debug!(provider = %descriptor.id, role = %descriptor.role, "connected provider");
         Ok(client)
     }
@@ -970,6 +1194,7 @@ mod tests {
         killed: Arc<AtomicBool>,
         exits: bool,
         errs: bool,
+        wait_error: bool,
         wait_calls: Arc<AtomicUsize>,
         entered_wait: mpsc::Sender<std::thread::ThreadId>,
         release: mpsc::Receiver<()>,
@@ -992,7 +1217,11 @@ mod tests {
             let _ = self.entered_wait.send(std::thread::current().id());
             let _ = self.release.recv();
             let _ = self.finished.send(());
-            Ok(exit_status())
+            if self.wait_error {
+                Err(std::io::Error::other("wait failed"))
+            } else {
+                Ok(exit_status())
+            }
         }
     }
     struct FakeControl {
@@ -1013,6 +1242,7 @@ mod tests {
                 killed: killed.clone(),
                 exits,
                 errs,
+                wait_error: false,
                 wait_calls: wait_calls.clone(),
                 entered_wait: entered_tx,
                 release: release_rx,
@@ -1026,6 +1256,28 @@ mod tests {
                 finished: finished_rx,
             },
         )
+    }
+
+    #[test]
+    fn reap_collects_a_wait_ready_child_before_returning() {
+        let (child, control) = fake_child(false, false);
+        // The child becomes waitable after the initial nonblocking inspection.
+        control.release.send(()).unwrap();
+        assert_eq!(reap(child, Duration::from_millis(50)), Reaped::Exited);
+        assert_eq!(control.wait_calls.load(Ordering::SeqCst), 1);
+        control
+            .finished
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn reap_does_not_confirm_a_failed_wait() {
+        let (mut child, control) = fake_child(false, false);
+        child.wait_error = true;
+        control.release.send(()).unwrap();
+        assert_eq!(reap(child, Duration::from_millis(50)), Reaped::WaitFailed);
+        assert_eq!(control.wait_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1134,6 +1386,136 @@ mod tests {
         // A beat in case this host detached rather than reaping synchronously.
         std::thread::sleep(Duration::from_millis(100));
         assert!(!process_is_alive(pid), "the provider process was reaped");
+    }
+
+    #[test]
+    fn managed_deadline_survives_request_begin_and_nested_restore() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(socket, Duration::from_secs(60));
+        let original = Instant::now() + Duration::from_secs(1);
+        connection.cap_cleanup_deadline(original);
+        connection.begin();
+        assert_eq!(connection.deadline(), original);
+        connection.set_deadline(original + Duration::from_secs(60));
+        assert_eq!(connection.deadline(), original);
+        connection.cap_cleanup_deadline(original + Duration::from_secs(120));
+        connection.begin();
+        assert_eq!(connection.deadline(), original);
+        let earlier = original - Duration::from_millis(100);
+        connection.cap_cleanup_deadline(earlier);
+        connection.begin();
+        assert_eq!(connection.deadline(), earlier);
+    }
+
+    #[test]
+    fn managed_readiness_does_not_replace_configured_rpc_timeout() {
+        let descriptor = managed_stall_descriptor();
+        let mut custody = None;
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let result = Client::connect_managed_configured_until(
+            &descriptor,
+            20_000,
+            deadline,
+            &mut custody,
+            |command| {
+                let args: Vec<_> = command.get_args().collect();
+                assert!(args
+                    .windows(2)
+                    .any(|pair| pair[0] == "--umbra-timeout-ms" && pair[1] == "20000"));
+                Err(std::io::Error::other("checked RPC timeout before spawn"))
+            },
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("checked RPC timeout"));
+        assert!(custody.is_none());
+        let expired = Client::connect_managed_configured_until(
+            &descriptor,
+            20_000,
+            Instant::now() - Duration::from_millis(1),
+            &mut custody,
+            |_| Ok(()),
+        );
+        assert!(expired
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("readiness expired before spawn"));
+        assert!(custody.is_none());
+    }
+
+    #[test]
+    fn managed_configuration_failure_never_spawns_provider() {
+        let descriptor = managed_stall_descriptor();
+        let mut custody = None;
+        let result = Client::connect_managed_configured(&descriptor, 1000, &mut custody, |_| {
+            Err(std::io::Error::other("startup endpoint setup failed"))
+        });
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("startup endpoint setup failed"));
+        assert!(custody.is_none(), "configuration failure spawned a child");
+    }
+
+    #[test]
+    fn managed_configuration_cannot_renew_readiness_before_spawn() {
+        let descriptor = managed_stall_descriptor();
+        let mut custody = None;
+        let result = Client::connect_managed_configured(&descriptor, 1, &mut custody, |_| {
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(())
+        });
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("readiness expired before spawn"));
+        assert!(custody.is_none(), "expired startup spawned a child");
+    }
+
+    fn managed_stall_descriptor() -> ProviderDescriptor {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stall-provider.sh");
+        ProviderDescriptor {
+            id: "fake".into(),
+            role: "test".into(),
+            protocol_version: PROTOCOL_VERSION,
+            executable: crate::BytePath::new(script.as_os_str().as_bytes().to_vec()).unwrap(),
+            capabilities: Default::default(),
+            options: Default::default(),
+        }
+    }
+
+    #[test]
+    fn managed_connect_timeout_retains_live_child_for_owner_collection() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stall-provider.sh");
+        let descriptor = ProviderDescriptor {
+            id: "fake".into(),
+            role: "test".into(),
+            protocol_version: PROTOCOL_VERSION,
+            executable: crate::BytePath::new(script.as_os_str().as_bytes().to_vec()).unwrap(),
+            capabilities: Default::default(),
+            options: Vec::new(),
+        };
+        let mut custody = None;
+        let result = Client::connect_managed(&descriptor, 100, &mut custody);
+        let mut child = custody.expect("spawned child remains in owner custody");
+        let before = child.try_wait().unwrap();
+        // This fixture never acquired resources; finish its deliberate stall
+        // and retain the actual parent receipt before asserting the outcome.
+        child.kill().unwrap();
+        let collected = child.wait().unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            before, None,
+            "connect error must not kill the managed provider"
+        );
+        assert!(!collected.success());
     }
 
     #[test]
@@ -1248,5 +1630,52 @@ mod fix264_real_expiry {
             assert!(e.to_string().contains("request deadline exceeded"));
         }
         FIX264_CLOCK.with(|v| v.set(None));
+    }
+}
+
+#[cfg(test)]
+mod startup_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn readiness_does_not_renew_expired_cutoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deadline");
+        let listener = UnixListener::bind(&path).unwrap();
+        let cutoff = Instant::now();
+        for ready in [false, true] {
+            let _peer = ready.then(|| UnixStream::connect(&path).unwrap());
+            assert_eq!(
+                wait_for_connection(&listener, cutoff).unwrap_err().kind(),
+                std::io::ErrorKind::TimedOut
+            );
+        }
+    }
+
+    #[test]
+    fn queued_connection_has_no_timer_floor() {
+        if std::env::var_os("UMBRA_INTEGRATION_REQUIRED").is_none() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ready");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..30 {
+            let peer = UnixStream::connect(&path).unwrap();
+            let start = Instant::now();
+            wait_for_connection(&listener, start + Duration::from_secs(1)).unwrap();
+            samples.push(start.elapsed());
+            let accepted = listener.accept().unwrap();
+            drop((peer, accepted));
+        }
+        samples.sort();
+        eprintln!(
+            "ready listener median={:?} p95={:?}",
+            samples[15], samples[28]
+        );
+        assert!(samples[15] <= Duration::from_millis(1));
+        assert!(samples[28] <= Duration::from_millis(5));
     }
 }

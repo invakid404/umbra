@@ -23,6 +23,8 @@ pub enum Start {
 
 /// Run-end evidence, keeping ledger proof separate from exit-wait success.
 pub struct Closure {
+    /// Ordered managed evidence, present only after validated Final and parent wait.
+    pub managed: Option<Box<ManagedTerminal>>,
     /// All resource obligations independently confirmed.
     pub tree_terminated: bool,
     /// Closure error; never overwrites a preexisting event-loop primary error.
@@ -31,10 +33,42 @@ pub struct Closure {
     pub final_to_exit: Option<Duration>,
 }
 
+/// Resource evidence retained only after successful managed provider collection.
+pub struct ManagedTerminal {
+    accepted: Accepted,
+    final_state: Final,
+    receipt: umbra_core::managed::ProviderReceipt,
+}
+
+impl ManagedTerminal {
+    pub(crate) fn collected(
+        accepted: Accepted,
+        final_state: Final,
+        receipt: umbra_core::managed::ProviderReceipt,
+    ) -> Self {
+        Self {
+            accepted,
+            final_state,
+            receipt,
+        }
+    }
+
+    /// Encode the exact ordered resource evidence for a durable certificate.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        umbra_core::provider::encode(&(&self.accepted, &self.final_state, &self.receipt))
+    }
+
+    /// Identity of the run whose provider was collected by its actual parent.
+    pub fn run(&self) -> umbra_core::managed::RunIdentity {
+        self.receipt.run
+    }
+}
+
 impl Closure {
     /// Missing proof, including failure before acceptance.
     pub fn failed(error: UmbraError) -> Self {
         Self {
+            managed: None,
             tree_terminated: false,
             error: Some(error),
             final_to_exit: None,
@@ -45,6 +79,7 @@ impl Closure {
     pub fn from_final(accepted: &Accepted, final_state: &Final) -> Self {
         match accepted.confirms(final_state) {
             Ok(true) => Self {
+                managed: None,
                 tree_terminated: true,
                 error: None,
                 final_to_exit: None,
@@ -143,6 +178,77 @@ struct State {
     progress: u64,
     diagnostics: Vec<String>,
     poisoned: bool,
+    admission: Option<NativeAdmission>,
+}
+
+struct NativeAdmission {
+    authority: crate::admission::Admission,
+    deadline: Box<dyn Fn() -> Result<u64> + Send>,
+    groups: std::collections::BTreeMap<SlotId, crate::admission::ProgramGrant>,
+    membership: std::collections::BTreeMap<SlotId, SlotId>,
+}
+
+impl NativeAdmission {
+    fn reserve(&mut self, slot: &Slot) -> Result<()> {
+        if slot.kind == ResourceKind::Tracee || slot.replaces.is_some() {
+            let deadline = (self.deadline)()?;
+            let mut grant = self.authority.reserve(deadline)?;
+            if let Err(error) = grant.enter(deadline) {
+                // Only an exact refusal permits this cancellation. Ambiguous
+                // entry remains charged by the independent owner.
+                let _ = grant.cancel_before_entry(deadline);
+                return Err(error);
+            }
+            self.groups.insert(
+                slot.id,
+                crate::admission::ProgramGrant::new(grant, slot.id)?,
+            );
+            self.membership.insert(slot.id, slot.id);
+        } else {
+            let group = slot
+                .parent
+                .and_then(|parent| self.membership.get(&parent))
+                .copied()
+                .ok_or_else(|| invalid("resource without admitted program"))?;
+            self.groups
+                .get_mut(&group)
+                .ok_or_else(|| invalid("missing program charge"))?
+                .attach(slot.id)?;
+            self.membership.insert(slot.id, group);
+        }
+        Ok(())
+    }
+
+    fn settle(&mut self, id: SlotId, entries: &[Entry]) -> Result<()> {
+        let group = *self
+            .membership
+            .get(&id)
+            .ok_or_else(|| invalid("unadmitted resource"))?;
+        let creator_terminal = entries
+            .iter()
+            .find(|entry| entry.slot.id == group)
+            .is_some_and(Entry::confirms);
+        self.groups
+            .get_mut(&group)
+            .ok_or_else(|| invalid("missing program charge"))?
+            .settle(entries, creator_terminal, &self.deadline)?;
+        Ok(())
+    }
+}
+
+impl State {
+    fn settle_admission(&mut self, id: SlotId) -> Result<()> {
+        let result = match &mut self.admission {
+            Some(admission) => admission.settle(id, &self.entries),
+            None => Ok(()),
+        };
+        if let Err(error) = &result {
+            self.poisoned = true;
+            self.diagnostics
+                .push(format!("admission retirement: {error}"));
+        }
+        result
+    }
 }
 
 /// A shared accounting handle that survives all resource-owning objects.
@@ -167,7 +273,47 @@ impl Ledger {
             progress: 0,
             diagnostics: Vec::new(),
             poisoned: false,
+            admission: None,
         })))
+    }
+
+    /// Bind the independent owner ledger before any native reservations.
+    /// The deadline callback supplies the caller's absolute operation cutoff;
+    /// it must retain the original cleanup cutoff once shutdown starts.
+    pub fn install_admission(
+        &self,
+        authority: crate::admission::Admission,
+        deadline: Box<dyn Fn() -> Result<u64> + Send>,
+    ) -> Result<()> {
+        let mut state = self.state();
+        if state.admission.is_some() || !state.entries.is_empty() || state.accepted.is_some() {
+            return Err(invalid("late or duplicate native admission installation"));
+        }
+        state.admission = Some(NativeAdmission {
+            authority,
+            deadline,
+            groups: Default::default(),
+            membership: Default::default(),
+        });
+        Ok(())
+    }
+
+    /// Read the retained managed cutoff for work already in progress.
+    pub fn admission_cutoff(&self) -> Result<Option<u64>> {
+        self.state()
+            .admission
+            .as_ref()
+            .map(|admission| (admission.deadline)())
+            .transpose()
+    }
+
+    /// Freeze external grants before counting native cleanup obligations.
+    pub fn freeze_admission(&self) -> Result<()> {
+        let state = self.state();
+        if let Some(admission) = &state.admission {
+            admission.authority.freeze((admission.deadline)()?)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -280,15 +426,19 @@ impl Ledger {
             instance: state.instance,
             sequence,
         };
+        let slot = Slot {
+            id,
+            parent,
+            replaces,
+            generation,
+            exec_generation,
+            kind,
+        };
+        if let Some(admission) = &mut state.admission {
+            admission.reserve(&slot)?;
+        }
         state.entries.push(Entry {
-            slot: Slot {
-                id,
-                parent,
-                replaces,
-                generation,
-                exec_generation,
-                kind,
-            },
+            slot,
             identity: None,
             disposition: Disposition::Reserved,
         });
@@ -381,6 +531,11 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    /// Share this program's accounting authority with a preparation helper.
+    pub fn ledger(&self) -> Ledger {
+        self.ledger.clone()
+    }
+
     /// Settle a failed creation only when no resource was ever returned.
     /// Failures after acquisition preserve the existing owner and disposition.
     pub fn creation_failed(&self) {
@@ -392,6 +547,7 @@ impl Reservation {
             {
                 entry.disposition = Disposition::NeverCreated;
                 state.progress = state.progress.saturating_add(1);
+                let _ = state.settle_admission(self.id);
             }
         }
     }
@@ -424,7 +580,8 @@ impl Reservation {
             state.poisoned = true;
         }
         state.progress = state.progress.saturating_add(1);
-        result
+        result?;
+        state.settle_admission(self.id)
     }
 
     /// Record the returned identity before any subsequent fallible operation.

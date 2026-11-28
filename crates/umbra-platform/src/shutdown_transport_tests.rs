@@ -442,14 +442,23 @@ fn shutdown_stale_phase_and_id() {
 
 #[test]
 fn shutdown_affinity_failure_paths() {
-    for failure in [
-        Failure::Spawn,
-        Failure::Handoff,
+    affinity_failure_paths(&[
         Failure::TransportPanic,
         Failure::Acceptance,
         Failure::OwnerPanic,
         Failure::Eof,
-    ] {
+    ]);
+}
+
+#[test]
+fn r2_reaper_creation_failure() {
+    // The helper only serves the cleanup protocol. Native destruction remains
+    // on its creating thread when helper creation or the ready handoff fails.
+    affinity_failure_paths(&[Failure::Spawn, Failure::Handoff]);
+}
+
+fn affinity_failure_paths(failures: &[Failure]) {
+    for &failure in failures {
         let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
         let owner_log = log.clone();
@@ -550,7 +559,7 @@ fn shutdown_affinity_failure_paths() {
 }
 
 #[test]
-fn shutdown_poll_preserves_deadlines() {
+fn r2_grace_exhaustion_is_loud() {
     let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
     let start = std::time::Instant::now();
     let clock = Arc::new(Mutex::new(start));
@@ -629,6 +638,66 @@ fn shutdown_poll_preserves_deadlines() {
     assert!(error.context.contains("owner-progress failure"));
     release_tx.send(()).unwrap();
     assert!(owner.join().unwrap().is_err());
+    late_terminal_cannot_restore_success();
+}
+
+fn late_terminal_cannot_restore_success() {
+    // Queue an explicitly late model result before polling so scheduling cannot
+    // substitute an empty-channel timeout for the late-completion check.
+    let ledger = Ledger::new();
+    crate::shutdown::collected_model_root(&ledger);
+    let nonce = Nonce::new_v4();
+    let accepted = ledger.freeze(nonce, Duration::from_secs(5)).unwrap();
+    let generation = accepted.generation;
+    let final_state = ledger.final_snapshot().unwrap();
+    assert!(accepted.confirms(&final_state).unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let completed_at = deadline + Duration::from_secs(1);
+    let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (accepted_tx, _accepted_rx) = mpsc::sync_channel(1);
+    let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
+    terminal_tx.send((completed_at, Ok(final_state))).unwrap();
+    let owner = std::thread::spawn(move || {
+        CLOCK.with(|value| *value.borrow_mut() = Some(Arc::new(Mutex::new(completed_at))));
+        serve_polls(
+            Handoff {
+                connection: Connection::new(right, Duration::from_secs(1)),
+                accepted,
+                ledger,
+                request_id: 1,
+                owner_deadline: deadline,
+            },
+            accepted_tx,
+            terminal_rx,
+        )
+    });
+    let mut connection = Connection::new(left, Duration::from_secs(1));
+    assert!(matches!(
+        connection.receive::<Frame>().unwrap(),
+        Frame::Response {
+            id: 1,
+            result: Ok(_)
+        }
+    ));
+    let result = call(
+        &mut connection,
+        2,
+        Request::PollShutdown {
+            nonce,
+            generation,
+            max_wait_ms: 1,
+        },
+    );
+    let outcome = owner.join().unwrap();
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("late completion manufactured successful closure"),
+    };
+    assert!(error.context.contains("owner-progress failure"));
+    assert!(
+        outcome.is_err(),
+        "late completion erased the failed outcome"
+    );
 }
 
 /// #205: `close_client`'s unconfirmed-Final error names each unconfirmed
@@ -668,4 +737,71 @@ fn close_client_names_its_unconfirmed_obligations() {
         assert!(message.contains(named), "{named} missing from: {message}");
     }
     assert!(!message.contains("Tracee pid=123"), "{message}");
+}
+
+#[path = "cleanup_owner_tests.rs"]
+mod cleanup_owner_tests;
+
+#[test]
+fn managed_start_failure_invalidates_and_collects_once() {
+    use std::io::Read;
+    struct FailedStart {
+        peer: std::os::unix::net::UnixStream,
+        events: Vec<&'static str>,
+        collection_fails: bool,
+    }
+    impl ManagedCleanup for FailedStart {
+        fn start(&mut self) -> Result<std::time::Instant> {
+            self.events.push("start");
+            Err(protocol_error("original start failure"))
+        }
+        fn failed(&mut self, error: &umbra_core::UmbraError) {
+            assert!(error.to_string().contains("original start failure"));
+            self.events.push("failed");
+        }
+        fn collect_provider(&mut self) -> Result<Duration> {
+            self.events.push("collect");
+            assert_eq!(
+                self.peer.read(&mut [0u8; 1]).unwrap(),
+                0,
+                "RPC must be invalidated before parent collection"
+            );
+            if self.collection_fails {
+                Err(protocol_error("collection fixture failure"))
+            } else {
+                Ok(Duration::ZERO)
+            }
+        }
+        fn abandon(&mut self) {
+            panic!("unexpected abandonment");
+        }
+    }
+    for collection_fails in [false, true] {
+        let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut client = Client::from_connection(
+            Connection::new(socket, Duration::from_secs(1)),
+            wire::Welcome {
+                id: "managed".into(),
+                role: "platform".into(),
+                version: wire::PROTOCOL_VERSION,
+                capabilities: Default::default(),
+            },
+        );
+        let mut owner = FailedStart {
+            peer,
+            events: Vec::new(),
+            collection_fails,
+        };
+        let closure = close_managed_client(&mut client, Nonce::new_v4(), &mut owner);
+        assert_eq!(owner.events, ["start", "failed", "collect"]);
+        assert!(!closure.tree_terminated);
+        assert!(closure.managed.is_none());
+        let error = closure.error.expect("Start failure must remain failed");
+        assert!(error.to_string().contains("original start failure"));
+        assert_eq!(
+            error.context.contains("collection fixture failure"),
+            collection_fails
+        );
+    }
 }

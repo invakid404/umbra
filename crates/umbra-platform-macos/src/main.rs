@@ -3,9 +3,23 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run() -> umbra_core::Result<()> {
     use umbra_platform::TraceControl;
+    let mut managed = umbra_isolation::managed::executable::entry()
+        .map_err(|e| umbra_core::provider::protocol_error(e.to_string()))?;
+    if managed.as_ref().is_some_and(|entry| {
+        entry.role != umbra_core::managed::Role::Provider
+            || entry.parent.role != umbra_core::managed::Role::CleanupOwner
+    }) {
+        return Err(umbra_core::provider::protocol_error(
+            "invalid managed provider role",
+        ));
+    }
     // #205: end with the owner, not with the terminal's signals.
     umbra_platform_macos::keep_lifetime_with_owner()?;
     let owner = umbra_platform_macos::OwnerIdentity::parent()?;
+    umbra_isolation::managed::executable::startup_observation(
+        "provider-accept-begin",
+        Some(umbra_core::managed::Role::Provider),
+    );
     let (connection, mut backend) = umbra_core::provider::accept("macos", "platform", |options| {
         let options = if options.is_empty() {
             umbra_platform_macos::Options::default()
@@ -17,7 +31,24 @@ fn run() -> umbra_core::Result<()> {
         let caps = backend.capabilities().capabilities;
         Ok((backend, caps))
     })?;
+    umbra_isolation::managed::executable::startup_observation(
+        "provider-accept-end",
+        Some(umbra_core::managed::Role::Provider),
+    );
     backend.observe_owner(owner, connection.observation_stream()?)?;
+    if let Some(entry) = managed.as_mut() {
+        entry
+            .complete_provider_startup()
+            .map_err(|e| umbra_core::provider::protocol_error(e.to_string()))?;
+        backend.install_managed_admission(
+            entry,
+            Box::new(|| {
+                umbra_isolation::managed::boot_nanos()
+                    .map(|now| now.saturating_add(5_000_000_000))
+                    .map_err(|e| umbra_core::provider::protocol_error(e.to_string()))
+            }),
+        )?;
+    }
     umbra_platform::provider::serve_session(
         connection,
         umbra_platform::PlatformSession {

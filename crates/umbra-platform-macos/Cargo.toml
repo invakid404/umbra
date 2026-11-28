@@ -11,8 +11,16 @@ publish = false
 signal-witness = []
 # Qualification-only allocation witnesses; no fault injection.
 retirement-witness = []
+# Qualification-only pre-exec descriptor observations; no runtime environment switch.
+managed-endpoint-probe = []
+# Native process-watch registration barriers; absent from normal providers.
+managed-watch-probe = []
+# Native cleanup ordering receipts and controller latches; absent in normal builds.
+test-native-cleanup-order = ["shutdown-witness"]
+# Hold a real debugger during preaccepted setup; no normal-build controls.
+managed-cancel-probe = ["shutdown-witness", "umbra-isolation/probe-cancellation-ticket"]
 # Independent acquisition and Final-to-exit qualification records.
-shutdown-witness = ["umbra-platform/shutdown-witness"]
+shutdown-witness = ["umbra-platform/shutdown-witness", "umbra-isolation/shutdown-witness"]
 # Mutation probes for the two syscall decode arms this crate owns, on the same
 # terms as `umbra-overlay`'s: each BREAKS one arm on purpose so a test can prove
 # an end-to-end case depends on it, both are compile-time only so no product
@@ -46,6 +54,7 @@ serde_json.workspace = true
 # Integration-test only: the dirfd fixture drives the real overlay transaction
 # flow. The crate itself stays free of any namespace or storage backend.
 [dev-dependencies]
+umbra-isolation = { path = "../umbra-isolation" }
 umbra-overlay = { path = "../umbra-overlay" }
 umbra-storage = { path = "../umbra-storage" }
 umbra-storage-local = { path = "../umbra-storage-local" }
@@ -54,5 +63,6 @@ tempfile.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+umbra-isolation = { path = "../umbra-isolation" }
 mach2.workspace = true
 libc = "=0.2.191"

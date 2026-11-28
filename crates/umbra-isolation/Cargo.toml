@@ -6,17 +6,55 @@ license.workspace = true
 edition.workspace = true
 publish = false
 
-# #193: run isolation for `umbra run` in launchd's session (SID 1). The only
-# crate in the CLI's dependency tree that permits `unsafe`; `umbra-cli` keeps
-# `#![forbid(unsafe_code)]` and calls the safe API in `src/lib.rs`. On every
-# other target the API is a no-op.
+# Managed macOS process custody and legacy #193 launchd-session isolation.
+# This crate permits unsafe native ownership operations behind safe entry APIs;
+# umbra-cli keeps forbid(unsafe_code). Managed roles are macOS-only; the legacy
+# isolation entry is a no-op on other targets.
+
+[features]
+# Test hook for the launchd topology in an ordinary test session.
+test-managed-session = []
+# Test harnesses can scope one shared boot clock without changing normal builds.
+test-clock = []
+# Force exit notification before parent-wait readiness in qualification.
+test-exit-before-wait = []
+# Qualification-only failure after startup resources have been adopted.
+test-managed-construction-failure = []
+# Hosted descriptor inventory fixture; no normal executable probe.
+managed-endpoint-probe = []
+# Observe validated cancellation tickets in native qualification only.
+probe-cancellation-ticket = []
+# Qualification-only: corrupt the run generation on a validated provider offer.
+probe-managed-offer-generation = []
+# Observational D6 instrumentation; no lifecycle behavior change.
+shutdown-witness = ["umbra-platform/shutdown-witness", "umbra-core/startup-witness"]
 
 [dependencies]
+umbra-core = { path = "../umbra-core" }
+umbra-platform = { path = "../umbra-platform" }
+serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "=0.2.191"
 mach2.workspace = true
 
 [dev-dependencies]
+umbra-isolation = { path = ".", features = ["test-clock"] }
 tempfile.workspace = true
+umbra-journal-file = { path = "../umbra-journal-file" }
+umbra-journal = { path = "../umbra-journal" }
+
+[[test]]
+name = "managed_topology"
+harness = false
+
+[[test]]
+name = "managed_startup"
+harness = false
+
+[[bin]]
+name = "umbra-managed-endpoint-probe"
+path = "tests/support/endpoint_inventory_main.rs"
+required-features = ["managed-endpoint-probe"]

@@ -6,8 +6,12 @@
 #![deny(missing_docs)]
 
 pub mod capabilities;
+#[doc(hidden)]
+pub mod cost_witness;
 #[cfg(unix)]
 pub mod launch_stdio;
+pub mod managed;
+pub mod managed_handoff;
 pub mod shutdown;
 pub mod storage;
 
@@ -108,8 +112,11 @@ pub enum ErrorKind {
 
 /// A machine-readable failure with the operation and diagnostic context preserved.
 #[derive(Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
-#[error("{kind:?} during {operation}: {context} (errno: {errno:?})")]
+#[error("{diagnostics}{kind:?} during {operation}: {context} (errno: {errno:?})")]
 pub struct UmbraError {
+    /// Earlier role and cleanup diagnostics, including their terminating newlines.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub diagnostics: String,
     /// Kind.
     pub kind: ErrorKind,
     /// Operation.
@@ -138,6 +145,7 @@ impl UmbraError {
             context: context.into(),
             errno: None,
             launch_tree_terminated: false,
+            diagnostics: String::new(),
         }
     }
 
@@ -1268,6 +1276,28 @@ pub struct ResumeCommand {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_diagnostics_precede_original_error_line() {
+        let original = super::UmbraError::new(
+            super::ErrorKind::Io,
+            "twin source",
+            "No such file or directory (os error 2)",
+        );
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["diagnostics"] =
+            serde_json::json!("managed role failed: Guardian exited with code 1\n");
+        let restored: super::UmbraError = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.to_string(),
+            format!("managed role failed: Guardian exited with code 1\n{original}")
+        );
+        assert_eq!(
+            restored.to_string().lines().last(),
+            Some(original.to_string().as_str())
+        );
+        assert_eq!(restored.to_string().matches("(errno: None)").count(), 1);
+    }
+
     use super::*;
     use serde::de::value::{Error as ValueError, SeqDeserializer};
 

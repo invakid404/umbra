@@ -110,6 +110,43 @@ pub struct Entry {
     pub disposition: Disposition,
 }
 
+impl Entry {
+    /// Whether the recorded identity and terminal proof establish settlement.
+    /// This does not establish that a caller supplied the complete inventory.
+    pub fn confirms(&self) -> bool {
+        match (&self.slot.kind, &self.disposition) {
+            (_, Disposition::NeverCreated) => self.identity.is_none(),
+            (ResourceKind::Tracer, Disposition::Confirmed(Proof::Collected { status })) => {
+                !status.is_empty()
+                    && self
+                        .identity
+                        .as_ref()
+                        .is_some_and(|id| id.pid.is_some_and(|pid| pid > 0))
+            }
+            (ResourceKind::TaskRight, Disposition::Confirmed(Proof::Released)) => {
+                self.identity.is_some()
+            }
+            (
+                ResourceKind::Tracee,
+                Disposition::Confirmed(Proof::Accounted {
+                    root_owned,
+                    root_collected,
+                    evidence,
+                }),
+            ) => {
+                !evidence.is_empty()
+                    && *root_owned == self.slot.parent.is_none()
+                    && (*root_owned == *root_collected)
+                    && self
+                        .identity
+                        .as_ref()
+                        .is_some_and(|id| id.pid.is_some_and(|pid| pid > 0))
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Frozen acceptance, which is not a closure confirmation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Accepted {
@@ -228,36 +265,7 @@ impl Accepted {
             if expected != &entry.slot {
                 return Err(invalid("final changed immutable reservation"));
             }
-            confirmed &= match (&entry.slot.kind, &entry.disposition) {
-                (_, Disposition::NeverCreated) => entry.identity.is_none(),
-                (ResourceKind::Tracer, Disposition::Confirmed(Proof::Collected { status })) => {
-                    !status.is_empty()
-                        && entry
-                            .identity
-                            .as_ref()
-                            .is_some_and(|id| id.pid.is_some_and(|pid| pid > 0))
-                }
-                (ResourceKind::TaskRight, Disposition::Confirmed(Proof::Released)) => {
-                    entry.identity.is_some()
-                }
-                (
-                    ResourceKind::Tracee,
-                    Disposition::Confirmed(Proof::Accounted {
-                        root_owned,
-                        root_collected,
-                        evidence,
-                    }),
-                ) => {
-                    !evidence.is_empty()
-                        && *root_owned == entry.slot.parent.is_none()
-                        && (*root_owned == *root_collected)
-                        && entry
-                            .identity
-                            .as_ref()
-                            .is_some_and(|id| id.pid.is_some_and(|pid| pid > 0))
-                }
-                _ => false,
-            };
+            confirmed &= entry.confirms();
         }
         Ok(confirmed)
     }

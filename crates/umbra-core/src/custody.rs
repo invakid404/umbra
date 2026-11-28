@@ -1,11 +1,11 @@
-//! Dormant managed-run custody records. No runtime path arms these yet.
+//! Managed-run custody records persisted before runtime acquisition is authorized.
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{ErrorKind, LeaseEpoch, Result, RunId, UmbraError};
 
 /// Terminal evidence checked before preparing a managed namespace finish.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustodyFinishProof {
     /// Exact generation being finalized.
     pub generation: Uuid,
@@ -19,7 +19,9 @@ pub struct CustodyFinishProof {
     pub creators_terminal: bool,
     /// No failed or unsettled cleanup remains.
     pub cleanup_confirmed: bool,
-    /// Root outcome committed with the namespace.
+    /// Root outcome committed with the namespace. `i32::MIN` denotes a
+    /// supervisor failure without an observed root outcome; it does not assert
+    /// a tracee exit status.
     pub root_result: i32,
 }
 
@@ -109,6 +111,9 @@ impl CustodyState {
         if record.run_id != run_id || record.generation.is_nil() {
             return Err(invalid());
         }
+        if matches!(&record.state, CustodyPhase::Failed { reason } if reason.trim().is_empty()) {
+            return Err(invalid());
+        }
         match previous {
             None => {
                 if record.sequence != 1 {
@@ -165,5 +170,51 @@ impl CustodyState {
             writer_epoch: epoch,
             record: record.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_empty_failure_is_rejected_and_valid_replay_is_idempotent() {
+        let run = RunId(Uuid::new_v4());
+        let epoch = LeaseEpoch(1);
+        let armed = CustodyRecord {
+            run_id: run,
+            generation: Uuid::new_v4(),
+            sequence: 1,
+            state: CustodyPhase::Armed {
+                capacity: 64,
+                startup_nonce: Uuid::new_v4(),
+                participants: vec![CustodyParticipant { pid: 1, birth: 1 }],
+            },
+        };
+        let prior = CustodyState::transition(None, run, epoch, &armed).unwrap();
+        for reason in ["", " \n\t"] {
+            let failed = CustodyRecord {
+                sequence: 2,
+                state: CustodyPhase::Failed {
+                    reason: reason.into(),
+                },
+                ..armed.clone()
+            };
+            let bytes = serde_json::to_vec(&failed).unwrap();
+            let decoded = serde_json::from_slice(&bytes).unwrap();
+            assert!(CustodyState::transition(Some(&prior), run, epoch, &decoded).is_err());
+        }
+        let failed = CustodyRecord {
+            sequence: 2,
+            state: CustodyPhase::Failed {
+                reason: "provider collection failed".into(),
+            },
+            ..armed
+        };
+        let terminal = CustodyState::transition(Some(&prior), run, epoch, &failed).unwrap();
+        assert_eq!(
+            CustodyState::transition(Some(&terminal), run, epoch, &failed).unwrap(),
+            terminal
+        );
     }
 }

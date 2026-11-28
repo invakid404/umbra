@@ -5,6 +5,14 @@ mod spawn;
 pub use abi::DarwinArm64Abi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod cache;
+#[cfg(all(target_os = "macos", feature = "test-native-cleanup-order"))]
+mod cleanup_order_probe;
+#[cfg(all(
+    feature = "managed-endpoint-probe",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+pub mod endpoint_probe;
 /// Publishing the embedded userspace-routing interposer, and its launch contract.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod interpose;
@@ -16,6 +24,12 @@ mod ownership;
 mod retirement;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod rsp;
+#[cfg(all(
+    feature = "managed-cancel-probe",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod setup_probe;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod signals;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -64,6 +78,13 @@ pub struct Options {
 mod owner;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use owner::{keep_lifetime_with_owner, OwnerIdentity};
+#[cfg(all(
+    feature = "managed-watch-probe",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+#[doc(hidden)]
+pub use owner::{probe_owner_watch, probe_watch_registration_error, WatchCheckpoint};
 
 /// Whether this host's packed-spawn ABI is the qualified profile: exactly the
 /// predicate `capture_spawn` refuses on (`spawn_host::qualify`), read-only.
@@ -97,3 +118,11 @@ mod option_tests {
         );
     }
 }
+
+#[cfg(all(
+    feature = "shutdown-witness",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+#[path = "../../../experiments/fixtures/umbra-fix-299b-performance/observation.rs"]
+mod performance_observation;

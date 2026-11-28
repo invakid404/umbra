@@ -7,6 +7,21 @@ edition.workspace = true
 publish = false
 
 [features]
+test-slow-namespace-preparation = []
+test-failed-namespace-preparation = []
+test-managed-construction-failure = ["umbra-isolation/test-managed-construction-failure"]
+# D5's shared base/head fixture selects registered dispatch only on the head.
+cost-library-managed = []
+# Qualification-only: lose the response after authoritative Armed persistence.
+probe-managed-arm-reply-loss = []
+# Qualification-only: lose successful PrepareFinish and CommitCustody replies.
+probe-managed-finish-reply-loss = []
+# Qualification-only: reject an actual owner's mismatched descriptor offer.
+probe-managed-offer-generation = ["umbra-isolation/probe-managed-offer-generation"]
+# Qualification-only: drop an enrolled owner and detect a returning destructor.
+probe-managed-owner-drop = []
+# Native setup cancellation from the external caller's independent guard.
+probe-native-setup-cancel = ["umbra-platform/shutdown-witness", "umbra-isolation/probe-cancellation-ticket"]
 # Test instrumentation: emit only successful writer-renewal observations.
 probe-idle-renewal = []
 # Forwarded to `umbra-overlay`; see its manifest for what each probe breaks and
@@ -25,6 +40,8 @@ mutation-probe-readdir = []
 mutation-probe-spawn-lifecycle = []
 
 [dependencies]
+serde.workspace = true
+sha2 = "=0.10.9"
 tracing.workspace = true
 # Run and operation identities are allocated here, so the generator is a direct
 # dependency rather than something borrowed from a backend crate.
@@ -36,14 +53,29 @@ umbra-overlay = { path = "../umbra-overlay" }
 umbra-journal = { path = "../umbra-journal" }
 umbra-agent = { path = "../umbra-agent" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+umbra-isolation = { path = "../umbra-isolation" }
+
 [dev-dependencies]
 libc = "=0.2.191"
 tempfile.workspace = true
 # `tests/kernel_refusal.rs` binds a real `Overlay` to real storage on
-# tempdirs; this is the only backend a test target here selects.
+# tempdirs. Routed custody tests select storage through a provider descriptor.
 umbra-storage-local = { path = "../umbra-storage-local" }
 # `tests/reopen.rs` builds a run's durable journal state directly, then reopens
 # it through the real provider executables, so it needs the backend as a library
 # as well as the binary cargo already builds for the workspace.
 umbra-journal-file = { path = "../umbra-journal-file" }
 uuid.workspace = true
+
+[[test]]
+name = "managed_library"
+harness = false
+
+[[test]]
+name = "managed_registration"
+harness = false
+
+[[test]]
+name = "startup_cost_library"
+harness = false

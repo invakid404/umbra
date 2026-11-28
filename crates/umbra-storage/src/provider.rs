@@ -62,7 +62,8 @@ pub enum Response {
     /// Close run.
     CloseRun(()),
 }
-/// Synchronous proxy owning its provider process and connection.
+/// Synchronous proxy owning its connection. Direct clients also own the provider
+/// child; managed workers receive a connection whose child belongs to the cleanup owner.
 pub struct Proxy {
     client: Mutex<Client>,
     advertised: Advertised,

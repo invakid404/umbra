@@ -93,8 +93,9 @@ harness and a proxy (`connect` returns paired platform proxies). A new backend p
 implements its existing contract, calls that harness from main, and installs a descriptor.
 No established trait, CLI branch, backend dependency or feature must be edited.
 Common registration and framing are implemented in `umbra-core::provider`, independent
-of role implementations. All implementation packages keep only core and their own
-contract as direct Umbra dependencies.
+of role implementations. Implementation packages normally depend only on core
+and their own contract. The macOS provider also uses `umbra-isolation` for
+managed resource admission and cancellation.
 
 The transport uses a Unix socket in a private temporary directory, a version/identity/
 role/capability handshake, monotonically increasing request IDs, owned JSON DTOs and
@@ -104,8 +105,12 @@ limit includes JSON's byte-array expansion and transport envelope overhead. Only
 ordinary request is outstanding per connection, providing backpressure. Configured I/O
 deadlines are bounded to 1–60000 ms; malformed, disconnected or timed-out connections
 are invalidated. This per-request deadline is authoritative: storage backends size
-their own probe and layout bounds to fit inside it, and a provider that overruns it is
-killed and reaped without blocking the caller. No failed call is retried automatically or redirected to host writes.
+their own probe and layout bounds to fit inside it. Transport or protocol failure
+invalidates the connection; a well-formed operation error leaves it open. Dropping
+an ordinary owning client kills and collects its provider. Managed platform ownership
+instead notifies the separate cleanup owner, which retains the provider process
+through bounded cleanup and actual parent collection. No failed ordinary call is
+retried automatically or redirected to host writes.
 Private IPC descriptors use Rust's non-inheritable Unix descriptors. Provider processes
 are trusted components, not tracees; future launch implementations must still sanitize
 all inherited resources and independently enforce controller/provider-death behavior.
@@ -145,8 +150,10 @@ floor means tiny registry timeouts can still fail closed.
 requests receive Pending while the original owner destroys the platform, or
 Final after destruction completes. Polling preserves the existing owner cleanup
 envelope; it does not renew it. Accepted, an ordinary Terminate response, and EOF
-are not closure proof. The client validates every final obligation and collects
-its owned provider process before the supervisor records successful completion.
+are not closure proof. The client validates every final obligation. In the
+managed path, the cleanup owner collects the provider and sends the collection
+evidence; an RPC disconnect alone cannot authorize completion. The supervisor
+requires both closure and collection before recording durable completion.
 Older providers lacking the shutdown capability are refused before launch;
 common protocol version 3 and the journal format remain unchanged.
 

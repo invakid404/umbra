@@ -1,7 +1,8 @@
 # umbra-platform-macos
 
-Darwin arm64 tracing backend. Direct Umbra dependencies are `umbra-core` and
-`umbra-platform`; `mach2` and `libc` are gated to `cfg(target_os = "macos")`.
+Darwin arm64 tracing backend. Direct Umbra dependencies are `umbra-core`,
+`umbra-platform`, and, on macOS, `umbra-isolation` for managed process custody.
+`mach2` and `libc` are also gated to `cfg(target_os = "macos")`.
 Non-arm64-macOS builds still compile (through `src/unsupported.rs`) — this
 covers non-macOS targets and macOS on x86_64. Fallible tracing/control calls
 report `UnsupportedCapability`, and capabilities are empty. The pure arm64 ABI
@@ -9,6 +10,19 @@ module remains available on those hosts.
 
 This document covers the crate's ABI decoder, native tracer, spawn protocol,
 interposer, provider executable and integration tests.
+
+The managed provider path is active. The local performance series at `80e8b9c9`
+passed owner option A: whole-invocation and admission criteria, with zero guard,
+protocol and deadline failures. Earlier stage-budget misses remain recorded as
+follow-up costs in the [performance report](../../experiments/fixtures/umbra-fix-299b-performance/checkpoint12-acceptance.md).
+Readiness and startup descriptor counts meet their revised accepted ceilings,
+at that measured revision, subject to the census limitations documented there.
+The series was not retaken after `ca11b82a`, which adds untimed `getpid`/`getsid`
+calls before provider spawn; it is not a performance claim for the current head.
+This does not qualify the
+unresolved provider-loss cases, hosted endpoint socket provenance, or the
+self-hosted SID-1 checkpoint failures. Those CI findings require verification
+on the corrected head; passing local tests does not settle them.
 
 The crate implements the v2 experimental tracer described in
 `experiments/tracer/umbra_tracer.py` and `experiments/tracer/REPORT-v2.md`
@@ -76,10 +90,15 @@ rate test is a separate ignored measurement explicitly invoked by CI, with no
 accepted refusal-rate threshold.
 
 The provider advertises `platform.shutdown-ledger.v1`. Its ledger reserves slots
-before root/child creation, tracer launch and task-right acquisition, and keeps
-retired history through quiesce, resume and preliminary termination. Exec records
+before preparation-helper, root and child creation, tracer launch and task-right
+acquisition, and keeps retired history through quiesce, resume and preliminary
+termination. Exec records
 replacement-right relationships without discarding the old right's release
 obligation. Captured process birth identities remain attached to their slots.
+Completed-child retirement releases its admission charge only after releasing
+the debugger and task rights and confirming the tracee's terminal evidence.
+The retained session tombstone does not keep that charge. Root collection
+remains an owned-child obligation.
 Exact owned-child collection is distinct from descendant exit accounting:
 `ECHILD`, EOF and sending a signal are never collection receipts.
 
@@ -91,8 +110,14 @@ fork-child sweep (100 ms + 1 s, added once) when any fork window is open at the
 freeze and nothing otherwise; no reservation is admitted after the freeze, so no
 window opens later. Polling never restarts them. Synchronous kernel calls and
 cooperative watchdog cancellation/join assume kernel-call completion. An
-envelope overrun fails closure rather than claiming successful cleanup. No
-session-age, inactivity or cancellation policy is added.
+envelope overrun fails closure rather than claiming successful cleanup.
+Managed cancellation clamps these windows to the original cleanup ticket;
+neither polling nor teardown starts a replacement ticket. Sessions that have
+completed ordered teardown but still retain resources remain in the owner
+allowance. This correction has a deterministic regression test. The live
+region-cap case subsequently passed with writer authority reopened after
+admission and owner waits changed to readiness events.
+No session-age or inactivity policy is added.
 
 The shared monitor stores a typed terminal cause. Genuine explicit deadline
 expiry reports operation `watchdog`; owner loss, monitor failure and panic
@@ -173,9 +198,9 @@ spawn success and Task acquisition remains outside held-Mach-task cleanup in
 non-isolated runs. A ledger reservation retains the obligation but supplies no
 Mach handle to the owner monitor; see
 [#248](https://github.com/invakid404/umbra/issues/248). Provider loss also removes
-the in-process watchdog. Terminal/library runs have no outer guardian sweep;
-the local no-spawn, null-spawn and packed-spawn comparison left root/debugger
-survivors requiring test recovery. A live-process census does not prove reap.
+the in-process watchdog. The historical unarmed terminal/library comparison had
+no outer guardian sweep; its no-spawn, null-spawn and packed-spawn runs left
+root/debugger survivors requiring test recovery. A live-process census does not prove reap.
 The current qualification restores 51 of the 54 packed-spawn arms. The three
 guardian provider-loss arms remain unchanged and out of CI pending
 [#303](https://github.com/invakid404/umbra/issues/303). The no-spawn and null-spawn
@@ -703,14 +728,21 @@ exposed that; the raw-`svc` leg with high bits set in `x2` guards it.
 <!-- memoria:section id="provider-binary" files="src/main.rs" guidance="../../docs/guides/reviewing-provider-binary.md" -->
 ## Provider binary
 
-`src/main.rs` is the shipped provider binary. It calls
+`src/main.rs` is the shipped `umbra-platform-macos` provider binary. It first
+validates any managed re-entry as a Provider parented by CleanupOwner. It calls
 `keep_lifetime_with_owner()` (below, "Signals"), captures its parent identity,
 accepts the `macos` handshake, installs the owner watch, and calls
 `umbra_platform::provider::serve_session` with a
 `PlatformSession { control: MacosTraceBackend, abi: DarwinArm64Abi }`.
-It decodes JSON `Options` from opaque provider options (empty falls back to
-`Options::default()`). Register it via `umbra providers --registry <path>
+Managed entry completes startup and installs admission plus independent
+cancellation before serving worker requests; a direct provider uses the ordinary
+owner connection. It decodes JSON `Options` from opaque provider options (empty
+falls back to `Options::default()`). Register it via `umbra providers --registry <path>
 --role platform`.
+
+`UMBRA_MANAGED_ROLE` is private launch metadata supplied by the registered
+parent. It is consumed on entry; an absent value selects ordinary provider
+entry, and invalid metadata fails before backend setup.
 
 **Environment.** `UMBRA_DEBUGSERVER` overrides discovery when the JSON
 `debugserver` option is absent; if both are unset, `xcode-select -p` supplies the
@@ -747,6 +779,46 @@ backend, so disposal cannot erase earlier acquisition obligations.
 With `shutdown-witness`, `UMBRA_FIX_271_EVIDENCE_FILE` selects an append-only
 JSONL file for acquisition, thread-order and closure timing observations. Unset
 means no witness output; builds without the feature do not read the variable.
+
+The `test-native-cleanup-order` feature also enables `shutdown-witness`.
+`UMBRA_NATIVE_CLEANUP_ORDER` selects a fresh directory containing the controller's
+run identity and release files. The provider records sequential barrier,
+debugger-collection and task-right receipts, holding selected boundaries for
+the controller. A hold exceeding two seconds invalidates the observation and
+releases cleanup. Unset means no ordering records or holds; normal builds
+contain none of these controls.
+A per-process `withhold-terminal-<pid>` file in that directory makes terminal
+lookup return its existing error outcome. It does not change the operation
+directed at the program, cached confirmation, parent collection, or deadlines.
+
+The same feature includes startup and cleanup timing observations.
+`UMBRA_F299_PERF_EVENTS` selects their output directory; unset produces no
+records. When selected, the harness must also supply
+`UMBRA_F299_PERF_MANIFEST_DIGEST`, `UMBRA_F299_PERF_RUN_NONCE`,
+`UMBRA_F299_PERF_PAIR_INDEX`, `UMBRA_F299_PERF_ORDER`, and
+`UMBRA_F299_PERF_WORKLOAD`. Missing identity fields fail the measurement.
+The observations bracket provider acceptance and retain per-producer sequences
+and process birth identities. They do not change deadlines.
+
+The separate `umbra-core/cost-witness` feature uses `UMBRA_COST_OBSERVER` and
+`UMBRA_COST_DIRECTORY` for explicit resource inventories. Unset observer means
+no output. Startup allocation hooks do not invoke that observer; managed
+snapshots run after worker readiness. Cost builds must not supply latency samples.
+
+The `managed-endpoint-probe` feature observes inherited descriptor identities
+at root and debugger pre-exec boundaries; it has no environment switch.
+`managed-watch-probe` exposes test barriers around native process-watch
+registration. These support the `managed_cleanup` integration target, whose
+live cases require `UMBRA_INTEGRATION_REQUIRED=1` and debugger permission.
+
+With `managed-cancel-probe`, `UMBRA_NATIVE_SETUP_PROBE` names a directory for
+`setup.json` and `observed.json`. The probe stops the owned debugger at the first
+`vCont?` request, before session acceptance, records cancellation against the
+original ticket, and resumes that debugger when the probe guard drops. An
+existing `setup.json` suppresses another hold. The integration test also needs
+`UMBRA_NATIVE_MANAGED_CALLER`, the supervisor's separately built
+`managed_library` executable with `probe-native-setup-cancel` enabled. These
+controls do not exist in normal providers.
 
 With `signal-witness`, `UMBRA_FIX284_PHASE` selects `entry`, `return-window`,
 `exec`, `internal`, `park`, `identity` or `ambiguous`. Unset means no probe.
@@ -967,12 +1039,15 @@ launchd as a zombie nobody collects:
   (`QSetDetachOnError:0`) and exits about 2 s later, but finishes exiting
   while the tracee is still mid-exit, so the tracee is left to launchd. #198's
   1 s observation of a debugserver still holding the tracee is the start of
-  that window. One trigger is umbra's own: the supervisor's platform client,
+  that window. One trigger on the direct, unarmed path is the platform client,
   when dropped, closes the connection and SIGKILLs the provider at once
   (`umbra-core`'s `Client::drop`). Its normal end does not reach that drop
   while anything is held: it waits for the provider's `Final`. A shutdown
   error before `Final` (the envelope deadline, a transport error) or a panic
-  while a session is live does, and is R2.
+  while a session is live does, and is R2. Managed workers hold no provider child
+  handle: they notify the cleanup owner, which retains cancellation and actual
+  parent-wait authority. This removes that immediate worker-Drop kill; it does
+  not qualify externally killed providers or every fallback outcome.
 - **R3 (#300):** stop-before-`k` repairs the observed running-program dispatch
   path without increasing the bound. The local watchdog case confirmed before
   tracer disposal in 20.57 ms. The SID-1 stopped-tracer case still requires CI
@@ -1080,6 +1155,32 @@ owned-child wait control precedes the sandboxed provider run. Independent
 acquisition records must match the complete ledger, retain birth/replacement
 identities, and show same-owner destruction before transport Final.
 Final-to-owned-exit must be at most 50 ms.
+
+The `r2_native_da_order_across_roles` selector adds held barriers with
+`--features test-native-cleanup-order`. Supply a fresh
+`UMBRA_NATIVE_CLEANUP_ORDER` directory path and the witness file above, then select
+that test with `--exact --nocapture --test-threads=1`. Its controller checks a
+confirmed terminal barrier before debugger cleanup, successful debugger
+collection, and task-right deallocation before each matching final slot confirms.
+For the normal selector, the native controller also observes the debug helper
+while the barrier is held;
+moving the actual cleanup request before that barrier is rejected even when
+later collection completes.
+
+`r2_native_da_order_emergency` uses a fork descendant and the terminal-observation
+hook to exercise deadline expiry, Unconfirmed before the cleanup request, and
+a retained failed result after collection. The emergency oracle permits the helper
+to end normally before the cleanup request. Its actual parent observes that
+boundary with nonblocking, non-consuming `waitid` and records the raw wait
+status after collection. A signal-ended helper before the request, an unavailable
+observation, or missing parent status fails the case. The request record must
+show the original allocation expired. Normal-case liveness checks stay intact.
+The scoped emergency reading and the subsequent normal/emergency selector pair
+passed; both emergency readings recorded normal helper exit status 0 before the
+request and raw collected status 0. The earlier shared-observer failure remains
+retained; it required liveness where the emergency contract permits normal exit.
+The ordinary-child causal-order and emergency controls are in `umbra-isolation`.
+Neither fixture qualifies the unresolved provider-loss or SID-1 cases.
 
 Deterministic unit tests cover shared terminal-cause attribution, late reserved
 results, old tracer collection and Drop during a channel-held latch. Platform
@@ -1494,8 +1595,8 @@ Set `UMBRA_INTEGRATION_REQUIRED=1` to make missing fixture inputs fail the sandb
 IPC and direct tracer suites. CI's `native-qualification` job runs these and the
 CLI's local matrix on a runner labelled `umbra-integration`; that runner
 requires debugger permission. The separate mounted-NFS matrix uses
-`UMBRA_TEST_NFS_ROOT` and is qualified by name on CI. Agent sessions must not
-set that variable or mount NFS; they leave those cases for CI qualification.
+`UMBRA_TEST_NFS_ROOT`; the current native job disables that matrix, so it is not
+qualified by this change. Agent sessions must not set that variable or mount NFS.
 No test provisions a mount or prompts.
 
 Sandbox handoff compares canonical target paths with `proc_pidpath`. The twin
@@ -1562,8 +1663,9 @@ There is no default session-age or inactivity limit. Omitted/null `timeout_ms`
 means no lifetime cap; numeric milliseconds opt in, with 1..=3,600,000 accepted.
 This option is independent of the registry's per-request IPC timeout. All timing
 uses awake uptime: laptop sleep does not expire a budget, and early timeout
-wakeups retain partial transport/RSP progress. Resume starts a new provider session
-and a fresh opt-in budget; fork/exec do not renew the current session's budget.
+wakeups retain partial transport/RSP progress. A new provider launch gets a fresh
+opt-in budget; fork/exec do not renew the current session's budget. CLI `resume`
+currently classifies recovery without launching a provider.
 
 The executable binds its actual parent's process generation to the Unix socket
 peer, registers NOTE_EXIT and EOF observation, then revalidates before launch.

@@ -64,6 +64,132 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-targets
 
+      - name: Managed cleanup protocol and simultaneous admission
+        run: |
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_phase -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_nonce -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_begin_eof -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_poll_eof -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_deadline -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_invalid_accept -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_backwards -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_poll_phase -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_invalid_final -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_begin_timeout -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_poll_timeout -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_drop -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_panic -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_session_drop -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_shutdown_panic -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_unconfirmed_final -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_wrong_id -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_malformed_response -- --exact --nocapture
+          cargo test -p umbra-platform --lib provider::closing::tests::cleanup_owner_tests::r2_cleanup_before_kill_provider_error -- --exact --nocapture
+          cargo test -p umbra-core --test admission r2_grant_visible_before_acquire -- --exact --nocapture
+          cargo test -p umbra-core --test admission r2_freeze_races_grant -- --exact --nocapture
+          cargo test -p umbra-core --test admission r2_grant_before_entry_freeze -- --exact --nocapture
+          cargo test -p umbra-core --test admission r2_release_requires_terminal_proof -- --exact --nocapture
+          cargo test -p umbra-core --test admission r2_absent_stale_partial_inventory -- --exact --nocapture
+          cargo test -p umbra-core --lib admission::tests::r2_budget_overflow_and_writer_death -- --exact --nocapture
+          cargo test -p umbra-core --lib managed::tests::cleanup_deadline_no_renewal -- --exact --nocapture
+
+      - name: Durable custody and concurrent recovery
+        run: |
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_reopen_armed_before_go -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_reopen_after_admission_timeout -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_warning_unwind_retains_custody -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_recovery_cannot_erase_unknown_creator -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_reopen_final_without_wait -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_finish_prepare_retains_authority -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_stale_owner_failure_generation -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_finish_commit_ack_lost -- --exact --nocapture
+          cargo test -p umbra-overlay --lib engine::tests::custody::r2_concurrent_resume_single_writer -- --exact --nocapture
+
+      - name: Managed parent custody after lost acknowledgements
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p umbra-isolation --lib spawn::descriptors::tests:: -- --nocapture --test-threads=1
+          cargo test -p umbra-isolation --lib managed::rollback::tests::watch_allocation_failure_retains_parent_collection -- --exact --nocapture --test-threads=1
+          cargo test -p umbra-isolation --lib managed::worker::tests::unsolicited_collection_ack_remains_failed_on_retry -- --exact --nocapture --test-threads=1
+          cargo test -p umbra-isolation --lib managed::worker::tests::collection_drains_start_arriving_after_route_scan -- --exact --nocapture --test-threads=1
+          cargo test -p umbra-isolation --features test-clock --lib managed::publication::tests::acknowledged_route_keeps_success_when_clock_crosses_receive_cutoff -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_ack_loss_preserves_owner_provider_custody -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime custody_normal_reaps_all -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_da_order_across_roles -- --exact --nocapture
+          cargo test -p umbra-isolation --features test-exit-before-wait --test managed_runtime shutdown_error_exit_before_parent_wait -- --exact --nocapture --test-threads=1
+          cargo test -p umbra-isolation --test managed_runtime custody_stuck_custodian_reaps_all -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_uncancellable_work_outer_cleanup -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_creator_past_tail -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_custody_owner_dies_no_false_collection -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_acquire_after_expired_outer_census -- --exact --nocapture
+          cargo test -p umbra-isolation --features managed-endpoint-probe --test managed_runtime r2_exec_and_fork_endpoint_inventory -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_guardian_ack_loss_preserves_child_collection -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_relay_ack_loss_preserves_child_collection -- --exact --nocapture
+
+      - name: Managed caller original clock
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p umbra-isolation --test managed_runtime r2_unknown_start_exit_never_renews -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_library_earlier_start_after_local_ticket -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_library_earlier_start_after_observation -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_total_publication_loss_preserves_custody -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_grace_exhaustion_is_loud -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_library_relay_stalls_before_start -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_guardian_stalls_before_first_trigger -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_library_owner_start_relay_stalled_worker_alive -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_runtime r2_library_received_start_forwarded_before_origin_exit -- --exact --nocapture
+
+      - name: Managed owner observation with inherited descriptor
+        if: runner.os == 'macOS'
+        run: cargo test -p umbra-isolation --test managed_runtime r2_owner_exit_with_inherited_fd -- --exact --nocapture
+
+      - name: Cleanup helper creation and handoff failure
+        run: cargo test -p umbra-platform --lib provider::closing::tests::r2_reaper_creation_failure -- --exact --nocapture
+
+      - name: Cleanup progress cannot renew the original grace window
+        run: cargo test -p umbra-platform --lib provider::closing::tests::r2_grace_exhaustion_is_loud -- --exact --nocapture
+
+      - name: Managed watch registration failure and exit ordering
+        if: runner.os == 'macOS'
+        run: cargo test -p umbra-isolation --lib managed::process::tests::custody_watch_registration_race -- --exact --nocapture
+
+      - name: Custody shares the original helper deadline window
+        if: runner.os == 'macOS'
+        run: cargo test -p umbra-isolation --lib managed::guard::policy_tests::custody_ticket_deadlines -- --exact --nocapture
+
+      - name: Guardian retains its approved cleanup allocations
+        if: runner.os == 'macOS'
+        run: cargo test -p umbra-isolation --lib guardian::tests::guardian_cleanup_opportunity -- --exact --nocapture
+
+      - name: Managed worker fail-stop after publication failure
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p umbra-isolation --test managed_startup r2_ticket_publication_all_writes_fail -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_startup custody_abrupt_owner_exit_reaps_all -- --exact --nocapture
+          cargo test -p umbra-isolation --test managed_startup custody_panic_reaps_all -- --exact --nocapture
+
+      - name: Registered owner abandonment fails before application launch
+        if: runner.os == 'macOS'
+        env:
+          UMBRA_INTEGRATION_REQUIRED: "1"
+        run: cargo test -p umbra-supervisor --features probe-managed-owner-drop --test managed_library -- r2_direct_drop_failed_result 1
+
+      - name: Failed provider closure retains recovery-only custody
+        if: runner.os == 'macOS'
+        env:
+          UMBRA_INTEGRATION_REQUIRED: "1"
+        run: cargo test -p umbra-supervisor --test managed_library -- r2_failed_closure_reopen 1
+
+      - name: Independent cancellation of accepted ordinary work
+        if: runner.os == 'macOS'
+        run: cargo test -p umbra-platform-macos --lib native::cancellation_tests::r2_preaccepted_work_cancel -- --exact --nocapture
+
+      - name: RSP cancellation preserves the stream
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p umbra-platform-macos --lib rsp::tests::r3_cancel_ordinary_request_same_stream -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib rsp::tests::r3_cancel_partial_write -- --exact --nocapture
+
       - name: Test contract documentation
         run: cargo test --workspace --doc
 
@@ -297,9 +423,15 @@ jobs:
 
       - name: Qualify enforcement, IPC, and the local run-fixture matrix
         run: |
+          cargo test -p umbra-platform-macos --test managed_cleanup r2_native_acquisition_ledger -- --exact --nocapture
+          cargo test -p umbra-platform-macos --features managed-endpoint-probe --test managed_cleanup r2_native_debugserver_endpoint_inventory -- --exact --nocapture
+          cargo test -p umbra-platform-macos --features managed-watch-probe --test managed_cleanup r2_native_watch_registration_race -- --exact --nocapture
+          cargo test -p umbra-platform-macos --test managed_cleanup r2_native_capacity_refusal_before_preparation -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib native::tests::owner_loss_wakes_a_pending_rsp_request -- --exact --nocapture
           cargo test -p umbra-platform-macos --lib native::teardown_tests:: -- --nocapture --test-threads=1
           cargo test -p umbra-platform-macos --lib rsp::tests::cancellation_preserves_partial_reply_and_same_stream_for_teardown -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib rsp::tests::r3_cancel_ordinary_request_same_stream -- --exact --nocapture
+          cargo test -p umbra-platform-macos --lib rsp::tests::r3_cancel_partial_write -- --exact --nocapture
           cargo test -p umbra-platform-macos --test sandbox_launch --test provider_ipc --test fixtures --test idle_poll -- --nocapture --test-threads=1
           # #205: the launchd-zombie and teardown decisions, the stub resolution,
           # debugserver's ignored terminal signals, and the provider's lifetime.
@@ -318,6 +450,124 @@ jobs:
           git diff --stat -- experiments/fixtures/umbra-fix-227-observer-providers/Cargo.lock
           cargo build --locked --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           cargo test -p umbra-supervisor --test observer_failure -- --nocapture --test-threads=1
+      - name: Qualify exit notification before parent wait
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-exit-before-wait --lib managed::guard::policy_tests::exit_notification_before_wait_keeps_collection_ready -- --exact --nocapture --test-threads=1
+          cargo test -p umbra-isolation --features test-exit-before-wait --lib managed::owner::tests::owner_exit_notification_before_wait_keeps_collection_ready -- --exact --nocapture --test-threads=1
+      - name: Qualify rollback watch allocation failure
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::owner_startup::construction_tests::watch_allocation_failure_still_collects_provider -- --exact --nocapture --test-threads=1
+      - name: Qualify rollback watch installation failure
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::owner_startup::construction_tests::watch_install_failure_still_collects_provider -- --exact --nocapture --test-threads=1
+      - name: Qualify adopted provider construction failure
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::owner_startup::construction_tests::adopted_provider_is_collected_during_failed_startup -- --exact --nocapture --test-threads=1
+      - name: Qualify expired readiness rollback
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::relay_startup::construction_tests::expired_readiness_still_collects_pre_go_guardian -- --exact --nocapture --test-threads=1
+      - name: Qualify consumed relay preparation failure
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::relay_startup::construction_tests::consumed_preparation_collects_guardian_without_panicking -- --exact --nocapture --test-threads=1
+      - name: Qualify caller descriptor exclusion
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features managed-endpoint-probe --test managed_runtime r2_caller_descriptors_stay_out_of_roles -- --exact --nocapture --test-threads=1
+      - name: Qualify deferred startup cost observation
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-core --features cost-witness --test cost_observation startup_observation_runs_only_after_readiness -- --exact --nocapture --test-threads=1
+      - name: Qualify admission owner ready exchange budget
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-cli --test cleanup_performance r10_admission_owner_ready_exchange_budget -- --exact --nocapture --test-threads=1
+      - name: Qualify registered library success
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- success 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library owner_construction
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features test-managed-construction-failure --test managed_library -- owner_construction 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library relay_construction
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features test-managed-construction-failure --test managed_library -- relay_construction 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library missing_storage
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- missing_storage 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library slow_preparation
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features test-slow-namespace-preparation --test managed_library -- slow_preparation 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library failed_preparation
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features test-failed-namespace-preparation --test managed_library -- failed_preparation 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library finish_reply_loss
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features probe-managed-finish-reply-loss --test managed_library -- finish_reply_loss 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library missing
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- missing 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library prepared_error
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- prepared_error 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library prepared_panic
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- prepared_panic 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library provider_death
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- provider_death 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library owner_death
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- owner_death 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library armed_reply_loss
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features probe-managed-arm-reply-loss --test managed_library -- armed_reply_loss 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library startup_abort
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- startup_abort 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library missing_provider
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- missing_provider 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library readiness_timeout
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- readiness_timeout 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library malformed_offer
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features probe-managed-offer-generation --test managed_library -- malformed_offer 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library r2_direct_drop_failed_result
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features probe-managed-owner-drop --test managed_library -- r2_direct_drop_failed_result 64 --exact --nocapture --test-threads=1
+      - name: Cancel accepted native setup through the independent route
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features probe-native-setup-cancel --test managed_library --no-run --message-format=json > /tmp/native-cancel-artifacts.jsonl
+          export UMBRA_NATIVE_MANAGED_CALLER=$(python3 -c 'import json; rows=[json.loads(line) for line in open("/tmp/native-cancel-artifacts.jsonl")]; paths=[r["executable"] for r in rows if r.get("reason")=="compiler-artifact" and r.get("target",{}).get("name")=="managed_library" and r.get("executable")]; assert len(paths)==1; print(paths[0])')
+          cargo build -p umbra-platform-macos --features managed-cancel-probe
+          cargo test -p umbra-platform-macos --features managed-cancel-probe --test managed_cleanup r2_native_preaccepted_work_cancel -- --exact --nocapture
+          cargo build --workspace --bins
+
       - name: Qualify adopted stdio ownership and launch consumption
         run: |
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
@@ -347,6 +597,21 @@ jobs:
           cargo build -p umbra-platform-macos --features retirement-witness --bin umbra-platform-macos
           cargo test -p umbra-platform-macos --lib retirement_ -- --nocapture
           cargo test -p umbra-cli --test child_retention -- --nocapture --test-threads=1
+      - name: Qualify abrupt worker end in a dedicated session
+        run: |
+          cargo test -p umbra-cli --features test-managed-session --test isolation own_session_worker_killed_with_a_stopped_provider -- --exact --nocapture --test-threads=1
+      - name: Qualify exit notification before native parent wait
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo build --workspace --features umbra-cli/test-exit-before-wait,umbra-cli/shutdown-witness
+          cargo test -p umbra-cli --features test-exit-before-wait,shutdown-witness --test isolation own_session_worker_exit_before_parent_wait -- --exact --nocapture --test-threads=1
+      - name: Qualify native cleanup order
+        env:
+          UMBRA_NATIVE_CLEANUP_ORDER: /tmp/umbra-order-${{ github.run_id }}-${{ github.run_attempt }}
+          UMBRA_FIX_271_EVIDENCE_FILE: /tmp/umbra-order-${{ github.run_id }}-${{ github.run_attempt }}.jsonl
+        run: |
+          cargo test -p umbra-platform-macos --features test-native-cleanup-order --test shutdown_ledger r2_native_da_order_across_roles -- --exact --nocapture --test-threads=1
+          UMBRA_NATIVE_CLEANUP_ORDER="${UMBRA_NATIVE_CLEANUP_ORDER}-emergency" UMBRA_FIX_271_EVIDENCE_FILE="${UMBRA_FIX_271_EVIDENCE_FILE}.emergency" cargo test -p umbra-platform-macos --features test-native-cleanup-order --test shutdown_ledger r2_native_da_order_emergency -- --exact --nocapture --test-threads=1
       - name: Qualify shutdown inventory and owner destruction
         env:
           UMBRA_RETIREMENT_WITNESS: "1"
@@ -386,7 +651,7 @@ jobs:
           UMBRA_REQUIRE_SID1: "1"
         run: |
           cargo test -p umbra-isolation -- --nocapture --test-threads=1
-          cargo test -p umbra-cli --test isolation -- --nocapture --test-threads=1
+          cargo test -p umbra-cli --features shutdown-witness --test isolation -- --nocapture --test-threads=1
           # Named SID-1 stdio contract: exact delivery and EOF by CLI exit.
           cargo test -p umbra-cli --test isolation f201_pipe_eof_isolated -- --exact --nocapture --test-threads=1
       # #205: fail the job on any launchd-parented zombie of this user born
@@ -820,6 +1085,30 @@ jobs:
             cargo test -p umbra-storage-nfs-userspace --features transport-raw --test userspace_run "$case" -- --exact --nocapture --test-threads=1
           done
 
+      - name: Durable custody against the userspace storage registry
+        env:
+          UMBRA_CUSTODY_REGISTRY_REQUIRED: "1"
+        run: |
+          export UMBRA_CUSTODY_STORAGE_DESCRIPTOR="$RUNNER_TEMP/managed-custody-storage.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          descriptor = json.loads(Path("crates/umbra-storage-nfs-userspace/provider.json").read_text())
+          descriptor["capabilities"] = ["userspace-nfsv4-v1", "experimental-userspace-routing-v1"]
+          descriptor["executable"] = list(os.fsencode(Path("target/debug/umbra-storage-nfs-userspace").resolve()))
+          host, port = os.environ["UMBRA_NFS_RAW_FIXTURE"].rsplit(":", 1)
+          options = {"host": list(host.encode()), "port": int(port),
+                     "export": list(b"umbra"), "run_parent": list(b"runs"),
+                     "root_anchor": list(b"root"), "control_anchor": list(b"control"),
+                     "deadline": {"millis": 10000}}
+          descriptor["options"] = list(json.dumps(options).encode())
+          Path(os.environ["UMBRA_CUSTODY_STORAGE_DESCRIPTOR"]).write_text(json.dumps(descriptor))
+          PY
+          for case in r2_reopen_armed_before_go r2_reopen_after_admission_timeout r2_warning_unwind_retains_custody r2_recovery_cannot_erase_unknown_creator r2_reopen_final_without_wait r2_finish_prepare_retains_authority r2_stale_owner_failure_generation r2_finish_commit_ack_lost r2_concurrent_resume_single_writer; do
+            cargo test -p umbra-overlay --lib "engine::tests::custody::$case" -- --exact --nocapture --test-threads=1
+          done
+          cargo test -p umbra-supervisor --test managed_library -- r2_failed_closure_reopen 1
+
       - name: Signal return-window rate reading
         env:
           UMBRA_F284_RATE_EVIDENCE: /tmp/slate-evidence-${{ github.run_id }}/fix284-rate-${{ github.run_attempt }}.jsonl
@@ -905,6 +1194,7 @@ jobs:
             --test userspace_run -- fix_271_shutdown_journal_and_inheritance fix_274_live_sibling_inheritance \
             fix_243_acquired_backend_drop fix_243_inserted_backend_drop fix_243_policy_backend_drop \
             --exact --nocapture --test-threads=1
+          python3 experiments/fixtures/umbra-fix-299b-performance/shutdown_exit.py
           python3 - <<'PY'
           import json, os
           from collections import Counter
@@ -913,6 +1203,9 @@ jobs:
           exits = [row for row in rows if row["event"] == "final-to-exit"]
           assert exits, "no positive closure reading"
           assert any(row["proof"] for row in exits), "no confirmed closure control"
+          import sys
+          sys.path.insert(0, "experiments/fixtures/umbra-fix-299b-performance")
+          from shutdown_exit import provider_exit_succeeded
           for row in exits:
               assert row["timing_origin"] == "final-decoded", row
               owner = transports[row["nonce"]]
@@ -924,7 +1217,8 @@ jobs:
               assert actual == recorded, (actual - recorded, recorded - actual)
               print("shutdown Final-to-exit:", row["nanos"], "ns", "acquisitions:", sum(actual.values()))
               # Fault cases may correctly return an unconfirmed complete inventory.
-              assert row["exit_ok"] and int(row["nanos"]) <= 50_000_000, row
+              # Managed cleanup can retain failure after a clean actual parent wait.
+              assert provider_exit_succeeded(row, owner, rows) and int(row["nanos"]) <= 50_000_000, row
           PY
 
       - name: Restore binaries after packed spawn faults

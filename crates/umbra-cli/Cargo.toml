@@ -11,8 +11,12 @@ name = "umbra"
 path = "src/main.rs"
 
 [features]
+# Test hook: exercise the dedicated guardian session without running in SID 1.
+test-managed-session = ["umbra-isolation/test-managed-session"]
+# Force the guardian notification before worker parent-wait readiness.
+test-exit-before-wait = ["test-managed-session", "umbra-isolation/test-exit-before-wait"]
 # Test-only closure measurements, also usable by external CLI-library fixtures.
-shutdown-witness = ["umbra-platform/shutdown-witness"]
+shutdown-witness = ["umbra-platform/shutdown-witness", "umbra-isolation/shutdown-witness"]
 probe-idle-renewal = ["umbra-supervisor/probe-idle-renewal"]
 # Forwarded to `umbra-overlay` through `umbra-supervisor`; see that manifest.
 # Building the `umbra` binary with one of these is how
@@ -63,6 +67,7 @@ umbra-overlay = { path = "../umbra-overlay" }
 umbra-isolation = { path = "../umbra-isolation" }
 
 [dev-dependencies]
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 # `tests/resume_cli.rs` builds a crashed run's durable state, then reopens it

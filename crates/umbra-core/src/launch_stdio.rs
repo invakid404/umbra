@@ -43,19 +43,25 @@ impl LaunchStdio {
 
     /// Admit owned tty, pipe/FIFO, Unix stream, regular-file and null endpoints.
     pub fn new(mut fds: [OwnedFd; 3]) -> Result<Self> {
+        crate::cost_snapshot!("stdio-owned-descriptions", None, &[]);
         // Direct callers and SCM_RIGHTS receivers may own standard slots.
         // Keep every source outside the spawn destinations so permutations
         // such as [1, 0, 2] cannot overwrite a later dup2 source.
         for fd in &mut fds {
             if fd.as_raw_fd() <= 2 {
-                *fd = rustix::io::fcntl_dupfd_cloexec(&*fd, 3).map_err(io)?;
+                let replacement = rustix::io::fcntl_dupfd_cloexec(&*fd, 3).map_err(io)?;
+                crate::cost_snapshot!("stdio-slot-duplicate", None, &[]);
+                *fd = replacement;
             }
         }
         let null = OpenOptions::new()
             .read(true)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
             .open("/dev/null")
-            .and_then(|file| file.metadata())
+            .and_then(|file| {
+                crate::cost_snapshot!("stdio-null-reference", None, &[]);
+                file.metadata()
+            })
             .map_err(|error| {
                 UmbraError::new(
                     ErrorKind::UnsupportedCapability,
@@ -71,9 +77,12 @@ impl LaunchStdio {
             ));
         }
         for fd in &fds {
-            let metadata = File::from(fd.try_clone().map_err(io)?)
-                .metadata()
-                .map_err(io)?;
+            let metadata = {
+                let file = File::from(fd.try_clone().map_err(io)?);
+                crate::cost_snapshot!("stdio-validation-duplicate", None, &[]);
+                file.metadata().map_err(io)?
+            };
+            crate::cost_snapshot!("stdio-validation-closed", None, &[]);
             let kind = metadata.file_type();
             let allowed = kind.is_file()
                 || kind.is_fifo()
@@ -215,8 +224,12 @@ impl LaunchStdio {
             .write(true)
             .open("/dev/null")
             .map_err(io)?;
+        crate::cost_snapshot!("stdio-null-opened", None, &[]);
         rustix::stdio::dup2_stdin(&null).map_err(io)?;
-        rustix::stdio::dup2_stdout(&null).map_err(io)
+        rustix::stdio::dup2_stdout(&null).map_err(io)?;
+        drop(null);
+        crate::cost_snapshot!("stdio-forwarders-released", None, &[]);
+        Ok(())
     }
 }
 

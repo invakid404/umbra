@@ -15,11 +15,10 @@
 //!
 //! # What this deliberately does not do
 //!
-//! It does **not** reach `Storage`. `NfsUserspaceStorage` still binds no
-//! transport and still answers `NotImplemented`; binding a live transport into
-//! the provider — and exposing it to `storage-ops` or `authority-recovery` — is
-//! `m1_integrate`'s seam, deferred by the M1 scope-lock. Nothing here advertises
-//! a capability, opens a run, or persists anything.
+//! This module establishes protocol state. [`crate::storage::NfsUserspaceStorage`]
+//! composes it with run anchors, writer admission and operations. Nothing in
+//! this module alone advertises a storage capability, opens an Umbra run, or
+//! persists its journal.
 //!
 //! The live backend is behind the off-by-default `transport-raw` feature, so a
 //! default build of this module compiles the fake path only and needs no native

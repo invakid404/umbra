@@ -29,9 +29,9 @@ extern "C" fn ignore_lifetime_signal(_: libc::c_int) {}
 /// ^C, ^\ or `kill -pgid` reaches it. Dying there, without the backend's
 /// drop, leaves its debugserver holding the program; ending that debugserver
 /// later hands the program to launchd as a zombie nobody collects (#198,
-/// #205). With these handled, the provider ends when its owner, the
-/// supervisor, does: the IPC connection closes, the drop runs the ordered
-/// teardown, and the process exits.
+/// #205). The provider observes its actual parent: the cleanup owner on the
+/// managed path, or the direct supervisor otherwise. Owner loss or transport
+/// closure requests teardown; handled terminal signals do not bypass it.
 ///
 /// Each handler is installed only where the inherited disposition is the
 /// default. An inherited ignore (`nohup`, or a background command of a
@@ -165,6 +165,14 @@ impl OwnerWatch {
     }
 
     pub fn new(identity: OwnerIdentity, stream: UnixStream) -> Result<Self> {
+        Self::with_barrier(identity, stream, |_| {})
+    }
+
+    fn with_barrier(
+        identity: OwnerIdentity,
+        stream: UnixStream,
+        mut barrier: impl FnMut(WatchCheckpoint),
+    ) -> Result<Self> {
         let mut peer = 0i32;
         let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
         let mut uid = 0;
@@ -189,6 +197,7 @@ impl OwnerWatch {
             ));
         }
         let queue = queue()?;
+        barrier(WatchCheckpoint::BeforeRegistration);
         register(
             &queue,
             event(
@@ -207,6 +216,7 @@ impl OwnerWatch {
                 0,
             ),
         )?;
+        barrier(WatchCheckpoint::AfterRegistration);
         if OwnerIdentity::read(peer)? != identity {
             return Err(unsupported(
                 "owner-observation: supervisor changed during registration",
@@ -217,6 +227,47 @@ impl OwnerWatch {
             _stream: stream,
         })
     }
+}
+
+/// Registration boundaries exposed only by the native qualification feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchCheckpoint {
+    BeforeRegistration,
+    AfterRegistration,
+    #[cfg(feature = "managed-watch-probe")]
+    BeforeGo,
+}
+
+/// Exercise the provider's actual generation check, registration and waiter.
+#[cfg(feature = "managed-watch-probe")]
+pub fn probe_owner_watch(
+    pid: u32,
+    stream: UnixStream,
+    mut barrier: impl FnMut(WatchCheckpoint),
+) -> Result<bool> {
+    let identity =
+        OwnerIdentity::read(i32::try_from(pid).map_err(|e| error("owner-observation", e))?)?;
+    let watch = OwnerWatch::with_barrier(identity, stream, &mut barrier)?;
+    let (waiter, _disarm) = Waiter::new(Some(watch))?;
+    barrier(WatchCheckpoint::BeforeGo);
+    Ok(matches!(
+        waiter.wait(Some(Instant::now() + std::time::Duration::from_millis(100)))?,
+        Wake::OwnerGone
+    ))
+}
+
+/// Require the kernel's failed registration receipt to remain a failure.
+#[cfg(feature = "managed-watch-probe")]
+pub fn probe_watch_registration_error() -> Result<()> {
+    register(
+        &queue()?,
+        event(
+            usize::MAX,
+            libc::EVFILT_PROC,
+            libc::EV_ADD | libc::EV_CLEAR,
+            libc::NOTE_EXIT,
+        ),
+    )
 }
 pub(crate) enum Wake {
     Disarm,

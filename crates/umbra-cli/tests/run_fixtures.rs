@@ -10,8 +10,8 @@ use std::{
     time::Instant,
 };
 use umbra_core::{
-    BytePath, JournalAccess, JournalControlBinding, JournalFormatPolicy, JournalLifecycle,
-    JournalOpenRequest, JournalPayload, PhysicalPath, RunId, Sequence,
+    BytePath, CustodyPhase, JournalAccess, JournalControlBinding, JournalFormatPolicy,
+    JournalLifecycle, JournalOpenRequest, JournalPayload, PhysicalPath, RunId, Sequence,
 };
 use umbra_journal::Journal;
 use umbra_journal_file::FileJournal;
@@ -202,7 +202,7 @@ fn matrix(nfs: bool) {
             "{case}: no completion record"
         );
         eprintln!(
-            "PASS {} {case}: {} exact bytes, host absent, lease released, RunCompleted, elapsed={:.3}s",
+            "PASS {} {case}: {} exact bytes, host absent, lease released, journal complete, elapsed={:.3}s",
             if nfs { "nfs" } else { "local" },
             expected.len(),
             elapsed.as_secs_f64()
@@ -325,8 +325,10 @@ fn assert_lease_released(run_dir: &Path, case: &str) {
 /// corrupt log from a log without the record. This opens the real `FileJournal`
 /// read-only and replays it, so the format header, frame length, checksum and
 /// sequence ordering are checked by the backend before any payload is looked at
-/// (`umbra-journal/src/lib.rs:86-92` is the contract), and only a decoded
-/// `JournalPayload::Lifecycle(JournalLifecycle::RunCompleted { .. })` answers yes.
+/// (`umbra-journal/src/lib.rs:86-92` is the contract). Managed completion requires
+/// a validated terminal custody transition, clean recovery and an observed root
+/// outcome (cleanup alone may complete after a fatal tracee stop). Unarmed legacy
+/// journals require a decoded `RunCompleted` record.
 ///
 /// Every failure is a panic, never `false`: a missing journal, a framing or
 /// checksum error, or a record that will not decode. A log this cannot read is
@@ -345,7 +347,7 @@ fn journal_records_completion(run_dir: &Path, run_id: RunId, case: &str) -> bool
     let control = run_dir.join("control");
     let directory = PhysicalPath(BytePath::new(control.as_os_str().as_bytes().to_vec()).unwrap());
     let mut journal = FileJournal::new();
-    journal
+    let recovery = journal
         .open(&JournalOpenRequest {
             control: JournalControlBinding { run_id, directory },
             access: JournalAccess::ReadOnly,
@@ -360,15 +362,31 @@ fn journal_records_completion(run_dir: &Path, run_id: RunId, case: &str) -> bool
     let records = journal
         .replay(Sequence(0))
         .unwrap_or_else(|e| panic!("{case}: replaying {}: {e}", control.display()));
-    let completed = records
-        .map(|record| record.unwrap_or_else(|e| panic!("{case}: undecodable journal record: {e}")))
-        .any(|record| {
-            matches!(
-                record.payload,
-                JournalPayload::Lifecycle(JournalLifecycle::RunCompleted { .. })
-            )
-        });
-    completed
+    let mut legacy_completed = false;
+    let mut observed_root = false;
+    for record in records {
+        let record = record.unwrap_or_else(|e| panic!("{case}: undecodable journal record: {e}"));
+        if let JournalPayload::Custody(custody) = &record.payload {
+            if let CustodyPhase::FinishPrepared { root_result, .. } = custody.state {
+                observed_root = root_result != i32::MIN;
+            }
+        }
+        legacy_completed |= matches!(
+            record.payload,
+            JournalPayload::Lifecycle(JournalLifecycle::RunCompleted { .. })
+        );
+    }
+    // FileJournal::open validates the run, generation, epoch, consecutive
+    // transitions and the prepared certificate before returning this state.
+    // A legacy record cannot override failed or unresolved managed custody.
+    match recovery.custody {
+        Some(custody) => {
+            recovery.clean
+                && observed_root
+                && matches!(custody.record.state, CustodyPhase::Complete { .. })
+        }
+        None => legacy_completed,
+    }
 }
 
 /// Refuse any change to the seeded workspace.
@@ -736,7 +754,7 @@ fn utilities(nfs: bool) {
             "{case}: no completion record"
         );
         eprintln!(
-            "PASS {} {case}: host untouched, lease released, RunCompleted, elapsed={:.3}s",
+            "PASS {} {case}: host untouched, lease released, journal complete, elapsed={:.3}s",
             if nfs { "nfs" } else { "local" },
             elapsed.as_secs_f64()
         );
