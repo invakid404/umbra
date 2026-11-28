@@ -142,6 +142,38 @@ impl WorkerCleanup {
             && self.forwarding.iter().all(|queue| queue.is_empty())
     }
 
+    /// Snapshot all remaining routes together after the sequential drain.
+    /// A notification ready at this boundary must be processed before return.
+    fn collection_routes_ready(&mut self) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut descriptors = Vec::new();
+        for (index, route) in self.routes.iter_mut().enumerate() {
+            if self.retired[index]
+                || (route.peer() == self.owner
+                    && self.receipt.is_some()
+                    && self.awaiting[index].is_none())
+            {
+                continue;
+            }
+            let channel = route.channel();
+            if !channel.at_frame_boundary() {
+                return Ok(true);
+            }
+            descriptors.push(libc::pollfd {
+                fd: channel.stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        // No waiting or new allocation of time: this is the completion boundary.
+        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 0) };
+        if ready < 0 {
+            self.tickets.fail();
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ready != 0)
+    }
+
     pub(super) fn belongs_to(&self, run: RunIdentity, local: Participant) -> bool {
         self.run == run && self.local == local
     }
@@ -796,7 +828,10 @@ impl ManagedCleanup for WorkerCleanup {
                 if let Some(inject) = self.before_collection_complete.take() {
                     inject();
                 }
-                if self.collection_complete() && !received_control {
+                if self.collection_complete()
+                    && !received_control
+                    && !self.collection_routes_ready().map_err(error)?
+                {
                     break;
                 }
                 if !received_control {
@@ -1283,9 +1318,11 @@ mod tests {
             peer.join().unwrap();
             result
         });
-        assert!(
-            result.is_err(),
-            "buffered failed Start must prevent false clean collection"
+        let failure =
+            result.expect_err("buffered failed Start must prevent false clean collection");
+        assert_eq!(
+            failure.to_string(),
+            error("managed cleanup retained a failure").to_string()
         );
         assert!(worker.tickets.failed(), "failed Start must be committed");
         assert!(worker.receipt.is_some());
