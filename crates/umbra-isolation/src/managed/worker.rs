@@ -749,10 +749,14 @@ impl ManagedCleanup for WorkerCleanup {
                             forwarding.push((peer, start));
                         }
                         Some(ControlMessage::Ack(ack)) => {
-                            let start = self.awaiting[index]
-                                .as_ref()
-                                .ok_or_else(|| error("unsolicited collection ACK"))?;
-                            ack.validate(start, peer).map_err(error)?;
+                            let Some(start) = self.awaiting[index].as_ref() else {
+                                self.tickets.fail();
+                                return Err(error("unsolicited collection ACK"));
+                            };
+                            if let Err(failure) = ack.validate(start, peer) {
+                                self.tickets.fail();
+                                return Err(error(failure));
+                            }
                             if !inventory.contains(&ack.committed.origin) {
                                 self.tickets.fail();
                                 return Err(error("collection ACK has unknown origin"));
