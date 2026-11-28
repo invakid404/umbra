@@ -877,7 +877,13 @@ pub fn run_worker(
     startup: umbra_isolation::managed::worker_startup::WorkerStartup,
 ) -> Result<()> {
     let mut completion = None;
-    let result = unix::run_inner(spec, run_id, Some(startup), &mut completion);
+    let mut startup = Some(startup);
+    let result = unix::run_inner(spec, run_id, &mut startup, &mut completion);
+    if let (Some(startup), Err(error)) = (startup.as_mut(), &result) {
+        if let Err(delivery) = startup.report_setup_failure(error.clone()) {
+            eprintln!("managed setup error delivery failed: {delivery}");
+        }
+    }
     if let Some(complete) = completion {
         complete(result.clone())?;
     }
@@ -941,7 +947,7 @@ mod unix {
             spec,
             RunId(Uuid::new_v4()),
             #[cfg(target_os = "macos")]
-            None,
+            &mut None,
             #[cfg(target_os = "macos")]
             &mut None,
         )
@@ -950,7 +956,7 @@ mod unix {
     pub(super) fn run_inner(
         mut spec: RunSpec,
         run_id: RunId,
-        #[cfg(target_os = "macos")] startup: Option<
+        #[cfg(target_os = "macos")] startup: &mut Option<
             umbra_isolation::managed::worker_startup::WorkerStartup,
         >,
         #[cfg(target_os = "macos")] completion: &mut Option<crate::managed_observer::Completion>,
@@ -1342,7 +1348,7 @@ mod unix {
         let namespace: crate::namespace_owner::NamespaceOwner = namespace.into();
         stage("namespace-prepared");
         #[cfg(target_os = "macos")]
-        let (namespace, platform_result) = if let Some(mut startup) = startup {
+        let (namespace, platform_result) = if let Some(mut startup) = startup.take() {
             let crate::namespace_owner::NamespaceOwner::Unmanaged(raw) = namespace else {
                 unreachable!("namespace has not been armed yet");
             };

@@ -300,6 +300,13 @@ impl RelayStartup {
         self.step(Self::progress_release)
     }
 
+    /// Take the original worker setup error for caller delivery before rollback.
+    pub fn take_setup_failure(&mut self) -> Option<umbra_core::UmbraError> {
+        self.arming
+            .as_mut()
+            .and_then(RelayArming::take_setup_failure)
+    }
+
     fn progress_release(&mut self) -> io::Result<Option<Go>> {
         if self.released {
             return Ok(self.authorization.clone());

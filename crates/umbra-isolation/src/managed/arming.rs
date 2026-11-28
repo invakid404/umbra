@@ -22,8 +22,15 @@ pub struct Request {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 enum Response {
-    PersistenceStarted { run: RunIdentity, deadline: u64 },
+    PersistenceStarted {
+        run: RunIdentity,
+        deadline: u64,
+    },
     Authorized(Go),
+    SetupFailed {
+        run: RunIdentity,
+        error: umbra_core::UmbraError,
+    },
 }
 
 /// Relay side of the existing worker-relay startup exchange. Validates the
@@ -38,6 +45,7 @@ pub struct RelayArming {
     capacity: u64,
     failed: bool,
     authorization: Option<Go>,
+    setup_failure: Option<umbra_core::UmbraError>,
 }
 
 impl RelayArming {
@@ -113,6 +121,7 @@ impl RelayArming {
             sent: false,
             failed: false,
             authorization: None,
+            setup_failure: None,
         })
     }
 
@@ -150,6 +159,13 @@ impl RelayArming {
                     self.response_deadline = Some(deadline);
                     return Ok(None);
                 }
+                Response::SetupFailed { run, error } => {
+                    if run != self.request.run || self.response_deadline.is_some() {
+                        return Err(invalid("invalid pre-arm failure"));
+                    }
+                    self.setup_failure = Some(error);
+                    return Err(invalid("worker setup failed"));
+                }
                 Response::Authorized(go) => go,
             };
             go.validate(self.request.run, self.local, self.capacity)?;
@@ -163,6 +179,11 @@ impl RelayArming {
             self.failed = true;
         }
         result
+    }
+
+    /// Take the structured pre-arm error after a terminal response.
+    pub fn take_setup_failure(&mut self) -> Option<umbra_core::UmbraError> {
+        self.setup_failure.take()
     }
 
     /// Return the assigned endpoint for runtime notification or rollback.
@@ -188,6 +209,22 @@ pub struct WorkerArming {
 }
 
 impl WorkerArming {
+    /// Report preparation failure once without adding a wait or allocation.
+    pub fn report_setup_failure(&mut self, error: umbra_core::UmbraError) -> io::Result<()> {
+        if self.attempted || self.persistence_deadline.is_some() {
+            return Err(invalid("setup failure after persistence started"));
+        }
+        self.failed = true;
+        self.channel.queue(&Response::SetupFailed {
+            run: self.run,
+            error,
+        })?;
+        if !self.channel.flush(self.readiness_deadline)? {
+            return Err(invalid("setup failure report would block"));
+        }
+        Ok(())
+    }
+
     pub(super) fn persistence_deadline(&self) -> io::Result<u64> {
         self.persistence_deadline
             .ok_or_else(|| invalid("persistence not started"))

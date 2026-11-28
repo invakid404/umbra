@@ -26,6 +26,12 @@ pub struct WorkerStartup {
 }
 
 impl WorkerStartup {
+    /// Publish a pre-arm setup error on the existing relay route without waiting.
+    pub fn report_setup_failure(&mut self, error: umbra_core::UmbraError) -> io::Result<()> {
+        self.ensure_arming()?;
+        self.arming.as_mut().unwrap().report_setup_failure(error)
+    }
+
     /// Prepare the worker's independent owner control before any run resources.
     pub fn new(mut entry: Entry) -> io::Result<Self> {
         if entry.role != Role::Worker {

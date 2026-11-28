@@ -294,8 +294,36 @@ pub fn relay(
         None
     };
     startup.arm_storage(run_id, caller)?;
-    while startup.poll_release()?.is_none() {
-        startup.wait_for_release()?;
+    loop {
+        match startup.poll_release() {
+            Ok(Some(_)) => break,
+            Ok(None) => startup.wait_for_release()?,
+            Err(error) => {
+                if let Some(failure) = startup.take_setup_failure() {
+                    if external_caller {
+                        let delivery = (|| -> io::Result<()> {
+                            let mut parent = startup.entry.take_exchange()?;
+                            parent.queue(&crate::managed_observer::Request {
+                                run_id,
+                                sequence: 1,
+                                event: crate::managed_observer::Event::RunResult(Err(
+                                    failure.clone()
+                                )),
+                            })?;
+                            if !parent.flush(startup.entry.readiness_deadline)? {
+                                return Err(io::Error::other("setup error report would block"));
+                            }
+                            Ok(())
+                        })();
+                        if let Err(delivery) = delivery {
+                            eprintln!("managed setup error delivery failed: {delivery}");
+                        }
+                    }
+                    return Err(io::Error::other(failure));
+                }
+                return Err(error);
+            }
+        }
     }
     let child = startup
         .guard
