@@ -218,6 +218,7 @@ pub fn spawn_tree(
         go_queued: None,
         capacity: launch.capacity,
         readiness_deadline,
+        rollback_cutoff: None,
     })
 }
 
@@ -544,6 +545,7 @@ pub struct PendingRole {
     go_queued: Option<super::startup::Go>,
     capacity: u64,
     readiness_deadline: u64,
+    rollback_cutoff: Option<u64>,
 }
 impl PendingRole {
     #[cfg(all(test, feature = "test-managed-construction-failure"))]
@@ -565,6 +567,7 @@ impl PendingRole {
             go_queued: None,
             capacity: 64,
             readiness_deadline,
+            rollback_cutoff: None,
         }
     }
     pub(super) fn role(&self) -> Role {
@@ -595,11 +598,33 @@ impl PendingRole {
         }
         self.bootstrap.flush(self.readiness_deadline)
     }
+    /// Pin the existing interval once after readiness, before any GO is queued.
+    pub(super) fn preparation_rollback_cutoff(&mut self, now: u64) -> io::Result<u64> {
+        if self.go_queued.is_some() || !self.ready {
+            return Err(invalid("rollback outside prepared pre-GO phase"));
+        }
+        let original = self
+            .readiness_deadline
+            .checked_add(9_000_000_000)
+            .ok_or_else(|| invalid("rollback clock overflow"))?;
+        if let Some(cutoff) = self.rollback_cutoff {
+            return Ok(cutoff);
+        }
+        let cutoff = if now >= original {
+            now.checked_add(9_000_000_000)
+                .ok_or_else(|| invalid("rollback clock overflow"))?
+        } else {
+            original
+        };
+        self.rollback_cutoff = Some(cutoff);
+        Ok(cutoff)
+    }
+
     pub(super) fn permits_rollback(&self, deadline: u64) -> bool {
         self.go_queued.is_none()
             && self
-                .readiness_deadline
-                .checked_add(9_000_000_000)
+                .rollback_cutoff
+                .or_else(|| self.readiness_deadline.checked_add(9_000_000_000))
                 .is_some_and(|maximum| deadline <= maximum)
     }
 

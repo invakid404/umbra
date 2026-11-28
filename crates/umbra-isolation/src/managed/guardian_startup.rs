@@ -55,7 +55,15 @@ impl GuardianStartup {
             .readiness_deadline
             .checked_add(9_000_000_000)
             .ok_or_else(|| invalid("rollback clock overflow"))?;
-        super::rollback::Rollback::retain(&mut self.children, &mut self.rollback, deadline)?;
+        if self.phase >= 2 {
+            super::rollback::Rollback::retain_prepared(
+                &mut self.children,
+                &mut self.rollback,
+                deadline,
+            )?;
+        } else {
+            super::rollback::Rollback::retain(&mut self.children, &mut self.rollback, deadline)?;
+        }
         self.entry.close_before_go()?;
         self.guard.take();
         self.bootstrap.take();

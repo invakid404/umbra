@@ -35,6 +35,29 @@ impl Rollback {
         }
     }
 
+    /// Prepared children share one failure observation; retries reuse each
+    /// retained cutoff and an existing rollback slot is never reallocated.
+    pub(super) fn retain_prepared(
+        children: &mut Vec<PendingRole>,
+        slot: &mut Option<Self>,
+        original: u64,
+    ) -> io::Result<()> {
+        if slot.is_some() {
+            return Ok(());
+        }
+        let now = boot_nanos()?;
+        let mut cutoff = None;
+        for child in children.iter_mut() {
+            let child_cutoff = child.preparation_rollback_cutoff(now)?;
+            cutoff = Some(cutoff.map_or(child_cutoff, |old: u64| old.min(child_cutoff)));
+        }
+        Self::retain(children, slot, cutoff.unwrap_or(original))
+    }
+
+    pub(super) fn deadline(&self) -> u64 {
+        self.deadline
+    }
+
     /// Close all bootstrap channels together, sharing the supplied original
     /// cutoff. A GO already queued makes pre-GO rollback invalid.
     pub fn begin(

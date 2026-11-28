@@ -52,12 +52,7 @@ impl RelayStartup {
                 self.wait_for_rollback()?;
             }
             return Ok(super::guard::Outcome {
-                completion_deadline: Some(
-                    self.entry
-                        .readiness_deadline
-                        .checked_add(9_000_000_000)
-                        .ok_or_else(|| invalid("rollback clock overflow"))?,
-                ),
+                completion_deadline: Some(self.rollback.as_ref().unwrap().deadline()),
                 worker_status: None,
                 primary: None,
                 events: vec![super::guard::Event::Failed(
@@ -85,7 +80,15 @@ impl RelayStartup {
             .readiness_deadline
             .checked_add(9_000_000_000)
             .ok_or_else(|| invalid("rollback clock overflow"))?;
-        super::rollback::Rollback::retain(&mut self.children, &mut self.rollback, deadline)?;
+        if self.ready {
+            super::rollback::Rollback::retain_prepared(
+                &mut self.children,
+                &mut self.rollback,
+                deadline,
+            )?;
+        } else {
+            super::rollback::Rollback::retain(&mut self.children, &mut self.rollback, deadline)?;
+        }
         self.entry.close_before_go()?;
         self.guard.take();
         self.bootstrap.take();
