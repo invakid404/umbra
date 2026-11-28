@@ -311,6 +311,72 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use umbra_core::managed::{CleanupPath, Role, RunIdentity, Ticket};
 
+    #[cfg(feature = "test-clock")]
+    #[test]
+    fn acknowledged_route_keeps_success_when_clock_crosses_receive_cutoff() {
+        use std::{cell::Cell, rc::Rc};
+        let _clock = super::super::test_clock::install(|| Ok(100));
+        let run: RunIdentity = serde_json::from_str(
+            r#"{"nonce":"00000000-0000-0000-0000-000000000001","generation":1}"#,
+        )
+        .unwrap();
+        let local = Participant {
+            role: Role::Worker,
+            pid: 42,
+            birth: (1, 0),
+        };
+        let peer = Participant {
+            role: Role::CleanupOwner,
+            pid: 43,
+            birth: (1, 0),
+        };
+        let start = Start {
+            run,
+            origin: local,
+            ticket: Ticket::new(100, CleanupPath::Trusted, 1).unwrap(),
+        };
+        let cutoff = start.ticket.started + ACK_NANOS;
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut tickets = TicketState::new(run, 1).unwrap();
+        let mut remote = TicketState::new(run, 1).unwrap();
+        let mut publication = Publication::begin(
+            start.clone(),
+            local,
+            local,
+            &mut tickets,
+            vec![Route::new(peer, Channel::new(left).unwrap()).unwrap()],
+        )
+        .unwrap();
+        let mut channel = Channel::new(right).unwrap();
+        assert!(!publication.progress(&mut tickets).unwrap());
+        assert!(matches!(
+            channel.receive::<ControlMessage>(cutoff).unwrap(),
+            Some(ControlMessage::Start(found)) if found == start
+        ));
+        let ack = remote.accept(start, local, peer).unwrap();
+        channel.queue(&ControlMessage::Ack(ack)).unwrap();
+        assert!(channel.flush(cutoff).unwrap());
+        assert!(publication.progress(&mut tickets).unwrap());
+        assert!(!tickets.failed());
+
+        // The controller may advance after observing a completed publication
+        // while progress is between its expiry check and the channel read.
+        let samples = Rc::new(Cell::new(0));
+        let observed = samples.clone();
+        let _crossing = super::super::test_clock::install(move || {
+            let prior = observed.get();
+            observed.set(prior + 1);
+            Ok(if prior == 0 { cutoff - 1 } else { cutoff })
+        });
+        assert!(publication.progress(&mut tickets).unwrap());
+        assert!(samples.get() >= 2, "exercise both clock samples");
+        assert!(
+            !tickets.failed(),
+            "completed publication failed at cutoff: {:?}",
+            publication.failures()
+        );
+    }
+
     #[test]
     fn acknowledged_route_still_acknowledges_concurrent_start() {
         let run: RunIdentity = serde_json::from_str(
