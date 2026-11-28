@@ -235,9 +235,9 @@ pub struct Owner {
     cancellation_requested: bool,
     collected: Option<ExitStatus>,
     exit_observed: bool,
-    #[cfg(all(test, feature = "test-exit-before-wait"))]
+    #[cfg(feature = "test-exit-before-wait")]
     defer_exit_wait: bool,
-    #[cfg(all(test, feature = "test-exit-before-wait"))]
+    #[cfg(feature = "test-exit-before-wait")]
     test_exit_observed: bool,
     failures: Vec<String>,
     watch: Option<super::process::ProcessWatch>,
@@ -319,7 +319,7 @@ impl Owner {
         let reason = match observed {
             Ok(None) => return Ok(()),
             Ok(Some(peer)) if peer.pid == self.provider.id() && self.tickets.ticket().is_some() => {
-                #[cfg(all(test, feature = "test-exit-before-wait"))]
+                #[cfg(feature = "test-exit-before-wait")]
                 {
                     self.test_exit_observed = true;
                 }
@@ -558,9 +558,9 @@ impl Owner {
                 cancellation_requested: false,
                 collected: None,
                 exit_observed: false,
-                #[cfg(all(test, feature = "test-exit-before-wait"))]
-                defer_exit_wait: false,
-                #[cfg(all(test, feature = "test-exit-before-wait"))]
+                #[cfg(feature = "test-exit-before-wait")]
+                defer_exit_wait: std::env::var_os("UMBRA_TEST_PROVIDER_EXIT_BEFORE_WAIT").is_some(),
+                #[cfg(feature = "test-exit-before-wait")]
                 test_exit_observed: false,
                 failures: Vec::new(),
                 watch: None,
@@ -713,9 +713,12 @@ impl Owner {
                 self.transport_closed = true;
             }
         }
-        #[cfg(all(test, feature = "test-exit-before-wait"))]
+        #[cfg(feature = "test-exit-before-wait")]
         if self.defer_exit_wait && self.test_exit_observed {
             self.defer_exit_wait = false;
+            if let Some(path) = std::env::var_os("UMBRA_TEST_PROVIDER_EXIT_BEFORE_WAIT") {
+                std::fs::write(path, b"exit-before-parent-wait\n")?;
+            }
             return Ok(None);
         }
         if self.collected.is_none() {

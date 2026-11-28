@@ -488,6 +488,10 @@ impl Run {
                 "UMBRA_TEST_WORKER_EXIT_BEFORE_WAIT",
                 dir.join("worker-exit-before-wait"),
             );
+            command.env(
+                "UMBRA_TEST_PROVIDER_EXIT_BEFORE_WAIT",
+                dir.join("provider-exit-before-wait"),
+            );
         }
         if observe {
             std::fs::create_dir(dir.join("signals")).unwrap();
@@ -1396,9 +1400,14 @@ fn own_session_stopped_provider(case: &str, forced: bool) {
     std::thread::sleep(Duration::from_millis(100));
     signal(tree.supervisor, "KILL");
     let marker = run.dir.join("worker-exit-before-wait");
+    let provider_marker = run.dir.join("provider-exit-before-wait");
     let o = run.finish(Duration::from_secs(30));
     if forced {
         assert_eq!(std::fs::read(marker).unwrap(), b"exit-before-parent-wait\n");
+        assert_eq!(
+            std::fs::read(provider_marker).unwrap(),
+            b"exit-before-parent-wait\n"
+        );
     }
     assert!(
         o.term_signal() == Some(SIGKILL) && o.survivors.is_empty(),
