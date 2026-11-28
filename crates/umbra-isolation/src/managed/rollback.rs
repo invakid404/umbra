@@ -10,6 +10,8 @@ pub struct Rollback {
     deadline: u64,
     roles: Vec<umbra_core::managed::Role>,
     watch: Option<super::process::ProcessWatch>,
+    #[cfg(test)]
+    fail_watch_allocation: bool,
 }
 
 impl Rollback {
@@ -74,6 +76,8 @@ impl Rollback {
             statuses: vec![None; children.len()],
             roles: children.iter().map(PendingRole::role).collect(),
             watch: None,
+            #[cfg(test)]
+            fail_watch_allocation: false,
             children: children.into_iter().map(PendingRole::into_child).collect(),
             deadline,
         })
@@ -111,6 +115,10 @@ impl Rollback {
             return Ok(());
         }
         if self.watch.is_none() {
+            #[cfg(test)]
+            if self.fail_watch_allocation {
+                return Err(io::Error::from_raw_os_error(libc::EMFILE));
+            }
             self.watch = Some(super::process::ProcessWatch::new()?);
         }
         let watch = self.watch.as_mut().unwrap();
@@ -174,6 +182,41 @@ mod tests {
     use umbra_core::managed::Role;
 
     #[test]
+    fn watch_allocation_failure_retains_parent_collection() {
+        let child = SpawnedChild::spawn(
+            std::path::Path::new("/bin/sleep"),
+            &["sleep".into(), "0.05".into()],
+            &[],
+            false,
+            &[],
+        )
+        .unwrap();
+        let deadline = boot_nanos().unwrap() + 1_000_000_000;
+        let mut rollback = Rollback {
+            children: vec![child],
+            statuses: vec![None],
+            deadline,
+            roles: vec![Role::Guardian],
+            watch: None,
+            fail_watch_allocation: true,
+        };
+        let failure = rollback.wait_for_activity().unwrap_err();
+        let collected_at_return = rollback.statuses()[0];
+        // Collect the real child even when the regression fails.
+        while collected_at_return.is_none() && rollback.children[0].collect().unwrap().is_none() {
+            assert!(boot_nanos().unwrap() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(failure.raw_os_error(), Some(libc::EMFILE));
+        assert_eq!(rollback.deadline(), deadline);
+        assert_eq!(
+            collected_at_return,
+            Some(0),
+            "watch failure returned before parent collection"
+        );
+    }
+
+    #[test]
     fn exit_wait_preserves_cutoff_and_actual_child_custody() {
         let child = SpawnedChild::spawn(
             std::path::Path::new("/bin/sleep"),
@@ -191,6 +234,8 @@ mod tests {
             deadline,
             roles: vec![Role::Worker],
             watch: None,
+            #[cfg(test)]
+            fail_watch_allocation: false,
         };
         let waited = rollback.wait_for_activity();
         let finished = boot_nanos().unwrap();
