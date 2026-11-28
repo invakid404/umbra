@@ -319,6 +319,10 @@ impl RelayStartup {
                 .take()
                 .map(RelayArming::into_channel)
                 .or_else(|| self.failed_route.take());
+            #[cfg(feature = "test-managed-construction-failure")]
+            if std::env::var("UMBRA_TEST_CONSTRUCTION_FAILURE").as_deref() == Ok("relay") {
+                return Err(invalid("test hook: relay guard construction failed"));
+            }
             self.guard = Some(Guard::from_entry_restoring(
                 &mut self.entry,
                 watch,

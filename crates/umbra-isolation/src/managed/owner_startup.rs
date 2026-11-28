@@ -1,4 +1,61 @@
 //! Cleanup-owner startup retaining process custody on every failed step.
+#[cfg(all(test, feature = "test-managed-construction-failure"))]
+mod construction_tests {
+    use super::*;
+    use std::{os::unix::net::UnixStream, process::Command};
+
+    #[test]
+    fn adopted_provider_is_collected_during_failed_startup() {
+        let launch = serde_json::from_str(
+            r#"{"version":1,"run":{"nonce":"00000000-0000-4000-8000-000000000001","generation":1},"capacity":64,"dispatch":"admission","payload":[]}"#,
+        ).unwrap();
+        let deadline = super::super::boot_nanos().unwrap() + 2_000_000_000;
+        let entry = Entry::root_relay(launch, deadline).unwrap();
+        let mut startup = OwnerStartup::new(entry);
+        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let (cancellation, _peer) = UnixStream::pair().unwrap();
+        let participant =
+            super::super::process::identity(std::process::id(), Role::CleanupOwner).unwrap();
+        startup.owner = Some(
+            super::super::owner::Owner::new(
+                participant,
+                startup.entry.launch.run,
+                64,
+                child,
+                cancellation,
+                vec![],
+            )
+            .map_err(|failure| failure.0)
+            .unwrap(),
+        );
+        startup.phase = 5;
+        // Model the retained state at the construction hook. No service has polled
+        // admission, so no program acquisition can have been granted.
+        let result = (|| {
+            while !startup.rollback()? {
+                startup.wait_for_rollback()?;
+            }
+            Ok::<_, io::Error>(())
+        })();
+        let retained_failure = startup.failed;
+        // Keep the failing-first reading safe: collect our fixture even when
+        // production rollback refuses it, then assert on the earlier result.
+        if let Some(owner) = startup.owner.take() {
+            startup.launch.child = Some(owner.into_child());
+        }
+        if let Some(child) = startup.launch.child.as_mut() {
+            if child.try_wait().unwrap().is_none() {
+                child.kill().unwrap();
+                child.wait().unwrap();
+            }
+        }
+        result.expect("the real owner must collect its adopted provider");
+        assert!(
+            retained_failure,
+            "collection must not turn failed startup into success"
+        );
+    }
+}
 use super::{
     bootstrap::Bootstrap,
     executable::Entry,
@@ -201,6 +258,10 @@ impl OwnerStartup {
                 self.launch.child = Some(child);
                 return Err(error);
             }
+        }
+        #[cfg(feature = "test-managed-construction-failure")]
+        if std::env::var("UMBRA_TEST_CONSTRUCTION_FAILURE").as_deref() == Ok("owner") {
+            return Err(invalid("test hook: owner runtime construction failed"));
         }
         let owner = self.owner.as_mut().unwrap();
         owner.install_admission(admission)?;

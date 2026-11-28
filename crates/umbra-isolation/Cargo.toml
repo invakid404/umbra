@@ -16,6 +16,8 @@ publish = false
 test-managed-session = []
 # Test harnesses can scope one shared boot clock without changing normal builds.
 test-clock = []
+# Qualification-only failure after startup resources have been adopted.
+test-managed-construction-failure = []
 # Hosted descriptor inventory fixture; no normal executable probe.
 managed-endpoint-probe = []
 # Observe validated cancellation tickets in native qualification only.
