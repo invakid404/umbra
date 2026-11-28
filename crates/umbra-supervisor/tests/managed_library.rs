@@ -449,6 +449,21 @@ fn main() {
         }
         assert!(!events.borrow().contains(&"finished"));
     }
+    // Custody follows confirmed collection, independently of the command result.
+    // Every accepted mode is listed so a new mode must choose its own oracle.
+    let complete_custody = match mode.as_str() {
+        "success" | "slow_preparation" | "finish_reply_loss" => true,
+        "missing" => true, // Logical failure after independently confirmed closure.
+        "prepared_error" | "prepared_panic" => false,
+        "provider_death" | "owner_death" => false,
+        "r2_failed_closure_reopen" | "r2_native_preaccepted_work_cancel" => false,
+        "armed_reply_loss" | "r2_direct_drop_failed_result" => false,
+        // These refuse preparation/startup; no Complete custody is authorized.
+        "owner_construction" | "relay_construction" | "missing_storage" => false,
+        "failed_preparation" | "startup_abort" | "missing_provider" => false,
+        "readiness_timeout" | "malformed_offer" => false,
+        unknown => panic!("missing custody expectation for mode {unknown}"),
+    };
     if mode == "r2_failed_closure_reopen" {
         r2_failed_closure_reopen(
             &if routed_custody.is_some() {
@@ -462,7 +477,7 @@ fn main() {
             routed_custody.is_some(),
         );
     } else if let Some(run_id) = observed_run.get() {
-        inspect_custody(&store, run_id, expects_success, false);
+        inspect_custody(&store, run_id, complete_custody, false);
     }
     drop(run);
     umbra_core::cost_snapshot!("library-after-return", None, &[]);
