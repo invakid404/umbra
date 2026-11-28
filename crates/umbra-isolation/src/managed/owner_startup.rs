@@ -6,6 +6,20 @@ mod construction_tests {
 
     #[test]
     fn adopted_provider_is_collected_during_failed_startup() {
+        rollback_collection(0);
+    }
+
+    #[test]
+    fn watch_allocation_failure_still_collects_provider() {
+        rollback_collection(1);
+    }
+
+    #[test]
+    fn watch_install_failure_still_collects_provider() {
+        rollback_collection(2);
+    }
+
+    fn rollback_collection(watch_failure: u8) {
         let launch = serde_json::from_str(
             r#"{"version":1,"run":{"nonce":"00000000-0000-4000-8000-000000000001","generation":1},"capacity":64,"dispatch":"admission","payload":[]}"#,
         ).unwrap();
@@ -31,6 +45,7 @@ mod construction_tests {
             .unwrap(),
         );
         startup.phase = 5;
+        startup.rollback_watch_failure = watch_failure;
         startup.rollback_deadline = Some(deadline);
         // Model the retained state at the construction hook. No service has polled
         // admission, so no program acquisition can have been granted.
@@ -65,7 +80,11 @@ mod construction_tests {
                 child.wait().unwrap();
             }
         }
-        result.expect("the real owner must collect its adopted provider");
+        if watch_failure == 0 {
+            result.expect("the real owner must collect its adopted provider");
+        } else {
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EMFILE));
+        }
         assert!(collected, "production must perform the actual parent wait");
         assert_eq!(startup.rollback_deadline, Some(deadline));
         assert!(
@@ -104,6 +123,8 @@ pub struct OwnerStartup {
     failed: bool,
     rollback_deadline: Option<u64>,
     rollback_watch: Option<super::process::ProcessWatch>,
+    #[cfg(all(test, feature = "test-managed-construction-failure"))]
+    rollback_watch_failure: u8,
 }
 
 impl OwnerStartup {
@@ -179,17 +200,30 @@ impl OwnerStartup {
         if self.rollback_watch.is_none() {
             // Install before asking the provider to exit: a process completing
             // exit may no longer expose identity while its wait is not ready yet.
-            let mut watch = super::process::ProcessWatch::new()?;
-            let installed = super::process::identity(child.id(), Role::Provider)
-                .and_then(|participant| watch.install(participant));
-            if let Err(error) = installed {
-                return if child.try_wait()?.is_some() {
-                    Ok(true)
-                } else {
-                    Err(error)
-                };
+            let watched = (|| {
+                #[cfg(all(test, feature = "test-managed-construction-failure"))]
+                if self.rollback_watch_failure == 1 {
+                    return Err(io::Error::from_raw_os_error(libc::EMFILE));
+                }
+                let mut watch = super::process::ProcessWatch::new()?;
+                #[cfg(all(test, feature = "test-managed-construction-failure"))]
+                if self.rollback_watch_failure == 2 {
+                    return Err(io::Error::from_raw_os_error(libc::EMFILE));
+                }
+                let participant = super::process::identity(child.id(), Role::Provider)?;
+                watch.install(participant)?;
+                Ok(watch)
+            })();
+            match watched {
+                Ok(watch) => self.rollback_watch = Some(watch),
+                Err(error) => {
+                    return if child.try_wait()?.is_some() {
+                        Ok(true)
+                    } else {
+                        Err(error)
+                    };
+                }
             }
-            self.rollback_watch = Some(watch);
         }
         if let Err(error) = child.kill() {
             // Exit can race the bounded stop. Only the real parent wait, not
@@ -217,6 +251,8 @@ impl OwnerStartup {
             failed: false,
             rollback_deadline: None,
             rollback_watch: None,
+            #[cfg(all(test, feature = "test-managed-construction-failure"))]
+            rollback_watch_failure: 0,
         }
     }
 
