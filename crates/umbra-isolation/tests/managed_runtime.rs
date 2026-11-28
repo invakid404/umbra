@@ -37,6 +37,12 @@ fn cleanup_order_emergency_stays_unconfirmed() {
     runtime_tree::run_ordered(true).unwrap();
 }
 
+#[cfg(feature = "test-exit-before-wait")]
+#[test]
+fn shutdown_error_exit_before_parent_wait() {
+    runtime_tree::run_ordered_trigger(runtime_tree::Case::ShutdownError).unwrap();
+}
+
 #[test]
 fn r2_da_order_across_roles() {
     cleanup_order_waits_for_held_barriers();

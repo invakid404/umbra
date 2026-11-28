@@ -849,6 +849,13 @@ pub fn child() -> io::Result<()> {
         }
     }
     let mut guard = Guard::new(local, config.run, 1)?;
+    #[cfg(feature = "test-exit-before-wait")]
+    if config.case == Case::ShutdownError && role == Role::Relay {
+        // Create the evidence entry before the directory watch is installed.
+        // Updating its bytes later must not supply a directory-entry wake.
+        std::fs::write(root.join("relay-exit-before-wait"), b"")?;
+        guard.test_defer_exit_wait(root.join("relay-exit-before-wait"));
+    }
     guard.install_inventory(&inventory, true)?;
     for route in routes {
         guard.route(route.peer(), route);
@@ -1370,6 +1377,13 @@ fn run_inner(case: Case, order: bool) -> io::Result<()> {
         eprintln!(
             "{case:?} actual parent receipt: {}",
             serde_json::to_string(&receipt)?
+        );
+    }
+    #[cfg(feature = "test-exit-before-wait")]
+    if case == Case::ShutdownError {
+        assert_eq!(
+            std::fs::read(root.join("relay-exit-before-wait"))?,
+            b"exit-before-parent-wait\n"
         );
     }
     if order {

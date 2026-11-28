@@ -84,11 +84,20 @@ pub struct Guard {
     stage_events: std::collections::BTreeSet<u64>,
     exchanges: std::collections::BTreeMap<umbra_core::managed::Role, super::Channel>,
     pending_failure: Option<Start>,
-    #[cfg(all(test, feature = "test-exit-before-wait"))]
+    #[cfg(feature = "test-exit-before-wait")]
     defer_exit_wait: bool,
+    #[cfg(feature = "test-exit-before-wait")]
+    exit_wait_evidence: Option<std::path::PathBuf>,
 }
 
 impl Guard {
+    /// Force one parent wait to be not ready after the exit notification.
+    #[cfg(feature = "test-exit-before-wait")]
+    pub fn test_defer_exit_wait(&mut self, evidence: std::path::PathBuf) {
+        self.defer_exit_wait = true;
+        self.exit_wait_evidence = Some(evidence);
+    }
+
     pub(super) fn watch_descriptor(&self) -> i32 {
         self.watch.descriptor()
     }
@@ -488,8 +497,10 @@ impl Guard {
             stage_events: std::collections::BTreeSet::new(),
             exchanges: std::collections::BTreeMap::new(),
             pending_failure: None,
-            #[cfg(all(test, feature = "test-exit-before-wait"))]
+            #[cfg(feature = "test-exit-before-wait")]
             defer_exit_wait: false,
+            #[cfg(feature = "test-exit-before-wait")]
+            exit_wait_evidence: None,
         })
     }
 
@@ -727,7 +738,7 @@ impl Guard {
             if owned.collected || owned.lost {
                 continue;
             }
-            #[cfg(all(test, feature = "test-exit-before-wait"))]
+            #[cfg(feature = "test-exit-before-wait")]
             if self.defer_exit_wait
                 && events
                     .iter()
@@ -736,6 +747,10 @@ impl Guard {
                 // Model NOTE_EXIT arriving before the parent's nonblocking wait
                 // can return a status. Keep the actual child handle untouched.
                 self.defer_exit_wait = false;
+                if let Some(path) = &self.exit_wait_evidence {
+                    std::fs::write(path, b"exit-before-parent-wait\n")
+                        .expect("record forced exit ordering");
+                }
                 continue;
             }
             match owned.child.collect() {
