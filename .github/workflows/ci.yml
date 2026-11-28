@@ -445,6 +445,98 @@ jobs:
           git diff --stat -- experiments/fixtures/umbra-fix-227-observer-providers/Cargo.lock
           cargo build --locked --manifest-path experiments/fixtures/umbra-fix-227-observer-providers/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
           cargo test -p umbra-supervisor --test observer_failure -- --nocapture --test-threads=1
+      - name: Qualify adopted provider construction failure
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::owner_startup::construction_tests::adopted_provider_is_collected_during_failed_startup -- --exact --nocapture --test-threads=1
+      - name: Qualify consumed relay preparation failure
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features test-managed-construction-failure --lib managed::relay_startup::construction_tests::consumed_preparation_collects_guardian_without_panicking -- --exact --nocapture --test-threads=1
+      - name: Qualify caller descriptor exclusion
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-isolation --features managed-endpoint-probe --test managed_runtime r2_caller_descriptors_stay_out_of_roles -- --exact --nocapture --test-threads=1
+      - name: Qualify deferred startup cost observation
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-core --features cost-witness --test cost_observation startup_observation_runs_only_after_readiness -- --exact --nocapture --test-threads=1
+      - name: Qualify admission owner ready exchange budget
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-cli --test cleanup_performance r10_admission_owner_ready_exchange_budget -- --exact --nocapture --test-threads=1
+      - name: Qualify registered library success
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- success 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library owner_construction
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features test-managed-construction-failure --test managed_library -- owner_construction 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library relay_construction
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features test-managed-construction-failure --test managed_library -- relay_construction 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library missing_storage
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- missing_storage 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library slow_preparation
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features test-slow-namespace-preparation --test managed_library -- slow_preparation 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library failed_preparation
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features test-failed-namespace-preparation --test managed_library -- failed_preparation 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library finish_reply_loss
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features probe-managed-finish-reply-loss --test managed_library -- finish_reply_loss 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library missing
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- missing 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library prepared_error
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- prepared_error 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library prepared_panic
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- prepared_panic 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library provider_death
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- provider_death 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library owner_death
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- owner_death 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library armed_reply_loss
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features probe-managed-arm-reply-loss --test managed_library -- armed_reply_loss 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library startup_abort
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- startup_abort 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library missing_provider
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- missing_provider 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library readiness_timeout
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --test managed_library -- readiness_timeout 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library malformed_offer
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features probe-managed-offer-generation --test managed_library -- malformed_offer 64 --exact --nocapture --test-threads=1
+      - name: Qualify registered library r2_direct_drop_failed_result
+        run: |
+          test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
+          cargo test -p umbra-supervisor --features probe-managed-owner-drop --test managed_library -- r2_direct_drop_failed_result 64 --exact --nocapture --test-threads=1
       - name: Cancel accepted native setup through the independent route
         run: |
           test "$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')" -ge 5242880
