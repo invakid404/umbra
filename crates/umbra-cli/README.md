@@ -190,6 +190,10 @@ status to the CLI, which mirrors it after collecting the guardian. Incomplete
 cleanup stays a command failure; the sweep is not a parent collection.
 The own-session paused-journal regression passes with the worker's signal
 preserved and no survivors. The unchanged SID-1 case still needs CI qualification.
+The `test-exit-before-wait` feature also forces worker and provider exit
+notifications before their parent waits become ready. Its own-session regression
+requires both hook records, the mirrored worker status and no survivors; the
+self-hosted native job builds the feature-enabled CLI before running it.
 SID-1 behavior requires its named CI qualification. See
 [umbra-isolation](../umbra-isolation/README.md).
 <!-- /memoria:section -->

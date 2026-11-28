@@ -60,6 +60,14 @@ Each wake retains the original deadline. A route that acknowledged Start still
 answers a concurrent Start while another route is pending; queued acknowledgments
 must finish writing before publication completes.
 
+An exit notification can arrive before a nonblocking parent wait returns a
+status. Guards and the cleanup owner retain that collection work after consuming
+the one-shot notification, yielding and polling again under the original stage
+and ticket cutoffs. Only the actual parent wait establishes collection.
+The `test-exit-before-wait` feature forces this ordering in unit tests and the
+hosted shutdown-error case; the CLI forwards it for the own-session
+paused-journal regression. These tests retain their original cleanup assertions.
+
 Compared with the old isolated CLI, this topology adds one process; compared
 with an old terminal CLI it adds three. An external library caller has four
 helper/worker processes. `managed::topology::Topology` creates seven CLI socketpairs
