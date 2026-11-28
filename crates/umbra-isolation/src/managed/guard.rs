@@ -83,6 +83,8 @@ pub struct Guard {
     stage_events: std::collections::BTreeSet<u64>,
     exchanges: std::collections::BTreeMap<umbra_core::managed::Role, super::Channel>,
     pending_failure: Option<Start>,
+    #[cfg(all(test, feature = "test-exit-before-wait"))]
+    defer_exit_wait: bool,
 }
 
 impl Guard {
@@ -484,6 +486,8 @@ impl Guard {
             stage_events: std::collections::BTreeSet::new(),
             exchanges: std::collections::BTreeMap::new(),
             pending_failure: None,
+            #[cfg(all(test, feature = "test-exit-before-wait"))]
+            defer_exit_wait: false,
         })
     }
 
@@ -711,6 +715,17 @@ impl Guard {
         }
         for owned in &mut self.children {
             if owned.collected || owned.lost {
+                continue;
+            }
+            #[cfg(all(test, feature = "test-exit-before-wait"))]
+            if self.defer_exit_wait
+                && events
+                    .iter()
+                    .any(|event| matches!(event, Event::Exited(peer) if *peer == owned.identity))
+            {
+                // Model NOTE_EXIT arriving before the parent's nonblocking wait
+                // can return a status. Keep the actual child handle untouched.
+                self.defer_exit_wait = false;
                 continue;
             }
             match owned.child.collect() {
@@ -951,6 +966,64 @@ fn exit_diagnostic(role: umbra_core::managed::Role, status: i32) -> String {
 mod policy_tests {
     use super::*;
     use umbra_core::managed::{CleanupPath, Role, Ticket};
+
+    #[cfg(feature = "test-exit-before-wait")]
+    #[test]
+    fn exit_notification_before_wait_keeps_collection_ready() {
+        use super::super::process::identity;
+        use std::time::{Duration, Instant};
+        let local = identity(std::process::id(), Role::Relay).unwrap();
+        let run = RunIdentity {
+            nonce: uuid::Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut guard = Guard::new(local, run, 1).unwrap();
+        let child = SpawnedChild::spawn(
+            std::path::Path::new("/bin/sleep"),
+            &["sleep".into(), "0.05".into()],
+            &[],
+            false,
+            &[],
+        )
+        .unwrap();
+        let peer = identity(child.pid(), Role::Guardian).unwrap();
+        assert!(guard.child(peer, child).is_ok());
+        guard.defer_exit_wait = true;
+        let bound = boot_nanos().unwrap() + 2_000_000_000;
+        // Wait for the real notification without consuming it; poll then forces
+        // the first parent wait to report not-ready, matching the kernel order.
+        super::super::readiness::wait_descriptors(
+            &mut [libc::pollfd {
+                fd: guard.watch.descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            }],
+            bound,
+        )
+        .unwrap();
+        let events = guard.poll();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::Exited(p) if *p == peer)));
+        assert!(!guard.children[0].collected);
+        let began = Instant::now();
+        let cutoff = boot_nanos().unwrap() + 1_000_000_000;
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        use std::os::fd::AsFd;
+        let waited = guard.wait_for_activity(Some((reader.as_fd(), false, cutoff)));
+        let elapsed = began.elapsed();
+        // Complete actual collection before asserting the scheduling result.
+        while !guard.children[0].collected {
+            guard.poll();
+            assert!(boot_nanos().unwrap() < bound, "fixture parent wait failed");
+            std::thread::yield_now();
+        }
+        waited.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "consumed exit lost the collection wake: {elapsed:?}"
+        );
+    }
 
     #[test]
     fn application_readiness_wakes_guard_without_start() {
