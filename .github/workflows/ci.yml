@@ -109,6 +109,9 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cargo test -p umbra-isolation --lib spawn::descriptors::tests:: -- --nocapture --test-threads=1
+          cargo test -p umbra-isolation --lib managed::rollback::tests::watch_allocation_failure_retains_parent_collection -- --exact --nocapture --test-threads=1
+          cargo test -p umbra-isolation --lib managed::worker::tests::unsolicited_collection_ack_remains_failed_on_retry -- --exact --nocapture --test-threads=1
+          cargo test -p umbra-isolation --lib managed::worker::tests::collection_drains_start_arriving_after_route_scan -- --exact --nocapture --test-threads=1
           cargo test -p umbra-isolation --test managed_runtime r2_ack_loss_preserves_owner_provider_custody -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime custody_normal_reaps_all -- --exact --nocapture
           cargo test -p umbra-isolation --test managed_runtime r2_da_order_across_roles -- --exact --nocapture

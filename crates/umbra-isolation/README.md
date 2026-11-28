@@ -52,8 +52,14 @@ collection remains a reported failure.
 
 Managed startup and cleanup wait on descriptor readiness and process-exit
 events. If a provider rollback watch cannot be allocated or installed, its real
-parent stops it and checks for collection at intervals of at most one millisecond
-under the original rollback cutoff; the watch error remains a failure.
+parent first checks for collection. If the provider remains uncollected, the
+parent requests its stop and polls with sleeps capped at one millisecond under
+the original rollback cutoff; scheduling may delay those polls. An already
+collected provider completes rollback; otherwise the watch error remains a
+failure. Pre-GO helper rollback also retains parent collection if watch allocation
+fails: bootstrap closure requests recursive rollback, and parent polling uses
+the retained cutoff without allocating another watch. Expiry retains unresolved
+custody, and successful collection still reports the allocation error.
 Admission cancellation wakes a pending exchange to observe a shortened
 cutoff. Observer traffic shares the guard wait with independent cleanup routes.
 Each wake retains the original deadline. A route that acknowledged Start still
@@ -66,7 +72,14 @@ the one-shot notification, yielding and polling again under the original stage
 and ticket cutoffs. Only the actual parent wait establishes collection.
 The `test-exit-before-wait` feature forces this ordering in unit tests and the
 hosted shutdown-error case; the CLI forwards it for the own-session
-paused-journal regression. These tests retain their original cleanup assertions.
+paused-journal regression. The hooks hold collection until the parent loop has
+consumed the exit notification, then defer one parent wait. These tests retain
+their original cleanup assertions.
+
+Worker collection retains unsolicited or invalid acknowledgement errors across
+retries. After draining routes sequentially, it checks their readiness together
+before returning, so a Start arriving on an already-scanned route is processed.
+Only a complete exchange with no retained failure exposes a clean receipt.
 
 Compared with the old isolated CLI, this topology adds one process; compared
 with an old terminal CLI it adds three. An external library caller has four
