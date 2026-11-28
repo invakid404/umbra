@@ -1128,6 +1128,124 @@ mod tests {
     }
 
     #[test]
+    fn collection_drains_failed_start_buffered_after_owner_receipt() {
+        // Both messages are buffered before collection; owner route is visited first.
+        let local = identity(std::process::id(), Role::Worker).unwrap();
+        let owner = Participant {
+            role: Role::CleanupOwner,
+            ..local
+        };
+        let guardian = Participant {
+            role: Role::Guardian,
+            ..local
+        };
+        let provider = Participant {
+            role: Role::Provider,
+            ..local
+        };
+        let run: RunIdentity = serde_json::from_str(
+            r#"{"nonce":"00000000-0000-0000-0000-000000000001","generation":1}"#,
+        )
+        .unwrap();
+        let (worker_owner, owner_socket) = UnixStream::pair().unwrap();
+        let (worker_guardian, guardian_socket) = UnixStream::pair().unwrap();
+        // Keep the scripted peers enrolled until collection returns; this case
+        // measures notification ordering rather than an additional peer loss.
+        let _peer_lifetime = (
+            owner_socket.try_clone().unwrap(),
+            guardian_socket.try_clone().unwrap(),
+        );
+        let mut worker = WorkerCleanup::new(
+            run,
+            local,
+            owner,
+            provider,
+            1,
+            vec![
+                Route::new(owner, Channel::new(worker_owner).unwrap()).unwrap(),
+                Route::new(guardian, Channel::new(worker_guardian).unwrap()).unwrap(),
+            ],
+        )
+        .unwrap();
+        let original = Start {
+            run,
+            origin: local,
+            ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Trusted, 1).unwrap(),
+        };
+        worker
+            .tickets
+            .accept(original.clone(), local, local)
+            .unwrap();
+        let deadline = original.ticket.started + umbra_core::managed::ACK_NANOS;
+        let notification = Start {
+            run,
+            origin: guardian,
+            ticket: Ticket::new(boot_nanos().unwrap(), CleanupPath::Failed, 1).unwrap(),
+        };
+        let mut owner_channel = Channel::new(owner_socket).unwrap();
+        let mut guardian_channel = Channel::new(guardian_socket).unwrap();
+        owner_channel
+            .queue(&ControlMessage::Collected(ProviderReceipt {
+                run,
+                owner,
+                provider,
+                status: 0,
+                failed: false,
+            }))
+            .unwrap();
+        guardian_channel
+            .queue(&ControlMessage::Start(notification.clone()))
+            .unwrap();
+        assert!(owner_channel.flush(deadline).unwrap());
+        assert!(guardian_channel.flush(deadline).unwrap());
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let result = std::thread::scope(|scope| {
+            let peer = scope.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    assert!(
+                        boot_nanos().unwrap() < deadline,
+                        "collection forwarding exceeded existing ACK cutoff"
+                    );
+                    if let Some(message) =
+                        owner_channel.receive::<ControlMessage>(deadline).unwrap()
+                    {
+                        match message {
+                            ControlMessage::Collect { run: found } => assert_eq!(found, run),
+                            ControlMessage::Start(forwarded) => {
+                                assert_eq!(forwarded, notification);
+                                let mut tickets = TicketState::new(run, 1).unwrap();
+                                tickets.accept(original.clone(), local, owner).unwrap();
+                                let ack = tickets.accept(forwarded, guardian, owner).unwrap();
+                                owner_channel.queue(&ControlMessage::Ack(ack)).unwrap();
+                                while !owner_channel.flush(deadline).unwrap() {
+                                    std::thread::yield_now();
+                                }
+                            }
+                            _ => panic!("unexpected worker message"),
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            let result = worker.collect_provider();
+            done.store(true, std::sync::atomic::Ordering::Release);
+            peer.join().unwrap();
+            result
+        });
+        assert!(
+            result.is_err(),
+            "buffered failed Start must prevent false clean collection"
+        );
+        assert!(worker.tickets.failed(), "failed Start must be committed");
+        assert!(worker.receipt.is_some());
+        assert_eq!(worker.tickets.ticket(), Some(original.ticket));
+        assert!(
+            matches!(guardian_channel.receive::<ControlMessage>(deadline).unwrap(),
+            Some(ControlMessage::Ack(ack)) if ack.start == notification)
+        );
+    }
+
+    #[test]
     fn collection_commits_independent_start_before_ack_and_retains_failure() {
         // Live control sockets with a scripted owner receipt: the owner withholds
         // its receipt until the guardian has received the worker's ACK.
