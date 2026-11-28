@@ -109,20 +109,22 @@ impl Rollback {
         Ok(false)
     }
 
+    fn allocate_watch(&mut self) -> io::Result<super::process::ProcessWatch> {
+        #[cfg(test)]
+        if let Some(release) = self.watch_failure_release.take() {
+            drop(release);
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        super::process::ProcessWatch::new()
+    }
+
     /// Watch actual children without replacing their required parent waits.
     pub fn wait_for_activity(&mut self) -> io::Result<()> {
         if self.poll()? {
             return Ok(());
         }
         if self.watch.is_none() {
-            let allocated = (|| {
-                #[cfg(test)]
-                if let Some(release) = self.watch_failure_release.take() {
-                    drop(release);
-                    return Err(io::Error::from_raw_os_error(libc::EMFILE));
-                }
-                super::process::ProcessWatch::new()
-            })();
+            let allocated = self.allocate_watch();
             match allocated {
                 Ok(watch) => self.watch = Some(watch),
                 Err(failure) => {
