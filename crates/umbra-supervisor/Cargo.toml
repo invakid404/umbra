@@ -9,6 +9,7 @@ publish = false
 [features]
 test-slow-namespace-preparation = []
 test-failed-namespace-preparation = []
+test-managed-construction-failure = ["umbra-isolation/test-managed-construction-failure"]
 # D5's shared base/head fixture selects registered dispatch only on the head.
 cost-library-managed = []
 # Qualification-only: lose the response after authoritative Armed persistence.

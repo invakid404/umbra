@@ -20,7 +20,10 @@ fn main() {
         run::{CommandLaunch, RunLaunch, RunObserver, RunOutcome, RunPersistence, RunSpec},
     };
     if let Some(mut role) = RegisteredRole::enter().unwrap() {
-        if let Err(error) = execute(&mut role) {
+        let result = execute(&mut role);
+        #[cfg(feature = "test-managed-construction-failure")]
+        check_construction_collection(&result);
+        if let Err(error) = result {
             eprintln!("managed library helper: {error}");
             std::process::exit(1);
         }
@@ -33,6 +36,8 @@ fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "success".into());
     assert!([
         "success",
+        "owner_construction",
+        "relay_construction",
         "slow_preparation",
         "failed_preparation",
         "finish_reply_loss",
@@ -92,6 +97,18 @@ fn main() {
         .map(|value| value.parse().unwrap())
         .unwrap_or(64);
     let temp = tempfile::tempdir().unwrap();
+    let construction_record = temp.path().join("construction");
+    if ["owner_construction", "relay_construction"].contains(&mode.as_str()) {
+        assert!(cfg!(feature = "test-managed-construction-failure"));
+        // This test entry is single-threaded and helpers have not been spawned.
+        unsafe {
+            std::env::set_var(
+                "UMBRA_TEST_CONSTRUCTION_FAILURE",
+                mode.split('_').next().unwrap(),
+            );
+            std::env::set_var("UMBRA_TEST_CONSTRUCTION_RECORD", &construction_record);
+        }
+    }
     let drop_returned = temp.path().join("owner-drop-returned");
     if mode == "r2_direct_drop_failed_result" {
         // SAFETY: this harness-free caller has not started threads or children.
@@ -295,6 +312,15 @@ fn main() {
         elapsed.as_secs_f64() <= bound,
         "managed run exceeded D4: {elapsed:?} > {bound}s"
     );
+    if ["owner_construction", "relay_construction"].contains(&mode.as_str()) {
+        assert!(result.is_err(), "construction failure became success");
+        let checked = std::fs::read_to_string(construction_record.with_extension("checked"))
+            .expect("construction hook must execute and its real parent must verify collection");
+        assert!(checked.contains("test hook:"));
+        assert!(checked.contains("construction failed"));
+        assert!(events.borrow().is_empty());
+        return;
+    }
     if mode == "armed_reply_loss" || mode == "r2_direct_drop_failed_result" {
         assert!(
             result.is_err(),
@@ -398,6 +424,42 @@ fn main() {
     drop(run);
     umbra_core::cost_snapshot!("library-after-return", None, &[]);
     println!("managed_library: {mode} capacity={capacity} elapsed={elapsed:?} passed");
+}
+
+#[cfg(all(target_os = "macos", feature = "test-managed-construction-failure"))]
+fn check_construction_collection(result: &std::io::Result<()>) {
+    let Some(path) = std::env::var_os("UMBRA_TEST_CONSTRUCTION_RECORD") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let Ok(record) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let ids: Vec<u32> = record
+        .split_whitespace()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    if ids[0] != std::process::id() {
+        return;
+    }
+    let error = result
+        .as_ref()
+        .expect_err("construction hook must stay failed");
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let observed = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            ids[1],
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    assert!(
+        observed == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+        "registered parent must have collected the construction-failure child"
+    );
+    std::fs::write(path.with_extension("checked"), error.to_string()).unwrap();
 }
 
 #[cfg(target_os = "macos")]

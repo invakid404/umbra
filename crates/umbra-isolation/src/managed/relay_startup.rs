@@ -345,6 +345,12 @@ impl RelayStartup {
                 .or_else(|| self.failed_route.take());
             #[cfg(feature = "test-managed-construction-failure")]
             if std::env::var("UMBRA_TEST_CONSTRUCTION_FAILURE").as_deref() == Ok("relay") {
+                if let Some(path) = std::env::var_os("UMBRA_TEST_CONSTRUCTION_RECORD") {
+                    std::fs::write(
+                        path,
+                        format!("{} {}", std::process::id(), self.children[0].child.pid()),
+                    )?;
+                }
                 return Err(invalid("test hook: relay guard construction failed"));
             }
             self.guard = Some(Guard::from_entry_restoring(
